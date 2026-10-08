@@ -132,7 +132,7 @@ impl Screenshot {
         }
         let linear = detile_2d_32bpp(&self.data, w, h);
         let mut rgba = Vec::with_capacity(linear.len());
-        for chunk in linear.chunks_exact(4) {
+        for chunk in linear.as_chunks::<4>().0 {
             let (b, g, r, _x) = (chunk[0], chunk[1], chunk[2], chunk[3]);
             rgba.extend_from_slice(&[r, g, b, 0xFF]);
         }

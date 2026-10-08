@@ -11,6 +11,8 @@ use crate::protocol::Command;
 use crate::protocol::ExpectedBody;
 use crate::protocol::Response;
 
+const MAX_MEMORY_TRANSFER: u32 = 0x1_0000;
+
 fn report_parse(err: ParseError) -> rootcause::Report<Error> {
     rootcause::Report::new(Error::from(err))
 }
@@ -62,10 +64,17 @@ impl Command for GetMem {
 
     fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
         if self.length == 0 {
-            return Err(
-                rootcause::Report::new(Error::from(ArgumentError::EmptyFilename))
-                    .attach("getmem LENGTH must be > 0"),
-            );
+            return Err(rootcause::Report::new(Error::from(
+                ArgumentError::EmptyMemoryTransfer,
+            )));
+        }
+        if self.length > MAX_MEMORY_TRANSFER {
+            return Err(rootcause::Report::new(Error::from(
+                ArgumentError::MemoryTransferTooLarge {
+                    length: self.length,
+                    maximum: MAX_MEMORY_TRANSFER,
+                },
+            )));
         }
         Ok(ArgBuilder::new("getmem")
             .hex32("ADDR", self.address)
@@ -81,16 +90,28 @@ impl Command for GetMem {
         let lines = response
             .expect_multiline()
             .map_err(rootcause::Report::new)?;
-        let mut data = Vec::with_capacity(self.length as usize);
-        let mut unmapped = Vec::new();
-        for line in lines {
+        let expected = self.length as usize;
+        let mut actual = 0usize;
+        for line in &lines {
             let bytes = line.as_bytes();
             if bytes.len() % 2 != 0 {
                 return Err(report_parse(ParseError::InvalidHexDigits {
                     key: "memory-hex",
                 }));
             }
-            for (idx, chunk) in bytes.chunks(2).enumerate() {
+            actual = actual.saturating_add(bytes.len() / 2);
+        }
+        if actual != expected {
+            return Err(report_parse(ParseError::MemoryLengthMismatch {
+                expected,
+                actual,
+            }));
+        }
+
+        let mut data = Vec::with_capacity(expected);
+        let mut unmapped = Vec::new();
+        for line in lines {
+            for chunk in line.as_bytes().chunks(2) {
                 if chunk == b"??" {
                     unmapped.push(data.len() as u32);
                     data.push(0);
@@ -103,7 +124,6 @@ impl Command for GetMem {
                     report_parse(ParseError::InvalidHexDigits { key: "memory-hex" })
                 })?;
                 data.push(byte);
-                let _ = idx;
             }
         }
         Ok(MemorySnapshot {
@@ -213,5 +233,54 @@ impl Command for WalkMem {
     fn binary_len(&self) -> Option<usize> {
         let _ = hex_string_to_bytes("");
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn getmem_rejects_truncated_response() {
+        let command = GetMem {
+            address: 0x1000,
+            length: 2,
+        };
+        let error = command
+            .parse(Response::Multiline {
+                head: "memory data follows".to_owned(),
+                lines: vec!["AA".to_owned()],
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error.current_context(),
+            Error::Parse(ParseError::MemoryLengthMismatch {
+                expected: 2,
+                actual: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn getmem_reports_complete_oversized_response_length() {
+        let command = GetMem {
+            address: 0x1000,
+            length: 2,
+        };
+        let error = command
+            .parse(Response::Multiline {
+                head: "memory data follows".to_owned(),
+                lines: vec!["AABBCCDDEEFF".to_owned()],
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error.current_context(),
+            Error::Parse(ParseError::MemoryLengthMismatch {
+                expected: 2,
+                actual: 6
+            })
+        ));
     }
 }

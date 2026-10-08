@@ -46,6 +46,18 @@ pub enum Error {
     #[error("unknown status code {raw}")]
     UnknownStatusCode { raw: u16 },
 
+    #[error("module {name:?} was not reported by XBDM")]
+    ModuleNotFound { name: String },
+
+    #[error("module {name:?} has zero size")]
+    EmptyModule { name: String },
+
+    #[error("module memory at {address:#010x} is not mapped")]
+    UnmappedModuleMemory { address: u32 },
+
+    #[error("module range at {base:#010x} with size {size:#x} exceeds the address space")]
+    ModuleRangeOverflow { base: u32, size: u32 },
+
     #[error("expected {expected:?} response but got status {got}")]
     UnexpectedStatus {
         expected: ExpectedShape,
@@ -114,6 +126,8 @@ pub enum ParseError {
     InvalidQuadwordHex { key: &'static str },
     #[error("response line did not match the expected shape")]
     UnrecognizedShape,
+    #[error("memory response length mismatch: expected {expected:#x} bytes, got {actual:#x}")]
+    MemoryLengthMismatch { expected: usize, actual: usize },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -128,6 +142,10 @@ pub enum ArgumentError {
     EmptyFilename,
     #[error("memory length exceeds the protocol's u32 limit")]
     MemoryLengthOverflow,
+    #[error("memory transfer length must be nonzero")]
+    EmptyMemoryTransfer,
+    #[error("memory transfer length {length:#x} exceeds per-command limit {maximum:#x}")]
+    MemoryTransferTooLarge { length: u32, maximum: u32 },
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -63,6 +63,7 @@ cargo install xeedee
 xeedee -H 192.168.1.26 systime
 xeedee -H 192.168.1.26 file ls 'DEVKIT:\'
 xeedee -H 192.168.1.26 file get 'DEVKIT:\my-capture.xbm'
+xeedee -H 192.168.1.26 dump-module xboxkrnl.exe /tmp/xboxkrnl.exe
 ```
 
 ## Features

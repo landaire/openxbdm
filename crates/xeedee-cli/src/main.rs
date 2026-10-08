@@ -10,6 +10,7 @@ use clap::ValueEnum;
 use indicatif::ProgressBar;
 use owo_colors::OwoColorize;
 use rootcause::prelude::*;
+use tokio::io::AsyncWriteExt;
 use tabled::Tabled;
 
 mod ui;
@@ -229,6 +230,14 @@ enum Command {
 
     /// List loaded kernel and user modules.
     Modules,
+
+    /// Read one loaded module to a host file without modifying console state.
+    DumpModule {
+        /// Module name as reported by `modules` (e.g. `xboxkrnl.exe`).
+        module: String,
+        /// Host output path.
+        output: PathBuf,
+    },
 
     /// List sections of a named module.
     Modsections {
@@ -1448,6 +1457,77 @@ where
                         );
                     }
                 }
+                Ok::<(), rootcause::Report<Error>>(())
+            })
+            .await?;
+        }
+        Command::DumpModule { module, output } => {
+            let client = &mut client;
+            Box::pin(async move {
+                let modules = client.run(Modules).await?;
+                let module_info = modules
+                    .into_iter()
+                    .find(|candidate| candidate.name.eq_ignore_ascii_case(&module))
+                    .ok_or_else(|| {
+                        rootcause::Report::new(Error::ModuleNotFound {
+                            name: module.clone(),
+                        })
+                    })?;
+                if module_info.size == 0 {
+                    return Err(rootcause::Report::new(Error::EmptyModule {
+                        name: module_info.name,
+                    }));
+                }
+                module_info
+                    .base
+                    .checked_add(module_info.size - 1)
+                    .ok_or_else(|| {
+                        rootcause::Report::new(Error::ModuleRangeOverflow {
+                            base: module_info.base,
+                            size: module_info.size,
+                        })
+                    })?;
+
+                let mut file = tokio::fs::File::create(&output)
+                    .await
+                    .map_err(Error::from)
+                    .into_report()
+                    .attach_with(|| format!("creating module dump {output:?}"))?;
+                let bar = ui.progress(module_info.size as u64, "read");
+                let mut offset = 0u32;
+                while offset < module_info.size {
+                    let length = (module_info.size - offset).min(0x1000);
+                    let address = module_info
+                        .base
+                        .checked_add(offset)
+                        .expect("module range was validated");
+                    let snapshot = client.run(GetMem { address, length }).await?;
+                    if let Some(relative) = snapshot.unmapped_offsets.first() {
+                        return Err(rootcause::Report::new(Error::UnmappedModuleMemory {
+                            address: address + relative,
+                        }));
+                    }
+                    file.write_all(&snapshot.data)
+                        .await
+                        .map_err(Error::from)
+                        .into_report()
+                        .attach_with(|| format!("writing module dump {output:?}"))?;
+                    offset += length;
+                    bar.set_position(offset as u64);
+                }
+                file.flush()
+                    .await
+                    .map_err(Error::from)
+                    .into_report()
+                    .attach_with(|| format!("flushing module dump {output:?}"))?;
+                bar.finish_and_clear();
+                eprintln!(
+                    "{} {} bytes from {} at {:#010x}",
+                    ok_tag("dumped"),
+                    module_info.size,
+                    module_info.name,
+                    module_info.base
+                );
                 Ok::<(), rootcause::Report<Error>>(())
             })
             .await?;

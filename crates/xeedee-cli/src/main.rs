@@ -462,7 +462,7 @@ enum Command {
 enum FileCommand {
     /// List a directory's entries.
     Ls {
-        /// Remote path, e.g. `DEVKIT:\\`.
+        /// Remote path, e.g. `DEVKIT:\`. Quote paths in your shell: 'DEVKIT:\'.
         path: String,
 
         /// Field to sort by.
@@ -477,7 +477,8 @@ enum FileCommand {
     /// Recursively enumerate a directory tree. With no path, walks every
     /// drive returned by `drivelist`.
     Tree {
-        /// Remote path (e.g. `DEVKIT:\\`). Omit to walk every drive.
+        /// Remote path (e.g. `DEVKIT:\`). Omit to walk every drive.
+        /// Quote paths in your shell: 'DEVKIT:\'.
         path: Option<String>,
         /// Maximum recursion depth. 0 means unlimited.
         #[arg(long, default_value_t = 0u32)]

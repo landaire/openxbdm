@@ -46,6 +46,12 @@ pub enum Error {
     #[error("remote reported error {code} ({message:?})")]
     Remote { code: ErrorCode, message: String },
 
+    #[error("{operation} failed on the console with result {:#010x}", .hresult.0)]
+    ConsoleOperationFailed {
+        operation: &'static str,
+        hresult: crate::commands::Hresult,
+    },
+
     #[error("unknown status code {raw}")]
     UnknownStatusCode { raw: u16 },
 

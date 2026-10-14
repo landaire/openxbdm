@@ -38,7 +38,18 @@ use openxbdm_client::commands::GetMem;
 use openxbdm_client::commands::GetNetAddrs;
 use openxbdm_client::commands::GetPid;
 use openxbdm_client::commands::GetSocketInfo;
+use openxbdm_client::commands::Hresult;
 use openxbdm_client::commands::IsStopped;
+use openxbdm_client::commands::Kd;
+use openxbdm_client::commands::KdLite;
+use openxbdm_client::commands::KdNetDisable;
+use openxbdm_client::commands::KdNetEnable;
+use openxbdm_client::commands::KdNetMac;
+use openxbdm_client::commands::KdNetQuery;
+use openxbdm_client::commands::KdNetSet;
+use openxbdm_client::commands::KdNetShow;
+use openxbdm_client::commands::KdNetUpdate;
+use openxbdm_client::commands::MacAddress;
 use openxbdm_client::commands::MagicBoot;
 use openxbdm_client::commands::MakeDirectory;
 use openxbdm_client::commands::ModuleSections;
@@ -495,6 +506,20 @@ enum Command {
         line: String,
     },
 
+    /// Route debug exceptions to the kernel debugger or the debug monitor.
+    #[command(subcommand)]
+    Kd(KdCommand),
+
+    /// Set or clear the persistent kernel debugger lite setting. Both
+    /// subcommands write the console configuration.
+    #[command(subcommand)]
+    Kdlite(KdLiteCommand),
+
+    /// Read or change the network kernel debugger record. `set`,
+    /// `enable` and `disable` write the console flash.
+    #[command(subcommand)]
+    Kdnet(KdNetCommand),
+
     /// Record replies to a command list, or compare two recordings.
     #[command(subcommand)]
     Parity(parity::ParityCommand),
@@ -505,6 +530,51 @@ enum Command {
     #[cfg(feature = "dangerous")]
     #[command(subcommand)]
     Dangerous(DangerousCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum KdCommand {
+    /// Pass debug exceptions to the kernel debugger.
+    Enable,
+    /// Handle debug exceptions in the debug monitor.
+    Disable,
+    /// Enable the kernel debugger, then release every stopped thread.
+    Except,
+    /// Perform `except` only when a kernel debugger is present.
+    Exceptif,
+}
+
+#[derive(Subcommand, Debug)]
+enum KdLiteCommand {
+    /// Enable kernel debugger lite. Writes the console configuration.
+    Enable,
+    /// Disable kernel debugger lite. Writes the console configuration.
+    Disable,
+}
+
+#[derive(Subcommand, Debug)]
+enum KdNetCommand {
+    /// Print the network kernel debugger record stored in flash.
+    Show,
+    /// Set the record's enable field. Writes the console flash.
+    Enable,
+    /// Clear the record's enable field. Writes the console flash.
+    Disable,
+    /// Write the debugger host address, port and target MAC, and set the
+    /// enable field. Writes the console flash.
+    Set {
+        /// IPv4 address of the debugger host.
+        #[arg(long)]
+        ip: Ipv4Addr,
+        /// UDP port of the debugger host.
+        #[arg(long)]
+        port: u16,
+        /// Target MAC address, `AA-BB-CC-DD-EE-FF`. When omitted, the
+        /// stored MAC is kept; an all-zero stored MAC is replaced by the
+        /// console MAC with its last octet decremented.
+        #[arg(long, value_name = "AA-BB-CC-DD-EE-FF")]
+        mac: Option<MacAddress>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2080,6 +2150,65 @@ where
             })
             .await?;
         }
+        Command::Kd(cmd) => {
+            let request = match cmd {
+                KdCommand::Enable => Kd::Enable,
+                KdCommand::Disable => Kd::Disable,
+                KdCommand::Except => Kd::Except,
+                KdCommand::Exceptif => Kd::ExceptIf,
+            };
+            client.run(request).await?;
+        }
+        Command::Kdlite(cmd) => {
+            client
+                .run(match cmd {
+                    KdLiteCommand::Enable => KdLite::Enable,
+                    KdLiteCommand::Disable => KdLite::Disable,
+                })
+                .await?;
+        }
+        Command::Kdnet(cmd) => {
+            let client = &mut client;
+            Box::pin(async move {
+                match cmd {
+                    KdNetCommand::Show => match client.run(KdNetShow).await? {
+                        KdNetQuery::Settings(s) => {
+                            println!("enable     {}", s.enable);
+                            println!("target ip  {}", s.target_ip);
+                            println!("target mac {}", s.target_mac);
+                            println!("host ip    {}", s.host_ip);
+                            println!("host port  {}", s.host_port);
+                            println!("encrypted  {}", s.encrypted);
+                        }
+                        KdNetQuery::LoadFailed(hresult) => {
+                            return Err(console_failure("kdnet settings load", hresult));
+                        }
+                    },
+                    KdNetCommand::Enable => {
+                        let update = client.run(KdNetEnable).await?;
+                        check_kdnet_update("kdnet enable", update)?;
+                        eprintln!("{} kdnet enabled", ok_tag("saved"));
+                    }
+                    KdNetCommand::Disable => {
+                        let update = client.run(KdNetDisable).await?;
+                        check_kdnet_update("kdnet disable", update)?;
+                        eprintln!("{} kdnet disabled", ok_tag("saved"));
+                    }
+                    KdNetCommand::Set { ip, port, mac } => {
+                        client
+                            .run(KdNetSet {
+                                host_ip: Some(ip),
+                                host_port: Some(port),
+                                target_mac: mac.map(KdNetMac::Address),
+                            })
+                            .await?;
+                        eprintln!("{} kdnet set", ok_tag("saved"));
+                    }
+                }
+                Ok::<(), rootcause::Report<Error>>(())
+            })
+            .await?;
+        }
         #[cfg(feature = "dangerous")]
         Command::Dangerous(cmd) => {
             let client = &mut client;
@@ -2123,6 +2252,21 @@ where
 
     let _ = client.bye().await;
     Ok(())
+}
+
+fn console_failure(operation: &'static str, hresult: Hresult) -> rootcause::Report<Error> {
+    rootcause::Report::new(Error::ConsoleOperationFailed { operation, hresult })
+}
+
+fn check_kdnet_update(
+    operation: &'static str,
+    update: KdNetUpdate,
+) -> Result<(), rootcause::Report<Error>> {
+    match update {
+        KdNetUpdate::Saved(hresult) if !hresult.is_failure() => Ok(()),
+        KdNetUpdate::Saved(hresult) => Err(console_failure(operation, hresult)),
+        KdNetUpdate::LoadFailed(hresult) => Err(console_failure("kdnet settings load", hresult)),
+    }
 }
 
 #[derive(Default)]

@@ -350,3 +350,71 @@ impl Command for XbeInfo {
         })
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MagicBootFlags {
+    /// `WAIT`: block the response until the console is reachable again.
+    pub wait: bool,
+    /// `COLD`: force a cold reboot instead of warm.
+    pub cold: bool,
+    /// `WARM`: keep the current title memory intact where possible.
+    pub warm: bool,
+    /// `STOP`: pause execution immediately after boot so a debugger can attach.
+    pub stop: bool,
+}
+
+/// `magicboot`: boot into a title with optional parameters. Replaces the
+/// currently loaded title and reboots into it.
+#[derive(Debug, Clone, Default)]
+pub struct MagicBoot {
+    /// Optional `title=...` argument: boot into this title path.
+    pub title: Option<String>,
+    /// Optional `directory=...` argument: media directory path.
+    pub directory: Option<String>,
+    /// Optional `cmdline=...` argument: command line to pass to the title.
+    pub cmdline: Option<String>,
+    pub flags: MagicBootFlags,
+}
+
+impl Command for MagicBoot {
+    type Output = ();
+
+    fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
+        let mut args = ArgBuilder::new("magicboot");
+
+        if let Some(title) = &self.title {
+            args = args.quoted("title", title).map_err(report_argument)?;
+        }
+        if let Some(directory) = &self.directory {
+            args = args
+                .quoted("directory", directory)
+                .map_err(report_argument)?;
+        }
+        if let Some(cmdline) = &self.cmdline {
+            args = args.quoted("cmdline", cmdline).map_err(report_argument)?;
+        }
+        if self.flags.wait {
+            args = args.flag("wait");
+        }
+        if self.flags.cold {
+            args = args.flag("cold");
+        }
+        if self.flags.warm {
+            args = args.flag("warm");
+        }
+        if self.flags.stop {
+            args = args.flag("stop");
+        }
+
+        Ok(args.finish())
+    }
+
+    fn expected(&self) -> ExpectedBody {
+        ExpectedBody::Line
+    }
+
+    fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
+        response.expect_ok().map_err(rootcause::Report::new)?;
+        Ok(())
+    }
+}

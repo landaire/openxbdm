@@ -1,14 +1,201 @@
 # Behavioral nuance ledger
 
-- XBDM command table entries are 20 bytes, but handler pointers may target labels inside shared functions.
-- Command access flags are observed values only. Their semantic names are not assigned yet.
+Single behaviors that require exact compatibility, and the points where
+openxbdm differs from stock. Domain records under `parity/` hold the full
+lists.
+
+## Framework and protocol
+
 - `getmem` returns 202 text with hexadecimal bytes. Unmapped bytes use `??`; they are not omitted.
-- `setmem` can report a shorter count than requested if a page becomes unwritable or unmapped.
 - Binary download and upload bodies use different status codes: 203 sends data, 204 requests data.
 - Notification traffic uses a dedicated connection and may arrive independently of command replies.
+- A processor handler that returns 202/203/204 without setting a continuation gets `400-` with the text chosen for the original result (e.g. `400- multiline response follows`), not `unexpected error`; after a 204 upload the same case sends `400- unexpected error`.
+- A processor answering 205 takes the connection as if `dedicate handler=` named it; repeated 205 answers send `205- connection dedicated` again.
+- The receive pump bounds a piece already buffered behind the command line by the continuation's buffer size after the remaining count, so a buffered piece larger than the buffer is passed whole up to the buffer size even when fewer bytes remain.
+- Title termination closes connections dedicated to a title processor with its own thread (flag 0x40000000 comes from the processor's title flag), not only connections handed to the title command thread.
+- openxbdm runs title and dedicated processor calls on threads like stock's but keeps every connection's socket I/O on the server thread; a call longer than 20 ms finishes in the background, so a slow handler delays only its own connection. `thr=` of the command, reply, and receive traces is therefore the server thread even for connections stock services on title or dedicated processor threads. `DriveTable::translate` and NetSimWriteIniFile read the trace mask the server publishes, which equals the server state.
+- `verbose level=1` traces its own status line: the mask is set inside the handler, after the `%d:%s` command trace and before the status line builder. Settings-file lines trace `-1:%s` but no `R=` line (nothing is sent for them); keyword lines (`notify`, `sysset`, ...) and lines with an empty command word print only `DoIniLine`, and CR LF files produce an empty `DoIniLine ''` (and `NetSimReadIniLine ''`) line between lines.
+- The `R=` trace is printed only by the status line builder: `205- connection dedicated`, the `401-` refusal, banners, and transfer lines are sent without it, while `446- line too long` goes through the builder and is traced.
+- `BR(recv)` prints 0 when the receive failed and the connection was closed; the second number of both `BR` texts is the remaining count before the take.
+- A `NAME!` line for a title processor on a connection the title command thread does not own yet prints `%d:%s` twice: the server thread traces it, hands it to the title thread (0x91f50428 with transfer 1), and that thread dispatches it again through 0x91f505f0. openxbdm prints both lines before the call, so a `Creating new title command processor thread` text follows them instead of coming between them.
+
+## Session and notifications
+
+- `notifyat addr=a.b.c.d` targets host d.c.b.a. The settings writer prints the address bytes in the same reversed order, so a saved `notifyat` line restores the same target.
+- `notify reconnectport=N` sends nothing at all when `getpeername` fails; the connection stays a command connection.
+- A 17th notification channel request sends `null` to all 16 existing channels, prunes failing ones, retries once, and then fails with `400- notification limit exceeded` if no slot was freed.
+- `dmtelllog` sends no reply line when its result is 0 (area added to an open log, file open failure, partial stop).
+- A fastpipe packet consumes max(T, 0x5b4) bytes of the stream; a packet shorter than 0x5b4 bytes must be padded or the start of the next packet is lost.
+- `rpc` with `buf_size=0` ends after the first 8-byte send, which may be a `03 E5` marker while the call is still pending.
+- The fastpipe `BB` reply HRESULT for success is 0, not 0x02da0000.
+- In an `XBDMFE!Begin` path suffix the closing quote appears only when the name fills its room (Length + 7 or the rest of the 0x1fe-byte text); a shorter name ends the text without the quote.
+- File events of a terminating title are suppressed until a different title is current.
+- openxbdm queues notification texts posted by file events and code 0xa9 and sends them on the server thread after the producing operation; stock sends them synchronously in the producing thread. A text is lost only when the 16-slot queue is full and the producer cannot wait (server thread or above passive level).
+- `dbgprint start`, `stop` and `reset` are string parameters and need `=`; a bare token is not recognized.
+- File event sequence 0x91f9735c: each increment tests the sum for zero with `addic.`, which sets CR0 from the 64-bit sum of the zero-extended word, so the skip of 0 never fires and the sequence wraps from 0xffffffff to 0; a Begin record with id 0 gets no End text.
+- Export 155 (`XBDMFE!PseudoBegin` with a path): a `Library=` string that fills the 0x200-byte buffer makes stock's strlen run past it or its path `_snprintf` write past it; openxbdm sends the text without the path (`parity/session.md`).
+- Export 160's `XBDMFE!UnmarkThread` format ends with a space; export 155 always prints `Type=0x00000000`.
+- Export 36 never reaches processors registered with export 32: it compares through 0x91f411f0(text, name, kind length), which needs the text to end after the kind, but the text continues with `!`.
+- Export 36 rejects a text with a byte of 0x80 or above before the `!` (signed char compare at 0x91f3b0b4).
+- Session handlers of kind 5 get the module record; those of a stopping module load (kind 0x80000005) get the record with its leading length word 0x12c, because 0x91f395c0 adds 4 only for kind exactly 5.
+- Export 24 with kind 0 and a handler never returns in stock (0x91f3cb30 branches back with the list lock held at IRQL 2); openxbdm removes the handler from the kind-1 list once and returns 0x02da0000.
+- Export 6 returns 0x02da0000 for a readable `xnot` block that is not in the list. Closing a session does not refresh the kind-0xa and kind-0xf kernel hooks, so they stay installed until the next export 24 call or title termination.
+- Export 25 stores the new block pointer, or NULL, through the caller's pointer before it fails with 0x8007000e.
+- Title notification sessions are unlinked at title termination (0x91f3c9b0) but never freed.
+- Swap chain title cleanup (0x91f64128) reinstalls the dispatcher while routines remain even when it is already installed, so the dispatcher itself becomes the saved kernel routine and a later unregister writes the dispatcher back instead of the kernel's routine.
+- openxbdm runs notification session handlers on the server thread when the debugger delivers the event; stock runs them on the thread that raised it.
+- Log engine (exports 355..364, used by `dmtelllog`): 361 has no worker-thread check while 362 and 363 ignore the worker thread; 361/362 format with the kernel `vsprintf` without a size limit (openxbdm cuts the text to the entry); the file name is strcpy'd over the header without a limit (openxbdm stops at the 0x104-byte field); entry_size * entries + 0x160 is not overflow-checked (openxbdm refuses with 0x8007000e); a callback failure in the worker's main loop leaves the done event unsignaled, so export 360 waits forever (openxbdm's `dmtelllog stop` waits for the worker thread instead and for producers inside export 363).
+- Command processors (exports 30/72): a name is copied for at most 0x3f characters and rejected (0x80070057) when the byte after them is not NUL; there is no duplicate-name check, and the lookup returns the first slot. Unregistering (NULL handler) removes every slot with that name.
+
+## Security
+
+- `authuser` always stores its result as the connection's privileges. A failed attempt on an unlocked console removes all privileges from that connection.
+- An unlocked connection inherits the lock-mode challenge last sent on its connection slot, so `authuser` remains usable after unlocking.
+- Users are kernel objects in an unnamed directory: names are case-insensitive (0xff matches `?`), listed in hash-bucket order with the newest entry first in each bucket, and a single trailing backslash is ignored.
+- `setuserpriv` does not rewrite the settings file; the saved privileges change only when another command saves settings.
+- Users are saved only while the box is locked; the `adminpw` line is saved regardless of the lock state.
+- Key exchange values are 768-bit little-endian numbers; the generator is 2^705, not 2.
+- `lockmode unlock encrypt` replies `200- box not locked; file encryption not enabled`; `lockmode encrypt` on an unlocked box replies the same text with `400`.
+- Stock `user` adds release the new object twice when `ObInsertObject` fails (names with a leading or a single inner backslash); openxbdm returns the same `400- out of memory` without the second release. Empty names and doubled backslashes already fail in `ObCreateObject`.
+- Export 62 sets the lock mode to 1 when enabling, so it turns a `lockmode ... encrypt` lock into a plain lock; it does not write the settings file, while exports 61 and 64 do. Export 58, like `setuserpriv`, changes the access mask without saving it.
+- Export 60 zero-fills the whole 0x104-byte user record before copying the name, and opens the user again by that name to read its access; a user removed in between yields E_UNEXPECTED.
+- A user name longer than 64 bytes (only export 61 can create one) overflows the 0x4c-byte directory query buffer: the kernel copies a truncated name but reports its full length, and stock export 60 copies that length from its stack into the 0x104-byte record. openxbdm ends the user walk and `userlist` at such an entry.
+
+## Console
+
+- `dbgname` with spaces is persisted unquoted and reloads truncated at the first space.
+- `setretail` goes through kernel export 700 only: on a kernel without it the reply is `400- Modify failed: 0xc0000138`.
+- `consolemem` is 0 when the debug monitor memory query fails, even on 1 GiB kits.
+- `verbose` stores the parsed prefix of a rejected value.
+- A Trinity or later console whose I2C settings block cannot be read at startup is a test kit even without hardware flag 0x02000000; startup then clears a nonzero dword at flash offset 0x90 and restarts the console. `drivemap internal=1` in the settings file skips the check.
+- On system software before 0x20165400 the end of a title abandons an HTTP registration in progress and starts it again; registration also waits until a title is running.
+- Debug name export 17 (control code 0x33) with a size of 0 underflows and copies the whole name past the buffer in stock; openxbdm writes nothing.
+- Export 194 accepts a buffer with `*size` 0 and returns success without a size pointer even when the response is longer than 0 bytes (nothing is copied, the transaction is still stored). Only state 9 (registered) reports a transaction and length; every other state stores 0 for both.
+
+## System and settings file
+
+- The alternate settings text of control codes 0x1d and 0x22 always carries a `sysset` line (with ` videostd=0x%08x` when set) and a `recovery` line; the regular settings file carries neither `sysset` nor the video standard set by export 92.
+- The persistent title's `cmdline` is saved quoted but reloads as the raw rest of the line, so its quotes grow on every save and load.
+- The last line of the settings file loses its final byte when it has no line terminator; a NUL at the start of a line stops loading.
+- Lines executed from the saved settings file do not rewrite it (loading has not finished); lines from `recint.ini` do.
+- `wait forever` persists across boots; `wait` and `wait stop` are cleared at startup.
+- Control code 0x17 empties the settings file even on a disc boot or before loading finished; the regular writer skips both.
+- Control code 0x21 (title launch) uses up the `title` launch title: the launch information receives it and the settings file is rewritten without it. After a launch fell back to a hardware reboot the launch title stays for the next boot, and codes 0x21 and 0x77 fall back to the persistent title.
+- At a title launch with reason 4, `magicboot stop` and `wait` stop the launching thread at `execution pending_title` for at most 15 seconds; the stop flag is consumed before the timeout is chosen, so it never waits forever. `stopon all` stops launches of other reasons.
+- Control code 0x22 with a buffer the settings text fills makes stock write the buffer to handle 0 and bug check 0x2c; openxbdm keeps the bytes that fit and reports that count. A padded control code 0x1d write ends with zeros where stock sends stale pool bytes.
+- Control code 0x02 closes every connection and stops the server thread; the console accepts no connection until it restarts.
+- WriteIniSzNoCRLF (0x91f319c8) echoes every text it writes under trace bit 4, before its null check, so WriteIniSz with a null text (end of the launch-title line, and inlined at the end of the `sysset` line of 0x91f31fb0) prints `'(null)'`. Line terminators written directly through 0x91f31860 are not echoed. The echo count therefore follows how each settings writer splits its line: `dbgname name=` and the title lines echo each piece, while `dumpsettings`, `eventdefer set`, `httpreg server=`, `user name=` and the `xhttpproxy ... name=` prefix are formatted whole and echo once; an `xhttpproxy` certificate is one text per 0x1ff bytes.
+- The `title` command writes the settings file twice when it sets a title (in 0x91f46ff0 and again in the handler), and twice for `nopersist`; every write repeats the WriteIniFileImpl and echo texts.
+- LoadIniFile prints `XBDM: LoadIniFile` and the handle/size line only when bit 4 is set before the saved file runs; at boot the mask is still 0, so these texts appear only with a mask set by earlier code. `XBDM: g_fFinishedLoadingIniFile = TRUE` reads the mask after the saved file ran, so a `verbose level=` line in it enables the text.
+- FGetImageAndDrive (0x91f44608) reports success when the name does not fit after the drive: it prints the `appending title` overflow text, leaves the image unterminated, and returns 1. FTitleExists prints no `returning` text for a disc image accepted before boot.
+- DmpTitleReboot prints `not stopping` only for reason 0; reasons that skip the stop for lack of flags or `stopon all` print nothing. Its `g_XamGlobals.Flags` value is the monitor's launch flags 0x91fa2324, not a XAM field. After a timed-out pending_title stop the XAM thread prints the timeout text and then starts execution itself.
+- The disc wait 0x91f52040 prints `[xbdm] Timed-out waiting for media detect` and `[xbdm] XamGetMediaInfo() - (media=%d,type=%d)` without a trace bit.
+- Exports 28 and 125 end the calling thread (`ExTerminateThread(0)`) after an in-place relaunch when it belongs to the title process.
+
+## File system
+
 - Internal drive setup is not known to be idempotent. Re-running symbolic-link registration can encounter existing names.
-- Mock server state is per connection. This prevents one test from changing another test's debug name or memory.
-- Mock memory uses a bounded mapped range. Out-of-range access must remain distinguishable from access denial and malformed arguments.
-- Console callees store r3-r10 into the caller frame at sp+0x10..sp+0x50. The Xbox target calls every import through a stub that allocates that area. Without it, `DbgPrint` overwrote the saved LR of `_start` with a live register value and the loader thread jumped into `.bss`.
+- Control code 0x03 (0x91f2ef60) stores the title's target pointer in the drive table and the target length taken at mapping time; later changes to the title's string change translation. Removing a row moves the last row into its place, so `drivelist` order changes. Names `F`/`SMB` ignore the target and reload the network share from XConfig (3, 0x10).
+- `drivefreespace` keeps its 0x200-byte pool line buffer when the open fails (stock leak); an allocation failure replies `400- ` while `dirlist` replies `400- out of memory`.
+- Export 85 returns a counter (0x91f9feec) of file closes after delete, fileeof, mkdir, rename, setfileattributes, sendfile, writefile and sendvfile; it counts closes, not successful changes.
+- A dropped `sysfileupd` upload leaves the temporary file open and marked for deletion until reboot; a dropped `sendvfile` keeps its result block allocated.
+
+## Memory
+
+- `setmem` can report a shorter count than requested if a page becomes unwritable or unmapped.
+- `detour`: stock accepts `Id` equal to the entry count (0x2e8) and reads or writes past the entry table; openxbdm replies 0x82da0000 as for larger ids. `detour start` without `file` copies an uninitialized stack buffer as the name; openxbdm uses an empty name (status 0xc000000f in `getstate`). The record pool is uninitialized pool memory in stock and zero in openxbdm; fields a record type does not write keep the earlier use's content in both. The completion worker's poll wait consumes the stop signal, so a stock `stop` with delayed completions pending hangs; openxbdm ends the worker. A stock worker pass that completes an unlogged request after a logged one writes into and requeues the previous record; openxbdm writes no record. Walking the in-use entries at module unload is bounded by the entry count (a list corrupted by releasing the free head loops forever in stock).
+- `detour` records keep stale fields: a release record (type 6) from `entry release` carries the system time of whatever record last used that pool slot, and the vector records (type 3) carry v2, v4, ..., v12, v13 followed by 0x60 bytes of stack, because stvx ignores the low address bits of the stub's 8-byte-spaced save offsets. `detour stop` deletes the log file.
+- `traceimports` calls kernel ordinal 719 through the address `XexGetProcedureAddress` returned without a check; when the export is absent it branches to address 0 on the server thread (no exception handler), which crashes the monitor. openxbdm prints the "not a valid choice" line and replies `400- `.
+- Memory exports 10 and 40 return 0x82da0004 whenever no count pointer is passed and the copy ran to the end of its length (their down counter ends at 0xffffffff); a byte that fails to read or write ends the copy like an invalid page.
+- Export 78 stores registered allocation type names through a table pointer (0x91faea60) that is never allocated, so registration with tracking enabled faults in stock; the allocation-not-found diagnostic of type lookups reads the same table. openxbdm keeps 0x100 registered names and fails further registrations with 0x800703fb.
+
+## Debugger
+
 - Stock XBDM `dbgextld name=` loads `DEVKIT:\DMEXT\<name>`. It has one extension slot; a second load fails with `443` until the first is unloaded with `dbgextld unload module=<handle>`.
+- `break now`: stock traps on its only command thread, which stays stopped until a kernel debugger break-in; openxbdm keeps serving other connections and holds the `break now` reply until the thread is continued (dropped if the connection closes).
+- Debug events above passive level (stock deferred queue 0x91f39768): a queued assert or rip resolves as if continued (r3 = 0x49, Iar + 4); a queued data breakpoint steps over the register in place.
+- After a crash dump (data block +0x0c bit 0x40) stock stops dispatching exceptions: the kd lite chain, else r3 = 0 and Iar + 4, even for generic exceptions.
+- An execution change of type 3 with the stop flag formats `execution pending_title stop`. Releasing stopped threads on a state change (0x91f2da88) only signals debuggable threads (record flag 0x2000), so a non-debuggable thread waiting in `stop_at_pending_title` waits for its timeout.
+- Software breakpoint table (0x91f25480): the block walk compares against each block's first address, including stale first addresses of blocks emptied by `break clearall`, and sends an address below the head's first entry to the last block; after that, entries of earlier blocks can become unreachable for lookups and `clear`. A new entry keeps the saved instruction word of the slot it shifts into until it is armed; bulk memory reads restore saved bytes whether or not the entry is armed. A step over a breakpoint re-arms by block and index, not by address. openxbdm keeps the blocks in an 8-block arena instead of pool memory, so a set that needs a ninth block fails.
+- The data breakpoint globals use address 0 as "none": a data breakpoint set at 0 reports through `isbreak` but the next set replaces it instead of failing with out of memory, and a clear of address 0 always reprograms the register with 0.
+- Export 15 stops visiting threads (and creating their monitor records) once the caller's list is full and returns 0x82da0105; `threads` turns that into E_UNEXPECTED.
+- Export 49 looks up the given thread but returns the address of the calling thread's record word (+0x18); no monitor code reads that word.
+- Exports 13/41 read and write gpr1 through record +0x14 when record flag 0x10000 is set; nothing in the image sets that flag, so openxbdm does not model it.
+- Export 8 sleeps 1 ms after releasing a thread whose record has flag 0x200; openxbdm does not model that flag and does not sleep.
+- `getcontext` copies the context once into a 0xa50-byte pool block (`400- out of memory` when the allocation fails); openxbdm frees the block of a connection closed mid-transfer at the next event pass.
+
+## Network
+
+- `getxnqoslookupinfo` and other table lines go through a 0x100-byte buffer with a forced terminator: a fully populated QoS line is cut at 255 characters.
+- `linkstate` maps `XNetSetOpt` error 10022 to `407- err=10022`; every other error is `400- err=N`. The link state is read before any change and reported as `oldstate`.
+- `xhttpproxy name=""` stores no name, like a missing `name`; `port` and `certsize` are read only when `name=` is present. A failure text keeps a trailing space: `428- err=0x82da001c `.
+- `xhttpproxy` certificate hex is scanned in place from the raw value (optional leading quote skipped) and stops at a space, quote, or end of line; extra pairs, odd digits, or a count other than `certsize` give `407- err=0x82da0007`.
+- The settings writer stores `staticip use=%d, addr=...` with a comma; reading it back works only because the dword getter stores the numeric prefix of a value with trailing text.
+- Debug-monitor control codes 0xa5/0xa6 identify a proxy by the name pointer and port they handed out, not by an entry handle.
+- Classifier text compiler (exports 216, 224; 0x91f8bdd0): the parser keeps the first syntax error, but lexer and operator builder errors replace the status, and parsing continues after a builder error with the failed rule's operands freed; later rules then pop the wrong nodes, so `UDP[1] == UDP` reports 0x800710d2 (no operand) instead of the 0x80070099 of the second `UDP`. Names are declared as items when the rule is reduced, even in a folded-away `?:` branch, so `0 ? UDP : TCP` serializes both items. `1 && x` keeps the constant operand; `0 && x` folds to false. A constant true program installs no classifier; a constant false one fails with 0x82da0010. Field names bind case-insensitively; keywords and function names are case-sensitive. Decimal literals with more than 10 digits (or hex with more than 8) are 64-bit whatever their value. An address literal scan only stops at a non-digit after every separator, so `1.2.3.4x` is an address followed by a name. The compiler accepts 0x20 items and 0x40 live nodes, more than the 16 items and 32 nodes the stored copy allows, so such programs fail later in `insertq` with 0x82da001c.
+- Classifier compiler deviations where stock faults: after an earlier builder error, `name[...]`/`name(...)` can be reduced over a non-name operand; stock reads its value word as an item position (a string reference's link, stale bytes of a narrow integer, or a node pointer) and faults on an out-of-range position, and after a constant index drops a non-string operand as a string reference and faults; openxbdm returns 0x8007048a or drops nothing. `i64::MIN / -1` traps in stock and wraps in openxbdm; ignore-case string functions on bytes 0x80..0xfe hit a CRT assertion in stock.
+
+## Performance counters
+
+- Performance counters with period 0 are never sampled; a history query on them always reports no data. A period of 10 puts the counter back in the bucket being emptied, so it is sampled again 10 ticks later as expected.
+- The `Debugger Pages` counter is always 0: its source word is the zero dword 11 of export 75. The four `% GPU` counters read value and rate words nothing writes, so they report 0 and history queries report no data.
+- When the memory statistics query of the counter sampler fails, stock copies its uninitialized stack block into the page counters; openxbdm copies zeros.
+- Export 26 (open counter) returns 0x82da0002 both for a missing `\DmCounters` directory and for a null name.
+- Export 53 (walk counters) copies the full directory entry name, up to 0x104 bytes, into a 0x100-byte name field followed by the type dword; openxbdm copies at most 0xff bytes. The counter type comes from the low half of the registration word.
+- The title's handle to `\DmCounters` is forgotten by the second title terminate routine (0x91f32418), so the next title opens the directory again.
+- `querypc` and export 27 raise the IRQL only around history and copied-sample reads; instantaneous reads and handler counters run at the caller's IRQL.
+
+## Capture, trace, and profiler
+
+- Capture (`capctrl`, exports 73/74/162): stop and abort call debug monitor service 2 with 0 when only call-cap instrumentation is loaded (fast-cap absent, call-cap present), mirroring start's enable. Abort reports the stop failure (0x82da0018 without a capture) except a full buffer. A stop more than 0x20000000 time base ticks (about 10.7 s) after start fails with 0x82da0029 and recording continues; abort then also leaves it running.
+- Capture chunk allocation grants a chunk only while four chunk sizes still fit below the buffer end, so the last three chunks of the buffer are never used. With the PIX discard flag (control 0x3f) the buffer starts over at its base; that chunk is handed out twice.
+- A capture start that sees a title terminate after allocating returns 0x82da0027 with the start/stop interlock still held: every start and stop returns 0x800700aa until the next title terminate clears it. Title terminate forgets the capture buffers without freeing them.
+- The capture file is named at write time: the drive table translates the name stored at start when `stop` runs. A name that no longer translates or opens keeps the buffers (profilingstatus 0x82da0018); `stop` maps the status through RtlNtStatusToDosError to 0x8007xxxx. Chunk starts off a page boundary (several recording processors with a buffer size not a multiple of 128 KiB) call RtlAssert during the write.
+- Export 73 from a title while a capture records continues it (0x02da0006) under the new file name without touching either file; the thread switch routine stays restored, so thread switches are no longer recorded.
+- Export 73 reads at most 0x140 bytes of the title's name; stock copies it unbounded into a 0x141-byte stack buffer. Counter selectors above 0x13 make stock print `Invalid counter ID %d` and trap on every processor during the start IPI; openxbdm prints and records without counters.
+- Instruction trace start arms single-step for the calling thread and skips the first 2 returns or 0x28 instructions, so recording begins at the instruction after the start call; tracing stops when the thread reaches the export 136 entry. Code 0x3a returns the low word of every encoded instruction (recorded or not); the timing line subtracts one from both counts while a branch waits for its target.
+- The trace handler runs RtlEnterCriticalSection, KeAcquireSpinLockAtRaisedIrql, KfAcquireSpinLock, ObReferenceObject, and ObDereferenceObject natively (their reservation loops never finish under single-step) and records their body up to the first `blr` with fabricated r4/r5/r11/r31; only ObDereferenceObject follows forward conditional branches. Hardware flag 0x02000000 turns this off for good, but only in the service 6 trace hook.
+- The trace stream writes an instruction word only on a miss in a 64 KiB two-way address cache; branches and traps are written when the next address is known, followed by that address; leaving the start function of export 134 writes 0xfffffffc and defers a fake `bl` (0x48000001).
+- Trace session memory is freed with the buffer base (allocation + 0x78) and the address of the size limit variable as the size, so the kernel may rewrite the limit (export 135 returns it). A session without a file keeps its memory after export 136 until export 137; export 137 does not remove the hooks.
+- Title termination during a trace removes the hooks, resets the size limit to 4 MiB, and forgets the session without freeing its memory; a running writer thread keeps polling every 10 ms forever and its handle is dropped.
+- After each trace flush, freed buffers return to the free slot of their position in the flush list, which can overwrite a free buffer still in that slot.
+- `lopctrl start`: the writer thread opens the capture file and writes the module snapshot, header, and function tables before the command continues; when the file cannot be created or the prologue fails, stock returns without signaling the start event and the command thread waits forever. openxbdm fails the start with 0x82da0000 (the writer-thread failure code), as for a name without a drive.
+- `lopctrl`: exports 149/150 and the command all pass owner 1, so the owner mismatch result 0x80070005 of 0x91f33010 is unreachable. `info` after a title ended during profiling returns 0x82da0027 until the next successful start. `elapsedTime` is whole seconds; `totalSamp` and `overheadInt` are the interrupt and busy-interrupt counts of the highest sampled processor only.
+- CPU profiler interval: stock writes PRV 0x1c8 (bit 0x8000 of the high word) and PRV 0x1e0/0x1e8 (-interval in the high word) with the low words taken from uninitialized stack; openxbdm writes 0. A seeded random interval generator is advanced on every reload but its result is never used.
+- PMC event names: counter slots whose unit selection is 5 make stock read past the name table and use string bytes as a pointer; built-in setups 0 and 44 route such slots. openxbdm names them `** INVALID EVENT **`. A unit that drives some lanes but not the decoded one clobbers the remembered lane index with -1, so the name is the last entry of the preceding table; openxbdm keeps that. Export 210 does not check the counter number; openxbdm reports 7 past 15. Exports 196/198 apply memory past the 45-setup table for larger indices; openxbdm fails them. `PMCStop` (0x91f91638) succeeds only for the current owner exactly.
+
+## PIX and Xbox Studio
+
+- `xstudio DedicateSocket` reports `OK <port>` even when the session does not start (test mode on, studio service refusal); the listener then has no thread, and the next `DedicateSocket` replaces it without closing it. A null-cable transport failure is stored and fails every later `DedicateSocket` until reboot.
+- Studio socket transport: a received message longer than the receive buffer completes with 0x80070057 and drops buffer-capacity bytes instead of the message length, so the rest of the body is read as the next length prefix. A zero-length body is read with a zero-length recv whose 0 result closes the transport. Receive buffers shorter than 4 bytes raise assertion trap 0x19 and still receive 4 bytes.
+- Studio socket transport result with wait returns 0x80004002 without leaving its critical section when the connection ends during the wait; openxbdm leaves it (a later call from another thread would block forever). Stock dereferences any request handle; openxbdm fails a handle that names no request slot with 0x80070057. Null-cable transport creation passes the null pointer to ExFreePool after a failed allocation; openxbdm skips the free.
+- Control codes 0x99/0x9f alert the server thread so its pass starts or stops the studio session; openxbdm's server pass runs at most 20 ms apart, so it does not alert.
+- While the PIX stream is active, ODD read start (0x46) writes an `ODD ` record with bit 0 of the low time word cleared and the drive authentication state, and read completion (0x47) one with that bit set and the status.
+- PIX capture: with completed write requests on both streams, taking the next free buffers pops both queue heads and keeps only the second request's eight buffers (0x91f5de90); the first request's buffers are not reused until the capture restarts.
+- PIX capture: requests of record stream 1 are never written unless output is discarded (code 0x3f); without it their status stays pending and a wait for free buffers polls forever.
+- PIX capture: message 5 with a plugin unloads the plugin's image twice when no catma image is loaded (0x91f60fb0); openxbdm unloads it once.
+- PIX capture: the thread name records of a capture file take a reference to every debuggable thread (`ObLookupAnyThreadByThreadId`) and never release it (0x91f5d110).
+- PIX capture: narrow strings in timing records are packed with sign extension, so a character of 0x80 or above overwrites the characters before it in the same word with 0xff (0x91f77f88).
+- PIX capture: while paused (message 10) the frame thread spins on the session lock servicing messages; a message other than 11 resumes, goes back to the queue head, and pauses again at the next frame.
+- PIX capture: code 0x5c rate-limits command data buffers with a token budget of 0x87a23 time base ticks per allocation and a minimum spacing of 0x43d11 ticks.
+- PIX capture engine deviations (where stock traps, faults or reads uninitialized data): see `parity/performance.md`, "PIX capture engine deviations".
+
+## Hardware and PGO
+
+- The commands `autoinput` and `oddlog` call the same functions stock exports as 166-174 and 147/148. Export 166 passes its first argument (the `autoinput` user, unchecked) to the XAM input focus query (0x3dd), which is resolved once at startup; when it is absent the export stores 0 and returns 0x82da0007.
+- Export 174 (`queryqueue`) clears every non-null output before taking the lock; with a controller present it returns XBDM_NOERR even when the controller is disconnected, reporting only the queue length.
+- Export 147 takes a drive path (`devkit:\...`): it copies the name with strcpy into a static buffer of about 0x100 bytes and the writer thread translates it through the drive table (0x91f2eb68), failing with STATUS_NO_SUCH_FILE (`0x82da000d`) when it does not translate; openxbdm translates on the server thread without the copy. After a failed ExCreateThread stock's next stop waits forever on the never-set finished event 0x91fad060; openxbdm sets it. At startup stock reads the drive authentication state from `\Device\CdRom0` (IOCTL 0x240cc) and uses the output dword even when the request fails; openxbdm uses 0 then.
+- NuiCam raw data requests (controls 0x96-0x98, 0xa1) are accepted only when kernel ordinal 0x30d resolved at startup; a request queued earlier is dropped silently. A completion with no queued request marks the next completed request (node byte +0x1f). Capture mode op 1 returns the old mode and selects mode 1, but switches capture with value 0; every mode change drops the queued requests without signalling them, as does the second title terminate routine.
+- PGO runtime (docs/re-notes/pgo.md): `pogoctrl snapshot` always sets the record's phase flag, so an absent phase names profiles `<base>-!<n>.pgc`; a snapshot restarts counting even for a stopped module; `allocscale` on any registered module returns 0x82da0019 because the count block is allocated at registration. Profile numbers always start at 1 (the directory scan compares the character after the name, always `!`); the next number is tried while the name exists, and a name that can be neither created nor opened falls back to `\Device\Harddisk0\Partition1\DEVKIT`, then stops the console. The `!%u.pgc` suffix is printed at the name's length in UTF-16 units, overwriting UTF-8 bytes of non-ASCII names.
+- PGO exports 106 and 114 look modules up without a name, which never matches: 106 returns 0 and 114 has no effect; 115 only checks that the phase converts. `pogo.ini` keys match as case-insensitive prefixes in a fixed order (`=1` alone sets `AllocScale` 1, `Validate=1` sets `ValidateEPLH`), and an empty number is valid as 0. The bucket search of exports 189-191 keeps its below flag once set, so exact matches after a downward step land in the odd bucket below. The module interface's probe slots receive the second instruction word of each probe export, not its address.
+- PGO runtime deviations where stock faults, overruns, or reads uninitialized memory: failed entry allocation in exports 181/183/186/189 skips the increment stock makes at address 0x8 or 0x10; a full block whose record left the list drops the entry instead of writing past the reservation; an address outside every module gives an empty module name; registration before export 113, a null name in export 113 or phase in export 115, an empty `OutputPath`, a base path without `\`, overlong devkit fallback names, profile names that fill their buffer, overlong UTF-8 module paths, and phases whose last UTF-8 sequence takes the terminator are bounded or treated as described in parity/hardware.md. Dispatch table writes treat an unmapped entry as the fault stock's exception handler catches.
+
+## Exports and the Xbox module
+
+- Exports and control codes that change server state run through `dispatcher::call_on_server` (`parity.md`, "Server-thread requests"): inline before the command loop starts, then on the server thread. Called on the server thread itself (for example from a command processor) or above passive level they return without running, where stock acts inline: netsim exports 163, 164, 216-219, 224, 225 return 0x82da0000; debugger exports 8, 19, 22, 34, 37, 38, 39, 45, 56, 178, 179 return E_UNEXPECTED, and export 46 queues its change for the next server pass. Exports 21 and 373 read the attached debugger as the server last published it, at most one server pass old.
+- The XEX export table sits in `.text` (0x91f95794) with 373 slots for 253 exports; ordinals 3, 55, 57, 124 share one no-op returning XBDM_NOERR and 4, 5 share one checked pool free. Its version words carry the low 24 bits of 2.0.21256.0 and 2.0.1861.0 and both top bytes in a third word. openxbdm's table has one slot per ordinal up to the highest implemented one.
+- Export importers run with 64-bit registers and expect r14-r31 preserved in full; 32-bit code saves only the low words, so every openxbdm export enters through a bridge that saves the full registers.
+- Binary Ninja ends a basic block at `mtmsrd`, so HLIL of every interlocked sequence (`mfmsr; mtmsrd r13,1; lwarx ...; mtmsrd rX,1`) is cut short; exports 46, 74, 78, 144, 147, 148, 193, 307, 308, 312, 345, 346, 361-363 were read from the raw disassembly.
+- Lock-free library (exports 300-351): creation failures return 0x80070008 (HRESULT_FROM_WIN32(ERROR_NOT_ENOUGH_MEMORY)), not E_OUTOFMEMORY. Queue, priority queue and hash table destroy always return 1; pool destroy returns 0 for an invalid pool; stack destroy returns nothing. The queue keeps KSEMAPHOREs inside the object; the stack, hash table and pool create semaphore handles, which stock then waits on with KeWaitForSingleObject (and the hash table releases with KeReleaseSemaphore), faulting on the handle; openxbdm uses NtWaitForSingleObjectEx/NtReleaseSemaphore and keeps the IRQL > DISPATCH_LEVEL skip of the kernel release. Hash table destroy never closes its semaphore handles. Stack pop without the wait option reports a popped value of 0 as empty (0x80310002) after removing the node. Hash table remove-any with an item semaphore returns success after one wait without removing an item and leaves the remover counted as waiting. A recursive pool owner reacquiring exclusive without the spin flag spins forever in stock (compare and exchange values swapped); openxbdm clears the bit. Any wait entry creation failure sets the pool entry count to 0x8000, after which pool destroy walks past the entry table; openxbdm bounds the walk by the table size. Lock records from 348 carry 0x10000 in the waiters word and 345 refuses them.
+- Console callees store r3-r10 into the caller frame at sp+0x10..sp+0x50. The Xbox target calls every import through a stub that allocates that area. Without that area, `DbgPrint` overwrites the saved LR of the caller with a live register value.
 - Stock XBDM owns TCP port 730. A replacement module loaded beside it cannot listen and retries every second.

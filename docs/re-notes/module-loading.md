@@ -45,6 +45,8 @@ Consequences:
 
 ## Hardware result
 
+These results establish the loader behavior. The build used for them served only the commands named below; the current implementation has not been run on hardware (`status.md`).
+
 With openxbdm built at `0x91f00000` with the bounding path `\Device\Harddisk0\Partition1\DEVKIT\FlashEx\xbdm.xex` and placed at `DEVKIT:\FlashEx\xbdm.xex`, a cold reboot brought up openxbdm as the console debug monitor: `dbgname` returned `openxbdm-deanxbox` and `consolefeatures` listed `OPENXBDM`. On that boot, without retries, the file was still present and the restricted `delete` command removed it afterward.
 
 The same override works under shadowboot. With the compiler-generated `0xe0000`-byte boot region (SHA-256 `3164f39c830537eeb3ca0a7f14078be53b249d1f878a558f73d7dc4ad73bb5a4`) at `HDD:\xboxromw2d.bin` and openxbdm at `DEVKIT:\FlashEx\xbdm.xex`, an XBDM `reboot` was followed by:

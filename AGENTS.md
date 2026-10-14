@@ -25,7 +25,7 @@ Guidance for agents working in the openxbdm repository. These rules override def
 - Vendor 3rd party code.
 - Code should be explicitly cross-platform.
 - No cutting corners. Do things _the correct way_. Do not, for example, read an entire file into memory to parse it. We do not know how large files may be and this may consume a lot of memory. Instead, mmap it.
-- All tests, clippy, fixers get primarily run through buck2 to the best of our ability. Reference G:\dev\rarchive for test harnessing.
+- All tests, clippy, fixers get primarily run through buck2 to the best of our ability. Reference the rarchive repository (`../rarchive`) for test harnessing.
 - Nothing that ties simulation to framerate, if possible. i.e. physics code should not be framerate-driven.
 
 ### Binary Readers

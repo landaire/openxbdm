@@ -6,29 +6,69 @@ monitor on the console.
 
 [xbdm]: https://xboxdevwiki.net/Xbox_Debug_Monitor
 
-## What it is
+Xbox 360 development kits serve a text-line protocol on TCP port 730, with
+multi-line and binary bodies, and answer name discovery on UDP port 730.
 
-Xbox 360 devkits speak a TCP protocol on port 730 (and answer UDP
-discovery broadcasts on 731). The protocol is text-line-oriented with
-optional multi-line and binary bodies. Historically the only way to talk
-to a devkit was Microsoft's proprietary `xbdm.dll` / XDK tools.
+## Crates
 
-`openxbdm-client` is a pure-Rust client: a typed transport layer (including a
-`MockTransport` for tests), parsers for every response shape, framed
-command building, discovery, and high-level wrappers around the common
-commands (directory listing, file up/download, memory read/write,
-notification subscription, reboot, etc.).
+| Crate | Contents |
+| --- | --- |
+| `openxbdm-core` | `no_std` protocol grammar, status codes, value encodings, and the authentication response function shared by client and server |
+| `openxbdm-client` | Async client: transports (including `MockTransport`), response parsers, typed commands, discovery |
+| `openxbdm-cli` | The `openxbdm` command-line client, including `parity record` and `parity compare` for differential testing |
+| `openxbdm-ffi` | C/C++ bindings for the client (`cdylib`, `staticlib`) |
+| `openxbdm-server` | `no_std`, allocation-free command engine: all 177 stock commands in `src/commands/<domain>` over per-domain backend traits |
+| `openxbdm-server-host` | The engine over std TCP sockets with a simulated console (`openxbdm-server` binary), and the integration tests |
+| `openxbdm-server-xbox360` | The Xbox 360 system-debugger module: console backends, control dispatcher, and the 253 exports |
+| `openxbdm-kd-core` | `no_std` kdnet packet codec and session |
+| `openxbdm-kd` | Kernel debugger client over kdnet: the `openxbdm-kd` binary, GDB server, and debugger host |
+| `openxbdm-testing` | Test-only dependencies for the Buck2 test targets |
 
-The workspace contains:
+## Build
 
-- `openxbdm-client`: async client library.
-- `openxbdm-cli`: the `openxbdm` command-line client.
-- `openxbdm-ffi`: C/C++ bindings for the client.
-- `openxbdm-server`: allocation-free, `no_std` command parsing and backend dispatch.
-- `openxbdm-server-host`: the `openxbdm-server` TCP server backed by deterministic mocks.
-- `openxbdm-server-xbox360`: the Xbox 360 system-debugger module.
+`devenv shell` (`devenv.nix`) provides the Rust toolchain, Buck2, and
+Reindeer. Buck2 is the primary build system; Cargo builds the same
+sources from the vendored dependencies.
 
-## Quick start
+```text
+buck2 build //...
+buck2 test //...
+cargo build --workspace
+cargo test --workspace
+```
+
+The console module is built separately with `./build_xbox360.sh`, which
+needs the `llvm-xbox-360` toolchain. See `DEVELOPING.md` for the
+toolchain, vendoring, Buck rules, and console deployment.
+
+## Host server
+
+```text
+cargo run -p openxbdm-server-host -- --listen 127.0.0.1:1730
+openxbdm -H 127.0.0.1:1730 dmversion
+```
+
+The default listen address is `127.0.0.1:1730`; name discovery is served
+on the UDP port with the same number. All connections share one simulated
+console, which starts by executing its settings file as the console
+monitor does.
+
+## Tests
+
+- `crates/openxbdm-server-host/tests/<domain>.rs`: integration tests that
+  start the host server and send every command over TCP, through
+  `openxbdm-client` where it has the command and as raw lines otherwise.
+  `framework.rs` covers dispatch and access rules, `trace.rs` the
+  `verbose` trace texts, `network/` the `ipproxy`, `netcap`, and `netsim`
+  engines; `common/` holds the shared harness.
+- `crates/openxbdm-client/tests/`: Insta snapshot tests of command
+  encoding and reply parsing against captured fixtures.
+- Unit tests in `openxbdm-core`, `openxbdm-client`, `openxbdm-cli`, and
+  `openxbdm-server`.
+
+Buck2 test targets are declared in `build_defs/rust_tests.bzl`.
+
+## Client
 
 Every wire verb is a type implementing [`openxbdm_client::Command`]. You hand one
 to `Client::run` and get back the decoded `Output` associated type.
@@ -76,68 +116,67 @@ openxbdm -H 192.168.1.26 file get 'DEVKIT:\my-capture.xbm'
 openxbdm -H 192.168.1.26 dump-module xboxkrnl.exe /tmp/xboxkrnl.exe
 ```
 
-## Features
+### Features
 
-| flag        | what it enables                                              |
-| ----------- | ------------------------------------------------------------ |
-| `cli`       | The `openxbdm` binary (`clap`, `indicatif`, `tabled`, etc.). |
-| `tokio`     | `tokio::net::TcpStream` transport. Implied by `cli`.         |
-| `jiff`      | `jiff::Zoned` conversions on time-bearing response types.    |
-| `image`     | PNG screenshot decode via the `image` crate.                 |
-| `capture`   | Video capture over the PIX! protocol and `.xbm` detiling.    |
-| `dangerous` | In-memory patches to xbdm (nand-dump, drivemap-enable, etc). |
+`openxbdm-client`:
 
-All non-transport, non-CLI features are off by default.
+| Feature | Enables |
+| --- | --- |
+| `tokio` (default) | `tokio::net::TcpStream` transport |
+| `jiff` | `jiff::Zoned` conversions on time-bearing response types |
+| `capture` | Video capture over the PIX! protocol and `.xbm` decoding |
+| `dangerous` | In-memory patches to xbdm (drive map enable, code patches) |
 
-## Status
+`openxbdm-cli` enables `capture` and `dangerous` by default.
 
-Implemented and exercised against a real v10888-based devkit (`xbdm-main-nov11`):
-
-- Core command layer: `directory listing`, `getfile`, `sendfile`,
-  `getmem`, `setmem`, `reboot`, `threadinfo`, etc.
-- Notification channel (async events on a second connection).
-- UDP discovery and ping.
-- `PIX!{...}` video capture with intermediate `.xbm` decode into NV12.
-- Dangerous helpers: `drivemap` enable/persist, in-memory code patching
-  (strictly opt-in via the `dangerous` feature).
-
-Not implemented:
-
-- No MP4 encoding in-crate; the `capture` path shells out to `ffmpeg`
-  for H.264 muxing.
-
-## Mock server
-
-```text
-cargo run -p openxbdm-server-host -- --listen 127.0.0.1:1730
-openxbdm -H 127.0.0.1:1730 dmversion
-```
-
-Each connection gets isolated mock state.
+The client was exercised against a stock v10888-based development kit
+(`xbdm-main-nov11`): directory listing, `getfile`, `sendfile`, `getmem`,
+`setmem`, `reboot`, `threadinfo`, notification channels, UDP discovery,
+PIX! video capture, and the `dangerous` helpers. MP4 output shells out to
+`ffmpeg` for H.264 muxing.
 
 ## Xbox 360 module
 
-`build_xbox360.sh` builds the console module with the PowerPC target from the
-adjacent `llvm-xbox-360` repository (override with `LLVM_XBOX_360`) and writes
-`target/openxbdm.xex`: load address `0x91f00000`, system-debugger DLL flags,
-build 21256 import versions, small pages, compression, and development-key
-encryption.
+`./build_xbox360.sh` writes `target/openxbdm.xex`: load address
+`0x91f00000`, system-debugger DLL flags, build 21256 import versions,
+small pages, compression, development-key encryption, and the bounding
+path `\Device\Harddisk0\Partition1\DEVKIT\FlashEx\xbdm.xex`. The module
+boots on a devkit in place of stock XBDM; see `docs/re-notes/status.md`.
 
-The module is deployed as `DEVKIT:\FlashEx\xbdm.xex`. The kernel searches
-`\Hdd\`, `\Devkit\`, and `\FlashEx\` before `\SystemRoot\` when it loads a
-system module by bare name. XAM loads XBDM with a flag that only admits images
-whose bounding path names the file being loaded, so the build sets the
-bounding path to `\Device\Harddisk0\Partition1\DEVKIT\FlashEx\xbdm.xex`. A
-module that fails to load leaves stock XBDM in place. Before starting its TCP
-listener the module tries for up to 30 seconds to remove
-`DEVKIT:\FlashEx\xbdm.xex`; while that file exists, every cold boot loads the
-module.
+Development loop, without writing the console disk: with kdnet enabled,
+run the kernel debugger host and reboot the console; the kernel loads
+the module from the host.
 
-## Reverse-engineering records
+```text
+openxbdm-kd host --file 'host:\Device\Harddisk0\Partition1\DEVKIT\FlashEx\xbdm.xex=target/openxbdm.xex'
+```
 
-- `docs/re-notes/status.md`: feature inventory and implementation status.
-- `docs/re-notes/xbdm.md`: command table, protocol behavior, and backend boundaries.
+Stopping the host and rebooting returns to stock XBDM from flash. Placed
+at `DEVKIT:\FlashEx\xbdm.xex` the module also loads in place of the flash
+monitor and removes that file at startup; read the hazards and recovery
+in `DEVELOPING.md` before using that method.
+
+## Differential testing
+
+`openxbdm parity record` sends a command list to a monitor and records
+the replies; `openxbdm parity compare` reports differences between two
+recordings outside listed varying fields. Against stock XBDM on a devkit,
+the 399 lines of `docs/re-notes/parity/hardware-commands.txt` give 0
+differences (`docs/re-notes/parity.md`). Usage: `DEVELOPING.md`.
+
+## Documentation
+
+- `DEVELOPING.md`: environment, build, vendoring, deployment, recovery, differential testing.
+- `docs/re-notes/status.md`: component status.
+- `docs/re-notes/parity.md`: per-command, export, and control code coverage; gaps and deviations.
+- `docs/re-notes/xbdm.md`: protocol, command table, and feature map.
+- `docs/re-notes/commands/`: command specifications (`framework.md`, `group1.md` to `group8.md`).
+- `docs/re-notes/parity/`: per-domain parity records.
+- `docs/re-notes/exports.md`: export table.
+- `docs/re-notes/dispatcher.md`: debug monitor control dispatcher.
+- `docs/re-notes/pgo.md`: PGO instrumentation runtime.
 - `docs/re-notes/module-loading.md`: kernel module search and boot-time replacement.
+- `docs/re-notes/kd.md`: kdnet protocol and the kernel debugger host.
 - `docs/re-notes/nuances.md`: behaviors requiring exact compatibility.
 
 ## License
@@ -148,3 +187,49 @@ Dual-licensed under either of:
 - MIT license
 
 at your option.
+
+## Kernel debugger (openxbdm-kd)
+
+`openxbdm-kd` talks to the kernel debugger over the kdnet UDP transport and
+serves GDB. Enable kdnet with stock XBDM (`kdnet set IP=<host> Port=50000`,
+`kdnet enable`, reboot). The host must reach the kdnet target address on the
+local link; for an APIPA target address (169.254.x.y) add a host route, for
+example `nmcli device modify eth0 +ipv4.routes 169.254.59.14/32`.
+
+    openxbdm-kd listen [--passive] [--log-file kd.log]
+    openxbdm-kd [--target 169.254.59.14] break
+    openxbdm-kd mem 0x80040000 64
+    openxbdm-kd gdbserver --listen 127.0.0.1:2159
+    openxbdm-kd host [--file CONSOLE_PATH=LOCAL_PATH] [--stop-on-load IMAGE]
+    openxbdm-kd reboot
+
+Without `--target` the address is learned from the kernel's beacon. While
+the tool is attached the kernel waits for it at every print, module load
+and stop.
+
+`host` keeps the console running while attached: it continues every event,
+prints debug output and module loads, and answers the kernel's host file
+requests. Each module load asks the host first with a path such as
+`host:\Device\Flash\xbdm.xex`; every requested path is printed. `--file`
+serves a requested path (compared case-insensitively) from a local file;
+other paths are answered as not found and the kernel loads from its own
+devices. To boot XBDM from a local image:
+
+    openxbdm-kd host --file 'host:\Device\Flash\xbdm.xex=xbdm.xex'
+
+`--stop-on-load xbdm.xex` keeps the console stopped at that image's load,
+after it is mapped and before its entry point runs, and reads commands from
+standard input: `mem ADDRESS [LENGTH]`, `write ADDRESS HEXBYTES` and
+`continue` (end of input also continues). `--log-file` appends every
+received datagram in the `listen --log-file` format.
+
+GDB (any build with PowerPC support):
+
+    gdb -ex 'set architecture powerpc:common64' -ex 'set endian big' \
+        -ex 'target remote 127.0.0.1:2159'
+
+Registers, memory, software breakpoints, `stepi` (software single step),
+interrupt and detach are supported. Detaching removes breakpoints and
+resumes the console. Do not set breakpoints in the kernel debugger's own
+code paths, such as the kd poll path at `0x801b4990`. Single step through
+MSR.SE stops the console with bug check 0x2b.

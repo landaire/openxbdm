@@ -26,22 +26,53 @@ platform provides, so `buck2 build //...` skips it. Build the module with
 
 which needs the `llvm-xbox-360` toolchain checkout in `../llvm-xbox-360`
 or at `$LLVM_XBOX_360`, and writes `target/openxbdm.xex` by default.
-`OPENXBDM_FEATURES` passes Cargo features to the module build; deployments
-through `DEVKIT:\FlashEx` use `boot-guard`:
+`OPENXBDM_FEATURES` passes Cargo features to the module build; the
+`DEVKIT:\FlashEx` deployment uses `boot-guard`:
 
     OPENXBDM_FEATURES=boot-guard ./build_xbox360.sh
 
 ## Console deployment
 
-The module has not been verified on hardware. A module placed at
-`DEVKIT:\FlashEx\xbdm.xex` loads at every boot, before the network is
-available, until the file is removed; a module that stops the console
-during boot leaves no network path to remove it. The last deployment
-(built without `boot-guard`) stopped the console in the boot animation,
-and that console stays unreachable until the file is removed by other
-means. Do not deploy a build without `boot-guard`.
+### Kernel debugger host
 
-Deployment, through stock XBDM:
+The recommended method writes nothing to the console disk. While a kd
+host is attached, the kernel requests each module from the host before
+its own devices, so `openxbdm-kd host` can supply openxbdm at boot.
+Stopping the host and rebooting returns the console to stock XBDM from
+flash.
+
+kdnet setup, once, through stock XBDM (the address and port are stored in
+flash):
+
+    openxbdm -H <console> kdnet set IP=<host> Port=50000
+    openxbdm -H <console> kdnet enable
+    openxbdm -H <console> reboot
+
+The host must reach the kdnet target address on the local link. For an
+APIPA target address (169.254.x.y) add a host route, for example
+
+    nmcli device modify eth0 +ipv4.routes 169.254.59.14/32
+
+Development loop:
+
+1. `./build_xbox360.sh` (no `boot-guard` needed).
+2. Start the host and reboot the console:
+
+       openxbdm-kd host --file 'host:\Device\Harddisk0\Partition1\DEVKIT\FlashEx\xbdm.xex=target/openxbdm.xex'
+
+3. Test against port 730. To return to stock XBDM, stop the host and
+   reboot.
+
+Kernel debugger notes: `docs/re-notes/kd.md`. Do not set breakpoints in
+the kd poll path (`0x801b4990`); do not single step with MSR.SE on
+hardware (bug check 0x2b).
+
+### FlashEx file
+
+A module placed at `DEVKIT:\FlashEx\xbdm.xex` loads at every boot, before
+the network is available, until the file is removed. A build that stops
+the console during boot freezes every following boot until the file is
+removed. Use only `boot-guard` builds:
 
 1. Build with `OPENXBDM_FEATURES=boot-guard`.
 2. Upload `target/openxbdm.xex` to `DEVKIT:\FlashEx\xbdm.xex`.
@@ -67,10 +98,30 @@ Boot behavior of a `boot-guard` build:
 
 Recovery: if the armed boot stops, power-cycle the console. The next boot
 runs without the marker and restores the flash monitor. This requires the
-module to reach its entry point; a stop before that point, or a build
-without `boot-guard`, requires removing `DEVKIT:\FlashEx\xbdm.xex`
-without booting the module. Each deployment arms one boot; repeat steps 2
-to 4 for the next run.
+module to reach its entry point. A stop before that point, or a build
+without `boot-guard`, needs the kd host: serve a working image for the
+same path with `openxbdm-kd host --file` and reboot; its server thread
+deletes the override. Each deployment arms one boot; repeat steps 2 to 4
+for the next run.
+
+## Differential testing
+
+`openxbdm parity record` sends each line of a command list to a monitor
+and writes every reply (head, body lines, binary length and digest) as
+JSON; `openxbdm parity compare` compares two recordings and exits with
+status 1 when they differ outside the varying fields. Run the list once
+against stock XBDM (kd host stopped) and once against openxbdm (served by
+the kd host), each starting without `DEVKIT:\oxtest`:
+
+    openxbdm -H <console> parity record \
+        --commands docs/re-notes/parity/hardware-commands.txt --output stock.json
+    openxbdm -H <console> parity record \
+        --commands docs/re-notes/parity/hardware-commands.txt --output openxbdm.json
+    openxbdm parity compare \
+        --variances docs/re-notes/parity/hardware-variances.txt stock.json openxbdm.json
+
+The list holds only lines that are safe to repeat; excluded commands and
+the varying fields are described in `docs/re-notes/parity/hardware.md`.
 
 ## Buck rules
 
@@ -131,12 +182,17 @@ snapshots with `cargo insta review`. `tests/fixtures/file_io.log` holds the
 host file requests of one `xbdm.xex` load, captured with
 `openxbdm-kd host --file ... --log-file`.
 
+`openxbdm kdnet show` prints the kdnet record in flash;
+`openxbdm kdnet set --ip <host> --port 50000 [--mac AA-BB-CC-DD-EE-FF]`,
+`kdnet enable` and `kdnet disable` write it.
+
 Live checks need kdnet enabled and nothing else bound to UDP 50000. Boot
 with XBDM served from the host, then check XBDM on port 730 and the
 `file close ...: 258048 bytes served` line:
 
     openxbdm-kd host --file 'host:\Device\Flash\xbdm.xex=xbdm.xex'
 
+GDB:
 
     openxbdm-kd break
     gdb -batch -ex 'set architecture powerpc:common64' -ex 'set endian big' \

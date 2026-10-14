@@ -4,6 +4,15 @@ members = [
     "crates/xeedee",
     "crates/xeedee-cli",
     "crates/xeedee-ffi",
+    "crates/xeedee-fuse",
+]
+# xeedee-fuse wraps `fuser`, which is Linux/macOS-only (no Windows support).
+# Keep it out of the default build set so plain `cargo build`/`check` at the
+# workspace root stays cross-platform; `cargo build -p xeedee-fuse` still works.
+default-members = [
+    "crates/xeedee",
+    "crates/xeedee-cli",
+    "crates/xeedee-ffi",
 ]
 
 [workspace.package]
@@ -14,6 +23,7 @@ repository = "https://github.com/landaire/xeedee"
 
 [workspace.dependencies]
 bytes = "1.11.1"
+fuser = "0.17.0"
 futures-io = "0.3.32"
 futures-util = { version = "0.3.32", default-features = false, features = ["std", "io"] }
 jiff = "0.2.23"

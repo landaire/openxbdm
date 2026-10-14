@@ -36,6 +36,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      - name: Install libfuse3 (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+      - name: Install macfuse (macOS)
+        if: runner.os == 'macOS'
+        run: brew install macfuse
       - run: cargo build --release -p xeedee-cli --bin xeedee
 
       - name: Package (tar.gz)
@@ -88,6 +94,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+
+      - name: Install libfuse3 (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+      - name: Install macfuse (macOS)
+        if: runner.os == 'macOS'
+        run: brew install macfuse
 
       - name: Install diplomat-tool
         run: cargo install diplomat-tool --version '^0.15' --locked

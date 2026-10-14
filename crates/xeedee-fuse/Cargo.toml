@@ -1,0 +1,22 @@
+[package]
+name = "xeedee-fuse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Mount an Xbox 360 devkit's drives as a local filesystem via FUSE (Linux/macOS only)"
+publish = false
+
+[[bin]]
+name = "xeedee-fuse"
+path = "src/main.rs"
+
+[dependencies]
+xeedee = { path = "../xeedee", features = ["tokio"] }
+
+clap = { version = "4.6.1", features = ["derive"] }
+fuser = { workspace = true }
+rootcause = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

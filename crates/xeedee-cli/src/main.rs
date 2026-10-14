@@ -11,6 +11,8 @@ use indicatif::ProgressBar;
 use owo_colors::OwoColorize;
 use rootcause::prelude::*;
 use tabled::Tabled;
+use xeedee::commands::MagicBoot;
+use xeedee::commands::process::MagicBootFlags;
 
 mod ui;
 
@@ -22,6 +24,7 @@ use xeedee::commands::Breakpoint;
 use xeedee::commands::DataBreakKind;
 use xeedee::commands::DataBreakpoint;
 use xeedee::commands::DbgName;
+use xeedee::commands::Debugger;
 use xeedee::commands::Delete;
 use xeedee::commands::DirList;
 use xeedee::commands::DmVersion;
@@ -156,6 +159,37 @@ enum SortOrder {
     Desc,
 }
 
+#[derive(Parser, Debug)]
+struct MagicBootOptions {
+    /// Boot into this title path (e.g. `DEVKIT:\game.xex`).
+    #[arg(long)]
+    title: Option<String>,
+
+    /// Media directory path.
+    #[arg(long)]
+    directory: Option<String>,
+
+    /// Command line arguments to pass to the title.
+    #[arg(long)]
+    cmdline: Option<String>,
+
+    /// Block the response until the console is reachable again.
+    #[arg(long)]
+    wait: bool,
+
+    /// Force a cold reboot instead of warm.
+    #[arg(long)]
+    cold: bool,
+
+    /// Keep the current title memory intact where possible.
+    #[arg(long)]
+    warm: bool,
+
+    /// Pause execution immediately after boot so a debugger can attach.
+    #[arg(long)]
+    stop: bool,
+}
+
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Broadcast an XBDM NAP discovery probe and list all consoles that
@@ -252,7 +286,9 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
-
+    /// Boot into a title with optional parameters. Replaces the currently
+    /// loaded title and reboots into it.
+    MagicBoot(MagicBootOptions),
     /// Enumerate the console's virtual-address ranges.
     Walkmem,
 
@@ -375,6 +411,15 @@ enum Command {
         /// of encoding a PNG. Useful for formats we haven't decoded yet.
         #[arg(long)]
         raw: bool,
+    },
+
+    Debugger {
+        #[arg(short, long, default_value = "true")]
+        do_override: bool,
+        #[arg(short, long, default_value = "xeedee")]
+        name: String,
+        #[arg(short, long, default_value = "xeedee")]
+        user: String,
     },
 
     /// Drive an xbmovie-style PIX! movie capture session against the
@@ -842,6 +887,13 @@ async fn run(cli: Cli) -> Result<(), rootcause::Report<Error>> {
                 ui,
             )
             .await;
+        }
+        Command::Debugger {
+            do_override,
+            name,
+            user,
+        } => {
+            return run_debugger(&target, conn_timeout, 0, *do_override, name, user).await;
         }
         _ => {}
     }
@@ -1559,6 +1611,25 @@ where
             })
             .await?;
         }
+        Command::MagicBoot(opts) => {
+            let client = &mut client;
+            Box::pin(async move {
+                let cmd = MagicBoot {
+                    title: opts.title,
+                    directory: opts.directory,
+                    cmdline: opts.cmdline,
+                    flags: MagicBootFlags {
+                        wait: opts.wait,
+                        cold: opts.cold,
+                        warm: opts.warm,
+                        stop: opts.stop,
+                    },
+                };
+                client.run(cmd).await?;
+                Ok::<(), rootcause::Report<Error>>(())
+            })
+            .await?;
+        }
         Command::Walkmem => {
             let client = &mut client;
             Box::pin(async move {
@@ -1815,6 +1886,9 @@ where
                 Ok::<(), rootcause::Report<Error>>(())
             })
             .await?;
+        }
+        Command::Debugger { .. } => {
+            unreachable!("Debugger is handled by run_debugger before drive_connected")
         }
         Command::Screenshot { output, raw } => {
             let client = &mut client;
@@ -3033,6 +3107,87 @@ fn which_ffmpeg() -> Result<(), rootcause::Report<Error>> {
                 ),
         )
     }
+}
+
+async fn run_debugger(
+    target: &Target,
+    conn_timeout: Duration,
+    duration_secs: u64,
+    do_override: bool,
+    name: &str,
+    user: &str,
+) -> Result<(), rootcause::Report<Error>> {
+    use futures_util::io::AsyncBufReadExt as _;
+    use futures_util::io::BufReader;
+
+    let transport = connect_target_timeout(target, conn_timeout).await?;
+    let mut client = xeedee::Client::new(transport).read_banner().await?;
+
+    let cmd = Debugger {
+        do_override,
+        name: name.into(),
+        user: user.into(),
+    };
+
+    client.run(cmd).await?;
+    eprintln!(
+        "{}, {}",
+        ok_tag("subscribed"),
+        if duration_secs == 0 {
+            "Ctrl-C to stop".to_owned()
+        } else {
+            format!("stopping in {duration_secs}s")
+        }
+    );
+
+    // `notify` turns the current connection into a pure notification
+    // channel after xbdm acknowledges with a single response line;
+    // subsequent reads get async events at the server's discretion.
+    client.send_raw("notify reconnectport=0").await?;
+
+    let mut transport = client.into_inner();
+    let mut reader = BufReader::new(&mut transport);
+    let mut line = String::new();
+
+    let deadline = if duration_secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(duration_secs))
+    };
+
+    let start = std::time::Instant::now();
+    loop {
+        line.clear();
+        let read = async { reader.read_line(&mut line).await };
+        let remaining = deadline.map(|d| d.saturating_sub(start.elapsed()));
+        let result = match remaining {
+            Some(Duration::ZERO) => break,
+            Some(r) => match tokio::time::timeout(r, read).await {
+                Ok(r) => r,
+                Err(_) => break,
+            },
+            None => read.await,
+        };
+        match result {
+            Ok(0) => {
+                eprintln!("{} notification channel closed", warn_tag("eof:"));
+                break;
+            }
+            Ok(_) => {
+                let trimmed = line.trim_end_matches(['\r', '\n']);
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let ts = start.elapsed().as_millis();
+                let rendered = format!("{ts:>6}ms {trimmed}");
+                println!("{rendered}");
+            }
+            Err(e) => {
+                return Err(rootcause::Report::new(Error::from(e)));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "capture")]

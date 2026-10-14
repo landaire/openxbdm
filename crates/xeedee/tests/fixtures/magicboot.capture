@@ -1,0 +1,6 @@
+# xbdm capture v1
+S> 201- connected\r\n
+C> magicboot title="Hdd:\\Dashboards\\FSD3\\default.xex"\r\n
+S> 200- OK\r\n
+C> bye\r\n
+S> 200- bye\r\n

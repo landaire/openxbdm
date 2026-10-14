@@ -11,5 +11,11 @@ publish = false
 name = "openxbdm-server-xbox360"
 path = "src/main.rs"
 
+[features]
+# Deployment through DEVKIT:\FlashEx: a boot without the marker file
+# DEVKIT:\FlashEx\openxbdm.arm removes the override module and restarts.
+boot-guard = []
+
 [dependencies]
+openxbdm-core = { path = "../openxbdm-core" }
 openxbdm-server = { path = "../openxbdm-server" }

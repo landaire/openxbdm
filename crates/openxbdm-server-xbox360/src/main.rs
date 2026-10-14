@@ -7,494 +7,455 @@ fn main() {
 }
 
 #[cfg(target_arch = "powerpc")]
+mod backend;
+#[cfg(target_arch = "powerpc")]
+mod exports;
+#[cfg(target_arch = "powerpc")]
+mod kernel;
+#[cfg(target_arch = "powerpc")]
+mod lockfree;
+#[cfg(target_arch = "powerpc")]
+mod net;
+
+#[cfg(target_arch = "powerpc")]
 mod xbox360 {
     use core::panic::PanicInfo;
     use core::sync::atomic::AtomicBool;
     use core::sync::atomic::AtomicU32;
     use core::sync::atomic::Ordering;
 
-    use openxbdm_server::Address;
-    use openxbdm_server::BackendError;
-    use openxbdm_server::ConsoleBackend;
-    use openxbdm_server::FileSystemBackend;
-    use openxbdm_server::MemoryBackend;
-    use openxbdm_server::ProcessBackend;
-    use openxbdm_server::ProcessId;
-    use openxbdm_server::ReadableMask;
-    use openxbdm_server::ResponseSink;
-    use openxbdm_server::Service;
-    use openxbdm_server::SessionControl;
-    use openxbdm_server::TransferCount;
+    use openxbdm_server::ConnectionIndex;
+    use openxbdm_server::Server;
+    use openxbdm_server::SocketId;
+    use openxbdm_server::commands::session;
+    use openxbdm_server::network::Endpoint;
+    use openxbdm_server::network::Ipv4Address;
+    use openxbdm_server::server::MAX_CONNECTIONS;
+    use openxbdm_server::server::Owner;
 
-    const XNCALLER_XBDM: u32 = 3;
-    const AF_INET: u32 = 2;
-    const SOCK_STREAM: u32 = 1;
-    const IPPROTO_TCP: u32 = 6;
-    const INVALID_SOCKET: u32 = u32::MAX;
-    const SOCKET_ERROR: i32 = -1;
+    use crate::backend::Console;
+    use crate::kernel;
+    use crate::kernel::AnsiString;
+    use crate::kernel::ObjectAttributes;
+    use crate::net;
+    use crate::net::FdSet;
+    use crate::net::INVALID_SOCKET;
+    use crate::net::TimeVal;
+    use crate::net::XNCALLER_XBDM;
+    use crate::net::XamNetwork;
+
     const XBDM_PORT: u16 = 730;
-    const COMMAND_CAPACITY: usize = 4096;
-    const RECEIVE_CAPACITY: usize = 1024;
-    const FEATURES: &[&str] = &["DEBUGGING", "OPENXBDM"];
-    const DRIVES: &[&str] = &["HDD", "FLASH"];
+    const LISTEN_BACKLOG: i32 = 8;
+    /// Stack of the server thread; the server state lives on it.
+    const SERVER_STACK_SIZE: u32 = 128 * 1024;
+    /// `ExCreateThread` flags of stock's server thread (docs framework
+    /// notes); bit 0x400 makes it not debuggable, so its own thread
+    /// notifications never wait for it.
+    const SERVER_THREAD_FLAGS: u32 = 0x0400_04a6;
+    /// Bug check code of a panic above passive level ('OXDP').
+    const BUG_CHECK_PANIC: u32 = 0x4f58_4450;
+    /// A failed listen is retried after LISTEN_RETRY_STEPS steps of
+    /// LISTEN_RETRY_STEP_MS; each step serves queued requests.
+    const LISTEN_RETRY_STEPS: u32 = 10;
+    const LISTEN_RETRY_STEP_MS: u32 = 100;
+    /// Select timeout, which bounds the delay before a shutdown request is
+    /// seen.
+    const POLL_INTERVAL_MS: u32 = 1000;
+    /// Longest wait before a thread posted at a debug event is processed.
+    const DEBUG_EVENT_POLL_MS: u32 = 20;
+    const OVERRIDE_REMOVAL_ATTEMPTS: u32 = 30;
 
     static SHUTDOWN: AtomicBool = AtomicBool::new(false);
     static THREAD_HANDLE: AtomicU32 = AtomicU32::new(0);
     static LISTENER_SOCKET: AtomicU32 = AtomicU32::new(INVALID_SOCKET);
-    static CLIENT_SOCKET: AtomicU32 = AtomicU32::new(INVALID_SOCKET);
 
-    // System callees home r3-r10 into the caller frame at sp+0x10..sp+0x50.
-    // SysV frames do not reserve that area, so each import is called through
-    // a stub that allocates it. Stack-passed arguments are not forwarded.
-    macro_rules! import_thunk {
-        ($(#[$meta:meta])* $name:ident($($arg:ident: $argty:ty),* $(,)?) -> $ret:ty, lib = $lib:expr, ordinal = $ordinal:expr) => {
-            const _: () = assert!(<[&str]>::len(&[$(stringify!($arg)),*]) <= 8);
-
-            $(#[$meta])*
-            #[unsafe(naked)]
-            #[unsafe(no_mangle)]
-            pub extern "C" fn $name($(_: $argty),*) -> $ret {
-                core::arch::naked_asm!(
-                    "stwu 1, -0x50(1)",
-                    "mflr 0",
-                    "stw 0, 0x54(1)",
-                    "bl 2f",
-                    "lwz 0, 0x54(1)",
-                    "mtlr 0",
-                    "addi 1, 1, 0x50",
-                    "blr",
-                    ".pushsection .xthunks, \"ax\"",
-                    ".balign 4",
-                    "2:",
-                    ".long {record}",
-                    ".long 0x60000000",
-                    ".long 0x60000000",
-                    ".long 0x4e800020",
-                    ".popsection",
-                    record = const (1u32 << 24) | (($lib as u32) << 16) | ($ordinal as u32),
-                )
-            }
-        };
+    fn shutting_down() -> bool {
+        SHUTDOWN.load(Ordering::SeqCst)
     }
 
-    import_thunk!(DbgPrint(format: *const core::ffi::c_char) -> u32, lib = 0, ordinal = 3);
-    // Returns the address when the debugger may read it and null otherwise;
-    // stock XBDM guards its reads with the same export.
-    import_thunk!(DebugReadCheck(address: u32) -> u32, lib = 0, ordinal = 427);
-    import_thunk!(
-        ExCreateThread(
-            handle_out: *mut u32,
-            stack_size: u32,
-            thread_id_out: *mut u32,
-            xapi_thread_startup: u32,
-            start_address: u32,
-            start_context: u32,
-            creation_flags: u32,
-        ) -> u32,
-        lib = 0,
-        ordinal = 13
-    );
-    import_thunk!(ExTerminateThread(exit_code: u32) -> u32, lib = 0, ordinal = 25);
-    import_thunk!(KeDelayExecutionThread(mode: u32, alertable: u32, interval: *const i64) -> u32, lib = 0, ordinal = 90);
-    import_thunk!(NtClose(handle: u32) -> u32, lib = 0, ordinal = 207);
-    import_thunk!(NtDeleteFile(object_attributes: *const ObjectAttributes) -> u32, lib = 0, ordinal = 216);
-    import_thunk!(NetDll_XNetStartup(caller: u32, params: *const u8) -> i32, lib = 1, ordinal = 51);
-    import_thunk!(NetDll_WSAStartup(caller: u32, version: u32, data: *mut u8) -> i32, lib = 1, ordinal = 1);
-    import_thunk!(NetDll_socket(caller: u32, af: u32, ty: u32, protocol: u32) -> u32, lib = 1, ordinal = 3);
-    import_thunk!(NetDll_closesocket(caller: u32, socket: u32) -> i32, lib = 1, ordinal = 4);
-    import_thunk!(NetDll_bind(caller: u32, socket: u32, name: *const u8, name_len: i32) -> i32, lib = 1, ordinal = 11);
-    import_thunk!(NetDll_listen(caller: u32, socket: u32, backlog: i32) -> i32, lib = 1, ordinal = 13);
-    import_thunk!(NetDll_accept(caller: u32, socket: u32, name: *mut u8, name_len: *mut i32) -> u32, lib = 1, ordinal = 14);
-    import_thunk!(NetDll_recv(caller: u32, socket: u32, buffer: *mut u8, length: i32, flags: i32) -> i32, lib = 1, ordinal = 18);
-    import_thunk!(NetDll_send(caller: u32, socket: u32, buffer: *const u8, length: i32, flags: i32) -> i32, lib = 1, ordinal = 22);
-
-    #[repr(C)]
-    struct SockAddrIn {
-        family: u16,
-        port: u16,
-        address: u32,
-        zero: [u8; 8],
+    /// Stop the server thread after its current pass (control code 0x02).
+    pub(crate) fn request_shutdown() {
+        SHUTDOWN.store(true, Ordering::SeqCst);
     }
 
-    #[repr(C)]
-    pub(crate) struct AnsiString {
-        length: u16,
-        maximum_length: u16,
-        buffer: *const u8,
-    }
-
-    #[repr(C)]
-    pub(crate) struct ObjectAttributes {
-        root_directory: u32,
-        object_name: *const AnsiString,
-        attributes: u32,
-    }
-
-    struct Console;
-
-    impl ConsoleBackend for Console {
-        fn debug_name(&self) -> &str {
-            "openxbdm-deanxbox"
-        }
-
-        fn set_debug_name(&mut self, _name: &str) -> Result<(), BackendError> {
-            Err(BackendError::AccessDenied)
-        }
-
-        fn dm_version(&self) -> &str {
-            "2.0.21256.0"
-        }
-
-        fn console_type(&self) -> &str {
-            "DevKit"
-        }
-
-        fn console_features(&self) -> &[&str] {
-            FEATURES
-        }
-    }
-
-    impl FileSystemBackend for Console {
-        fn drives(&self) -> &[&str] {
-            DRIVES
-        }
-
-        fn delete_file(&mut self, path: &str) -> Result<(), BackendError> {
-            if !path.eq_ignore_ascii_case(OVERRIDE_MODULE_XBDM_PATH) {
-                return Err(BackendError::AccessDenied);
-            }
-            delete_override_module()
-        }
-    }
-
-    impl MemoryBackend for Console {
-        fn read_memory(&self, address: Address, output: &mut [u8]) -> Result<ReadableMask, BackendError> {
-            const PAGE_SIZE: u32 = 0x1000;
-            let mut bits = 0u64;
-            let mut checked_page = None;
-            for (index, byte) in output.iter_mut().enumerate().take(u64::BITS as usize) {
-                let Some(current) = u32::try_from(index).ok().and_then(|offset| address.get().checked_add(offset))
-                else {
-                    break;
-                };
-                let page = current & !(PAGE_SIZE - 1);
-                let readable = match checked_page {
-                    Some((checked, readable)) if checked == page => readable,
-                    _ => {
-                        let readable = DebugReadCheck(page) != 0;
-                        checked_page = Some((page, readable));
-                        readable
-                    }
-                };
-                if readable {
-                    // The kernel reported the page readable for the debugger.
-                    *byte = unsafe { core::ptr::read_volatile(current as usize as *const u8) };
-                    bits |= 1u64 << index;
-                }
-            }
-            if bits == 0 {
-                return Err(BackendError::MemoryNotMapped);
-            }
-            Ok(ReadableMask::from_bits(bits))
-        }
-
-        fn write_memory(&mut self, _address: Address, _data: &[u8]) -> Result<TransferCount, BackendError> {
-            Err(BackendError::Unavailable)
-        }
-    }
-
-    impl ProcessBackend for Console {
-        fn process_id(&self) -> ProcessId {
-            ProcessId::new(2)
-        }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Removal {
+        Removed,
+        Absent,
+        Failed,
     }
 
     // XAM loads xbdm.xex with the system-root-only flag. The kernel still
     // searches \FlashEx\ before \SystemRoot\ and accepts a module there whose
     // bounding path names that file, so this file replaces the flash XBDM
     // until it is removed.
-    const OVERRIDE_MODULE_XBDM_PATH: &str = r"DEVKIT:\FlashEx\xbdm.xex";
-    const OVERRIDE_REMOVAL_ATTEMPTS: u32 = 30;
+    const OVERRIDE_MODULE_PATH: &[u8] = br"\Device\Harddisk0\Partition1\DEVKIT\FlashEx\xbdm.xex";
 
-    fn delete_override_module() -> Result<(), BackendError> {
-        const PATH: &[u8] = br"\Device\Harddisk0\Partition1\DEVKIT\FlashEx\xbdm.xex";
-        let name = AnsiString { length: PATH.len() as u16, maximum_length: PATH.len() as u16, buffer: PATH.as_ptr() };
-        let attributes = ObjectAttributes { root_directory: 0, object_name: &name, attributes: 0x40 };
-        let status = NtDeleteFile(&attributes);
-        if status as i32 >= 0 {
-            return Ok(());
-        }
-        match status {
-            0xC000_000F | 0xC000_0034 | 0xC000_003A => Err(BackendError::NotFound),
-            0xC000_0022 => Err(BackendError::AccessDenied),
-            _ => Err(BackendError::Unavailable),
+    fn delete_file(path: &[u8]) -> Removal {
+        let name = AnsiString::new(path);
+        let attributes = ObjectAttributes {
+            root_directory: 0,
+            object_name: &name,
+            attributes: kernel::OBJ_CASE_INSENSITIVE,
+        };
+        match kernel::NtDeleteFile(&attributes) {
+            status if (status as i32) >= 0 => Removal::Removed,
+            0xC000_000F | 0xC000_0034 | 0xC000_003A => Removal::Absent,
+            _ => Removal::Failed,
         }
     }
 
-    #[derive(Clone, Copy)]
-    struct SocketError;
-
-    struct SocketSink {
-        socket: u32,
-    }
-
-    impl SocketSink {
-        fn write_status(&mut self, code: u16, message: &str) -> Result<(), SocketError> {
-            let prefix = [
-                b'0' + ((code / 100) % 10) as u8,
-                b'0' + ((code / 10) % 10) as u8,
-                b'0' + (code % 10) as u8,
-                b'-',
-                b' ',
-            ];
-            send_all(self.socket, &prefix)?;
-            send_all(self.socket, message.as_bytes())?;
-            send_all(self.socket, b"\r\n")
-        }
-    }
-
-    impl ResponseSink for SocketSink {
-        type Error = SocketError;
-
-        fn single(&mut self, code: u16, message: &str) -> Result<(), Self::Error> {
-            self.write_status(code, message)
-        }
-
-        fn multiline_start(&mut self, message: &str) -> Result<(), Self::Error> {
-            self.write_status(202, message)
-        }
-
-        fn multiline_line(&mut self, line: &str) -> Result<(), Self::Error> {
-            send_all(self.socket, line.as_bytes())?;
-            send_all(self.socket, b"\r\n")
-        }
-
-        fn multiline_end(&mut self) -> Result<(), Self::Error> {
-            self.multiline_line(".")
-        }
-    }
-
-    fn send_all(socket: u32, mut bytes: &[u8]) -> Result<(), SocketError> {
-        while !bytes.is_empty() {
-            let count = NetDll_send(XNCALLER_XBDM, socket, bytes.as_ptr(), bytes.len() as i32, 0);
-            if count <= 0 {
-                return Err(SocketError);
-            }
-            bytes = &bytes[count as usize..];
-        }
-        Ok(())
-    }
-
-    fn close_tracked_socket(socket: &AtomicU32) {
-        let handle = socket.swap(INVALID_SOCKET, Ordering::SeqCst);
-        if handle != INVALID_SOCKET {
-            NetDll_closesocket(XNCALLER_XBDM, handle);
-        }
-    }
-
-    fn serve_client(socket: u32) {
-        let mut sink = SocketSink { socket };
-        if sink.single(201, "connected to openxbdm").is_err() {
-            return;
-        }
-
-        let mut service = Service::new(Console);
-        let mut command = [0u8; COMMAND_CAPACITY];
-        let mut command_len = 0usize;
-        let mut discarding = false;
-        let mut receive = [0u8; RECEIVE_CAPACITY];
-
-        while !SHUTDOWN.load(Ordering::SeqCst) {
-            let count = NetDll_recv(XNCALLER_XBDM, socket, receive.as_mut_ptr(), receive.len() as i32, 0);
-            if count <= 0 {
-                return;
-            }
-
-            for &byte in &receive[..count as usize] {
-                if byte == b'\n' {
-                    if discarding {
-                        if sink.single(400, "command exceeds protocol limit").is_err() {
-                            return;
-                        }
-                    } else {
-                        let line_len = command_len - usize::from(command_len > 0 && command[command_len - 1] == b'\r');
-                        let Ok(line) = core::str::from_utf8(&command[..line_len]) else {
-                            if sink.single(400, "invalid command encoding").is_err() {
-                                return;
-                            }
-                            command_len = 0;
-                            continue;
-                        };
-                        let control = match service.dispatch(line, &mut sink) {
-                            Ok(control) => control,
-                            Err(_) => return,
-                        };
-                        if control == SessionControl::Disconnect {
-                            return;
-                        }
-                    }
-                    command_len = 0;
-                    discarding = false;
-                } else if !discarding {
-                    if command_len == command.len() {
-                        discarding = true;
-                    } else {
-                        command[command_len] = byte;
-                        command_len += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    fn open_listener() -> Result<u32, ()> {
-        let socket = NetDll_socket(XNCALLER_XBDM, AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if socket == INVALID_SOCKET {
-            return Err(());
-        }
-
-        let address = SockAddrIn { family: AF_INET as u16, port: XBDM_PORT, address: 0, zero: [0; 8] };
-        let bound = NetDll_bind(
-            XNCALLER_XBDM,
-            socket,
-            &address as *const SockAddrIn as *const u8,
-            core::mem::size_of::<SockAddrIn>() as i32,
-        );
-        if bound == SOCKET_ERROR || NetDll_listen(XNCALLER_XBDM, socket, 8) == SOCKET_ERROR {
-            NetDll_closesocket(XNCALLER_XBDM, socket);
-            return Err(());
-        }
-        Ok(socket)
-    }
-
-    fn initialize_network() -> Result<(), ()> {
+    fn initialize_network() -> bool {
         let mut startup = [0u8; 13];
         startup[0] = 0x0d;
         startup[1] = 0x81;
         startup[4] = 0x40;
-        if NetDll_XNetStartup(XNCALLER_XBDM, startup.as_ptr()) != 0 {
-            return Err(());
+        if net::NetDll_XNetStartup(XNCALLER_XBDM, startup.as_ptr()) != 0 {
+            return false;
         }
-
         let mut wsa_data = [0u8; 512];
-        if NetDll_WSAStartup(XNCALLER_XBDM, 2, wsa_data.as_mut_ptr()) != 0 {
-            return Err(());
-        }
-        Ok(())
+        net::NetDll_WSAStartup(XNCALLER_XBDM, 2, wsa_data.as_mut_ptr()) == 0
     }
 
-    fn sleep_one_second() {
-        let interval = -10_000_000i64;
-        KeDelayExecutionThread(1, 0, &interval);
+    fn close_listener() {
+        let socket = LISTENER_SOCKET.swap(INVALID_SOCKET, Ordering::SeqCst);
+        if socket != INVALID_SOCKET {
+            net::close(socket);
+        }
+    }
+
+    /// Service connections until the listener fails or shutdown starts.
+    /// `discovery` is the UDP socket of the name discovery responder.
+    /// Threads wait at debug events only while these passes run.
+    fn serve(
+        server: &mut Server,
+        console: &mut Console,
+        network: &mut XamNetwork,
+        listener: u32,
+        discovery: Option<u32>,
+    ) {
+        crate::backend::debugger::begin_event_service();
+        serve_passes(server, console, network, listener, discovery);
+        crate::backend::debugger::end_event_service();
+    }
+
+    fn serve_passes(
+        server: &mut Server,
+        console: &mut Console,
+        network: &mut XamNetwork,
+        listener: u32,
+        discovery: Option<u32>,
+    ) {
+        let mut timer_ms = POLL_INTERVAL_MS;
+        while !shutting_down() {
+            let mut active = [None::<(ConnectionIndex, SocketId, bool)>; MAX_CONNECTIONS];
+            for (slot, (index, socket, owner)) in server.connections().enumerate() {
+                if owner != Owner::Unserviced && !server.awaits_processor(index) {
+                    active[slot] = Some((index, socket, server.wants_write(index)));
+                }
+            }
+
+            let mut read = FdSet::new();
+            let mut write = FdSet::new();
+            read.insert(listener);
+            if let Some(discovery) = discovery {
+                read.insert(discovery);
+            }
+            for &(_, socket, wants_write) in active.iter().flatten() {
+                if wants_write {
+                    write.insert(socket.0);
+                } else {
+                    read.insert(socket.0);
+                }
+            }
+            let mut pipes = [None::<SocketId>; session::PIPE_SLOTS];
+            for (slot, socket) in pipes.iter_mut().zip(server.fast_pipe_sockets()) {
+                *slot = Some(socket);
+                read.insert(socket.0);
+            }
+            // Threads waiting at debug events are seen at the next pass.
+            let timeout =
+                TimeVal::from_milliseconds(timer_ms.min(POLL_INTERVAL_MS).min(DEBUG_EVENT_POLL_MS));
+            if net::select(&mut read, &mut write, Some(&timeout)).is_err() {
+                return;
+            }
+
+            for &(index, socket, wants_write) in active.iter().flatten() {
+                if wants_write && write.contains(socket.0) {
+                    server.on_writable(index, console, network);
+                } else if !wants_write && read.contains(socket.0) {
+                    server.on_readable(index, console, network);
+                }
+            }
+            for socket in pipes.into_iter().flatten() {
+                if read.contains(socket.0) {
+                    server.on_fast_pipe_readable(socket, console, network);
+                }
+            }
+            if let Some(discovery) = discovery
+                && read.contains(discovery)
+            {
+                answer_discovery(server, discovery);
+            }
+            timer_ms = server.poll_timers(console).unwrap_or(POLL_INTERVAL_MS);
+            crate::backend::dispatcher::drain(server, console, network);
+            crate::backend::session::poll_processor_calls(server, console, network);
+            server.poll_debug_events(console, network);
+            server.drain_posted_notifications(console, network);
+            crate::backend::performance::studio::poll();
+            crate::backend::performance::pix::poll();
+            if read.contains(listener) {
+                match net::accept(listener) {
+                    Some(socket) => {
+                        server.accept(SocketId(socket), console, network);
+                    }
+                    None => return,
+                }
+            }
+        }
+    }
+
+    fn answer_discovery(server: &Server, socket: u32) {
+        let mut request = [0u8; session::DISCOVERY_PACKET_CAPACITY];
+        let Ok((length, sender)) = net::receive_from(socket, &mut request) else {
+            return;
+        };
+        let mut reply = [0u8; session::DISCOVERY_PACKET_CAPACITY];
+        let Some(answer) = session::answer_discovery(&server.state, &request[..length], &mut reply)
+        else {
+            return;
+        };
+        let destination = match answer.destination {
+            session::DiscoveryDestination::Sender => sender,
+            session::DiscoveryDestination::Broadcast => Endpoint {
+                address: Ipv4Address([0xff; 4]),
+                port: sender.port,
+            },
+        };
+        net::send_to(socket, &reply[..answer.length], destination);
     }
 
     fn run_server() {
-        while initialize_network().is_err() {
-            if SHUTDOWN.load(Ordering::SeqCst) {
+        while !initialize_network() {
+            if shutting_down() {
                 return;
             }
-            DbgPrint(c"openxbdm: network initialization failed\n".as_ptr());
-            sleep_one_second();
+            kernel::debug_print(c"openxbdm: network initialization failed\n");
+            kernel::sleep_milliseconds(1000);
         }
 
-        while !SHUTDOWN.load(Ordering::SeqCst) {
-            let Ok(listener) = open_listener() else {
-                if SHUTDOWN.load(Ordering::SeqCst) {
-                    return;
+        // Stock initializes the studio subsystem last, once the network runs.
+        crate::backend::performance::studio::initialize();
+        let mut network = XamNetwork;
+        crate::backend::dispatcher::with_startup_host(|server, console| {
+            openxbdm_server::commands::system::load_settings(server, console, &mut network);
+            crate::backend::dvd_hotplug::install(server.state.console.trace_mask);
+        });
+        // From here on the server thread takes queued requests until it
+        // stops: in its passes, and between listen attempts.
+        let Some((server, console)) = crate::backend::dispatcher::begin_serving() else {
+            return;
+        };
+        while !shutting_down() {
+            let Ok(listener) = net::listen(XBDM_PORT, LISTEN_BACKLOG) else {
+                kernel::debug_print(c"openxbdm: listen failed\n");
+                for _ in 0..LISTEN_RETRY_STEPS {
+                    if shutting_down() {
+                        break;
+                    }
+                    crate::backend::dispatcher::drain(server, console, &mut network);
+                    kernel::sleep_milliseconds(LISTEN_RETRY_STEP_MS);
                 }
-                DbgPrint(c"openxbdm: listen failed\n".as_ptr());
-                sleep_one_second();
                 continue;
             };
             LISTENER_SOCKET.store(listener, Ordering::SeqCst);
-            if SHUTDOWN.load(Ordering::SeqCst) {
-                close_tracked_socket(&LISTENER_SOCKET);
-                return;
+            if shutting_down() {
+                break;
             }
-            DbgPrint(c"openxbdm: listening on TCP port 730\n".as_ptr());
-
-            while !SHUTDOWN.load(Ordering::SeqCst) {
-                let client = NetDll_accept(XNCALLER_XBDM, listener, core::ptr::null_mut(), core::ptr::null_mut());
-                if client == INVALID_SOCKET {
-                    break;
-                }
-                CLIENT_SOCKET.store(client, Ordering::SeqCst);
-                if SHUTDOWN.load(Ordering::SeqCst) {
-                    close_tracked_socket(&CLIENT_SOCKET);
-                    break;
-                }
-                serve_client(client);
-                close_tracked_socket(&CLIENT_SOCKET);
+            kernel::debug_print(c"openxbdm: listening on TCP port 730\n");
+            let discovery = net::bind_datagram(XBDM_PORT).ok();
+            serve(server, console, &mut network, listener, discovery);
+            if let Some(discovery) = discovery {
+                net::close(discovery);
             }
-
-            close_tracked_socket(&LISTENER_SOCKET);
-            if !SHUTDOWN.load(Ordering::SeqCst) {
-                sleep_one_second();
-            }
+            close_listener();
         }
+        close_listener();
+        server.shut_down();
+        let mut open = [None::<ConnectionIndex>; MAX_CONNECTIONS];
+        for (slot, (index, _, _)) in server.connections().enumerate() {
+            open[slot] = Some(index);
+        }
+        for index in open.into_iter().flatten() {
+            server.close(index, &mut network);
+        }
+        // Processor threads run this module's code.
+        crate::backend::session::release_processor_threads(console);
+    }
+
+    /// Remove the override, retrying while the file system is not ready.
+    fn remove_override_module() -> Removal {
+        let mut removal = delete_file(OVERRIDE_MODULE_PATH);
+        for _ in 1..OVERRIDE_REMOVAL_ATTEMPTS {
+            if removal != Removal::Failed || shutting_down() {
+                break;
+            }
+            kernel::sleep_milliseconds(1000);
+            removal = delete_file(OVERRIDE_MODULE_PATH);
+        }
+        kernel::debug_print(match removal {
+            Removal::Removed => c"openxbdm: removed FlashEx override module\n",
+            Removal::Absent => c"openxbdm: FlashEx override module is absent\n",
+            Removal::Failed => c"openxbdm: failed to remove FlashEx override module\n",
+        });
+        removal
     }
 
     extern "C" fn server_thread(_context: u32) -> u32 {
-        // A boot-time attempt left the file in place while a later delete
-        // command removed it, so removal is retried before the listener starts.
-        let mut removal = delete_override_module();
-        for _ in 1..OVERRIDE_REMOVAL_ATTEMPTS {
-            if matches!(removal, Ok(()) | Err(BackendError::NotFound)) || SHUTDOWN.load(Ordering::SeqCst) {
-                break;
-            }
-            sleep_one_second();
-            removal = delete_override_module();
-        }
-        match removal {
-            Ok(()) => DbgPrint(c"openxbdm: removed FlashEx override module\n".as_ptr()),
-            Err(BackendError::NotFound) => DbgPrint(c"openxbdm: FlashEx override module is absent\n".as_ptr()),
-            Err(_) => DbgPrint(c"openxbdm: failed to remove FlashEx override module\n".as_ptr()),
-        };
-        if !SHUTDOWN.load(Ordering::SeqCst) {
+        // Recorded first: debug prints and calls from this thread must
+        // never wait for the server.
+        crate::backend::debugger::set_server_thread();
+        crate::backend::dispatcher::create_host();
+        remove_override_module();
+        if !shutting_down() {
             run_server();
         }
-        ExTerminateThread(0);
+        stop_server_services();
+        kernel::ExTerminateThread(0);
         loop {
             core::hint::spin_loop();
         }
     }
 
+    /// Later calls and events take their default without waiting.
+    fn stop_server_services() {
+        crate::backend::dispatcher::stop_serving();
+        crate::backend::debugger::end_event_service();
+    }
+
+    /// Module entry point named by the linker script. The loader calls it
+    /// with the console ABI, so it runs `module_entry` behind the bridge.
     #[unsafe(no_mangle)]
-    pub extern "C" fn _start(_module: u32, reason: u32, _reserved: u32) -> u32 {
+    #[unsafe(naked)]
+    pub unsafe extern "C" fn _start() {
+        core::arch::naked_asm!(
+            "lis 12, {target}@ha",
+            "addi 12, 12, {target}@l",
+            "b {bridge}",
+            target = sym module_entry,
+            bridge = sym crate::exports::module_bridge,
+        )
+    }
+
+    extern "C" fn module_entry(module: u32, reason: u32, _reserved: u32) -> u32 {
         match reason {
             0 => {
                 SHUTDOWN.store(true, Ordering::SeqCst);
-                close_tracked_socket(&CLIENT_SOCKET);
-                close_tracked_socket(&LISTENER_SOCKET);
+                close_listener();
                 let handle = THREAD_HANDLE.swap(0, Ordering::SeqCst);
                 if handle != 0 {
-                    NtClose(handle);
+                    // Commands on the server thread can arm engine hooks,
+                    // so the engines stop only after it has exited.
+                    kernel::NtWaitForSingleObjectEx(handle, 0, 0, core::ptr::null());
+                    kernel::NtClose(handle);
                 }
+                stop_server_services();
+                crate::backend::debugger::uninstall();
+                crate::backend::session::uninstall();
+                crate::backend::performance::shut_down();
+                crate::backend::dispatcher::wait_for_callers();
+                crate::backend::debugger::wait_for_event_waiters();
                 1
             }
             1 => {
-                SHUTDOWN.store(false, Ordering::SeqCst);
-                let mut handle = 0u32;
-                let entry = server_thread as *const () as usize as u32;
-                let status = ExCreateThread(&mut handle, 64 * 1024, core::ptr::null_mut(), 0, entry, 0, 0);
-                if status as i32 >= 0 {
-                    THREAD_HANDLE.store(handle, Ordering::SeqCst);
-                    DbgPrint(c"openxbdm: server thread started\n".as_ptr());
-                    1
-                } else {
-                    DbgPrint(c"openxbdm: server thread creation failed\n".as_ptr());
-                    0
+                // The recovery installs nothing, refuses every export, and
+                // never waits on the loader thread.
+                #[cfg(feature = "boot-guard")]
+                if delete_file(BOOT_MARKER_PATH) != Removal::Removed {
+                    crate::exports::RECOVERY.store(1, Ordering::SeqCst);
+                    return start_thread(recovery_thread).map_or(0, |()| 1);
                 }
+                crate::backend::dispatcher::initialize_host();
+                if !kernel::register_debug_monitor(module) {
+                    kernel::debug_print(c"openxbdm: debug monitor registration failed\n");
+                    return 0;
+                }
+                crate::backend::debugger::install();
+                crate::backend::network::xhttpproxy::initialize();
+                crate::backend::session::initialize();
+                crate::backend::hardware::initialize();
+                crate::backend::dispatcher::install();
+                crate::backend::performance::initialize();
+                crate::backend::memory::initialize();
+                // The hooks above point into the image, so it stays loaded
+                // without a server; calls and events take their defaults.
+                if start_thread(server_thread).is_err() {
+                    stop_server_services();
+                }
+                1
             }
             _ => 1,
         }
     }
 
+    struct ThreadCreationFailed;
+
+    fn start_thread(entry: extern "C" fn(u32) -> u32) -> Result<(), ThreadCreationFailed> {
+        SHUTDOWN.store(false, Ordering::SeqCst);
+        let mut handle = 0u32;
+        let entry = entry as *const () as usize as u32;
+        let status = kernel::ExCreateThread(
+            &mut handle,
+            SERVER_STACK_SIZE,
+            core::ptr::null_mut(),
+            0,
+            entry,
+            0,
+            SERVER_THREAD_FLAGS,
+        );
+        if (status as i32) < 0 {
+            kernel::debug_print(c"openxbdm: server thread creation failed\n");
+            return Err(ThreadCreationFailed);
+        }
+        THREAD_HANDLE.store(handle, Ordering::SeqCst);
+        kernel::debug_print(c"openxbdm: server thread started\n");
+        Ok(())
+    }
+
+    /// Boot without the marker after a deployment: the previous boot of this
+    /// build armed the monitor and did not remove the override, so remove it
+    /// and restart into the flash monitor without installing any hook.
+    #[cfg(feature = "boot-guard")]
+    extern "C" fn recovery_thread(_context: u32) -> u32 {
+        kernel::debug_print(c"openxbdm: boot marker absent, restoring the flash monitor\n");
+        if remove_override_module() != Removal::Failed {
+            kernel::HalReturnToFirmware(kernel::FIRMWARE_REBOOT);
+        }
+        kernel::ExTerminateThread(0);
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    #[cfg(feature = "boot-guard")]
+    const BOOT_MARKER_PATH: &[u8] = br"\Device\Harddisk0\Partition1\DEVKIT\FlashEx\openxbdm.arm";
+
+    /// Above passive level nothing may wait, so the console stops with a
+    /// bug check. The server thread releases every waiter and exits; other
+    /// threads break into the debugger and then stay parked.
     #[panic_handler]
     fn panic(_info: &PanicInfo<'_>) -> ! {
-        DbgPrint(c"openxbdm: panic\n".as_ptr());
+        if kernel::current_irql() != 0 {
+            kernel::KeBugCheckEx(BUG_CHECK_PANIC, 0, 0, 0, 0);
+        }
+        kernel::debug_print(c"openxbdm: panic\n");
+        if kernel::current_thread() == crate::backend::debugger::server_thread() {
+            stop_server_services();
+            kernel::ExTerminateThread(0);
+        }
+        kernel::DbgBreakPoint();
         loop {
-            sleep_one_second();
+            kernel::sleep_milliseconds(1000);
         }
     }
 }

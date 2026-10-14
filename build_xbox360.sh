@@ -21,12 +21,16 @@ mkdir -p "$(dirname -- "$output")"
         --target "$target" \
         -Zbuild-std=core,compiler_builtins \
         -Zbuild-std-features=compiler-builtins-mem \
-        -Zjson-target-spec
+        -Zjson-target-spec \
+        --features "${OPENXBDM_FEATURES:-}"
 )
 
 elf="$root/target/powerpc-unknown-xbox360/xbox360/openxbdm-server-xbox360"
+# Run from the toolchain so this repository's vendored-source
+# configuration does not apply to xex-link.
+cd "$toolchain"
 cargo run --quiet \
-    --manifest-path "$toolchain/Cargo.toml" \
+    --manifest-path Cargo.toml \
     -p xex-link -- \
     "$elf" "$output" \
     --load-address 0x91f00000 \
@@ -37,5 +41,7 @@ cargo run --quiet \
     --image-flags SMALL_PAGES \
     --bounding-path '\Device\Harddisk0\Partition1\DEVKIT\FlashEx\xbdm.xex' \
     --module-flags EXPORTS_TO_TITLE,SYSTEM_DEBUGGER,DLL \
+    --export-module xbdm.xex \
+    --export-min-version 2.0.1861.0 \
     --compress \
     --encrypt devkit

@@ -1,0 +1,306 @@
+//! `netsim` services: the network simulator on the Ethernet intercept.
+
+mod engine;
+mod filter;
+mod frame;
+mod pipeline;
+
+use core::ptr::NonNull;
+use core::ptr::null_mut;
+use core::sync::atomic::AtomicPtr;
+use core::sync::atomic::Ordering;
+
+use openxbdm_core::status::Hresult;
+use openxbdm_server::commands::network::netsim;
+use openxbdm_server::commands::network::netsim::Direction;
+use openxbdm_server::commands::network::netsim::KeyStatus;
+use openxbdm_server::commands::network::netsim::Program;
+use openxbdm_server::commands::network::netsim::QueueConfig;
+use openxbdm_server::commands::network::netsim::QueueIndex;
+use openxbdm_server::commands::network::netsim::QueueKind;
+use openxbdm_server::commands::network::netsim::QueueSnapshot;
+use openxbdm_server::commands::network::netsim::QueueStats;
+use openxbdm_server::commands::network::netsim::RedirectConfig;
+use openxbdm_server::commands::network::netsim::RedirectIndex;
+use openxbdm_server::commands::network::netsim::RedirectSnapshot;
+use openxbdm_server::commands::network::netsim::WSAEALREADY;
+use openxbdm_server::commands::network::netsim::status;
+
+use self::engine::Instance;
+use super::FrameHook;
+use super::NetDll_XnpEthernetInterceptSetCallbacks;
+use super::XNCALLER_SYSAPP;
+use crate::backend::Console;
+use crate::kernel::LIB_KERNEL;
+use crate::kernel::LIB_XAM;
+use crate::kernel::import_thunk;
+
+/// Intercept flags of the simulator registration; a capture registers with
+/// none.
+const INTERCEPT_FLAGS: u32 = 2;
+
+use crate::kernel::KeCancelTimer;
+use crate::kernel::KeInitializeDpc;
+use crate::kernel::KeInitializeTimerEx;
+use crate::kernel::KeRemoveQueueDpc;
+use crate::kernel::KeSetTimerEx;
+import_thunk!(
+    XeCryptRandom(buffer: *mut u8, length: u32) -> u32,
+    lib = LIB_KERNEL,
+    ordinal = 0x18a
+);
+import_thunk!(
+    XeKeysGetStatus(status: *mut u32) -> u32,
+    lib = LIB_KERNEL,
+    ordinal = 0x23f
+);
+import_thunk!(
+    NetDll_XnpEthernetInterceptXmit(caller: u32, frame: *mut u8, length: u32) -> u32,
+    lib = LIB_XAM,
+    ordinal = 0x6e
+);
+import_thunk!(
+    NetDll_XnpEthernetInterceptRecv(caller: u32, frame: *mut u8, length: u32) -> u32,
+    lib = LIB_XAM,
+    ordinal = 0x6f
+);
+
+/// `KeSetTimerEx(timer, due, 0, dpc)`. The console takes the due time in one
+/// 64-bit register; this joins the two halves the 32-bit ABI passes.
+#[unsafe(naked)]
+extern "C" fn set_timer(timer: *mut u8, due_high: u32, due_low: u32, dpc: *mut u8) -> u32 {
+    core::arch::naked_asm!(
+        // rldimi 5, 4, 32, 0: the high half into the upper word of r5.
+        ".long 0x7885000e",
+        "mr 4, 5",
+        "li 5, 0",
+        "b {set}",
+        set = sym KeSetTimerEx,
+    )
+}
+
+/// Pool blocks of the library (stock allocator 0x91f36460: tag `DMNS`,
+/// pool type 2).
+mod memory {
+    use crate::kernel;
+
+    const TAG: u32 = 0x444d_4e53;
+    const POOL_TYPE: u32 = 2;
+
+    pub(super) fn allocate(size: usize) -> Option<*mut u8> {
+        let address = kernel::ExAllocatePoolTypeWithTag(u32::try_from(size).ok()?, TAG, POOL_TYPE);
+        (address != 0).then_some(address as usize as *mut u8)
+    }
+
+    pub(super) fn free(block: *mut u8) {
+        kernel::ExFreePool(block as usize as u32);
+    }
+}
+
+/// An intercept result as a library result: positive errors become
+/// `HRESULT_FROM_WIN32`. Only the simulator's own registration turns
+/// `WSAEALREADY` into 0x82da0010.
+fn registration_error(error: i32, own_registration: bool) -> Hresult {
+    if own_registration && error as u32 == WSAEALREADY {
+        status::INTERCEPT_BUSY
+    } else if error > 0 {
+        Hresult(0x8007_0000 | (error as u32 & 0xffff))
+    } else {
+        Hresult(error as u32)
+    }
+}
+
+/// The instance (0x91f9fc84). The exports read it on caller threads,
+/// unsynchronized with its creation and destruction, as stock does.
+static INSTANCE: AtomicPtr<Instance> = AtomicPtr::new(null_mut());
+
+fn instance() -> Result<&'static Instance, Hresult> {
+    // SAFETY: the instance stays allocated until `destroy_simulator`.
+    NonNull::new(INSTANCE.load(Ordering::Acquire))
+        .map(|instance| unsafe { &*instance.as_ptr() })
+        .ok_or(status::NO_INSTANCE)
+}
+
+/// Whether the instance exists.
+pub(crate) fn simulator_exists() -> bool {
+    instance().is_ok()
+}
+
+/// Forward frames to a capture's callbacks, or stop forwarding; `false`
+/// when there is no instance to chain into (0x91f8d428).
+pub(crate) fn chain_capture(hook: Option<FrameHook>) -> bool {
+    let Ok(instance) = instance() else {
+        return false;
+    };
+    instance.chain(hook, false);
+    true
+}
+
+/// Let frames bypass the simulation while the IP proxy runs (0x91f8d3d8).
+pub(crate) fn set_proxy_bypass(active: bool) {
+    if let Ok(instance) = instance() {
+        instance.set_bypass(active);
+    }
+}
+
+/// Queue counts of the instance, zero without one (0x91f37028 through
+/// 0x91f8d4f8).
+pub(crate) fn queue_counts() -> (u32, u32) {
+    instance().map_or((0, 0), |instance| {
+        (
+            instance.queue_count(Direction::Inbound),
+            instance.queue_count(Direction::Outbound),
+        )
+    })
+}
+
+/// Redirect count of the instance, zero without one (0x91f8da78).
+pub(crate) fn redirect_count() -> u32 {
+    instance().map_or(0, Instance::redirect_count)
+}
+
+/// Counters of a queue (0x91f8d558).
+pub(crate) fn queue_stats(direction: Direction, index: QueueIndex) -> Result<QueueStats, Hresult> {
+    instance()?.queue_stats(direction, index.0)
+}
+
+/// Type and stored settings of a queue (0x91f8d620).
+pub(crate) fn queue(direction: Direction, index: QueueIndex) -> Result<QueueSnapshot, Hresult> {
+    instance()?.queue(direction, index.0)
+}
+
+impl netsim::Backend for Console {
+    fn simulator_exists(&mut self) -> bool {
+        instance().is_ok()
+    }
+
+    /// 0x91f365e8. A running capture moves from its own intercept into the
+    /// instance; a failed registration leaves it detached, as stock does.
+    fn create_simulator(&mut self) -> Result<(), Hresult> {
+        if instance().is_ok() {
+            return Err(status::INSTANCE_EXISTS);
+        }
+        let pointer = Instance::create()?;
+        // SAFETY: just created and owned here.
+        let instance = unsafe { pointer.as_ref() };
+        if self.network.ipproxy.is_started() {
+            instance.set_bypass(true);
+        }
+        if let Some(hook) = self.network.netcap.hook() {
+            instance.chain(Some(hook), false);
+            let error = NetDll_XnpEthernetInterceptSetCallbacks(XNCALLER_SYSAPP, 0, 0, 0, 0);
+            if error != 0 {
+                Instance::destroy(pointer.as_ptr());
+                return Err(registration_error(error, false));
+            }
+        }
+        let error = NetDll_XnpEthernetInterceptSetCallbacks(
+            XNCALLER_SYSAPP,
+            engine::transmit_entry as *const () as usize,
+            engine::receive_entry as *const () as usize,
+            instance.context(),
+            INTERCEPT_FLAGS,
+        );
+        if error != 0 {
+            Instance::destroy(pointer.as_ptr());
+            return Err(registration_error(error, true));
+        }
+        INSTANCE.store(pointer.as_ptr(), Ordering::Release);
+        Ok(())
+    }
+
+    /// 0x91f36750.
+    fn destroy_simulator(&mut self) -> Result<(), Hresult> {
+        let pointer = NonNull::new(INSTANCE.swap(null_mut(), Ordering::AcqRel))
+            .ok_or(status::INSTANCE_CHANGED)?;
+        NetDll_XnpEthernetInterceptSetCallbacks(XNCALLER_SYSAPP, 0, 0, 0, INTERCEPT_FLAGS);
+        if let Some(hook) = self.network.netcap.hook() {
+            NetDll_XnpEthernetInterceptSetCallbacks(
+                XNCALLER_SYSAPP,
+                super::netcap::transmit_entry as *const () as usize,
+                super::netcap::receive_entry as *const () as usize,
+                hook.context,
+                0,
+            );
+        }
+        Instance::destroy(pointer.as_ptr());
+        Ok(())
+    }
+
+    fn queue_count(&mut self, direction: Direction) -> u32 {
+        instance().map_or(0, |instance| instance.queue_count(direction))
+    }
+
+    fn redirect_count(&mut self) -> u32 {
+        redirect_count()
+    }
+
+    fn insert_queue(
+        &mut self,
+        direction: Direction,
+        position: Option<QueueIndex>,
+        kind: QueueKind,
+        update: &QueueConfig,
+        program: Option<&Program>,
+    ) -> Result<QueueIndex, Hresult> {
+        let position = position.map(|QueueIndex(index)| index);
+        instance()?
+            .insert_queue(direction, position, kind, update, program)
+            .map(QueueIndex)
+    }
+
+    fn modify_queue(
+        &mut self,
+        direction: Direction,
+        index: QueueIndex,
+        update: &QueueConfig,
+    ) -> Result<(), Hresult> {
+        instance()?.modify_queue(direction, index.0, update)
+    }
+
+    fn remove_queues(
+        &mut self,
+        direction: Direction,
+        position: Option<QueueIndex>,
+    ) -> Result<u32, Hresult> {
+        instance()?.remove_queues(direction, position.map(|QueueIndex(index)| index))
+    }
+
+    fn queue_stats(
+        &mut self,
+        direction: Direction,
+        index: QueueIndex,
+    ) -> Result<QueueStats, Hresult> {
+        queue_stats(direction, index)
+    }
+
+    fn queue(&mut self, direction: Direction, index: QueueIndex) -> Result<QueueSnapshot, Hresult> {
+        queue(direction, index)
+    }
+
+    fn insert_redirect(
+        &mut self,
+        position: Option<RedirectIndex>,
+        redirect: &RedirectConfig,
+        program: Option<&Program>,
+    ) -> Result<RedirectIndex, Hresult> {
+        let position = position.map(|RedirectIndex(index)| index);
+        instance()?
+            .insert_redirect(position, redirect, program)
+            .map(RedirectIndex)
+    }
+
+    fn remove_redirects(&mut self, position: Option<RedirectIndex>) -> Result<u32, Hresult> {
+        instance()?.remove_redirects(position.map(|RedirectIndex(index)| index))
+    }
+
+    fn redirect(&mut self, index: RedirectIndex) -> Option<RedirectSnapshot> {
+        instance().ok()?.redirect(index.0)
+    }
+
+    fn key_status(&mut self) -> KeyStatus {
+        let mut value = 0u32;
+        XeKeysGetStatus(&mut value);
+        KeyStatus(value)
+    }
+}

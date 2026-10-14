@@ -3,11 +3,11 @@
 /flash_old
 /nand.bin
 /xbdm.xex
-/xeedee-capture
+/openxbdm-capture
 /screenshot.png
 
 # diplomat-generated C++ headers; regenerated in CI and at release time.
-/crates/xeedee-ffi/bindings/
+/crates/openxbdm-ffi/bindings/
 
 # insta snapshot pending-review files (stay local until accepted/rejected).
 *.pending-snap

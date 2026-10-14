@@ -1,0 +1,10 @@
+[package]
+name = "openxbdm-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Allocation-free XBDM server request dispatch"
+
+[lib]
+path = "src/lib.rs"

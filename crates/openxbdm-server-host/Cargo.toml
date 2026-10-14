@@ -1,0 +1,19 @@
+[package]
+name = "openxbdm-server-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Host XBDM server backed by deterministic mocks"
+publish = false
+
+[[bin]]
+name = "openxbdm-server"
+path = "src/main.rs"
+
+[dependencies]
+openxbdm-server = { path = "../openxbdm-server" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "net", "rt", "time"] }
+openxbdm-client = { path = "../openxbdm-client" }

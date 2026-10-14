@@ -876,6 +876,80 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "openxbdm-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "futures-io",
+ "futures-util",
+ "image",
+ "indicatif",
+ "jiff",
+ "openxbdm-client",
+ "owo-colors",
+ "powerpc",
+ "rootcause",
+ "tabled",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "xex2",
+]
+
+[[package]]
+name = "openxbdm-client"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "futures-io",
+ "futures-util",
+ "insta",
+ "jiff",
+ "memchr",
+ "powerpc",
+ "rootcause",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "winnow 1.0.1",
+]
+
+[[package]]
+name = "openxbdm-ffi"
+version = "0.1.0"
+dependencies = [
+ "diplomat",
+ "diplomat-runtime",
+ "openxbdm-client",
+ "rootcause",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "openxbdm-server"
+version = "0.1.0"
+
+[[package]]
+name = "openxbdm-server-host"
+version = "0.1.0"
+dependencies = [
+ "openxbdm-client",
+ "openxbdm-server",
+ "tokio",
+]
+
+[[package]]
+name = "openxbdm-server-xbox360"
+version = "0.1.0"
+dependencies = [
+ "openxbdm-server",
+]
+
+[[package]]
 name = "owo-colors"
 version = "4.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1933,60 +2007,6 @@ dependencies = [
  "rsa",
  "sha1",
  "thiserror 1.0.69",
-]
-
-[[package]]
-name = "xeedee"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "futures",
- "futures-io",
- "futures-util",
- "insta",
- "jiff",
- "memchr",
- "powerpc",
- "rootcause",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "winnow 1.0.1",
-]
-
-[[package]]
-name = "xeedee-cli"
-version = "0.1.0"
-dependencies = [
- "clap",
- "futures-io",
- "futures-util",
- "image",
- "indicatif",
- "jiff",
- "owo-colors",
- "powerpc",
- "rootcause",
- "tabled",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "xeedee",
- "xex2",
-]
-
-[[package]]
-name = "xeedee-ffi"
-version = "0.1.0"
-dependencies = [
- "diplomat",
- "diplomat-runtime",
- "rootcause",
- "tokio",
- "tokio-util",
- "xeedee",
 ]
 
 [[package]]

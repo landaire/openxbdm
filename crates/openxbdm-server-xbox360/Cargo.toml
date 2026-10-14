@@ -1,0 +1,15 @@
+[package]
+name = "openxbdm-server-xbox360"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Xbox 360 system debugger module"
+publish = false
+
+[[bin]]
+name = "openxbdm-server-xbox360"
+path = "src/main.rs"
+
+[dependencies]
+openxbdm-server = { path = "../openxbdm-server" }

@@ -1,0 +1,19 @@
+[package]
+name = "openxbdm-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "C/C++ FFI bindings for the `openxbdm-client` wire-protocol surface via diplomat"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+openxbdm-client = { path = "../openxbdm-client", default-features = false, features = ["tokio", "jiff"] }
+diplomat = "0.15"
+diplomat-runtime = "0.15"
+rootcause = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt", "time", "io-util", "macros"] }
+tokio-util = { workspace = true }

@@ -18,25 +18,25 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            bin: xeedee
+            bin: openxbdm
             archive: tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
-            bin: xeedee
+            bin: openxbdm
             archive: tar.gz
           - os: macos-13
             target: x86_64-apple-darwin
-            bin: xeedee
+            bin: openxbdm
             archive: tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            bin: xeedee.exe
+            bin: openxbdm.exe
             archive: zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release -p xeedee-cli --bin xeedee
+      - run: cargo build --release -p openxbdm-cli --bin openxbdm
 
       - name: Package (tar.gz)
         if: matrix.archive == 'tar.gz'
@@ -45,7 +45,7 @@ jobs:
           mkdir dist
           cp target/release/${{ matrix.bin }} dist/
           cp README.md LICENSE-APACHE LICENSE-MIT dist/ 2>/dev/null || true
-          tar -C dist -czf xeedee-${{ matrix.target }}.tar.gz .
+          tar -C dist -czf openxbdm-${{ matrix.target }}.tar.gz .
 
       - name: Package (zip)
         if: matrix.archive == 'zip'
@@ -54,14 +54,14 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target/release/${{ matrix.bin }} dist/
           Copy-Item README.md dist/ -ErrorAction SilentlyContinue
-          Compress-Archive -Path dist/* -DestinationPath xeedee-${{ matrix.target }}.zip
+          Compress-Archive -Path dist/* -DestinationPath openxbdm-${{ matrix.target }}.zip
 
       - uses: actions/upload-artifact@v4
         with:
           name: cli-${{ matrix.target }}
           path: |
-            xeedee-${{ matrix.target }}.tar.gz
-            xeedee-${{ matrix.target }}.zip
+            openxbdm-${{ matrix.target }}.tar.gz
+            openxbdm-${{ matrix.target }}.zip
 
   build-ffi:
     strategy:
@@ -70,20 +70,20 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            cdylib: libxeedee_ffi.so
-            staticlib: libxeedee_ffi.a
+            cdylib: libopenxbdm_ffi.so
+            staticlib: libopenxbdm_ffi.a
           - os: macos-latest
             target: aarch64-apple-darwin
-            cdylib: libxeedee_ffi.dylib
-            staticlib: libxeedee_ffi.a
+            cdylib: libopenxbdm_ffi.dylib
+            staticlib: libopenxbdm_ffi.a
           - os: macos-13
             target: x86_64-apple-darwin
-            cdylib: libxeedee_ffi.dylib
-            staticlib: libxeedee_ffi.a
+            cdylib: libopenxbdm_ffi.dylib
+            staticlib: libopenxbdm_ffi.a
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            cdylib: xeedee_ffi.dll
-            staticlib: xeedee_ffi.lib
+            cdylib: openxbdm_ffi.dll
+            staticlib: openxbdm_ffi.lib
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -92,12 +92,12 @@ jobs:
       - name: Install diplomat-tool
         run: cargo install diplomat-tool --version '^0.15' --locked
 
-      - name: Build xeedee-ffi (release)
-        run: cargo build --release -p xeedee-ffi
+      - name: Build openxbdm-ffi (release)
+        run: cargo build --release -p openxbdm-ffi
 
       - name: Generate C++ bindings
         shell: bash
-        run: diplomat-tool cpp crates/xeedee-ffi/bindings/cpp --entry crates/xeedee-ffi/src/lib.rs
+        run: diplomat-tool cpp crates/openxbdm-ffi/bindings/cpp --entry crates/openxbdm-ffi/src/lib.rs
 
       - name: Stage artifacts
         shell: bash
@@ -105,25 +105,25 @@ jobs:
           mkdir -p dist/lib dist/include
           cp target/release/${{ matrix.cdylib }} dist/lib/
           cp target/release/${{ matrix.staticlib }} dist/lib/
-          cp -r crates/xeedee-ffi/bindings/cpp/* dist/include/
+          cp -r crates/openxbdm-ffi/bindings/cpp/* dist/include/
           cp README.md dist/ 2>/dev/null || true
 
       - name: Package (tar.gz)
         if: runner.os != 'Windows'
         shell: bash
-        run: tar -C dist -czf xeedee-ffi-${{ matrix.target }}.tar.gz .
+        run: tar -C dist -czf openxbdm-ffi-${{ matrix.target }}.tar.gz .
 
       - name: Package (zip)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -Path dist/* -DestinationPath xeedee-ffi-${{ matrix.target }}.zip
+        run: Compress-Archive -Path dist/* -DestinationPath openxbdm-ffi-${{ matrix.target }}.zip
 
       - uses: actions/upload-artifact@v4
         with:
           name: ffi-${{ matrix.target }}
           path: |
-            xeedee-ffi-${{ matrix.target }}.tar.gz
-            xeedee-ffi-${{ matrix.target }}.zip
+            openxbdm-ffi-${{ matrix.target }}.tar.gz
+            openxbdm-ffi-${{ matrix.target }}.zip
 
   publish:
     needs: [build-cli, build-ffi]

@@ -42,6 +42,6 @@ jobs:
       - name: Install diplomat-tool
         run: cargo install diplomat-tool --version '^0.15' --locked
       - name: Build FFI (cdylib + staticlib)
-        run: cargo build -p xeedee-ffi --release
+        run: cargo build -p openxbdm-ffi --release
       - name: Generate C++ bindings
-        run: diplomat-tool cpp crates/xeedee-ffi/bindings/cpp --entry crates/xeedee-ffi/src/lib.rs
+        run: diplomat-tool cpp crates/openxbdm-ffi/bindings/cpp --entry crates/openxbdm-ffi/src/lib.rs

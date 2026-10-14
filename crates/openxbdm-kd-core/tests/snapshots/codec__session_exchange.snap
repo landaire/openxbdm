@@ -1,0 +1,12 @@
+---
+source: crates/openxbdm-kd-core/tests/codec.rs
+expression: out
+---
+state change: reply [69, 69, 69, 69, 04, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00]
+repeat: Duplicate(PacketId(0x00000000))
+reset: [69, 69, 69, 69, 06, 00, 00, 00, 00, 00, 00, 80, 00, 00, 00, 00]
+request: [30, 30, 30, 30, 02, 00, 38, 00, 00, 00, 00, 80, 77, 00, 00, 00]
+second send: Outstanding { outstanding: PacketId(0x80000000) }
+resend: ResendRequested retransmit true
+acknowledge: Acknowledged(PacketId(0x80000000)) outstanding None
+reply id PacketId(0x00000002)

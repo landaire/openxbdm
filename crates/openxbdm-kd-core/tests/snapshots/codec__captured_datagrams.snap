@@ -1,0 +1,186 @@
+---
+source: crates/openxbdm-kd-core/tests/codec.rs
+expression: out
+---
+Beacon(
+    Beacon {
+        unidentified: 0,
+        host_address: 192.168.1.74,
+    },
+)
+PacketHeader {
+    leader: 808464432,
+    packet_type: StateChange,
+    byte_count: 253,
+    id: PacketId(0x00000000),
+    checksum: Checksum(0x0000324e),
+}
+StateChange(
+    StateChange {
+        new_state: LoadSymbols,
+        processor_level: 0,
+        processor: Processor(
+            0,
+        ),
+        number_processors: 1,
+        thread: 18446744071564362496,
+        program_counter: 18446744071562786216,
+        body: LoadSymbols(
+            LoadSymbols {
+                path_name_length: 13,
+                base: 18446744071562330112,
+                process_id: 4294967295,
+                checksum: 1862603,
+                size_of_image: 2359296,
+                unload: false,
+            },
+        ),
+        control_report: ControlReport {
+            instruction_count: 16,
+            instruction_stream: [
+                15,
+                224,
+                0,
+                23,
+                78,
+                128,
+                0,
+                32,
+                15,
+                224,
+                0,
+                24,
+                78,
+                128,
+                0,
+                32,
+            ],
+            cr: 1140850728,
+            ctr: 0,
+            lr: 2148202308,
+            gpr3: 18446744071564390008,
+        },
+        path: [
+            120,
+            98,
+            111,
+            120,
+            107,
+            114,
+            110,
+            108,
+            46,
+            101,
+            120,
+            101,
+        ],
+    },
+)
+PacketHeader {
+    leader: 808464432,
+    packet_type: StateChange,
+    byte_count: 240,
+    id: PacketId(0x00000000),
+    checksum: Checksum(0x00003923),
+}
+StateChange(
+    StateChange {
+        new_state: Exception,
+        processor_level: 0,
+        processor: Processor(
+            0,
+        ),
+        number_processors: 6,
+        thread: 805355552,
+        program_counter: 18446744071562786184,
+        body: Exception {
+            record: ExceptionRecord {
+                code: NtStatus(0x80000003),
+                flags: 0,
+                record: 0,
+                address: 18446744071562786184,
+                number_parameters: 1,
+                information: [
+                    266338326,
+                    0,
+                    18446744071564606592,
+                    1006852416,
+                    1801548883,
+                    1801548883,
+                    1801548883,
+                    1006852432,
+                    1801548883,
+                    1801548883,
+                    1801548883,
+                    1801548883,
+                    1801548883,
+                    1801548883,
+                    1801548883,
+                ],
+            },
+            first_chance: true,
+        },
+        control_report: ControlReport {
+            instruction_count: 16,
+            instruction_stream: [
+                15,
+                224,
+                0,
+                22,
+                78,
+                128,
+                0,
+                32,
+                160,
+                196,
+                0,
+                2,
+                128,
+                164,
+                0,
+                4,
+            ],
+            cr: 1143517224,
+            ctr: 18446744071863252760,
+            lr: 2148126348,
+            gpr3: 0,
+        },
+        path: [],
+    },
+)
+PacketHeader {
+    leader: 808464432,
+    packet_type: Manipulate,
+    byte_count: 56,
+    id: PacketId(0x00000002),
+    checksum: Checksum(0x000011e5),
+}
+Manipulate(
+    Reply {
+        api: GetVersion,
+        processor_level: 0,
+        processor: Processor(
+            0,
+        ),
+        status: NtStatus(0x00000000),
+        body: Version(
+            Version {
+                major: 268,
+                minor: 16547,
+                protocol_version: 6,
+                flags: 11,
+                machine_type: 498,
+                max_packet_type: 12,
+                kernel_base: 18446744071562330112,
+                unidentified_address_28: 18446744071563904972,
+                unidentified_address_30: 18446744071563959056,
+            },
+        ),
+    },
+)
+Control(
+    ControlPacket {
+        kind: Acknowledge,
+        id: PacketId(0x80000000),
+    },
+)

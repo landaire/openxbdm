@@ -1,0 +1,17 @@
+[package]
+name = "openxbdm-kd-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sans-io codec and session state for the Xbox 360 kernel debugger network transport"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = { version = "2.0.18", default-features = false }
+winnow = { version = "1.0.1", default-features = false, features = ["binary"] }
+
+[dev-dependencies]
+insta = "1.47.2"

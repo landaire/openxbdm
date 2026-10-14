@@ -8,3 +8,9 @@ description = "Allocation-free XBDM server request dispatch"
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+openxbdm-core = { path = "../openxbdm-core" }
+
+[dev-dependencies]
+insta = "1.47.2"

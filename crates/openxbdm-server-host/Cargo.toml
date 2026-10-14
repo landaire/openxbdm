@@ -7,13 +7,17 @@ repository.workspace = true
 description = "Host XBDM server backed by deterministic mocks"
 publish = false
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "openxbdm-server"
 path = "src/main.rs"
 
 [dependencies]
+openxbdm-core = { path = "../openxbdm-core" }
 openxbdm-server = { path = "../openxbdm-server" }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["io-util", "net", "rt", "time"] }
 openxbdm-client = { path = "../openxbdm-client" }
+tokio = { workspace = true, features = ["io-util", "net", "rt", "time"] }

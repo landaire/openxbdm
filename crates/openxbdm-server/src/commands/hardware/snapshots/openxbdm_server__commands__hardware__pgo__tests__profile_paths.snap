@@ -1,0 +1,13 @@
+---
+source: crates/openxbdm-server/src/commands/hardware/pgo.rs
+expression: results
+---
+[
+    "\"\\device\\harddisk0\\partition1\\devkit\\game\\game\\pgo\"",
+    "\"d:\\pgo\\game\"",
+    "\"e:\\pgo\\game\"",
+    "\"pgo\"",
+    "BaseModuleNameFailed",
+    "BaseNameTooLong",
+    "\"\\device\\harddisk0\\partition1\\devkit\\game\\xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"",
+]

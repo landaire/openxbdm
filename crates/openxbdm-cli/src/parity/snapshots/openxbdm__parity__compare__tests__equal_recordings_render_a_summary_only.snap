@@ -1,0 +1,7 @@
+---
+source: crates/openxbdm-cli/src/parity/compare.rs
+expression: "render(&comparison, \"stock.json\", \"stock.json\")"
+---
+a: stock.json
+b: stock.json
+10 exchanges: 10 equal, 0 equal outside varying fields, 0 differ

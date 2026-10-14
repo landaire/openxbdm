@@ -1,0 +1,16 @@
+---
+source: crates/openxbdm-cli/src/parity/record.rs
+expression: outcome.recording
+---
+{
+  "banner": "201- connected",
+  "exchanges": [
+    {
+      "command": "bye",
+      "reply": {
+        "kind": "line",
+        "head": "200- bye"
+      }
+    }
+  ]
+}

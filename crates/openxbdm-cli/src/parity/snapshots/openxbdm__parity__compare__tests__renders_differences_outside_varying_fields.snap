@@ -1,0 +1,32 @@
+---
+source: crates/openxbdm-cli/src/parity/compare.rs
+expression: "render(&comparison, \"stock.json\", \"openxbdm.json\")"
+---
+a: stock.json
+b: openxbdm.json
+[2] getsockinfo
+  body
+    - handle=0x3343f000 flags=0x00808000 name="a b"
+    + handle=0x3cd59000 flags=0x00008000 name="a b"
+[4] threads
+  body
+    - -2
+    + -3
+    + -4
+[5] getmemex addr=0x80040000 length=0x10
+  binary digest
+    a: 00000000000000aa
+    b: 00000000000000ac
+[7] sendfile name="DEVKIT:\\oxtest\\a" length=2
+  after upload
+    head
+      a: 200- OK
+      b: 400- 
+[8] isstopped thread=0x1
+  reply
+    a: 405- no such thread
+    b: closed after ``
+[10] dmversion
+  only in b
+unused variance: walkmem
+11 exchanges: 2 equal, 3 equal outside varying fields, 6 differ

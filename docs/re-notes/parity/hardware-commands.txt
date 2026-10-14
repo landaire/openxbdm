@@ -1,0 +1,422 @@
+# Command list for `openxbdm parity record`; see hardware.md.
+# Only read-only forms, error paths rejected before any side effect, and
+# scratch files under DEVKIT:\oxtest.
+
+# Scratch setup.
+mkdir name="DEVKIT:\oxtest"
+mkdir name="DEVKIT:\oxtest"
+mkdir name="DEVKIT:\oxtest\sub"
+sendfile name="DEVKIT:\oxtest\a.txt" length=0x10
+%upload 30313233343536373839616263646566
+
+# Framework.
+%send
+notacommand
+DMVERSION
+dmversion extra=1
+oxnone!dmversion
+%repeat 600 x
+
+addtitlemem
+adminpw
+adminpw passwd=0q0123456789abcdef
+advmem
+advmem bogus
+advmem status
+altaddr
+autoinput
+autoinput user=0x0
+autoinput user=0x0 queryqueue
+autoinput user=0x4 queryqueue
+autoinput user=0x4 connect
+autoinput user=0x4 disconnect
+autoinput user=0x4 clearqueue
+autoinput user=0x0 bind
+autoinput user=0x0 queuepackets
+autoinput user=0x4 queuepackets count=0x1 timearray
+%upload 00000000000000000000000000000000
+autoinput user=0x4 setpacket
+%upload 000000000000000000000000
+autoinput user=0x0 process
+autoprof
+autoprof xuid=0qzz
+autoshutoff
+autoshutoff timeout=0x2
+autoshutoff timeout=0x7
+avatar
+avatar simulateerrortype=0x1 simulateerrorvalue=0x0
+avatar simulateerrortype=0x0
+bkgdmodetest
+boxid
+break
+break read=0x0
+break write=0x80000004 size=0x8
+break addr=0x2 clear
+builtinmu
+capctrl
+capctrl start
+capctrl fastcapenabled
+capctrl callcapenabled
+capctrl profilingstatus
+civstatus
+confignetra show
+confignetra
+confignetra customubootaddr=0x1z
+consolefeatures
+consolemem
+consoletype
+continue
+continue thread=0x1
+continue thread=0x1 exception
+dbgextld
+dbgextld unload
+dbgextld unload module=0x1
+dbgextld name=oxnonexistent.xex
+dbgname
+dbgprint
+dbgprint start
+dbgprint reset
+debugger
+debugger init
+debugmemsize
+debugmode
+dedicate
+dedicate handler=oxnonexistent
+delete
+delete name="E:\"
+delete name="E:\oxnonexistent"
+delete name="E:\oxnonexistent" dir
+delete name="DEVKIT:\oxtest\sub"
+delete name="DEVKIT:\oxtest\a.txt" dir
+delete name="DEVKIT:\oxtest" dir
+detour
+detour log
+detour entry
+detour getstate
+detour log available
+detour log getentries count=0x0
+detour entry query Id=0x0
+detour entry query
+detour entry release
+detour entry setinfo
+dirlist
+dirlist name="DEVKIT:\oxtest"
+dirlist name="E:\oxnonexistent"
+dirlist name="DEVKIT:\"
+dirlist name="E:\"
+dirlist name="\Device\Harddisk0\Partition1"
+discoverable
+discoverable enabled=maybe
+dmtelllog
+dmtelllog start
+dmtelllog start file=oxtest\dmtell.txt
+dmtelllog stop
+dmtelllog start file=oxtest\dmtell.txt area=0x1
+dmtelllog stop
+dmversion
+drivefreespace
+drivefreespace name="E:\"
+drivefreespace name="DEVKIT:\"
+drivefreespace name="E:\oxnonexistent"
+drivelist
+dumpmode
+dumpsettings
+dvdblk
+dvdblk block=0x0 count=0x41
+dvdblk block=0x0 count=0x1
+dvdperf
+dvdperf stop report
+enablewirelesscontrollers
+enablewirelesscontrollers enabled=maybe
+eventdefer
+feature
+feature enable=0x1
+fileeof
+fileeof name="DEVKIT:\oxtest\eof.bin"
+fileeof name="E:\oxnonexistent" size=0x0
+fileeof name="DEVKIT:\oxtest\eof.bin" size=0x20 mustcreate
+fileeof name="DEVKIT:\oxtest\eof.bin" size=0x20 mustcreate
+fileeof name="DEVKIT:\oxtest\eof.bin" size=0x8
+fileeof name="DEVKIT:\oxtest\eof.bin" size=0x10 cancreate
+getfileattributes name="DEVKIT:\oxtest\eof.bin"
+fileevent
+getconsoleid
+getcontext
+getcontext thread=0x1 full
+getcontext thread=0xf9000000 control int
+getfile
+getfile name="E:\oxnonexistent"
+getfile name="DEVKIT:\oxtest\a.txt" offset=0x4
+getfile name="DEVKIT:\oxtest\a.txt"
+getfile name="DEVKIT:\oxtest\a.txt" offset=0x4 size=0x4
+getfile name="DEVKIT:\oxtest\a.txt" offset=0x100 size=0x1
+getfileattributes
+getfileattributes name="E:\oxnonexistent"
+getfileattributes name="DEVKIT:\oxtest\a.txt"
+getfileattributes name="DEVKIT:\oxtest\sub"
+gethddblk
+gethddblk name=\Device\Harddisk0\Partition0
+gethddblk name=\Device\Harddisk0\Partition0 block=0x0 count=0x101
+gethddblk name=\Device\oxnonexistent block=0x0 count=0x1
+gethddblk name=\Device\Harddisk0\Partition0 block=0x0 count=0x1
+getmem
+getmem addr=0x0
+getmem addr=0x0 length=0x20
+getmem addr=0x80040000 length=0x40
+getmem addr=0x815f0000 length=0x40
+getmemex
+getmemex addr=0x0
+getmemex addr=0x0 length=0x0
+getmemex addr=0x0 length=0x10
+getmemex addr=0x80040000 length=0x20
+getnetaddrs
+getpid
+getsockinfo
+getsum
+getsum ADDR=0x0
+getsum ADDR=0x0 LENGTH=0x10
+getsum ADDR=0x0 LENGTH=0x10 BLOCKSIZE=0x0
+getsum ADDR=0x0 LENGTH=0x10 BLOCKSIZE=0x8
+getsum ADDR=0x0 LENGTH=0x4 BLOCKSIZE=0x8
+getsum ADDR=0x80040000 LENGTH=0x100 BLOCKSIZE=0x80
+getuserpriv me
+getuserpriv
+getuserpriv name=oxnobody
+getvfattr
+getvfattr count=0x2
+%upload 000000154445564b49543a5c6f78746573745c612e747874000000001a4445564b49543a5c6f78746573745c6e6f66696c652e62696e00
+getxnkeyinfo
+getxnqoslookupinfo
+getxnsecassocinfo
+go
+gpucount
+gpucount enable
+gpucount disable
+halt
+halt thread=0x1
+hdd
+ipproxy
+ipproxy start
+ipproxy start ver=0x1 addr=0x1 port=0x10000
+ipproxy stop
+iptv
+iptvallowuninstall
+iptvdvr
+irtsweep
+isbreak
+isbreak addr=0x0
+isdebugger
+isstopped
+isstopped thread=0x1
+isstopped thread=0xf9000000
+kd
+kd bogus
+kdlite
+kdlite bogus
+keyxchg
+%upload 010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+kiosk
+kiosk enabled=on
+kiosk enabled=maybe
+linkstate
+linkstate setflags
+linkstate setflags and=0x0
+lopctrl
+lopctrl start
+lopctrl info
+memtrack
+memtrack cmd=bogus
+memtrack cmd=querystackdepth
+memtrack cmd=queryflags
+memtrack cmd=querytype type=0x0
+memtrack cmd=querytype
+memtrack cmd=querytype type=0xe
+memtrack cmd=save
+memtrack cmd=enable stackdepth=0x21
+memtrack cmd=enable flags=0x100
+mixcmd querystats
+mixcmd countxamheaps
+mixcmd xamheap 1
+mixcmd xamheap z
+mixcmd bogus
+mkdir
+mkdir name="E:\oxnonexistent\sub"
+mockcurrencyvalue
+mockcurrencyvalue enabled=on
+mockcurrencyvalue enabled=maybe
+modsections
+modsections name=oxnonexistent.xex
+modsections name=xam.xex
+modsections name="xboxkrnl.exe"
+modules
+netcap
+netcap start
+netcap stop
+netcap start file=DEVKIT:\oxtest\cap.bin
+netcap stop
+netsim
+netsim getnumqs
+netsim getnumipv4redirs
+netsim getqstats in index=0x0
+netsim getq in index=0x0
+netsim insertq
+netsim insertq in cfg=zz
+netsim removeq
+netsim removeipv4redir
+nicstats
+nostopon
+nostopon bogus
+notifyat
+notifyat port=0x1 addr=bogus
+oddlog stop
+oddlog file=DEVKIT:\oxtest\odd.txt
+oddlog stop
+pclist
+pdbinfo
+pdbinfo addr=0x0
+pdbinfo addr=0x815f0000
+perfstat
+pixcmd f
+pixcmd z
+pixcmd k
+pixcmd m 1
+pixcmd u 99
+pixcmd n 00000000
+pixpreview
+playto
+playto set
+playto show
+pogoctrl
+pogoctrl allocscale module=0x0 scale=0x1
+pogoctrl start module=0x1
+pogoctrl stop module=0x1
+querypc
+querypc name=oxnonexistent
+querypc name=oxnonexistent type=0x1
+querypc name="Debugger Pages" type=0x1
+rename
+rename newname="DEVKIT:\oxtest\b.txt"
+rename name="E:\oxnonexistent" newname="E:\oxnonexistent2"
+rename name="DEVKIT:\oxtest\a.txt" newname="DEVKIT:\oxtest\b.txt"
+getfileattributes name="DEVKIT:\oxtest\b.txt"
+rename name="DEVKIT:\oxtest\b.txt" newname="DEVKIT:\oxtest\a.txt"
+resume
+resume thread=0x1
+rpc
+rpc version=0x3
+rpc version=0x4
+rpc version=0x4 system
+sendfile
+sendfile name="DEVKIT:\oxtest\a.txt"
+sendfile name="E:\oxnonexistent\x.txt" length=0x1
+sendfile name="DEVKIT:\oxtest\z.txt" length=0x0
+%upload
+getfileattributes name="DEVKIT:\oxtest\z.txt"
+sendvfile
+sendvfile count=0x1
+%upload 0000003501d000000000000001d00000000000000000000000000004000000804445564b49543a5c6f78746573745c762e7478740064617461
+getfile name="DEVKIT:\oxtest\v.txt"
+getfileattributes name="DEVKIT:\oxtest\v.txt"
+setcontext
+setcontext thread=0x1 Gpr3=0q0
+setdiscboot
+setdiscboot enable=0x2
+setfileattributes
+setfileattributes name="E:\oxnonexistent"
+setfileattributes name="DEVKIT:\oxtest\a.txt" hidden=0x1
+getfileattributes name="DEVKIT:\oxtest\a.txt"
+setfileattributes name="DEVKIT:\oxtest\a.txt" hidden=0x0 readonly=0x0 createhi=0x1d00000 createlo=0x0 changehi=0x1d00000 changelo=0x0
+getfileattributes name="DEVKIT:\oxtest\a.txt"
+setmem
+setmem addr=0x0
+setmem addr=0x0 data=zz
+setmem addr=0x0 data=0
+setmem addr=0x0 data=00
+setreset
+setretail
+setretail and=0xffffffff
+setserver
+setuserpriv
+spew oxtest
+srvproc num=0x6
+srvproc num=0xffffffff
+stopon
+stopon bogus
+suspend
+suspend thread=0x1
+systeminfo
+systime
+tdecomp
+threadinfo
+threadinfo thread=0x1
+threadinfo thread=0xf9000000
+threads
+threadstat
+traceimports
+usbportctrl
+usbportctrl controller=0x0
+usbportctrl controller=0x0 port=0x0
+vd
+vd cmd=bogus
+vd cmd=peek
+vd cmd=peek addr=0x300
+vd cmd=peek addr=0x0
+vd cmd=gpeek addr=0x0
+vd cmd=gpeek addr=0xfffd
+vd cmd=poke
+vd cmd=poke addr=0x0
+vd cmd=poke addr=0x100 data=0x100
+vd cmd=gpoke addr=0x0
+vd cmd=gpoke addr=0xfffd data=0x0
+vd cmd=edid
+vd cmd=edid block=0x100
+vd cmd=edid block=0x0
+verbose
+walkmem
+writefile
+writefile name="DEVKIT:\oxtest\a.txt"
+writefile name="DEVKIT:\oxtest\a.txt" offset=0x0
+writefile name="E:\oxnonexistent" offset=0x0 length=0x1
+writefile name="DEVKIT:\oxtest\nofile.bin" offset=0x0 length=0x4
+writefile name="DEVKIT:\oxtest\a.txt" offset=0x2 length=0x4
+%upload 5758595a
+writefile name="DEVKIT:\oxtest\a.txt" offset=0x0 length=0x0
+%upload
+getfile name="DEVKIT:\oxtest\a.txt"
+xbeinfo
+xbeinfo running
+xbeinfo name=E:\oxnonexistent.xex
+xbeinfo name=E:\oxnonexistent.xex ondiskonly
+xexfield
+xexfield module=xam.xex
+xexfield module=oxnonexistent.xex field=0x10100
+xexfield module=xam.xex field=0x10100
+xhttpproxy
+xstudio
+xstudio bogus
+
+# Lines that end or change the connection.
+dedicate global
+notify
+notifyport
+authuser
+authuser passwd=0q1
+authuser resp=0q0
+authuser resp=0q0 name=oxnobody
+getuserpriv me
+%reconnect
+authuser resp=0q0 admin
+%reconnect
+
+# Scratch cleanup.
+delete name="DEVKIT:\oxtest\a.txt"
+delete name="DEVKIT:\oxtest\v.txt"
+delete name="DEVKIT:\oxtest\z.txt"
+delete name="DEVKIT:\oxtest\eof.bin"
+delete name="DEVKIT:\oxtest\cap.bin"
+delete name="DEVKIT:\oxtest\odd.txt"
+delete name="DEVKIT:\oxtest\dmtell.txt"
+delete name="DEVKIT:\oxtest\sub" dir
+delete name="DEVKIT:\oxtest" dir
+dirlist name="DEVKIT:\oxtest"
+bye

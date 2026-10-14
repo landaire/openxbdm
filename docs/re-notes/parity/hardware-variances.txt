@@ -1,0 +1,23 @@
+# Reply fields that differ between runs of hardware-commands.txt for
+# reasons outside the monitor; see hardware.md.
+dirlist name="DEVKIT:\oxtest" | body.createhi body.createlo body.changehi body.changelo | scratch files are created at run time
+dirlist name="DEVKIT:\" | body.createhi body.createlo body.changehi body.changelo | the scratch directory is created at run time
+dirlist name="E:\" | body.createhi body.createlo body.changehi body.changelo | the scratch directory is created at run time
+getfileattributes name="DEVKIT:\oxtest\eof.bin" | body.createhi body.createlo body.changehi body.changelo | scratch file times
+getfileattributes name="DEVKIT:\oxtest\a.txt" | body.createhi body.createlo body.changehi body.changelo | scratch file times
+getfileattributes name="DEVKIT:\oxtest\b.txt" | body.createhi body.createlo body.changehi body.changelo | scratch file times
+getfileattributes name="DEVKIT:\oxtest\z.txt" | body.createhi body.createlo body.changehi body.changelo | scratch file times
+getfileattributes name="DEVKIT:\oxtest\sub" | body.createhi body.createlo body.changehi body.changelo | scratch file times
+getvfattr count=0x2 | binary | the records carry the scratch file times
+getcontext thread=0xf9000000 control int | body | registers of a running title thread
+threadinfo thread=0xf9000000 | body.createhi body.createlo | creation time of the title thread in this boot
+getpid | head.pid | random per boot
+getsockinfo | body | socket handles, client ports and closed connections still in TIME_WAIT depend on the connection history
+keyxchg | binary | random key exchange value
+mixcmd querystats | head | XAM heap counters
+mixcmd xamheap 1 | head | XAM heap counters
+nicstats | head | network interface counters
+pixcmd m 1 | head | frame counters
+querypc name="Debugger Pages" type=0x1 | body.ratelo body.ratehi | stock reports stale scratch words
+modules | body | the xbdm.xex line describes the loaded image
+walkmem | body | the virtual memory layout depends on the boot and the loaded image

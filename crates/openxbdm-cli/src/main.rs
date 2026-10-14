@@ -13,6 +13,7 @@ use rootcause::prelude::*;
 use tabled::Tabled;
 use tokio::io::AsyncWriteExt;
 
+mod parity;
 mod ui;
 
 use openxbdm_client::commands::AltAddr;
@@ -494,6 +495,10 @@ enum Command {
         line: String,
     },
 
+    /// Record replies to a command list, or compare two recordings.
+    #[command(subcommand)]
+    Parity(parity::ParityCommand),
+
     /// Dangerous, low-level operations that write into xbdm's memory
     /// image. Each subcommand is gated behind the `dangerous` feature
     /// and documented with what it touches.
@@ -728,6 +733,21 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    if let Command::Parity(command) = &cli.cmd {
+        let target = cli
+            .host
+            .as_deref()
+            .map(|host| Target::parse(host, cli.port));
+        let timeout = Duration::from_secs(cli.timeout);
+        return match runtime.block_on(parity::run(command, target, timeout)) {
+            Ok(code) => code,
+            Err(report) => {
+                eprintln!("error: {report:?}");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     match runtime.block_on(run(cli)) {
         Ok(()) => ExitCode::SUCCESS,
@@ -1068,7 +1088,9 @@ where
     // `async move` block consume a mutable borrow without taking ownership of
     // the connection (which we still need for `client.bye()` after the match).
     match cmd {
-        Command::Discover { .. } | Command::Resolve { .. } => unreachable!(),
+        Command::Discover { .. } | Command::Resolve { .. } | Command::Parity(_) => {
+            unreachable!()
+        }
         Command::Ping => {
             println!("connected");
         }

@@ -11,4 +11,4 @@ publish = false
 # in build_defs/rust_tests.bzl depend on these.
 [dependencies]
 futures = "0.3.32"
-insta = "1.47.2"
+insta = { version = "1.47.2", features = ["json"] }

@@ -38,7 +38,9 @@ pub async fn find_by_name(
 /// Ask every console on the segment to identify itself. Collects
 /// replies until the deadline; duplicates by source address are
 /// dropped.
-pub async fn discover_all(config: DiscoveryConfig) -> Result<Vec<DiscoveredConsole>, rootcause::Report<Error>> {
+pub async fn discover_all(
+    config: DiscoveryConfig,
+) -> Result<Vec<DiscoveredConsole>, rootcause::Report<Error>> {
     let engine = Discovery::broadcast(config.clone(), Instant::now());
     drive(engine, config).await
 }
@@ -53,7 +55,11 @@ async fn drive(
         .into_report()
         .attach("binding udp socket for nap discovery")?;
     if config.broadcast {
-        socket.set_broadcast(true).map_err(Error::from).into_report().attach("enabling SO_BROADCAST")?;
+        socket
+            .set_broadcast(true)
+            .map_err(Error::from)
+            .into_report()
+            .attach("enabling SO_BROADCAST")?;
     }
 
     tracing::debug!(

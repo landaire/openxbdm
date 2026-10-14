@@ -16,7 +16,10 @@ use crate::error::ParseError;
 pub type Input<'a> = &'a str;
 
 pub fn three_digit_code(input: &mut Input<'_>) -> Result<u16, ErrMode<ContextError>> {
-    digit1.verify(|s: &str| s.len() == 3).try_map(|s: &str| s.parse::<u16>()).parse_next(input)
+    digit1
+        .verify(|s: &str| s.len() == 3)
+        .try_map(|s: &str| s.parse::<u16>())
+        .parse_next(input)
 }
 
 /// Parse a response head: `NNN<sep>rest` where `sep` is one of `- `, `-`,
@@ -32,19 +35,27 @@ pub fn response_head<'a>(input: &mut Input<'a>) -> Result<(u16, &'a str), ErrMod
 #[allow(dead_code)]
 pub fn hex_u64_prefixed(input: &mut Input<'_>) -> Result<u64, ErrMode<ContextError>> {
     alt(("0x", "0X")).parse_next(input)?;
-    take_while(1..=16, |c: char| c.is_ascii_hexdigit()).try_map(|s: &str| u64::from_str_radix(s, 16)).parse_next(input)
+    take_while(1..=16, |c: char| c.is_ascii_hexdigit())
+        .try_map(|s: &str| u64::from_str_radix(s, 16))
+        .parse_next(input)
 }
 
 /// Parse a quadword literal (`0q` + 16 hex digits).
 #[allow(dead_code)]
 pub fn qword_literal(input: &mut Input<'_>) -> Result<u64, ErrMode<ContextError>> {
     alt(("0q", "0Q")).parse_next(input)?;
-    take_while(16..=16, |c: char| c.is_ascii_hexdigit()).try_map(|s: &str| u64::from_str_radix(s, 16)).parse_next(input)
+    take_while(16..=16, |c: char| c.is_ascii_hexdigit())
+        .try_map(|s: &str| u64::from_str_radix(s, 16))
+        .parse_next(input)
 }
 
 /// Run a parser over a `&str` and translate any winnow error into a
 /// typed [`FramingError`].
-pub fn run_framing<'a, T, F>(parser: F, input: &'a str, on_fail: FramingError) -> Result<T, FramingError>
+pub fn run_framing<'a, T, F>(
+    parser: F,
+    input: &'a str,
+    on_fail: FramingError,
+) -> Result<T, FramingError>
 where
     F: FnOnce(&mut Input<'a>) -> Result<T, ErrMode<ContextError>>,
 {
@@ -78,7 +89,8 @@ pub fn kv_tokens<'a>(input: &mut Input<'a>) -> Result<KvTokens<'a>, ErrMode<Cont
         if input.is_empty() {
             break;
         }
-        let key = take_while(1.., |c: char| c != '=' && !c.is_ascii_whitespace()).parse_next(input)?;
+        let key =
+            take_while(1.., |c: char| c != '=' && !c.is_ascii_whitespace()).parse_next(input)?;
         match opt('=').parse_next(input)? {
             Some(_) => {
                 let value = kv_value.parse_next(input)?;
@@ -109,7 +121,9 @@ pub fn kv_value<'a>(input: &mut Input<'a>) -> Result<KvValue<'a>, ErrMode<Contex
 }
 
 fn bare_value<'a>(input: &mut Input<'a>) -> Result<KvValue<'a>, ErrMode<ContextError>> {
-    take_while(0.., |c: char| !c.is_ascii_whitespace()).map(KvValue::Bare).parse_next(input)
+    take_while(0.., |c: char| !c.is_ascii_whitespace())
+        .map(KvValue::Bare)
+        .parse_next(input)
 }
 
 fn quoted_value<'a>(input: &mut Input<'a>) -> Result<KvValue<'a>, ErrMode<ContextError>> {
@@ -174,6 +188,9 @@ mod tests {
     #[test]
     fn qword_literal_parses_16_digits() {
         let mut input = "0q0011223344556677";
-        assert_eq!(qword_literal.parse_next(&mut input).unwrap(), 0x0011_2233_4455_6677);
+        assert_eq!(
+            qword_literal.parse_next(&mut input).unwrap(),
+            0x0011_2233_4455_6677
+        );
     }
 }

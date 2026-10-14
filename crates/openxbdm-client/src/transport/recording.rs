@@ -28,7 +28,10 @@ pub struct RecordingTransport<T> {
 
 impl<T> RecordingTransport<T> {
     pub fn new(inner: T) -> Self {
-        Self { inner, log: Arc::new(Mutex::new(CaptureLog::new())) }
+        Self {
+            inner,
+            log: Arc::new(Mutex::new(CaptureLog::new())),
+        }
     }
 
     /// Shared handle to the underlying log. Clone this out before the
@@ -49,7 +52,11 @@ impl<T> RecordingTransport<T> {
 }
 
 impl<T: AsyncRead + Unpin> AsyncRead for RecordingTransport<T> {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
         let this = &mut *self;
         let poll = Pin::new(&mut this.inner).poll_read(cx, buf);
         if let Poll::Ready(Ok(n)) = &poll
@@ -63,7 +70,11 @@ impl<T: AsyncRead + Unpin> AsyncRead for RecordingTransport<T> {
 }
 
 impl<T: AsyncWrite + Unpin> AsyncWrite for RecordingTransport<T> {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         let this = &mut *self;
         let poll = Pin::new(&mut this.inner).poll_write(cx, buf);
         if let Poll::Ready(Ok(n)) = &poll

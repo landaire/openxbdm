@@ -15,38 +15,9 @@
 
 use core::fmt::Write as _;
 
+pub use openxbdm_core::value::Qword;
+
 use crate::error::ArgumentError;
-
-/// A 64-bit value formatted using XBDM's `0q` quadword notation: sixteen
-/// lowercase hex digits split into two eight-digit halves, prefixed `0q`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Qword(pub u64);
-
-impl core::fmt::Display for Qword {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let hi = (self.0 >> 32) as u32;
-        let lo = self.0 as u32;
-        write!(f, "0q{:08x}{:08x}", hi, lo)
-    }
-}
-
-/// Two 64-bit values glued into a single 128-bit XBDM quadword literal,
-/// as used by `LOCKMODE BOXID=...` and a handful of XUID carriers.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct QwordPair {
-    pub hi: u64,
-    pub lo: u64,
-}
-
-impl core::fmt::Display for QwordPair {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let hi_hi = (self.hi >> 32) as u32;
-        let hi_lo = self.hi as u32;
-        let lo_hi = (self.lo >> 32) as u32;
-        let lo_lo = self.lo as u32;
-        write!(f, "0q{:08x}{:08x}{:08x}{:08x}", hi_hi, hi_lo, lo_hi, lo_lo)
-    }
-}
 
 /// Builder for the right-hand side of an XBDM command line.
 ///
@@ -60,7 +31,9 @@ pub struct ArgBuilder {
 
 impl ArgBuilder {
     pub fn new(command: &str) -> Self {
-        Self { buf: command.to_owned() }
+        Self {
+            buf: command.to_owned(),
+        }
     }
 
     /// Append a bare sub-command token (e.g. `ADVISE`, `START`, `NOPERSIST`).
@@ -103,12 +76,6 @@ impl ArgBuilder {
         self
     }
 
-    /// Append `KEY=0q<quad-pair>` (128-bit quadword pair).
-    pub fn qword_pair(mut self, key: &str, value: QwordPair) -> Self {
-        let _ = write!(self.buf, " {}={}", key, value);
-        self
-    }
-
     /// Append `KEY="..."` with minimal quoting. Backslashes pass through
     /// unchanged (XBDM tokenises them literally); embedded double quotes
     /// and CR/LF are rejected.
@@ -140,20 +107,20 @@ mod tests {
     }
 
     #[test]
-    fn qword_pair_formats_as_four_halves() {
-        let q = QwordPair { hi: 0x0011_2233_4455_6677, lo: 0x8899_aabb_ccdd_eeff };
-        assert_eq!(q.to_string(), "0q00112233445566778899aabbccddeeff");
-    }
-
-    #[test]
     fn builder_composes_systime_wire() {
-        let line = ArgBuilder::new("setsystime").hex32("clockhi", 0x01d4_c3e5).hex32("clocklo", 0xd97b_cd80).finish();
+        let line = ArgBuilder::new("setsystime")
+            .hex32("clockhi", 0x01d4_c3e5)
+            .hex32("clocklo", 0xd97b_cd80)
+            .finish();
         assert_eq!(line, "setsystime clockhi=0x01d4c3e5 clocklo=0xd97bcd80");
     }
 
     #[test]
     fn builder_quotes_filenames() {
-        let line = ArgBuilder::new("getfile").quoted("NAME", r"e:\foo.bar").unwrap().finish();
+        let line = ArgBuilder::new("getfile")
+            .quoted("NAME", r"e:\foo.bar")
+            .unwrap()
+            .finish();
         assert_eq!(line, r#"getfile NAME="e:\foo.bar""#);
     }
 

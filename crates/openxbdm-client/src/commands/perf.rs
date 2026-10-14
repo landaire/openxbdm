@@ -19,6 +19,23 @@ fn require_u32(kv: &KvLine<'_>, key: &'static str) -> Result<u32, ParseError> {
     value_u32(kv.require(key)?, key)
 }
 
+fn require_i32(kv: &KvLine<'_>, key: &'static str) -> Result<i32, ParseError> {
+    kv.require(key)?
+        .as_str()
+        .parse::<i32>()
+        .map_err(|_| ParseError::InvalidDecimalI32 { key })
+}
+
+fn require_u16(kv: &KvLine<'_>, key: &'static str) -> Result<u16, ParseError> {
+    let value = require_u32(kv, key)?;
+    u16::try_from(value).map_err(|_| ParseError::ValueOutOfRange { key, value })
+}
+
+fn require_u8(kv: &KvLine<'_>, key: &'static str) -> Result<u8, ParseError> {
+    let value = require_u32(kv, key)?;
+    u8::try_from(value).map_err(|_| ParseError::ValueOutOfRange { key, value })
+}
+
 fn hi_lo_u64(kv: &KvLine<'_>, hi: &'static str, lo: &'static str) -> Result<u64, ParseError> {
     let hi_val = require_u32(kv, hi)?;
     let lo_val = require_u32(kv, lo)?;
@@ -58,12 +75,18 @@ impl Command for PerfCounterList {
     }
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
-        let lines = response.expect_multiline().map_err(rootcause::Report::new)?;
+        let lines = response
+            .expect_multiline()
+            .map_err(rootcause::Report::new)?;
         let mut out = Vec::with_capacity(lines.len());
         for line in lines {
             let kv = parse_kv_line(&line);
             out.push(PerfCounterEntry {
-                name: kv.require("name").map_err(report_parse)?.as_str().to_owned(),
+                name: kv
+                    .require("name")
+                    .map_err(report_parse)?
+                    .as_str()
+                    .to_owned(),
                 kind: require_u32(&kv, "type").map_err(report_parse)?,
             });
         }
@@ -105,7 +128,8 @@ impl Command for QueryPerfCounter {
     fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
         if self.name.is_empty() {
             return Err(
-                rootcause::Report::new(Error::from(ArgumentError::EmptyFilename)).attach("querypc NAME required")
+                rootcause::Report::new(Error::from(ArgumentError::EmptyFilename))
+                    .attach("querypc NAME required"),
             );
         }
         let builder = ArgBuilder::new("querypc")
@@ -120,8 +144,12 @@ impl Command for QueryPerfCounter {
     }
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
-        let mut lines = response.expect_multiline().map_err(rootcause::Report::new)?;
-        let head = lines.pop().ok_or_else(|| report_parse(ParseError::UnrecognizedShape))?;
+        let mut lines = response
+            .expect_multiline()
+            .map_err(rootcause::Report::new)?;
+        let head = lines
+            .pop()
+            .ok_or_else(|| report_parse(ParseError::UnrecognizedShape))?;
         let kv = parse_kv_line(&head);
         Ok(PerfCounterSample {
             kind: require_u32(&kv, "type").map_err(report_parse)?,
@@ -131,23 +159,25 @@ impl Command for QueryPerfCounter {
     }
 }
 
-/// `getsockinfo`: list of open sockets owned by XBDM.
+/// `getsockinfo`: every active socket of the console network stack.
 #[derive(Debug, Clone, Copy)]
 pub struct GetSocketInfo;
 
+/// One socket. The console prints owner type, family, type, and protocol
+/// as signed decimals and the TCP state from a byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SocketEntry {
     pub handle: u32,
-    pub owner_type: u32,
+    pub owner_type: i32,
     pub flags: u32,
-    pub addr_family: u32,
-    pub socket_type: u32,
-    pub protocol: u32,
+    pub addr_family: i32,
+    pub socket_type: i32,
+    pub protocol: i32,
     pub local_addr: u32,
     pub remote_addr: u32,
     pub local_port: u16,
     pub remote_port: u16,
-    pub tcp_state: u32,
+    pub tcp_state: u8,
 }
 
 impl Command for GetSocketInfo {
@@ -162,22 +192,24 @@ impl Command for GetSocketInfo {
     }
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
-        let lines = response.expect_multiline().map_err(rootcause::Report::new)?;
+        let lines = response
+            .expect_multiline()
+            .map_err(rootcause::Report::new)?;
         let mut out = Vec::with_capacity(lines.len());
         for line in lines {
             let kv = parse_kv_line(&line);
             out.push(SocketEntry {
                 handle: require_u32(&kv, "handle").map_err(report_parse)?,
-                owner_type: require_u32(&kv, "ownertype").map_err(report_parse)?,
+                owner_type: require_i32(&kv, "ownertype").map_err(report_parse)?,
                 flags: require_u32(&kv, "flags").map_err(report_parse)?,
-                addr_family: require_u32(&kv, "addrfamily").map_err(report_parse)?,
-                socket_type: require_u32(&kv, "socktype").map_err(report_parse)?,
-                protocol: require_u32(&kv, "protocol").map_err(report_parse)?,
+                addr_family: require_i32(&kv, "addrfamily").map_err(report_parse)?,
+                socket_type: require_i32(&kv, "socktype").map_err(report_parse)?,
+                protocol: require_i32(&kv, "protocol").map_err(report_parse)?,
                 local_addr: require_u32(&kv, "localaddr").map_err(report_parse)?,
                 remote_addr: require_u32(&kv, "remoteaddr").map_err(report_parse)?,
-                local_port: require_u32(&kv, "localport").map_err(report_parse)? as u16,
-                remote_port: require_u32(&kv, "remoteport").map_err(report_parse)? as u16,
-                tcp_state: require_u32(&kv, "tcpstate").map_err(report_parse)?,
+                local_port: require_u16(&kv, "localport").map_err(report_parse)?,
+                remote_port: require_u16(&kv, "remoteport").map_err(report_parse)?,
+                tcp_state: require_u8(&kv, "tcpstate").map_err(report_parse)?,
             });
         }
         Ok(out)

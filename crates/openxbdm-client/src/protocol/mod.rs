@@ -31,7 +31,6 @@ mod status;
 
 pub use args::ArgBuilder;
 pub use args::Qword;
-pub use args::QwordPair;
 pub use command::Command;
 pub use command::ExpectedBody;
 pub use response::Response;

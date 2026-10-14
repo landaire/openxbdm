@@ -106,7 +106,11 @@ where
         .map_err(Error::from)
         .into_report()
         .attach("opening TCP connection to XBDM host")?;
-    stream.set_nodelay(true).map_err(Error::from).into_report().attach("configuring TCP_NODELAY on XBDM socket")?;
+    stream
+        .set_nodelay(true)
+        .map_err(Error::from)
+        .into_report()
+        .attach("configuring TCP_NODELAY on XBDM socket")?;
     Ok(stream.compat())
 }
 
@@ -120,13 +124,18 @@ pub async fn connect_target(target: &Target) -> Result<TokioTransport, rootcause
 }
 
 /// Connect with a hard timeout so hung consoles don't wedge the caller.
-pub async fn connect_timeout<A>(addr: A, timeout: Duration) -> Result<TokioTransport, rootcause::Report<Error>>
+pub async fn connect_timeout<A>(
+    addr: A,
+    timeout: Duration,
+) -> Result<TokioTransport, rootcause::Report<Error>>
 where
     A: ToSocketAddrs,
 {
     match tokio::time::timeout(timeout, connect(addr)).await {
         Ok(result) => result,
-        Err(_) => Err(rootcause::Report::new(Error::from(TransportError::ConnectTimeout))),
+        Err(_) => Err(rootcause::Report::new(Error::from(
+            TransportError::ConnectTimeout,
+        ))),
     }
 }
 
@@ -137,7 +146,9 @@ pub async fn connect_target_timeout(
 ) -> Result<TokioTransport, rootcause::Report<Error>> {
     match tokio::time::timeout(timeout, connect_target(target)).await {
         Ok(result) => result,
-        Err(_) => Err(rootcause::Report::new(Error::from(TransportError::ConnectTimeout))),
+        Err(_) => Err(rootcause::Report::new(Error::from(
+            TransportError::ConnectTimeout,
+        ))),
     }
 }
 
@@ -160,13 +171,25 @@ mod tests {
     #[test]
     fn parses_bare_hostname() {
         let t = Target::parse("deanxbox", 730);
-        assert_eq!(t, Target::HostPort { host: "deanxbox".to_owned(), port: 730 });
+        assert_eq!(
+            t,
+            Target::HostPort {
+                host: "deanxbox".to_owned(),
+                port: 730
+            }
+        );
     }
 
     #[test]
     fn parses_hostname_with_port() {
         let t = Target::parse("deanxbox:42", 730);
-        assert_eq!(t, Target::HostPort { host: "deanxbox".to_owned(), port: 42 });
+        assert_eq!(
+            t,
+            Target::HostPort {
+                host: "deanxbox".to_owned(),
+                port: 42
+            }
+        );
     }
 
     #[test]
@@ -178,7 +201,10 @@ mod tests {
     #[test]
     fn parses_bare_ipv6() {
         let t = Target::parse("::1", 730);
-        assert_eq!(t, Target::Addr(SocketAddr::new("::1".parse().unwrap(), 730)));
+        assert_eq!(
+            t,
+            Target::Addr(SocketAddr::new("::1".parse().unwrap(), 730))
+        );
     }
 
     #[test]

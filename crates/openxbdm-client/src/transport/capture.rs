@@ -58,7 +58,10 @@ pub struct CaptureEntry {
 
 impl CaptureEntry {
     pub fn new(direction: Direction, data: impl Into<Vec<u8>>) -> Self {
-        Self { direction, data: data.into() }
+        Self {
+            direction,
+            data: data.into(),
+        }
     }
 }
 
@@ -94,14 +97,22 @@ impl CaptureLog {
             last.data.extend_from_slice(bytes);
             return;
         }
-        self.entries.push(CaptureEntry { direction, data: bytes.to_vec() });
+        self.entries.push(CaptureEntry {
+            direction,
+            data: bytes.to_vec(),
+        });
     }
 
     /// Render the capture to the canonical text format.
     pub fn to_text(&self) -> String {
         let mut out = String::from("# xbdm capture v1\n");
         for entry in &self.entries {
-            let _ = writeln!(&mut out, "{} {}", entry.direction.tag(), escape(&entry.data));
+            let _ = writeln!(
+                &mut out,
+                "{} {}",
+                entry.direction.tag(),
+                escape(&entry.data)
+            );
         }
         out
     }
@@ -118,7 +129,8 @@ impl CaptureLog {
             let Some((tag, rest)) = line.split_once(' ') else {
                 return Err(CaptureParseError::MissingTag { line_no: idx + 1 });
             };
-            let direction = Direction::from_tag(tag).ok_or(CaptureParseError::UnknownTag { line_no: idx + 1 })?;
+            let direction = Direction::from_tag(tag)
+                .ok_or(CaptureParseError::UnknownTag { line_no: idx + 1 })?;
             let data = unescape(rest).ok_or(CaptureParseError::BadEscape { line_no: idx + 1 })?;
             if let Some(last) = entries.last_mut()
                 && last.direction == direction

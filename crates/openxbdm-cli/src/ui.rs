@@ -40,6 +40,8 @@ where
     use tabled::settings::Width;
     use tabled::settings::object::Rows;
     let mut table = tabled::Table::new(rows);
-    table.with(Style::rounded()).with(Modify::new(Rows::first()).with(Width::wrap(48)));
+    table
+        .with(Style::rounded())
+        .with(Modify::new(Rows::first()).with(Width::wrap(48)));
     table.to_string()
 }

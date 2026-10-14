@@ -51,12 +51,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let nb = needle.as_bytes();
             for (i, w) in base.windows(nb.len()).enumerate() {
                 if w == nb {
-                    let ctx_size: usize = std::env::var("XEXGREP_CTX").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+                    let ctx_size: usize = std::env::var("XEXGREP_CTX")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(16);
                     let ctx_start = i.saturating_sub(ctx_size);
                     let ctx_end = (i + nb.len() + ctx_size * 2).min(base.len());
                     let ctx: String = base[ctx_start..ctx_end]
                         .iter()
-                        .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+                        .map(|&b| {
+                            if (0x20..0x7f).contains(&b) {
+                                b as char
+                            } else {
+                                '.'
+                            }
+                        })
                         .collect();
                     println!("{name:30}  {needle:30}  @0x{i:08x}  |{ctx}|");
                 }

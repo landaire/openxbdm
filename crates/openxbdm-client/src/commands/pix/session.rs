@@ -3,12 +3,12 @@
 //!
 //! # 1. `pixcmd` - the PIX profiler (lives in xbdm itself)
 //!
-//! xbdm registers a first-party `pixcmd` command. Its handler
-//! at `xbdm 0x91f56b88` is a first-letter switch over positional
-//! `u32`-argument subcommands that drive the PIX performance profiler
-//! (outputs `.pix2` trace files, emits `PIX!MovieData` / `PIX!Gpu` /
-//! `PIX!Trace` style notifications). [`PixCmd`] is the thin wrapper
-//! for this.
+//! xbdm registers a first-party `pixcmd` command (handler `0x91f57fe0`).
+//! The byte at line offset 7 selects the subcommand and decimal arguments
+//! start at offset 9, so exactly one space must follow `pixcmd`. Replies
+//! are `200- OK`, `200- NO`, `200- BUSY`, `200- OldD3D`, or formatted
+//! `200- OK <values>`; `pixcmd r` answers `203- OK <n>` followed by `n`
+//! bytes of trace data. [`PixCmd`] is the thin wrapper for this.
 //!
 //! # 2. `PIX!{Token}` - the xbmovie video capture (lives in the title)
 //!
@@ -126,10 +126,16 @@ impl Notification {
             return Some(Notification::MovieData(rest.trim_start().to_owned()));
         }
         if let Some(rest) = body.strip_prefix("VideoOpError") {
-            return Some(Notification::VideoOp { error: true, detail: rest.trim_start().to_owned() });
+            return Some(Notification::VideoOp {
+                error: true,
+                detail: rest.trim_start().to_owned(),
+            });
         }
         if let Some(rest) = body.strip_prefix("VideoOp") {
-            return Some(Notification::VideoOp { error: false, detail: rest.trim_start().to_owned() });
+            return Some(Notification::VideoOp {
+                error: false,
+                detail: rest.trim_start().to_owned(),
+            });
         }
         if let Some(rest) = body.strip_prefix("Resource") {
             return Some(Notification::Resource(rest.trim_start().to_owned()));
@@ -231,14 +237,23 @@ where
             &resp,
             Response::Line { head, .. } if head.contains("PIX")
         );
-        session.send_raw(&format!("{{Version}} {}", PIX_VERSION)).await?;
-        Ok(ConnectOutcome { session, handler_detected })
+        session
+            .send_raw(&format!("{{Version}} {}", PIX_VERSION))
+            .await?;
+        Ok(ConnectOutcome {
+            session,
+            handler_detected,
+        })
     }
 
     /// Cap the per-segment file size in megabytes. xbmovie's default
     /// is 512 MB.
-    pub async fn limit_capture_size_mb(&mut self, megabytes: u32) -> Result<(), rootcause::Report<Error>> {
-        self.send_ok(&format!("{{LimitCaptureSize}} {}", megabytes)).await
+    pub async fn limit_capture_size_mb(
+        &mut self,
+        megabytes: u32,
+    ) -> Result<(), rootcause::Report<Error>> {
+        self.send_ok(&format!("{{LimitCaptureSize}} {}", megabytes))
+            .await
     }
 
     /// Pick the output file. Path is sent verbatim; xbmovie uses the
@@ -248,8 +263,12 @@ where
     /// signalled by a `PIX!{CaptureFileCreationEnded} <hresult>` on
     /// the notification channel and should be waited for before
     /// calling [`CaptureSession::begin_capture`].
-    pub async fn begin_capture_file_creation(&mut self, path: &str) -> Result<(), rootcause::Report<Error>> {
-        self.send_ok(&format!("{{BeginCaptureFileCreation}} {}", path)).await
+    pub async fn begin_capture_file_creation(
+        &mut self,
+        path: &str,
+    ) -> Result<(), rootcause::Report<Error>> {
+        self.send_ok(&format!("{{BeginCaptureFileCreation}} {}", path))
+            .await
     }
 
     pub async fn begin_capture(&mut self) -> Result<(), rootcause::Report<Error>> {
@@ -276,9 +295,14 @@ where
     async fn send_ok(&mut self, body: &str) -> Result<(), rootcause::Report<Error>> {
         let response = self.send_raw(body).await?;
         match response {
-            Response::Line { code: SuccessCode::Ok, head } => {
+            Response::Line {
+                code: SuccessCode::Ok,
+                head,
+            } => {
                 if head.contains("Cannot execute") {
-                    return Err(rootcause::Report::new(Error::from(PixError::Busy { message: head })));
+                    return Err(rootcause::Report::new(Error::from(PixError::Busy {
+                        message: head,
+                    })));
                 }
                 if head.contains("PIX") {
                     tracing::debug!(target: "openxbdm_client::pix", command = %body, %head, "pix ok");
@@ -290,7 +314,12 @@ where
             other => {
                 let mut msg = String::new();
                 let _ = write!(msg, "expected 200 PIX!OK, got {other:?}");
-                Err(rootcause::Report::new(Error::from(PixError::UnexpectedResponse { response: other })).attach(msg))
+                Err(
+                    rootcause::Report::new(Error::from(PixError::UnexpectedResponse {
+                        response: other,
+                    }))
+                    .attach(msg),
+                )
             }
         }
     }
@@ -320,23 +349,35 @@ mod tests {
 
     #[test]
     fn parses_capture_ended() {
-        assert_eq!(Notification::parse("PIX!{CaptureEnded}"), Some(Notification::CaptureEnded));
+        assert_eq!(
+            Notification::parse("PIX!{CaptureEnded}"),
+            Some(Notification::CaptureEnded)
+        );
     }
 
     #[test]
     fn parses_movie_data_bare() {
-        assert_eq!(Notification::parse("PIX!MovieData"), Some(Notification::MovieData(String::new())));
+        assert_eq!(
+            Notification::parse("PIX!MovieData"),
+            Some(Notification::MovieData(String::new()))
+        );
     }
 
     #[test]
     fn parses_video_op_variants() {
         assert_eq!(
             Notification::parse("PIX!VideoOpError timeout"),
-            Some(Notification::VideoOp { error: true, detail: "timeout".into() })
+            Some(Notification::VideoOp {
+                error: true,
+                detail: "timeout".into()
+            })
         );
         assert_eq!(
             Notification::parse("PIX!VideoOp paused"),
-            Some(Notification::VideoOp { error: false, detail: "paused".into() })
+            Some(Notification::VideoOp {
+                error: false,
+                detail: "paused".into()
+            })
         );
     }
 
@@ -357,7 +398,10 @@ mod tests {
             "PIX!NotActive ResourceCapture",
             "PIX!StartFailed ResourceCapture",
         ] {
-            assert!(matches!(Notification::parse(tok), Some(Notification::Status(_))));
+            assert!(matches!(
+                Notification::parse(tok),
+                Some(Notification::Status(_))
+            ));
         }
     }
 

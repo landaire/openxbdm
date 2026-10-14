@@ -136,7 +136,9 @@ pub struct DrivemapPersistReport {
 /// altaddr dispatch entry. All three are found by structural signatures
 /// anchored on stable string literals; addresses differ across builds
 /// but the shapes don't.
-pub async fn discover<T>(client: &mut Client<T, Connected>) -> Result<XbdmLayout, rootcause::Report<Error>>
+pub async fn discover<T>(
+    client: &mut Client<T, Connected>,
+) -> Result<XbdmLayout, rootcause::Report<Error>>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
@@ -148,18 +150,15 @@ where
 
     let pe = read_layout(client, module.base).await?;
 
-    let text = pe
-        .section(".text")
-        .cloned()
-        .ok_or_else(|| rootcause::Report::new(Error::from(DrivemapError::SectionMissing(".text"))))?;
-    let rdata = pe
-        .section(".rdata")
-        .cloned()
-        .ok_or_else(|| rootcause::Report::new(Error::from(DrivemapError::SectionMissing(".rdata"))))?;
-    let data = pe
-        .section(".data")
-        .cloned()
-        .ok_or_else(|| rootcause::Report::new(Error::from(DrivemapError::SectionMissing(".data"))))?;
+    let text = pe.section(".text").cloned().ok_or_else(|| {
+        rootcause::Report::new(Error::from(DrivemapError::SectionMissing(".text")))
+    })?;
+    let rdata = pe.section(".rdata").cloned().ok_or_else(|| {
+        rootcause::Report::new(Error::from(DrivemapError::SectionMissing(".rdata")))
+    })?;
+    let data = pe.section(".data").cloned().ok_or_else(|| {
+        rootcause::Report::new(Error::from(DrivemapError::SectionMissing(".data")))
+    })?;
 
     // Read the three sections we're going to interrogate.
     let rdata_bytes = read(client, rdata.address(pe.module_base), rdata.virtual_size).await?;
@@ -170,7 +169,13 @@ where
     let flag_global = locate_flag_global(&pe, &rdata, &rdata_bytes, &text_bytes)?;
     let altaddr_entry = locate_altaddr_entry(&pe, &rdata, &rdata_bytes, &data, &data_bytes)?;
 
-    Ok(XbdmLayout { module, pe, drivemap_fn, flag_global, altaddr_entry })
+    Ok(XbdmLayout {
+        module,
+        pe,
+        drivemap_fn,
+        flag_global,
+        altaddr_entry,
+    })
 }
 
 /// Locate the drivemap-setup function via its first call shape. We
@@ -211,18 +216,29 @@ fn locate_drivemap_fn(
             let start = match find_prologue(text_bytes, i) {
                 Some(off) => text_base.wrapping_add(off as u32),
                 None => {
-                    return Err(rootcause::Report::new(Error::from(DrivemapError::DrivemapPrologueMismatch)).attach(
-                        format!("signature at {call_site_addr:#010x} but no prologue within 64 bytes before"),
-                    ));
+                    return Err(rootcause::Report::new(Error::from(
+                        DrivemapError::DrivemapPrologueMismatch,
+                    ))
+                    .attach(format!(
+                        "signature at {call_site_addr:#010x} but no prologue within 64 bytes before"
+                    )));
                 }
             };
             return Ok(start);
         }
     }
-    Err(rootcause::Report::new(Error::from(DrivemapError::DrivemapFunctionNotFound)))
+    Err(rootcause::Report::new(Error::from(
+        DrivemapError::DrivemapFunctionNotFound,
+    )))
 }
 
-fn try_match_drivemap_call_site(window: &[u8], dev_hi: u16, dev_lo: i16, ntdev_hi: u16, ntdev_lo: i16) -> bool {
+fn try_match_drivemap_call_site(
+    window: &[u8],
+    dev_hi: u16,
+    dev_lo: i16,
+    ntdev_hi: u16,
+    ntdev_lo: i16,
+) -> bool {
     if window.len() < 24 {
         return false;
     }
@@ -273,10 +289,16 @@ fn try_match_drivemap_call_site(window: &[u8], dev_hi: u16, dev_lo: i16, ntdev_h
     matches!(bl.op, powerpc::Opcode::B) && bl.code & 1 == 1
 }
 
-/// If `ins` is `addi _, ra, simm` with `ra ∈ {rt1, rt2}` and
-/// `simm ∈ {dev_lo, ntdev_lo}`, return the `simm` matched; otherwise
+/// If `ins` is `addi _, ra, simm` with `ra` one of `rt1`, `rt2` and
+/// `simm` one of `dev_lo`, `ntdev_lo`, return the `simm` matched; otherwise
 /// `None`.
-fn match_addi_to_string(ins: &powerpc::Ins, rt1: u8, rt2: u8, dev_lo: i16, ntdev_lo: i16) -> Option<i16> {
+fn match_addi_to_string(
+    ins: &powerpc::Ins,
+    rt1: u8,
+    rt2: u8,
+    dev_lo: i16,
+    ntdev_lo: i16,
+) -> Option<i16> {
     for candidate in [dev_lo, ntdev_lo] {
         if let Some((_, ra)) = as_addi(ins, candidate)
             && (ra == rt1 || ra == rt2)
@@ -312,12 +334,14 @@ fn locate_flag_global(
         rootcause::Report::new(Error::from(DrivemapError::DrivemapFlagNotFound))
             .attach("literal \"internal\" not found in xbdm .rdata")
     })?;
-    let internal_addr = rdata.address(pe.module_base).wrapping_add(internal_off as u32);
+    let internal_addr = rdata
+        .address(pe.module_base)
+        .wrapping_add(internal_off as u32);
     let (_, int_lo) = crate::commands::dangerous::ppc::address_halves(internal_addr);
 
-    let data = pe
-        .section(".data")
-        .ok_or_else(|| rootcause::Report::new(Error::from(DrivemapError::SectionMissing(".data"))))?;
+    let data = pe.section(".data").ok_or_else(|| {
+        rootcause::Report::new(Error::from(DrivemapError::SectionMissing(".data")))
+    })?;
 
     // Walk .text one instruction at a time; when we find an `addi` that
     // completes a reference to "internal", look at other `addi`s in a
@@ -326,7 +350,8 @@ fn locate_flag_global(
     // candidate -- return the first one that passes.
     const WINDOW_INSNS: usize = 16;
     let total_insns = text_bytes.len() / 4;
-    let word = |idx: usize| u32::from_be_bytes(text_bytes[idx * 4..idx * 4 + 4].try_into().unwrap());
+    let word =
+        |idx: usize| u32::from_be_bytes(text_bytes[idx * 4..idx * 4 + 4].try_into().unwrap());
     for i in 0..total_insns {
         let ins = decode(word(i));
         if as_addi(&ins, int_lo).is_none() {
@@ -396,7 +421,9 @@ fn locate_flag_global(
             }
         }
     }
-    Err(rootcause::Report::new(Error::from(DrivemapError::DrivemapFlagNotFound)))
+    Err(rootcause::Report::new(Error::from(
+        DrivemapError::DrivemapFlagNotFound,
+    )))
 }
 
 fn combine_halves(hi: u16, lo: i16) -> u32 {
@@ -421,9 +448,9 @@ fn locate_altaddr_entry(
     let alt_addr = rdata.address(pe.module_base).wrapping_add(alt_off as u32);
     let needle = alt_addr.to_be_bytes();
 
-    let text = pe
-        .section(".text")
-        .ok_or_else(|| rootcause::Report::new(Error::from(DrivemapError::SectionMissing(".text"))))?;
+    let text = pe.section(".text").ok_or_else(|| {
+        rootcause::Report::new(Error::from(DrivemapError::SectionMissing(".text")))
+    })?;
 
     let hits = find_bytes_all(data_bytes, &needle, 4);
     for off in hits {
@@ -441,19 +468,27 @@ fn locate_altaddr_entry(
             });
         }
     }
-    Err(rootcause::Report::new(Error::from(DrivemapError::AltaddrEntryNotFound)))
+    Err(rootcause::Report::new(Error::from(
+        DrivemapError::AltaddrEntryNotFound,
+    )))
 }
 
 /// Query the current state: is the flag set, what drives are currently
 /// visible, where are the structural anchors.
-pub async fn status<T>(client: &mut Client<T, Connected>) -> Result<DrivemapStatus, rootcause::Report<Error>>
+pub async fn status<T>(
+    client: &mut Client<T, Connected>,
+) -> Result<DrivemapStatus, rootcause::Report<Error>>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     let layout = discover(client).await?;
     let flag_value = read_u32_be(client, layout.flag_global).await?;
     let visible_drives = client.run(DriveList).await.unwrap_or_default();
-    Ok(DrivemapStatus { layout, flag_value, visible_drives })
+    Ok(DrivemapStatus {
+        layout,
+        flag_value,
+        visible_drives,
+    })
 }
 
 /// The main event: swap altaddr's handler pointer to drivemap_fn,
@@ -497,19 +532,25 @@ where
     // .text. If it doesn't, we're probably looking at a console that
     // was left in a broken state from a prior run and we'd just be
     // moving the damage around.
-    let text = layout
-        .pe
-        .section(".text")
-        .ok_or_else(|| rootcause::Report::new(Error::from(DrivemapError::SectionMissing(".text"))))?;
+    let text = layout.pe.section(".text").ok_or_else(|| {
+        rootcause::Report::new(Error::from(DrivemapError::SectionMissing(".text")))
+    })?;
     if layout.altaddr_entry.current_handler < text.address(layout.pe.module_base)
         || layout.altaddr_entry.current_handler >= text.end(layout.pe.module_base)
     {
-        return Err(rootcause::Report::new(Error::from(DrivemapError::AltaddrHandlerOutsideText {
-            got: layout.altaddr_entry.current_handler,
-        })));
+        return Err(rootcause::Report::new(Error::from(
+            DrivemapError::AltaddrHandlerOutsideText {
+                got: layout.altaddr_entry.current_handler,
+            },
+        )));
     }
 
-    write_u32_be(&mut hijack_client, layout.altaddr_entry.handler_ptr_addr, layout.drivemap_fn).await?;
+    write_u32_be(
+        &mut hijack_client,
+        layout.altaddr_entry.handler_ptr_addr,
+        layout.drivemap_fn,
+    )
+    .await?;
 
     // Fire altaddr. This is expected to hit the timeout: drivemap_fn
     // doesn't format a valid xbdm response, so we never see CRLF. The
@@ -521,33 +562,56 @@ where
 
     let mut restore_client = reconnect().await?;
 
-    write_u32_be(&mut restore_client, layout.altaddr_entry.handler_ptr_addr, layout.altaddr_entry.current_handler)
-        .await?;
+    write_u32_be(
+        &mut restore_client,
+        layout.altaddr_entry.handler_ptr_addr,
+        layout.altaddr_entry.current_handler,
+    )
+    .await?;
     let observed = read_u32_be(&mut restore_client, layout.altaddr_entry.handler_ptr_addr).await?;
     if observed != layout.altaddr_entry.current_handler {
-        return Err(rootcause::Report::new(Error::from(DrivemapError::RestoreMismatch {
-            expected: layout.altaddr_entry.current_handler,
-            observed,
-        })));
+        return Err(rootcause::Report::new(Error::from(
+            DrivemapError::RestoreMismatch {
+                expected: layout.altaddr_entry.current_handler,
+                observed,
+            },
+        )));
     }
 
     write_u32_be(&mut restore_client, layout.flag_global, 1).await?;
 
     let drives_after = restore_client.run(DriveList).await.unwrap_or_default();
-    Ok(DrivemapEnableReport { layout, drives_before, drives_after, already_enabled: false })
+    Ok(DrivemapEnableReport {
+        layout,
+        drives_before,
+        drives_after,
+        already_enabled: false,
+    })
 }
 
 /// Write `\SystemRoot\recint.ini` so that `drivemap internal=1` sticks
 /// across reboots. Requires `enable` to have been run in the current
 /// session (otherwise the path isn't reachable).
-pub async fn persist<T>(client: &mut Client<T, Connected>) -> Result<DrivemapPersistReport, rootcause::Report<Error>>
+pub async fn persist<T>(
+    client: &mut Client<T, Connected>,
+) -> Result<DrivemapPersistReport, rootcause::Report<Error>>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     const BODY: &[u8] = b"[xbdm]\r\ndrivemap internal=1\r\n";
     const PATH: &str = "FLASH:\\recint.ini";
 
-    let upload = client.send_file(PATH, crate::commands::FileUploadKind::Create { size: BODY.len() as u64 }).await?;
+    let upload = client
+        .send_file(
+            PATH,
+            crate::commands::FileUploadKind::Create {
+                size: BODY.len() as u32,
+            },
+        )
+        .await?;
     upload.send_all(BODY).await?;
-    Ok(DrivemapPersistReport { path: PATH.to_owned(), bytes_written: BODY.len() as u64 })
+    Ok(DrivemapPersistReport {
+        path: PATH.to_owned(),
+        bytes_written: BODY.len() as u64,
+    })
 }

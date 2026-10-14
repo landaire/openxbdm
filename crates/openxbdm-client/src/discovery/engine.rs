@@ -166,7 +166,11 @@ impl Discovery {
     ///
     /// Returns [`NapError`] when the supplied name is too long or
     /// contains a control character that XBDM's name handler rejects.
-    pub fn lookup(name: impl Into<String>, config: DiscoveryConfig, start: Instant) -> Result<Self, NapError> {
+    pub fn lookup(
+        name: impl Into<String>,
+        config: DiscoveryConfig,
+        start: Instant,
+    ) -> Result<Self, NapError> {
         let name = name.into();
         let request = NapRequest::lookup(name.clone());
         Self::new(request, config, DiscoveryFilter::StopOnName(name), start)
@@ -210,8 +214,15 @@ impl Discovery {
             && at <= now
         {
             self.sends_left = self.sends_left.saturating_sub(1);
-            self.next_send_at = if self.sends_left > 0 { Some(now + self.retransmit_interval) } else { None };
-            return DiscoveryAction::SendDatagram { dest: self.destination, payload: self.encoded_request.clone() };
+            self.next_send_at = if self.sends_left > 0 {
+                Some(now + self.retransmit_interval)
+            } else {
+                None
+            };
+            return DiscoveryAction::SendDatagram {
+                dest: self.destination,
+                payload: self.encoded_request.clone(),
+            };
         }
         let until = match self.next_send_at {
             Some(t) => self.deadline.min(t),
@@ -233,10 +244,15 @@ impl Discovery {
         let Ok(reply) = parse_response(payload) else {
             return;
         };
-        let console = DiscoveredConsole { name: reply.name, addr: src };
+        let console = DiscoveredConsole {
+            name: reply.name,
+            addr: src,
+        };
         let keep = match &self.filter {
             DiscoveryFilter::All => true,
-            DiscoveryFilter::StopOnName(name) => &console.name == name,
+            // The console answers a lookup that matches its name ignoring
+            // ASCII case and replies with its own spelling.
+            DiscoveryFilter::StopOnName(name) => console.name.eq_ignore_ascii_case(name),
         };
         if !keep {
             return;
@@ -305,7 +321,10 @@ mod tests {
         let start = t0();
         let mut d = Discovery::broadcast(config_with(2, 400, 1500), start);
         // Initial send.
-        assert!(matches!(d.poll(start), DiscoveryAction::SendDatagram { .. }));
+        assert!(matches!(
+            d.poll(start),
+            DiscoveryAction::SendDatagram { .. }
+        ));
         // Before interval elapses: Wait.
         match d.poll(start + Duration::from_millis(200)) {
             DiscoveryAction::Wait { until } => {
@@ -314,9 +333,15 @@ mod tests {
             other => panic!("expected Wait, got {other:?}"),
         }
         // After interval: send #2.
-        assert!(matches!(d.poll(start + Duration::from_millis(400)), DiscoveryAction::SendDatagram { .. }));
+        assert!(matches!(
+            d.poll(start + Duration::from_millis(400)),
+            DiscoveryAction::SendDatagram { .. }
+        ));
         // Then send #3 at +800ms.
-        assert!(matches!(d.poll(start + Duration::from_millis(800)), DiscoveryAction::SendDatagram { .. }));
+        assert!(matches!(
+            d.poll(start + Duration::from_millis(800)),
+            DiscoveryAction::SendDatagram { .. }
+        ));
         // No more sends -- next event is the deadline.
         match d.poll(start + Duration::from_millis(900)) {
             DiscoveryAction::Wait { until } => {
@@ -379,7 +404,9 @@ mod tests {
         d.handle_inbound("10.0.0.5:730".parse().unwrap(), &xbox_reply("otherxbox"));
         d.handle_inbound("10.0.0.6:730".parse().unwrap(), &xbox_reply("deanxbox"));
         // Even though deadline is 1500ms out, we should be Done now.
-        let DiscoveryAction::Done(consoles) = d.poll(start) else { panic!("expected early Done") };
+        let DiscoveryAction::Done(consoles) = d.poll(start) else {
+            panic!("expected early Done")
+        };
         assert_eq!(consoles.len(), 1);
         assert_eq!(consoles[0].name, "deanxbox");
     }

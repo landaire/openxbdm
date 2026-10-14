@@ -25,6 +25,7 @@ use openxbdm_client::commands::DirList;
 use openxbdm_client::commands::DmVersion;
 use openxbdm_client::commands::DriveFreeSpace;
 use openxbdm_client::commands::DriveList;
+use openxbdm_client::commands::EofDisposition;
 use openxbdm_client::commands::FileEof;
 use openxbdm_client::commands::FileUploadKind;
 use openxbdm_client::commands::GetConsoleFeatures;
@@ -37,13 +38,13 @@ use openxbdm_client::commands::GetNetAddrs;
 use openxbdm_client::commands::GetPid;
 use openxbdm_client::commands::GetSocketInfo;
 use openxbdm_client::commands::IsStopped;
+use openxbdm_client::commands::MagicBoot;
 use openxbdm_client::commands::MakeDirectory;
 use openxbdm_client::commands::ModuleSections;
 use openxbdm_client::commands::Modules;
 use openxbdm_client::commands::PerfCounterList;
 use openxbdm_client::commands::QueryPerfCounter;
 use openxbdm_client::commands::Reboot;
-use openxbdm_client::commands::RebootFlags;
 use openxbdm_client::commands::Rename;
 use openxbdm_client::commands::SetMem;
 use openxbdm_client::commands::SysTime;
@@ -78,7 +79,11 @@ use openxbdm_client::transport::tokio::Target;
 use openxbdm_client::transport::tokio::connect_target_timeout;
 
 #[derive(Parser, Debug)]
-#[command(name = "openxbdm", about = "Async-first XBDM (Xbox Debug Monitor) client", version)]
+#[command(
+    name = "openxbdm",
+    about = "Async-first XBDM (Xbox Debug Monitor) client",
+    version
+)]
 struct Cli {
     /// Host, IP, or `host:port` of the target XBDM console.
     ///
@@ -151,6 +156,24 @@ enum SortOrder {
     Asc,
     /// Descending (Z-A, largest first, newest first).
     Desc,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum DataBreakKindArg {
+    Read,
+    Write,
+    #[value(alias = "rw")]
+    Readwrite,
+}
+
+impl From<DataBreakKindArg> for DataBreakKind {
+    fn from(kind: DataBreakKindArg) -> Self {
+        match kind {
+            DataBreakKindArg::Read => DataBreakKind::Read,
+            DataBreakKindArg::Write => DataBreakKind::Write,
+            DataBreakKindArg::Readwrite => DataBreakKind::ReadWrite,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -299,7 +322,7 @@ enum Command {
         kind: u32,
     },
 
-    /// List the sockets XBDM is currently tracking.
+    /// List the active sockets of the console network stack.
     Sockets,
 
     /// Report whether a thread id is halted, and why.
@@ -308,23 +331,39 @@ enum Command {
         thread: String,
     },
 
-    /// Reboot the console. Flags may be combined.
+    /// Reboot the console.
     Reboot {
-        /// Warm reboot: keep the current title loaded.
+        /// Stop at the title entry point after the reboot.
         #[arg(long)]
-        warm: bool,
-        /// Halt on entry so a debugger can attach before code runs.
-        #[arg(long = "stop")]
-        stop_on_start: bool,
-        /// Reboot without the debug monitor attached.
-        #[arg(long = "nodebug")]
-        no_debug: bool,
-        /// Block until the console comes back up on XBDM.
+        stop: bool,
+        /// Wait for a debugger connection after the reboot.
         #[arg(long)]
         wait: bool,
-        /// Launch this title after reboot instead of the default.
+        /// Reset through the system management controller.
+        #[arg(long = "smcreset")]
+        smc_reset: bool,
+    },
+
+    /// Launch a title, relaunching in place unless `--cold` is given.
+    Magicboot {
+        /// Always reboot the console.
+        #[arg(long)]
+        cold: bool,
+        /// Wait for a debugger connection after a reboot.
+        #[arg(long)]
+        wait: bool,
+        /// Stop at the title entry point after a reboot.
+        #[arg(long)]
+        stop: bool,
+        /// Drive path of the title image.
         #[arg(long)]
         title: Option<String>,
+        /// Drive path of the title directory.
+        #[arg(long)]
+        directory: Option<String>,
+        /// Title command line.
+        #[arg(long = "cmdline")]
+        cmd_line: Option<String>,
     },
 
     /// Set (or clear via `--nopersist`) the default title.
@@ -354,16 +393,16 @@ enum Command {
         clear: bool,
     },
 
-    /// Set or clear a data-access breakpoint (read / write / rw / exec).
+    /// Set or clear the hardware data breakpoint (read / write / readwrite).
     Databp {
         /// Watched address in hex (e.g. `0x8123ABCD`).
         address: String,
-        /// Size in bytes of the watched region.
+        /// Size in bytes of the watched region (at most 8, within one
+        /// aligned doubleword).
         size: u32,
-        /// Access kind to trap on: `read`, `write`, `readwrite`, or
-        /// `execute` (default `write`).
-        #[arg(long, default_value = "write")]
-        kind: String,
+        /// Access kind to trap on.
+        #[arg(long, value_enum, default_value_t = DataBreakKindArg::Write)]
+        kind: DataBreakKindArg,
         /// Remove the data breakpoint instead of setting it.
         #[arg(long)]
         clear: bool,
@@ -394,7 +433,10 @@ enum Command {
         /// `\Device\Harddisk0\Partition1\DEVKIT\<name>.xbm` and the
         /// handler produces numbered segment files `<name>N.xbm`. The
         /// default matches xbmovie's.
-        #[arg(long, default_value = r"\Device\Harddisk0\Partition1\DEVKIT\openxbdm_capture.xbm")]
+        #[arg(
+            long,
+            default_value = r"\Device\Harddisk0\Partition1\DEVKIT\openxbdm_capture.xbm"
+        )]
         remote: String,
         /// Per-segment size cap in megabytes. xbmovie's default is
         /// 12285 (effectively "whole HDD"); we match that.
@@ -535,13 +577,13 @@ enum FileCommand {
         /// the local destination.
         #[arg(short, long)]
         recursive: bool,
-        /// Optional start offset. File mode only.
+        /// Optional start offset. Without `--size`, reads to the end of
+        /// the file. File mode only.
         #[arg(long)]
-        offset: Option<u64>,
-        /// Optional byte count (required if `--offset` is set). File
-        /// mode only.
-        #[arg(long)]
-        size: Option<u64>,
+        offset: Option<u32>,
+        /// Optional byte count; requires `--offset`. File mode only.
+        #[arg(long, requires = "offset")]
+        size: Option<std::num::NonZeroU32>,
     },
 
     /// Upload a local file to a console path.
@@ -560,20 +602,24 @@ enum FileCommand {
         /// Existing remote file to patch.
         remote: String,
         /// Byte offset in the remote file where the write begins.
-        offset: u64,
+        offset: u32,
         /// Number of bytes to read from `local` and write.
-        length: u64,
+        length: u32,
     },
 
-    /// Truncate or extend a file on the console.
+    /// Set the end of file of a file on the console.
     Fileeof {
         /// Remote file path.
         path: String,
         /// New end-of-file size in bytes.
-        size: u64,
-        /// Create the file if it doesn't already exist.
+        size: u32,
+        /// Create the file; fail if it already exists.
+        #[arg(long, conflicts_with = "cancreate")]
+        mustcreate: bool,
+        /// Create the file if it is missing; an existing file is truncated
+        /// before the size is applied.
         #[arg(long)]
-        create: bool,
+        cancreate: bool,
     },
 }
 
@@ -672,7 +718,10 @@ fn main() -> ExitCode {
         .with_target(false)
         .init();
 
-    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("failed to build tokio runtime: {e}");
@@ -704,24 +753,38 @@ impl UiCtx {
         ui::transfer_bar(total, label, self.no_progress)
     }
     fn fmt_bytes(&self, n: u64) -> String {
-        if self.raw_bytes { n.to_string() } else { humanize_bytes(n) }
+        if self.raw_bytes {
+            n.to_string()
+        } else {
+            humanize_bytes(n)
+        }
     }
     /// Render a `FileTime` for humans as a local-time ISO-8601 string
     /// ("2026-04-20 15:42:10"). Falls back to the raw FILETIME hex only
     /// if the value is outside jiff's representable range.
     fn fmt_time(&self, ft: openxbdm_client::FileTime) -> String {
         match ft.into_jiff_timestamp() {
-            Ok(ts) => ts.to_zoned(jiff::tz::TimeZone::system()).strftime("%Y-%m-%d %H:%M:%S").to_string(),
+            Ok(ts) => ts
+                .to_zoned(jiff::tz::TimeZone::system())
+                .strftime("%Y-%m-%d %H:%M:%S")
+                .to_string(),
             Err(_) => format!("{:#018x}", ft.as_raw()),
         }
     }
 }
 
-fn sort_dir_entries(entries: &mut [openxbdm_client::commands::DirEntry], sort_by: LsSortBy, order: SortOrder) {
+fn sort_dir_entries(
+    entries: &mut [openxbdm_client::commands::DirEntry],
+    sort_by: LsSortBy,
+    order: SortOrder,
+) {
     use core::cmp::Ordering;
     entries.sort_by(|a, b| {
         let primary = match sort_by {
-            LsSortBy::Name => a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()),
+            LsSortBy::Name => a
+                .name
+                .to_ascii_lowercase()
+                .cmp(&b.name.to_ascii_lowercase()),
             LsSortBy::Size => a.size.cmp(&b.size),
             LsSortBy::Kind => a.is_directory.cmp(&b.is_directory),
             LsSortBy::Modified => a.change_time.as_raw().cmp(&b.change_time.as_raw()),
@@ -735,7 +798,9 @@ fn sort_dir_entries(entries: &mut [openxbdm_client::commands::DirEntry], sort_by
             return ordered;
         }
         // Stable tie-breaker: name ascending so adjacent equal keys stay readable.
-        a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase())
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
     });
 }
 
@@ -754,10 +819,17 @@ fn humanize_bytes(n: u64) -> String {
 }
 
 async fn run(cli: Cli) -> Result<(), rootcause::Report<Error>> {
-    let ui = UiCtx { format: cli.format, no_progress: cli.no_progress, raw_bytes: cli.bytes };
+    let ui = UiCtx {
+        format: cli.format,
+        no_progress: cli.no_progress,
+        raw_bytes: cli.bytes,
+    };
 
     match &cli.cmd {
-        Command::Discover { listen_ms, broadcast } => {
+        Command::Discover {
+            listen_ms,
+            broadcast,
+        } => {
             return run_discover(*listen_ms, broadcast.as_deref(), ui).await;
         }
         Command::Resolve { name, listen_ms } => {
@@ -773,8 +845,10 @@ async fn run(cli: Cli) -> Result<(), rootcause::Report<Error>> {
     }
 
     let host = cli.host.as_deref().ok_or_else(|| {
-        rootcause::Report::new(Error::from(openxbdm_client::error::ArgumentError::EmptyFilename))
-            .attach("--host is required for this subcommand")
+        rootcause::Report::new(Error::from(
+            openxbdm_client::error::ArgumentError::EmptyFilename,
+        ))
+        .attach("--host is required for this subcommand")
     })?;
     let target = Target::parse(host, cli.port);
     let conn_timeout = Duration::from_secs(cli.timeout);
@@ -800,7 +874,13 @@ async fn run(cli: Cli) -> Result<(), rootcause::Report<Error>> {
         Command::PixNotify { duration, log } => {
             return run_pix_notify(&target, conn_timeout, *duration, log.clone()).await;
         }
-        Command::Capture { remote, size_limit_mb, duration, output_dir, no_conversion } => {
+        Command::Capture {
+            remote,
+            size_limit_mb,
+            duration,
+            output_dir,
+            no_conversion,
+        } => {
             return run_capture(
                 &target,
                 conn_timeout,
@@ -833,7 +913,10 @@ async fn run(cli: Cli) -> Result<(), rootcause::Report<Error>> {
 }
 
 #[cfg(feature = "dangerous")]
-async fn run_drivemap_enable(target: &Target, conn_timeout: Duration) -> Result<(), rootcause::Report<Error>> {
+async fn run_drivemap_enable(
+    target: &Target,
+    conn_timeout: Duration,
+) -> Result<(), rootcause::Report<Error>> {
     let hijack_transport = connect_target_timeout(target, conn_timeout).await?;
     let hijack = Client::new(hijack_transport).read_banner().await?;
 
@@ -853,7 +936,11 @@ async fn run_drivemap_enable(target: &Target, conn_timeout: Duration) -> Result<
             "{} drivemap flag already set; skipped hijack. {} drive{} visible.",
             ok_tag("no-op"),
             report.drives_after.len(),
-            if report.drives_after.len() == 1 { "" } else { "s" }
+            if report.drives_after.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
         );
     } else {
         eprintln!(
@@ -876,7 +963,9 @@ async fn run_nand_dump(
     output: Option<String>,
     ui: UiCtx,
 ) -> Result<(), rootcause::Report<Error>> {
-    let output_path = output.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("nand.bin"));
+    let output_path = output
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nand.bin"));
 
     // Quick probe: if FLASH is already in the drivelist we can skip the
     // hijack entirely. Saves the full .text/.rdata/.data readback that
@@ -888,7 +977,10 @@ async fn run_nand_dump(
     let _ = probe.bye().await;
 
     if !flash_visible {
-        eprintln!("{} FLASH: not mounted; running drivemap-enable first", warn_tag("note:"));
+        eprintln!(
+            "{} FLASH: not mounted; running drivemap-enable first",
+            warn_tag("note:")
+        );
         let hijack_transport = connect_target_timeout(target, conn_timeout).await?;
         let hijack = Client::new(hijack_transport).read_banner().await?;
         let target_for_reconnect = target.clone();
@@ -901,9 +993,15 @@ async fn run_nand_dump(
             }
         };
         let report = dm::enable(hijack, reconnect, Duration::from_secs(3)).await?;
-        if !report.drives_after.iter().any(|d| d.eq_ignore_ascii_case("flash")) {
-            return Err(rootcause::Report::new(Error::from(openxbdm_client::error::ArgumentError::EmptyFilename))
-                .attach("drivemap-enable completed but FLASH: is still not mounted"));
+        if !report
+            .drives_after
+            .iter()
+            .any(|d| d.eq_ignore_ascii_case("flash"))
+        {
+            return Err(rootcause::Report::new(Error::from(
+                openxbdm_client::error::ArgumentError::EmptyFilename,
+            ))
+            .attach("drivemap-enable completed but FLASH: is still not mounted"));
         }
     }
 
@@ -912,9 +1010,19 @@ async fn run_nand_dump(
     // Bypass the stat-based directory check -- xbdm serves the raw
     // NAND image when `FLASH:\` is getfile'd even though stat reports
     // it as a directory.
-    let DownloadResult { copied, total } =
-        download_single_file(&mut dl_client, "FLASH:\\", &output_path, GetFileRange::WholeFile, ui).await?;
-    eprintln!("{} NAND dump: {copied} bytes ({total} declared) to {}", ok_tag("done"), output_path.display());
+    let DownloadResult { copied, total } = download_single_file(
+        &mut dl_client,
+        "FLASH:\\",
+        &output_path,
+        GetFileRange::WholeFile,
+        ui,
+    )
+    .await?;
+    eprintln!(
+        "{} NAND dump: {copied} bytes ({total} declared) to {}",
+        ok_tag("done"),
+        output_path.display()
+    );
     let _ = dl_client.bye().await;
     Ok(())
 }
@@ -932,7 +1040,11 @@ where
     }
 }
 
-async fn drive<T>(client: Client<T>, cmd: Command, ui: UiCtx) -> Result<(), rootcause::Report<Error>>
+async fn drive<T>(
+    client: Client<T>,
+    cmd: Command,
+    ui: UiCtx,
+) -> Result<(), rootcause::Report<Error>>
 where
     T: futures_io::AsyncRead + futures_io::AsyncWrite + Unpin,
 {
@@ -1036,7 +1148,11 @@ where
         Command::Df { drive } => {
             let client = &mut client;
             Box::pin(async move {
-                let space = client.run(DriveFreeSpace { drive: drive.clone() }).await?;
+                let space = client
+                    .run(DriveFreeSpace {
+                        drive: drive.clone(),
+                    })
+                    .await?;
                 if ui.pretty() {
                     #[derive(Tabled)]
                     struct Row {
@@ -1045,9 +1161,18 @@ where
                         size: String,
                     }
                     let rows = vec![
-                        Row { key: "free_to_caller".into(), size: ui.fmt_bytes(space.free_to_caller_bytes) },
-                        Row { key: "total".into(), size: ui.fmt_bytes(space.total_bytes) },
-                        Row { key: "total_free".into(), size: ui.fmt_bytes(space.total_free_bytes) },
+                        Row {
+                            key: "free_to_caller".into(),
+                            size: ui.fmt_bytes(space.free_to_caller_bytes),
+                        },
+                        Row {
+                            key: "total".into(),
+                            size: ui.fmt_bytes(space.total_bytes),
+                        },
+                        Row {
+                            key: "total_free".into(),
+                            size: ui.fmt_bytes(space.total_free_bytes),
+                        },
                     ];
                     print_colored_table(&heading_label(&format!("df {drive}"), &ui), rows, &ui);
                 } else {
@@ -1066,10 +1191,18 @@ where
             let client = &mut client;
             Box::pin(async move {
                 match fc {
-                    FileCommand::Tree { path, max_depth, dirs_only } => {
+                    FileCommand::Tree {
+                        path,
+                        max_depth,
+                        dirs_only,
+                    } => {
                         run_tree(client, path, max_depth, !dirs_only, ui).await?;
                     }
-                    FileCommand::Ls { path, sort_by, sort_order } => {
+                    FileCommand::Ls {
+                        path,
+                        sort_by,
+                        sort_order,
+                    } => {
                         let mut entries = client.run(DirList { path: path.clone() }).await?;
                         sort_dir_entries(&mut entries, sort_by, sort_order);
                         if ui.pretty() {
@@ -1085,18 +1218,34 @@ where
                                 .iter()
                                 .map(|e| Row {
                                     name: e.name.clone(),
-                                    size: if e.is_directory { "-".into() } else { ui.fmt_bytes(e.size) },
-                                    kind: if e.is_directory { "DIR".into() } else { "FILE".into() },
+                                    size: if e.is_directory {
+                                        "-".into()
+                                    } else {
+                                        ui.fmt_bytes(e.size)
+                                    },
+                                    kind: if e.is_directory {
+                                        "DIR".into()
+                                    } else {
+                                        "FILE".into()
+                                    },
                                     changed: ui.fmt_time(e.change_time),
                                 })
                                 .collect();
-                            print_colored_table(&heading_label(&format!("ls {path}"), &ui), rows, &ui);
+                            print_colored_table(
+                                &heading_label(&format!("ls {path}"), &ui),
+                                rows,
+                                &ui,
+                            );
                         } else {
                             for entry in entries {
                                 println!(
                                     "{}\t{}\t{}\t{}",
                                     entry.name,
-                                    if entry.is_directory { "-".into() } else { ui.fmt_bytes(entry.size) },
+                                    if entry.is_directory {
+                                        "-".into()
+                                    } else {
+                                        ui.fmt_bytes(entry.size)
+                                    },
                                     if entry.is_directory { "DIR" } else { "FILE" },
                                     ui.fmt_time(entry.change_time),
                                 );
@@ -1107,7 +1256,11 @@ where
                         let attrs = client.run(GetFileAttributes { path }).await?;
                         println!(
                             "size={} created={} changed={} is_directory={}",
-                            if attrs.is_directory { "-".into() } else { ui.fmt_bytes(attrs.size) },
+                            if attrs.is_directory {
+                                "-".into()
+                            } else {
+                                ui.fmt_bytes(attrs.size)
+                            },
                             ui.fmt_time(attrs.create_time),
                             ui.fmt_time(attrs.change_time),
                             attrs.is_directory,
@@ -1117,13 +1270,29 @@ where
                         client.run(MakeDirectory { path }).await?;
                     }
                     FileCommand::Rm { path, dir } => {
-                        client.run(Delete { path, is_directory: dir }).await?;
+                        client
+                            .run(Delete {
+                                path,
+                                is_directory: dir,
+                            })
+                            .await?;
                     }
                     FileCommand::Mv { from, to } => {
                         client.run(Rename { from, to }).await?;
                     }
-                    FileCommand::Get { remote, output, recursive, offset, size } => {
-                        let attrs = client.run(GetFileAttributes { path: remote.clone() }).await.ok();
+                    FileCommand::Get {
+                        remote,
+                        output,
+                        recursive,
+                        offset,
+                        size,
+                    } => {
+                        let attrs = client
+                            .run(GetFileAttributes {
+                                path: remote.clone(),
+                            })
+                            .await
+                            .ok();
                         let is_directory = attrs.as_ref().map(|a| a.is_directory).unwrap_or(false);
 
                         if is_directory {
@@ -1131,20 +1300,26 @@ where
                                 return Err(rootcause::Report::new(Error::from(
                                     openxbdm_client::error::ArgumentError::EmptyFilename,
                                 ))
-                                .attach(format!("{remote:?} is a directory; pass -r for recursive download")));
+                                .attach(format!(
+                                    "{remote:?} is a directory; pass -r for recursive download"
+                                )));
                             }
                             if offset.is_some() || size.is_some() {
                                 return Err(rootcause::Report::new(Error::from(
                                     openxbdm_client::error::ArgumentError::EmptyFilename,
                                 ))
-                                .attach("--offset / --size are file-mode only, not valid with -r"));
+                                .attach(
+                                    "--offset / --size are file-mode only, not valid with -r",
+                                ));
                             }
                             let root = resolve_get_dir_output(&remote, output.as_deref())?;
                             tokio::fs::create_dir_all(&root)
                                 .await
                                 .map_err(Error::from)
                                 .into_report()
-                                .attach_with(|| format!("creating local directory {}", root.display()))?;
+                                .attach_with(|| {
+                                    format!("creating local directory {}", root.display())
+                                })?;
                             let mut stats = RecursiveGetStats::default();
                             download_dir_recursive(client, &remote, &root, ui, &mut stats).await?;
                             eprintln!(
@@ -1156,19 +1331,14 @@ where
                                 root.display()
                             );
                         } else {
-                            let range = match (offset, size) {
-                                (Some(offset), Some(size)) => GetFileRange::Range { offset, size },
-                                (None, None) => GetFileRange::WholeFile,
-                                _ => {
-                                    return Err(rootcause::Report::new(Error::from(
-                                        openxbdm_client::error::ArgumentError::EmptyFilename,
-                                    ))
-                                    .attach("--offset and --size must be provided together"));
-                                }
+                            let range = match offset {
+                                Some(offset) => GetFileRange::Range { offset, size },
+                                None => GetFileRange::WholeFile,
                             };
                             let output_path = resolve_get_output(&remote, output.as_deref())?;
                             let DownloadResult { copied, total } =
-                                download_single_file(client, &remote, &output_path, range, ui).await?;
+                                download_single_file(client, &remote, &output_path, range, ui)
+                                    .await?;
                             eprintln!(
                                 "{} {copied} bytes ({total} declared) to {}",
                                 ok_tag("downloaded"),
@@ -1181,37 +1351,82 @@ where
                             .map_err(Error::from)
                             .into_report()
                             .attach_with(|| format!("stat local file {local:?}"))?;
-                        let size = metadata.len();
+                        let size = u32::try_from(metadata.len())
+                            .map_err(|_| {
+                                Error::from(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    "sendfile lengths are 32-bit",
+                                ))
+                            })
+                            .into_report()
+                            .attach_with(|| {
+                                format!("local file {local:?} is {} bytes", metadata.len())
+                            })?;
                         let mut file = tokio::fs::File::open(&local)
                             .await
                             .map_err(Error::from)
                             .into_report()
                             .attach_with(|| format!("opening local file {local:?}"))?;
-                        let upload = client.send_file(&remote, FileUploadKind::Create { size }).await?;
-                        let bar = ui.progress(size, "upload");
+                        let upload = client
+                            .send_file(&remote, FileUploadKind::Create { size })
+                            .await?;
+                        let bar = ui.progress(u64::from(size), "upload");
                         let compat = tokio_util::compat::TokioAsyncReadCompatExt::compat(&mut file);
                         let mut tracked = ProgressRead::new(compat, bar.clone());
                         upload.copy_from(&mut tracked).await?;
                         bar.finish_and_clear();
                         eprintln!("{} {size} bytes to {remote}", ok_tag("uploaded"));
                     }
-                    FileCommand::Writeto { local, remote, offset, length } => {
+                    FileCommand::Writeto {
+                        local,
+                        remote,
+                        offset,
+                        length,
+                    } => {
                         let mut file = tokio::fs::File::open(&local)
                             .await
                             .map_err(Error::from)
                             .into_report()
                             .attach_with(|| format!("opening local file {local:?}"))?;
-                        let upload =
-                            client.send_file(&remote, FileUploadKind::WriteAt { offset, size: length }).await?;
-                        let bar = ui.progress(length, "write");
+                        let upload = client
+                            .send_file(
+                                &remote,
+                                FileUploadKind::WriteAt {
+                                    offset,
+                                    size: length,
+                                },
+                            )
+                            .await?;
+                        let bar = ui.progress(u64::from(length), "write");
                         let compat = tokio_util::compat::TokioAsyncReadCompatExt::compat(&mut file);
                         let mut tracked = ProgressRead::new(compat, bar.clone());
                         upload.copy_from(&mut tracked).await?;
                         bar.finish_and_clear();
-                        eprintln!("{} {length} bytes at offset {offset} in {remote}", ok_tag("wrote"));
+                        eprintln!(
+                            "{} {length} bytes at offset {offset} in {remote}",
+                            ok_tag("wrote")
+                        );
                     }
-                    FileCommand::Fileeof { path, size, create } => {
-                        client.run(FileEof { path, size, create_if_missing: create }).await?;
+                    FileCommand::Fileeof {
+                        path,
+                        size,
+                        mustcreate,
+                        cancreate,
+                    } => {
+                        let disposition = if mustcreate {
+                            EofDisposition::CreateNew
+                        } else if cancreate {
+                            EofDisposition::CreateOrTruncate
+                        } else {
+                            EofDisposition::OpenExisting
+                        };
+                        client
+                            .run(FileEof {
+                                path,
+                                size,
+                                disposition,
+                            })
+                            .await?;
                     }
                 }
                 Ok::<(), rootcause::Report<Error>>(())
@@ -1240,7 +1455,7 @@ where
             let client = &mut client;
             Box::pin(async move {
                 let mem = client.run(GetConsoleMem).await?;
-                println!("class={:#04x}", mem.class);
+                println!("{mem:?}");
                 Ok::<(), rootcause::Report<Error>>(())
             })
             .await?;
@@ -1310,16 +1525,25 @@ where
                 let module_info = modules
                     .into_iter()
                     .find(|candidate| candidate.name.eq_ignore_ascii_case(&module))
-                    .ok_or_else(|| rootcause::Report::new(Error::ModuleNotFound { name: module.clone() }))?;
+                    .ok_or_else(|| {
+                        rootcause::Report::new(Error::ModuleNotFound {
+                            name: module.clone(),
+                        })
+                    })?;
                 if module_info.size == 0 {
-                    return Err(rootcause::Report::new(Error::EmptyModule { name: module_info.name }));
+                    return Err(rootcause::Report::new(Error::EmptyModule {
+                        name: module_info.name,
+                    }));
                 }
-                module_info.base.checked_add(module_info.size - 1).ok_or_else(|| {
-                    rootcause::Report::new(Error::ModuleRangeOverflow {
-                        base: module_info.base,
-                        size: module_info.size,
-                    })
-                })?;
+                module_info
+                    .base
+                    .checked_add(module_info.size - 1)
+                    .ok_or_else(|| {
+                        rootcause::Report::new(Error::ModuleRangeOverflow {
+                            base: module_info.base,
+                            size: module_info.size,
+                        })
+                    })?;
 
                 let mut file = tokio::fs::File::create(&output)
                     .await
@@ -1330,7 +1554,10 @@ where
                 let mut offset = 0u32;
                 while offset < module_info.size {
                     let length = (module_info.size - offset).min(0x1000);
-                    let address = module_info.base.checked_add(offset).expect("module range was validated");
+                    let address = module_info
+                        .base
+                        .checked_add(offset)
+                        .expect("module range was validated");
                     let snapshot = client.run(GetMem { address, length }).await?;
                     if let Some(relative) = snapshot.unmapped_offsets.first() {
                         return Err(rootcause::Report::new(Error::UnmappedModuleMemory {
@@ -1365,7 +1592,11 @@ where
         Command::Modsections { module } => {
             let client = &mut client;
             Box::pin(async move {
-                let sections = client.run(ModuleSections { module: module.clone() }).await?;
+                let sections = client
+                    .run(ModuleSections {
+                        module: module.clone(),
+                    })
+                    .await?;
                 if ui.pretty() {
                     #[derive(Tabled)]
                     struct Row {
@@ -1394,7 +1625,11 @@ where
                             ),
                         })
                         .collect();
-                    print_colored_table(&heading_label(&format!("modsections {module}"), &ui), rows, &ui);
+                    print_colored_table(
+                        &heading_label(&format!("modsections {module}"), &ui),
+                        rows,
+                        &ui,
+                    );
                 } else {
                     for s in sections {
                         println!(
@@ -1498,7 +1733,12 @@ where
             Box::pin(async move {
                 let addr = parse_u32(&address).map_err(|e| attach_hint(e, "--address"))?;
                 let len = parse_u32(&length).map_err(|e| attach_hint(e, "--length"))?;
-                let snap = client.run(GetMem { address: addr, length: len }).await?;
+                let snap = client
+                    .run(GetMem {
+                        address: addr,
+                        length: len,
+                    })
+                    .await?;
                 print_hex_dump(snap.address, &snap.data, &snap.unmapped_offsets);
                 Ok::<(), rootcause::Report<Error>>(())
             })
@@ -1517,7 +1757,10 @@ where
                     }
                     let rows: Vec<Row> = counters
                         .iter()
-                        .map(|c| Row { kind: format!("{:#010x}", c.kind), name: c.name.clone() })
+                        .map(|c| Row {
+                            kind: format!("{:#010x}", c.kind),
+                            name: c.name.clone(),
+                        })
                         .collect();
                     print_colored_table(&heading_label("pclist", &ui), rows, &ui);
                 } else {
@@ -1533,7 +1776,10 @@ where
             let client = &mut client;
             Box::pin(async move {
                 let sample = client.run(QueryPerfCounter { name, kind }).await?;
-                println!("type={:#010x} value={} rate={}", sample.kind, sample.value, sample.rate);
+                println!(
+                    "type={:#010x} value={} rate={}",
+                    sample.kind, sample.value, sample.rate
+                );
                 Ok::<(), rootcause::Report<Error>>(())
             })
             .await?;
@@ -1546,13 +1792,13 @@ where
                     #[derive(Tabled)]
                     struct Row {
                         handle: String,
-                        af: u32,
+                        af: i32,
                         #[tabled(rename = "type")]
-                        sock_type: u32,
-                        proto: u32,
+                        sock_type: i32,
+                        proto: i32,
                         local: String,
                         remote: String,
-                        tcpstate: u32,
+                        tcpstate: u8,
                         flags: String,
                     }
                     let rows: Vec<Row> = sockets
@@ -1600,15 +1846,18 @@ where
             })
             .await?;
         }
-        Command::Reboot { warm, stop_on_start, no_debug, wait, title } => {
+        Command::Reboot {
+            stop,
+            wait,
+            smc_reset,
+        } => {
             let client = &mut client;
             Box::pin(async move {
                 client
                     .run(Reboot {
-                        flags: RebootFlags { warm, stop_on_start, no_debug, wait },
-                        title,
-                        directory: None,
-                        cmd_line: None,
+                        stop,
+                        wait,
+                        smc_reset,
                     })
                     .await?;
                 println!("reboot issued");
@@ -1616,10 +1865,41 @@ where
             })
             .await?;
         }
+        Command::Magicboot {
+            cold,
+            wait,
+            stop,
+            title,
+            directory,
+            cmd_line,
+        } => {
+            let client = &mut client;
+            Box::pin(async move {
+                client
+                    .run(MagicBoot {
+                        cold,
+                        wait,
+                        stop,
+                        title,
+                        directory,
+                        cmd_line,
+                    })
+                    .await?;
+                println!("launch issued");
+                Ok::<(), rootcause::Report<Error>>(())
+            })
+            .await?;
+        }
         Command::SetTitle { nopersist, name } => {
             let client = &mut client;
             Box::pin(async move {
-                let cmd = if nopersist { Title::NoPersist } else { Title::Set { name: name.unwrap_or_default() } };
+                let cmd = if nopersist {
+                    Title::NoPersist
+                } else {
+                    Title::Set {
+                        name: name.unwrap_or_default(),
+                    }
+                };
                 client.run(cmd).await?;
                 Ok::<(), rootcause::Report<Error>>(())
             })
@@ -1632,7 +1912,12 @@ where
                 let data = decode_hex(&hex)
                     .map_err(rootcause::Report::new)
                     .attach_with(|| format!("decoding --data {hex:?}"))?;
-                let result = client.run(SetMem { address: addr, data }).await?;
+                let result = client
+                    .run(SetMem {
+                        address: addr,
+                        data,
+                    })
+                    .await?;
                 println!("requested={} written={}", result.requested, result.written);
                 Ok::<(), rootcause::Report<Error>>(())
             })
@@ -1642,28 +1927,33 @@ where
             let client = &mut client;
             Box::pin(async move {
                 let addr = parse_u32(&address).map_err(rootcause::Report::new)?;
-                client.run(Breakpoint { address: addr, clear }).await?;
+                client
+                    .run(Breakpoint {
+                        address: addr,
+                        clear,
+                    })
+                    .await?;
                 Ok::<(), rootcause::Report<Error>>(())
             })
             .await?;
         }
-        Command::Databp { address, size, kind, clear } => {
+        Command::Databp {
+            address,
+            size,
+            kind,
+            clear,
+        } => {
             let client = &mut client;
             Box::pin(async move {
                 let addr = parse_u32(&address).map_err(rootcause::Report::new)?;
-                let kind = match kind.to_ascii_lowercase().as_str() {
-                    "read" => DataBreakKind::Read,
-                    "write" => DataBreakKind::Write,
-                    "readwrite" | "rw" => DataBreakKind::ReadWrite,
-                    "execute" | "exec" => DataBreakKind::Execute,
-                    _ => {
-                        return Err(rootcause::Report::new(Error::from(
-                            openxbdm_client::error::ArgumentError::EmptyFilename,
-                        ))
-                        .attach("kind must be one of read/write/readwrite/execute"));
-                    }
-                };
-                client.run(DataBreakpoint { address: addr, size, kind, clear }).await?;
+                client
+                    .run(DataBreakpoint {
+                        address: addr,
+                        size,
+                        kind: kind.into(),
+                        clear,
+                    })
+                    .await?;
                 Ok::<(), rootcause::Report<Error>>(())
             })
             .await?;
@@ -1689,12 +1979,16 @@ where
                         .attach_with(|| format!("writing raw framebuffer to {output}"))?;
                     let sidecar = format!("{output}.meta");
                     let meta_text = format!(
-                        "pitch={}\nwidth={}\nheight={}\nformat={:?}\nframebuffer_size={}\npitch_hex={:#010x}\nformat_raw={:#010x}\n",
+                        "pitch={}\nwidth={}\nheight={}\nformat={:?}\noffset_x={}\noffset_y={}\nframebuffer_size={}\nshown_width={}\nshown_height={}\npitch_hex={:#010x}\nformat_raw={:#010x}\n",
                         meta.pitch,
                         meta.width,
                         meta.height,
                         meta.format,
+                        meta.offset_x,
+                        meta.offset_y,
                         meta.framebuffer_size,
+                        meta.shown_width,
+                        meta.shown_height,
                         meta.pitch,
                         meta.format.raw()
                     );
@@ -1707,15 +2001,11 @@ where
                         ok_tag("wrote"),
                     );
                 } else {
-                    let rgba = shot.to_rgba8().ok_or_else(|| {
-                        rootcause::Report::new(Error::from(
-                            openxbdm_client::error::ArgumentError::EmptyFilename,
-                        ))
-                        .attach(format!(
-                            "cannot convert format {:?} to PNG without de-tiling; re-run with --raw",
-                            meta.format
-                        ))
-                    })?;
+                    let rgba = shot
+                        .to_rgba8()
+                        .map_err(Error::from)
+                        .into_report()
+                        .attach("decoding screenshot; re-run with --raw to keep the tiled body")?;
                     let buffer = image::RgbaImage::from_raw(meta.width, meta.height, rgba)
                         .ok_or_else(|| {
                             rootcause::Report::new(Error::from(
@@ -1872,10 +2162,23 @@ where
                 .map_err(Error::from)
                 .into_report()
                 .attach_with(|| format!("creating local directory {}", child_local.display()))?;
-            Box::pin(download_dir_recursive(client, &child_remote, &child_local, ui, stats)).await?;
+            Box::pin(download_dir_recursive(
+                client,
+                &child_remote,
+                &child_local,
+                ui,
+                stats,
+            ))
+            .await?;
         } else {
-            let DownloadResult { copied, .. } =
-                download_single_file(client, &child_remote, &child_local, GetFileRange::WholeFile, ui).await?;
+            let DownloadResult { copied, .. } = download_single_file(
+                client,
+                &child_remote,
+                &child_local,
+                GetFileRange::WholeFile,
+                ui,
+            )
+            .await?;
             stats.files += 1;
             stats.bytes += copied;
         }
@@ -1883,7 +2186,10 @@ where
     Ok(())
 }
 
-fn resolve_get_dir_output(remote: &str, output: Option<&str>) -> Result<PathBuf, rootcause::Report<Error>> {
+fn resolve_get_dir_output(
+    remote: &str,
+    output: Option<&str>,
+) -> Result<PathBuf, rootcause::Report<Error>> {
     let basename = remote_basename(remote).unwrap_or_else(|| "download".to_owned());
     match output {
         None => Ok(PathBuf::from(basename)),
@@ -1892,7 +2198,11 @@ fn resolve_get_dir_output(remote: &str, output: Option<&str>) -> Result<PathBuf,
             // If the user gave us an existing directory, drop the tree
             // inside it (rather than overwriting). Otherwise use the
             // path verbatim as the root.
-            if p.is_dir() { Ok(p.join(basename)) } else { Ok(p) }
+            if p.is_dir() {
+                Ok(p.join(basename))
+            } else {
+                Ok(p)
+            }
         }
     }
 }
@@ -1901,19 +2211,31 @@ fn remote_basename(remote: &str) -> Option<String> {
     // Strip drive prefix like `FLASH:` if present so the local path
     // doesn't end up with a literal colon.
     let after_drive = remote.split_once(':').map(|x| x.1).unwrap_or(remote);
-    after_drive.rsplit(['\\', '/']).find(|s| !s.is_empty()).map(|s| s.to_owned())
+    after_drive
+        .rsplit(['\\', '/'])
+        .find(|s| !s.is_empty())
+        .map(|s| s.to_owned())
 }
 
-fn resolve_get_output(remote: &str, output: Option<&str>) -> Result<PathBuf, rootcause::Report<Error>> {
+fn resolve_get_output(
+    remote: &str,
+    output: Option<&str>,
+) -> Result<PathBuf, rootcause::Report<Error>> {
     let basename = remote_basename(remote).ok_or_else(|| {
-        rootcause::Report::new(Error::from(openxbdm_client::error::ArgumentError::EmptyFilename))
-            .attach(format!("cannot derive local filename from {remote:?}"))
+        rootcause::Report::new(Error::from(
+            openxbdm_client::error::ArgumentError::EmptyFilename,
+        ))
+        .attach(format!("cannot derive local filename from {remote:?}"))
     })?;
     match output {
         None => Ok(PathBuf::from(basename)),
         Some(explicit) => {
             let p = PathBuf::from(explicit);
-            if p.is_dir() { Ok(p.join(basename)) } else { Ok(p) }
+            if p.is_dir() {
+                Ok(p.join(basename))
+            } else {
+                Ok(p)
+            }
         }
     }
 }
@@ -1921,27 +2243,34 @@ fn resolve_get_output(remote: &str, output: Option<&str>) -> Result<PathBuf, roo
 fn decode_hex(input: &str) -> Result<Vec<u8>, Error> {
     let trimmed = input.trim();
     if !trimmed.len().is_multiple_of(2) {
-        return Err(Error::from(openxbdm_client::ParseError::InvalidHexDigits { key: "hex-bytes" }));
+        return Err(Error::from(openxbdm_client::ParseError::InvalidHexDigits {
+            key: "hex-bytes",
+        }));
     }
     let mut out = Vec::with_capacity(trimmed.len() / 2);
     for pair in trimmed.as_bytes().chunks(2) {
-        let s = core::str::from_utf8(pair)
-            .map_err(|_| Error::from(openxbdm_client::ParseError::InvalidHexDigits { key: "hex-bytes" }))?;
-        out.push(
-            u8::from_str_radix(s, 16)
-                .map_err(|_| Error::from(openxbdm_client::ParseError::InvalidHexDigits { key: "hex-bytes" }))?,
-        );
+        let s = core::str::from_utf8(pair).map_err(|_| {
+            Error::from(openxbdm_client::ParseError::InvalidHexDigits { key: "hex-bytes" })
+        })?;
+        out.push(u8::from_str_radix(s, 16).map_err(|_| {
+            Error::from(openxbdm_client::ParseError::InvalidHexDigits { key: "hex-bytes" })
+        })?);
     }
     Ok(out)
 }
 
 fn parse_u32(input: &str) -> Result<u32, Error> {
     let trimmed = input.trim();
-    if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
         u32::from_str_radix(hex, 16)
             .map_err(|_| Error::from(openxbdm_client::ParseError::InvalidHexDigits { key: "cli" }))
     } else {
-        trimmed.parse::<u32>().map_err(|_| Error::from(openxbdm_client::ParseError::InvalidDecimalU32 { key: "cli" }))
+        trimmed
+            .parse::<u32>()
+            .map_err(|_| Error::from(openxbdm_client::ParseError::InvalidDecimalU32 { key: "cli" }))
     }
 }
 
@@ -2023,8 +2352,6 @@ async fn run_capture(
     no_conversion: bool,
     ui: UiCtx,
 ) -> Result<(), rootcause::Report<Error>> {
-    use futures_util::io::AsyncBufReadExt as _;
-    use futures_util::io::BufReader;
     use tokio::sync::mpsc;
 
     std::fs::create_dir_all(&output_dir)
@@ -2037,41 +2364,45 @@ async fn run_capture(
     // only signals completion on the notify channel. Subscribe first
     // so no events are missed.
     let notify_transport = connect_target_timeout(target, conn_timeout).await?;
-    let mut notify_client = openxbdm_client::Client::new(notify_transport).read_banner().await?;
-    let _ack = notify_client.send_raw("notify reverse").await?;
+    let notify_client = openxbdm_client::Client::new(notify_transport)
+        .read_banner()
+        .await?;
+    let notify_request = openxbdm_client::commands::Notify {
+        reverse: true,
+        ..Default::default()
+    };
+    let (mut notify_channel, _) = notify_client
+        .into_notification_channel(notify_request)
+        .await?;
 
     let (notify_tx, mut notify_rx) = mpsc::unbounded_channel::<Notification>();
-    let mut notify_raw = notify_client.into_inner();
     let notify_task = tokio::spawn(async move {
-        let mut reader = BufReader::new(&mut notify_raw);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) => break,
-                Ok(_) => {
-                    let trimmed = line.trim_end_matches(['\r', '\n']);
-                    if let Some(n) = Notification::parse(trimmed) {
-                        if notify_tx.send(n).is_err() {
-                            break;
-                        }
-                    } else {
-                        tracing::debug!(target: "openxbdm_client::pix", line = %trimmed, "non-pix notify line");
-                    }
+        while let Ok(line) = notify_channel.next_notification().await {
+            if let Some(n) = Notification::parse(&line) {
+                if notify_tx.send(n).is_err() {
+                    break;
                 }
-                Err(_) => break,
+            } else {
+                tracing::debug!(target: "openxbdm_client::pix", line = %line, "non-pix notify line");
             }
         }
     });
 
     // Command channel (main connection).
     let cmd_transport = connect_target_timeout(target, conn_timeout).await?;
-    let mut client = openxbdm_client::Client::new(cmd_transport).read_banner().await?;
+    let mut client = openxbdm_client::Client::new(cmd_transport)
+        .read_banner()
+        .await?;
 
-    let openxbdm_client::commands::pix::ConnectOutcome { mut session, handler_detected } =
-        CaptureSession::connect(&mut client).await?;
+    let openxbdm_client::commands::pix::ConnectOutcome {
+        mut session,
+        handler_detected,
+    } = CaptureSession::connect(&mut client).await?;
     if handler_detected {
-        eprintln!("{} PIX handler responded to {{Connect}}", ok_tag("connected"));
+        eprintln!(
+            "{} PIX handler responded to {{Connect}}",
+            ok_tag("connected")
+        );
     } else {
         eprintln!(
             "{} no title has registered as the PIX handler (got plain `OK`). \
@@ -2123,16 +2454,22 @@ async fn run_capture(
     {
         Ok(Ok(0)) => eprintln!("{} capture file ready", ok_tag("ready")),
         Ok(Ok(hr)) => {
-            return Err(rootcause::Report::new(Error::from(openxbdm_client::error::ArgumentError::EmptyFilename))
-                .attach(format!("capture file creation failed on console, hresult {hr:#010x}")));
+            return Err(rootcause::Report::new(Error::from(
+                openxbdm_client::error::ArgumentError::EmptyFilename,
+            ))
+            .attach(format!(
+                "capture file creation failed on console, hresult {hr:#010x}"
+            )));
         }
         Ok(Err(e)) => return Err(e),
         Err(_) => {
-            return Err(rootcause::Report::new(Error::from(openxbdm_client::error::ArgumentError::EmptyFilename))
-                .attach(format!(
-                    "no CaptureFileCreationEnded within {}s; is a title actually rendering D3D frames?",
-                    FILE_READY_TIMEOUT.as_secs()
-                )));
+            return Err(rootcause::Report::new(Error::from(
+                openxbdm_client::error::ArgumentError::EmptyFilename,
+            ))
+            .attach(format!(
+                "no CaptureFileCreationEnded within {}s; is a title actually rendering D3D frames?",
+                FILE_READY_TIMEOUT.as_secs()
+            )));
         }
     }
 
@@ -2158,7 +2495,10 @@ async fn run_capture(
 
     session.end_capture().await?;
     session.end_capture_file_creation().await?;
-    eprintln!("{} capture closed, waiting for {{CaptureEnded}}", ok_tag("stopping"));
+    eprintln!(
+        "{} capture closed, waiting for {{CaptureEnded}}",
+        ok_tag("stopping")
+    );
 
     // Wait for the handler to signal the whole session is done so we
     // know all segments have been flushed to disk.
@@ -2183,7 +2523,9 @@ async fn run_capture(
     // the segment download phase.
     drop(client);
     let files_transport = connect_target_timeout(target, conn_timeout).await?;
-    let mut client = openxbdm_client::Client::new(files_transport).read_banner().await?;
+    let mut client = openxbdm_client::Client::new(files_transport)
+        .read_banner()
+        .await?;
     eprintln!("{} capture finalised, downloading segments", ok_tag("done"));
 
     // Find segment files. xbmovie's file naming is
@@ -2193,12 +2535,28 @@ async fn run_capture(
     // list the parent directory in DOS form and match by basename
     // stem -- this works regardless of how we sent the path to the
     // PIX handler.
-    let CaptureRemotePath { parent: parent_dir_dos, stem, ext } = split_capture_remote(&remote);
-    eprintln!("{} scanning {parent_dir_dos} for segments (stem={stem:?}, ext={ext:?})", ok_tag("looking"),);
-    let entries = match client.run(DirList { path: parent_dir_dos.clone() }).await {
+    let CaptureRemotePath {
+        parent: parent_dir_dos,
+        stem,
+        ext,
+    } = split_capture_remote(&remote);
+    eprintln!(
+        "{} scanning {parent_dir_dos} for segments (stem={stem:?}, ext={ext:?})",
+        ok_tag("looking"),
+    );
+    let entries = match client
+        .run(DirList {
+            path: parent_dir_dos.clone(),
+        })
+        .await
+    {
         Ok(entries) => entries,
         Err(e) => {
-            eprintln!("{} dirlist failed on {parent_dir_dos}: {:?}", warn_tag("warn:"), e.current_context());
+            eprintln!(
+                "{} dirlist failed on {parent_dir_dos}: {:?}",
+                warn_tag("warn:"),
+                e.current_context()
+            );
             vec![]
         }
     };
@@ -2231,13 +2589,20 @@ async fn run_capture(
     for (index, name, _size_hint) in segments {
         let remote_path = format!("{parent_dir_dos}{name}");
         let local_path = format!("{output_dir}/{name}");
-        let download = client.get_file(&remote_path, GetFileRange::WholeFile).await?;
+        let download = client
+            .get_file(&remote_path, GetFileRange::WholeFile)
+            .await?;
         let total = download.total();
         if total == 0 {
             // Release the streaming borrow before reusing `client`.
             drop(download);
             eprintln!("{} segment {index}: empty, skipping", warn_tag("skip:"));
-            let _ = client.run(openxbdm_client::commands::Delete { path: remote_path, is_directory: false }).await;
+            let _ = client
+                .run(openxbdm_client::commands::Delete {
+                    path: remote_path,
+                    is_directory: false,
+                })
+                .await;
             continue;
         }
         let bar = ui.progress(total, &format!("segment {index}"));
@@ -2250,8 +2615,16 @@ async fn run_capture(
         let mut tracked = ProgressWrite::new(compat, bar.clone());
         let copied = download.copy_into(&mut tracked).await?;
         bar.finish_and_clear();
-        eprintln!("{} segment {index}: {copied} bytes -> {local_path}", ok_tag("saved"));
-        let _ = client.run(openxbdm_client::commands::Delete { path: remote_path, is_directory: false }).await;
+        eprintln!(
+            "{} segment {index}: {copied} bytes -> {local_path}",
+            ok_tag("saved")
+        );
+        let _ = client
+            .run(openxbdm_client::commands::Delete {
+                path: remote_path,
+                is_directory: false,
+            })
+            .await;
         segments_downloaded += 1;
         bytes_downloaded += copied;
         downloaded_local_paths.push(local_path);
@@ -2288,7 +2661,10 @@ async fn run_capture(
         match encode_xbm_to_mp4(xbm_path, &mp4_path, "frame", 0.0, 20, &[]).await {
             Ok(()) => {
                 if let Err(e) = std::fs::remove_file(xbm_path) {
-                    eprintln!("{} could not delete {xbm_path} after encode: {e}", warn_tag("warn:"));
+                    eprintln!(
+                        "{} could not delete {xbm_path} after encode: {e}",
+                        warn_tag("warn:")
+                    );
                 } else {
                     eprintln!("{} removed {xbm_path}", ok_tag("cleaned"));
                 }
@@ -2344,7 +2720,11 @@ fn split_capture_remote(remote: &str) -> CaptureRemotePath {
         Some(dot) => (&name[..dot], &name[dot..]),
         None => (name, ""),
     };
-    CaptureRemotePath { parent: parent.to_owned(), stem: stem.to_owned(), ext: ext.to_owned() }
+    CaptureRemotePath {
+        parent: parent.to_owned(),
+        stem: stem.to_owned(),
+        ext: ext.to_owned(),
+    }
 }
 
 #[cfg(feature = "capture")]
@@ -2375,9 +2755,16 @@ async fn run_xbm(cmd: &XbmCommand) -> Result<(), rootcause::Report<Error>> {
             );
             println!(
                 "source       {}x{}  display {}x{}",
-                header.source_width, header.source_height, header.display_width, header.display_height,
+                header.source_width,
+                header.source_height,
+                header.display_width,
+                header.display_height,
             );
-            println!("tick rate    {} ticks/s  yuv bytes/frame {}", header.timestamp_rate, header.frame_pixel_bytes(),);
+            println!(
+                "tick rate    {} ticks/s  yuv bytes/frame {}",
+                header.timestamp_rate,
+                header.frame_pixel_bytes(),
+            );
 
             let mut cursor = FrameCursor::new(&mut f)?;
             let mut frame_count = 0u64;
@@ -2401,7 +2788,11 @@ async fn run_xbm(cmd: &XbmCommand) -> Result<(), rootcause::Report<Error>> {
             if let (Some(a), Some(b)) = (first_ts, last_ts) {
                 let span = b.wrapping_sub(a);
                 let seconds = span as f64 / header.timestamp_rate as f64;
-                let fps = if seconds > 0.0 { (frame_count.saturating_sub(1)) as f64 / seconds } else { 0.0 };
+                let fps = if seconds > 0.0 {
+                    (frame_count.saturating_sub(1)) as f64 / seconds
+                } else {
+                    0.0
+                };
                 println!("timestamps   {a} -> {b} (span {span}, {seconds:.3}s, {fps:.2} fps)");
             }
             println!("audio bytes  {audio_bytes}");
@@ -2410,10 +2801,20 @@ async fn run_xbm(cmd: &XbmCommand) -> Result<(), rootcause::Report<Error>> {
             }
             Ok(())
         }
-        XbmCommand::Extract { file, output_dir, concat, raw } => run_xbm_extract(file, output_dir, *concat, *raw).await,
-        XbmCommand::Encode { file, output, crop, fps, crf, ffmpeg_args } => {
-            run_xbm_encode(file, output, crop, *fps, *crf, ffmpeg_args).await
-        }
+        XbmCommand::Extract {
+            file,
+            output_dir,
+            concat,
+            raw,
+        } => run_xbm_extract(file, output_dir, *concat, *raw).await,
+        XbmCommand::Encode {
+            file,
+            output,
+            crop,
+            fps,
+            crf,
+            ffmpeg_args,
+        } => run_xbm_encode(file, output, crop, *fps, *crf, ffmpeg_args).await,
     }
 }
 
@@ -2491,15 +2892,25 @@ async fn run_xbm_extract(
             .into_report()
             .attach_with(|| format!("writing {out_path}"))?;
         if let Some((w, _)) = concat_writer.as_mut() {
-            w.write_all(payload).map_err(Error::from).into_report().attach("appending to concat")?;
+            w.write_all(payload)
+                .map_err(Error::from)
+                .into_report()
+                .attach("appending to concat")?;
         }
         index += 1;
     }
 
     let meta_path = format!("{output_dir}/metadata.txt");
     let fps = if timestamps.len() >= 2 {
-        let span = timestamps.last().unwrap().wrapping_sub(*timestamps.first().unwrap());
-        if span > 0 { (timestamps.len() - 1) as f64 * header.timestamp_rate as f64 / span as f64 } else { 0.0 }
+        let span = timestamps
+            .last()
+            .unwrap()
+            .wrapping_sub(*timestamps.first().unwrap());
+        if span > 0 {
+            (timestamps.len() - 1) as f64 * header.timestamp_rate as f64 / span as f64
+        } else {
+            0.0
+        }
     } else {
         0.0
     };
@@ -2508,7 +2919,11 @@ async fn run_xbm_extract(
     } else {
         "nv12 (Y plane, then interleaved UV plane; detiled from on-device layout)"
     };
-    let ffmpeg_pixfmt = if raw { "nv12  # WILL NOT RENDER -- re-run without --raw" } else { "nv12" };
+    let ffmpeg_pixfmt = if raw {
+        "nv12  # WILL NOT RENDER -- re-run without --raw"
+    } else {
+        "nv12"
+    };
     let meta = format!(
         "# xbmovie .xbm frame dump\n\
          source: {file}\n\
@@ -2540,7 +2955,10 @@ async fn run_xbm_extract(
         header.frame_width,
         header.frame_height,
     );
-    std::fs::write(&meta_path, meta).map_err(Error::from).into_report().attach("writing metadata")?;
+    std::fs::write(&meta_path, meta)
+        .map_err(Error::from)
+        .into_report()
+        .attach("writing metadata")?;
 
     eprintln!(
         "{} extracted {} frame{s} ({} pixel bytes each) -> {output_dir}",
@@ -2607,8 +3025,12 @@ async fn encode_xbm_to_mp4(
         "source" => (header.source_width, header.source_height),
         "none" => (aligned_w, aligned_h),
         other => {
-            return Err(rootcause::Report::new(Error::from(openxbdm_client::error::ArgumentError::EmptyFilename))
-                .attach(format!("--crop must be one of `frame`, `source`, `none`; got {other:?}")));
+            return Err(rootcause::Report::new(Error::from(
+                openxbdm_client::error::ArgumentError::EmptyFilename,
+            ))
+            .attach(format!(
+                "--crop must be one of `frame`, `source`, `none`; got {other:?}"
+            )));
         }
     };
 
@@ -2620,12 +3042,23 @@ async fn encode_xbm_to_mp4(
         records.push(fr);
     }
     if records.is_empty() {
-        return Err(rootcause::Report::new(Error::from(openxbdm_client::error::ArgumentError::EmptyFilename))
-            .attach("xbm contains no frame records"));
+        return Err(rootcause::Report::new(Error::from(
+            openxbdm_client::error::ArgumentError::EmptyFilename,
+        ))
+        .attach("xbm contains no frame records"));
     }
     let derived_fps = if records.len() >= 2 {
-        let span = records.last().unwrap().header.timestamp.wrapping_sub(records.first().unwrap().header.timestamp);
-        if span > 0 { (records.len() - 1) as f64 * header.timestamp_rate as f64 / span as f64 } else { 0.0 }
+        let span = records
+            .last()
+            .unwrap()
+            .header
+            .timestamp
+            .wrapping_sub(records.first().unwrap().header.timestamp);
+        if span > 0 {
+            (records.len() - 1) as f64 * header.timestamp_rate as f64 / span as f64
+        } else {
+            0.0
+        }
     } else {
         0.0
     };
@@ -2677,7 +3110,11 @@ async fn encode_xbm_to_mp4(
         records.len()
     );
 
-    let mut child = cmd.spawn().map_err(Error::from).into_report().attach("spawning ffmpeg")?;
+    let mut child = cmd
+        .spawn()
+        .map_err(Error::from)
+        .into_report()
+        .attach("spawning ffmpeg")?;
     let mut stdin = child.stdin.take().expect("stdin configured as piped");
 
     let mut tiled = vec![0u8; pixel_bytes];
@@ -2699,10 +3136,16 @@ async fn encode_xbm_to_mp4(
         }
     }
     drop(stdin);
-    let status = child.wait().map_err(Error::from).into_report().attach("waiting on ffmpeg")?;
+    let status = child
+        .wait()
+        .map_err(Error::from)
+        .into_report()
+        .attach("waiting on ffmpeg")?;
     if !status.success() {
-        return Err(rootcause::Report::new(Error::from(openxbdm_client::error::ArgumentError::EmptyFilename))
-            .attach(format!("ffmpeg exited with {status}")));
+        return Err(rootcause::Report::new(Error::from(
+            openxbdm_client::error::ArgumentError::EmptyFilename,
+        ))
+        .attach(format!("ffmpeg exited with {status}")));
     }
     eprintln!("{} wrote {output}", ok_tag("done"));
     Ok(())
@@ -2714,11 +3157,19 @@ async fn encode_xbm_to_mp4(
 fn which_ffmpeg() -> Result<(), rootcause::Report<Error>> {
     use std::process::Command;
     use std::process::Stdio;
-    let ok = Command::new("ffmpeg").arg("-version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok();
+    let ok = Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok();
     if ok {
         Ok(())
     } else {
-        Err(rootcause::Report::new(Error::from(openxbdm_client::error::ArgumentError::EmptyFilename)).attach(
+        Err(rootcause::Report::new(Error::from(
+            openxbdm_client::error::ArgumentError::EmptyFilename,
+        ))
+        .attach(
             "ffmpeg not found on $PATH. Install it (`nix-shell -p ffmpeg`, \
              `brew install ffmpeg`, etc.) and retry. The `xbm encode` \
              subcommand streams decoded NV12 frames to ffmpeg's stdin.",
@@ -2733,21 +3184,28 @@ async fn run_pix_notify(
     duration_secs: u64,
     log_path: Option<String>,
 ) -> Result<(), rootcause::Report<Error>> {
-    use futures_util::io::AsyncBufReadExt as _;
-    use futures_util::io::BufReader;
     use std::io::Write as _;
 
     let transport = connect_target_timeout(target, conn_timeout).await?;
-    let mut client = openxbdm_client::Client::new(transport).read_banner().await?;
+    let client = openxbdm_client::Client::new(transport)
+        .read_banner()
+        .await?;
 
-    // `notify` turns the current connection into a pure notification
-    // channel after xbdm acknowledges with a single response line;
-    // subsequent reads get async events at the server's discretion.
-    let ack = client.send_raw("notify").await?;
+    // `notify` turns the connection into a notification channel: xbdm
+    // answers with the 205 line and the current execution state, then
+    // sends events at its own discretion.
+    let (mut channel, execution) = client
+        .into_notification_channel(openxbdm_client::commands::Notify::default())
+        .await?;
     eprintln!(
-        "{} {ack:?}; {}",
+        "{} execution {}; {}",
         ok_tag("subscribed"),
-        if duration_secs == 0 { "Ctrl-C to stop".to_owned() } else { format!("stopping in {duration_secs}s") }
+        execution.name(),
+        if duration_secs == 0 {
+            "Ctrl-C to stop".to_owned()
+        } else {
+            format!("stopping in {duration_secs}s")
+        }
     );
 
     let mut log_file = match log_path.as_deref() {
@@ -2760,32 +3218,30 @@ async fn run_pix_notify(
         None => None,
     };
 
-    let mut transport = client.into_inner();
-    let mut reader = BufReader::new(&mut transport);
-    let mut line = String::new();
-
-    let deadline = if duration_secs == 0 { None } else { Some(Duration::from_secs(duration_secs)) };
+    let deadline = if duration_secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(duration_secs))
+    };
 
     let start = std::time::Instant::now();
     loop {
-        line.clear();
-        let read = async { reader.read_line(&mut line).await };
         let remaining = deadline.map(|d| d.saturating_sub(start.elapsed()));
         let result = match remaining {
             Some(Duration::ZERO) => break,
-            Some(r) => match tokio::time::timeout(r, read).await {
+            Some(r) => match tokio::time::timeout(r, channel.next_notification()).await {
                 Ok(r) => r,
                 Err(_) => break,
             },
-            None => read.await,
+            None => channel.next_notification().await,
         };
         match result {
-            Ok(0) => {
+            Err(report) if matches!(report.current_context(), Error::ConnectionClosed) => {
                 eprintln!("{} notification channel closed", warn_tag("eof:"));
                 break;
             }
-            Ok(_) => {
-                let trimmed = line.trim_end_matches(['\r', '\n']);
+            Ok(line) => {
+                let trimmed = line.as_str();
                 if trimmed.is_empty() {
                     continue;
                 }
@@ -2807,22 +3263,28 @@ async fn run_pix_notify(
                     let _ = writeln!(f, "{rendered}");
                 }
             }
-            Err(e) => {
-                return Err(rootcause::Report::new(Error::from(e)));
-            }
+            Err(report) => return Err(report),
         }
     }
     Ok(())
 }
 
-async fn run_discover(listen_ms: u64, broadcast: Option<&str>, ui: UiCtx) -> Result<(), rootcause::Report<Error>> {
+async fn run_discover(
+    listen_ms: u64,
+    broadcast: Option<&str>,
+    ui: UiCtx,
+) -> Result<(), rootcause::Report<Error>> {
     let mut config = DiscoveryConfig::broadcast();
     config.listen_for = Duration::from_millis(listen_ms);
     if let Some(raw) = broadcast {
-        let parsed: SocketAddr =
-            raw.parse().or_else(|_| format!("{raw}:{NAP_PORT}").parse::<SocketAddr>()).map_err(|_| {
-                rootcause::Report::new(Error::from(openxbdm_client::error::ArgumentError::QuotedContainsCrlf))
-                    .attach(format!("invalid --broadcast value {raw:?}"))
+        let parsed: SocketAddr = raw
+            .parse()
+            .or_else(|_| format!("{raw}:{NAP_PORT}").parse::<SocketAddr>())
+            .map_err(|_| {
+                rootcause::Report::new(Error::from(
+                    openxbdm_client::error::ArgumentError::QuotedContainsCrlf,
+                ))
+                .attach(format!("invalid --broadcast value {raw:?}"))
             })?;
         config.destination = parsed;
     }
@@ -2838,8 +3300,13 @@ async fn run_discover(listen_ms: u64, broadcast: Option<&str>, ui: UiCtx) -> Res
             name: String,
             address: String,
         }
-        let rows: Vec<Row> =
-            results.iter().map(|c| Row { name: c.name.clone(), address: c.addr.to_string() }).collect();
+        let rows: Vec<Row> = results
+            .iter()
+            .map(|c| Row {
+                name: c.name.clone(),
+                address: c.addr.to_string(),
+            })
+            .collect();
         print_colored_table(&heading_label("discover", &ui), rows, &ui);
     } else {
         for console in results {
@@ -2858,8 +3325,10 @@ async fn run_resolve(name: &str, listen_ms: u64) -> Result<(), rootcause::Report
             println!("{}\t{}", console.name, console.addr);
             Ok(())
         }
-        None => Err(rootcause::Report::new(Error::from(openxbdm_client::error::TransportError::ConnectTimeout))
-            .attach(format!("no reply from console named {name:?}"))),
+        None => Err(rootcause::Report::new(Error::from(
+            openxbdm_client::error::TransportError::ConnectTimeout,
+        ))
+        .attach(format!("no reply from console named {name:?}"))),
     }
 }
 
@@ -2913,27 +3382,57 @@ where
 
     let roots: Vec<String> = match path {
         Some(p) => vec![normalize_dir_path(&p)],
-        None => client.run(DriveList).await?.into_iter().map(|d| format!("{d}:\\")).collect(),
+        None => client
+            .run(DriveList)
+            .await?
+            .into_iter()
+            .map(|d| format!("{d}:\\"))
+            .collect(),
     };
 
     let mut dir_count: u64 = 0;
     for root in &roots {
-        walk(client, root, 0, max_depth, include_files, ui, spinner.as_ref(), &mut dir_count, &[], true).await?;
+        walk(
+            client,
+            root,
+            0,
+            max_depth,
+            include_files,
+            ui,
+            spinner.as_ref(),
+            &mut dir_count,
+            &[],
+            true,
+        )
+        .await?;
     }
 
     if let Some(bar) = spinner {
         bar.finish_and_clear();
     }
-    eprintln!("{} {} dir{}", ok_tag("walked"), dir_count, if dir_count == 1 { "" } else { "s" });
+    eprintln!(
+        "{} {} dir{}",
+        ok_tag("walked"),
+        dir_count,
+        if dir_count == 1 { "" } else { "s" }
+    );
     Ok(())
 }
 
 fn normalize_dir_path(input: &str) -> String {
-    if input.ends_with('\\') || input.is_empty() { input.to_owned() } else { format!("{input}\\") }
+    if input.ends_with('\\') || input.is_empty() {
+        input.to_owned()
+    } else {
+        format!("{input}\\")
+    }
 }
 
 fn join_path(parent: &str, child: &str) -> String {
-    if parent.ends_with('\\') { format!("{parent}{child}") } else { format!("{parent}\\{child}") }
+    if parent.ends_with('\\') {
+        format!("{parent}{child}")
+    } else {
+        format!("{parent}\\{child}")
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2961,21 +3460,39 @@ where
         tree_println(spinner, tree_dir_style(dir.trim_end_matches('\\'), true));
     }
 
-    let entries = match client.run(DirList { path: dir.to_owned() }).await {
+    let entries = match client
+        .run(DirList {
+            path: dir.to_owned(),
+        })
+        .await
+    {
         Ok(entries) => entries,
         Err(err) => {
             let indent = tree_indent(ancestor_is_last, ui);
             let reason = format!("{:?}", err.current_context());
-            let line =
-                format!("{indent}(unreadable) {}", if colors_enabled() { format!("{}", reason.red()) } else { reason });
+            let line = format!(
+                "{indent}(unreadable) {}",
+                if colors_enabled() {
+                    format!("{}", reason.red())
+                } else {
+                    reason
+                }
+            );
             tree_println(spinner, line);
             return Ok(());
         }
     };
 
-    let mut filtered: Vec<_> = entries.into_iter().filter(|e| include_files || e.is_directory).collect();
+    let mut filtered: Vec<_> = entries
+        .into_iter()
+        .filter(|e| include_files || e.is_directory)
+        .collect();
     filtered.sort_by(|a, b| {
-        b.is_directory.cmp(&a.is_directory).then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+        b.is_directory.cmp(&a.is_directory).then_with(|| {
+            a.name
+                .to_ascii_lowercase()
+                .cmp(&b.name.to_ascii_lowercase())
+        })
     });
 
     for (idx, entry) in filtered.iter().enumerate() {
@@ -2993,8 +3510,11 @@ where
             format!("{indent}{branch}{label}")
         } else {
             let size_text = format!("({})", ui.fmt_bytes(entry.size));
-            let size_tag =
-                if colors_enabled() { format!("  {}", size_text.dimmed()) } else { format!("  {size_text}") };
+            let size_tag = if colors_enabled() {
+                format!("  {}", size_text.dimmed())
+            } else {
+                format!("  {size_text}")
+            };
             format!("{indent}{branch}{label}{size_tag}")
         };
         tree_println(spinner, line);
@@ -3037,15 +3557,27 @@ fn tree_indent(ancestor_is_last: &[bool], ui: UiCtx) -> String {
 }
 
 fn heading_label(label: &str, ui: &UiCtx) -> String {
-    if ui.pretty() && colors_enabled() { format!("{}", label.cyan().bold()) } else { label.to_owned() }
+    if ui.pretty() && colors_enabled() {
+        format!("{}", label.cyan().bold())
+    } else {
+        label.to_owned()
+    }
 }
 
 fn ok_tag(label: &str) -> String {
-    if colors_enabled() { format!("{}", label.green().bold()) } else { label.to_owned() }
+    if colors_enabled() {
+        format!("{}", label.green().bold())
+    } else {
+        label.to_owned()
+    }
 }
 
 fn warn_tag(label: &str) -> String {
-    if colors_enabled() { format!("{}", label.yellow().bold()) } else { label.to_owned() }
+    if colors_enabled() {
+        format!("{}", label.yellow().bold())
+    } else {
+        label.to_owned()
+    }
 }
 
 fn print_colored_table<I, T>(heading: &str, rows: I, ui: &UiCtx)
@@ -3081,7 +3613,11 @@ impl<W> ProgressWrite<W> {
 }
 
 impl<W: AsyncWrite + Unpin> AsyncWrite for ProgressWrite<W> {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
         let this = &mut *self;
         match Pin::new(&mut this.inner).poll_write(cx, buf) {
             Poll::Pending => Poll::Pending,
@@ -3114,7 +3650,11 @@ impl<R> ProgressRead<R> {
 }
 
 impl<R: AsyncRead + Unpin> AsyncRead for ProgressRead<R> {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<std::io::Result<usize>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
         let this = &mut *self;
         match Pin::new(&mut this.inner).poll_read(cx, buf) {
             Poll::Pending => Poll::Pending,
@@ -3127,7 +3667,10 @@ impl<R: AsyncRead + Unpin> AsyncRead for ProgressRead<R> {
     }
 }
 
-fn write_capture(path: &PathBuf, handle: &Arc<Mutex<CaptureLog>>) -> Result<(), rootcause::Report<Error>> {
+fn write_capture(
+    path: &PathBuf,
+    handle: &Arc<Mutex<CaptureLog>>,
+) -> Result<(), rootcause::Report<Error>> {
     let snapshot = handle.lock().expect("capture log poisoned").clone();
     std::fs::write(path, snapshot.to_text())
         .map_err(Error::from)

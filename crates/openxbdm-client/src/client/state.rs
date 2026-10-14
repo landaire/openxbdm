@@ -8,3 +8,7 @@ pub struct Fresh;
 
 #[derive(Debug, Default)]
 pub struct Connected;
+
+/// The connection is a notification channel.
+#[derive(Debug, Default)]
+pub struct Notifications;

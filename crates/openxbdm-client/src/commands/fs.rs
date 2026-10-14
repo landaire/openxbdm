@@ -17,7 +17,11 @@ use crate::protocol::Response;
 use crate::time::FileTime;
 
 /// Composite u64 from `KEY_hi` + `KEY_lo` XBDM fields.
-fn hi_lo_u64(kv: &KvLine<'_>, hi_key: &'static str, lo_key: &'static str) -> Result<u64, ParseError> {
+fn hi_lo_u64(
+    kv: &KvLine<'_>,
+    hi_key: &'static str,
+    lo_key: &'static str,
+) -> Result<u64, ParseError> {
     let hi = value_u32(kv.require(hi_key)?, hi_key)?;
     let lo = value_u32(kv.require(lo_key)?, lo_key)?;
     Ok(((hi as u64) << 32) | (lo as u64))
@@ -32,7 +36,11 @@ fn report_argument(err: ArgumentError) -> rootcause::Report<Error> {
 }
 
 fn reject_empty(name: &str) -> Result<(), rootcause::Report<Error>> {
-    if name.is_empty() { Err(report_argument(ArgumentError::EmptyFilename)) } else { Ok(()) }
+    if name.is_empty() {
+        Err(report_argument(ArgumentError::EmptyFilename))
+    } else {
+        Ok(())
+    }
 }
 
 /// `drivefreespace NAME="X:\"` -> free and total byte counters.
@@ -53,7 +61,10 @@ impl Command for DriveFreeSpace {
 
     fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
         reject_empty(&self.drive)?;
-        ArgBuilder::new("drivefreespace").quoted("NAME", &self.drive).map_err(report_argument).map(ArgBuilder::finish)
+        ArgBuilder::new("drivefreespace")
+            .quoted("NAME", &self.drive)
+            .map_err(report_argument)
+            .map(ArgBuilder::finish)
     }
 
     fn expected(&self) -> ExpectedBody {
@@ -61,13 +72,19 @@ impl Command for DriveFreeSpace {
     }
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
-        let mut lines = response.expect_multiline().map_err(rootcause::Report::new)?;
-        let head = lines.pop().ok_or_else(|| report_parse(ParseError::UnrecognizedShape))?;
+        let mut lines = response
+            .expect_multiline()
+            .map_err(rootcause::Report::new)?;
+        let head = lines
+            .pop()
+            .ok_or_else(|| report_parse(ParseError::UnrecognizedShape))?;
         let kv = parse_kv_line(&head);
         Ok(DriveSpace {
-            free_to_caller_bytes: hi_lo_u64(&kv, "freetocallerhi", "freetocallerlo").map_err(report_parse)?,
+            free_to_caller_bytes: hi_lo_u64(&kv, "freetocallerhi", "freetocallerlo")
+                .map_err(report_parse)?,
             total_bytes: hi_lo_u64(&kv, "totalbyteshi", "totalbyteslo").map_err(report_parse)?,
-            total_free_bytes: hi_lo_u64(&kv, "totalfreebyteshi", "totalfreebyteslo").map_err(report_parse)?,
+            total_free_bytes: hi_lo_u64(&kv, "totalfreebyteshi", "totalfreebyteslo")
+                .map_err(report_parse)?,
         })
     }
 }
@@ -93,7 +110,10 @@ impl Command for DirList {
 
     fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
         reject_empty(&self.path)?;
-        ArgBuilder::new("dirlist").quoted("NAME", &self.path).map_err(report_argument).map(ArgBuilder::finish)
+        ArgBuilder::new("dirlist")
+            .quoted("NAME", &self.path)
+            .map_err(report_argument)
+            .map(ArgBuilder::finish)
     }
 
     fn expected(&self) -> ExpectedBody {
@@ -101,7 +121,9 @@ impl Command for DirList {
     }
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
-        let lines = response.expect_multiline().map_err(rootcause::Report::new)?;
+        let lines = response
+            .expect_multiline()
+            .map_err(rootcause::Report::new)?;
         let mut entries = Vec::with_capacity(lines.len());
         for line in lines {
             let kv = parse_kv_line(&line);
@@ -140,7 +162,10 @@ impl Command for GetFileAttributes {
 
     fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
         reject_empty(&self.path)?;
-        ArgBuilder::new("getfileattributes").quoted("NAME", &self.path).map_err(report_argument).map(ArgBuilder::finish)
+        ArgBuilder::new("getfileattributes")
+            .quoted("NAME", &self.path)
+            .map_err(report_argument)
+            .map(ArgBuilder::finish)
     }
 
     fn expected(&self) -> ExpectedBody {
@@ -148,13 +173,21 @@ impl Command for GetFileAttributes {
     }
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
-        let mut lines = response.expect_multiline().map_err(rootcause::Report::new)?;
-        let head = lines.pop().ok_or_else(|| report_parse(ParseError::UnrecognizedShape))?;
+        let mut lines = response
+            .expect_multiline()
+            .map_err(rootcause::Report::new)?;
+        let head = lines
+            .pop()
+            .ok_or_else(|| report_parse(ParseError::UnrecognizedShape))?;
         let kv = parse_kv_line(&head);
         Ok(FileAttributes {
             size: hi_lo_u64(&kv, "sizehi", "sizelo").map_err(report_parse)?,
-            create_time: FileTime::from_raw(hi_lo_u64(&kv, "createhi", "createlo").map_err(report_parse)?),
-            change_time: FileTime::from_raw(hi_lo_u64(&kv, "changehi", "changelo").map_err(report_parse)?),
+            create_time: FileTime::from_raw(
+                hi_lo_u64(&kv, "createhi", "createlo").map_err(report_parse)?,
+            ),
+            change_time: FileTime::from_raw(
+                hi_lo_u64(&kv, "changehi", "changelo").map_err(report_parse)?,
+            ),
             is_directory: kv.has_flag("directory"),
         })
     }
@@ -171,7 +204,10 @@ impl Command for MakeDirectory {
 
     fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
         reject_empty(&self.path)?;
-        ArgBuilder::new("mkdir").quoted("NAME", &self.path).map_err(report_argument).map(ArgBuilder::finish)
+        ArgBuilder::new("mkdir")
+            .quoted("NAME", &self.path)
+            .map_err(report_argument)
+            .map(ArgBuilder::finish)
     }
 
     fn expected(&self) -> ExpectedBody {
@@ -196,7 +232,9 @@ impl Command for Delete {
 
     fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
         reject_empty(&self.path)?;
-        let mut builder = ArgBuilder::new("delete").quoted("NAME", &self.path).map_err(report_argument)?;
+        let mut builder = ArgBuilder::new("delete")
+            .quoted("NAME", &self.path)
+            .map_err(report_argument)?;
         if self.is_directory {
             builder = builder.flag("DIR");
         }
@@ -213,14 +251,25 @@ impl Command for Delete {
     }
 }
 
-/// `fileeof NAME="X:\\path" SIZE=<n>`: truncate or extend a file.
-/// Optionally pass `CREATE` (via the `create_if_missing` flag) so the
-/// file is created when absent.
+/// How `fileeof` opens the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EofDisposition {
+    /// The file must exist.
+    OpenExisting,
+    /// `MUSTCREATE`: the file must not exist.
+    CreateNew,
+    /// `CANCREATE`: create the file, or truncate an existing one to zero
+    /// bytes before the new size is applied.
+    CreateOrTruncate,
+}
+
+/// `fileeof NAME="X:\\path" SIZE=<n> [MUSTCREATE|CANCREATE]`: set a file's
+/// end of file. The size is a 32-bit value.
 #[derive(Debug, Clone)]
 pub struct FileEof {
     pub path: String,
-    pub size: u64,
-    pub create_if_missing: bool,
+    pub size: u32,
+    pub disposition: EofDisposition,
 }
 
 impl Command for FileEof {
@@ -228,11 +277,15 @@ impl Command for FileEof {
 
     fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
         reject_empty(&self.path)?;
-        let mut builder =
-            ArgBuilder::new("fileeof").quoted("NAME", &self.path).map_err(report_argument)?.dec("SIZE", self.size);
-        if self.create_if_missing {
-            builder = builder.flag("CREATE");
-        }
+        let builder = ArgBuilder::new("fileeof")
+            .quoted("NAME", &self.path)
+            .map_err(report_argument)?
+            .dec("SIZE", u64::from(self.size));
+        let builder = match self.disposition {
+            EofDisposition::OpenExisting => builder,
+            EofDisposition::CreateNew => builder.flag("MUSTCREATE"),
+            EofDisposition::CreateOrTruncate => builder.flag("CANCREATE"),
+        };
         Ok(builder.finish())
     }
 

@@ -31,9 +31,15 @@ impl Command for DbgName {
             DbgName::Get => Ok(ArgBuilder::new("dbgname").finish()),
             DbgName::Set(name) => {
                 if name.contains(['\r', '\n', '"']) {
-                    return Err(rootcause::Report::new(Error::from(ArgumentError::InvalidDbgNameChar)));
+                    return Err(rootcause::Report::new(Error::from(
+                        ArgumentError::InvalidDbgNameChar,
+                    )));
                 }
-                Ok(format!("dbgname name={name}"))
+                // The monitor ends an unquoted value at the first space.
+                Ok(ArgBuilder::new("dbgname")
+                    .quoted("name", name)
+                    .map_err(Error::from)?
+                    .finish())
             }
         }
     }
@@ -43,12 +49,16 @@ impl Command for DbgName {
     }
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
-        response.expect_ok().map_err(rootcause::Report::new).attach("parsing dbgname response")
+        response
+            .expect_ok()
+            .map_err(rootcause::Report::new)
+            .attach("parsing dbgname response")
     }
 }
 
 /// `systime`: returns the console's clock as two 32-bit halves of a Windows
-/// `FILETIME` (100-ns ticks since 1601-01-01 UTC).
+/// `FILETIME` (100-ns ticks since 1601-01-01 UTC). The console answers
+/// `406-` until `setsystime` has run since boot.
 #[derive(Debug, Clone, Copy)]
 pub struct SysTime;
 
@@ -71,11 +81,49 @@ impl Command for SysTime {
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         let head = response.expect_ok().map_err(rootcause::Report::new)?;
         let kv = parse_kv_line(&head);
-        let hi_value = kv.require("clockhi").map_err(|e| rootcause::Report::new(Error::from(e)))?;
-        let lo_value = kv.require("clocklo").map_err(|e| rootcause::Report::new(Error::from(e)))?;
-        let hi = value_u32(hi_value, "clockhi").map_err(|e| rootcause::Report::new(Error::from(e)))?;
-        let lo = value_u32(lo_value, "clocklo").map_err(|e| rootcause::Report::new(Error::from(e)))?;
-        Ok(SysTimeResult { file_time: FileTime::from_halves(hi, lo) })
+        let hi_value = kv
+            .require("high")
+            .map_err(|e| rootcause::Report::new(Error::from(e)))?;
+        let lo_value = kv
+            .require("low")
+            .map_err(|e| rootcause::Report::new(Error::from(e)))?;
+        let hi = value_u32(hi_value, "high").map_err(|e| rootcause::Report::new(Error::from(e)))?;
+        let lo = value_u32(lo_value, "low").map_err(|e| rootcause::Report::new(Error::from(e)))?;
+        Ok(SysTimeResult {
+            file_time: FileTime::from_halves(hi, lo),
+        })
+    }
+}
+
+/// `setsystime clockhi= clocklo= [tz=]`: set the console clock. With
+/// `time_zone_defaults` the console also writes a default time zone when
+/// none is configured.
+#[derive(Debug, Clone, Copy)]
+pub struct SetSysTime {
+    pub file_time: FileTime,
+    pub time_zone_defaults: bool,
+}
+
+impl Command for SetSysTime {
+    type Output = ();
+
+    fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
+        let mut builder = ArgBuilder::new("setsystime")
+            .hex32("clockhi", self.file_time.high())
+            .hex32("clocklo", self.file_time.low());
+        if self.time_zone_defaults {
+            builder = builder.hex32("tz", 1);
+        }
+        Ok(builder.finish())
+    }
+
+    fn expected(&self) -> ExpectedBody {
+        ExpectedBody::Line
+    }
+
+    fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
+        response.expect_ok().map_err(rootcause::Report::new)?;
+        Ok(())
     }
 }
 
@@ -99,17 +147,15 @@ impl Command for DmVersion {
     }
 }
 
-/// `consoletype`: retail vs. devkit vs. testkit vs. reviewer kit.
+/// `consoletype`: development kit or test kit; the monitor reports no
+/// other kind.
 #[derive(Debug, Clone, Copy)]
 pub struct GetConsoleType;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsoleType {
-    Retail,
     DevKit,
     TestKit,
-    ReviewerKit,
-    Other(String),
 }
 
 impl Command for GetConsoleType {
@@ -125,13 +171,13 @@ impl Command for GetConsoleType {
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         let head = response.expect_ok().map_err(rootcause::Report::new)?;
-        Ok(match head.trim().to_ascii_lowercase().as_str() {
-            "devkit" => ConsoleType::DevKit,
-            "testkit" => ConsoleType::TestKit,
-            "retail" => ConsoleType::Retail,
-            "reviewerkit" => ConsoleType::ReviewerKit,
-            _ => ConsoleType::Other(head),
-        })
+        match head.as_str() {
+            "devkit" => Ok(ConsoleType::DevKit),
+            "testkit" => Ok(ConsoleType::TestKit),
+            _ => {
+                Err(rootcause::Report::new(Error::from(ParseError::UnrecognizedShape)).attach(head))
+            }
+        }
     }
 }
 
@@ -158,12 +204,15 @@ impl Command for GetConsoleFeatures {
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         let head = response.expect_ok().map_err(rootcause::Report::new)?;
-        let flags = head.split_ascii_whitespace().map(|s| s.to_owned()).collect();
+        let flags = head
+            .split_ascii_whitespace()
+            .map(|s| s.to_owned())
+            .collect();
         Ok(ConsoleFeatures { flags })
     }
 }
 
-/// `altaddr`: the alternate (debug) IPv4 address the console advertises.
+/// `altaddr`: the IPv4 address of the title network stack.
 #[derive(Debug, Clone, Copy)]
 pub struct AltAddr;
 
@@ -181,8 +230,12 @@ impl Command for AltAddr {
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         let head = response.expect_ok().map_err(rootcause::Report::new)?;
         let kv = parse_kv_line(&head);
-        let raw = value_u32(kv.require("addr").map_err(|e| rootcause::Report::new(Error::from(e)))?, "addr")
-            .map_err(|e| rootcause::Report::new(Error::from(e)))?;
+        let raw = value_u32(
+            kv.require("addr")
+                .map_err(|e| rootcause::Report::new(Error::from(e)))?,
+            "addr",
+        )
+        .map_err(|e| rootcause::Report::new(Error::from(e)))?;
         Ok(Ipv4Addr::from(raw))
     }
 }
@@ -205,21 +258,28 @@ impl Command for GetPid {
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         let head = response.expect_ok().map_err(rootcause::Report::new)?;
         let kv = parse_kv_line(&head);
-        value_u32(kv.require("pid").map_err(|e| rootcause::Report::new(Error::from(e)))?, "pid")
-            .map_err(|e| rootcause::Report::new(Error::from(e)))
+        value_u32(
+            kv.require("pid")
+                .map_err(|e| rootcause::Report::new(Error::from(e)))?,
+            "pid",
+        )
+        .map_err(|e| rootcause::Report::new(Error::from(e)))
     }
 }
 
-/// `consolemem`: memory class byte. The raw value is preserved alongside
-/// any known classification we can derive.
+/// `consolemem`: memory configuration class.
 #[derive(Debug, Clone, Copy)]
 pub struct GetConsoleMem;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ConsoleMem {
-    /// Raw class value as reported by the kernel. Known on retail/devkit:
-    /// `0x01` -> 512 MiB, `0x02` -> 1 GiB.
-    pub class: u8,
+pub enum ConsoleMem {
+    /// No additional memory is installed (value 0).
+    Standard,
+    /// Additional memory is installed but the kernel manages no more than
+    /// 0x20000 pages (value 1).
+    ExtraMemoryUnused,
+    /// The kernel manages more than 0x20000 pages (value 2).
+    ExtraMemoryInUse,
 }
 
 impl Command for GetConsoleMem {
@@ -236,16 +296,29 @@ impl Command for GetConsoleMem {
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         let head = response.expect_ok().map_err(rootcause::Report::new)?;
         let kv = parse_kv_line(&head);
-        let raw =
-            value_u32(kv.require("consolemem").map_err(|e| rootcause::Report::new(Error::from(e)))?, "consolemem")
-                .map_err(|e| rootcause::Report::new(Error::from(e)))?;
-        Ok(ConsoleMem { class: raw as u8 })
+        let raw = value_u32(
+            kv.require("consolemem")
+                .map_err(|e| rootcause::Report::new(Error::from(e)))?,
+            "consolemem",
+        )
+        .map_err(|e| rootcause::Report::new(Error::from(e)))?;
+        match raw {
+            0 => Ok(ConsoleMem::Standard),
+            1 => Ok(ConsoleMem::ExtraMemoryUnused),
+            2 => Ok(ConsoleMem::ExtraMemoryInUse),
+            value => Err(rootcause::Report::new(Error::from(
+                ParseError::UnknownCode {
+                    key: "consolemem",
+                    value,
+                },
+            ))),
+        }
     }
 }
 
-/// `getnetaddrs`: the debug (XBDM) and title network-address blobs the
-/// console knows about. Each blob is a 40-byte hex string the host side
-/// interprets as a `sockaddr` plus extra XBDM metadata.
+/// `getnetaddrs`: the debug name and the debug and title network address
+/// records (36 bytes each, sent as 72 hex digits). The name is not quoted
+/// and may contain spaces.
 #[derive(Debug, Clone, Copy)]
 pub struct GetNetAddrs;
 
@@ -262,8 +335,12 @@ fn hex_string_to_bytes(s: &str) -> Result<Vec<u8>, ParseError> {
     }
     let mut out = Vec::with_capacity(s.len() / 2);
     for chunk in s.as_bytes().chunks(2) {
-        let pair = core::str::from_utf8(chunk).map_err(|_| ParseError::InvalidHexDigits { key: "net-blob" })?;
-        out.push(u8::from_str_radix(pair, 16).map_err(|_| ParseError::InvalidHexDigits { key: "net-blob" })?);
+        let pair = core::str::from_utf8(chunk)
+            .map_err(|_| ParseError::InvalidHexDigits { key: "net-blob" })?;
+        out.push(
+            u8::from_str_radix(pair, 16)
+                .map_err(|_| ParseError::InvalidHexDigits { key: "net-blob" })?,
+        );
     }
     Ok(out)
 }
@@ -281,14 +358,16 @@ impl Command for GetNetAddrs {
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         let head = response.expect_ok().map_err(rootcause::Report::new)?;
-        let kv = parse_kv_line(&head);
-        let name_value = kv.require("name").map_err(|e| rootcause::Report::new(Error::from(e)))?;
-        let debug_value = kv.require("debug").map_err(|e| rootcause::Report::new(Error::from(e)))?;
-        let title_value = kv.require("title").map_err(|e| rootcause::Report::new(Error::from(e)))?;
+        let shape = || rootcause::Report::new(Error::from(ParseError::UnrecognizedShape));
+        let rest = head.strip_prefix("name=").ok_or_else(shape)?;
+        let (rest, title) = rest.rsplit_once(" title=").ok_or_else(shape)?;
+        let (name, debug) = rest.rsplit_once(" debug=").ok_or_else(shape)?;
         Ok(NetAddrs {
-            name: name_value.as_str().to_owned(),
-            debug: hex_string_to_bytes(debug_value.as_str()).map_err(|e| rootcause::Report::new(Error::from(e)))?,
-            title: hex_string_to_bytes(title_value.as_str()).map_err(|e| rootcause::Report::new(Error::from(e)))?,
+            name: name.to_owned(),
+            debug: hex_string_to_bytes(debug)
+                .map_err(|e| rootcause::Report::new(Error::from(e)))?,
+            title: hex_string_to_bytes(title)
+                .map_err(|e| rootcause::Report::new(Error::from(e)))?,
         })
     }
 }
@@ -313,7 +392,9 @@ impl Command for DriveList {
     }
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
-        let lines = response.expect_multiline().map_err(rootcause::Report::new)?;
+        let lines = response
+            .expect_multiline()
+            .map_err(rootcause::Report::new)?;
         let mut drives = Vec::with_capacity(lines.len());
         for line in lines {
             let kv = parse_kv_line(&line);

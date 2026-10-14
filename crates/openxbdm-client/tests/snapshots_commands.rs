@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use openxbdm_client::Client;
 use openxbdm_client::commands::AltAddr;
+use openxbdm_client::commands::ConsoleMem;
 use openxbdm_client::commands::ConsoleType;
 use openxbdm_client::commands::DbgName;
 use openxbdm_client::commands::DirList;
@@ -48,7 +49,8 @@ fn fixture(name: &str) -> CaptureLog {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("tests/fixtures");
     path.push(format!("{name}.capture"));
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading fixture {}: {e}", path.display()));
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("reading fixture {}: {e}", path.display()));
     CaptureLog::from_text(&text).expect("parsing capture fixture")
 }
 
@@ -58,7 +60,10 @@ where
 {
     let log = fixture(fixture_name);
     let mock = MockTransport::from_log(log);
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     runtime.block_on(async move {
         let mut client = Client::new(mock).read_banner().await.unwrap();
         client.run(command).await.unwrap()
@@ -114,7 +119,12 @@ fn drivelist_360_multi_segment_chunk() {
 
 #[test]
 fn drivefreespace_parses_hi_lo_pairs() {
-    let space = run_command("drivefreespace", DriveFreeSpace { drive: "DEVKIT:\\".to_owned() });
+    let space = run_command(
+        "drivefreespace",
+        DriveFreeSpace {
+            drive: "DEVKIT:\\".to_owned(),
+        },
+    );
     insta::assert_debug_snapshot!(space, @r###"
     DriveSpace {
         free_to_caller_bytes: 216171921408,
@@ -126,7 +136,12 @@ fn drivefreespace_parses_hi_lo_pairs() {
 
 #[test]
 fn dirlist_parses_entries_with_mixed_types() {
-    let entries = run_command("dirlist_devkit", DirList { path: "DEVKIT:\\".to_owned() });
+    let entries = run_command(
+        "dirlist_devkit",
+        DirList {
+            path: "DEVKIT:\\".to_owned(),
+        },
+    );
     insta::assert_debug_snapshot!(entries, @r###"
     [
         DirEntry {
@@ -157,7 +172,12 @@ fn dirlist_parses_entries_with_mixed_types() {
 
 #[test]
 fn getfileattributes_parses_single_entry() {
-    let attrs = run_command("getfileattributes", GetFileAttributes { path: "DEVKIT:\\music1.wma".to_owned() });
+    let attrs = run_command(
+        "getfileattributes",
+        GetFileAttributes {
+            path: "DEVKIT:\\music1.wma".to_owned(),
+        },
+    );
     insta::assert_debug_snapshot!(attrs, @r###"
     FileAttributes {
         size: 243079,
@@ -176,10 +196,16 @@ fn getfileattributes_parses_single_entry() {
 fn getfile_streams_prefixed_payload() {
     let log = fixture("getfile_small");
     let mock = MockTransport::from_log(log).with_lax_writes();
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let (bytes, total) = runtime.block_on(async move {
         let mut client = Client::new(mock).read_banner().await.unwrap();
-        let download = client.get_file("E:\\greet.txt", GetFileRange::WholeFile).await.unwrap();
+        let download = client
+            .get_file("E:\\greet.txt", GetFileRange::WholeFile)
+            .await
+            .unwrap();
         let total = download.total();
         let bytes = download.into_vec().await.unwrap();
         (bytes, total)
@@ -192,7 +218,10 @@ fn getfile_streams_prefixed_payload() {
 fn screenshot_streams_metadata_and_framebuffer() {
     let log = fixture("screenshot_small");
     let mock = MockTransport::from_log(log).with_lax_writes();
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let shot = runtime.block_on(async move {
         let mut client = Client::new(mock).read_banner().await.unwrap();
         client.screenshot().await.unwrap()
@@ -228,7 +257,7 @@ fn consolefeatures_parses_leading_space_separated_flags() {
 #[test]
 fn consolemem_parses_memory_class() {
     let mem = run_command("consolemem", GetConsoleMem);
-    assert_eq!(mem.class, 0x02);
+    assert_eq!(mem, ConsoleMem::ExtraMemoryInUse);
 }
 
 #[test]
@@ -244,12 +273,18 @@ fn netaddrs_parses_name_and_hex_blobs() {
     // Blobs lead with the IPv4 address: C0A8011A == 192.168.1.26.
     assert_eq!(&addrs.debug[..4], &[0xC0, 0xA8, 0x01, 0x1A]);
     assert_eq!(&addrs.title[..4], &[0xC0, 0xA8, 0x01, 0x19]);
-    assert_eq!(addrs.debug.len(), addrs.title.len());
+    assert_eq!(addrs.debug.len(), 36);
+    assert_eq!(addrs.title.len(), 36);
 }
 
 #[test]
 fn modsections_parses_every_section_with_flags() {
-    let sections = run_command("modsections", ModuleSections { module: "xbdm.xex".to_owned() });
+    let sections = run_command(
+        "modsections",
+        ModuleSections {
+            module: "xbdm.xex".to_owned(),
+        },
+    );
     assert_eq!(sections.len(), 8);
     assert_eq!(sections[0].name, ".rdata");
     assert_eq!(sections[0].base, 0x91f0_0400);
@@ -263,7 +298,12 @@ fn modsections_parses_every_section_with_flags() {
 
 #[test]
 fn threadinfo_parses_detail_block() {
-    let detail = run_command("threadinfo", ThreadInfo { thread: ThreadId(0xfb00_0000) });
+    let detail = run_command(
+        "threadinfo",
+        ThreadInfo {
+            thread: ThreadId(0xfb00_0000),
+        },
+    );
     assert_eq!(detail.thread, ThreadId(0xfb00_0000));
     assert_eq!(detail.suspend, 0);
     assert_eq!(detail.priority, 13);
@@ -279,7 +319,13 @@ fn threadinfo_parses_detail_block() {
 
 #[test]
 fn getmem_parses_hex_rows_into_bytes() {
-    let snapshot = run_command("getmem", GetMem { address: 0x8004_0000, length: 64 });
+    let snapshot = run_command(
+        "getmem",
+        GetMem {
+            address: 0x8004_0000,
+            length: 64,
+        },
+    );
     assert_eq!(snapshot.address, 0x8004_0000);
     assert_eq!(snapshot.data.len(), 64);
     // XEX2 image header at the kernel base.
@@ -317,7 +363,10 @@ fn sockets_parses_tracked_socket_entries() {
 fn pclist_parses_type_and_name_pairs() {
     let counters = run_command("pclist", PerfCounterList);
     assert!(!counters.is_empty());
-    let pages = counters.iter().find(|c| c.name == "Debugger Pages").expect("Debugger Pages counter present");
+    let pages = counters
+        .iter()
+        .find(|c| c.name == "Debugger Pages")
+        .expect("Debugger Pages counter present");
     assert_eq!(pages.kind, 0x01);
     // Names may contain spaces; the parser must not split on them.
     assert!(counters.iter().any(|c| c.name.contains(' ')));
@@ -325,7 +374,13 @@ fn pclist_parses_type_and_name_pairs() {
 
 #[test]
 fn querypc_parses_split_hi_lo_value_and_rate() {
-    let sample = run_command("querypc", QueryPerfCounter { name: "Debugger Pages".to_owned(), kind: 0x01 });
+    let sample = run_command(
+        "querypc",
+        QueryPerfCounter {
+            name: "Debugger Pages".to_owned(),
+            kind: 0x01,
+        },
+    );
     assert_eq!(sample.value, 0);
     // rate = (ratehi << 32) | ratelo
     assert_eq!(sample.rate, 0x0000_000d_3c07_cb50);
@@ -403,7 +458,13 @@ fn xbeinfo_parses_running_title() {
 
 #[test]
 fn setmem_parses_written_count() {
-    let result = run_command("setmem", SetMem { address: 0xFEEF_0000, data: vec![0xDE, 0xAD, 0xBE, 0xEF] });
+    let result = run_command(
+        "setmem",
+        SetMem {
+            address: 0xFEEF_0000,
+            data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        },
+    );
     insta::assert_debug_snapshot!(result, @r###"
     BytesWritten {
         requested: 4,
@@ -416,17 +477,28 @@ fn setmem_parses_written_count() {
 fn sendfile_streams_upload_and_finalizes() {
     let log = fixture("sendfile_small");
     let mock = MockTransport::from_log(log);
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     runtime.block_on(async move {
         let mut client = Client::new(mock).read_banner().await.unwrap();
-        let upload = client.send_file(r"E:\hi.txt", FileUploadKind::Create { size: 5 }).await.unwrap();
+        let upload = client
+            .send_file(r"E:\hi.txt", FileUploadKind::Create { size: 5 })
+            .await
+            .unwrap();
         upload.send_all(b"hello").await.unwrap();
     });
 }
 
 #[test]
 fn isstopped_maps_408_to_running() {
-    let state = run_command("isstopped_running", IsStopped { thread: ThreadId(0xfb000018) });
+    let state = run_command(
+        "isstopped_running",
+        IsStopped {
+            thread: ThreadId(0xfb000018),
+        },
+    );
     insta::assert_debug_snapshot!(state, @"Running");
 }
 
@@ -434,7 +506,10 @@ fn isstopped_maps_408_to_running() {
 fn error_response_is_typed() {
     let log = fixture("error_unknown");
     let mock = MockTransport::from_log(log).with_lax_writes();
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let err = runtime.block_on(async move {
         let mut client = Client::new(mock).read_banner().await.unwrap();
         client.send_raw("notacommand").await.unwrap_err()
@@ -442,7 +517,9 @@ fn error_response_is_typed() {
     let kind = err.current_context();
     insta::assert_debug_snapshot!(kind, @r###"
     Remote {
-        code: UnknownCommand,
+        code: ErrorCode(
+            407,
+        ),
         message: "unknown command",
     }
     "###);
@@ -454,12 +531,18 @@ fn error_response_is_typed() {
 fn pix_full_handshake_walks_every_token_in_order() {
     let log = fixture("pix_handshake");
     let mock = MockTransport::from_log(log);
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     runtime.block_on(async move {
         let mut client = Client::new(mock).read_banner().await.unwrap();
         let mut session = CaptureSession::connect(&mut client).await.unwrap().session;
         session.limit_capture_size_mb(256).await.unwrap();
-        session.begin_capture_file_creation(r"DEVKIT:\snip.wmv").await.unwrap();
+        session
+            .begin_capture_file_creation(r"DEVKIT:\snip.wmv")
+            .await
+            .unwrap();
         session.begin_capture().await.unwrap();
         session.end_capture().await.unwrap();
         session.end_capture_file_creation().await.unwrap();

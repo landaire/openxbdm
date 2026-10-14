@@ -1,0 +1,30 @@
+---
+source: crates/openxbdm-client/src/commands/debugger.rs
+expression: attachments
+---
+[
+    Attached {
+        name: None,
+        user: None,
+    },
+    Attached {
+        name: Some(
+            "Dev PC",
+        ),
+        user: Some(
+            "dev",
+        ),
+    },
+    Attached {
+        name: Some(
+            "Dev PC",
+        ),
+        user: None,
+    },
+    Attached {
+        name: None,
+        user: Some(
+            "dev",
+        ),
+    },
+]

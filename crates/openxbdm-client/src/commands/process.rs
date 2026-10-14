@@ -56,11 +56,17 @@ impl Command for Modules {
     }
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
-        let lines = response.expect_multiline().map_err(rootcause::Report::new)?;
+        let lines = response
+            .expect_multiline()
+            .map_err(rootcause::Report::new)?;
         let mut out = Vec::with_capacity(lines.len());
         for line in lines {
             let kv = parse_kv_line(&line);
-            let name = kv.require("name").map_err(report_parse)?.as_str().to_owned();
+            let name = kv
+                .require("name")
+                .map_err(report_parse)?
+                .as_str()
+                .to_owned();
             out.push(ModuleInfo {
                 name,
                 base: require_u32(&kv, "base").map_err(report_parse)?,
@@ -90,7 +96,6 @@ pub struct ModuleSections {
 pub struct SectionFlags(pub u32);
 
 impl SectionFlags {
-    pub const LOADED: u32 = 0x01;
     pub const READABLE: u32 = 0x02;
     pub const WRITABLE: u32 = 0x04;
     pub const EXECUTABLE: u32 = 0x08;
@@ -126,7 +131,10 @@ impl Command for ModuleSections {
         if self.module.is_empty() {
             return Err(report_argument(ArgumentError::EmptyFilename));
         }
-        ArgBuilder::new("modsections").quoted("NAME", &self.module).map_err(report_argument).map(ArgBuilder::finish)
+        ArgBuilder::new("modsections")
+            .quoted("NAME", &self.module)
+            .map_err(report_argument)
+            .map(ArgBuilder::finish)
     }
 
     fn expected(&self) -> ExpectedBody {
@@ -134,12 +142,18 @@ impl Command for ModuleSections {
     }
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
-        let lines = response.expect_multiline().map_err(rootcause::Report::new)?;
+        let lines = response
+            .expect_multiline()
+            .map_err(rootcause::Report::new)?;
         let mut out = Vec::with_capacity(lines.len());
         for line in lines {
             let kv = parse_kv_line(&line);
             out.push(ModuleSection {
-                name: kv.require("name").map_err(report_parse)?.as_str().to_owned(),
+                name: kv
+                    .require("name")
+                    .map_err(report_parse)?
+                    .as_str()
+                    .to_owned(),
                 base: require_u32(&kv, "base").map_err(report_parse)?,
                 size: require_u32(&kv, "size").map_err(report_parse)?,
                 index: require_u32(&kv, "index").map_err(report_parse)?,
@@ -187,12 +201,15 @@ impl Command for Threads {
     }
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
-        let lines = response.expect_multiline().map_err(rootcause::Report::new)?;
+        let lines = response
+            .expect_multiline()
+            .map_err(rootcause::Report::new)?;
         let mut out = Vec::with_capacity(lines.len());
         for line in lines {
             let trimmed = line.trim();
-            let signed =
-                trimmed.parse::<i32>().map_err(|_| report_parse(ParseError::InvalidDecimalU32 { key: "thread-id" }))?;
+            let signed = trimmed
+                .parse::<i32>()
+                .map_err(|_| report_parse(ParseError::InvalidDecimalU32 { key: "thread-id" }))?;
             out.push(ThreadId::from_signed(signed));
         }
         Ok(out)
@@ -226,7 +243,9 @@ impl Command for ThreadInfo {
     type Output = ThreadDetail;
 
     fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
-        Ok(ArgBuilder::new("threadinfo").hex32("THREAD", self.thread.as_u32()).finish())
+        Ok(ArgBuilder::new("threadinfo")
+            .hex32("THREAD", self.thread.as_u32())
+            .finish())
     }
 
     fn expected(&self) -> ExpectedBody {
@@ -234,8 +253,12 @@ impl Command for ThreadInfo {
     }
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
-        let mut lines = response.expect_multiline().map_err(rootcause::Report::new)?;
-        let head = lines.pop().ok_or_else(|| report_parse(ParseError::UnrecognizedShape))?;
+        let mut lines = response
+            .expect_multiline()
+            .map_err(rootcause::Report::new)?;
+        let head = lines
+            .pop()
+            .ok_or_else(|| report_parse(ParseError::UnrecognizedShape))?;
         let kv = parse_kv_line(&head);
         let create_hi = require_u32(&kv, "createhi").map_err(report_parse)?;
         let create_lo = require_u32(&kv, "createlo").map_err(report_parse)?;
@@ -262,8 +285,72 @@ impl Command for ThreadInfo {
     }
 }
 
-/// `xbeinfo RUNNING` or `xbeinfo NAME="..."`: executable metadata for the
-/// currently loaded title or a named `.xex` file.
+/// Kernel handle of a thread object, as opposed to a [`ThreadId`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ThreadHandle(pub u32);
+
+/// Thread exit status reported by `threadstat`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ThreadExitCode(pub u32);
+
+impl ThreadExitCode {
+    /// Reported for threads that have not terminated (and for threads
+    /// that exited with this value).
+    pub const STILL_ACTIVE: Self = Self(0x103);
+}
+
+/// Win32 error code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Win32Error(pub u32);
+
+/// `threadstat handle=0x<handle>`: exit status of the thread object a
+/// handle refers to. A missing handle gives `423- bad parameter`.
+#[derive(Debug, Clone, Copy)]
+pub struct ThreadStat {
+    pub handle: ThreadHandle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadStatus {
+    /// `200- Exit Code 0x%x`.
+    ExitCode(ThreadExitCode),
+    /// `200- Error 0x%x`: the handle did not reference a thread object.
+    LookupFailed(Win32Error),
+}
+
+impl Command for ThreadStat {
+    type Output = ThreadStatus;
+
+    fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
+        Ok(ArgBuilder::new("threadstat")
+            .hex32("handle", self.handle.0)
+            .finish())
+    }
+
+    fn expected(&self) -> ExpectedBody {
+        ExpectedBody::Line
+    }
+
+    fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
+        let head = response.expect_ok().map_err(rootcause::Report::new)?;
+        let hex = |text: &str, key: &'static str| {
+            text.strip_prefix("0x")
+                .and_then(|digits| u32::from_str_radix(digits, 16).ok())
+                .ok_or_else(|| report_parse(ParseError::InvalidHexDigits { key }))
+        };
+        if let Some(value) = head.strip_prefix("Exit Code ") {
+            hex(value, "Exit Code").map(|code| ThreadStatus::ExitCode(ThreadExitCode(code)))
+        } else if let Some(value) = head.strip_prefix("Error ") {
+            hex(value, "Error").map(|code| ThreadStatus::LookupFailed(Win32Error(code)))
+        } else {
+            Err(report_parse(ParseError::UnrecognizedShape))
+        }
+    }
+}
+
+/// `xbeinfo RUNNING` or `xbeinfo NAME="..."`: the object path of the
+/// running executable. The console answers a named query with the running
+/// executable too; timestamp and checksum are always 0.
 #[derive(Debug, Clone)]
 pub enum XbeInfo {
     Running,
@@ -283,9 +370,10 @@ impl Command for XbeInfo {
     fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
         match self {
             XbeInfo::Running => Ok(ArgBuilder::new("xbeinfo").flag("RUNNING").finish()),
-            XbeInfo::Named(path) => {
-                ArgBuilder::new("xbeinfo").quoted("NAME", path).map_err(report_argument).map(ArgBuilder::finish)
-            }
+            XbeInfo::Named(path) => ArgBuilder::new("xbeinfo")
+                .quoted("NAME", path)
+                .map_err(report_argument)
+                .map(ArgBuilder::finish),
         }
     }
 
@@ -294,7 +382,9 @@ impl Command for XbeInfo {
     }
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
-        let lines = response.expect_multiline().map_err(rootcause::Report::new)?;
+        let lines = response
+            .expect_multiline()
+            .map_err(rootcause::Report::new)?;
         let mut timestamp: Option<u32> = None;
         let mut checksum: Option<u32> = None;
         let mut name: Option<String> = None;
@@ -311,9 +401,43 @@ impl Command for XbeInfo {
             }
         }
         Ok(XbeInfoResult {
-            timestamp: timestamp.ok_or(ParseError::MissingKey { key: "timestamp" }).map_err(report_parse)?,
-            checksum: checksum.ok_or(ParseError::MissingKey { key: "checksum" }).map_err(report_parse)?,
-            name: name.ok_or(ParseError::MissingKey { key: "name" }).map_err(report_parse)?,
+            timestamp: timestamp
+                .ok_or(ParseError::MissingKey { key: "timestamp" })
+                .map_err(report_parse)?,
+            checksum: checksum
+                .ok_or(ParseError::MissingKey { key: "checksum" })
+                .map_err(report_parse)?,
+            name: name
+                .ok_or(ParseError::MissingKey { key: "name" })
+                .map_err(report_parse)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::SuccessCode;
+
+    #[test]
+    fn threadstat_parses_both_reply_forms() {
+        let command = ThreadStat {
+            handle: ThreadHandle(0x10),
+        };
+        let replies: Vec<ThreadStatus> = ["Exit Code 0x103", "Exit Code 0x0", "Error 0x6"]
+            .iter()
+            .map(|head| {
+                command
+                    .parse(Response::Line {
+                        code: SuccessCode::Ok,
+                        head: (*head).to_owned(),
+                    })
+                    .unwrap()
+            })
+            .collect();
+        insta::assert_snapshot!(
+            format!("{replies:x?}"),
+            @"[ExitCode(ThreadExitCode(103)), ExitCode(ThreadExitCode(0)), LookupFailed(Win32Error(6))]"
+        );
     }
 }

@@ -53,7 +53,11 @@ pub trait Command {
     /// semantically part of the API). Returning `Some(Err(_))` lets the
     /// command rewrite the error type before it propagates.
     #[allow(unused_variables)]
-    fn handle_remote(&self, code: ErrorCode, message: &str) -> Option<Result<Self::Output, rootcause::Report<Error>>> {
+    fn handle_remote(
+        &self,
+        code: ErrorCode,
+        message: &str,
+    ) -> Option<Result<Self::Output, rootcause::Report<Error>>> {
         None
     }
 }

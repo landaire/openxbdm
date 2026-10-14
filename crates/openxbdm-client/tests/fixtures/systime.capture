@@ -1,4 +1,4 @@
 # xbdm capture v1
 S> 201- connected\r\n
 C> systime\r\n
-S> 200- clockhi=0x01da3411 clocklo=0x9a2b8200\r\n
+S> 200- high=0x1da3411 low=0x9a2b8200\r\n

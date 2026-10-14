@@ -1,22 +1,22 @@
 //! Screenshot capture.
 //!
-//! Wire shape (reverse-engineered from `xbdm.xex`'s screenshot callback):
+//! Wire shape of the monitor's screenshot transfer:
 //!
 //! ```text
 //! 203- binary response follows\r\n
 //! pitch=0x... width=0x... height=0x... format=0x... offsetx=0x... offsety=0x...,
 //!   framebuffersize=0x... sw=0x... sh=0x... colorspace=0x...\r\n
-//! <framebuffersize bytes of raw pixel data>
+//! <framebuffersize bytes of front buffer tiles>
 //! ```
 //!
-//! The pixel buffer is the current HDMI scanout. For the typical
-//! `format=0x98280186` (D3DFMT_LE_X8R8G8B8 with XBDM's "ready" flag set)
-//! on standard-definition output, the layout is linear `B G R X` bytes
-//! per pixel at `pitch` bytes per row. When `pitch > width * 4` each row
-//! has trailing padding that must be stripped.
+//! The body is the front buffer exactly as the GPU stores it: 4 KiB tiles
+//! of 32x32 pixels, row-major, covering the displayed rectangle widened to
+//! tile boundaries. `offsetx`/`offsety` locate the first displayed pixel
+//! inside the first tile, and each tile row holds
+//! `ceil((offsetx + width) / 32)` tiles.
 //!
 //! Format variants we explicitly recognise are documented in
-//! [`ScreenshotPixelFormat`]; everything else is surfaced as
+//! [`PixelFormat`]; everything else is surfaced as
 //! `PixelFormat::Unknown(u32)` so callers can still access the raw bytes
 //! and decide how to interpret them.
 
@@ -37,21 +37,20 @@ use futures_util::io::AsyncReadExt;
 /// Metadata XBDM emits before the framebuffer bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScreenshotMetadata {
-    /// Bytes per scanline on the wire. Usually `width * 4` but may be
-    /// larger if the GPU needs pitch alignment.
+    /// Bytes per pixel row of the whole front buffer surface.
     pub pitch: u32,
-    /// Logical framebuffer width (same as `sw` in standard cases).
+    /// Displayed width in pixels.
     pub width: u32,
-    /// Logical framebuffer height (same as `sh`).
+    /// Displayed height in pixels.
     pub height: u32,
     /// Raw XBDM format enum. High bit `0x80000000` is an internal marker
     /// we preserve so round-trips are faithful.
     pub format: PixelFormat,
-    /// Offset into the first tile along X, if the format uses tiling.
+    /// Column of the first displayed pixel inside the first tile.
     pub offset_x: u32,
-    /// Offset into the first tile along Y, if the format uses tiling.
+    /// Row of the first displayed pixel inside the first tile.
     pub offset_y: u32,
-    /// Total bytes XBDM will send as the body (== `pitch * aligned_height`).
+    /// Body size: the tiles covering the displayed rectangle, 4 KiB each.
     pub framebuffer_size: u32,
     /// "Shown" width reported separately from tile-aligned width.
     pub shown_width: u32,
@@ -102,6 +101,15 @@ impl PixelFormat {
     }
 }
 
+/// Why [`Screenshot::to_rgba8`] cannot decode a screenshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DecodeError {
+    #[error("no RGBA conversion for pixel format {format:?}")]
+    UnsupportedFormat { format: PixelFormat },
+    #[error("body of {length:#x} bytes does not hold every tile of the displayed rectangle")]
+    BodyTooShort { length: usize },
+}
+
 /// Collected screenshot, holding both the parsed metadata and the raw
 /// bytes off the wire. Converters (e.g. PNG encoders in the CLI) run on
 /// top of this type.
@@ -112,65 +120,71 @@ pub struct Screenshot {
 }
 
 impl Screenshot {
-    /// Decode the framebuffer into a fully linear `RGBA` byte buffer with
-    /// `stride == width * 4`.
-    ///
-    /// Xbox 360 GPU memory for scanout is 2D-tiled: the visible 32x32
-    /// tiles are laid out in a Z-ordered macro/micro pattern. We run
-    /// [`detile_2d_32bpp`] to undo the swizzle first, then convert from
-    /// the in-memory `B G R X` byte order to `R G B A` with fully opaque
-    /// alpha. Returns `None` for formats we don't know how to decode so
-    /// callers can fall back to saving the raw bytes.
-    pub fn to_rgba8(&self) -> Option<Vec<u8>> {
-        if !self.metadata.format.is_linear_xrgb8888() {
-            return None;
+    /// Decode the framebuffer into a linear `RGBA` byte buffer with
+    /// `stride == width * 4`, converting from the in-memory `B G R X` byte
+    /// order with opaque alpha.
+    pub fn to_rgba8(&self) -> Result<Vec<u8>, DecodeError> {
+        let m = &self.metadata;
+        if !m.format.is_linear_xrgb8888() {
+            return Err(DecodeError::UnsupportedFormat { format: m.format });
         }
-        let w = self.metadata.width;
-        let h = self.metadata.height;
-        if (w as usize) * (h as usize) * 4 > self.data.len() {
-            return None;
-        }
-        let linear = detile_2d_32bpp(&self.data, w, h);
+        let linear = detile_32bpp(&self.data, m.width, m.height, m.offset_x, m.offset_y).ok_or(
+            DecodeError::BodyTooShort {
+                length: self.data.len(),
+            },
+        )?;
         let mut rgba = Vec::with_capacity(linear.len());
         for chunk in linear.as_chunks::<4>().0 {
             let (b, g, r, _x) = (chunk[0], chunk[1], chunk[2], chunk[3]);
             rgba.extend_from_slice(&[r, g, b, 0xFF]);
         }
-        Some(rgba)
+        Ok(rgba)
     }
 }
 
-/// Undo Xbox 360 2D tile swizzling for a 32 bits-per-pixel surface.
-///
-/// The GPU lays scanout memory out in a macro/micro Z-ordered pattern:
-/// pixels are grouped into 32x32 tiles, each tile is 4 KiB, and within
-/// a tile pixels follow a fixed bit-scramble. This function reverses
-/// that so the result is a simple `width * height * 4` row-major buffer
-/// matching what the display ultimately scans out.
-pub fn detile_2d_32bpp(tiled: &[u8], width: u32, height: u32) -> Vec<u8> {
+/// Linearize a screenshot body: `width * height` pixels of 4 bytes,
+/// starting at (`offset_x`, `offset_y`) of the first tile. `None` when the
+/// body does not hold every tile of the rectangle.
+pub fn detile_32bpp(
+    tiled: &[u8],
+    width: u32,
+    height: u32,
+    offset_x: u32,
+    offset_y: u32,
+) -> Option<Vec<u8>> {
     const BPP_BYTES: usize = 4;
+    let tiles_per_row = offset_x.checked_add(width)?.div_ceil(32);
+    let tile_rows = offset_y.checked_add(height)?.div_ceil(32);
+    let surface_width = tiles_per_row.checked_mul(32)?;
+    // Tile offsets are computed in u32, so the whole surface must fit in it.
+    let surface_bytes = tiles_per_row.checked_mul(tile_rows)?.checked_mul(0x1000)?;
+    if surface_bytes as usize > tiled.len() {
+        return None;
+    }
     let mut out = vec![0u8; (width as usize) * (height as usize) * BPP_BYTES];
     for y in 0..height {
         for x in 0..width {
-            let src_byte = tile_offset_32bpp_bytes(x, y, width) as usize;
-            let dst_byte = ((y * width + x) as usize) * BPP_BYTES;
-            if src_byte + BPP_BYTES <= tiled.len() {
-                out[dst_byte..dst_byte + BPP_BYTES].copy_from_slice(&tiled[src_byte..src_byte + BPP_BYTES]);
-            }
+            let src = tile_offset_32bpp_bytes(x + offset_x, y + offset_y, surface_width) as usize;
+            let dst = ((y as usize) * (width as usize) + (x as usize)) * BPP_BYTES;
+            out[dst..dst + BPP_BYTES].copy_from_slice(&tiled[src..src + BPP_BYTES]);
         }
     }
-    out
+    Some(out)
 }
 
-/// Byte offset of the logical pixel at `(x, y)` inside a 32-bpp Xbox 360
-/// 2D-tiled surface. This is the standard `XGAddress2DTiledOffset`
-/// algorithm specialised for 32 bpp (log2(bytes_per_pixel) = 2).
+/// Byte offset of pixel `(x, y)` inside a 32-bpp tiled surface `width`
+/// pixels wide: the tile index times 4 KiB plus the position inside the
+/// tile.
 pub fn tile_offset_32bpp_bytes(x: u32, y: u32, width: u32) -> u32 {
     const LOG_BPP: u32 = 2;
     let aligned_width = (width + 31) & !31;
     let macro_ = ((x >> 5) + (y >> 5) * (aligned_width >> 5)) << (LOG_BPP + 7);
     let micro = ((x & 7) + ((y & 6) << 2)) << LOG_BPP;
-    let offset = macro_ + ((micro & !0xF) << 1) + (micro & 0xF) + ((y & 8) << (3 + LOG_BPP)) + ((y & 1) << 4);
+    let offset = macro_
+        + ((micro & !0xF) << 1)
+        + (micro & 0xF)
+        + ((y & 8) << (3 + LOG_BPP))
+        + ((y & 1) << 4);
     ((offset & !0x1FF) << 3)
         + ((y & 16) << 7)
         + ((offset & 0x1C0) << 2)
@@ -213,8 +227,8 @@ impl<T> Client<T, Connected>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    /// Take a screenshot of the current HDMI scanout. Returns the typed
-    /// metadata plus the raw framebuffer bytes.
+    /// Take a screenshot of the front buffer. Returns the typed metadata
+    /// plus the raw tile bytes.
     pub async fn screenshot(&mut self) -> Result<Screenshot, rootcause::Report<Error>> {
         // 203 head; engine parks in StreamingBody after this.
         let _head_text = self.submit_streaming("screenshot").await?;
@@ -260,14 +274,21 @@ where
     }
 }
 
-async fn read_line_buffered<R>(reader: &mut R, leftover: &mut BytesMut) -> Result<String, rootcause::Report<Error>>
+async fn read_line_buffered<R>(
+    reader: &mut R,
+    leftover: &mut BytesMut,
+) -> Result<String, rootcause::Report<Error>>
 where
     R: AsyncRead + Unpin,
 {
     let mut tmp = [0u8; 512];
     loop {
         if let Some(pos) = memchr::memchr(b'\n', leftover) {
-            let end = if pos > 0 && leftover[pos - 1] == b'\r' { pos - 1 } else { pos };
+            let end = if pos > 0 && leftover[pos - 1] == b'\r' {
+                pos - 1
+            } else {
+                pos
+            };
             let line = String::from_utf8(leftover[..end].to_vec())
                 .map_err(|_| rootcause::Report::new(Error::from(FramingError::NonUtf8Line)))?;
             let _ = leftover.split_to(pos + 1);
@@ -330,5 +351,14 @@ mod tests {
         assert_eq!(meta.format, PixelFormat::LeX8R8G8B8);
         assert_eq!(meta.framebuffer_size, 0x12c000);
         assert!(meta.format.is_linear_xrgb8888());
+    }
+
+    #[test]
+    fn detile_rejects_overflowing_rectangle() {
+        let body = [0u8; 0x1000];
+        assert_eq!(detile_32bpp(&body, 1, 1, u32::MAX, 0), None);
+        assert_eq!(detile_32bpp(&body, 1, 1, 0, u32::MAX), None);
+        assert_eq!(detile_32bpp(&body, 1, 1, u32::MAX - 1, 0), None);
+        assert!(detile_32bpp(&body, 1, 1, 31, 31).is_some());
     }
 }

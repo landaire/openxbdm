@@ -3,15 +3,13 @@
 use crate::commands::kv::KvLine;
 use crate::commands::kv::parse_kv_line;
 use crate::commands::kv::value_u32;
-use crate::error::ArgumentError;
 use crate::error::Error;
 use crate::error::ParseError;
 use crate::protocol::ArgBuilder;
 use crate::protocol::Command;
+use crate::protocol::ErrorCode;
 use crate::protocol::ExpectedBody;
 use crate::protocol::Response;
-
-const MAX_MEMORY_TRANSFER: u32 = 0x1_0000;
 
 fn report_parse(err: ParseError) -> rootcause::Report<Error> {
     rootcause::Report::new(Error::from(err))
@@ -21,24 +19,12 @@ fn require_u32(kv: &KvLine<'_>, key: &'static str) -> Result<u32, ParseError> {
     value_u32(kv.require(key)?, key)
 }
 
-fn hex_string_to_bytes(s: &str) -> Result<Vec<u8>, ParseError> {
-    if !s.len().is_multiple_of(2) {
-        return Err(ParseError::InvalidHexDigits { key: "memory-hex" });
-    }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    for chunk in s.as_bytes().chunks(2) {
-        let pair = core::str::from_utf8(chunk).map_err(|_| ParseError::InvalidHexDigits { key: "memory-hex" })?;
-        out.push(u8::from_str_radix(pair, 16).map_err(|_| ParseError::InvalidHexDigits { key: "memory-hex" })?);
-    }
-    Ok(out)
-}
-
 /// `getmem ADDR=<va> LENGTH=<n>`: read `n` bytes from virtual address `va`.
 ///
-/// Despite the name, the response is a `202` multiline body where each
-/// line is a hex-encoded chunk (e.g. `AABBCCDD...`). Pages that are not
-/// mapped appear as `??` pairs; we decode them to `0x00` in the returned
-/// `Vec<u8>` and set the corresponding entry in `unmapped_offsets`.
+/// The response is a `202` multiline body of hex lines of up to 32 bytes.
+/// Bytes of unmapped pages appear as `??` pairs; they decode to `0x00` in
+/// the returned `Vec<u8>` and are listed in `unmapped_offsets`. The console
+/// accepts any length, including 0.
 #[derive(Debug, Clone, Copy)]
 pub struct GetMem {
     pub address: u32,
@@ -59,16 +45,10 @@ impl Command for GetMem {
     type Output = MemorySnapshot;
 
     fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
-        if self.length == 0 {
-            return Err(rootcause::Report::new(Error::from(ArgumentError::EmptyMemoryTransfer)));
-        }
-        if self.length > MAX_MEMORY_TRANSFER {
-            return Err(rootcause::Report::new(Error::from(ArgumentError::MemoryTransferTooLarge {
-                length: self.length,
-                maximum: MAX_MEMORY_TRANSFER,
-            })));
-        }
-        Ok(ArgBuilder::new("getmem").hex32("ADDR", self.address).hex32("LENGTH", self.length).finish())
+        Ok(ArgBuilder::new("getmem")
+            .hex32("ADDR", self.address)
+            .hex32("LENGTH", self.length)
+            .finish())
     }
 
     fn expected(&self) -> ExpectedBody {
@@ -76,18 +56,25 @@ impl Command for GetMem {
     }
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
-        let lines = response.expect_multiline().map_err(rootcause::Report::new)?;
+        let lines = response
+            .expect_multiline()
+            .map_err(rootcause::Report::new)?;
         let expected = self.length as usize;
         let mut actual = 0usize;
         for line in &lines {
             let bytes = line.as_bytes();
             if bytes.len() % 2 != 0 {
-                return Err(report_parse(ParseError::InvalidHexDigits { key: "memory-hex" }));
+                return Err(report_parse(ParseError::InvalidHexDigits {
+                    key: "memory-hex",
+                }));
             }
             actual = actual.saturating_add(bytes.len() / 2);
         }
         if actual != expected {
-            return Err(report_parse(ParseError::MemoryLengthMismatch { expected, actual }));
+            return Err(report_parse(ParseError::MemoryLengthMismatch {
+                expected,
+                actual,
+            }));
         }
 
         let mut data = Vec::with_capacity(expected);
@@ -99,21 +86,27 @@ impl Command for GetMem {
                     data.push(0);
                     continue;
                 }
-                let pair = core::str::from_utf8(chunk)
-                    .map_err(|_| report_parse(ParseError::InvalidHexDigits { key: "memory-hex" }))?;
-                let byte = u8::from_str_radix(pair, 16)
-                    .map_err(|_| report_parse(ParseError::InvalidHexDigits { key: "memory-hex" }))?;
+                let pair = core::str::from_utf8(chunk).map_err(|_| {
+                    report_parse(ParseError::InvalidHexDigits { key: "memory-hex" })
+                })?;
+                let byte = u8::from_str_radix(pair, 16).map_err(|_| {
+                    report_parse(ParseError::InvalidHexDigits { key: "memory-hex" })
+                })?;
                 data.push(byte);
             }
         }
-        Ok(MemorySnapshot { address: self.address, data, unmapped_offsets: unmapped })
+        Ok(MemorySnapshot {
+            address: self.address,
+            data,
+            unmapped_offsets: unmapped,
+        })
     }
 }
 
 /// `setmem ADDR=<va> DATA=<hex>`: write bytes to the console's virtual
-/// address space. The response is `200- set <n> bytes`; the returned
-/// count may be shorter than the request if the kernel aborted on an
-/// unmapped page.
+/// address space. The console replies `200- set <n> bytes`, or `404- set
+/// <n> bytes` when it stopped at an unmapped or unwritable page; both yield
+/// the count written.
 #[derive(Debug, Clone)]
 pub struct SetMem {
     pub address: u32,
@@ -131,10 +124,6 @@ impl Command for SetMem {
     type Output = BytesWritten;
 
     fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
-        if self.data.is_empty() {
-            return Err(rootcause::Report::new(Error::from(ArgumentError::EmptyFilename))
-                .attach("setmem DATA must be non-empty"));
-        }
         let mut hex = String::with_capacity(self.data.len() * 2);
         use core::fmt::Write as _;
         for byte in &self.data {
@@ -149,13 +138,34 @@ impl Command for SetMem {
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         let head = response.expect_ok().map_err(rootcause::Report::new)?;
-        // Response is "set N bytes" where N is the decimal count the
-        // kernel actually wrote.
-        let written = head
-            .split_ascii_whitespace()
-            .find_map(|token| token.parse::<u32>().ok())
-            .ok_or_else(|| report_parse(ParseError::InvalidDecimalU32 { key: "setmem-count" }))?;
-        Ok(BytesWritten { requested: self.data.len() as u32, written })
+        self.bytes_written(&head)
+    }
+
+    fn handle_remote(
+        &self,
+        code: ErrorCode,
+        message: &str,
+    ) -> Option<Result<Self::Output, rootcause::Report<Error>>> {
+        (code == ErrorCode::MEMORY_NOT_MAPPED).then(|| self.bytes_written(message))
+    }
+}
+
+impl SetMem {
+    /// Parse `set N bytes`, N decimal.
+    fn bytes_written(&self, text: &str) -> Result<BytesWritten, rootcause::Report<Error>> {
+        let written = text
+            .strip_prefix("set ")
+            .and_then(|rest| rest.strip_suffix(" bytes"))
+            .and_then(|count| count.parse::<u32>().ok())
+            .ok_or_else(|| {
+                report_parse(ParseError::InvalidDecimalU32 {
+                    key: "setmem-count",
+                })
+            })?;
+        Ok(BytesWritten {
+            requested: self.data.len() as u32,
+            written,
+        })
     }
 }
 
@@ -182,7 +192,9 @@ impl Command for WalkMem {
     }
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
-        let lines = response.expect_multiline().map_err(rootcause::Report::new)?;
+        let lines = response
+            .expect_multiline()
+            .map_err(rootcause::Report::new)?;
         let mut out = Vec::with_capacity(lines.len());
         for line in lines {
             let kv = parse_kv_line(&line);
@@ -194,11 +206,6 @@ impl Command for WalkMem {
         }
         Ok(out)
     }
-
-    fn binary_len(&self) -> Option<usize> {
-        let _ = hex_string_to_bytes("");
-        None
-    }
 }
 
 #[cfg(test)]
@@ -207,20 +214,32 @@ mod tests {
 
     #[test]
     fn getmem_rejects_truncated_response() {
-        let command = GetMem { address: 0x1000, length: 2 };
+        let command = GetMem {
+            address: 0x1000,
+            length: 2,
+        };
         let error = command
-            .parse(Response::Multiline { head: "memory data follows".to_owned(), lines: vec!["AA".to_owned()] })
+            .parse(Response::Multiline {
+                head: "memory data follows".to_owned(),
+                lines: vec!["AA".to_owned()],
+            })
             .unwrap_err();
 
         assert!(matches!(
             error.current_context(),
-            Error::Parse(ParseError::MemoryLengthMismatch { expected: 2, actual: 1 })
+            Error::Parse(ParseError::MemoryLengthMismatch {
+                expected: 2,
+                actual: 1
+            })
         ));
     }
 
     #[test]
     fn getmem_reports_complete_oversized_response_length() {
-        let command = GetMem { address: 0x1000, length: 2 };
+        let command = GetMem {
+            address: 0x1000,
+            length: 2,
+        };
         let error = command
             .parse(Response::Multiline {
                 head: "memory data follows".to_owned(),
@@ -230,7 +249,10 @@ mod tests {
 
         assert!(matches!(
             error.current_context(),
-            Error::Parse(ParseError::MemoryLengthMismatch { expected: 2, actual: 6 })
+            Error::Parse(ParseError::MemoryLengthMismatch {
+                expected: 2,
+                actual: 6
+            })
         ));
     }
 }

@@ -138,28 +138,39 @@ pub struct XbmHeader {
 impl XbmHeader {
     /// Read and validate the 0x800-byte top-level header from a seekable reader.
     pub fn read<R: Read + Seek>(r: &mut R) -> Result<Self, rootcause::Report<Error>> {
-        r.seek(SeekFrom::Start(0)).map_err(Error::from).into_report().attach("seeking xbm to offset 0")?;
+        r.seek(SeekFrom::Start(0))
+            .map_err(Error::from)
+            .into_report()
+            .attach("seeking xbm to offset 0")?;
         let mut buf = [0u8; HEADER_SIZE as usize];
-        r.read_exact(&mut buf).map_err(Error::from).into_report().attach("reading xbm header block")?;
+        r.read_exact(&mut buf)
+            .map_err(Error::from)
+            .into_report()
+            .attach("reading xbm header block")?;
 
         let read_u32 = |off: usize| u32::from_be_bytes(buf[off..off + 4].try_into().unwrap());
 
         let magic = read_u32(0x000);
-        let variant = MagicVariant::from_u32(magic)
-            .ok_or_else(|| rootcause::Report::new(Error::from(XbmError::BadMagic { got: magic })))?;
+        let variant = MagicVariant::from_u32(magic).ok_or_else(|| {
+            rootcause::Report::new(Error::from(XbmError::BadMagic { got: magic }))
+        })?;
         let version = read_u32(0x004);
         if version != crate::commands::pix::PIX_VERSION {
-            return Err(rootcause::Report::new(Error::from(XbmError::UnsupportedVersion {
-                got: version,
-                expected: crate::commands::pix::PIX_VERSION,
-            })));
+            return Err(rootcause::Report::new(Error::from(
+                XbmError::UnsupportedVersion {
+                    got: version,
+                    expected: crate::commands::pix::PIX_VERSION,
+                },
+            )));
         }
         let header_size = read_u32(0x008);
         if header_size as u64 != HEADER_SIZE {
-            return Err(rootcause::Report::new(Error::from(XbmError::UnexpectedHeaderSize {
-                got: header_size,
-                expected: HEADER_SIZE as u32,
-            })));
+            return Err(rootcause::Report::new(Error::from(
+                XbmError::UnexpectedHeaderSize {
+                    got: header_size,
+                    expected: HEADER_SIZE as u32,
+                },
+            )));
         }
 
         Ok(XbmHeader {
@@ -323,7 +334,12 @@ impl FrameHeader {
 
     pub fn parse(buf: &[u8; 16]) -> Self {
         let u = |o: usize| u32::from_be_bytes(buf[o..o + 4].try_into().unwrap());
-        FrameHeader { frame_magic: u(0), flags: u(4), timestamp: u(8), audio_count: u(12) }
+        FrameHeader {
+            frame_magic: u(0),
+            flags: u(4),
+            timestamp: u(8),
+            audio_count: u(12),
+        }
     }
 
     pub fn has_metadata_struct(&self) -> bool {
@@ -375,13 +391,24 @@ pub struct FrameRef {
 
 impl<'a, R: Read + Seek> FrameCursor<'a, R> {
     pub fn new(reader: &'a mut R) -> Result<Self, rootcause::Report<Error>> {
-        let file_size =
-            reader.seek(SeekFrom::End(0)).map_err(Error::from).into_report().attach("stat-ing xbm file size")?;
-        Ok(FrameCursor { reader, file_size, next_offset: HEADER_SIZE, expected_magic: None })
+        let file_size = reader
+            .seek(SeekFrom::End(0))
+            .map_err(Error::from)
+            .into_report()
+            .attach("stat-ing xbm file size")?;
+        Ok(FrameCursor {
+            reader,
+            file_size,
+            next_offset: HEADER_SIZE,
+            expected_magic: None,
+        })
     }
 
     /// Advance to the next frame record. Returns `Ok(None)` at EOF.
-    pub fn next_frame(&mut self, file_header: &XbmHeader) -> Result<Option<FrameRef>, rootcause::Report<Error>> {
+    pub fn next_frame(
+        &mut self,
+        file_header: &XbmHeader,
+    ) -> Result<Option<FrameRef>, rootcause::Report<Error>> {
         if self.next_offset + FrameHeader::SIZE > self.file_size {
             return Ok(None);
         }
@@ -391,7 +418,11 @@ impl<'a, R: Read + Seek> FrameCursor<'a, R> {
             .into_report()
             .attach_with(|| format!("seek to frame at {:#x}", self.next_offset))?;
         let mut fh_buf = [0u8; 16];
-        self.reader.read_exact(&mut fh_buf).map_err(Error::from).into_report().attach("reading frame header")?;
+        self.reader
+            .read_exact(&mut fh_buf)
+            .map_err(Error::from)
+            .into_report()
+            .attach("reading frame header")?;
         let header = FrameHeader::parse(&fh_buf);
 
         // First frame sets the sentinel we expect subsequent frames to
@@ -401,27 +432,41 @@ impl<'a, R: Read + Seek> FrameCursor<'a, R> {
             None => self.expected_magic = Some(header.frame_magic),
             Some(expected) if expected == header.frame_magic => {}
             Some(_expected) => {
-                return Err(rootcause::Report::new(Error::from(XbmError::ImplausibleFrameSize {
-                    offset: self.next_offset,
-                    size: 0,
-                }))
-                .attach(format!("frame magic at {:#x} does not match the first frame's sentinel", self.next_offset)));
+                return Err(
+                    rootcause::Report::new(Error::from(XbmError::ImplausibleFrameSize {
+                        offset: self.next_offset,
+                        size: 0,
+                    }))
+                    .attach(format!(
+                        "frame magic at {:#x} does not match the first frame's sentinel",
+                        self.next_offset
+                    )),
+                );
             }
         }
 
         let pixels_relative = header.pixels_offset_within_record();
         let pixels_offset = self.next_offset + pixels_relative;
         let audio_offset = pixels_offset + file_header.frame_pixel_bytes() as u64;
-        let record_size = pixels_relative + file_header.frame_pixel_bytes() as u64 + header.audio_bytes() as u64;
+        let record_size =
+            pixels_relative + file_header.frame_pixel_bytes() as u64 + header.audio_bytes() as u64;
 
         if self.next_offset + record_size > self.file_size {
-            return Err(rootcause::Report::new(Error::from(XbmError::ImplausibleFrameSize {
-                offset: self.next_offset,
-                size: record_size as u32,
-            })));
+            return Err(rootcause::Report::new(Error::from(
+                XbmError::ImplausibleFrameSize {
+                    offset: self.next_offset,
+                    size: record_size as u32,
+                },
+            )));
         }
 
-        let record = FrameRef { record_offset: self.next_offset, pixels_offset, audio_offset, record_size, header };
+        let record = FrameRef {
+            record_offset: self.next_offset,
+            pixels_offset,
+            audio_offset,
+            record_size,
+            header,
+        };
         self.next_offset += record_size;
         Ok(Some(record))
     }
@@ -433,7 +478,11 @@ mod tests {
 
     #[test]
     fn magic_variants_round_trip() {
-        for v in [MagicVariant::Standard, MagicVariant::Thumbnail, MagicVariant::Alternate] {
+        for v in [
+            MagicVariant::Standard,
+            MagicVariant::Thumbnail,
+            MagicVariant::Alternate,
+        ] {
             let round = MagicVariant::from_u32(v.as_u32()).unwrap();
             assert!(matches!(
                 (v, round),

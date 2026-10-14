@@ -29,7 +29,9 @@ fn main() {
     let base = parse_u32(&base_str).expect("base addr must parse as hex/decimal");
 
     let mut buf = String::new();
-    std::io::stdin().read_to_string(&mut buf).expect("stdin read");
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .expect("stdin read");
     let bytes = parse_hex(&buf);
     assert!(bytes.len().is_multiple_of(4), "need a multiple of 4 bytes");
 
@@ -48,17 +50,21 @@ fn main() {
         match ins.op {
             Opcode::Addis => {
                 // lis is addis rT, 0, simm
-                if let (Some(Argument::GPR(rt)), Some(Argument::GPR(ra)), Some(uimm)) =
-                    (operands.first().copied(), operands.get(1).copied(), operands.get(2).and_then(|a| uimm_of(a)))
-                    && ra.0 == 0
+                if let (Some(Argument::GPR(rt)), Some(Argument::GPR(ra)), Some(uimm)) = (
+                    operands.first().copied(),
+                    operands.get(1).copied(),
+                    operands.get(2).and_then(|a| uimm_of(a)),
+                ) && ra.0 == 0
                 {
                     lis_state.insert(rt.0, (address, uimm));
                 }
             }
             Opcode::Addi => {
-                if let (Some(Argument::GPR(rt)), Some(Argument::GPR(ra)), Some(simm)) =
-                    (operands.first().copied(), operands.get(1).copied(), operands.get(2).and_then(|a| simm_of(a)))
-                    && ra.0 != 0
+                if let (Some(Argument::GPR(rt)), Some(Argument::GPR(ra)), Some(simm)) = (
+                    operands.first().copied(),
+                    operands.get(1).copied(),
+                    operands.get(2).and_then(|a| simm_of(a)),
+                ) && ra.0 != 0
                     && let Some(&(lis_addr, hi)) = lis_state.get(&ra.0)
                 {
                     let resolved = combine(hi, simm);

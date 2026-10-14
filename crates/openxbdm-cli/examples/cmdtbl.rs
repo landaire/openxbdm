@@ -19,7 +19,9 @@ fn main() {
     let _len = args.next().and_then(|s| parse_u32(&s)).unwrap_or(u32::MAX);
 
     let mut buf = String::new();
-    std::io::stdin().read_to_string(&mut buf).expect("stdin read");
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .expect("stdin read");
     let bytes = parse_hex(&buf);
 
     let stride = 20usize;

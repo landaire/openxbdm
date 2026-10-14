@@ -16,18 +16,22 @@ fn report_argument(err: ArgumentError) -> rootcause::Report<Error> {
     rootcause::Report::new(Error::from(err))
 }
 
-/// `dbgextld unload module=0x<addr>`: unload a previously loaded debug
-/// extension by its module handle.
+/// `dbgextld unload module=0x<handle>`: release one reference to the loaded
+/// debugger extension; the module is unloaded when the count reaches zero.
+/// A handle other than the loaded one gives `423- bad parameter`.
 #[derive(Debug, Clone, Copy)]
 pub struct UnloadDebuggerExtension {
-    pub module_handle: u32,
+    pub module: ExtensionHandle,
 }
 
 impl Command for UnloadDebuggerExtension {
     type Output = ();
 
     fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
-        Ok(ArgBuilder::new("dbgextld").flag("unload").hex32("module", self.module_handle).finish())
+        Ok(ArgBuilder::new("dbgextld")
+            .flag("unload")
+            .hex32("module", self.module.0)
+            .finish())
     }
 
     fn expected(&self) -> ExpectedBody {
@@ -40,9 +44,10 @@ impl Command for UnloadDebuggerExtension {
     }
 }
 
-/// `dbgextld name="<module>.xex"`: load a named debugger extension. On
-/// success the response head contains `module=0x<handle>` which we parse
-/// and return for later unloading.
+/// `dbgextld name="<module>"`: load a debugger extension from the DEVKIT
+/// `DMEXT` directory. Loading the already loaded extension again increments
+/// its reference count and returns the same handle; loading a different one
+/// while one is loaded gives `443- `. The reply is `200- module=0x<handle>`.
 #[derive(Debug, Clone)]
 pub struct LoadDebuggerExtension {
     pub module_name: String,
@@ -58,7 +63,10 @@ impl Command for LoadDebuggerExtension {
         if self.module_name.is_empty() {
             return Err(report_argument(ArgumentError::EmptyFilename));
         }
-        ArgBuilder::new("dbgextld").quoted("name", &self.module_name).map_err(report_argument).map(ArgBuilder::finish)
+        ArgBuilder::new("dbgextld")
+            .quoted("name", &self.module_name)
+            .map_err(report_argument)
+            .map(ArgBuilder::finish)
     }
 
     fn expected(&self) -> ExpectedBody {
@@ -68,12 +76,9 @@ impl Command for LoadDebuggerExtension {
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         let head = response.expect_ok().map_err(rootcause::Report::new)?;
         let kv = crate::commands::kv::parse_kv_line(&head);
-        let handle = match kv.get("module") {
-            Some(value) => {
-                crate::commands::kv::value_u32(value, "module").map_err(|e| rootcause::Report::new(Error::from(e)))?
-            }
-            None => 0,
-        };
-        Ok(ExtensionHandle(handle))
+        kv.require("module")
+            .and_then(|value| crate::commands::kv::value_u32(value, "module"))
+            .map(ExtensionHandle)
+            .map_err(|e| rootcause::Report::new(Error::from(e)))
     }
 }

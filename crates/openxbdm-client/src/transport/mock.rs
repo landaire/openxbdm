@@ -42,7 +42,13 @@ pub struct MockTransport {
 
 impl MockTransport {
     pub fn from_log(log: CaptureLog) -> Self {
-        Self { frames: log.entries().to_vec(), cursor: 0, offset: 0, lax_writes: false, reads_pend_on_end: false }
+        Self {
+            frames: log.entries().to_vec(),
+            cursor: 0,
+            offset: 0,
+            lax_writes: false,
+            reads_pend_on_end: false,
+        }
     }
 
     /// Build a mock transport from a list of server-to-client responses
@@ -87,7 +93,11 @@ impl MockTransport {
 }
 
 impl AsyncRead for MockTransport {
-    fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
         loop {
             let Some((direction, remaining_in_frame, frame_total)) = self.frame_view() else {
                 if self.reads_pend_on_end {
@@ -126,12 +136,20 @@ impl AsyncRead for MockTransport {
 impl MockTransport {
     fn frame_view(&self) -> Option<(Direction, usize, usize)> {
         let frame = self.frames.get(self.cursor)?;
-        Some((frame.direction, frame.data.len().saturating_sub(self.offset), frame.data.len()))
+        Some((
+            frame.direction,
+            frame.data.len().saturating_sub(self.offset),
+            frame.data.len(),
+        ))
     }
 }
 
 impl AsyncWrite for MockTransport {
-    fn poll_write(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
@@ -158,7 +176,9 @@ impl AsyncWrite for MockTransport {
             if frame.data[offset..offset + to_check] != buf[..to_check] {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("mock transport: client bytes diverged from script at frame {cursor} offset {offset}"),
+                    format!(
+                        "mock transport: client bytes diverged from script at frame {cursor} offset {offset}"
+                    ),
                 )));
             }
         }

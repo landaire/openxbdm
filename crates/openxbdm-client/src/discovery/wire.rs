@@ -12,14 +12,13 @@ use winnow::token::take;
 /// as the command port but on UDP instead of TCP).
 pub const NAP_PORT: u16 = crate::XBDM_PORT;
 
-/// Maximum console name length supported by the protocol. `namelen` is a
-/// single unsigned byte, and the console-side handler rejects replies with
-/// `namelen >= 0xFF`, so the effective maximum is 254.
-pub const MAX_NAME_LEN: usize = 254;
+/// Maximum console name length supported by the protocol: `namelen` is a
+/// single unsigned byte.
+pub const MAX_NAME_LEN: usize = 255;
 
-/// Request opcode. The low seven bits select the operation; the high bit
-/// (0x80) is set by the host-side shim on retry after broadcast fallback
-/// but is ignored by the console handler.
+/// Request opcode. The low seven bits select the operation; with the high
+/// bit (0x80) set the console sends its reply to the broadcast address
+/// instead of the sender.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestOpcode {
     /// `0x01`: "do you have this name?" The console only replies when its
@@ -56,7 +55,7 @@ pub struct DiscoveredConsole {
 pub enum NapError {
     #[error("name is longer than {MAX_NAME_LEN} bytes and cannot fit in a NAP packet")]
     NameTooLong,
-    #[error("name contains NUL, CR, or LF which the XBDM name handler rejects")]
+    #[error("name contains NUL, CR, or LF; the console compares names only up to a NUL")]
     NameContainsControlChar,
     #[error("response packet was empty")]
     EmptyPacket,
@@ -76,11 +75,17 @@ impl RequestOpcode {
 
 impl NapRequest {
     pub fn lookup(name: impl Into<String>) -> Self {
-        Self { opcode: RequestOpcode::LookupName, name: name.into() }
+        Self {
+            opcode: RequestOpcode::LookupName,
+            name: name.into(),
+        }
     }
 
     pub fn what_is_your_name() -> Self {
-        Self { opcode: RequestOpcode::WhatIsYourName, name: String::new() }
+        Self {
+            opcode: RequestOpcode::WhatIsYourName,
+            name: String::new(),
+        }
     }
 }
 
@@ -101,7 +106,9 @@ pub fn encode_request(request: &NapRequest) -> Result<Vec<u8>, NapError> {
 
 pub fn parse_response(packet: &[u8]) -> Result<NapResponse, NapError> {
     let mut input = packet;
-    parser_response.parse_next(&mut input).map_err(|_| classify_parse_failure(packet))
+    parser_response
+        .parse_next(&mut input)
+        .map_err(|_| classify_parse_failure(packet))
 }
 
 fn classify_parse_failure(packet: &[u8]) -> NapError {
@@ -109,10 +116,16 @@ fn classify_parse_failure(packet: &[u8]) -> NapError {
         return NapError::EmptyPacket;
     }
     if packet[0] != RESPONSE_OPCODE {
-        return NapError::UnexpectedOpcode { expected: RESPONSE_OPCODE, got: packet[0] };
+        return NapError::UnexpectedOpcode {
+            expected: RESPONSE_OPCODE,
+            got: packet[0],
+        };
     }
     if packet.len() < 2 {
-        return NapError::Truncated { expected: 0, got: 0 };
+        return NapError::Truncated {
+            expected: 0,
+            got: 0,
+        };
     }
     let expected = packet[1] as usize;
     let got = packet.len().saturating_sub(2);
@@ -123,10 +136,13 @@ fn classify_parse_failure(packet: &[u8]) -> NapError {
 }
 
 fn parser_response(input: &mut &[u8]) -> Result<NapResponse, ErrMode<ContextError>> {
-    any.verify(|b: &u8| *b == RESPONSE_OPCODE).parse_next(input)?;
+    any.verify(|b: &u8| *b == RESPONSE_OPCODE)
+        .parse_next(input)?;
     let namelen = any.parse_next(input)? as usize;
     let raw = take(namelen).parse_next(input)?;
-    let name = core::str::from_utf8(raw).map(|s| s.to_owned()).map_err(|_| ErrMode::Backtrack(ContextError::new()))?;
+    let name = core::str::from_utf8(raw)
+        .map(|s| s.to_owned())
+        .map_err(|_| ErrMode::Backtrack(ContextError::new()))?;
     Ok(NapResponse { name })
 }
 
@@ -183,6 +199,12 @@ mod tests {
     #[test]
     fn rejects_truncated_body() {
         let err = parse_response(&[0x02, 0x05, b'a']).unwrap_err();
-        assert!(matches!(err, NapError::Truncated { expected: 5, got: 1 }));
+        assert!(matches!(
+            err,
+            NapError::Truncated {
+                expected: 5,
+                got: 1
+            }
+        ));
     }
 }

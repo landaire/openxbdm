@@ -40,9 +40,11 @@
 //!   a time. Calling [`ClientEngine::submit`] before the prior command's
 //!   response has been pulled returns
 //!   [`SubmitError::CommandInFlight`].
-//! - Asynchronous notifications (XBDM's NOTIFY channel) are not yet
-//!   modelled. Unsolicited bytes received while the engine is idle are
-//!   buffered until the next command consumes them.
+//! - Asynchronous notifications arrive on a separate connection that
+//!   has been turned into a notification channel with `notify`; see
+//!   [`ClientEngine::enter_notification_mode`]. On a command connection,
+//!   unsolicited bytes received while the engine is idle are buffered
+//!   until the next command consumes them.
 //!
 //! [`Client`]: super::Client
 
@@ -94,6 +96,8 @@ pub enum ClientEvent {
         /// `"file not found"`, etc.).
         message: String,
     },
+    /// One line received on a notification channel.
+    Notification(String),
     /// Peer closed the connection cleanly. No further commands can
     /// be submitted.
     Closed,
@@ -117,6 +121,9 @@ pub enum SubmitError {
     /// Engine has terminally failed or the peer has closed.
     #[error("engine is no longer usable (closed or failed)")]
     Unusable,
+    /// The connection is a notification channel and carries no commands.
+    #[error("connection is a notification channel; commands are not accepted")]
+    NotificationChannel,
 }
 
 /// Sans-io XBDM client. See module docs for the I/O loop pattern.
@@ -126,6 +133,8 @@ pub struct ClientEngine {
     inbox: BytesMut,
     outbox: BytesMut,
     events: VecDeque<ClientEvent>,
+    /// Text of the `201` banner after the status code.
+    banner: Option<String>,
 }
 
 #[derive(Debug)]
@@ -139,12 +148,19 @@ enum State {
     /// Got `202 multiline`; accumulating body lines until we see `.`.
     ReadingMultiline { head: String, lines: Vec<String> },
     /// Got `203 binary follows`; collecting `remaining` more bytes.
-    ReadingBinary { head: String, remaining: usize, data: Vec<u8> },
+    ReadingBinary {
+        head: String,
+        remaining: usize,
+        data: Vec<u8>,
+    },
     /// Streaming caller has been notified of a 203 head and now owns
     /// the body. The engine accepts no inbound bytes (recv is a no-op)
     /// and refuses new submits until [`ClientEngine::end_stream`] is
     /// called.
     StreamingBody,
+    /// The connection is a notification channel; every line received is a
+    /// notification.
+    Notifications,
     /// Peer closed the connection.
     Closed,
     /// Hit a fatal protocol error; no further work possible.
@@ -176,7 +192,19 @@ impl ClientEngine {
     /// Construct a fresh engine. Initial state expects a `201` banner
     /// before any command may be submitted.
     pub fn new() -> Self {
-        Self { state: State::NeedBanner, inbox: BytesMut::new(), outbox: BytesMut::new(), events: VecDeque::new() }
+        Self {
+            state: State::NeedBanner,
+            inbox: BytesMut::new(),
+            outbox: BytesMut::new(),
+            events: VecDeque::new(),
+            banner: None,
+        }
+    }
+
+    /// Text of the `201` banner after the status code: `connected`, or
+    /// the box id and challenge of a locked console.
+    pub fn banner(&self) -> Option<&str> {
+        self.banner.as_deref()
     }
 
     /// Hand bytes received from the peer to the engine. Bytes are
@@ -189,7 +217,10 @@ impl ClientEngine {
     /// [`Self::end_stream`] to push any over-read bytes back into the
     /// engine before calling `recv` again.
     pub fn recv(&mut self, bytes: &[u8]) {
-        if matches!(self.state, State::Closed | State::Failed | State::StreamingBody) {
+        if matches!(
+            self.state,
+            State::Closed | State::Failed | State::StreamingBody
+        ) {
             return;
         }
         if !bytes.is_empty() {
@@ -269,6 +300,7 @@ impl ClientEngine {
             | State::ReadingMultiline { .. }
             | State::ReadingBinary { .. }
             | State::StreamingBody => return Err(SubmitError::CommandInFlight),
+            State::Notifications => return Err(SubmitError::NotificationChannel),
             State::Closed | State::Failed => return Err(SubmitError::Unusable),
         }
         self.outbox.extend_from_slice(line.as_bytes());
@@ -293,16 +325,45 @@ impl ClientEngine {
     /// `Idle` -> `AwaitingHead(NoBinary)` so the next `recv` parses a
     /// fresh response head.
     pub fn expect_response(&mut self) -> Result<(), SubmitError> {
+        self.arm_response(HeadExpect::NoBinary)
+    }
+
+    /// As [`Self::expect_response`], for a reply that is `203` with
+    /// `len` bytes of body.
+    pub fn expect_binary_response(&mut self, len: usize) -> Result<(), SubmitError> {
+        self.arm_response(HeadExpect::EagerBinary(len))
+    }
+
+    fn arm_response(&mut self, expect: HeadExpect) -> Result<(), SubmitError> {
         match self.state {
             State::NeedBanner => Err(SubmitError::NotConnected),
             State::Idle => {
-                self.state = State::AwaitingHead(HeadExpect::NoBinary);
+                self.state = State::AwaitingHead(expect);
                 Ok(())
             }
             State::AwaitingHead(_)
             | State::ReadingMultiline { .. }
             | State::ReadingBinary { .. }
             | State::StreamingBody => Err(SubmitError::CommandInFlight),
+            State::Notifications => Err(SubmitError::NotificationChannel),
+            State::Closed | State::Failed => Err(SubmitError::Unusable),
+        }
+    }
+
+    /// Treat every following line as a notification. Called after the
+    /// console accepted `notify` with `205- now a notification channel`.
+    pub fn enter_notification_mode(&mut self) -> Result<(), SubmitError> {
+        match self.state {
+            State::Idle => {
+                self.state = State::Notifications;
+                Ok(())
+            }
+            State::NeedBanner => Err(SubmitError::NotConnected),
+            State::AwaitingHead(_)
+            | State::ReadingMultiline { .. }
+            | State::ReadingBinary { .. }
+            | State::StreamingBody => Err(SubmitError::CommandInFlight),
+            State::Notifications => Err(SubmitError::NotificationChannel),
             State::Closed | State::Failed => Err(SubmitError::Unusable),
         }
     }
@@ -375,6 +436,7 @@ impl ClientEngine {
                 match head.code.try_classify() {
                     Classified::Success(SuccessCode::Connected) => {
                         self.state = State::Idle;
+                        self.banner = Some(head.rest);
                         self.events.push_back(ClientEvent::Connected);
                         true
                     }
@@ -406,7 +468,10 @@ impl ClientEngine {
                         // 4xx is a per-command failure, not a session
                         // teardown: drop back to Idle so the caller can
                         // submit again.
-                        self.events.push_back(ClientEvent::RemoteError { code, message: head.rest });
+                        self.events.push_back(ClientEvent::RemoteError {
+                            code,
+                            message: head.rest,
+                        });
                         self.state = State::Idle;
                         true
                     }
@@ -415,7 +480,10 @@ impl ClientEngine {
                         true
                     }
                     Classified::Success(SuccessCode::MultilineFollows) => {
-                        self.state = State::ReadingMultiline { head: head.rest, lines: Vec::new() };
+                        self.state = State::ReadingMultiline {
+                            head: head.rest,
+                            lines: Vec::new(),
+                        };
                         true
                     }
                     Classified::Success(SuccessCode::BinaryFollows) => match expect {
@@ -424,13 +492,17 @@ impl ClientEngine {
                             true
                         }
                         HeadExpect::EagerBinary(len) => {
-                            self.state =
-                                State::ReadingBinary { head: head.rest, remaining: len, data: Vec::with_capacity(len) };
+                            self.state = State::ReadingBinary {
+                                head: head.rest,
+                                remaining: len,
+                                data: Vec::with_capacity(len),
+                            };
                             true
                         }
                         HeadExpect::StreamBinary => {
                             self.state = State::StreamingBody;
-                            self.events.push_back(ClientEvent::BinaryHead { head: head.rest });
+                            self.events
+                                .push_back(ClientEvent::BinaryHead { head: head.rest });
                             true
                         }
                     },
@@ -438,17 +510,24 @@ impl ClientEngine {
                         // 204 hands the conversation to the caller: it
                         // owns the upload bytes and pushes them into
                         // the outbox; the engine just returns to Idle.
-                        self.events.push_back(ClientEvent::Response(Response::SendBinary { head: head.rest }));
+                        self.events
+                            .push_back(ClientEvent::Response(Response::SendBinary {
+                                head: head.rest,
+                            }));
                         self.state = State::Idle;
                         true
                     }
                     Classified::Success(
                         code @ (SuccessCode::Ok
                         | SuccessCode::Connected
-                        | SuccessCode::Disconnecting
-                        | SuccessCode::Dedicated),
+                        | SuccessCode::Dedicated
+                        | SuccessCode::Reserved206
+                        | SuccessCode::FastPipe),
                     ) => {
-                        self.events.push_back(ClientEvent::Response(Response::Line { code, head: head.rest }));
+                        self.events.push_back(ClientEvent::Response(Response::Line {
+                            code,
+                            head: head.rest,
+                        }));
                         self.state = State::Idle;
                         true
                     }
@@ -465,19 +544,24 @@ impl ClientEngine {
                     let head = std::mem::take(head);
                     let lines = std::mem::take(lines);
                     self.state = State::Idle;
-                    self.events.push_back(ClientEvent::Response(Response::Multiline { head, lines }));
+                    self.events
+                        .push_back(ClientEvent::Response(Response::Multiline { head, lines }));
                 } else {
                     lines.push(line);
                 }
                 true
             }
-            State::ReadingBinary { remaining, data, .. } => {
+            State::ReadingBinary {
+                remaining, data, ..
+            } => {
                 if *remaining == 0 {
-                    let State::ReadingBinary { head, data, .. } = std::mem::replace(&mut self.state, State::Idle)
+                    let State::ReadingBinary { head, data, .. } =
+                        std::mem::replace(&mut self.state, State::Idle)
                     else {
                         unreachable!();
                     };
-                    self.events.push_back(ClientEvent::Response(Response::Binary { head, data }));
+                    self.events
+                        .push_back(ClientEvent::Response(Response::Binary { head, data }));
                     return true;
                 }
                 if self.inbox.is_empty() {
@@ -487,6 +571,13 @@ impl ClientEngine {
                 let chunk = self.inbox.split_to(take);
                 data.extend_from_slice(&chunk);
                 *remaining -= take;
+                true
+            }
+            State::Notifications => {
+                let Some(line) = self.try_take_line() else {
+                    return false;
+                };
+                self.events.push_back(ClientEvent::Notification(line));
                 true
             }
             State::StreamingBody | State::Closed | State::Failed => false,
@@ -506,7 +597,11 @@ impl ClientEngine {
             }
             return None;
         };
-        let end = if pos > 0 && self.inbox[pos - 1] == b'\r' { pos - 1 } else { pos };
+        let end = if pos > 0 && self.inbox[pos - 1] == b'\r' {
+            pos - 1
+        } else {
+            pos
+        };
         let take = pos + 1; // include the LF
         if end > MAX_LINE_LEN {
             self.fail(Error::Framing(FramingError::LineTooLong));
@@ -556,7 +651,10 @@ mod tests {
     #[test]
     fn banner_yields_connected_and_unblocks_submit() {
         let mut e = ClientEngine::new();
-        assert!(matches!(e.submit("ping", None), Err(SubmitError::NotConnected)));
+        assert!(matches!(
+            e.submit("ping", None),
+            Err(SubmitError::NotConnected)
+        ));
         e.recv(b"201- connected\r\n");
         let evs = drive(&mut e);
         assert_eq!(evs.len(), 1);
@@ -600,7 +698,10 @@ mod tests {
         match &evs[0] {
             ClientEvent::Response(Response::Multiline { head, lines }) => {
                 assert_eq!(head, "multiline follows");
-                assert_eq!(lines, &vec!["name=\"a\"".to_string(), "name=\"b\"".to_string()]);
+                assert_eq!(
+                    lines,
+                    &vec!["name=\"a\"".to_string(), "name=\"b\"".to_string()]
+                );
             }
             other => panic!("got {other:?}"),
         }
@@ -669,7 +770,10 @@ mod tests {
         e.submit("ping", None).unwrap();
         let _ = drain_send(&mut e);
         e.recv(b"200- pong\r\n");
-        assert!(matches!(e.poll(), Some(ClientEvent::Response(Response::Line { .. }))));
+        assert!(matches!(
+            e.poll(),
+            Some(ClientEvent::Response(Response::Line { .. }))
+        ));
     }
 
     #[test]
@@ -679,7 +783,10 @@ mod tests {
         let _ = drive(&mut e);
         e.submit("first", None).unwrap();
         // No response yet, so a second submit must be rejected.
-        assert!(matches!(e.submit("second", None), Err(SubmitError::CommandInFlight)));
+        assert!(matches!(
+            e.submit("second", None),
+            Err(SubmitError::CommandInFlight)
+        ));
     }
 
     #[test]
@@ -701,7 +808,10 @@ mod tests {
         let evs = drive(&mut e);
         assert_eq!(evs.len(), 1);
         match &evs[0] {
-            ClientEvent::Failed(err) => assert!(matches!(err.as_ref(), Error::Framing(FramingError::MissingBanner))),
+            ClientEvent::Failed(err) => assert!(matches!(
+                err.as_ref(),
+                Error::Framing(FramingError::MissingBanner)
+            )),
             other => panic!("got {other:?}"),
         }
     }
@@ -727,7 +837,10 @@ mod tests {
         assert_eq!(evs.len(), 1);
         match &evs[0] {
             ClientEvent::Failed(err) => {
-                assert!(matches!(err.as_ref(), Error::Transport(TransportError::MissingBinaryLen)))
+                assert!(matches!(
+                    err.as_ref(),
+                    Error::Transport(TransportError::MissingBinaryLen)
+                ))
             }
             other => panic!("got {other:?}"),
         }
@@ -771,7 +884,10 @@ mod tests {
         let leftover = e.take_inbox();
         assert_eq!(&leftover[..], b"\x04\x00\x00\x00DATA");
         // Submit must be rejected while streaming.
-        assert!(matches!(e.submit("ping", None), Err(SubmitError::CommandInFlight)));
+        assert!(matches!(
+            e.submit("ping", None),
+            Err(SubmitError::CommandInFlight)
+        ));
         // Subsequent recv is ignored while streaming (caller owns the wire).
         e.recv(b"junk");
         assert!(e.take_inbox().is_empty());
@@ -822,11 +938,17 @@ mod tests {
         let _ = drain_send(&mut e);
         e.recv(b"204- send binary\r\n");
         let evs = drive(&mut e);
-        assert!(matches!(evs[0], ClientEvent::Response(Response::SendBinary { .. })));
+        assert!(matches!(
+            evs[0],
+            ClientEvent::Response(Response::SendBinary { .. })
+        ));
         e.expect_response().unwrap();
         e.recv(b"200- ok\r\n");
         match e.poll() {
-            Some(ClientEvent::Response(Response::Line { code: SuccessCode::Ok, .. })) => {}
+            Some(ClientEvent::Response(Response::Line {
+                code: SuccessCode::Ok,
+                ..
+            })) => {}
             other => panic!("got {other:?}"),
         }
     }
@@ -914,7 +1036,10 @@ mod tests {
         );
         assert!(engine.is_terminal());
         // A failed engine must not accept another command.
-        assert!(matches!(engine.submit("dbgname", None), Err(SubmitError::Unusable)));
+        assert!(matches!(
+            engine.submit("dbgname", None),
+            Err(SubmitError::Unusable)
+        ));
     }
 
     #[test]

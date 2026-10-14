@@ -28,7 +28,10 @@ pub type Value<'a> = KvValue<'a>;
 
 impl<'a> KvLine<'a> {
     pub fn get(&self, key: &str) -> Option<Value<'a>> {
-        self.pairs.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| *v)
+        self.pairs
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .map(|(_, v)| *v)
     }
 
     pub fn require(&self, key: &'static str) -> Result<Value<'a>, ParseError> {
@@ -50,8 +53,14 @@ impl<'a> KvLine<'a> {
 
 pub fn parse_kv_line(line: &str) -> KvLine<'_> {
     match run_parse(kv_tokens, line, ParseError::UnrecognizedShape) {
-        Ok(tokens) => KvLine { pairs: tokens.pairs, flags: tokens.flags },
-        Err(_) => KvLine { pairs: Vec::new(), flags: Vec::new() },
+        Ok(tokens) => KvLine {
+            pairs: tokens.pairs,
+            flags: tokens.flags,
+        },
+        Err(_) => KvLine {
+            pairs: Vec::new(),
+            flags: Vec::new(),
+        },
     }
 }
 
@@ -61,7 +70,8 @@ pub fn value_u32(value: Value<'_>, key: &'static str) -> Result<u32, ParseError>
     if let Some(stripped) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
         u32::from_str_radix(stripped, 16).map_err(|_| ParseError::InvalidHexDigits { key })
     } else {
-        raw.parse::<u32>().map_err(|_| ParseError::InvalidDecimalU32 { key })
+        raw.parse::<u32>()
+            .map_err(|_| ParseError::InvalidDecimalU32 { key })
     }
 }
 
@@ -71,15 +81,18 @@ pub fn value_u64(value: Value<'_>, key: &'static str) -> Result<u64, ParseError>
     if let Some(stripped) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
         u64::from_str_radix(stripped, 16).map_err(|_| ParseError::InvalidHexDigits { key })
     } else {
-        raw.parse::<u64>().map_err(|_| ParseError::InvalidDecimalU64 { key })
+        raw.parse::<u64>()
+            .map_err(|_| ParseError::InvalidDecimalU64 { key })
     }
 }
 
 /// Parse a quadword value (`0q` + 16 hex digits).
 pub fn value_qword(value: Value<'_>, key: &'static str) -> Result<u64, ParseError> {
     let raw = value.as_str();
-    let stripped =
-        raw.strip_prefix("0q").or_else(|| raw.strip_prefix("0Q")).ok_or(ParseError::MissingQuadwordPrefix { key })?;
+    let stripped = raw
+        .strip_prefix("0q")
+        .or_else(|| raw.strip_prefix("0Q"))
+        .ok_or(ParseError::MissingQuadwordPrefix { key })?;
     if stripped.len() != 16 {
         return Err(ParseError::QuadwordWrongLength { key });
     }
@@ -93,7 +106,10 @@ mod tests {
     #[test]
     fn parses_hex_and_decimal() {
         let kv = parse_kv_line("addr=0x80123456 size=64");
-        assert_eq!(value_u32(kv.require("addr").unwrap(), "addr").unwrap(), 0x8012_3456);
+        assert_eq!(
+            value_u32(kv.require("addr").unwrap(), "addr").unwrap(),
+            0x8012_3456
+        );
         assert_eq!(value_u32(kv.require("size").unwrap(), "size").unwrap(), 64);
     }
 
@@ -108,8 +124,14 @@ mod tests {
     #[test]
     fn parses_qword() {
         let kv = parse_kv_line("boxid=0q0011223344556677 nonce=0q8899aabbccddeeff");
-        assert_eq!(value_qword(kv.require("boxid").unwrap(), "boxid").unwrap(), 0x0011_2233_4455_6677);
-        assert_eq!(value_qword(kv.require("nonce").unwrap(), "nonce").unwrap(), 0x8899_aabb_ccdd_eeff);
+        assert_eq!(
+            value_qword(kv.require("boxid").unwrap(), "boxid").unwrap(),
+            0x0011_2233_4455_6677
+        );
+        assert_eq!(
+            value_qword(kv.require("nonce").unwrap(), "nonce").unwrap(),
+            0x8899_aabb_ccdd_eeff
+        );
     }
 
     #[test]

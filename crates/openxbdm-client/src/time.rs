@@ -79,10 +79,13 @@ mod tests {
     fn file_time_round_trip() {
         let now = SystemTime::now();
         let since = now.duration_since(UNIX_EPOCH).unwrap();
-        let ticks = WIN_EPOCH_TO_UNIX_100NS + since.as_secs() * 10_000_000 + since.subsec_nanos() as u64 / 100;
+        let ticks = WIN_EPOCH_TO_UNIX_100NS
+            + since.as_secs() * 10_000_000
+            + since.subsec_nanos() as u64 / 100;
         let ft = FileTime::from_raw(ticks);
         let round = ft.into_system_time();
-        let drift = round.duration_since(UNIX_EPOCH).unwrap().as_nanos() as i128 - since.as_nanos() as i128;
+        let drift =
+            round.duration_since(UNIX_EPOCH).unwrap().as_nanos() as i128 - since.as_nanos() as i128;
         assert!(drift.abs() < 100);
     }
 }

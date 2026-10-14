@@ -106,8 +106,12 @@ impl CaptureProfile {
             CaptureProfile::ProfileF3_360p => "XBMovie_F3_V90_1395KVideo360p_96KAudioStereo",
             CaptureProfile::ProfileF2_720p30 => "XBMovie_F2_V90_8MVideo720p_192KAudioStereo",
             CaptureProfile::ProfileF6_720p60 => "XBMovie_F6_V90_15MVideo720p60_384KAudio5.1",
-            CaptureProfile::ProfileF9_720p3DLeft => "XBMovie_F9_V90_8MVideo720p3DLeftEye_384KAudio5.1",
-            CaptureProfile::ProfileF10_720p3DRight => "XBMovie_F10_V90_8MVideo720p3DRightEye_384KAudio5.1",
+            CaptureProfile::ProfileF9_720p3DLeft => {
+                "XBMovie_F9_V90_8MVideo720p3DLeftEye_384KAudio5.1"
+            }
+            CaptureProfile::ProfileF10_720p3DRight => {
+                "XBMovie_F10_V90_8MVideo720p3DRightEye_384KAudio5.1"
+            }
             CaptureProfile::ProfileX1_1080p => "XBMovie_X1_V90_15MVideo1080p_384KAudio5.1",
             CaptureProfile::ProfileF8_1470p3D => "XBMovie_F8_V90_15MVideo1470p3D_384KAudio5.1",
             CaptureProfile::HighBitrate1080p30 => "Openxbdm_HighBitrate_1080p30_25Mbps",
@@ -372,7 +376,11 @@ mod tests {
             let xml = profile.xml();
             assert!(xml.starts_with("<profile"), "{}", profile.label());
             assert!(xml.ends_with("</profile>"), "{}", profile.label());
-            assert!(xml.contains(profile.label()), "XML body missing profile name {}", profile.label());
+            assert!(
+                xml.contains(profile.label()),
+                "XML body missing profile name {}",
+                profile.label()
+            );
         }
     }
 

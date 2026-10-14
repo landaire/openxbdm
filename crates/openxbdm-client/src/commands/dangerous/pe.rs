@@ -55,11 +55,17 @@ pub struct PeLayout {
 impl PeLayout {
     /// Locate a section by case-insensitive ASCII name (e.g. `.text`).
     pub fn section(&self, name: &str) -> Option<&Section> {
-        self.sections.iter().find(|s| s.name.eq_ignore_ascii_case(name))
+        self.sections
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(name))
     }
 
     pub fn module_end(&self) -> u32 {
-        self.sections.iter().map(|s| s.end(self.module_base)).max().unwrap_or(self.module_base)
+        self.sections
+            .iter()
+            .map(|s| s.end(self.module_base))
+            .max()
+            .unwrap_or(self.module_base)
     }
 }
 
@@ -70,31 +76,46 @@ const IMAGE_FILE_MACHINE_POWERPCBE: u16 = 0x01F2;
 
 /// Walk xbdm's in-memory PE and return its section layout. `base` is
 /// the VA at which xbdm is loaded (e.g. `0x91f00000`).
-pub async fn read_layout<T>(client: &mut Client<T, Connected>, base: u32) -> Result<PeLayout, rootcause::Report<Error>>
+pub async fn read_layout<T>(
+    client: &mut Client<T, Connected>,
+    base: u32,
+) -> Result<PeLayout, rootcause::Report<Error>>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     // DOS stub (first 64 bytes).
     let dos = read(client, base, 64).await?;
     if &dos[..2] != b"MZ" {
-        return Err(rootcause::Report::new(Error::from(PeError::MissingDosSignature))
-            .attach(format!("read back bytes: {:02x?}", &dos[..16.min(dos.len())])));
+        return Err(
+            rootcause::Report::new(Error::from(PeError::MissingDosSignature)).attach(format!(
+                "read back bytes: {:02x?}",
+                &dos[..16.min(dos.len())]
+            )),
+        );
     }
     let e_lfanew = u32::from_le_bytes(dos[0x3C..0x40].try_into().unwrap());
 
     // PE header + COFF header + optional header size field at offset 20.
     let pe_header = read(client, base.wrapping_add(e_lfanew), 24).await?;
     if &pe_header[..4] != b"PE\0\0" {
-        return Err(rootcause::Report::new(Error::from(PeError::MissingPeSignature))
-            .attach(format!("bytes at e_lfanew: {:02x?}", &pe_header[..16.min(pe_header.len())])));
+        return Err(
+            rootcause::Report::new(Error::from(PeError::MissingPeSignature)).attach(format!(
+                "bytes at e_lfanew: {:02x?}",
+                &pe_header[..16.min(pe_header.len())]
+            )),
+        );
     }
     let machine = u16::from_le_bytes(pe_header[4..6].try_into().unwrap());
     if machine != IMAGE_FILE_MACHINE_POWERPCBE {
-        return Err(rootcause::Report::new(Error::from(PeError::UnexpectedMachine(machine))));
+        return Err(rootcause::Report::new(Error::from(
+            PeError::UnexpectedMachine(machine),
+        )));
     }
     let num_sections = u16::from_le_bytes(pe_header[6..8].try_into().unwrap());
     if !(1..=64).contains(&num_sections) {
-        return Err(rootcause::Report::new(Error::from(PeError::AbsurdSectionCount(num_sections))));
+        return Err(rootcause::Report::new(Error::from(
+            PeError::AbsurdSectionCount(num_sections),
+        )));
     }
     let size_of_optional = u16::from_le_bytes(pe_header[20..22].try_into().unwrap());
 
@@ -103,7 +124,12 @@ where
         .wrapping_add(24) // PE signature + COFF header
         .wrapping_add(size_of_optional as u32);
     let section_table_size = num_sections as u32 * 40;
-    let raw = read(client, base.wrapping_add(section_table_rva), section_table_size).await?;
+    let raw = read(
+        client,
+        base.wrapping_add(section_table_rva),
+        section_table_size,
+    )
+    .await?;
 
     let mut sections = Vec::with_capacity(num_sections as usize);
     for i in 0..num_sections as usize {
@@ -113,8 +139,15 @@ where
         let name = String::from_utf8_lossy(&name_bytes[..name_end]).into_owned();
         let virtual_size = u32::from_le_bytes(entry[8..12].try_into().unwrap());
         let rva = u32::from_le_bytes(entry[12..16].try_into().unwrap());
-        sections.push(Section { name, rva, virtual_size });
+        sections.push(Section {
+            name,
+            rva,
+            virtual_size,
+        });
     }
 
-    Ok(PeLayout { module_base: base, sections })
+    Ok(PeLayout {
+        module_base: base,
+        sections,
+    })
 }

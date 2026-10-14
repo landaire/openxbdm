@@ -24,6 +24,9 @@ pub enum Error {
     #[error(transparent)]
     Transport(#[from] TransportError),
 
+    #[error(transparent)]
+    ScreenshotDecode(#[from] crate::commands::screenshot::DecodeError),
+
     #[cfg(feature = "capture")]
     #[error(transparent)]
     Pix(#[from] crate::commands::pix::PixError),
@@ -59,10 +62,16 @@ pub enum Error {
     ModuleRangeOverflow { base: u32, size: u32 },
 
     #[error("expected {expected:?} response but got status {got}")]
-    UnexpectedStatus { expected: ExpectedShape, got: StatusCode },
+    UnexpectedStatus {
+        expected: ExpectedShape,
+        got: StatusCode,
+    },
 
     #[error("expected success code {expected} but got {got}")]
-    UnexpectedSuccessCode { expected: SuccessCode, got: SuccessCode },
+    UnexpectedSuccessCode {
+        expected: SuccessCode,
+        got: SuccessCode,
+    },
 
     #[error("streaming body abandoned; connection framing lost")]
     StreamAbandoned {
@@ -112,6 +121,10 @@ pub enum ParseError {
     InvalidDecimalU32 { key: &'static str },
     #[error("value for {key:?} is not a valid decimal u64")]
     InvalidDecimalU64 { key: &'static str },
+    #[error("value for {key:?} is not a valid decimal i32")]
+    InvalidDecimalI32 { key: &'static str },
+    #[error("value {value:#x} for {key:?} is out of range")]
+    ValueOutOfRange { key: &'static str, value: u32 },
     #[error("value for {key:?} is missing the 0q quadword prefix")]
     MissingQuadwordPrefix { key: &'static str },
     #[error("quadword for {key:?} is not exactly 16 hex digits")]
@@ -120,6 +133,8 @@ pub enum ParseError {
     InvalidQuadwordHex { key: &'static str },
     #[error("response line did not match the expected shape")]
     UnrecognizedShape,
+    #[error("value {value} for {key:?} is not a known code")]
+    UnknownCode { key: &'static str, value: u32 },
     #[error("memory response length mismatch: expected {expected:#x} bytes, got {actual:#x}")]
     MemoryLengthMismatch { expected: usize, actual: usize },
 }
@@ -136,10 +151,6 @@ pub enum ArgumentError {
     EmptyFilename,
     #[error("memory length exceeds the protocol's u32 limit")]
     MemoryLengthOverflow,
-    #[error("memory transfer length must be nonzero")]
-    EmptyMemoryTransfer,
-    #[error("memory transfer length {length:#x} exceeds per-command limit {maximum:#x}")]
-    MemoryTransferTooLarge { length: u32, maximum: u32 },
 }
 
 #[derive(Debug, thiserror::Error)]

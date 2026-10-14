@@ -27,6 +27,17 @@ mod ffi {
     #[diplomat::opaque]
     pub struct OpenxbdmError(pub(crate) String);
 
+    /// How `fileeof` opens the file.
+    #[allow(dead_code, reason = "foreign callers construct the variants")]
+    pub enum FileEofDisposition {
+        /// The file must exist.
+        OpenExisting,
+        /// The file must not exist.
+        CreateNew,
+        /// Create the file or truncate an existing one before resizing.
+        CreateOrTruncate,
+    }
+
     impl OpenxbdmError {
         pub fn message(&self, out: &mut DiplomatWrite) {
             let _ = write!(out, "{}", self.0);
@@ -59,7 +70,10 @@ mod ffi {
         }
 
         pub fn get(&self, idx: usize, out: &mut DiplomatWrite) -> Result<(), Box<OpenxbdmError>> {
-            let s = self.0.get(idx).ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))?;
+            let s = self
+                .0
+                .get(idx)
+                .ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))?;
             let _ = write!(out, "{}", s);
             Ok(())
         }
@@ -75,7 +89,9 @@ mod ffi {
     impl OpenxbdmCommand {
         #[diplomat::attr(auto, constructor)]
         pub fn new(mnemonic: &str) -> Box<OpenxbdmCommand> {
-            Box::new(OpenxbdmCommand(std::cell::RefCell::new(Some(openxbdm_client::ArgBuilder::new(mnemonic)))))
+            Box::new(OpenxbdmCommand(std::cell::RefCell::new(Some(
+                openxbdm_client::ArgBuilder::new(mnemonic),
+            ))))
         }
 
         pub fn flag(&self, token: &str) {
@@ -96,13 +112,12 @@ mod ffi {
         pub fn qword(&self, key: &str, value: u64) {
             self.mutate(|b| b.qword(key, openxbdm_client::Qword(value)));
         }
-        pub fn qword_pair(&self, key: &str, hi: u64, lo: u64) {
-            self.mutate(|b| b.qword_pair(key, openxbdm_client::QwordPair { hi, lo }));
-        }
 
         pub fn quoted(&self, key: &str, value: &str) -> Result<(), Box<OpenxbdmError>> {
             let mut slot = self.0.borrow_mut();
-            let b = slot.take().ok_or_else(|| Box::new(OpenxbdmError("command already consumed".into())))?;
+            let b = slot
+                .take()
+                .ok_or_else(|| Box::new(OpenxbdmError("command already consumed".into())))?;
             match b.quoted(key, value) {
                 Ok(next) => {
                     *slot = Some(next);
@@ -114,13 +129,18 @@ mod ffi {
 
         pub fn finish(&self) -> Result<Box<OpenxbdmBytes>, Box<OpenxbdmError>> {
             let mut slot = self.0.borrow_mut();
-            let b = slot.take().ok_or_else(|| Box::new(OpenxbdmError("command already consumed".into())))?;
+            let b = slot
+                .take()
+                .ok_or_else(|| Box::new(OpenxbdmError("command already consumed".into())))?;
             Ok(Box::new(OpenxbdmBytes(b.finish().into_bytes())))
         }
     }
 
     impl OpenxbdmCommand {
-        fn mutate(&self, f: impl FnOnce(openxbdm_client::ArgBuilder) -> openxbdm_client::ArgBuilder) {
+        fn mutate(
+            &self,
+            f: impl FnOnce(openxbdm_client::ArgBuilder) -> openxbdm_client::ArgBuilder,
+        ) {
             let mut slot = self.0.borrow_mut();
             if let Some(b) = slot.take() {
                 *slot = Some(f(b));
@@ -164,7 +184,9 @@ mod ffi {
 
         #[diplomat::attr(auto, named_constructor = "from_halves")]
         pub fn from_halves(high: u32, low: u32) -> Box<OpenxbdmFileTime> {
-            Box::new(OpenxbdmFileTime(openxbdm_client::FileTime::from_halves(high, low)))
+            Box::new(OpenxbdmFileTime(openxbdm_client::FileTime::from_halves(
+                high, low,
+            )))
         }
 
         pub fn as_raw(&self) -> u64 {
@@ -178,10 +200,18 @@ mod ffi {
         }
 
         pub fn unix_seconds(&self) -> u64 {
-            self.0.into_system_time().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+            self.0
+                .into_system_time()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
         }
         pub fn unix_nanos(&self) -> u32 {
-            self.0.into_system_time().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0)
+            self.0
+                .into_system_time()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
         }
     }
 
@@ -195,7 +225,10 @@ mod ffi {
         /// Connect to `address` (e.g. `"192.168.1.26:730"`, `"deanxbox:730"`)
         /// with a connect timeout in seconds.
         #[diplomat::attr(auto, named_constructor = "connect")]
-        pub fn connect(address: &str, timeout_secs: u32) -> Result<Box<OpenxbdmClient>, Box<OpenxbdmError>> {
+        pub fn connect(
+            address: &str,
+            timeout_secs: u32,
+        ) -> Result<Box<OpenxbdmClient>, Box<OpenxbdmError>> {
             crate::inner::Inner::connect(address, timeout_secs)
                 .map(|i| Box::new(OpenxbdmClient(i)))
                 .map_err(|e| Box::new(OpenxbdmError(e)))
@@ -203,14 +236,20 @@ mod ffi {
 
         /// `dbgname`: read the console's debuggable name into `out`.
         pub fn dbgname(&self, out: &mut DiplomatWrite) -> Result<(), Box<OpenxbdmError>> {
-            let name = self.0.run(openxbdm_client::commands::DbgName::Get).map_err(err_box)?;
+            let name = self
+                .0
+                .run(openxbdm_client::commands::DbgName::Get)
+                .map_err(err_box)?;
             let _ = write!(out, "{}", name);
             Ok(())
         }
 
         /// `dbgname name=<name>`: set the console's debuggable name.
         pub fn set_dbgname(&self, name: &str) -> Result<(), Box<OpenxbdmError>> {
-            self.0.run(openxbdm_client::commands::DbgName::Set(name.to_owned())).map(|_| ()).map_err(err_box)
+            self.0
+                .run(openxbdm_client::commands::DbgName::Set(name.to_owned()))
+                .map(|_| ())
+                .map_err(err_box)
         }
 
         /// `systime`: console clock as a `FileTime`.
@@ -223,21 +262,23 @@ mod ffi {
 
         /// `dmversion`: opaque build identifier.
         pub fn dmversion(&self, out: &mut DiplomatWrite) -> Result<(), Box<OpenxbdmError>> {
-            let v = self.0.run(openxbdm_client::commands::DmVersion).map_err(err_box)?;
+            let v = self
+                .0
+                .run(openxbdm_client::commands::DmVersion)
+                .map_err(err_box)?;
             let _ = write!(out, "{}", v);
             Ok(())
         }
 
-        /// `consoletype`: returns one of "retail", "devkit", "testkit",
-        /// "reviewerkit", or a raw string for anything else.
+        /// `consoletype`: returns "devkit" or "testkit".
         pub fn consoletype(&self, out: &mut DiplomatWrite) -> Result<(), Box<OpenxbdmError>> {
-            let t = self.0.run(openxbdm_client::commands::GetConsoleType).map_err(err_box)?;
+            let t = self
+                .0
+                .run(openxbdm_client::commands::GetConsoleType)
+                .map_err(err_box)?;
             let s = match t {
-                openxbdm_client::commands::ConsoleType::Retail => "retail",
                 openxbdm_client::commands::ConsoleType::DevKit => "devkit",
                 openxbdm_client::commands::ConsoleType::TestKit => "testkit",
-                openxbdm_client::commands::ConsoleType::ReviewerKit => "reviewerkit",
-                openxbdm_client::commands::ConsoleType::Other(ref raw) => raw.as_str(),
             };
             let _ = write!(out, "{}", s);
             Ok(())
@@ -251,38 +292,64 @@ mod ffi {
                 .map_err(err_box)
         }
 
-        /// `altaddr`: alternate (debug) IPv4 address as a host-order `u32`.
+        /// `altaddr`: title IPv4 address as a host-order `u32`.
         pub fn altaddr(&self) -> Result<u32, Box<OpenxbdmError>> {
-            self.0.run(openxbdm_client::commands::AltAddr).map(u32::from).map_err(err_box)
+            self.0
+                .run(openxbdm_client::commands::AltAddr)
+                .map(u32::from)
+                .map_err(err_box)
         }
 
         /// `getpid`: pid of the currently running title process.
         pub fn getpid(&self) -> Result<u32, Box<OpenxbdmError>> {
-            self.0.run(openxbdm_client::commands::GetPid).map_err(err_box)
+            self.0
+                .run(openxbdm_client::commands::GetPid)
+                .map_err(err_box)
         }
 
-        /// `consolemem`: memory-class byte.
+        /// `consolemem`: memory configuration class (0, 1 or 2).
         pub fn consolemem(&self) -> Result<u8, Box<OpenxbdmError>> {
-            self.0.run(openxbdm_client::commands::GetConsoleMem).map(|m| m.class).map_err(err_box)
+            self.0
+                .run(openxbdm_client::commands::GetConsoleMem)
+                .map(|memory| match memory {
+                    openxbdm_client::commands::ConsoleMem::Standard => 0,
+                    openxbdm_client::commands::ConsoleMem::ExtraMemoryUnused => 1,
+                    openxbdm_client::commands::ConsoleMem::ExtraMemoryInUse => 2,
+                })
+                .map_err(err_box)
         }
 
         /// `getnetaddrs`: console name + debug/title `sockaddr`-ish blobs.
         pub fn getnetaddrs(&self) -> Result<Box<OpenxbdmNetAddrs>, Box<OpenxbdmError>> {
             self.0
                 .run(openxbdm_client::commands::GetNetAddrs)
-                .map(|a| Box::new(OpenxbdmNetAddrs { name: a.name, debug: a.debug, title: a.title }))
+                .map(|a| {
+                    Box::new(OpenxbdmNetAddrs {
+                        name: a.name,
+                        debug: a.debug,
+                        title: a.title,
+                    })
+                })
                 .map_err(err_box)
         }
 
         /// `drivelist`: drive labels (e.g. "D", "DEVKIT", "HDD").
         pub fn drivelist(&self) -> Result<Box<OpenxbdmStringList>, Box<OpenxbdmError>> {
-            self.0.run(openxbdm_client::commands::DriveList).map(|v| Box::new(OpenxbdmStringList(v))).map_err(err_box)
+            self.0
+                .run(openxbdm_client::commands::DriveList)
+                .map(|v| Box::new(OpenxbdmStringList(v)))
+                .map_err(err_box)
         }
 
         /// `drivefreespace`: free and total byte counters for a drive.
-        pub fn drivefreespace(&self, drive: &str) -> Result<Box<OpenxbdmDriveSpace>, Box<OpenxbdmError>> {
+        pub fn drivefreespace(
+            &self,
+            drive: &str,
+        ) -> Result<Box<OpenxbdmDriveSpace>, Box<OpenxbdmError>> {
             self.0
-                .run(openxbdm_client::commands::DriveFreeSpace { drive: drive.to_owned() })
+                .run(openxbdm_client::commands::DriveFreeSpace {
+                    drive: drive.to_owned(),
+                })
                 .map(|s| {
                     Box::new(OpenxbdmDriveSpace {
                         free_to_caller: s.free_to_caller_bytes,
@@ -296,15 +363,22 @@ mod ffi {
         /// `dirlist`: directory entries.
         pub fn dirlist(&self, path: &str) -> Result<Box<OpenxbdmDirEntries>, Box<OpenxbdmError>> {
             self.0
-                .run(openxbdm_client::commands::DirList { path: path.to_owned() })
+                .run(openxbdm_client::commands::DirList {
+                    path: path.to_owned(),
+                })
                 .map(|v| Box::new(OpenxbdmDirEntries(v)))
                 .map_err(err_box)
         }
 
         /// `getfileattributes`: size + timestamps for a single path.
-        pub fn getfileattributes(&self, path: &str) -> Result<Box<OpenxbdmFileAttributes>, Box<OpenxbdmError>> {
+        pub fn getfileattributes(
+            &self,
+            path: &str,
+        ) -> Result<Box<OpenxbdmFileAttributes>, Box<OpenxbdmError>> {
             self.0
-                .run(openxbdm_client::commands::GetFileAttributes { path: path.to_owned() })
+                .run(openxbdm_client::commands::GetFileAttributes {
+                    path: path.to_owned(),
+                })
                 .map(|a| {
                     Box::new(OpenxbdmFileAttributes {
                         size: a.size,
@@ -317,20 +391,54 @@ mod ffi {
         }
 
         pub fn mkdir(&self, path: &str) -> Result<(), Box<OpenxbdmError>> {
-            self.0.run(openxbdm_client::commands::MakeDirectory { path: path.to_owned() }).map_err(err_box)
+            self.0
+                .run(openxbdm_client::commands::MakeDirectory {
+                    path: path.to_owned(),
+                })
+                .map_err(err_box)
         }
 
         pub fn delete(&self, path: &str, is_directory: bool) -> Result<(), Box<OpenxbdmError>> {
-            self.0.run(openxbdm_client::commands::Delete { path: path.to_owned(), is_directory }).map_err(err_box)
+            self.0
+                .run(openxbdm_client::commands::Delete {
+                    path: path.to_owned(),
+                    is_directory,
+                })
+                .map_err(err_box)
         }
 
         pub fn rename(&self, from: &str, to: &str) -> Result<(), Box<OpenxbdmError>> {
-            self.0.run(openxbdm_client::commands::Rename { from: from.to_owned(), to: to.to_owned() }).map_err(err_box)
+            self.0
+                .run(openxbdm_client::commands::Rename {
+                    from: from.to_owned(),
+                    to: to.to_owned(),
+                })
+                .map_err(err_box)
         }
 
-        pub fn fileeof(&self, path: &str, size: u64, create_if_missing: bool) -> Result<(), Box<OpenxbdmError>> {
+        pub fn fileeof(
+            &self,
+            path: &str,
+            size: u32,
+            disposition: FileEofDisposition,
+        ) -> Result<(), Box<OpenxbdmError>> {
+            let disposition = match disposition {
+                FileEofDisposition::OpenExisting => {
+                    openxbdm_client::commands::EofDisposition::OpenExisting
+                }
+                FileEofDisposition::CreateNew => {
+                    openxbdm_client::commands::EofDisposition::CreateNew
+                }
+                FileEofDisposition::CreateOrTruncate => {
+                    openxbdm_client::commands::EofDisposition::CreateOrTruncate
+                }
+            };
             self.0
-                .run(openxbdm_client::commands::FileEof { path: path.to_owned(), size, create_if_missing })
+                .run(openxbdm_client::commands::FileEof {
+                    path: path.to_owned(),
+                    size,
+                    disposition,
+                })
                 .map_err(err_box)
         }
 
@@ -342,69 +450,80 @@ mod ffi {
             self.0.run(openxbdm_client::commands::Go).map_err(err_box)
         }
 
+        /// `halt`: stock XBDM always rejects it (`400- ` on development
+        /// kits, `407- unknown command` on test kits).
         pub fn halt(&self, thread: u32) -> Result<(), Box<OpenxbdmError>> {
             self.0
-                .run(openxbdm_client::commands::Halt { thread: openxbdm_client::commands::ThreadId(thread) })
+                .run(openxbdm_client::commands::Halt {
+                    thread: openxbdm_client::commands::ThreadId(thread),
+                })
                 .map_err(err_box)
         }
 
-        pub fn continue_thread(&self, thread: u32, single_step: bool) -> Result<(), Box<OpenxbdmError>> {
+        /// `continue`: release a stopped thread. `pass_exception` marks the
+        /// pending exception as not handled by the debugger.
+        pub fn continue_thread(
+            &self,
+            thread: u32,
+            pass_exception: bool,
+        ) -> Result<(), Box<OpenxbdmError>> {
             self.0
                 .run(openxbdm_client::commands::Continue {
                     thread: openxbdm_client::commands::ThreadId(thread),
-                    single_step,
+                    pass_exception,
                 })
                 .map_err(err_box)
         }
 
         pub fn suspend(&self, thread: u32) -> Result<(), Box<OpenxbdmError>> {
             self.0
-                .run(openxbdm_client::commands::Suspend { thread: openxbdm_client::commands::ThreadId(thread) })
+                .run(openxbdm_client::commands::Suspend {
+                    thread: openxbdm_client::commands::ThreadId(thread),
+                })
                 .map_err(err_box)
         }
 
         pub fn resume(&self, thread: u32) -> Result<(), Box<OpenxbdmError>> {
             self.0
-                .run(openxbdm_client::commands::Resume { thread: openxbdm_client::commands::ThreadId(thread) })
+                .run(openxbdm_client::commands::Resume {
+                    thread: openxbdm_client::commands::ThreadId(thread),
+                })
                 .map_err(err_box)
         }
 
         pub fn isstopped(&self, thread: u32) -> Result<Box<OpenxbdmStopState>, Box<OpenxbdmError>> {
             self.0
-                .run(openxbdm_client::commands::IsStopped { thread: openxbdm_client::commands::ThreadId(thread) })
+                .run(openxbdm_client::commands::IsStopped {
+                    thread: openxbdm_client::commands::ThreadId(thread),
+                })
                 .map(|s| Box::new(OpenxbdmStopState::from(s)))
                 .map_err(err_box)
         }
 
-        /// `isbreak`: returns the breakpoint kind as a `u32` (0=None,
-        /// 1=Execution, 2=DataRead, 3=DataWrite, 4=DataReadWrite,
-        /// 5=DataExecute, or the raw value for anything else).
+        /// `isbreak`: returns the stock `type=` value: 0 none, 4 execution,
+        /// 1 data write, 2 data read/write, 5 data read.
         pub fn isbreak(&self, address: u32) -> Result<u32, Box<OpenxbdmError>> {
             self.0
                 .run(openxbdm_client::commands::IsBreak { address })
-                .map(|k| match k {
-                    openxbdm_client::commands::BreakpointKind::None => 0,
-                    openxbdm_client::commands::BreakpointKind::Execution => 1,
-                    openxbdm_client::commands::BreakpointKind::DataRead => 2,
-                    openxbdm_client::commands::BreakpointKind::DataWrite => 3,
-                    openxbdm_client::commands::BreakpointKind::DataReadWrite => 4,
-                    openxbdm_client::commands::BreakpointKind::DataExecute => 5,
-                    openxbdm_client::commands::BreakpointKind::Unknown(raw) => raw,
-                })
+                .map(openxbdm_client::commands::BreakpointKind::code)
                 .map_err(err_box)
         }
 
         pub fn set_breakpoint(&self, address: u32, clear: bool) -> Result<(), Box<OpenxbdmError>> {
-            self.0.run(openxbdm_client::commands::Breakpoint { address, clear }).map_err(err_box)
+            self.0
+                .run(openxbdm_client::commands::Breakpoint { address, clear })
+                .map_err(err_box)
         }
 
         pub fn set_initial_breakpoint(&self) -> Result<(), Box<OpenxbdmError>> {
-            self.0.run(openxbdm_client::commands::SetInitialBreakpoint).map_err(err_box)
+            self.0
+                .run(openxbdm_client::commands::SetInitialBreakpoint)
+                .map_err(err_box)
         }
 
-        /// `break` with READ/WRITE/READWRITE/EXECUTE kind. `kind` is the
-        /// same encoding used by [`OpenxbdmClient::isbreak`]: 2=Read,
-        /// 3=Write, 4=ReadWrite, 5=Execute. Other values are rejected.
+        /// `break` with a READ/WRITE/READWRITE kind. `kind` uses the
+        /// [`OpenxbdmClient::isbreak`] data codes: 1=Write, 2=ReadWrite,
+        /// 5=Read. Other values are rejected.
         pub fn set_data_breakpoint(
             &self,
             address: u32,
@@ -412,40 +531,69 @@ mod ffi {
             kind: u32,
             clear: bool,
         ) -> Result<(), Box<OpenxbdmError>> {
-            let kind = match kind {
-                2 => openxbdm_client::commands::DataBreakKind::Read,
-                3 => openxbdm_client::commands::DataBreakKind::Write,
-                4 => openxbdm_client::commands::DataBreakKind::ReadWrite,
-                5 => openxbdm_client::commands::DataBreakKind::Execute,
-                other => {
-                    return Err(Box::new(OpenxbdmError(format!("invalid data breakpoint kind {other}"))));
+            let kind = match openxbdm_client::commands::BreakpointKind::from_code(kind) {
+                Some(openxbdm_client::commands::BreakpointKind::Data(kind)) => kind,
+                _ => {
+                    return Err(Box::new(OpenxbdmError(format!(
+                        "invalid data breakpoint kind {kind}"
+                    ))));
                 }
             };
-            self.0.run(openxbdm_client::commands::DataBreakpoint { address, size, kind, clear }).map_err(err_box)
+            self.0
+                .run(openxbdm_client::commands::DataBreakpoint {
+                    address,
+                    size,
+                    kind,
+                    clear,
+                })
+                .map_err(err_box)
         }
 
         pub fn clear_all_breakpoints(&self) -> Result<(), Box<OpenxbdmError>> {
-            self.0.run(openxbdm_client::commands::ClearAllBreakpoints).map_err(err_box)
+            self.0
+                .run(openxbdm_client::commands::ClearAllBreakpoints)
+                .map_err(err_box)
         }
 
-        /// `reboot`: reboot the console. Pass empty strings for `title`/
-        /// `directory`/`cmd_line` to omit them.
+        /// `reboot`: reboot the console.
         pub fn reboot(
             &self,
-            warm: bool,
-            stop_on_start: bool,
-            no_debug: bool,
+            stop: bool,
             wait: bool,
+            smc_reset: bool,
+        ) -> Result<(), Box<OpenxbdmError>> {
+            self.0
+                .run(openxbdm_client::commands::Reboot {
+                    stop,
+                    wait,
+                    smc_reset,
+                })
+                .map_err(err_box)
+        }
+
+        /// `magicboot`: launch a title. Pass empty strings for `title`/
+        /// `directory`/`cmd_line` to omit them.
+        pub fn magic_boot(
+            &self,
+            cold: bool,
+            wait: bool,
+            stop: bool,
             title: &str,
             directory: &str,
             cmd_line: &str,
         ) -> Result<(), Box<OpenxbdmError>> {
             let opt = |s: &str| {
-                if s.is_empty() { None } else { Some(s.to_owned()) }
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s.to_owned())
+                }
             };
             self.0
-                .run(openxbdm_client::commands::Reboot {
-                    flags: openxbdm_client::commands::RebootFlags { warm, stop_on_start, no_debug, wait },
+                .run(openxbdm_client::commands::MagicBoot {
+                    cold,
+                    wait,
+                    stop,
                     title: opt(title),
                     directory: opt(directory),
                     cmd_line: opt(cmd_line),
@@ -454,40 +602,46 @@ mod ffi {
         }
 
         pub fn set_title(&self, name: &str) -> Result<(), Box<OpenxbdmError>> {
-            self.0.run(openxbdm_client::commands::Title::Set { name: name.to_owned() }).map_err(err_box)
+            self.0
+                .run(openxbdm_client::commands::Title::Set {
+                    name: name.to_owned(),
+                })
+                .map_err(err_box)
         }
 
         pub fn clear_title(&self) -> Result<(), Box<OpenxbdmError>> {
-            self.0.run(openxbdm_client::commands::Title::NoPersist).map_err(err_box)
+            self.0
+                .run(openxbdm_client::commands::Title::NoPersist)
+                .map_err(err_box)
         }
 
         pub fn stopon(&self, flags: &OpenxbdmStopOnFlags) -> Result<(), Box<OpenxbdmError>> {
-            self.0.run(openxbdm_client::commands::StopOn(flags.to_client())).map_err(err_box)
+            self.0
+                .run(openxbdm_client::commands::StopOn(flags.to_client()))
+                .map_err(err_box)
         }
 
         pub fn nostopon(&self, flags: &OpenxbdmStopOnFlags) -> Result<(), Box<OpenxbdmError>> {
-            self.0.run(openxbdm_client::commands::NoStopOn(flags.to_client())).map_err(err_box)
-        }
-
-        pub fn notify(
-            &self,
-            port: u16,
-            reverse: bool,
-            drop_on_reconnect: bool,
-        ) -> Result<Box<OpenxbdmNotifyReply>, Box<OpenxbdmError>> {
             self.0
-                .run(openxbdm_client::commands::Notify { reconnect_port: port, reverse, drop_on_reconnect })
-                .map(|r| Box::new(OpenxbdmNotifyReply::from(r)))
+                .run(openxbdm_client::commands::NoStopOn(flags.to_client()))
                 .map_err(err_box)
         }
 
         pub fn modules(&self) -> Result<Box<OpenxbdmModules>, Box<OpenxbdmError>> {
-            self.0.run(openxbdm_client::commands::Modules).map(|v| Box::new(OpenxbdmModules(v))).map_err(err_box)
+            self.0
+                .run(openxbdm_client::commands::Modules)
+                .map(|v| Box::new(OpenxbdmModules(v)))
+                .map_err(err_box)
         }
 
-        pub fn module_sections(&self, module: &str) -> Result<Box<OpenxbdmModuleSections>, Box<OpenxbdmError>> {
+        pub fn module_sections(
+            &self,
+            module: &str,
+        ) -> Result<Box<OpenxbdmModuleSections>, Box<OpenxbdmError>> {
             self.0
-                .run(openxbdm_client::commands::ModuleSections { module: module.to_owned() })
+                .run(openxbdm_client::commands::ModuleSections {
+                    module: module.to_owned(),
+                })
                 .map(|v| Box::new(OpenxbdmModuleSections(v)))
                 .map_err(err_box)
         }
@@ -495,13 +649,22 @@ mod ffi {
         pub fn threads(&self) -> Result<Box<OpenxbdmThreadIds>, Box<OpenxbdmError>> {
             self.0
                 .run(openxbdm_client::commands::Threads)
-                .map(|v| Box::new(OpenxbdmThreadIds(v.into_iter().map(|t| t.as_u32()).collect())))
+                .map(|v| {
+                    Box::new(OpenxbdmThreadIds(
+                        v.into_iter().map(|t| t.as_u32()).collect(),
+                    ))
+                })
                 .map_err(err_box)
         }
 
-        pub fn thread_info(&self, thread: u32) -> Result<Box<OpenxbdmThreadDetail>, Box<OpenxbdmError>> {
+        pub fn thread_info(
+            &self,
+            thread: u32,
+        ) -> Result<Box<OpenxbdmThreadDetail>, Box<OpenxbdmError>> {
             self.0
-                .run(openxbdm_client::commands::ThreadInfo { thread: openxbdm_client::commands::ThreadId(thread) })
+                .run(openxbdm_client::commands::ThreadInfo {
+                    thread: openxbdm_client::commands::ThreadId(thread),
+                })
                 .map(|d| Box::new(OpenxbdmThreadDetail::from(d)))
                 .map_err(err_box)
         }
@@ -514,8 +677,12 @@ mod ffi {
                 .map_err(err_box)
         }
 
-        /// `xbeinfo NAME="..."`: metadata for a specific `.xex` / `.xbe` on disk.
-        pub fn xbeinfo_named(&self, path: &str) -> Result<Box<OpenxbdmXbeInfo>, Box<OpenxbdmError>> {
+        /// `xbeinfo NAME="..."`: the console reports the running executable for
+        /// any name.
+        pub fn xbeinfo_named(
+            &self,
+            path: &str,
+        ) -> Result<Box<OpenxbdmXbeInfo>, Box<OpenxbdmError>> {
             self.0
                 .run(openxbdm_client::commands::XbeInfo::Named(path.to_owned()))
                 .map(|r| Box::new(OpenxbdmXbeInfo::from(r)))
@@ -535,16 +702,32 @@ mod ffi {
             kind: u32,
         ) -> Result<Box<OpenxbdmPerfCounterSample>, Box<OpenxbdmError>> {
             self.0
-                .run(openxbdm_client::commands::QueryPerfCounter { name: name.to_owned(), kind })
-                .map(|s| Box::new(OpenxbdmPerfCounterSample { kind: s.kind, value: s.value, rate: s.rate }))
+                .run(openxbdm_client::commands::QueryPerfCounter {
+                    name: name.to_owned(),
+                    kind,
+                })
+                .map(|s| {
+                    Box::new(OpenxbdmPerfCounterSample {
+                        kind: s.kind,
+                        value: s.value,
+                        rate: s.rate,
+                    })
+                })
                 .map_err(err_box)
         }
 
         pub fn get_socket_info(&self) -> Result<Box<OpenxbdmSockets>, Box<OpenxbdmError>> {
-            self.0.run(openxbdm_client::commands::GetSocketInfo).map(|v| Box::new(OpenxbdmSockets(v))).map_err(err_box)
+            self.0
+                .run(openxbdm_client::commands::GetSocketInfo)
+                .map(|v| Box::new(OpenxbdmSockets(v)))
+                .map_err(err_box)
         }
 
-        pub fn getmem(&self, address: u32, length: u32) -> Result<Box<OpenxbdmMemorySnapshot>, Box<OpenxbdmError>> {
+        pub fn getmem(
+            &self,
+            address: u32,
+            length: u32,
+        ) -> Result<Box<OpenxbdmMemorySnapshot>, Box<OpenxbdmError>> {
             self.0
                 .run(openxbdm_client::commands::GetMem { address, length })
                 .map(|s| Box::new(OpenxbdmMemorySnapshot::from(s)))
@@ -556,18 +739,27 @@ mod ffi {
         /// `data.len()` if an unmapped page aborted the write).
         pub fn setmem(&self, address: u32, data: &[u8]) -> Result<u32, Box<OpenxbdmError>> {
             self.0
-                .run(openxbdm_client::commands::SetMem { address, data: data.to_vec() })
+                .run(openxbdm_client::commands::SetMem {
+                    address,
+                    data: data.to_vec(),
+                })
                 .map(|w| w.written)
                 .map_err(err_box)
         }
 
         pub fn walkmem(&self) -> Result<Box<OpenxbdmVirtualRegions>, Box<OpenxbdmError>> {
-            self.0.run(openxbdm_client::commands::WalkMem).map(|v| Box::new(OpenxbdmVirtualRegions(v))).map_err(err_box)
+            self.0
+                .run(openxbdm_client::commands::WalkMem)
+                .map(|v| Box::new(OpenxbdmVirtualRegions(v)))
+                .map_err(err_box)
         }
 
         /// `screenshot`: capture the current HDMI scanout.
         pub fn screenshot(&self) -> Result<Box<OpenxbdmScreenshot>, Box<OpenxbdmError>> {
-            self.0.screenshot().map(|s| Box::new(OpenxbdmScreenshot::from(s))).map_err(err_box)
+            self.0
+                .screenshot()
+                .map(|s| Box::new(OpenxbdmScreenshot::from(s)))
+                .map_err(err_box)
         }
     }
 
@@ -630,12 +822,18 @@ mod ffi {
             self.0.len()
         }
         pub fn name(&self, idx: usize, out: &mut DiplomatWrite) -> Result<(), Box<OpenxbdmError>> {
-            let e = self.0.get(idx).ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))?;
+            let e = self
+                .0
+                .get(idx)
+                .ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))?;
             let _ = write!(out, "{}", e.name);
             Ok(())
         }
         pub fn size(&self, idx: usize) -> Result<u64, Box<OpenxbdmError>> {
-            self.0.get(idx).map(|e| e.size).ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))
+            self.0
+                .get(idx)
+                .map(|e| e.size)
+                .ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))
         }
         pub fn create_time(&self, idx: usize) -> Result<u64, Box<OpenxbdmError>> {
             self.0
@@ -682,58 +880,137 @@ mod ffi {
     }
 
     /// `isstopped` reply. Flattened: `kind()` returns a discriminant;
-    /// field accessors are valid only for the matching kind.
+    /// field accessors are valid only for the kinds they name.
     ///
-    /// Kinds: 0=Running, 1=Breakpoint, 2=DataBreakpoint, 3=SingleStep,
-    /// 4=Exception, 5=HardwareDebug, 6=Assertion, 7=Other.
+    /// Kinds: 0=Running, 1=Stopped, 2=DebugString, 3=Assertion,
+    /// 4=Breakpoint, 5=SingleStep, 6=NtAssertion, 7=DataBreakpoint, 8=Rip,
+    /// 9=Exception.
     #[diplomat::opaque]
     pub struct OpenxbdmStopState {
         pub(crate) kind: u32,
+        pub(crate) thread: u32,
         pub(crate) address: u32,
+        pub(crate) data_address: u32,
+        pub(crate) length: u32,
         pub(crate) access: u32,
         pub(crate) code: u32,
-        pub(crate) other: String,
+        pub(crate) access_violation: bool,
+        pub(crate) first_chance: bool,
+        pub(crate) noncontinuable: bool,
+        pub(crate) message: Option<String>,
+    }
+
+    impl OpenxbdmStopState {
+        fn with_kind(kind: u32) -> Self {
+            Self {
+                kind,
+                thread: 0,
+                address: 0,
+                data_address: 0,
+                length: 0,
+                access: 0,
+                code: 0,
+                access_violation: false,
+                first_chance: false,
+                noncontinuable: false,
+                message: None,
+            }
+        }
     }
 
     impl From<openxbdm_client::commands::StopState> for OpenxbdmStopState {
         fn from(s: openxbdm_client::commands::StopState) -> Self {
-            match s {
-                openxbdm_client::commands::StopState::Running => {
-                    Self { kind: 0, address: 0, access: 0, code: 0, other: String::new() }
-                }
-                openxbdm_client::commands::StopState::Halted(reason) => match reason {
-                    openxbdm_client::commands::StopReason::Breakpoint { address } => {
-                        Self { kind: 1, address, access: 0, code: 0, other: String::new() }
-                    }
-                    openxbdm_client::commands::StopReason::DataBreakpoint { address, access } => Self {
-                        kind: 2,
-                        address,
-                        access: match access {
-                            openxbdm_client::commands::DataAccess::Read => 2,
-                            openxbdm_client::commands::DataAccess::Write => 3,
-                            openxbdm_client::commands::DataAccess::ReadWrite => 4,
-                            openxbdm_client::commands::DataAccess::Execute => 5,
-                            openxbdm_client::commands::DataAccess::Unknown(raw) => raw,
-                        },
-                        code: 0,
-                        other: String::new(),
-                    },
-                    openxbdm_client::commands::StopReason::SingleStep => {
-                        Self { kind: 3, address: 0, access: 0, code: 0, other: String::new() }
-                    }
-                    openxbdm_client::commands::StopReason::Exception { code } => {
-                        Self { kind: 4, address: 0, access: 0, code, other: String::new() }
-                    }
-                    openxbdm_client::commands::StopReason::HardwareDebug => {
-                        Self { kind: 5, address: 0, access: 0, code: 0, other: String::new() }
-                    }
-                    openxbdm_client::commands::StopReason::Assertion => {
-                        Self { kind: 6, address: 0, access: 0, code: 0, other: String::new() }
-                    }
-                    openxbdm_client::commands::StopReason::Other(s) => {
-                        Self { kind: 7, address: 0, access: 0, code: 0, other: s }
-                    }
+            use openxbdm_client::commands::AccessViolationKind;
+            use openxbdm_client::commands::DataAccess;
+            use openxbdm_client::commands::ExceptionDetail;
+            use openxbdm_client::commands::StopReason;
+            use openxbdm_client::commands::StopState;
+
+            let reason = match s {
+                StopState::Running => return Self::with_kind(0),
+                StopState::Halted(reason) => reason,
+            };
+            match reason {
+                StopReason::Stopped => Self::with_kind(1),
+                StopReason::DebugString { thread } => Self {
+                    thread: thread.0,
+                    ..Self::with_kind(2)
                 },
+                StopReason::Assertion {
+                    thread,
+                    string_address,
+                    string_length,
+                } => Self {
+                    thread: thread.0,
+                    address: string_address,
+                    length: string_length,
+                    ..Self::with_kind(3)
+                },
+                StopReason::Breakpoint { address, thread } => Self {
+                    thread: thread.0,
+                    address,
+                    ..Self::with_kind(4)
+                },
+                StopReason::SingleStep { address, thread } => Self {
+                    thread: thread.0,
+                    address,
+                    ..Self::with_kind(5)
+                },
+                StopReason::NtAssertion { address, thread } => Self {
+                    thread: thread.0,
+                    address,
+                    ..Self::with_kind(6)
+                },
+                StopReason::DataBreakpoint {
+                    access,
+                    data_address,
+                    address,
+                    thread,
+                } => Self {
+                    thread: thread.0,
+                    address,
+                    data_address,
+                    access: match access {
+                        DataAccess::Write => 1,
+                        DataAccess::Read => 2,
+                        DataAccess::Execute => 3,
+                    },
+                    ..Self::with_kind(7)
+                },
+                StopReason::Rip { thread, message } => Self {
+                    thread: thread.0,
+                    message,
+                    ..Self::with_kind(8)
+                },
+                StopReason::Exception(exception) => {
+                    let base = Self {
+                        thread: exception.thread.0,
+                        address: exception.address,
+                        code: exception.code,
+                        first_chance: exception.first_chance,
+                        noncontinuable: exception.noncontinuable,
+                        ..Self::with_kind(9)
+                    };
+                    match exception.detail {
+                        ExceptionDetail::AccessViolation {
+                            access,
+                            data_address,
+                        } => Self {
+                            access_violation: true,
+                            data_address,
+                            access: match access {
+                                AccessViolationKind::Read => 0,
+                                AccessViolationKind::Write => 1,
+                            },
+                            ..base
+                        },
+                        ExceptionDetail::Parameters { count, address } => Self {
+                            length: count,
+                            data_address: address,
+                            ..base
+                        },
+                    }
+                }
             }
         }
     }
@@ -742,22 +1019,54 @@ mod ffi {
         pub fn kind(&self) -> u32 {
             self.kind
         }
-        /// Valid when kind is 1 (Breakpoint) or 2 (DataBreakpoint).
+        /// Valid for every kind except 0 (Running) and 1 (Stopped).
+        pub fn thread(&self) -> u32 {
+            self.thread
+        }
+        /// Instruction address for kinds 4-7 and 9; string address for 3.
         pub fn address(&self) -> u32 {
             self.address
         }
-        /// Valid when kind is 2 (DataBreakpoint): 2=Read, 3=Write,
-        /// 4=ReadWrite, 5=Execute, other=raw `access` value.
+        /// Kind 7: watched data address. Kind 9: faulting data address when
+        /// `is_access_violation()`, else the parameter array address.
+        pub fn data_address(&self) -> u32 {
+            self.data_address
+        }
+        /// Kind 3: string length. Kind 9 without access violation: number
+        /// of exception parameters.
+        pub fn length(&self) -> u32 {
+            self.length
+        }
+        /// Kind 7: 1=Write, 2=Read, 3=Execute. Kind 9 with access
+        /// violation: 0=Read, 1=Write.
         pub fn access(&self) -> u32 {
             self.access
         }
-        /// Valid when kind is 4 (Exception): the exception code.
+        /// Kind 9: the exception code.
         pub fn exception_code(&self) -> u32 {
             self.code
         }
-        /// Valid when kind is 7 (Other): the raw response head text.
-        pub fn other(&self, out: &mut DiplomatWrite) {
-            let _ = write!(out, "{}", self.other);
+        /// Kind 9: the exception is an access violation (0xc0000005).
+        pub fn is_access_violation(&self) -> bool {
+            self.access_violation
+        }
+        /// Kind 9: first-chance exception.
+        pub fn is_first_chance(&self) -> bool {
+            self.first_chance
+        }
+        /// Kind 9: noncontinuable exception.
+        pub fn is_noncontinuable(&self) -> bool {
+            self.noncontinuable
+        }
+        /// Kind 8: whether the stop line carried a string.
+        pub fn has_message(&self) -> bool {
+            self.message.is_some()
+        }
+        /// Kind 8: the string, when `has_message()`.
+        pub fn message(&self, out: &mut DiplomatWrite) {
+            if let Some(message) = &self.message {
+                let _ = write!(out, "{message}");
+            }
         }
     }
 
@@ -794,19 +1103,14 @@ mod ffi {
             f.stacktrace = v;
             self.inner.set(f);
         }
-        pub fn set_title_init(&self, v: bool) {
+        pub fn set_module_load(&self, v: bool) {
             let mut f = self.inner.get();
-            f.title_init = v;
+            f.module_load = v;
             self.inner.set(f);
         }
-        pub fn set_title_exit(&self, v: bool) {
+        pub fn set_pogo_module_start(&self, v: bool) {
             let mut f = self.inner.get();
-            f.title_exit = v;
-            self.inner.set(f);
-        }
-        pub fn set_debugger(&self, v: bool) {
-            let mut f = self.inner.get();
-            f.debugger = v;
+            f.pogo_module_start = v;
             self.inner.set(f);
         }
         pub fn set_all(&self, v: bool) {
@@ -822,29 +1126,44 @@ mod ffi {
         }
     }
 
-    /// `notify` reply.
+    /// A connection turned into a notification channel with `notify`.
     #[diplomat::opaque]
-    pub struct OpenxbdmNotifyReply {
-        pub(crate) port_present: bool,
-        pub(crate) port: u16,
-        pub(crate) raw: String,
-    }
+    pub struct OpenxbdmNotificationChannel(pub(crate) crate::inner::NotificationInner);
 
-    impl From<openxbdm_client::commands::NotifyReply> for OpenxbdmNotifyReply {
-        fn from(r: openxbdm_client::commands::NotifyReply) -> Self {
-            Self { port_present: r.reconnect_port.is_some(), port: r.reconnect_port.unwrap_or(0), raw: r.raw }
+    impl OpenxbdmNotificationChannel {
+        /// Connect to `address` and send `notify`. With `has_reconnect_port`
+        /// the console also records a target at this host and
+        /// `reconnect_port`.
+        #[diplomat::attr(auto, named_constructor = "open")]
+        pub fn open(
+            address: &str,
+            timeout_secs: u32,
+            has_reconnect_port: bool,
+            reconnect_port: u16,
+            debug: bool,
+            reverse: bool,
+        ) -> Result<Box<OpenxbdmNotificationChannel>, Box<OpenxbdmError>> {
+            let request = openxbdm_client::commands::Notify {
+                reconnect_port: has_reconnect_port.then_some(reconnect_port),
+                debug,
+                reverse,
+            };
+            crate::inner::NotificationInner::open(address, timeout_secs, request)
+                .map(|inner| Box::new(OpenxbdmNotificationChannel(inner)))
+                .map_err(err_box)
         }
-    }
 
-    impl OpenxbdmNotifyReply {
-        pub fn has_reconnect_port(&self) -> bool {
-            self.port_present
+        /// Execution state announced when the channel opened, as its
+        /// notification name (`started`, `stopped`, ...).
+        pub fn execution_state(&self, out: &mut DiplomatWrite) {
+            let _ = write!(out, "{}", self.0.execution_state());
         }
-        pub fn reconnect_port(&self) -> u16 {
-            self.port
-        }
-        pub fn raw(&self, out: &mut DiplomatWrite) {
-            let _ = write!(out, "{}", self.raw);
+
+        /// Wait for the next notification line.
+        pub fn next_line(&self, out: &mut DiplomatWrite) -> Result<(), Box<OpenxbdmError>> {
+            let line = self.0.next_line().map_err(err_box)?;
+            let _ = write!(out, "{line}");
+            Ok(())
         }
     }
 
@@ -857,7 +1176,10 @@ mod ffi {
             self.0.len()
         }
         pub fn name(&self, idx: usize, out: &mut DiplomatWrite) -> Result<(), Box<OpenxbdmError>> {
-            let m = self.0.get(idx).ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))?;
+            let m = self
+                .0
+                .get(idx)
+                .ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))?;
             let _ = write!(out, "{}", m.name);
             Ok(())
         }
@@ -902,7 +1224,10 @@ mod ffi {
             idx: usize,
             f: impl FnOnce(&openxbdm_client::commands::ModuleInfo) -> T,
         ) -> Result<T, Box<OpenxbdmError>> {
-            self.0.get(idx).map(f).ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))
+            self.0
+                .get(idx)
+                .map(f)
+                .ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))
         }
     }
 
@@ -915,7 +1240,10 @@ mod ffi {
             self.0.len()
         }
         pub fn name(&self, idx: usize, out: &mut DiplomatWrite) -> Result<(), Box<OpenxbdmError>> {
-            let s = self.0.get(idx).ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))?;
+            let s = self
+                .0
+                .get(idx)
+                .ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))?;
             let _ = write!(out, "{}", s.name);
             Ok(())
         }
@@ -939,7 +1267,10 @@ mod ffi {
             idx: usize,
             f: impl FnOnce(&openxbdm_client::commands::ModuleSection) -> T,
         ) -> Result<T, Box<OpenxbdmError>> {
-            self.0.get(idx).map(f).ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))
+            self.0
+                .get(idx)
+                .map(f)
+                .ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))
         }
     }
 
@@ -952,7 +1283,10 @@ mod ffi {
             self.0.len()
         }
         pub fn get(&self, idx: usize) -> Result<u32, Box<OpenxbdmError>> {
-            self.0.get(idx).copied().ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))
+            self.0
+                .get(idx)
+                .copied()
+                .ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))
         }
     }
 
@@ -1046,7 +1380,11 @@ mod ffi {
 
     impl From<openxbdm_client::commands::XbeInfoResult> for OpenxbdmXbeInfo {
         fn from(r: openxbdm_client::commands::XbeInfoResult) -> Self {
-            Self { timestamp: r.timestamp, checksum: r.checksum, name: r.name }
+            Self {
+                timestamp: r.timestamp,
+                checksum: r.checksum,
+                name: r.name,
+            }
         }
     }
 
@@ -1071,12 +1409,18 @@ mod ffi {
             self.0.len()
         }
         pub fn name(&self, idx: usize, out: &mut DiplomatWrite) -> Result<(), Box<OpenxbdmError>> {
-            let e = self.0.get(idx).ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))?;
+            let e = self
+                .0
+                .get(idx)
+                .ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))?;
             let _ = write!(out, "{}", e.name);
             Ok(())
         }
         pub fn kind(&self, idx: usize) -> Result<u32, Box<OpenxbdmError>> {
-            self.0.get(idx).map(|e| e.kind).ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))
+            self.0
+                .get(idx)
+                .map(|e| e.kind)
+                .ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))
         }
     }
 
@@ -1111,19 +1455,19 @@ mod ffi {
         pub fn handle(&self, idx: usize) -> Result<u32, Box<OpenxbdmError>> {
             self.field(idx, |s| s.handle)
         }
-        pub fn owner_type(&self, idx: usize) -> Result<u32, Box<OpenxbdmError>> {
+        pub fn owner_type(&self, idx: usize) -> Result<i32, Box<OpenxbdmError>> {
             self.field(idx, |s| s.owner_type)
         }
         pub fn flags(&self, idx: usize) -> Result<u32, Box<OpenxbdmError>> {
             self.field(idx, |s| s.flags)
         }
-        pub fn addr_family(&self, idx: usize) -> Result<u32, Box<OpenxbdmError>> {
+        pub fn addr_family(&self, idx: usize) -> Result<i32, Box<OpenxbdmError>> {
             self.field(idx, |s| s.addr_family)
         }
-        pub fn socket_type(&self, idx: usize) -> Result<u32, Box<OpenxbdmError>> {
+        pub fn socket_type(&self, idx: usize) -> Result<i32, Box<OpenxbdmError>> {
             self.field(idx, |s| s.socket_type)
         }
-        pub fn protocol(&self, idx: usize) -> Result<u32, Box<OpenxbdmError>> {
+        pub fn protocol(&self, idx: usize) -> Result<i32, Box<OpenxbdmError>> {
             self.field(idx, |s| s.protocol)
         }
         pub fn local_addr(&self, idx: usize) -> Result<u32, Box<OpenxbdmError>> {
@@ -1138,7 +1482,7 @@ mod ffi {
         pub fn remote_port(&self, idx: usize) -> Result<u16, Box<OpenxbdmError>> {
             self.field(idx, |s| s.remote_port)
         }
-        pub fn tcp_state(&self, idx: usize) -> Result<u32, Box<OpenxbdmError>> {
+        pub fn tcp_state(&self, idx: usize) -> Result<u8, Box<OpenxbdmError>> {
             self.field(idx, |s| s.tcp_state)
         }
     }
@@ -1149,7 +1493,10 @@ mod ffi {
             idx: usize,
             f: impl FnOnce(&openxbdm_client::commands::SocketEntry) -> T,
         ) -> Result<T, Box<OpenxbdmError>> {
-            self.0.get(idx).map(f).ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))
+            self.0
+                .get(idx)
+                .map(f)
+                .ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))
         }
     }
 
@@ -1164,7 +1511,11 @@ mod ffi {
 
     impl From<openxbdm_client::commands::MemorySnapshot> for OpenxbdmMemorySnapshot {
         fn from(s: openxbdm_client::commands::MemorySnapshot) -> Self {
-            Self { address: s.address, data: s.data, unmapped: s.unmapped_offsets }
+            Self {
+                address: s.address,
+                data: s.data,
+                unmapped: s.unmapped_offsets,
+            }
         }
     }
 
@@ -1184,7 +1535,10 @@ mod ffi {
             self.unmapped.len()
         }
         pub fn unmapped_at(&self, idx: usize) -> Result<u32, Box<OpenxbdmError>> {
-            self.unmapped.get(idx).copied().ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))
+            self.unmapped
+                .get(idx)
+                .copied()
+                .ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))
         }
     }
 
@@ -1213,7 +1567,10 @@ mod ffi {
             idx: usize,
             f: impl FnOnce(&openxbdm_client::commands::VirtualRegion) -> T,
         ) -> Result<T, Box<OpenxbdmError>> {
-            self.0.get(idx).map(f).ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))
+            self.0
+                .get(idx)
+                .map(f)
+                .ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))
         }
     }
 
@@ -1304,19 +1661,20 @@ mod ffi {
 
         /// Decode the raw framebuffer into a `width * height * 4` RGBA
         /// byte buffer. Returns a zero-length handle when the pixel
-        /// format isn't a known linear XRGB layout.
+        /// format isn't a known linear XRGB layout or the body is short.
         pub fn to_rgba8(&self) -> Box<OpenxbdmBytes> {
-            // We lost the typed metadata when we flattened; rebuild just
-            // enough to reuse the upstream detiler.
             if !self.is_linear_xrgb8888 {
                 return Box::new(OpenxbdmBytes(Vec::new()));
             }
-            let w = self.width as usize;
-            let h = self.height as usize;
-            if w * h * 4 > self.data.len() {
+            let Some(linear) = openxbdm_client::commands::screenshot::detile_32bpp(
+                &self.data,
+                self.width,
+                self.height,
+                self.offset_x,
+                self.offset_y,
+            ) else {
                 return Box::new(OpenxbdmBytes(Vec::new()));
-            }
-            let linear = openxbdm_client::commands::screenshot::detile_2d_32bpp(&self.data, self.width, self.height);
+            };
             let mut rgba = Vec::with_capacity(linear.len());
             for chunk in linear.as_chunks::<4>().0 {
                 let (b, g, r, _x) = (chunk[0], chunk[1], chunk[2], chunk[3]);
@@ -1334,7 +1692,9 @@ mod ffi {
     impl OpenxbdmDiscovery {
         /// Broadcast a `whatisyourname` request and collect replies for
         /// up to `timeout_ms` milliseconds.
-        pub fn discover_all(timeout_ms: u32) -> Result<Box<OpenxbdmDiscoveredConsoles>, Box<OpenxbdmError>> {
+        pub fn discover_all(
+            timeout_ms: u32,
+        ) -> Result<Box<OpenxbdmDiscoveredConsoles>, Box<OpenxbdmError>> {
             crate::inner::discover_all_blocking(timeout_ms)
                 .map(|v| Box::new(OpenxbdmDiscoveredConsoles::from_vec(v)))
                 .map_err(|e| Box::new(OpenxbdmError(e)))
@@ -1342,10 +1702,15 @@ mod ffi {
 
         /// Broadcast a targeted `lookup name` request; returns the first
         /// matching reply or an error if none arrive within `timeout_ms`.
-        pub fn find_by_name(name: &str, timeout_ms: u32) -> Result<Box<OpenxbdmDiscoveredConsole>, Box<OpenxbdmError>> {
+        pub fn find_by_name(
+            name: &str,
+            timeout_ms: u32,
+        ) -> Result<Box<OpenxbdmDiscoveredConsole>, Box<OpenxbdmError>> {
             match crate::inner::find_by_name_blocking(name, timeout_ms) {
                 Ok(Some(c)) => Ok(Box::new(OpenxbdmDiscoveredConsole::from(c))),
-                Ok(None) => Err(Box::new(OpenxbdmError(format!("no reply from {name:?} within {timeout_ms}ms")))),
+                Ok(None) => Err(Box::new(OpenxbdmError(format!(
+                    "no reply from {name:?} within {timeout_ms}ms"
+                )))),
                 Err(e) => Err(Box::new(OpenxbdmError(e))),
             }
         }
@@ -1373,7 +1738,12 @@ mod ffi {
                     true
                 }
             };
-            Self { name: c.name, ip_octets: octets, is_ipv6, port: c.addr.port() }
+            Self {
+                name: c.name,
+                ip_octets: octets,
+                is_ipv6,
+                port: c.addr.port(),
+            }
         }
     }
 
@@ -1407,12 +1777,18 @@ mod ffi {
             self.0.len()
         }
         pub fn name(&self, idx: usize, out: &mut DiplomatWrite) -> Result<(), Box<OpenxbdmError>> {
-            let c = self.0.get(idx).ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))?;
+            let c = self
+                .0
+                .get(idx)
+                .ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))?;
             let _ = write!(out, "{}", c.name);
             Ok(())
         }
         pub fn port(&self, idx: usize) -> Result<u16, Box<OpenxbdmError>> {
-            self.0.get(idx).map(|c| c.port).ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))
+            self.0
+                .get(idx)
+                .map(|c| c.port)
+                .ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))
         }
         pub fn is_ipv6(&self, idx: usize) -> Result<bool, Box<OpenxbdmError>> {
             self.0
@@ -1421,7 +1797,10 @@ mod ffi {
                 .ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))
         }
         pub fn copy_ip(&self, idx: usize, dst: &mut [u8]) -> Result<usize, Box<OpenxbdmError>> {
-            let c = self.0.get(idx).ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))?;
+            let c = self
+                .0
+                .get(idx)
+                .ok_or_else(|| Box::new(OpenxbdmError(format!("index {idx} out of range"))))?;
             let n = if c.is_ipv6 { 16 } else { 4 };
             let n = n.min(dst.len());
             dst[..n].copy_from_slice(&c.ip_octets[..n]);

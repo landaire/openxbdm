@@ -28,7 +28,12 @@ where
     let mut cursor = 0u32;
     while cursor < length {
         let take = core::cmp::min(CHUNK, length - cursor);
-        let snap = client.run(GetMem { address: address.wrapping_add(cursor), length: take }).await?;
+        let snap = client
+            .run(GetMem {
+                address: address.wrapping_add(cursor),
+                length: take,
+            })
+            .await?;
         out.extend_from_slice(&snap.data);
         cursor = cursor.wrapping_add(take);
     }
@@ -36,12 +41,17 @@ where
 }
 
 /// Read a u32 (big-endian, native for PowerPC) at `address`.
-pub async fn read_u32_be<T>(client: &mut Client<T, Connected>, address: u32) -> Result<u32, rootcause::Report<Error>>
+pub async fn read_u32_be<T>(
+    client: &mut Client<T, Connected>,
+    address: u32,
+) -> Result<u32, rootcause::Report<Error>>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     let bytes = read(client, address, 4).await?;
-    Ok(u32::from_be_bytes(bytes.try_into().expect("asked for 4 bytes")))
+    Ok(u32::from_be_bytes(
+        bytes.try_into().expect("asked for 4 bytes"),
+    ))
 }
 
 /// Write a u32 big-endian at `address` via `setmem`.
@@ -54,7 +64,12 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     use crate::commands::memory::SetMem;
-    client.run(SetMem { address, data: value.to_be_bytes().to_vec() }).await?;
+    client
+        .run(SetMem {
+            address,
+            data: value.to_be_bytes().to_vec(),
+        })
+        .await?;
     Ok(())
 }
 

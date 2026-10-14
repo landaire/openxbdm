@@ -1,0 +1,2 @@
+# The module targets powerpc-unknown-xbox360; see build_xbox360.sh.
+compatible_with = ["//platforms:xbox360"]

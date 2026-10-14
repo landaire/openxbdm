@@ -475,6 +475,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "gdbstub"
+version = "0.7.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5bafc7e33650ab9f05dcc16325f05d56b8d10393114e31a19a353b86fa60cfe7"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "log",
+ "managed",
+ "num-traits",
+ "pastey",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -742,6 +756,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b29dffab797218e12e4df08ef5d15ab9efca2504038b1b32b9b32fc844b39c9"
 
 [[package]]
+name = "managed"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ca88d725a0a943b096803bd34e73a4437208b6077654cc4ecb2947a5f91618d"
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -908,6 +928,7 @@ dependencies = [
  "insta",
  "jiff",
  "memchr",
+ "openxbdm-core",
  "powerpc",
  "rootcause",
  "thiserror 2.0.18",
@@ -916,6 +937,10 @@ dependencies = [
  "tracing",
  "winnow 1.0.1",
 ]
+
+[[package]]
+name = "openxbdm-core"
+version = "0.1.0"
 
 [[package]]
 name = "openxbdm-ffi"
@@ -930,14 +955,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "openxbdm-kd"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "gdbstub",
+ "insta",
+ "jiff",
+ "openxbdm-kd-core",
+ "rootcause",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "openxbdm-kd-core"
+version = "0.1.0"
+dependencies = [
+ "insta",
+ "thiserror 2.0.18",
+ "winnow 1.0.1",
+]
+
+[[package]]
 name = "openxbdm-server"
 version = "0.1.0"
+dependencies = [
+ "insta",
+ "openxbdm-core",
+]
 
 [[package]]
 name = "openxbdm-server-host"
 version = "0.1.0"
 dependencies = [
  "openxbdm-client",
+ "openxbdm-core",
  "openxbdm-server",
  "tokio",
 ]
@@ -946,7 +1000,16 @@ dependencies = [
 name = "openxbdm-server-xbox360"
 version = "0.1.0"
 dependencies = [
+ "openxbdm-core",
  "openxbdm-server",
+]
+
+[[package]]
+name = "openxbdm-testing"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "insta",
 ]
 
 [[package]]
@@ -992,6 +1055,12 @@ dependencies = [
  "smallvec",
  "windows-link",
 ]
+
+[[package]]
+name = "pastey"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
 name = "pem-rfc7468"

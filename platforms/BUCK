@@ -1,0 +1,9 @@
+# No Buck platform provides this value, so targets that require it are
+# skipped by host builds. build_xbox360.sh builds the console module.
+constraint_setting(name = "console")
+
+constraint_value(
+    name = "xbox360",
+    constraint_setting = ":console",
+    visibility = ["PUBLIC"],
+)

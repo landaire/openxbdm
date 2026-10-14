@@ -1,12 +1,16 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/openxbdm-core",
     "crates/openxbdm-client",
     "crates/openxbdm-cli",
     "crates/openxbdm-ffi",
+    "crates/openxbdm-kd",
+    "crates/openxbdm-kd-core",
     "crates/openxbdm-server",
     "crates/openxbdm-server-host",
     "crates/openxbdm-server-xbox360",
+    "crates/openxbdm-testing",
 ]
 
 [workspace.package]

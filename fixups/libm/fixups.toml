@@ -1,0 +1,3 @@
+[buildscript.run]
+# Cargo sets OPT_LEVEL for build scripts; Buck builds are unoptimized.
+env = { OPT_LEVEL = "0" }

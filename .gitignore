@@ -11,3 +11,12 @@
 
 # insta snapshot pending-review files (stay local until accepted/rejected).
 *.pending-snap
+
+/buck-out
+/.cargo/*
+!/.cargo/config.toml
+/.devenv
+/.devenv.flake.nix
+/.direnv
+/devenv.local.nix
+/.omp

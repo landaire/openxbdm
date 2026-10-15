@@ -41,8 +41,8 @@ that Buck2 downloads.
 
 Buck2 is the primary build system. Cargo builds the same sources.
 
-    buck2 build //...
-    buck2 test //...
+    buck2 build //crates/...
+    buck2 test //crates/...
     build_defs/lint.py
 
     cargo build --workspace
@@ -66,7 +66,7 @@ and C++ headers, which Cargo and diplomat-tool build.
 `openxbdm-server-xbox360` targets `powerpc-unknown-xbox360`, which Buck2
 does not build. Its rule requires `//platforms:xbox360`
 (`[package.metadata.buck2]` in its `Cargo.toml`), a constraint no Buck
-platform provides, so `buck2 build //...` skips it. Build the module with
+platform provides, so `buck2 build //crates/...` skips it. Build the module with
 
     ./build_xbox360.sh [--plain | --no-rewrite] [output.xex]
 

@@ -189,11 +189,7 @@ pub(super) fn title_exited(state: &mut State, backend: &mut dyn crate::backend::
 fn start(invocation: &mut Invocation<'_>) -> Hresult {
     let line = invocation.line;
     // Absent and unparsable values read as 0, which selects the defaults.
-    let dword = |name| {
-        line.param(name)
-            .and_then(|value| value.dword())
-            .unwrap_or(0)
-    };
+    let dword = |name| line.dword(name).unwrap_or(0);
     let data_limit = dword("maxframedata");
     let buffer = dword("buffersize");
     let flags = CaptureFlags(dword("flags"));

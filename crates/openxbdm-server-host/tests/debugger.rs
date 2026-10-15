@@ -725,8 +725,11 @@ fn context_of_a_stopped_thread_round_trips() {
 }
 
 #[test]
-fn getcontext_copies_the_context_into_a_pool_block() {
+fn getcontext_uses_pool_memory_while_another_transfer_holds_the_spare() {
     let server = TestServer::start();
+    let mut holder = server.raw();
+    holder.line();
+    assert_eq!(holder.command("keyxchg"), "204- send binary data");
     let mut session = server.raw();
     session.line();
     server.host.lock().backend.filesystem.pool_exhausted = true;
@@ -741,6 +744,21 @@ fn getcontext_copies_the_context_into_a_pool_block() {
     );
     assert_eq!(session.multiline().len(), 4);
     assert_eq!(server.host.lock().backend.filesystem.pool_blocks(), 0);
+}
+
+#[test]
+fn getcontext_works_without_pool_memory() {
+    let server = TestServer::start();
+    let mut session = server.raw();
+    session.line();
+    server.host.lock().backend.filesystem.pool_exhausted = true;
+    for _ in 0..2 {
+        assert_eq!(
+            session.command(&format!("getcontext thread=0x{TITLE_THREAD:08x} control")),
+            "202- multiline response follows"
+        );
+        assert_eq!(session.multiline().len(), 4);
+    }
 }
 
 #[test]

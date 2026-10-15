@@ -17,12 +17,12 @@ use crate::continuation::Continuation as AnyContinuation;
 use crate::continuation::ContinuationContext;
 use crate::invocation::Invocation;
 use crate::state::ServerState;
+use crate::text::HEX_UPPER;
 
 /// Bytes copied from `name=`, including the terminator.
 pub const NAME_CAPACITY: usize = 0x100;
 /// Certificate bytes per hex chunk of a settings line.
 const SETTINGS_CHUNK: u32 = 0x1ff;
-const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
 /// Result of a certificate upload cut short by the connection.
 const UPLOAD_ABORTED: Hresult = Hresult(0x82da_0101);
 
@@ -147,10 +147,7 @@ pub(super) fn xhttpproxy(invocation: &mut Invocation<'_>) -> Hresult {
         None => (None, 0),
         Some(value) => {
             let name = value.copy_into(&mut name_buffer);
-            let port = line
-                .param("port")
-                .and_then(|value| value.dword())
-                .unwrap_or(0);
+            let port = line.dword("port").unwrap_or(0);
             let valid = if name.is_empty() {
                 port == 0
             } else {
@@ -159,10 +156,7 @@ pub(super) fn xhttpproxy(invocation: &mut Invocation<'_>) -> Hresult {
             if !valid {
                 return Hresult::from_error_code(ErrorCode::BAD_PARAMETER);
             }
-            let certificate_size = line
-                .param("certsize")
-                .and_then(|value| value.dword())
-                .unwrap_or(0);
+            let certificate_size = line.dword("certsize").unwrap_or(0);
             // An empty name stores no name, as a missing one does.
             ((!name.is_empty()).then_some((name, port)), certificate_size)
         }

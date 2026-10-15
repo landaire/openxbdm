@@ -6,6 +6,7 @@
 
 use std::cell::RefCell;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 
 use openxbdm_core::status::NtStatus;
 use openxbdm_server::backend::Platform as _;
@@ -79,6 +80,8 @@ pub struct Mock {
     pub sleeps: Vec<u32>,
     /// Event objects signaled by completed overlapped requests.
     pub signaled_events: Vec<u32>,
+    /// Record pool storage, obtained at the first start and kept.
+    records: Option<&'static [AtomicU32]>,
 }
 
 impl std::fmt::Debug for Mock {
@@ -181,6 +184,24 @@ impl detour::Platform for HostPlatform<'_> {
 
     fn record_freed(&self) {}
 
+    fn records(&self) -> Option<&'static [AtomicU32]> {
+        self.backend.borrow().memory.detour.records
+    }
+
+    fn allocate_records(&self) -> bool {
+        let mut backend = self.backend.borrow_mut();
+        if backend.memory.detour.records.is_none() {
+            if backend.filesystem.pool_exhausted {
+                return false;
+            }
+            let storage = (0..detour::RECORD_STORAGE_WORDS)
+                .map(|_| AtomicU32::new(0))
+                .collect();
+            backend.memory.detour.records = Some(Vec::leak(storage));
+        }
+        true
+    }
+
     fn read_u32(&self, address: u32) -> u32 {
         u32::from_be_bytes(std::array::from_fn(|index| {
             self.read_byte(address.wrapping_add(index as u32))
@@ -252,7 +273,10 @@ impl MockBackend {
     /// the log for writing and open it again for reading.
     pub(super) fn start_detour_writer(&mut self, log: Option<&[u8]>) -> NtStatus {
         let engine = Arc::clone(&self.memory.detour.engine);
-        engine.prepare_log();
+        if !self.with_detour(|engine, platform| engine.prepare_log(platform)) {
+            engine.abort_start();
+            return NtStatus::SUCCESS;
+        }
         let status = self.open_detour_log(log);
         engine.set_status(status);
         if status.is_success() {

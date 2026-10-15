@@ -487,7 +487,11 @@ impl Drop for Device {
 }
 
 /// Stock 0x91f72bd0.
-fn device_read(offset: u32, buffer: *mut u8, length: u32) -> Result<(), NtStatus> {
+pub(in crate::backend) fn device_read(
+    offset: u32,
+    buffer: *mut u8,
+    length: u32,
+) -> Result<(), NtStatus> {
     Device::open_read_write()?.read(buffer, length, u64::from(offset))
 }
 
@@ -526,7 +530,11 @@ impl Scratch {
 
 /// Stock 0x91f72c78: whole units are written from `source`; partial units
 /// are read, merged, and written back.
-fn device_write(offset: u32, source: *const u8, length: u32) -> Result<(), NtStatus> {
+pub(in crate::backend) fn device_write(
+    offset: u32,
+    source: *const u8,
+    length: u32,
+) -> Result<(), NtStatus> {
     let mut device = Device::open_read_write()?;
     let unit = device.write_unit()?;
     let mut scratch = Scratch {

@@ -39,13 +39,7 @@ const fn command(
     any_of: Access,
     handler: crate::registry::Handler,
 ) -> CommandEntry {
-    CommandEntry {
-        name,
-        any_of,
-        all_of: Access::NONE,
-        flags: DispatchFlags::NONE,
-        handler,
-    }
+    CommandEntry::new(name, any_of, Access::NONE, DispatchFlags::NONE, handler)
 }
 
 pub(crate) const COMMANDS: &[CommandEntry] = &[
@@ -139,7 +133,7 @@ pub enum Continuation {
     },
     Screenshot(ScreenshotTransfer),
     Edid {
-        block: [u8; EDID_BLOCK_SIZE],
+        block: crate::transfer_blocks::TransferBlock,
         sent: bool,
     },
     Trace,
@@ -309,9 +303,10 @@ pub trait Backend {
     /// Export 151 (0x91f32e30).
     fn cpu_profiler_info(&mut self) -> Result<CpuProfilerInfo, Hresult>;
 
-    /// Post a message to the PIX engine; false without a session or with a
-    /// full queue. Code 0xc replaces the payload of a queued code 0xc.
-    fn pix_post(&mut self, message: PixMessage) -> bool;
+    /// Post message `code` with `payload` (at most 12 words) to the PIX
+    /// engine; false without a session or with a full queue. Code 0xc
+    /// replaces the payload of a queued code 0xc.
+    fn pix_post(&mut self, code: u32, payload: &[u32]) -> bool;
     /// Engine status for a title with D3D `version` and `flags`.
     fn pix_status(&mut self, version: u32, flags: u32) -> Option<[u32; 12]>;
     fn pix_frame_statistics(&mut self, frame: u32) -> Option<[u32; 3]>;
@@ -365,10 +360,13 @@ pub(crate) fn resume(continuation: &mut Continuation, cx: &mut ContinuationConte
         Continuation::Screenshot(transfer) => transfer.resume(cx),
         Continuation::Edid { block, sent } => {
             if *sent || cx.aborted {
+                cx.state.transfer_blocks.release(cx.backend, *block);
                 return Hresult::END_OF_DATA;
             }
             *sent = true;
-            cx.binary[..EDID_BLOCK_SIZE].copy_from_slice(block);
+            cx.binary[..EDID_BLOCK_SIZE].copy_from_slice(
+                &cx.state.transfer_blocks.bytes(cx.backend, *block)[..EDID_BLOCK_SIZE],
+            );
             cx.binary_len = EDID_BLOCK_SIZE;
             Hresult::OK
         }
@@ -471,7 +469,7 @@ fn capture_control(invocation: &mut Invocation<'_>) -> Hresult {
         invocation
             .backend
             .capture_stop(&invocation.state.filesystem.drives)
-    } else if let Some(flags) = line.param("flags").and_then(|value| value.dword()) {
+    } else if let Some(flags) = line.dword("flags") {
         invocation
             .backend
             .capture_set_flags(capture::CaptureFlags::from_request(flags));
@@ -795,7 +793,7 @@ fn video_display(invocation: &mut Invocation<'_>) -> Hresult {
         return vd_failure(invocation, BAD_PARAMETER);
     };
     let line = invocation.line;
-    let dword = |name: &str| line.param(name).and_then(|value| value.dword());
+    let dword = |name: &str| line.dword(name);
     if command.eq_ignore_ascii_case(b"peek") {
         let Some(register) = dword("addr").filter(|&register| register < VD_REGISTER_END) else {
             return vd_failure(invocation, BAD_PARAMETER);
@@ -848,19 +846,44 @@ fn video_display(invocation: &mut Invocation<'_>) -> Hresult {
         let Some(block) = dword("block").filter(|&block| block <= 0xff) else {
             return vd_failure(invocation, BAD_PARAMETER);
         };
-        let mut data = [0u8; EDID_BLOCK_SIZE];
-        match invocation.backend.read_edid(block as u8, &mut data) {
-            EdidRead::Unsupported => return vd_failure(invocation, UNKNOWN_COMMAND),
-            EdidRead::Failed => return vd_failure(invocation, EDID_FAILED),
-            EdidRead::Read => {}
-        }
-        let Some(session) = invocation.session.as_deref_mut() else {
+        let Some(socket) = invocation.session.as_ref().map(|session| session.socket()) else {
             return Hresult::FAIL;
         };
-        session.continuation = AnyContinuation::Performance(Continuation::Edid {
-            block: data,
-            sent: false,
-        });
+        // Stock allocates the block before the read (and leaks it when the
+        // read fails).
+        let Some(held) = invocation.state.transfer_blocks.acquire(
+            invocation.backend,
+            socket,
+            EDID_BLOCK_SIZE as u32,
+        ) else {
+            return vd_failure(invocation, super::console::BUFFER_TOO_SMALL);
+        };
+        let mut data = [0u8; EDID_BLOCK_SIZE];
+        let read = invocation.backend.read_edid(block as u8, &mut data);
+        if read != EdidRead::Read {
+            invocation
+                .state
+                .transfer_blocks
+                .release(invocation.backend, held);
+            return vd_failure(
+                invocation,
+                match read {
+                    EdidRead::Unsupported => UNKNOWN_COMMAND,
+                    _ => EDID_FAILED,
+                },
+            );
+        }
+        invocation
+            .state
+            .transfer_blocks
+            .bytes(invocation.backend, held)[..EDID_BLOCK_SIZE]
+            .copy_from_slice(&data);
+        if let Some(session) = invocation.session.as_deref_mut() {
+            session.continuation = AnyContinuation::Performance(Continuation::Edid {
+                block: held,
+                sent: false,
+            });
+        }
         return Hresult::BINARY;
     }
     Hresult::OK

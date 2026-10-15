@@ -119,11 +119,7 @@ pub enum StreamPhase {
 /// `rpc version=4 (system|title) buf_size=<dword> [processor=<dword>]
 /// [thread=<name>]`.
 pub(super) fn rpc(invocation: &mut Invocation<'_>) -> Hresult {
-    let Some(version) = invocation
-        .line
-        .param("version")
-        .and_then(|value| value.dword())
-    else {
+    let Some(version) = invocation.line.dword("version") else {
         invocation.set_text(format_args!(
             "error=Version is not specified, expecting major version {RPC_VERSION}"
         ));
@@ -143,18 +139,13 @@ pub(super) fn rpc(invocation: &mut Invocation<'_>) -> Hresult {
     } else {
         return Hresult::from_error_code(ErrorCode::BAD_PARAMETER);
     };
-    let Some(size) = invocation
-        .line
-        .param("buf_size")
-        .and_then(|value| value.dword())
-    else {
+    let Some(size) = invocation.line.dword("buf_size") else {
         return Hresult::from_error_code(ErrorCode::BAD_PARAMETER);
     };
     // An absent or malformed value selects the default.
     let processor = invocation
         .line
-        .param("processor")
-        .and_then(|value| value.dword())
+        .dword("processor")
         .unwrap_or(DEFAULT_PROCESSOR);
     let mut name = [0u8; THREAD_NAME_CAPACITY];
     let name = match invocation.line.param("thread") {

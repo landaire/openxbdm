@@ -1,5 +1,6 @@
-//! Constant values of a classifier program and the operations the compiler
-//! folds over them (stock value library 0x91f898e0..0x91f8b9d0).
+//! Values of a classifier program and the operators over them (stock
+//! value library 0x91f898e0..0x91f8b9d0), shared by constant folding and
+//! frame evaluation.
 //!
 //! Specialized to the netsim configuration: no float values exist, string
 //! flags are 0 (no backslash escapes, so a string is its raw byte range),
@@ -8,6 +9,8 @@
 //! its signedness check.
 
 use openxbdm_core::status::Hresult;
+
+use super::Operator;
 
 /// The value has no type (0x80070483).
 const NO_VALUE: Hresult = Hresult(0x8007_0483);
@@ -18,11 +21,13 @@ const TOO_WIDE: Hresult = Hresult(0x8007_00ea);
 /// Signed value to unsigned target or the reverse (0x800700d1).
 const SIGN_MISMATCH: Hresult = Hresult(0x8007_00d1);
 const DIVIDE_BY_ZERO: Hresult = Hresult(0x8002_0012);
+/// Signed division of `i64::MIN` by -1 (0x80070216).
+const OVERFLOW: Hresult = Hresult(0x8007_0216);
 const NEGATIVE_SHIFT: Hresult = Hresult(0x8007_0083);
 const BAD_INDEX: Hresult = Hresult(0x8007_0585);
 const BAD_LENGTH: Hresult = Hresult(0x8007_0018);
 
-/// A string value: a byte range of the program text.
+/// A string value: a byte range of the text the operators receive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Text {
     pub start: usize,
@@ -168,8 +173,8 @@ fn rank(value: &Variant, unsigned: bool) -> u8 {
 /// when the other operand supplies none) and truncates to it.
 ///
 /// Signed division of `i64::MIN` by -1 executes a trap instruction in
-/// stock; here it wraps.
-pub fn arithmetic(left: &Variant, op: Arithmetic, right: &Variant) -> Result<Variant, Hresult> {
+/// stock; here it fails.
+fn arithmetic(left: &Variant, op: Arithmetic, right: &Variant) -> Result<Variant, Hresult> {
     let unsigned = is_unsigned(left) || is_unsigned(right);
     let l = integer(left)?.bits;
     let r = integer(right)?.bits;
@@ -179,9 +184,9 @@ pub fn arithmetic(left: &Variant, op: Arithmetic, right: &Variant) -> Result<Var
         Arithmetic::Multiply => l.wrapping_mul(r),
         Arithmetic::Divide | Arithmetic::Remainder if r == 0 => return Err(DIVIDE_BY_ZERO),
         Arithmetic::Divide if unsigned => l / r,
-        Arithmetic::Divide => (l as i64).wrapping_div(r as i64) as u64,
+        Arithmetic::Divide => (l as i64).checked_div(r as i64).ok_or(OVERFLOW)? as u64,
         Arithmetic::Remainder if unsigned => l % r,
-        Arithmetic::Remainder => (l as i64).wrapping_rem(r as i64) as u64,
+        Arithmetic::Remainder => (l as i64).checked_rem(r as i64).ok_or(OVERFLOW)? as u64,
         Arithmetic::ShiftLeft | Arithmetic::ShiftRight if !unsigned && (r as i64) < 0 => {
             return Err(NEGATIVE_SHIFT);
         }
@@ -220,7 +225,7 @@ fn address(value: &Variant) -> Option<&[u8]> {
 /// of the same kind bytewise; anything else compares as integers, unsigned
 /// when either operand has an unsigned type. Addresses of different kinds
 /// are rejected.
-pub fn compare(
+fn compare(
     left: &Variant,
     op: Comparison,
     right: &Variant,
@@ -256,7 +261,7 @@ pub fn compare(
 
 /// 0x91f8a7b8. Bitwise complement; a bool becomes the i32 complement of
 /// 0 or 1.
-pub fn complement(value: &Variant) -> Result<Variant, Hresult> {
+fn complement(value: &Variant) -> Result<Variant, Hresult> {
     use Variant::*;
     Ok(match *value {
         Null => return Err(NO_VALUE),
@@ -274,7 +279,7 @@ pub fn complement(value: &Variant) -> Result<Variant, Hresult> {
 }
 
 /// 0x91f8a888. Both operands are converted before either is tested.
-pub fn logical(left: &Variant, and: bool, right: &Variant) -> Result<Variant, Hresult> {
+fn logical(left: &Variant, and: bool, right: &Variant) -> Result<Variant, Hresult> {
     let left = to_bool(left)?;
     let right = to_bool(right)?;
     Ok(Variant::Bool(if and {
@@ -297,7 +302,7 @@ fn ignore_case(value: Option<&Variant>) -> Result<bool, Hresult> {
 }
 
 /// 0x91f8a938. `I32` of [`compare_text`].
-pub fn string_compare(
+fn string_compare(
     text: &[u8],
     left: &Variant,
     right: &Variant,
@@ -311,7 +316,7 @@ pub fn string_compare(
 /// 0x91f8a9f0. Searches `pattern` in the window of `source` that `start`
 /// and `length` select. Returns the match offset from the start of
 /// `source` or -1, or with `contains` whether there is a match.
-pub fn index_of(
+fn index_of(
     text: &[u8],
     source: &Variant,
     pattern: &Variant,
@@ -345,7 +350,7 @@ pub fn index_of(
 }
 
 /// 0x91f8abb0. An empty source or pattern never matches.
-pub fn starts_with(
+fn starts_with(
     text: &[u8],
     source: &Variant,
     pattern: &Variant,
@@ -361,7 +366,7 @@ pub fn starts_with(
 }
 
 /// 0x91f8ac90. An empty source or pattern never matches.
-pub fn ends_with(
+fn ends_with(
     text: &[u8],
     source: &Variant,
     pattern: &Variant,
@@ -383,12 +388,7 @@ pub fn ends_with(
 
 /// 0x91f8b0b0. The range of `source` from `start` (at most its length)
 /// spanning `length` bytes, or to its end.
-pub fn substring(
-    _text: &[u8],
-    source: &Variant,
-    start: &Variant,
-    length: Option<&Variant>,
-) -> Result<Text, Hresult> {
+fn substring(source: &Variant, start: &Variant, length: Option<&Variant>) -> Result<Text, Hresult> {
     let Variant::Str(source) = *source else {
         return Err(WRONG_TYPE);
     };
@@ -404,6 +404,76 @@ pub fn substring(
         return Err(BAD_LENGTH);
     }
     Ok(Text { start, end })
+}
+
+/// An operator of 0x91f89310 over its evaluated operands: the unary
+/// operators, arithmetic, comparisons, `&&` and `||` over two values, and
+/// the string functions. Callers pass the operand count the operator
+/// takes.
+pub fn apply(text: &[u8], operator: Operator, operands: &[Variant]) -> Result<Variant, Hresult> {
+    let first = &operands[0];
+    let optional = |index: usize| operands.get(index);
+    match operator.0 {
+        6 => arithmetic(&Variant::I32(-1), Arithmetic::Multiply, first),
+        8 => to_bool(first).map(|truth| Variant::Bool(!truth)),
+        9 => complement(first),
+        0xa..=0x10 | 0x17..=0x19 => {
+            let op = match operator.0 {
+                0xa => Arithmetic::Multiply,
+                0xb => Arithmetic::Divide,
+                0xc => Arithmetic::Remainder,
+                0xd => Arithmetic::Add,
+                0xe => Arithmetic::Subtract,
+                0xf => Arithmetic::ShiftLeft,
+                0x10 => Arithmetic::ShiftRight,
+                0x17 => Arithmetic::And,
+                0x18 => Arithmetic::Xor,
+                _ => Arithmetic::Or,
+            };
+            arithmetic(first, op, &operands[1])
+        }
+        0x11..=0x16 => {
+            let op = match operator.0 {
+                0x11 => Comparison::Less,
+                0x12 => Comparison::Greater,
+                0x13 => Comparison::LessEqual,
+                0x14 => Comparison::GreaterEqual,
+                0x15 => Comparison::Equal,
+                _ => Comparison::NotEqual,
+            };
+            compare(first, op, &operands[1], text)
+        }
+        0x1a | 0x1b => logical(first, operator.0 == 0x1a, &operands[1]),
+        0x1e => {
+            let Variant::Str(string) = *first else {
+                return Err(WRONG_TYPE);
+            };
+            match i32::try_from(string.len()) {
+                Ok(length) => Ok(Variant::I32(length)),
+                Err(_) => Err(BAD_LENGTH),
+            }
+        }
+        0x1f => string_compare(text, first, &operands[1], optional(2)),
+        // String.IndexOf(s, t[, start][, length][, ignorecase]): a boolean
+        // in the last position is the case flag.
+        0x20 => {
+            let is_bool = |index: usize| matches!(operands[index], Variant::Bool(_));
+            let (start, length, ignore_case) = match operands.len() {
+                2 => (None, None, None),
+                3 if is_bool(2) => (None, None, optional(2)),
+                3 => (optional(2), None, None),
+                4 if is_bool(3) => (optional(2), None, optional(3)),
+                4 => (optional(2), optional(3), None),
+                _ => (optional(2), optional(3), optional(4)),
+            };
+            index_of(text, first, &operands[1], start, length, ignore_case, false)
+        }
+        0x21 => index_of(text, first, &operands[1], None, None, optional(2), true),
+        0x22 => starts_with(text, first, &operands[1], optional(2)),
+        0x23 => ends_with(text, first, &operands[1], optional(2)),
+        0x24 => substring(first, &operands[1], optional(2)).map(Variant::Str),
+        _ => Err(WRONG_TYPE),
+    }
 }
 
 /// 0x91f898e0 with string flags 0 and no prefix match: -1, 0 or 1.
@@ -497,6 +567,8 @@ mod tests {
             (Bool(true), Add, I8(1), Ok(I32(2))),
             (I64(-1), Divide, I32(2), Ok(I64(0))),
             (I32(7), Divide, I32(0), Err(DIVIDE_BY_ZERO)),
+            (I64(i64::MIN), Divide, I32(-1), Err(OVERFLOW)),
+            (I64(i64::MIN), Remainder, I64(-1), Err(OVERFLOW)),
             (U8(7), Remainder, U8(0), Err(DIVIDE_BY_ZERO)),
             (I32(-7), Remainder, I32(3), Ok(I32(-1))),
             (I32(1), ShiftLeft, I32(-1), Err(NEGATIVE_SHIFT)),
@@ -673,7 +745,7 @@ mod tests {
             (I32(1), I32(0), None, Err(WRONG_TYPE)),
         ];
         for (source, start, length, expected) in cases {
-            assert_eq!(substring(TEXT, &source, &start, length.as_ref()), expected);
+            assert_eq!(substring(&source, &start, length.as_ref()), expected);
         }
     }
 

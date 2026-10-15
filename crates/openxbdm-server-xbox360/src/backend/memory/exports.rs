@@ -540,25 +540,21 @@ extern "C" fn query_memory_usage(statistics: u32) -> u32 {
     if (status as i32) < 0 {
         return status | 0x1000_0000;
     }
-    let total = [3, 6, 7, 8, 9, 10, 11, 12, 13]
+    let total = s[6..14]
         .iter()
-        .fold(0u32, |sum, &index| sum.wrapping_add(s[index]));
-    let words = [
-        (1, total),
-        (2, s[3]),
-        (3, s[8]),
-        (4, s[12]),
-        (5, 0),
-        (6, s[7]),
-        (7, s[10].wrapping_add(s[11])),
-        (8, s[9]),
-        (9, s[13]),
-        (10, s[6]),
-        (11, 0),
-    ];
-    for (index, value) in words {
-        write_u32(statistics + index * 4, value);
-    }
+        .fold(s[3], |sum, &value| sum.wrapping_add(value));
+    let word = |index: u32, value: u32| write_u32(statistics + index * 4, value);
+    word(1, total);
+    word(2, s[3]);
+    word(3, s[8]);
+    word(4, s[12]);
+    word(5, 0);
+    word(6, s[7]);
+    word(7, s[10].wrapping_add(s[11]));
+    word(8, s[9]);
+    word(9, s[13]);
+    word(10, s[6]);
+    word(11, 0);
     Hresult::OK.0
 }
 export!(165, query_memory_usage);

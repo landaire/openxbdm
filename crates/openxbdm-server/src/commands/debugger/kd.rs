@@ -281,11 +281,7 @@ fn kdnet_set(invocation: &mut Invocation<'_>, record: &mut KdnetRecord) -> Optio
     }
     if line.has("Port") {
         supplied = true;
-        match line
-            .param("Port")
-            .and_then(|value| value.dword())
-            .filter(|&port| port <= 0xffff)
-        {
+        match line.dword("Port").filter(|&port| port <= 0xffff) {
             Some(port) => record.0[KdnetRecord::HOST_PORT..KdnetRecord::HOST_PORT + 2]
                 .copy_from_slice(&(port as u16).to_be_bytes()),
             None => error = Some(BAD_PARAMETER.0),
@@ -463,7 +459,7 @@ pub fn release_extension(
 pub(super) fn debugger_extension(invocation: &mut Invocation<'_>) -> Hresult {
     let line = invocation.line;
     if line.has("unload") {
-        let Some(module) = line.param("module").and_then(|value| value.dword()) else {
+        let Some(module) = line.dword("module") else {
             invocation.set_text(format_args!("missing module"));
             return BAD_PARAMETER;
         };

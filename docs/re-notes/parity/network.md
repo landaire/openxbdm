@@ -53,7 +53,7 @@ title proxies and stops a non-persistent capture.
   faults, and openxbdm returns 0x8007048a. After a constant index stock
   then drops a non-string operand as a string reference and faults;
   openxbdm drops nothing. Signed division of `i64::MIN` by -1 traps in
-  stock and wraps in openxbdm. Case-insensitive string functions on bytes
+  stock and fails with 0x80070216 in openxbdm. Case-insensitive string functions on bytes
   0x80..0xfe raise a CRT assertion in stock; openxbdm compares the byte
   unchanged.
 

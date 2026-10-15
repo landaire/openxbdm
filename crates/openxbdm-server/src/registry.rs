@@ -33,28 +33,51 @@ impl DispatchFlags {
 /// connection.
 pub type Handler = fn(&mut Invocation<'_>) -> Hresult;
 
-/// One row of the built-in command table.
+/// One row of the built-in command table. Access masks and flags are
+/// kept in bytes so a row takes 16 bytes.
 #[derive(Debug, Clone, Copy)]
 pub struct CommandEntry {
     pub name: &'static str,
+    pub handler: Handler,
     /// Passes when the connection holds any of these bits; zero passes.
-    pub any_of: Access,
+    any_of: u8,
     /// When nonzero, the connection must hold all of these bits and
     /// `any_of` is not consulted.
-    pub all_of: Access,
-    pub flags: DispatchFlags,
-    pub handler: Handler,
+    all_of: u8,
+    flags: u8,
 }
 
 impl CommandEntry {
+    pub const fn new(
+        name: &'static str,
+        any_of: Access,
+        all_of: Access,
+        flags: DispatchFlags,
+        handler: Handler,
+    ) -> Self {
+        assert!(any_of.bits() <= 0xff && all_of.bits() <= 0xff && flags.0 <= 0xff);
+        Self {
+            name,
+            handler,
+            any_of: any_of.bits() as u8,
+            all_of: all_of.bits() as u8,
+            flags: flags.0 as u8,
+        }
+    }
+
+    pub const fn flags(&self) -> DispatchFlags {
+        DispatchFlags(self.flags as u32)
+    }
+
     /// The access rule of the monitor's table lookup.
     pub fn permits(&self, access: Access) -> bool {
-        if self.all_of.bits() != 0 {
-            access.contains(self.all_of)
-        } else if self.any_of.bits() == 0 {
+        let all_of = Access::from_bits(u32::from(self.all_of));
+        if self.all_of != 0 {
+            access.contains(all_of)
+        } else if self.any_of == 0 {
             true
         } else {
-            access.intersects(self.any_of)
+            access.intersects(Access::from_bits(u32::from(self.any_of)))
         }
     }
 }

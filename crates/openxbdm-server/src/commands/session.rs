@@ -114,90 +114,90 @@ const DISCOVERY_IDENTIFY: u8 = 3;
 const DISCOVERY_BROADCAST: u8 = 0x80;
 
 pub(crate) const COMMANDS: &[CommandEntry] = &[
-    CommandEntry {
-        name: "bye",
-        any_of: Access::NONE,
-        all_of: Access::NONE,
-        flags: DispatchFlags::ANY_CONTEXT,
-        handler: bye,
-    },
-    CommandEntry {
-        name: "dbgprint",
-        any_of: Access::READ,
-        all_of: Access::NONE,
-        flags: DispatchFlags::DEVKIT_ONLY,
-        handler: debug_print,
-    },
-    CommandEntry {
-        name: "dedicate",
-        any_of: Access::NONE,
-        all_of: Access::NONE,
-        flags: DispatchFlags::ANY_CONTEXT,
-        handler: dedicate,
-    },
-    CommandEntry {
-        name: "dmtelllog",
-        any_of: Access::CONTROL,
-        all_of: Access::NONE,
-        flags: DispatchFlags::NONE,
-        handler: telllog::tell_log,
-    },
-    CommandEntry {
-        name: "fastpipe",
-        any_of: Access::NONE,
-        all_of: Access::NONE,
-        flags: DispatchFlags::NONE,
-        handler: fastpipe::fast_pipe,
-    },
-    CommandEntry {
-        name: "fileevent",
-        any_of: Access::CONTROL,
-        all_of: Access::NONE,
-        flags: DispatchFlags::NONE,
-        handler: file_event,
-    },
-    CommandEntry {
-        name: "notify",
-        any_of: Access::CONTROL,
-        all_of: Access::NONE,
-        flags: DispatchFlags::NONE,
-        handler: notify,
-    },
-    CommandEntry {
-        name: "notifyat",
-        any_of: Access::CONTROL,
-        all_of: Access::NONE,
-        flags: DispatchFlags::NONE,
-        handler: notify_at,
-    },
-    CommandEntry {
-        name: "notifyport",
-        any_of: Access::CONTROL,
-        all_of: Access::NONE,
-        flags: DispatchFlags::NONE,
-        handler: notify,
-    },
-    CommandEntry {
-        name: "spew",
-        any_of: Access::READ,
-        all_of: Access::NONE,
-        flags: DispatchFlags::DEVKIT_ONLY,
-        handler: spew,
-    },
-    CommandEntry {
-        name: "srvproc",
-        any_of: Access::CONTROL,
-        all_of: Access::NONE,
-        flags: DispatchFlags::NONE,
-        handler: server_processor,
-    },
-    CommandEntry {
-        name: "rpc",
-        any_of: Access::CONTROL,
-        all_of: Access::NONE,
-        flags: DispatchFlags::NONE,
-        handler: rpc::rpc,
-    },
+    CommandEntry::new(
+        "bye",
+        Access::NONE,
+        Access::NONE,
+        DispatchFlags::ANY_CONTEXT,
+        bye,
+    ),
+    CommandEntry::new(
+        "dbgprint",
+        Access::READ,
+        Access::NONE,
+        DispatchFlags::DEVKIT_ONLY,
+        debug_print,
+    ),
+    CommandEntry::new(
+        "dedicate",
+        Access::NONE,
+        Access::NONE,
+        DispatchFlags::ANY_CONTEXT,
+        dedicate,
+    ),
+    CommandEntry::new(
+        "dmtelllog",
+        Access::CONTROL,
+        Access::NONE,
+        DispatchFlags::NONE,
+        telllog::tell_log,
+    ),
+    CommandEntry::new(
+        "fastpipe",
+        Access::NONE,
+        Access::NONE,
+        DispatchFlags::NONE,
+        fastpipe::fast_pipe,
+    ),
+    CommandEntry::new(
+        "fileevent",
+        Access::CONTROL,
+        Access::NONE,
+        DispatchFlags::NONE,
+        file_event,
+    ),
+    CommandEntry::new(
+        "notify",
+        Access::CONTROL,
+        Access::NONE,
+        DispatchFlags::NONE,
+        notify,
+    ),
+    CommandEntry::new(
+        "notifyat",
+        Access::CONTROL,
+        Access::NONE,
+        DispatchFlags::NONE,
+        notify_at,
+    ),
+    CommandEntry::new(
+        "notifyport",
+        Access::CONTROL,
+        Access::NONE,
+        DispatchFlags::NONE,
+        notify,
+    ),
+    CommandEntry::new(
+        "spew",
+        Access::READ,
+        Access::NONE,
+        DispatchFlags::DEVKIT_ONLY,
+        spew,
+    ),
+    CommandEntry::new(
+        "srvproc",
+        Access::CONTROL,
+        Access::NONE,
+        DispatchFlags::NONE,
+        server_processor,
+    ),
+    CommandEntry::new(
+        "rpc",
+        Access::CONTROL,
+        Access::NONE,
+        DispatchFlags::NONE,
+        rpc::rpc,
+    ),
 ];
 
 /// A processor number.
@@ -305,11 +305,7 @@ fn notify(invocation: &mut Invocation<'_>) -> Hresult {
     else {
         return Hresult::FAIL;
     };
-    let (endpoint, persist) = match invocation
-        .line
-        .param("reconnectport")
-        .and_then(|value| value.dword())
-    {
+    let (endpoint, persist) = match invocation.line.dword("reconnectport") {
         None => (
             Endpoint {
                 address: Ipv4Address::UNSPECIFIED,
@@ -423,11 +419,7 @@ fn register_from_line(
     socket: Option<SocketId>,
     reverse: bool,
 ) -> bool {
-    let Some(port) = invocation
-        .line
-        .param("port")
-        .and_then(|value| value.dword())
-    else {
+    let Some(port) = invocation.line.dword("port") else {
         return false;
     };
     let address = match invocation.line.param("addr") {
@@ -802,8 +794,7 @@ fn server_processor(invocation: &mut Invocation<'_>) -> Hresult {
     // An absent or malformed value selects the default.
     let number = invocation
         .line
-        .param("num")
-        .and_then(|value| value.dword())
+        .dword("num")
         .unwrap_or(DEFAULT_SERVER_PROCESSOR);
     if number >= PROCESSOR_COUNT {
         return Hresult::from_error_code(ErrorCode::UNKNOWN_COMMAND);

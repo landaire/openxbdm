@@ -949,6 +949,27 @@ fn automation_hresult(result: Result<(), AutomationError>) -> u32 {
     result.map_or_else(|error| error.hresult().0, |()| Hresult::OK.0)
 }
 
+// Shared by the exports and the command backend.
+#[inline(never)]
+fn connect(user: u32) -> Result<(), AutomationError> {
+    AUTOMATION.with(|automation| automation.connect(user))
+}
+
+#[inline(never)]
+fn disconnect(user: u32) -> Result<(), AutomationError> {
+    AUTOMATION.with(|automation| automation.disconnect(user))
+}
+
+#[inline(never)]
+fn clear_queue(user: u32) -> Result<(), AutomationError> {
+    AUTOMATION.with(|automation| automation.clear_queue(user))
+}
+
+#[inline(never)]
+fn query_queue(user: u32) -> Result<QueueStatus, AutomationError> {
+    AUTOMATION.with(|automation| automation.query(user, &mut Input))
+}
+
 /// Export 166 (stock 0x91f24468): input focus of `user` into `focus`;
 /// 0 and `407` when the XAM query is absent.
 extern "C" fn export_query_input_focus(user: u32, focus: *mut u32) -> u32 {
@@ -973,12 +994,12 @@ extern "C" fn export_automation_unbind(user: u32) -> u32 {
 
 /// Export 169 (stock 0x91f244c8): `autoinput connect`.
 extern "C" fn export_automation_connect(user: u32) -> u32 {
-    automation_hresult(AUTOMATION.with(|automation| automation.connect(user)))
+    automation_hresult(connect(user))
 }
 
 /// Export 170 (stock 0x91f24580): `autoinput disconnect`.
 extern "C" fn export_automation_disconnect(user: u32) -> u32 {
-    automation_hresult(AUTOMATION.with(|automation| automation.disconnect(user)))
+    automation_hresult(disconnect(user))
 }
 
 /// Export 171 (stock 0x91f24e20): `autoinput setpacket` with a gamepad
@@ -1048,7 +1069,7 @@ extern "C" fn export_automation_queue(
 
 /// Export 173 (stock 0x91f24630): `autoinput clearqueue`.
 extern "C" fn export_automation_clear_queue(user: u32) -> u32 {
-    automation_hresult(AUTOMATION.with(|automation| automation.clear_queue(user)))
+    automation_hresult(clear_queue(user))
 }
 
 /// Export 174 (stock 0x91f246c8): `autoinput queryqueue`; every present
@@ -1073,7 +1094,7 @@ extern "C" fn export_automation_query_queue(
         }
     };
     store([0; 4]);
-    match AUTOMATION.with(|automation| automation.query(user, &mut Input)) {
+    match query_queue(user) {
         Ok(status) => {
             store([
                 status.queue_length,
@@ -1145,11 +1166,11 @@ export!(174, export_automation_query_queue);
 
 impl commands::hardware::Backend for Console {
     fn automation_connect(&mut self, user: u32) -> Result<(), AutomationError> {
-        AUTOMATION.with(|automation| automation.connect(user))
+        connect(user)
     }
 
     fn automation_disconnect(&mut self, user: u32) -> Result<(), AutomationError> {
-        AUTOMATION.with(|automation| automation.disconnect(user))
+        disconnect(user)
     }
 
     fn automation_bind(&mut self, user: u32, queue_length: u32) -> Result<(), AutomationError> {
@@ -1161,11 +1182,11 @@ impl commands::hardware::Backend for Console {
     }
 
     fn automation_clear_queue(&mut self, user: u32) -> Result<(), AutomationError> {
-        AUTOMATION.with(|automation| automation.clear_queue(user))
+        clear_queue(user)
     }
 
     fn automation_query_queue(&mut self, user: u32) -> Result<QueueStatus, AutomationError> {
-        AUTOMATION.with(|automation| automation.query(user, &mut Input))
+        query_queue(user)
     }
 
     fn automation_set_packet(&mut self, user: u32, packet: Gamepad) -> Result<(), AutomationError> {

@@ -597,7 +597,7 @@ crate::exports::bridged!(debug_routine_entry, debug_routine);
 /// server does not take events.
 extern "C" fn debug_routine(trap_frame: u32, record: u32, context: u32, second_chance: u32) -> u32 {
     let previous = PREVIOUS_DEBUG_ROUTINE.load(Ordering::Acquire);
-    let chain = || {
+    let chain = move || {
         if previous == 0 {
             0
         } else {
@@ -988,19 +988,13 @@ static POLICY_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 static DIRECT_STEP: AtomicU32 = AtomicU32::new(0);
 
 fn encode_policy(policy: &DirectPolicy) -> [u32; POLICY_WORDS] {
-    let mut flags = 0;
-    for (set, bit) in [
-        (policy.kd_lite, POLICY_KD_LITE),
-        (policy.kernel_debugger, POLICY_KERNEL_DEBUGGER),
-        (policy.trap_passthrough, POLICY_TRAP_PASSTHROUGH),
-        (policy.dump_in_progress, POLICY_DUMP_IN_PROGRESS),
-        (policy.attached, POLICY_ATTACHED),
-        (policy.data_breakpoint.is_some(), POLICY_DATA_BREAKPOINT),
-    ] {
-        if set {
-            flags |= bit;
-        }
-    }
+    let bit = |set: bool, bit: u32| if set { bit } else { 0 };
+    let flags = bit(policy.kd_lite, POLICY_KD_LITE)
+        | bit(policy.kernel_debugger, POLICY_KERNEL_DEBUGGER)
+        | bit(policy.trap_passthrough, POLICY_TRAP_PASSTHROUGH)
+        | bit(policy.dump_in_progress, POLICY_DUMP_IN_PROGRESS)
+        | bit(policy.attached, POLICY_ATTACHED)
+        | bit(policy.data_breakpoint.is_some(), POLICY_DATA_BREAKPOINT);
     let dump_mode = match policy.dump_mode {
         DumpMode::Smart => 0,
         DumpMode::Enabled => 1,

@@ -40,7 +40,7 @@ pub(crate) mod util {
     /// A required dword parameter. When absent, the reply text becomes
     /// `missing <name>` and the caller fails with [`Hresult::FAIL`].
     pub fn required_dword(invocation: &mut Invocation<'_>, name: &str) -> Option<u32> {
-        let value = invocation.line.param(name).and_then(|value| value.dword());
+        let value = invocation.line.dword(name);
         if value.is_none() {
             invocation.set_text(format_args!("missing {name}"));
         }

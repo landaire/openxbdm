@@ -104,13 +104,7 @@ const fn entry(
     flags: DispatchFlags,
     handler: fn(&mut Invocation<'_>) -> Hresult,
 ) -> CommandEntry {
-    CommandEntry {
-        name,
-        any_of,
-        all_of: Access::NONE,
-        flags,
-        handler,
-    }
+    CommandEntry::new(name, any_of, Access::NONE, flags, handler)
 }
 
 pub(crate) const COMMANDS: &[CommandEntry] = &[
@@ -351,8 +345,13 @@ pub(crate) fn trace_text(
 }
 
 /// Bytes before the first NUL, as a `%s` argument prints them.
+#[inline(never)]
 pub(crate) fn c_string(bytes: &[u8]) -> &[u8] {
-    bytes.split(|&byte| byte == 0).next().unwrap_or_default()
+    let end = bytes
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(bytes.len());
+    &bytes[..end]
 }
 
 /// Crash dump mode set by `dumpmode` and export 118 (stock 0x91f9f660).
@@ -496,13 +495,7 @@ impl DumpSettings {
             flags: u32::from_be_bytes([block[0], block[1], block[2], block[3]]),
             ..Self::new()
         };
-        let path = &block[4..];
-        settings.set_path(
-            &path[..path
-                .iter()
-                .position(|&byte| byte == 0)
-                .unwrap_or(path.len())],
-        );
+        settings.set_path(c_string(&block[4..]));
         settings
     }
 
@@ -1171,11 +1164,7 @@ pub(crate) fn title_terminated(state: &mut ServerState, backend: &mut dyn AnyBac
 
 /// Settings-file `sysset videostd=<dword>` (stock DoIniLine 0x91f311b8).
 pub(crate) fn ini_sysset(invocation: &mut Invocation<'_>) {
-    if let Some(value) = invocation
-        .line
-        .param("videostd")
-        .and_then(|value| value.dword())
-    {
+    if let Some(value) = invocation.line.dword("videostd") {
         let mut settings = invocation.backend.system_settings();
         settings.set_video_standard(value);
         invocation.backend.set_system_settings(settings);
@@ -1358,10 +1347,7 @@ fn configure_network_ra(invocation: &mut Invocation<'_>) -> Hresult {
         }
     }
     if invocation.line.has("customubootaddr")
-        && let Some(address) = invocation
-            .line
-            .param("customubootaddr")
-            .and_then(|value| value.dword())
+        && let Some(address) = invocation.line.dword("customubootaddr")
     {
         record.custom_boot_address = address;
         record.flags &= !NetworkRaRecord::CUSTOM_BOOT_ADDRESS;
@@ -1676,19 +1662,11 @@ fn feature(invocation: &mut Invocation<'_>) -> Hresult {
     if !invocation.backend.feature_switch_present() {
         return Hresult::OK;
     }
-    let Some(enable) = invocation
-        .line
-        .param("enable")
-        .and_then(|value| value.dword())
-    else {
+    let Some(enable) = invocation.line.dword("enable") else {
         invocation.text.set_bytes(b"'enable' not specified");
         return BAD_PARAMETER;
     };
-    let Some(feature) = invocation
-        .line
-        .param("feature")
-        .and_then(|value| value.dword())
-    else {
+    let Some(feature) = invocation.line.dword("feature") else {
         invocation.text.set_bytes(b"'feature' not specified");
         return BAD_PARAMETER;
     };
@@ -1700,23 +1678,13 @@ fn feature(invocation: &mut Invocation<'_>) -> Hresult {
 fn console_id(invocation: &mut Invocation<'_>) -> Hresult {
     match invocation.backend.console_id() {
         Ok(ConsoleId(id)) => {
-            let length = id.iter().position(|&byte| byte == 0).unwrap_or(id.len());
+            let length = c_string(&id).len();
             invocation.text.clear();
             let _ = invocation.text.push_bytes(b"consoleid=");
             let _ = invocation.text.push_bytes(&id[..length]);
             Hresult::OK
         }
         Err(status) => Hresult(status.0 | 0x1000_0000),
-    }
-}
-
-fn push_hex(invocation: &mut Invocation<'_>, bytes: &[u8]) {
-    const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
-    for &byte in bytes {
-        let _ = invocation.text.push_bytes(&[
-            DIGITS[usize::from(byte >> 4)],
-            DIGITS[usize::from(byte & 0xf)],
-        ]);
     }
 }
 
@@ -1736,9 +1704,9 @@ fn network_addresses(invocation: &mut Invocation<'_>) -> Hresult {
     let _ = invocation.text.push_bytes(b"name=");
     let _ = invocation.text.push_bytes(name.as_bytes());
     let _ = invocation.text.push_bytes(b" debug=");
-    push_hex(invocation, &debug.record);
+    let _ = invocation.text.push_hex_upper(&debug.record);
     let _ = invocation.text.push_bytes(b" title=");
-    push_hex(invocation, &title.record);
+    let _ = invocation.text.push_hex_upper(&title.record);
     Hresult::OK
 }
 
@@ -1778,11 +1746,7 @@ fn http_registration(invocation: &mut Invocation<'_>) -> Hresult {
             registration.state = RegistrationState::Failed;
             FILENAME_INVALID
         } else {
-            registration.port = invocation
-                .line
-                .param("port")
-                .and_then(|value| value.dword())
-                .map_or(0, |port| port as u16);
+            registration.port = invocation.line.dword("port").map_or(0, |port| port as u16);
             registration.state = RegistrationState::Pending;
             Hresult::OK
         }
@@ -2063,7 +2027,7 @@ fn kiosk(invocation: &mut Invocation<'_>) -> Hresult {
     let (enable, id) = if equals_any(value, &["off", "false"]) {
         (false, 0)
     } else if equals_any(value, &["on", "true"]) {
-        match invocation.line.param("id").and_then(|value| value.dword()) {
+        match invocation.line.dword("id") {
             Some(id) => (true, id),
             None => return BAD_PARAMETER,
         }

@@ -157,11 +157,7 @@ pub(super) fn fast_pipe(invocation: &mut Invocation<'_>) -> Hresult {
         return Hresult::FAIL;
     }
     // An absent or malformed value requests a new group.
-    let group = invocation
-        .line
-        .param("group")
-        .and_then(|value| value.dword())
-        .unwrap_or(0);
+    let group = invocation.line.dword("group").unwrap_or(0);
     if !open_pipe(
         invocation.state,
         invocation.backend,

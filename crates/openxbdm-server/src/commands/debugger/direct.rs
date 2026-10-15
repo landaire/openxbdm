@@ -122,6 +122,8 @@ pub struct DirectStep {
 
 /// What the platform does after [`dispatch_direct`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+// Declaration order keeps the record word-aligned for its copies.
+#[repr(C)]
 pub struct DirectOutcome {
     pub notice: Option<DirectNotice>,
     /// The exception record after the monitor's trap rewrite; notifications

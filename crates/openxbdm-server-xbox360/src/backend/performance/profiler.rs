@@ -76,6 +76,16 @@ const SNAPSHOT_SIZE: u32 = module_snapshot::SIZE;
 const HEADER_SIZE: usize = 0x200;
 const HEADER_VERSION: u32 = 0x201;
 const TITLE: &[u8] = b"Microsoft CPU Profiler for Xbox";
+/// `TITLE` as big-endian header words, NUL padded.
+const TITLE_WORDS: [u32; TITLE.len().div_ceil(4)] = {
+    let mut words = [0u32; TITLE.len().div_ceil(4)];
+    let mut index = 0;
+    while index < TITLE.len() {
+        words[index / 4] |= (TITLE[index] as u32) << (24 - 8 * (index % 4));
+        index += 1;
+    }
+    words
+};
 /// Function tables the file records at most.
 const MODULE_CAPACITY: usize = 0x80;
 const WRITER_STACK: u32 = 0x8000;
@@ -272,6 +282,10 @@ impl ListHead {
 unsafe extern "C" fn push_entry(head: *mut u64, entry: u32) {
     core::arch::naked_asm!(
         "2:",
+        "mfmsr 9",
+        // mtmsrd 13, 1: r13 holds the processor control region address,
+        // whose external interrupt enable bit is clear.
+        ".long 0x7da10164",
         // ldarx 6, 0, 3
         ".long 0x7cc018a8",
         // rldicl 7, 6, 32, 32: the current first entry.
@@ -285,6 +299,8 @@ unsafe extern "C" fn push_entry(head: *mut u64, entry: u32) {
         ".long 0x7886000e",
         // stdcx. 6, 0, 3
         ".long 0x7cc019ad",
+        // mtmsrd 9, 1
+        ".long 0x7d210164",
         "bne- 2b",
         "blr",
     )
@@ -404,34 +420,11 @@ fn zero(address: u32, length: u32) {
     unsafe { core::ptr::write_bytes(address as usize as *mut u8, 0, length as usize) };
 }
 
-/// A sample record: the header words, then the return addresses.
-#[repr(C)]
-struct Record {
-    head: [u32; RECORD_HEADER_WORDS],
-    frames: [u32; MAX_FRAMES],
-}
-
-/// Per-processor sample in progress (stock 0x91fa3b10): a busy word and
-/// the record being built.
-struct Samples {
-    busy: [AtomicU32; PROCESSORS],
-    records: UnsafeCell<[Record; PROCESSORS]>,
-}
-
-// SAFETY: a processor uses its record only while it holds its busy word.
-unsafe impl Sync for Samples {}
-
-static SAMPLES: Samples = Samples {
-    busy: [const { AtomicU32::new(0) }; PROCESSORS],
-    records: UnsafeCell::new(
-        [const {
-            Record {
-                head: [0; RECORD_HEADER_WORDS],
-                frames: [0; MAX_FRAMES],
-            }
-        }; PROCESSORS],
-    ),
-};
+/// Per-processor busy words of the sample in progress (stock 0x91fa3b10).
+/// Stock builds each record in a static block next to its busy word; here
+/// the stack is walked once for the size and again into the reserved
+/// block space.
+static BUSY: [AtomicU32; PROCESSORS] = [const { AtomicU32::new(0) }; PROCESSORS];
 
 /// The interrupted state the kernel passes to the profile routine.
 #[derive(Clone, Copy)]
@@ -483,9 +476,16 @@ fn in_leaf_epilogue(frame: TrapFrame) -> Option<bool> {
 }
 
 /// Return addresses of the interrupted thread's stack, the interrupted
-/// address first, into `frames`; `None` at `MAX_FRAMES` (stock 0x91f900b8).
-fn walk_stack(frame: TrapFrame, frames: &mut [u32; MAX_FRAMES]) -> Option<usize> {
-    frames[0] = frame.address();
+/// address first, stored from `frames` when given; `None` at `MAX_FRAMES`
+/// (stock 0x91f900b8).
+fn walk_stack(frame: TrapFrame, frames: Option<u32>) -> Option<usize> {
+    let store = |index: usize, value: u32| {
+        if let Some(frames) = frames {
+            // SAFETY: `allocate` reserved room for every frame of the walk.
+            unsafe { *((frames as usize + 4 * index) as *mut u32) = value };
+        }
+    };
+    store(0, frame.address());
     let mut count = 1;
     let mut stack = frame.register(1);
     loop {
@@ -494,7 +494,7 @@ fn walk_stack(frame: TrapFrame, frames: &mut [u32; MAX_FRAMES]) -> Option<usize>
         if stack >= read_u32(thread + 0x5c) || stack <= read_u32(thread + 0x60) {
             return Some(count);
         }
-        frames[count] = read_u32(stack - 8);
+        store(count, read_u32(stack - 8));
         count += 1;
         if count == MAX_FRAMES {
             return None;
@@ -508,21 +508,19 @@ fn walk_stack(frame: TrapFrame, frames: &mut [u32; MAX_FRAMES]) -> Option<usize>
 fn sample(frame: TrapFrame, processor: usize) {
     let stack = frame.register(1);
     let readable = valid(frame.address()) && valid(stack) && valid(stack.wrapping_sub(8));
-    // SAFETY: this processor holds its busy word.
-    let record = unsafe { &mut (*SAMPLES.records.get())[processor] };
     let walked = if readable {
         in_leaf_epilogue(frame)
     } else {
         None
     }
-    .and_then(|leaf| walk_stack(frame, &mut record.frames).map(|depth| (leaf, depth)));
+    .and_then(|leaf| walk_stack(frame, None).map(|depth| (leaf, depth)));
     let Some((leaf, depth)) = walked else {
         count(header::FAULTED, processor);
         return;
     };
     count(header::SAMPLES, processor);
     let size = ((depth + RECORD_HEADER_WORDS) * 4) as u32;
-    record.head = [
+    let mut head = [
         RECORD_MAGIC,
         0,
         0,
@@ -538,21 +536,22 @@ fn sample(frame: TrapFrame, processor: usize) {
     processor_word(header::LARGEST, processor).fetch_max(size, Ordering::Relaxed);
     processor_word(header::SMALLEST, processor).fetch_min(size, Ordering::Relaxed);
     let time = kernel::timebase();
-    record.head[1] = (time >> 32) as u32;
-    record.head[2] = time as u32;
+    head[1] = (time >> 32) as u32;
+    head[2] = time as u32;
     let blocks = &THREADS[processor];
     match blocks.allocate(size) {
         Some((index, address)) => {
             count(header::STORED, processor);
-            // SAFETY: `allocate` reserved `size` bytes at `address`; the
-            // record's words are contiguous.
+            // SAFETY: `allocate` reserved `size` bytes at `address`, the
+            // header words and then `depth` frames.
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    (record as *const Record).cast::<u8>(),
-                    address as usize as *mut u8,
-                    size as usize,
+                    head.as_ptr(),
+                    address as usize as *mut u32,
+                    RECORD_HEADER_WORDS,
                 )
             };
+            walk_stack(frame, Some(address + (RECORD_HEADER_WORDS * 4) as u32));
             blocks.free.push(blocks.entry(index));
         }
         None => count(header::DROPPED, processor),
@@ -581,7 +580,7 @@ extern "C" fn profile_interrupt(frame: u32, irql: u32) {
         return;
     }
     count(header::SAMPLED, processor);
-    let busy = &SAMPLES.busy[processor];
+    let busy = &BUSY[processor];
     if busy
         .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
         .is_ok()
@@ -1109,13 +1108,10 @@ impl profiler::Engine for Sampler {
         kernel::MmQueryStatistics(statistics.as_mut_ptr());
         header_word(header::VERSION).store(HEADER_VERSION, Ordering::Relaxed);
         header_word(header::PROCESSORS).store(flags.processors(), Ordering::Relaxed);
-        for (index, chunk) in TITLE.chunks(4).enumerate() {
-            let mut word = [0u8; 4];
-            word[..chunk.len()].copy_from_slice(chunk);
-            header_word(header::TITLE + index * 4)
-                .store(u32::from_be_bytes(word), Ordering::Relaxed);
+        for (index, &word) in TITLE_WORDS.iter().enumerate() {
+            header_word(header::TITLE + index * 4).store(word, Ordering::Relaxed);
         }
-        for busy in &SAMPLES.busy {
+        for busy in &BUSY {
             busy.store(0, Ordering::Relaxed);
         }
         if !pmc::acquire(Owner::PROFILER) {

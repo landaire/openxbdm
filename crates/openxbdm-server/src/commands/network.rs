@@ -37,20 +37,13 @@ const WSAEINVAL: WsaError = WsaError(10022);
 /// Visible characters of one table line: the line buffer is 0x100 bytes and
 /// its last byte is always the terminator.
 const TABLE_LINE_LIMIT: usize = 0xff;
-const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
 
 const fn entry(
     name: &'static str,
     any_of: Access,
     handler: crate::registry::Handler,
 ) -> CommandEntry {
-    CommandEntry {
-        name,
-        any_of,
-        all_of: Access::NONE,
-        flags: DispatchFlags::NONE,
-        handler,
-    }
+    CommandEntry::new(name, any_of, Access::NONE, DispatchFlags::NONE, handler)
 }
 
 pub(crate) const COMMANDS: &[CommandEntry] = &[
@@ -400,7 +393,7 @@ fn write_record(line: &mut Text<TABLE_LINE_LIMIT>, record: &Record) -> core::fmt
         ),
         Record::Key(key) => {
             line.push_bytes(b"xnkid=\"")?;
-            write_hex(line, &key.xnkid.0)?;
+            line.push_hex_upper(&key.xnkid.0)?;
             write!(
                 line,
                 "\" ownertype={} flags=0x{:08x} qosdatasize={} qosbps={}",
@@ -413,9 +406,9 @@ fn write_record(line: &mut Text<TABLE_LINE_LIMIT>, record: &Record) -> core::fmt
                 "secaddr=0x{:08x} ownertype={} flags=0x{:08x} xnkid=\"",
                 association.secure_address, association.owner_type, association.flags,
             )?;
-            write_hex(line, &association.xnkid.0)?;
+            line.push_hex_upper(&association.xnkid.0)?;
             line.push_bytes(b"\" xnaddr=\"")?;
-            write_hex(line, &association.xnaddr.0)?;
+            line.push_hex_upper(&association.xnaddr.0)?;
             write!(
                 line,
                 "\" serviceid={} remoteaddr=0x{:08x} remoteport=0x{:04x} state={} nataddr=0x{:08x} natport=0x{:04x}",
@@ -445,22 +438,12 @@ fn write_record(line: &mut Text<TABLE_LINE_LIMIT>, record: &Record) -> core::fmt
                 lookup.retry,
                 lookup.secure_address,
             )?;
-            write_hex(line, &lookup.xnkid.0)?;
+            line.push_hex_upper(&lookup.xnkid.0)?;
             line.push_bytes(b"\" xnaddr=\"")?;
-            write_hex(line, &lookup.xnaddr.0)?;
+            line.push_hex_upper(&lookup.xnaddr.0)?;
             line.push_bytes(b"\"")
         }
     }
-}
-
-fn write_hex<const N: usize>(line: &mut Text<N>, bytes: &[u8]) -> core::fmt::Result {
-    for &byte in bytes {
-        line.push_bytes(&[
-            HEX_UPPER[usize::from(byte >> 4)],
-            HEX_UPPER[usize::from(byte & 0xf)],
-        ])?;
-    }
-    Ok(())
 }
 
 /// `linkstate [restore | disconnect | setflags and=<dword> or=<dword>]`:
@@ -478,8 +461,8 @@ pub(crate) fn parse_link_state(line: CommandLine<'_>) -> Result<Option<LinkFlags
     } else if line.has("disconnect") {
         Some(LinkFlags::DISCONNECT)
     } else if line.has("setflags") {
-        let and = line.param("and").and_then(|value| value.dword());
-        let or = line.param("or").and_then(|value| value.dword());
+        let and = line.dword("and");
+        let or = line.dword("or");
         let (Some(and), Some(or)) = (and, or) else {
             return Err(Hresult::from_error_code(ErrorCode::BAD_PARAMETER));
         };
@@ -530,11 +513,7 @@ pub fn link_error(error: WsaError) -> Hresult {
 /// `nicstats [deviceflags=<dword>]`: adapter counters; all adapters by
 /// default.
 fn nic_stats(invocation: &mut Invocation<'_>) -> Hresult {
-    let device_flags = invocation
-        .line
-        .param("deviceflags")
-        .and_then(|value| value.dword())
-        .unwrap_or(u32::MAX);
+    let device_flags = invocation.line.dword("deviceflags").unwrap_or(u32::MAX);
     let stats = invocation.backend.nic_stats(device_flags);
     invocation.set_text(format_args!(
         "tb=0q{:x} rub=0q{:x} ru1b=0q{:x} ru2b=0q{:x} rmb=0q{:x} rbb=0q{:x} tf={} ruf={} ru1f={} ru2f={} rmf={} \

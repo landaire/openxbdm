@@ -21,6 +21,7 @@ pub mod registry;
 pub mod server;
 pub mod state;
 pub mod text;
+pub mod transfer_blocks;
 
 pub use access::Access;
 pub use backend::Backend;

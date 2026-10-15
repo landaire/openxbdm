@@ -35,7 +35,8 @@ static KD_LITE_REFRESH: AtomicBool = AtomicBool::new(false);
 /// Code 0xa4 value: first-chance breakpoint and trace exceptions pass
 /// through without the debugger.
 static TRAP_PASSTHROUGH: AtomicU32 = AtomicU32::new(0);
-/// Mirrors of server state read by handlers.
+/// Mirrors of server state read by handlers. Each word stands alone, as
+/// stock's plain globals, so the accesses need no ordering.
 static KERNEL_DEBUGGER: AtomicBool = AtomicBool::new(true);
 static DEBUGGER_ATTACHED: AtomicU32 = AtomicU32::new(0);
 static DEBUGGER_ADDRESS: AtomicU32 = AtomicU32::new(0);
@@ -60,9 +61,9 @@ pub(crate) struct PublishedDebugger {
 
 pub(crate) fn published_debugger() -> PublishedDebugger {
     PublishedDebugger {
-        attached: DEBUGGER_ATTACHED.load(Ordering::Acquire),
-        address: DEBUGGER_ADDRESS.load(Ordering::Acquire),
-        port: DEBUGGER_PORT.load(Ordering::Acquire),
+        attached: DEBUGGER_ATTACHED.load(Ordering::Relaxed),
+        address: DEBUGGER_ADDRESS.load(Ordering::Relaxed),
+        port: DEBUGGER_PORT.load(Ordering::Relaxed),
     }
 }
 
@@ -366,20 +367,20 @@ extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: u32) ->
         0x01 => {
             // Break-in poll: when threads are stopped by the monitor the
             // kernel debugger takes over and the threads run again.
-            if THREADS_STOPPED.load(Ordering::Acquire) {
+            if THREADS_STOPPED.load(Ordering::Relaxed) {
                 BREAK_IN.store(true, Ordering::Release);
             }
             0
         }
         0x02 => {
             // The server's copy of this flag is refreshed from it.
-            TRAP_PASSTHROUGH.store(0, Ordering::Release);
+            TRAP_PASSTHROUGH.store(0, Ordering::Relaxed);
             system::service_prepare_reboot(argument)
         }
         0x03 => call_on_server(filesystem::service_set_drive_mapping, argument).unwrap_or(0),
         0x08 => memory::service_memtrack_record_alloc(argument),
         0x09 => memory::service_memtrack_record_free(argument),
-        0x0a => DEBUGGER_ATTACHED.load(Ordering::Acquire),
+        0x0a => DEBUGGER_ATTACHED.load(Ordering::Relaxed),
         0x0b => network::service_apply_xnet_config(argument),
         0x0c => network::service_set_static_ip_enable(argument),
         0x0d => network::service_get_static_ip_enable(argument),
@@ -395,7 +396,7 @@ extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: u32) ->
         0x17 => system::service_wipe_settings(argument),
         0x18 => memory::service_get_module_proc_address(argument),
         0x19 => {
-            let kd = KERNEL_DEBUGGER.load(Ordering::Acquire)
+            let kd = KERNEL_DEBUGGER.load(Ordering::Relaxed)
                 && kernel::hardware_flags() & HARDWARE_KERNEL_DEBUGGER != 0;
             u32::from(passive() || kd)
         }
@@ -461,7 +462,7 @@ extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: u32) ->
         0x98 => hardware::nuicam::service_flush_raw_data_requests(argument),
         0xa1 => hardware::nuicam::service_set_capture_mode(argument),
         0xa4 => {
-            TRAP_PASSTHROUGH.store(u32::from(argument != 0), Ordering::Release);
+            TRAP_PASSTHROUGH.store(u32::from(argument != 0), Ordering::Relaxed);
             0
         }
         0xa5 => network::xhttpproxy::service_http_proxy_acquire(argument),
@@ -482,7 +483,7 @@ pub(crate) fn install() {
 /// Apply queued requests on the server thread and refresh the mirrors the
 /// handlers read.
 pub(crate) fn drain(server: &mut Server, console: &mut Console, network: &mut XamNetwork) {
-    server.state.debugger.trap_passthrough = TRAP_PASSTHROUGH.load(Ordering::Acquire) != 0;
+    server.state.debugger.trap_passthrough = TRAP_PASSTHROUGH.load(Ordering::Relaxed) != 0;
     if KD_LITE_REFRESH.swap(false, Ordering::AcqRel) {
         debugger::refresh_kd_lite(&mut server.state, console);
     }
@@ -506,9 +507,9 @@ pub(crate) fn drain(server: &mut Server, console: &mut Console, network: &mut Xa
     let kd = state
         .kernel_debugger
         .unwrap_or(kernel::hardware_flags() & debugger::HARDWARE_KD_ENABLED != 0);
-    KERNEL_DEBUGGER.store(kd, Ordering::Release);
-    DEBUGGER_ADDRESS.store(state.debugger.address, Ordering::Release);
-    DEBUGGER_PORT.store(state.debugger.port, Ordering::Release);
-    DEBUGGER_ATTACHED.store(u32::from(state.debugger.attached), Ordering::Release);
-    THREADS_STOPPED.store(debugger::threads_stopped(&server.state), Ordering::Release);
+    KERNEL_DEBUGGER.store(kd, Ordering::Relaxed);
+    DEBUGGER_ADDRESS.store(state.debugger.address, Ordering::Relaxed);
+    DEBUGGER_PORT.store(state.debugger.port, Ordering::Relaxed);
+    DEBUGGER_ATTACHED.store(u32::from(state.debugger.attached), Ordering::Relaxed);
+    THREADS_STOPPED.store(debugger::threads_stopped(&server.state), Ordering::Relaxed);
 }

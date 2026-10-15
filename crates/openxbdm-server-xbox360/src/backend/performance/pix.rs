@@ -339,7 +339,6 @@ extern "C" fn trace_hook(_enable: u32) -> u32 {
 pub(crate) mod backend {
     use openxbdm_server::commands::performance::CaptureValue;
     use openxbdm_server::commands::performance::PixDogma;
-    use openxbdm_server::commands::performance::PixMessage;
 
     use super::*;
 
@@ -347,8 +346,8 @@ pub(crate) mod backend {
     /// its text (0x91fa280c, counter 0x91fa2808).
     static CAPTURE_VALUES: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
 
-    pub(crate) fn post(message: PixMessage) -> bool {
-        session::post(message.code, message.payload())
+    pub(crate) fn post(code: u32, payload: &[u32]) -> bool {
+        session::post(code, payload)
     }
 
     pub(crate) fn status(version: u32, flags: u32) -> Option<[u32; 12]> {

@@ -87,7 +87,7 @@ impl StoredProgram {
             .cast::<Program>();
         // SAFETY: the block holds a `Program`; pool blocks are 8-aligned.
         unsafe {
-            block.write(program.clone());
+            block.write(*program);
             Ok(Self(NonNull::new_unchecked(block)))
         }
     }
@@ -104,7 +104,7 @@ impl StoredProgram {
     /// A copy for a queue or redirect snapshot.
     #[inline(never)]
     fn snapshot(program: &Option<Self>) -> Option<Program> {
-        program.as_ref().map(|program| program.get().clone())
+        program.as_ref().map(|program| *program.get())
     }
 }
 

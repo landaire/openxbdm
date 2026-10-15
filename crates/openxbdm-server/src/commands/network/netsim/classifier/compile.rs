@@ -22,8 +22,6 @@ use super::StringTable;
 use super::Value;
 use super::grammar;
 use super::variant;
-use super::variant::Arithmetic;
-use super::variant::Comparison;
 use super::variant::Text;
 use super::variant::Variant;
 use super::write_program;
@@ -58,7 +56,6 @@ const NEGATIVE_INDEX: Hresult = Hresult(0x8007_0083);
 const INDEX_OUT_OF_RANGE: Hresult = Hresult(0x8007_0585);
 const TOO_FEW_ARGUMENTS: Hresult = Hresult(0x8002_0004);
 const TOO_MANY_ARGUMENTS: Hresult = Hresult(0x8002_000e);
-const STRING_TOO_LONG: Hresult = Hresult(0x8007_0018);
 /// The program is a constant false: it would match nothing.
 const ALWAYS_FALSE: Hresult = Hresult(0x82da_0010);
 /// A name that is not in the field table.
@@ -97,6 +94,7 @@ const FUNCTIONS: [(&[u8], Operator); 7] = [
 ];
 
 /// Frame field names (0x91f99660); a field's id is its position plus one.
+/// Only [`FIELD_NAMES`] and [`FIELD_ENDS`] are stored.
 const FIELDS: [&[u8]; super::FIELD_COUNT as usize] = [
     b"Ethernet",
     b"Ethernet.SourceAddress",
@@ -184,6 +182,63 @@ const FIELDS: [&[u8]; super::FIELD_COUNT as usize] = [
     b"XSPENC.VoiceOnlyPayload",
     b"Kerberosv5",
 ];
+
+/// The field names back to back.
+const FIELD_NAMES: [u8; field_names_length()] = pack_field_names();
+/// End of each name in [`FIELD_NAMES`]; a name starts where the previous
+/// one ends.
+const FIELD_ENDS: [u16; super::FIELD_COUNT as usize] = field_name_ends();
+
+const fn field_names_length() -> usize {
+    let mut length = 0;
+    let mut field = 0;
+    while field < FIELDS.len() {
+        length += FIELDS[field].len();
+        field += 1;
+    }
+    length
+}
+
+const fn pack_field_names() -> [u8; field_names_length()] {
+    let mut names = [0u8; field_names_length()];
+    let mut position = 0;
+    let mut field = 0;
+    while field < FIELDS.len() {
+        let mut byte = 0;
+        while byte < FIELDS[field].len() {
+            names[position] = FIELDS[field][byte];
+            position += 1;
+            byte += 1;
+        }
+        field += 1;
+    }
+    names
+}
+
+const fn field_name_ends() -> [u16; super::FIELD_COUNT as usize] {
+    let mut ends = [0u16; super::FIELD_COUNT as usize];
+    let mut end = 0;
+    let mut field = 0;
+    while field < FIELDS.len() {
+        end += FIELDS[field].len();
+        ends[field] = end as u16;
+        field += 1;
+    }
+    ends
+}
+
+/// The id of the field named `name` (0x91f75370: ASCII case-insensitive).
+fn field_id(name: &[u8]) -> Option<FieldId> {
+    let mut start = 0;
+    for (position, &end) in FIELD_ENDS.iter().enumerate() {
+        let end = usize::from(end);
+        if name.eq_ignore_ascii_case(&FIELD_NAMES[start..end]) {
+            return Some(FieldId(position as u8 + 1));
+        }
+        start = end;
+    }
+    None
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct NodeId(u8);
@@ -302,14 +357,8 @@ pub fn compile_text(text: &[u8]) -> Result<Option<Compiled<'_>>, Hresult> {
         let Some(name) = compiler.items[position].name.take() else {
             continue;
         };
-        // 0x91f75370: ASCII case-insensitive.
-        let bytes = &text[name.start..name.end];
-        let field = FIELDS
-            .iter()
-            .position(|field| bytes.eq_ignore_ascii_case(field))
-            .ok_or(UNKNOWN_FIELD)?;
+        *bound = field_id(&text[name.start..name.end]).ok_or(UNKNOWN_FIELD)?;
         compiler.release(Holder::Item(ItemIndex(position as u8)));
-        *bound = FieldId(field as u8 + 1);
     }
     Ok(Some(Compiled {
         compiler,
@@ -547,8 +596,8 @@ impl<'a> Compiler<'a> {
             let index = base.checked_add(symbol)?;
             (base != 0
                 && (0..=grammar::TABLE_LAST).contains(&index)
-                && grammar::CHECK[index as usize] == symbol)
-                .then_some(index as usize)
+                && grammar::CHECK[index as usize] == grammar::check_symbol(symbol))
+            .then_some(index as usize)
         };
         loop {
             let mut rule = grammar::DEFAULT_REDUCTION[usize::from(state)];
@@ -913,12 +962,9 @@ impl<'a> Compiler<'a> {
         let second = self.next(first);
         let value = |compiler: &Self, id: Option<NodeId>| match id.map(|id| compiler.node(id).kind)
         {
-            Some(Kind::Constant(value)) => Some(value),
-            _ => None,
+            Some(Kind::Constant(value)) => value,
+            _ => Variant::Null,
         };
-        let a = value(self, Some(first)).unwrap_or(Variant::Null);
-        let b = value(self, second).unwrap_or(Variant::Null);
-        let text = self.text;
         let result = match operator.0 {
             // Rule 1 (a constant) and unary plus.
             0 | 7 => {
@@ -938,49 +984,17 @@ impl<'a> Compiler<'a> {
                 if truth == (operator.0 == 0x1a) {
                     return self.generic(operator, first);
                 }
-                Ok(Variant::Bool(truth))
+                Variant::Bool(truth)
             }
             0x1c => return self.select(first),
             _ if !constant => return self.generic(operator, first),
-            6 => variant::arithmetic(&Variant::I32(-1), Arithmetic::Multiply, &a),
-            8 => variant::to_bool(&a).map(|truth| Variant::Bool(!truth)),
-            9 => {
-                let complement = variant::complement(&a).map_err(fail)?;
-                self.node_mut(first).kind = Kind::Constant(complement);
-                self.keep(first, second);
-                return Ok(());
+            6 | 8 | 9 | 0xa..=0x1b => {
+                let operands = [value(self, Some(first)), value(self, second)];
+                variant::apply(self.text, operator, &operands).map_err(fail)?
             }
-            0xa..=0x10 | 0x17..=0x19 => {
-                let op = match operator.0 {
-                    0xa => Arithmetic::Multiply,
-                    0xb => Arithmetic::Divide,
-                    0xc => Arithmetic::Remainder,
-                    0xd => Arithmetic::Add,
-                    0xe => Arithmetic::Subtract,
-                    0xf => Arithmetic::ShiftLeft,
-                    0x10 => Arithmetic::ShiftRight,
-                    0x17 => Arithmetic::And,
-                    0x18 => Arithmetic::Xor,
-                    _ => Arithmetic::Or,
-                };
-                variant::arithmetic(&a, op, &b)
-            }
-            0x11..=0x16 => {
-                let op = match operator.0 {
-                    0x11 => Comparison::Less,
-                    0x12 => Comparison::Greater,
-                    0x13 => Comparison::LessEqual,
-                    0x14 => Comparison::GreaterEqual,
-                    0x15 => Comparison::Equal,
-                    _ => Comparison::NotEqual,
-                };
-                variant::compare(&a, op, &b, text)
-            }
-            0x1a | 0x1b => variant::logical(&a, operator.0 == 0x1a, &b),
             // Operator 5 and the comma are never folded.
             _ => return self.generic(operator, first),
         };
-        let result = result.map_err(fail)?;
         self.fold(first, result);
         Ok(())
     }
@@ -1271,7 +1285,6 @@ impl<'a> Compiler<'a> {
         if !constant {
             return self.generic(operator, first);
         }
-        let fail = |code| (code, Some(first));
         let mut values = [Variant::Null; 5];
         let mut id = Some(first);
         for slot in values.iter_mut().take(count as usize) {
@@ -1281,58 +1294,8 @@ impl<'a> Compiler<'a> {
             }
             id = self.next(node);
         }
-        let [source, second, third, fourth, fifth] = values;
-        let optional = |position: u32, value: &Variant| (count > position).then_some(*value);
-        let third_value = optional(2, &third);
-        let text = self.text;
-        let result = match operator {
-            Operator::STRING_LENGTH => {
-                let Variant::Str(string) = source else {
-                    return Err(fail(SYNTAX_ERROR));
-                };
-                let length = u32::try_from(string.end - string.start).unwrap_or(u32::MAX);
-                if length >= 0x8000_0000 {
-                    return Err(fail(STRING_TOO_LONG));
-                }
-                Ok(Variant::I32(length as i32))
-            }
-            STRING_COMPARE => variant::string_compare(text, &source, &second, third_value.as_ref()),
-            STRING_INDEX_OF => {
-                let is_bool = |value: &Variant| matches!(value, Variant::Bool(_));
-                let (start, length, ignore_case) = match count {
-                    2 => (None, None, None),
-                    3 if is_bool(&third) => (None, None, Some(third)),
-                    3 => (Some(third), None, None),
-                    4 if is_bool(&fourth) => (Some(third), None, Some(fourth)),
-                    4 => (Some(third), Some(fourth), None),
-                    _ => (Some(third), Some(fourth), Some(fifth)),
-                };
-                variant::index_of(
-                    text,
-                    &source,
-                    &second,
-                    start.as_ref(),
-                    length.as_ref(),
-                    ignore_case.as_ref(),
-                    false,
-                )
-            }
-            STRING_CONTAINS => variant::index_of(
-                text,
-                &source,
-                &second,
-                None,
-                None,
-                third_value.as_ref(),
-                true,
-            ),
-            STRING_STARTS_WITH => {
-                variant::starts_with(text, &source, &second, third_value.as_ref())
-            }
-            STRING_ENDS_WITH => variant::ends_with(text, &source, &second, third_value.as_ref()),
-            _ => variant::substring(text, &source, &second, third_value.as_ref()).map(Variant::Str),
-        };
-        let result = result.map_err(fail)?;
+        let result = variant::apply(self.text, operator, &values[..count as usize])
+            .map_err(|code| (code, Some(first)))?;
         self.fold(first, result);
         Ok(())
     }

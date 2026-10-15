@@ -32,6 +32,7 @@ use crate::commands::filesystem::PoolBuffer;
 use crate::commands::filesystem::PoolRange;
 use crate::commands::filesystem::ShareAccess;
 use crate::invocation::Invocation;
+use crate::text::HEX_UPPER;
 use crate::text::ResponseText;
 
 /// First system version with the simulator.
@@ -700,10 +701,7 @@ impl Request {
         let selection = Selection {
             inbound: line.has("in"),
             outbound: line.has("out"),
-            index: line
-                .param("index")
-                .and_then(|value| value.dword())
-                .filter(|&index| index != u32::MAX),
+            index: line.dword("index").filter(|&index| index != u32::MAX),
         };
         let mut blob = [0u8; CONFIG_CAPACITY];
         let blob_length = match line.param("cfg") {
@@ -1124,7 +1122,7 @@ fn queue_config(
                 Ok(length) => {
                     invocation.text.clear();
                     let _ = invocation.text.write_str("cfg=");
-                    write_hex(invocation.text, &blob[..length]);
+                    let _ = invocation.text.push_hex_upper(&blob[..length]);
                     status::OK
                 }
                 Err(error) => fail(invocation, error),
@@ -1235,12 +1233,6 @@ fn remove_redirects_command(
             status::OK
         }
         Err(error) => fail(invocation, error),
-    }
-}
-
-fn write_hex(text: &mut ResponseText, bytes: &[u8]) {
-    for byte in bytes {
-        let _ = write!(text, "{byte:02X}");
     }
 }
 
@@ -1471,11 +1463,13 @@ impl PoolWriter {
     fn line(&mut self, backend: &mut dyn AnyBackend, prefix: &[u8], blob: &[u8]) {
         self.push(backend, prefix);
         for &byte in blob {
-            let mut digits = [0u8; 2];
-            let mut text = crate::text::Text::<2>::new();
-            let _ = write!(text, "{byte:02X}");
-            digits.copy_from_slice(text.as_bytes());
-            self.push(backend, &digits);
+            self.push(
+                backend,
+                &[
+                    HEX_UPPER[usize::from(byte >> 4)],
+                    HEX_UPPER[usize::from(byte & 0xf)],
+                ],
+            );
         }
         self.push(backend, LINE_END);
     }

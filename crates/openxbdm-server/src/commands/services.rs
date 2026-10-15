@@ -7,6 +7,7 @@ use openxbdm_core::status::NtStatus;
 use crate::access::Access;
 use crate::commands::console;
 use crate::commands::console::ConfigSetting;
+use crate::commands::util::required_dword;
 use crate::continuation::ContinuationContext;
 use crate::invocation::Invocation;
 use crate::registry::CommandEntry;
@@ -42,13 +43,7 @@ const fn entry(
     flags: DispatchFlags,
     handler: crate::registry::Handler,
 ) -> CommandEntry {
-    CommandEntry {
-        name,
-        any_of: Access::CONTROL,
-        all_of: Access::NONE,
-        flags,
-        handler,
-    }
+    CommandEntry::new(name, Access::CONTROL, Access::NONE, flags, handler)
 }
 
 /// Global state of this domain.
@@ -258,15 +253,6 @@ fn stored_dword(invocation: &mut Invocation<'_>, name: &str) -> Option<u32> {
     value.map(|value| value.dword_prefix())
 }
 
-/// A dword parameter the handler uses only when well formed.
-fn checked_dword(invocation: &mut Invocation<'_>, name: &str) -> Option<u32> {
-    let value = invocation.line.param(name).and_then(|value| value.dword());
-    if value.is_none() {
-        invocation.set_text(format_args!("missing {name}"));
-    }
-    value
-}
-
 /// `civfail [reboot=<dword>]`. The thread handle is not closed.
 fn civ_fail(invocation: &mut Invocation<'_>) -> Hresult {
     // The stack variable starts at zero.
@@ -281,8 +267,8 @@ fn civ_fail(invocation: &mut Invocation<'_>) -> Hresult {
 /// `civinject readerrors=<dword> hasherrors=<dword>`: absent counts are 0;
 /// the text names the last missing parameter.
 fn civ_inject(invocation: &mut Invocation<'_>) -> Hresult {
-    let read_errors = checked_dword(invocation, "readerrors").unwrap_or(0);
-    let hash_errors = checked_dword(invocation, "hasherrors").unwrap_or(0);
+    let read_errors = required_dword(invocation, "readerrors").unwrap_or(0);
+    let hash_errors = required_dword(invocation, "hasherrors").unwrap_or(0);
     invocation
         .backend
         .inject_civ_errors(hash_errors, read_errors);

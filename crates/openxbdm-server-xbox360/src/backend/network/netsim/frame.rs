@@ -665,11 +665,11 @@ pub(super) fn address(frame: &[u8], transmit: bool) -> [u8; 4] {
 
 /// Ones' complement sum of big-endian words (0x91f68360).
 fn sum(mut total: u32, bytes: &[u8]) -> u32 {
-    let mut chunks = bytes.chunks_exact(2);
-    for pair in &mut chunks {
-        total += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
+    let (pairs, rest) = bytes.as_chunks::<2>();
+    for &pair in pairs {
+        total += u32::from(u16::from_be_bytes(pair));
     }
-    if let [last] = chunks.remainder() {
+    if let [last] = rest {
         total += u32::from(*last) << 8;
     }
     total

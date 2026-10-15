@@ -261,17 +261,25 @@ fn exchange(address: u32, expected: u32, new: u32) -> u32 {
 
 /// Atomic 64-bit increment; the console runs in 64-bit mode.
 fn increment64(address: u32) {
-    // SAFETY: an 8-byte aligned counter of a count block. ldarx 4,0,3 and
-    // stdcx. 4,0,3 are encoded because the target CPU model lacks them.
+    // SAFETY: an 8-byte aligned counter of a count block. ldarx 4,0,3,
+    // stdcx. 4,0,3 and mtmsrd are encoded because the target CPU model
+    // lacks them. External interrupts stay disabled across the reservation
+    // (mtmsrd 13,1; r13 holds the processor control region address, whose
+    // enable bit is clear), the form the kernel loader accepts.
     unsafe {
         core::arch::asm!(
             "2:",
+            "mfmsr 5",
+            ".long 0x7da10164",
             ".long 0x7c8018a8",
             "addi 4, 4, 1",
             ".long 0x7c8019ad",
+            // mtmsrd 5, 1
+            ".long 0x7ca10164",
             "bne- 2b",
             in("r3") address,
             out("r4") _,
+            out("r5") _,
             options(nostack),
         );
     }
@@ -695,7 +703,7 @@ fn allocate(block: u32, size: u32) -> Option<u32> {
             return (offset != 0).then_some(offset);
         }
         if format(block) == BlockFormat::Extended
-            && SWEEP_FULL_BUFFER.load(Ordering::Acquire)
+            && SWEEP_FULL_BUFFER.load(Ordering::Relaxed)
             && end > read32(block + block::RESERVED)
         {
             // Without a record the image would use the offset past the
@@ -1398,7 +1406,7 @@ extern "C" fn probe_tracked_word_range(block: u32, list: u32, value: u64, table:
 /// Export 192 (stock 0x91f70920): a 31-bit call counter is about to
 /// overflow: write a profile and reset, or stop the console.
 extern "C" fn export_overflow(block: u32) {
-    if !SWEEP_ON_OVERFLOW.load(Ordering::Acquire) {
+    if !SWEEP_ON_OVERFLOW.load(Ordering::Relaxed) {
         fatal(Fatal::CounterOverflow);
     }
     if let Some(node) = node_of_block(block) {
@@ -1984,11 +1992,11 @@ fn set_option(module: u32, option: PgoOption, value: u32) -> Hresult {
         PgoOption::StandardPgc => write8(node.at(node::EXTENDED), u8::from(!set)),
         PgoOption::TestCounterOverflow => write8(node.at(node::FILL_COUNTERS), u8::from(set)),
         PgoOption::MaxTitleMemory => write32(node.at(node::TITLE_MEMORY), value),
-        PgoOption::ValidateEplh => VALIDATE_EPLH.store(set, Ordering::Release),
-        PgoOption::ValidateVplh => VALIDATE_VPLH.store(set, Ordering::Release),
-        PgoOption::ValidateVple => VALIDATE_VPLE.store(set, Ordering::Release),
-        PgoOption::EnableSweepOnOverflow => SWEEP_ON_OVERFLOW.store(set, Ordering::Release),
-        PgoOption::EnableSweepFullBuffer => SWEEP_FULL_BUFFER.store(set, Ordering::Release),
+        PgoOption::ValidateEplh => VALIDATE_EPLH.store(set, Ordering::Relaxed),
+        PgoOption::ValidateVplh => VALIDATE_VPLH.store(set, Ordering::Relaxed),
+        PgoOption::ValidateVple => VALIDATE_VPLE.store(set, Ordering::Relaxed),
+        PgoOption::EnableSweepOnOverflow => SWEEP_ON_OVERFLOW.store(set, Ordering::Relaxed),
+        PgoOption::EnableSweepFullBuffer => SWEEP_FULL_BUFFER.store(set, Ordering::Relaxed),
     }
     pgo::SUCCESS
 }

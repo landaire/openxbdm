@@ -239,57 +239,54 @@ fn write_vector<const N: usize>(
 /// Overlay every register parameter of a `setcontext` line. Unknown keys
 /// and values that do not parse are ignored.
 pub fn apply_parameters(line: &CommandLine<'_>, context: &mut Context) {
-    let mut name = Text::<8>::new();
-    let dword = |line: &CommandLine<'_>, key: &str| line.param(key).and_then(|value| value.dword());
-    let qword = |line: &CommandLine<'_>, key: &str| line.param(key).and_then(|value| value.qword());
-    if let Some(value) = dword(line, "Msr") {
+    if let Some(value) = line.dword("Msr") {
         context.msr = value;
     }
-    if let Some(value) = dword(line, "Iar") {
+    if let Some(value) = line.dword("Iar") {
         context.iar = value;
     }
-    if let Some(value) = dword(line, "Lr") {
+    if let Some(value) = line.dword("Lr") {
         context.lr = value;
     }
     if let Some(value) = qword(line, "Ctr") {
         context.ctr = value;
     }
-    for n in 0..32 {
-        name.clear();
-        let _ = write!(name, "Gpr{n}");
-        if let Some(value) = qword(line, name_str(&name)) {
-            context.gpr[n] = value;
-        }
-    }
-    if let Some(value) = dword(line, "Cr") {
+    if let Some(value) = line.dword("Cr") {
         context.cr = value;
     }
-    if let Some(value) = dword(line, "Xer") {
+    if let Some(value) = line.dword("Xer") {
         context.xer = value;
     }
     if let Some(value) = qword(line, "Fpscr") {
         context.fpscr = value;
     }
-    for n in 0..32 {
-        name.clear();
-        let _ = write!(name, "Fpr{n}");
-        if let Some(value) = qword(line, name_str(&name)) {
-            context.fpr[n] = value;
-        }
-    }
     if let Some(words) = vector(line, "Vscr") {
         context.vscr = words;
     }
-    for n in 0..128 {
-        name.clear();
-        let _ = write!(name, "Vr{n}");
-        if let Some(words) = vector(line, name_str(&name)) {
-            context.vr[n] = words;
+    let mut name = Text::<8>::new();
+    for (prefix, registers) in [("Gpr", &mut context.gpr), ("Fpr", &mut context.fpr)] {
+        for (n, register) in registers.iter_mut().enumerate() {
+            if let Some(value) = qword(line, register_name(&mut name, prefix, n)) {
+                *register = value;
+            }
+        }
+    }
+    for (n, register) in context.vr.iter_mut().enumerate() {
+        if let Some(words) = vector(line, register_name(&mut name, "Vr", n)) {
+            *register = words;
         }
     }
 }
 
-fn name_str<const N: usize>(name: &Text<N>) -> &str {
+fn qword(line: &CommandLine<'_>, key: &str) -> Option<u64> {
+    line.param(key).and_then(|value| value.qword())
+}
+
+/// `<prefix><n>`, the parameter name of register `n`.
+fn register_name<'a>(name: &'a mut Text<8>, prefix: &str, n: usize) -> &'a str {
+    name.clear();
+    let _ = name.push_bytes(prefix.as_bytes());
+    let _ = name.push_decimal(n as u32);
     core::str::from_utf8(name.as_bytes()).unwrap_or_default()
 }
 

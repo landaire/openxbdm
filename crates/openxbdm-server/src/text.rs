@@ -6,6 +6,8 @@ use core::fmt;
 pub const RESPONSE_TEXT_CAPACITY: usize = 0x1fb;
 /// Capacity of one continuation line or continuation reply text.
 pub const LINE_TEXT_CAPACITY: usize = 0x100;
+/// Uppercase hex digits.
+pub const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
 
 /// ASCII text with a fixed capacity. Writes past the capacity are
 /// truncated and reported as `fmt::Error`.
@@ -54,6 +56,12 @@ impl<const N: usize> Text<N> {
     /// `value` in decimal, as `{}` writes it.
     pub fn push_decimal(&mut self, value: u32) -> fmt::Result {
         self.cursor().push_decimal(value)
+    }
+
+    /// `bytes` as uppercase hex digit pairs, as `{:02X}` per byte writes
+    /// them.
+    pub fn push_hex_upper(&mut self, bytes: &[u8]) -> fmt::Result {
+        self.cursor().push_hex_upper(bytes)
     }
 
     fn cursor(&mut self) -> Cursor<'_> {
@@ -127,6 +135,17 @@ impl Cursor<'_> {
             }
         }
         self.push(&digits[start..])
+    }
+
+    #[inline(never)]
+    fn push_hex_upper(&mut self, bytes: &[u8]) -> fmt::Result {
+        for &byte in bytes {
+            self.push(&[
+                HEX_UPPER[usize::from(byte >> 4)],
+                HEX_UPPER[usize::from(byte & 0xf)],
+            ])?;
+        }
+        Ok(())
     }
 }
 

@@ -87,11 +87,7 @@ pub(super) fn ipproxy(invocation: &mut Invocation<'_>) -> Hresult {
 fn start(invocation: &mut Invocation<'_>) -> Hresult {
     let line = invocation.line;
     // Absent and unparsable values read as 0, which is rejected.
-    let value = |name| {
-        line.param(name)
-            .and_then(|value| value.dword())
-            .filter(|&value| value != 0)
-    };
+    let value = |name| line.dword(name).filter(|&value| value != 0);
     let (Some(_version), Some(address), Some(port)) = (value("ver"), value("addr"), value("port"))
     else {
         return Hresult::from_error_code(ErrorCode::BAD_PARAMETER);

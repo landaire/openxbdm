@@ -331,8 +331,7 @@ impl xhttpproxy::Backend for Console {
 
     fn proxy_title_exited(&mut self) {
         let guard = Guard::acquire();
-        let mut entries = guard.iter();
-        while let Some(entry) = entries.next() {
+        for entry in guard.iter() {
             // SAFETY: the iterator already holds the next link, so the entry
             // may be freed.
             unsafe {

@@ -26,7 +26,6 @@ use openxbdm_server::commands::performance::DisplayInformation;
 use openxbdm_server::commands::performance::EDID_BLOCK_SIZE;
 use openxbdm_server::commands::performance::EdidRead;
 use openxbdm_server::commands::performance::PixDogma;
-use openxbdm_server::commands::performance::PixMessage;
 use openxbdm_server::commands::performance::TILE_SIZE;
 use openxbdm_server::commands::performance::capture::CaptureFlags;
 
@@ -439,8 +438,8 @@ impl performance::Backend for Console {
         profiler::info()
     }
 
-    fn pix_post(&mut self, message: PixMessage) -> bool {
-        pix::backend::post(message)
+    fn pix_post(&mut self, code: u32, payload: &[u32]) -> bool {
+        pix::backend::post(code, payload)
     }
 
     fn pix_status(&mut self, version: u32, flags: u32) -> Option<[u32; 12]> {

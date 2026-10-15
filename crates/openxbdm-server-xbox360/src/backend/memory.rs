@@ -24,7 +24,6 @@ use openxbdm_server::text::Text;
 
 use super::Console;
 use crate::kernel;
-use crate::kernel::IoStatusBlock;
 use crate::kernel::LIB_KERNEL;
 use crate::kernel::import_thunk;
 use crate::kernel::import_variable;
@@ -78,13 +77,6 @@ const IMAGE_FILE_DLL: u16 = 0x2000;
 const DEBUG_DIRECTORY_ENTRY_SIZE: u32 = 0x1c;
 const SECTION_HEADER_SIZE: u32 = 0x28;
 const CODEVIEW_RSDS: u32 = u32::from_be_bytes(*b"RSDS");
-
-const FLASH_DEVICE: &[u8] = b"\\Device\\Flash";
-const FLASH_ACCESS: u32 = 0xc010_0000;
-const IOCTL_FLASH_GEOMETRY: u32 = 0x3c_0028;
-const MEM_COMMIT_RESERVE: u32 = 0x3000;
-const MEM_RELEASE: u32 = 0x8000;
-const PAGE_READWRITE: u32 = 4;
 
 /// `ExDebugMonitorService` 8: debug-adjusted memory statistics.
 const DEBUG_MONITOR_MEMORY_STATISTICS: u32 = 8;
@@ -164,23 +156,53 @@ impl Drop for LoaderLock {
     }
 }
 
-/// Loader data table entries of one list.
-fn list_entries(head: u32) -> impl Iterator<Item = u32> {
-    let mut entry = if head == 0 { 0 } else { read_u32(head) };
-    core::iter::from_fn(move || {
-        if head == 0 || entry == head {
-            return None;
+/// Loader data table entries of each list in `heads`, one list after the
+/// other; a zero head is an empty list. One iterator for both lists keeps
+/// the walks from being instantiated once per list.
+struct LoaderEntries {
+    heads: [u32; 2],
+    list: usize,
+    entry: u32,
+}
+
+impl LoaderEntries {
+    fn new(heads: [u32; 2]) -> Self {
+        Self {
+            heads,
+            list: 0,
+            entry: first_entry(heads[0]),
         }
-        let current = entry;
-        entry = read_u32(entry);
-        Some(current)
-    })
+    }
+}
+
+fn first_entry(head: u32) -> u32 {
+    if head == 0 { 0 } else { read_u32(head) }
+}
+
+impl Iterator for LoaderEntries {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<u32> {
+        loop {
+            let head = *self.heads.get(self.list)?;
+            if head != 0 && self.entry != head {
+                let current = self.entry;
+                self.entry = read_u32(current);
+                return Some(current);
+            }
+            self.list += 1;
+            self.entry = self
+                .heads
+                .get(self.list)
+                .map_or(0, |&head| first_entry(head));
+        }
+    }
 }
 
 /// Entries of both loader lists, in the order the monitor walks them.
-fn all_entries() -> impl Iterator<Item = u32> {
+fn all_entries() -> LoaderEntries {
     let data = kernel::debug_monitor_data();
-    list_entries(data.module_list()).chain(list_entries(data.secondary_module_list()))
+    LoaderEntries::new([data.module_list(), data.secondary_module_list()])
 }
 
 fn entry_name_units(entry: u32) -> impl Iterator<Item = u16> {
@@ -236,33 +258,32 @@ fn section_info(section: u32, base: u32) -> SectionInfo {
     }
 }
 
+/// Characters of a tracking diagnostic; stock formats it into a 0x200-byte
+/// buffer that keeps its terminator.
+const TRACKING_MESSAGE_LIMIT: usize = 0x1ff;
+
 /// Format a tracking diagnostic and report it as stock does: an assertion
-/// when the flags request it, else a debug print.
+/// when the flags request it, else `DbgPrint("DM: %s\n", message)`.
 fn tracking_diagnostic(arguments: core::fmt::Arguments<'_>) {
-    let mut message = Text::<0x200>::new();
-    let _ = message.write_fmt(arguments);
-    let _ = message.push_bytes(b"\0");
+    let mut text = Text::<TRACKING_MESSAGE_LIMIT>::new();
+    let _ = text.write_fmt(arguments);
+    let mut message = [0u8; TRACKING_MESSAGE_LIMIT + 1];
+    message[..text.as_bytes().len()].copy_from_slice(text.as_bytes());
     if TRACKING.flags.load(Ordering::Relaxed) & TRACKING_ASSERT != 0 {
         RtlAssert(
-            message.as_bytes().as_ptr(),
+            message.as_ptr(),
             TRACKING_ASSERT_FILE.as_ptr().cast(),
             TRACKING_ASSERT_LINE,
             core::ptr::null(),
         );
     } else {
-        // The message is the argument of a `%s` conversion, so a percent
-        // sign in it is printed literally.
-        let mut line = Text::<0x408>::new();
-        let _ = line.push_bytes(b"DM: ");
-        for &byte in &message.as_bytes()[..message.as_bytes().len() - 1] {
-            let _ = line.push_bytes(if byte == b'%' {
-                b"%%"
-            } else {
-                core::slice::from_ref(&byte)
-            });
-        }
-        let _ = line.push_bytes(b"\n\0");
-        kernel::DbgPrint(line.as_bytes().as_ptr(), 0, core::ptr::null());
+        // The message pointer goes in the first variadic argument slot, as
+        // `kernel::debug_print` passes it.
+        kernel::DbgPrint(
+            c"DM: %s\n".as_ptr().cast(),
+            message.as_ptr() as usize as u32,
+            core::ptr::null(),
+        );
     }
 }
 
@@ -562,103 +583,6 @@ pub(crate) fn service_adjust_memory_statistics(argument: u32) -> u32 {
     0
 }
 
-/// Open the raw flash device.
-fn open_flash() -> Result<u32, NtStatus> {
-    const REQUEST: filesystem::CreateRequest = filesystem::CreateRequest::open(
-        filesystem::FileAccess(FLASH_ACCESS),
-        filesystem::ShareAccess::NONE,
-        filesystem::CreateOptions::SYNCHRONOUS_IO_NONALERT,
-    );
-    super::filesystem::create_file(FLASH_DEVICE, &REQUEST).map(|handle| handle.0)
-}
-
-fn status_result(status: u32) -> Result<(), NtStatus> {
-    if (status as i32) < 0 {
-        Err(NtStatus(status))
-    } else {
-        Ok(())
-    }
-}
-
-/// Write `data` at `offset` of the open flash device, a block at a time;
-/// partial blocks are read, patched, and written back (stock 0x91f72c78).
-fn write_flash_blocks(handle: u32, mut offset: u32, mut data: &[u8]) -> Result<(), NtStatus> {
-    let mut io_status = IoStatusBlock::default();
-    let mut geometry = [0u8; 0x14];
-    super::filesystem::device_control(handle, IOCTL_FLASH_GEOMETRY, &mut geometry)?;
-    let word = |index: usize| {
-        u32::from_ne_bytes([
-            geometry[index * 4],
-            geometry[index * 4 + 1],
-            geometry[index * 4 + 2],
-            geometry[index * 4 + 3],
-        ])
-    };
-    let block = word(2).wrapping_mul(word(0));
-    let mut bounce = 0u32;
-    let mut bounce_size = block;
-    let mut result = Ok(());
-    while !data.is_empty() {
-        let misalignment = block.wrapping_sub(1) & offset;
-        let mut chunk = block;
-        let mut source = data.as_ptr();
-        let mut position = u64::from(offset);
-        if misalignment != 0 || (data.len() as u32) < block {
-            chunk = (block - misalignment).min(data.len() as u32);
-            if bounce == 0 {
-                let status = kernel::NtAllocateVirtualMemory(
-                    &mut bounce,
-                    &mut bounce_size,
-                    MEM_COMMIT_RESERVE,
-                    PAGE_READWRITE,
-                    0,
-                );
-                if let Err(status) = status_result(status) {
-                    result = Err(status);
-                    break;
-                }
-            }
-            position = u64::from(offset - misalignment);
-            let status = kernel::NtReadFile(
-                handle,
-                0,
-                0,
-                0,
-                &mut io_status,
-                bounce as usize as *mut u8,
-                block,
-                &position,
-            );
-            if let Err(status) = status_result(status) {
-                result = Err(status);
-                break;
-            }
-            // SAFETY: the bounce buffer holds a full block; `chunk` bytes
-            // fit after `misalignment`.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    data.as_ptr(),
-                    (bounce + misalignment) as usize as *mut u8,
-                    chunk as usize,
-                )
-            };
-            source = bounce as usize as *const u8;
-        }
-        let status = kernel::NtWriteFile(handle, 0, 0, 0, &mut io_status, source, block, &position);
-        if let Err(status) = status_result(status) {
-            result = Err(status);
-            break;
-        }
-        data = &data[chunk as usize..];
-        offset = offset.wrapping_add(chunk);
-    }
-    if bounce != 0 {
-        let mut size = 0u32;
-        kernel::NtFreeVirtualMemory(&mut bounce, &mut size, MEM_RELEASE, 0);
-    }
-    result
-}
-
 /// Whether the debugger may read the page of `address`.
 fn debug_readable(address: u32) -> bool {
     let mapped = kernel::MmDbgReadCheck(address);
@@ -694,20 +618,34 @@ fn write_debug_byte(address: u32, value: u8) -> bool {
     true
 }
 
+/// Whether the loader list at `head` has an entry for the module loaded at
+/// `base`.
+fn list_has_base(head: u32, base: u32) -> bool {
+    if head == 0 {
+        return false;
+    }
+    let mut entry = read_u32(head);
+    while entry != head {
+        if read_u32(entry + ENTRY_BASE as u32) == base {
+            return true;
+        }
+        entry = read_u32(entry);
+    }
+    false
+}
+
 /// The CodeView record of the module loaded at `base` (0x91f280d8).
 fn code_view_of(base: u32) -> Option<CodeView> {
     let _lock = LoaderLock::acquire();
     let data = kernel::debug_monitor_data();
     let mut directory = 0u32;
     let mut size = 0u32;
-    if list_entries(data.module_list()).any(|entry| read_u32(entry + ENTRY_BASE as u32) == base) {
+    if list_has_base(data.module_list(), base) {
         directory = RtlImageDirectoryEntryToData(base, 1, IMAGE_DIRECTORY_DEBUG, &mut size);
     }
     if directory == 0 || size == 0 {
         directory = 0;
-        if list_entries(data.secondary_module_list())
-            .any(|entry| read_u32(entry + ENTRY_BASE as u32) == base)
-        {
+        if list_has_base(data.secondary_module_list(), base) {
             directory = RtlImageDirectoryEntryToData(base, 1, IMAGE_DIRECTORY_DEBUG, &mut size);
         }
     }
@@ -728,7 +666,6 @@ fn code_view_of(base: u32) -> Option<CodeView> {
     }
     let mut guid = [0u8; 16];
     let mut age = [0u8; 4];
-    let mut path = [0u8; memory::PDB_PATH_CAPACITY];
     // SAFETY: the CodeView record lies in the mapped image.
     unsafe {
         core::ptr::copy_nonoverlapping(
@@ -741,18 +678,11 @@ fn code_view_of(base: u32) -> Option<CodeView> {
             age.as_mut_ptr(),
             age.len(),
         );
-        for (offset, byte) in path
-            .iter_mut()
-            .take(memory::PDB_PATH_CAPACITY - 1)
-            .enumerate()
-        {
-            *byte = core::ptr::read_volatile((record as usize + 0x18 + offset) as *const u8);
-            if *byte == 0 {
-                break;
-            }
-        }
     }
-    Some(CodeView::new(guid, age, &path))
+    Some(CodeView::read(guid, age, |offset| {
+        // SAFETY: as above; the path is NUL-terminated.
+        unsafe { core::ptr::read_volatile((record as usize + 0x18 + offset) as *const u8) }
+    }))
 }
 
 impl memory::Backend for Console {
@@ -901,28 +831,11 @@ impl memory::Backend for Console {
     }
 
     fn read_flash(&mut self, offset: u32, output: &mut [u8]) -> Result<(), NtStatus> {
-        let handle = open_flash()?;
-        let mut io_status = IoStatusBlock::default();
-        let position = u64::from(offset);
-        let status = kernel::NtReadFile(
-            handle,
-            0,
-            0,
-            0,
-            &mut io_status,
-            output.as_mut_ptr(),
-            output.len() as u32,
-            &position,
-        );
-        kernel::NtClose(handle);
-        status_result(status)
+        super::system::flash::device_read(offset, output.as_mut_ptr(), output.len() as u32)
     }
 
     fn write_flash(&mut self, offset: u32, data: &[u8]) -> Result<(), NtStatus> {
-        let handle = open_flash()?;
-        let result = write_flash_blocks(handle, offset, data);
-        kernel::NtClose(handle);
-        result
+        super::system::flash::device_write(offset, data.as_ptr(), data.len() as u32)
     }
 
     fn trace_imports(&mut self, module: &[u8], enable: bool) -> bool {

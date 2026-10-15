@@ -52,8 +52,12 @@ Settings file: `memory::memtrack_settings_lines` writes
   (the kernel formatter's form); not compared against a capture.
 - `detour`: `Id` equal to 0x2e8 is rejected (stock reads past the table);
   an absent `file` is an empty name (stock copies an uninitialized buffer);
-  the record pool starts zeroed (stock: uninitialized pool); the completion
-  worker exits when its poll wait sees the stop signal (stock hangs `stop`);
+  the record pool starts zeroed (stock: uninitialized pool) and its
+  storage (0x1c00 bytes, tag `Detr`, pool type 2) is allocated at the first
+  `start` and kept after `stop` (stock allocates it at each start and frees
+  it at stop; allocation failure returns the engine to state 0 in both);
+  the completion worker exits when its poll wait sees the stop signal
+  (stock hangs `stop`);
   an unlogged completion after a logged one in the same worker pass writes
   no record (stock requeues the previous record); the module unload walk is
   bounded by the entry count. The log name is translated when `start` and

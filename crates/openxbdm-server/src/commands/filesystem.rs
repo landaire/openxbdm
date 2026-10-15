@@ -814,22 +814,28 @@ impl DriveTable {
         backend: &mut dyn crate::backend::Backend,
         path: &[u8],
     ) -> Option<ObjectPath> {
-        trace_path(backend, |message| {
-            let _ = message.write_str("[xbdm] FFileNameToObName(sz='");
-            let _ = message.push_bytes(console::c_string(path));
-            let _ = message.write_str("',...)\n");
-        });
+        trace_path(
+            backend,
+            &[
+                b"[xbdm] FFileNameToObName(sz='",
+                console::c_string(path),
+                b"',...)\n",
+            ],
+        );
         let translated = self.object_name(backend, path);
         match &translated {
-            Some(output) => trace_path(backend, |message| {
-                let _ = message.write_str("[xbdm] FFileNameToObName succeeded, osz='");
-                let _ = message.push_bytes(console::c_string(output.as_bytes()));
-                let _ = message.write_str("'\n");
-            }),
-            None => trace_path(backend, |message| {
-                let _ =
-                    message.write_str("[xbdm] FFileNameToObName - not a drive path - failing\n");
-            }),
+            Some(output) => trace_path(
+                backend,
+                &[
+                    b"[xbdm] FFileNameToObName succeeded, osz='",
+                    console::c_string(output.as_bytes()),
+                    b"'\n",
+                ],
+            ),
+            None => trace_path(
+                backend,
+                &[b"[xbdm] FFileNameToObName - not a drive path - failing\n"],
+            ),
         }
         translated
     }
@@ -839,12 +845,9 @@ impl DriveTable {
         backend: &mut dyn crate::backend::Backend,
         path: &[u8],
     ) -> Option<ObjectPath> {
-        let at = |index: usize| path.get(index).copied().unwrap_or(0);
-        let input = if matches!(at(0), b'x' | b'X') && at(1) != b':' && at(1) != 0 && at(2) == b':'
-        {
-            &path[1..]
-        } else {
-            path
+        let input = match path {
+            [b'x' | b'X', drive, b':', ..] if !matches!(drive, b':' | 0) => &path[1..],
+            _ => path,
         };
         let colon = input.iter().position(|&byte| byte == b':')?;
         if input.get(colon + 1) != Some(&b'\\') {
@@ -853,10 +856,10 @@ impl DriveTable {
         let drive = &input[..colon];
         let mut output = ObjectPath::new();
         if let Some(entry) = self.find(drive) {
-            trace_path(backend, |message| {
-                let _ = message
-                    .write_str("[xbdm] FFileNameToObName - drive name in conversion table\n");
-            });
+            trace_path(
+                backend,
+                &[b"[xbdm] FFileNameToObName - drive name in conversion table\n"],
+            );
             match entry.target {
                 // The image copies the title's string up to its NUL on
                 // every use; an unreadable page ends it (the image would
@@ -890,15 +893,10 @@ impl DriveTable {
 
         // `_snprintf(buffer, 0x104, "%s%s", "\??\", path)`.
         let mut link = [0u8; 0x103];
-        let mut link_len = 0;
-        for &byte in b"\\??\\".iter().chain(input) {
-            if link_len == link.len() {
-                break;
-            }
-            link[link_len] = byte;
-            link_len += 1;
-        }
-        let link = &link[..link_len];
+        link[..4].copy_from_slice(b"\\??\\");
+        let count = input.len().min(link.len() - 4);
+        link[4..4 + count].copy_from_slice(&input[..count]);
+        let link = &link[..4 + count];
         match backend.translate_symbolic_link(link, &mut output.bytes) {
             Ok(length) => {
                 let mut length = length.min(OBJECT_PATH_LIMIT);
@@ -914,9 +912,9 @@ impl DriveTable {
             }
             Err(_) => {
                 output.push(b"\\??\\");
-                for &byte in drive {
-                    output.push(&[byte.to_ascii_uppercase()]);
-                }
+                let start = output.len;
+                output.push(drive);
+                output.bytes[start..output.len].make_ascii_uppercase();
                 output.push(&input[colon..]);
             }
         }
@@ -948,14 +946,13 @@ impl DriveTable {
                 continue;
             };
             if target.len() == length && object_path[..length].eq_ignore_ascii_case(target) {
-                let mut length = 0;
-                for &byte in entry.name.as_bytes().iter().chain(b":") {
-                    if length < output.len() {
-                        output[length] = byte;
-                    }
+                let name = entry.name.as_bytes();
+                let mut length = name.len().min(output.len());
+                output[..length].copy_from_slice(&name[..length]);
+                if length < output.len() {
+                    output[length] = b':';
                     length += 1;
                 }
-                let length = length.min(output.len());
                 let room = limit.saturating_sub(length);
                 let rest = &object_path[target.len()..];
                 let count = rest.len().min(room);
@@ -969,14 +966,16 @@ impl DriveTable {
     }
 }
 
-/// A FFileNameToObName trace text. The translation holds no server state;
-/// the published mask follows every change of the server's.
-fn trace_path(
-    backend: &mut dyn crate::backend::Backend,
-    build: impl FnOnce(&mut console::MessageText),
-) {
+/// A FFileNameToObName trace text of `parts`. The translation holds no
+/// server state; the published mask follows every change of the server's.
+#[inline(never)]
+fn trace_path(backend: &mut dyn crate::backend::Backend, parts: &[&[u8]]) {
     let mask = console::Backend::trace_mask(backend);
-    console::trace_text(mask, backend, TraceMask::PATHS, build);
+    console::trace_text(mask, backend, TraceMask::PATHS, |message| {
+        for part in parts {
+            let _ = message.push_bytes(part);
+        }
+    });
 }
 
 /// Control code 0x03 (0x91f2ef60, enabled): map the drive named by a title
@@ -1089,44 +1088,41 @@ impl<'a> SliceWriter<'a> {
         self.buffer[self.len..self.len + count].copy_from_slice(&bytes[..count]);
         self.len += count;
     }
-}
 
-impl core::fmt::Write for SliceWriter<'_> {
-    fn write_str(&mut self, value: &str) -> core::fmt::Result {
-        self.push(value.as_bytes());
-        Ok(())
+    /// `label` then `value` in lowercase hex of at least `width` digits,
+    /// as `{:0width$x}` writes it.
+    #[inline(never)]
+    fn push_hex(&mut self, label: &[u8], value: u32, width: u32) {
+        self.push(label);
+        let mut digits = [0u8; 8];
+        for (index, digit) in digits.iter_mut().enumerate() {
+            *digit = b"0123456789abcdef"[(value >> (28 - 4 * index)) as usize & 0xf];
+        }
+        let skip = (value.leading_zeros() / 4).min(8 - width);
+        self.push(&digits[skip as usize..]);
     }
 }
 
 /// The size, time, and attribute fields shared by `dirlist` and
 /// `getfileattributes` (0x91f45c90).
-fn write_attributes(output: &mut impl core::fmt::Write, information: &FileInformation) {
+#[inline(never)]
+fn write_attributes(output: &mut SliceWriter<'_>, information: &FileInformation) {
     let attributes = information.attributes;
-    let _ = write!(
-        output,
-        "sizehi=0x{:x} sizelo=0x{:x} createhi=0x{:08x} createlo=0x{:08x} changehi=0x{:08x} changelo=0x{:08x}{}{}{}",
-        (information.end_of_file >> 32) as u32,
-        information.end_of_file as u32,
-        information.creation_time.high(),
-        information.creation_time.low(),
-        information.last_write_time.high(),
-        information.last_write_time.low(),
-        if attributes.contains(FileAttributes::DIRECTORY) {
-            " directory"
-        } else {
-            ""
-        },
-        if attributes.contains(FileAttributes::READONLY) {
-            " readonly"
-        } else {
-            ""
-        },
-        if attributes.contains(FileAttributes::HIDDEN) {
-            " hidden"
-        } else {
-            ""
-        },
-    );
+    output.push_hex(b"sizehi=0x", (information.end_of_file >> 32) as u32, 1);
+    output.push_hex(b" sizelo=0x", information.end_of_file as u32, 1);
+    output.push_hex(b" createhi=0x", information.creation_time.high(), 8);
+    output.push_hex(b" createlo=0x", information.creation_time.low(), 8);
+    output.push_hex(b" changehi=0x", information.last_write_time.high(), 8);
+    output.push_hex(b" changelo=0x", information.last_write_time.low(), 8);
+    for (bit, text) in [
+        (FileAttributes::DIRECTORY, &b" directory"[..]),
+        (FileAttributes::READONLY, b" readonly"),
+        (FileAttributes::HIDDEN, b" hidden"),
+    ] {
+        if attributes.contains(bit) {
+            output.push(text);
+        }
+    }
 }
 
 pub(crate) const COMMANDS: &[CommandEntry] = &[
@@ -1202,13 +1198,7 @@ const fn entry(
     all_of: Access,
     handler: crate::registry::Handler,
 ) -> CommandEntry {
-    CommandEntry {
-        name,
-        any_of,
-        all_of,
-        flags: DispatchFlags::NONE,
-        handler,
-    }
+    CommandEntry::new(name, any_of, all_of, DispatchFlags::NONE, handler)
 }
 
 /// Transfers started by this domain.
@@ -1254,7 +1244,11 @@ pub(crate) fn resume(continuation: &mut Continuation, cx: &mut ContinuationConte
         Continuation::GetFile(transfer) => get_file_data(transfer, cx),
         Continuation::FileAttributes(information) => match information.take() {
             Some(information) => {
-                write_attributes(cx.line, &information);
+                let mut text = [0u8; crate::text::LINE_TEXT_CAPACITY];
+                let mut output = SliceWriter::new(&mut text);
+                write_attributes(&mut output, &information);
+                let length = output.len;
+                let _ = cx.line.push_bytes(&text[..length]);
                 Hresult::OK
             }
             None => Hresult::END_OF_DATA,
@@ -1504,16 +1498,12 @@ fn drive_free_space_line(
     let free = size.available_units.wrapping_mul(unit);
     let pool = cx.backend.pool(line);
     let mut output = SliceWriter::new(&mut pool[..LINE_BUFFER as usize - 1]);
-    let _ = write!(
-        output,
-        "freetocallerlo=0x{:08x} freetocallerhi=0x{:08x} totalbyteslo=0x{:08x} totalbyteshi=0x{:08x} totalfreebyteslo=0x{:08x} totalfreebyteshi=0x{:08x}",
-        free as u32,
-        (free >> 32) as u32,
-        total as u32,
-        (total >> 32) as u32,
-        free as u32,
-        (free >> 32) as u32,
-    );
+    output.push_hex(b"freetocallerlo=0x", free as u32, 8);
+    output.push_hex(b" freetocallerhi=0x", (free >> 32) as u32, 8);
+    output.push_hex(b" totalbyteslo=0x", total as u32, 8);
+    output.push_hex(b" totalbyteshi=0x", (total >> 32) as u32, 8);
+    output.push_hex(b" totalfreebyteslo=0x", free as u32, 8);
+    output.push_hex(b" totalfreebyteshi=0x", (free >> 32) as u32, 8);
     let length = output.len;
     send_pool_line(&pool[..length], cx.binary, &mut cx.binary_len);
     Hresult::OK
@@ -1608,10 +1598,7 @@ fn drive_list_line(list: &mut DriveList, cx: &mut ContinuationContext<'_>) -> Hr
             if let Ok(handle) = opened {
                 cx.backend.close_file(handle);
                 cx.line.clear();
-                let _ = cx.line.push_bytes(b"drivename=\"");
-                let _ = cx.line.push_bytes(&name[..colon]);
-                let _ = cx.line.push_bytes(b"\"");
-                return Hresult::OK;
+                return drive_name_line(cx, &name[..colon]);
             }
         }
     }
@@ -1619,10 +1606,10 @@ fn drive_list_line(list: &mut DriveList, cx: &mut ContinuationContext<'_>) -> Hr
         return Hresult::END_OF_DATA;
     };
     loop {
-        let Some(&drive) = cx.state.filesystem.drives.drives().nth(*index) else {
+        let row = *index;
+        let Some(Some(drive)) = cx.state.filesystem.drives.entries.get(row).copied() else {
             return Hresult::END_OF_DATA;
         };
-        let row = *index;
         *index += 1;
         if !drive.enabled {
             continue;
@@ -1635,10 +1622,7 @@ fn drive_list_line(list: &mut DriveList, cx: &mut ContinuationContext<'_>) -> Hr
         match open_translated(cx.state, cx.backend, &path[..length + 2], &request) {
             Ok(handle) => {
                 cx.backend.close_file(handle);
-                let _ = cx.line.push_bytes(b"drivename=\"");
-                let _ = cx.line.push_bytes(drive.name.as_bytes());
-                let _ = cx.line.push_bytes(b"\"");
-                return Hresult::OK;
+                return drive_name_line(cx, drive.name.as_bytes());
             }
             Err(_) if drive.name == b"F" || drive.name == b"SMB" => {
                 if let Some(entry) = cx.state.filesystem.drives.entries[row].as_mut() {
@@ -1648,6 +1632,13 @@ fn drive_list_line(list: &mut DriveList, cx: &mut ContinuationContext<'_>) -> Hr
             Err(_) => {}
         }
     }
+}
+
+fn drive_name_line(cx: &mut ContinuationContext<'_>, name: &[u8]) -> Hresult {
+    let _ = cx.line.push_bytes(b"drivename=\"");
+    let _ = cx.line.push_bytes(name);
+    let _ = cx.line.push_bytes(b"\"");
+    Hresult::OK
 }
 
 /// `fileeof name=<path> size=<dword> [mustcreate|cancreate]`.
@@ -1778,23 +1769,19 @@ fn get_file(invocation: &mut Invocation<'_>) -> Hresult {
 
 /// A failed read sends zeros for its chunk.
 fn get_file_data(transfer: &mut GetFile, cx: &mut ContinuationContext<'_>) -> Hresult {
-    if cx.aborted {
-        cx.backend.close_file(transfer.handle);
-        cx.backend.free_pool(transfer.buffer);
-        return Hresult::END_OF_DATA;
-    }
-    if !transfer.header_sent {
+    if !cx.aborted && !transfer.header_sent {
         transfer.header_sent = true;
         cx.binary[..4].copy_from_slice(&transfer.length.to_le_bytes());
         cx.binary_len = 4;
         return Hresult::OK;
     }
-    if transfer.chunk_sent == transfer.chunk_length {
-        if transfer.remaining == 0 {
-            cx.backend.close_file(transfer.handle);
-            cx.backend.free_pool(transfer.buffer);
-            return Hresult::END_OF_DATA;
-        }
+    let refill = transfer.chunk_sent == transfer.chunk_length;
+    if cx.aborted || refill && transfer.remaining == 0 {
+        cx.backend.close_file(transfer.handle);
+        cx.backend.free_pool(transfer.buffer);
+        return Hresult::END_OF_DATA;
+    }
+    if refill {
         let count = transfer.remaining.min(GETFILE_CHUNK);
         let range = PoolRange {
             buffer: transfer.buffer,
@@ -1808,10 +1795,29 @@ fn get_file_data(transfer: &mut GetFile, cx: &mut ContinuationContext<'_>) -> Hr
         transfer.chunk_length = count;
         transfer.chunk_sent = 0;
     }
-    let start = transfer.chunk_sent as usize;
-    let count = (transfer.chunk_length as usize - start).min(cx.binary.len());
-    cx.binary[..count].copy_from_slice(&cx.backend.pool(transfer.buffer)[start..start + count]);
-    transfer.chunk_sent += count as u32;
+    send_pool_piece(
+        cx,
+        transfer.buffer,
+        0,
+        transfer.chunk_length,
+        &mut transfer.chunk_sent,
+    )
+}
+
+/// Queue the next piece of the `total` bytes at `offset` in `buffer` as
+/// binary output, advancing `sent`.
+#[inline(never)]
+fn send_pool_piece(
+    cx: &mut ContinuationContext<'_>,
+    buffer: PoolBuffer,
+    offset: u32,
+    total: u32,
+    sent: &mut u32,
+) -> Hresult {
+    let count = ((total - *sent) as usize).min(cx.binary.len());
+    let start = (offset + *sent) as usize;
+    cx.binary[..count].copy_from_slice(&cx.backend.pool(buffer)[start..start + count]);
+    *sent += count as u32;
     cx.binary_len = count;
     Hresult::OK
 }
@@ -1913,12 +1919,7 @@ impl VirtualAttributes {
                 self.release(cx.backend);
                 return Hresult::END_OF_DATA;
             }
-            let count = ((total - *sent) as usize).min(cx.binary.len());
-            let start = (VFATTR_RECEIVE_AREA + *sent) as usize;
-            cx.binary[..count].copy_from_slice(&cx.backend.pool(buffer)[start..start + count]);
-            *sent += count as u32;
-            cx.binary_len = count;
-            return Hresult::OK;
+            return send_pool_piece(cx, buffer, VFATTR_RECEIVE_AREA, total, sent);
         }
 
         let mut remaining = cx.session.receive_remaining.unwrap_or(0);
@@ -1985,13 +1986,9 @@ impl VirtualAttributes {
                 };
                 let start = (VFATTR_RECEIVE_AREA + self.index * VFATTR_RECORD) as usize;
                 let pool = cx.backend.pool(buffer);
-                for (slot, value) in pool[start..start + VFATTR_RECORD as usize]
-                    .as_chunks_mut::<4>()
-                    .0
-                    .iter_mut()
-                    .zip(record)
-                {
-                    slot.copy_from_slice(&value.to_be_bytes());
+                let slot = &mut pool[start..start + VFATTR_RECORD as usize];
+                for (index, value) in record.iter().enumerate() {
+                    slot[index * 4..index * 4 + 4].copy_from_slice(&value.to_be_bytes());
                 }
                 self.index += 1;
                 if self.index == self.count {
@@ -2122,17 +2119,19 @@ fn set_file_attributes(invocation: &mut Invocation<'_>) -> Hresult {
         Ok(handle) => handle,
         Err(status) => return map(status, ACCESS_DENIED),
     };
-    let line = invocation.line;
-    let flag = |key: &str, bit: u32| {
-        line.param(key)
-            .and_then(|value| value.dword())
-            .map(|value| if value != 0 { bit } else { 0 })
-    };
-    let readonly = flag("readonly", FileAttributes::READONLY.0);
-    let hidden = flag("hidden", FileAttributes::HIDDEN.0);
-    let mask = readonly.map_or(0, |_| FileAttributes::READONLY.0)
-        | hidden.map_or(0, |_| FileAttributes::HIDDEN.0);
-    let value = readonly.unwrap_or(0) | hidden.unwrap_or(0);
+    let mut mask = 0;
+    let mut value = 0;
+    for (key, bit) in [
+        ("readonly", FileAttributes::READONLY.0),
+        ("hidden", FileAttributes::HIDDEN.0),
+    ] {
+        if let Some(flag) = invocation.line.dword(key) {
+            mask |= bit;
+            if flag != 0 {
+                value |= bit;
+            }
+        }
+    }
     let time = |high: &str, low: &str| {
         FileTime::from_parts(
             optional_dword(invocation, high, 0),
@@ -2304,38 +2303,7 @@ fn send_file(invocation: &mut Invocation<'_>) -> Hresult {
     let Some(length) = util::required_dword(invocation, "length") else {
         return util::MISSING;
     };
-    let request = CreateRequest {
-        access: FileAccess::GENERIC_WRITE
-            .union(FileAccess::DELETE)
-            .union(FileAccess::SYNCHRONIZE),
-        allocation_size: Some(u64::from(length)),
-        attributes: FileAttributes::NONE,
-        share: ShareAccess::NONE,
-        disposition: CreateDisposition::OverwriteIf,
-        options: CreateOptions::NONE,
-    };
-    let handle = match open_path(invocation.state, invocation.backend, name, &request) {
-        Ok(handle) => handle,
-        Err(status) => return map(status, CANNOT_CREATE),
-    };
-    let backend = &mut *invocation.backend;
-    let prepared = backend
-        .set_end_of_file(handle, u64::from(length))
-        .and_then(|()| backend.allocate_pool(2 * UPLOAD_HALF).ok_or(nt::NO_MEMORY));
-    let pool = match prepared {
-        Ok(pool) => pool,
-        Err(status) => {
-            let _ = backend.set_delete_disposition(handle, true);
-            close_changed(backend, handle);
-            return map(status, CANNOT_CREATE);
-        }
-    };
-    let upload = Upload {
-        writer: Writer::new(handle, pool, 0, true),
-        write_at: false,
-    };
-    begin(invocation, Continuation::Upload(upload), Some(length));
-    Hresult::SEND_BINARY
+    start_upload(invocation, name, None, length)
 }
 
 /// `writefile name=<path> offset=<dword> length=<dword>`: write into an
@@ -2354,34 +2322,67 @@ fn write_file(invocation: &mut Invocation<'_>) -> Hresult {
     let Some(length) = util::required_dword(invocation, "length") else {
         return util::MISSING;
     };
+    start_upload(invocation, name, Some(offset), length)
+}
+
+/// Open `name` for an upload of `length` bytes: written at `write_at` in
+/// an existing file, or into a file created with that size (`None`) that
+/// a failed upload deletes.
+fn start_upload(
+    invocation: &mut Invocation<'_>,
+    name: &[u8],
+    write_at: Option<u32>,
+    length: u32,
+) -> Hresult {
+    let (access, disposition, fallback) = match write_at {
+        Some(_) => (
+            FileAccess::GENERIC_READ
+                .union(FileAccess::GENERIC_WRITE)
+                .union(FileAccess::SYNCHRONIZE),
+            CreateDisposition::Open,
+            ACCESS_DENIED,
+        ),
+        None => (
+            FileAccess::GENERIC_WRITE
+                .union(FileAccess::DELETE)
+                .union(FileAccess::SYNCHRONIZE),
+            CreateDisposition::OverwriteIf,
+            CANNOT_CREATE,
+        ),
+    };
     let request = CreateRequest {
-        access: FileAccess::GENERIC_READ
-            .union(FileAccess::GENERIC_WRITE)
-            .union(FileAccess::SYNCHRONIZE),
+        access,
         allocation_size: Some(u64::from(length)),
         attributes: FileAttributes::NONE,
         share: ShareAccess::NONE,
-        disposition: CreateDisposition::Open,
+        disposition,
         options: CreateOptions::NONE,
     };
     let handle = match open_path(invocation.state, invocation.backend, name, &request) {
         Ok(handle) => handle,
-        Err(status) => return map(status, ACCESS_DENIED),
+        Err(status) => return map(status, fallback),
     };
     let backend = &mut *invocation.backend;
-    let prepared = backend
-        .set_file_position(handle, u64::from(offset))
-        .and_then(|()| backend.allocate_pool(2 * UPLOAD_HALF).ok_or(nt::NO_MEMORY));
+    let prepared = match write_at {
+        Some(offset) => backend.set_file_position(handle, u64::from(offset)),
+        None => backend.set_end_of_file(handle, u64::from(length)),
+    }
+    .and_then(|()| backend.allocate_pool(2 * UPLOAD_HALF).ok_or(nt::NO_MEMORY));
     let pool = match prepared {
         Ok(pool) => pool,
         Err(status) => {
+            if write_at.is_none() {
+                let _ = backend.set_delete_disposition(handle, true);
+            }
             close_changed(backend, handle);
-            return map(status, ACCESS_DENIED);
+            return map(status, fallback);
         }
     };
+    // A created file is written from its start.
+    let offset = u64::from(write_at.unwrap_or(0));
     let upload = Upload {
-        writer: Writer::new(handle, pool, u64::from(offset), false),
-        write_at: true,
+        writer: Writer::new(handle, pool, offset, write_at.is_none()),
+        write_at: write_at.is_some(),
     };
     begin(invocation, Continuation::Upload(upload), Some(length));
     Hresult::SEND_BINARY
@@ -2585,12 +2586,7 @@ impl MultiUpload {
                 self.buffer = None;
                 return Hresult::END_OF_DATA;
             }
-            let count = ((total - *sent) as usize).min(cx.binary.len());
-            let start = (VFILE_RESULTS + *sent) as usize;
-            cx.binary[..count].copy_from_slice(&cx.backend.pool(buffer)[start..start + count]);
-            *sent += count as u32;
-            cx.binary_len = count;
-            return Hresult::OK;
+            return send_pool_piece(cx, buffer, VFILE_RESULTS, total, sent);
         }
 
         let mut remaining = cx.session.receive_remaining.unwrap_or(0);
@@ -2617,13 +2613,14 @@ impl MultiUpload {
                 if remaining != 0 {
                     Hresult::OK
                 } else {
-                    let pool = cx.backend.pool(buffer);
+                    let mut header = [0u8; VFILE_HEADER as usize];
+                    header.copy_from_slice(&cx.backend.pool(buffer)[..VFILE_HEADER as usize]);
                     let dword = |offset: usize| {
                         u32::from_be_bytes([
-                            pool[offset],
-                            pool[offset + 1],
-                            pool[offset + 2],
-                            pool[offset + 3],
+                            header[offset],
+                            header[offset + 1],
+                            header[offset + 2],
+                            header[offset + 3],
                         ])
                     };
                     let qword = |offset: usize| {
@@ -2706,12 +2703,7 @@ impl BlockRead {
             cx.backend.free_pool(self.buffer);
             return Hresult::END_OF_DATA;
         }
-        let count = ((self.length - self.sent) as usize).min(cx.binary.len());
-        let start = self.sent as usize;
-        cx.binary[..count].copy_from_slice(&cx.backend.pool(self.buffer)[start..start + count]);
-        self.sent += count as u32;
-        cx.binary_len = count;
-        Hresult::OK
+        send_pool_piece(cx, self.buffer, 0, self.length, &mut self.sent)
     }
 }
 
@@ -2987,13 +2979,11 @@ fn format_fat(invocation: &mut Invocation<'_>) -> Hresult {
     if !(1..=5).contains(&partition) {
         return Hresult::from_error_code(ErrorCode::FILE_NOT_FOUND);
     }
-    let mut device = [0u8; 0x20];
-    let mut output = SliceWriter::new(&mut device);
-    let _ = write!(output, "\\Device\\Harddisk0\\Partition{partition}");
-    let length = output.len;
+    let mut device = *b"\\Device\\Harddisk0\\Partition0";
+    device[device.len() - 1] = b'0' + partition as u8;
     match invocation
         .backend
-        .format_partition(&device[..length], FORMAT_CLUSTER_SIZE)
+        .format_partition(&device, FORMAT_CLUSTER_SIZE)
     {
         Ok(()) => Hresult::OK,
         Err(_) => {
@@ -3002,27 +2992,6 @@ fn format_fat(invocation: &mut Invocation<'_>) -> Hresult {
         }
     }
 }
-
-/// CRC-32/MPEG-2 table: polynomial 0x04c11db7, most significant bit first.
-const CHECKSUM_TABLE: [u32; 256] = {
-    let mut table = [0u32; 256];
-    let mut index = 0;
-    while index < 256 {
-        let mut value = (index as u32) << 24;
-        let mut bit = 0;
-        while bit < 8 {
-            value = if value & 0x8000_0000 != 0 {
-                (value << 1) ^ 0x04c1_1db7
-            } else {
-                value << 1
-            };
-            bit += 1;
-        }
-        table[index] = value;
-        index += 1;
-    }
-    table
-};
 
 /// `getsum` progress.
 #[derive(Debug)]
@@ -3098,8 +3067,17 @@ fn block_checksum(backend: &mut dyn crate::backend::Backend, address: u32, size:
     while offset < size {
         let count = (size - offset).min(chunk.len() as u32) as usize;
         backend.read_memory(address.wrapping_add(offset), &mut chunk[..count]);
+        // CRC-32/MPEG-2 (polynomial 0x04c11db7, most significant bit
+        // first) computed bitwise as the image does, without a table.
         for &byte in &chunk[..count] {
-            crc = CHECKSUM_TABLE[((crc >> 24) ^ u32::from(byte)) as usize] ^ (crc << 8);
+            crc ^= u32::from(byte) << 24;
+            for _ in 0..8 {
+                crc = if crc & 0x8000_0000 != 0 {
+                    (crc << 1) ^ 0x04c1_1db7
+                } else {
+                    crc << 1
+                };
+            }
         }
         offset += count as u32;
     }
@@ -3213,8 +3191,7 @@ fn system_file_update_start(
     let name = string_param(invocation, "name", &mut name).ok_or(Hresult::INVALID_ARGUMENT)?;
     if invocation
         .line
-        .param("query")
-        .and_then(|value| value.dword())
+        .dword("query")
         .is_some_and(|value| value != 0)
     {
         let request = CreateRequest::open(
@@ -3264,7 +3241,8 @@ fn system_file_update_start(
     temporary[..separator].copy_from_slice(&name[..separator]);
     let sequence = invocation.backend.update_sequence();
     let mut output = SliceWriter::new(&mut temporary[separator..]);
-    let _ = write!(output, "\\temp{sequence:04x}.tmp");
+    output.push_hex(b"\\temp", u32::from(sequence), 4);
+    output.push(b".tmp");
     let length = separator + output.len;
     let temporary = &temporary[..length];
 

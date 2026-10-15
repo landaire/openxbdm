@@ -418,8 +418,17 @@ pub const OVERFLOW_VALUE: u64 = 0x7fff_ffff;
 
 /// Key under which a call tree stores `key` (0x91f70c80 table lookup):
 /// the reversed bits with alternate bits inverted.
-pub const fn tree_key(key: u32) -> u32 {
-    key.reverse_bits() ^ 0xaaaa_aaaa
+#[inline(never)]
+pub const fn tree_key(mut key: u32) -> u32 {
+    // A bit loop: `reverse_bits` expands to about 25 instructions on PPC.
+    let mut reversed = 0;
+    let mut bit = 0;
+    while bit < 32 {
+        reversed = (reversed << 1) | (key & 1);
+        key >>= 1;
+        bit += 1;
+    }
+    reversed ^ 0xaaaa_aaaa
 }
 
 /// Range table of exports 189-191: `count` at +4, flags at +6 (bit 0
@@ -598,10 +607,7 @@ pub struct Decoded {
 
 /// Length of a C string.
 pub fn c_len(bytes: &[u8]) -> usize {
-    bytes
-        .iter()
-        .position(|&byte| byte == 0)
-        .unwrap_or(bytes.len())
+    crate::commands::console::c_string(bytes).len()
 }
 
 /// Length of a wide C string; an unterminated buffer counts its length.

@@ -1,7 +1,7 @@
 //! Restart, clock, flash, the settings files, and the title launch
 //! services of the debug monitor dispatcher.
 
-mod flash;
+pub(super) mod flash;
 
 use core::ffi::CStr;
 use core::ffi::c_char;

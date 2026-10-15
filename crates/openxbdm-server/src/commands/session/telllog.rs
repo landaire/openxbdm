@@ -236,37 +236,20 @@ pub(super) fn tell_log(invocation: &mut Invocation<'_>) -> Hresult {
         else {
             return Hresult::from_error_code(ErrorCode::BAD_PARAMETER);
         };
-        let Some(area) = invocation
-            .line
-            .param("area")
-            .and_then(|value| value.dword())
-        else {
+        let Some(area) = invocation.line.dword("area") else {
             return Hresult::from_error_code(ErrorCode::BAD_PARAMETER);
         };
         // Absent values select blocking off and the engine defaults.
         let block = invocation
             .line
-            .param("block")
-            .and_then(|value| value.dword())
+            .dword("block")
             .is_some_and(|value| value != 0);
-        let size = invocation
-            .line
-            .param("size")
-            .and_then(|value| value.dword())
-            .unwrap_or(0);
-        let entries = invocation
-            .line
-            .param("entries")
-            .and_then(|value| value.dword())
-            .unwrap_or(0);
+        let size = invocation.line.dword("size").unwrap_or(0);
+        let entries = invocation.line.dword("entries").unwrap_or(0);
         start(invocation.backend, file, area, block, size, entries)
     } else if invocation.line.has("stop") {
         // An absent area stops the log for every component.
-        let area = invocation
-            .line
-            .param("area")
-            .and_then(|value| value.dword())
-            .unwrap_or(0);
+        let area = invocation.line.dword("area").unwrap_or(0);
         stop(invocation.backend, area)
     } else {
         return Hresult::from_error_code(ErrorCode::UNKNOWN_COMMAND);

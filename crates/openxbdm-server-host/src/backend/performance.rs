@@ -870,7 +870,8 @@ impl performance::Backend for MockBackend {
             .info(&mut performance.cpu_profiler)
     }
 
-    fn pix_post(&mut self, message: PixMessage) -> bool {
+    fn pix_post(&mut self, code: u32, payload: &[u32]) -> bool {
+        let message = PixMessage::new(code, payload);
         let pix = &mut self.performance.pix;
         if !pix.session {
             return false;

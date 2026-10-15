@@ -470,12 +470,16 @@ pub(super) fn frame_statistics(frame: u32) -> Option<[u32; 3]> {
     let rate = (MEASURED_FRAMES / (ticks as f32 * TICK_SECONDS)).min(MAX_RATE);
     let mut query = [frame, 0, 0, 0];
     events::notify_owner(STATISTICS_EVENT, query.as_mut_ptr() as usize as u32);
+    #[inline(never)]
+    fn truncate(value: f32) -> u32 {
+        value as i64 as u32
+    }
     let mut out = [0u32; 3];
     if query[3] != 0 {
         let scale = rate * RATE_SCALE;
-        out[0] = (scale * f32::from_bits(query[1]) * PERCENT) as i64 as u32;
-        out[1] = (scale * f32::from_bits(query[2]) * PERCENT) as i64 as u32;
-        out[2] = (query[3] as f32 * scale * COUNT_SCALE * PERCENT) as i64 as u32;
+        out[0] = truncate(scale * f32::from_bits(query[1]) * PERCENT);
+        out[1] = truncate(scale * f32::from_bits(query[2]) * PERCENT);
+        out[2] = truncate(query[3] as f32 * scale * COUNT_SCALE * PERCENT);
     }
     Some(out)
 }

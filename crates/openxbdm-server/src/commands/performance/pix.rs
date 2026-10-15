@@ -8,7 +8,6 @@ use openxbdm_core::status::Hresult;
 
 use super::CaptureValue;
 use super::Continuation;
-use super::PixMessage;
 use crate::backend::Backend;
 use crate::continuation::Continuation as AnyContinuation;
 use crate::invocation::Invocation;
@@ -189,7 +188,7 @@ pub(super) fn pix_command(invocation: &mut Invocation<'_>) -> Hresult {
         b'a' => Reply::posted(
             invocation
                 .backend
-                .pix_post(PixMessage::new(MESSAGE_START, &[1, 0, 0, 0, 0, 0, 0])),
+                .pix_post(MESSAGE_START, &[1, 0, 0, 0, 0, 0, 0]),
         ),
         b'b' => {
             invocation.backend.pix_set_trace(true);
@@ -203,7 +202,7 @@ pub(super) fn pix_command(invocation: &mut Invocation<'_>) -> Hresult {
             Reply::posted(
                 invocation
                     .backend
-                    .pix_post(PixMessage::new(MESSAGE_CAPTURE_FRAMES, &[count, 1, 0])),
+                    .pix_post(MESSAGE_CAPTURE_FRAMES, &[count, 1, 0]),
             )
         }
         b'd' => frames(invocation, &mut arguments),
@@ -211,13 +210,9 @@ pub(super) fn pix_command(invocation: &mut Invocation<'_>) -> Hresult {
             invocation.backend.pix_set_trace(false);
             Reply::Ok
         }
-        b'g' => Reply::posted(
-            invocation
-                .backend
-                .pix_post(PixMessage::new(MESSAGE_RESUME, &[])),
-        ),
+        b'g' => Reply::posted(invocation.backend.pix_post(MESSAGE_RESUME, &[])),
         b'h' => match invocation.backend.pix_dogma() {
-            Some(image) => Reply::posted(invocation.backend.pix_post(PixMessage::new(
+            Some(image) => Reply::posted(invocation.backend.pix_post(
                 MESSAGE_START,
                 &[
                     1,
@@ -228,7 +223,7 @@ pub(super) fn pix_command(invocation: &mut Invocation<'_>) -> Hresult {
                     image.info,
                     image.procedure_3,
                 ],
-            ))),
+            )),
             None => Reply::No,
         },
         b'k' => set_capture(invocation, &mut arguments),
@@ -258,20 +253,12 @@ pub(super) fn pix_command(invocation: &mut Invocation<'_>) -> Hresult {
                 Some(status) if pix.version >= PROFILE_VERSION && status[2] < PROFILE_VERSION => {
                     Reply::OldD3d
                 }
-                _ => Reply::posted(
-                    invocation
-                        .backend
-                        .pix_post(PixMessage::new(MESSAGE_PROFILE, &[])),
-                ),
+                _ => Reply::posted(invocation.backend.pix_post(MESSAGE_PROFILE, &[])),
             }
         }
         b'q' => status(invocation, &mut arguments),
         b'r' => return trace(invocation),
-        b't' => Reply::posted(
-            invocation
-                .backend
-                .pix_post(PixMessage::new(MESSAGE_STOP, &[0])),
-        ),
+        b't' => Reply::posted(invocation.backend.pix_post(MESSAGE_STOP, &[0])),
         b'u' => gpu_capture(invocation, &arguments),
         b'v' => frame_range(invocation, &mut arguments),
         b'w' => frame_detail(invocation, &mut arguments),
@@ -318,11 +305,7 @@ fn frames(invocation: &mut Invocation<'_>, arguments: &mut Arguments<'_>) -> Rep
         .wrapping_add(1)
         .min(MAX_FRAME_COUNT);
     let payload = [frame.wrapping_sub(first) as u32, count, 1];
-    Reply::posted_or_busy(
-        invocation
-            .backend
-            .pix_post(PixMessage::new(MESSAGE_FRAMES, &payload)),
-    )
+    Reply::posted_or_busy(invocation.backend.pix_post(MESSAGE_FRAMES, &payload))
 }
 
 fn frame_detail(invocation: &mut Invocation<'_>, arguments: &mut Arguments<'_>) -> Reply {
@@ -342,11 +325,7 @@ fn frame_detail(invocation: &mut Invocation<'_>, arguments: &mut Arguments<'_>) 
         (last.wrapping_sub(first) as u32).wrapping_add(1),
         detail,
     ];
-    Reply::posted(
-        invocation
-            .backend
-            .pix_post(PixMessage::new(MESSAGE_FRAME_DETAIL, &payload)),
-    )
+    Reply::posted(invocation.backend.pix_post(MESSAGE_FRAME_DETAIL, &payload))
 }
 
 /// `v [a b c d]`: all four values or none.
@@ -372,11 +351,7 @@ fn frame_range(invocation: &mut Invocation<'_>, arguments: &mut Arguments<'_>) -
             end,
         ]
     };
-    Reply::posted_or_busy(
-        invocation
-            .backend
-            .pix_post(PixMessage::new(MESSAGE_FRAME_RANGE, &payload)),
-    )
+    Reply::posted_or_busy(invocation.backend.pix_post(MESSAGE_FRAME_RANGE, &payload))
 }
 
 /// `k a b text`.
@@ -402,11 +377,7 @@ fn set_capture(invocation: &mut Invocation<'_>, arguments: &mut Arguments<'_>) -
         return Reply::No;
     };
     invocation.backend.pix_set_capture_text(text);
-    Reply::posted(
-        invocation
-            .backend
-            .pix_post(PixMessage::new(MESSAGE_SET_CAPTURE, &[0])),
-    )
+    Reply::posted(invocation.backend.pix_post(MESSAGE_SET_CAPTURE, &[0]))
 }
 
 /// `o a f s [t u]`.
@@ -458,11 +429,7 @@ fn record(invocation: &mut Invocation<'_>, arguments: &mut Arguments<'_>) -> Rep
     if invocation.backend.pix_boot_animation_loaded() {
         return Reply::Busy;
     }
-    Reply::posted_or_busy(
-        invocation
-            .backend
-            .pix_post(PixMessage::new(MESSAGE_RECORD, &payload)),
-    )
+    Reply::posted_or_busy(invocation.backend.pix_post(MESSAGE_RECORD, &payload))
 }
 
 /// `q version flags`: store the title's D3D version and flags, then report
@@ -536,11 +503,7 @@ fn gpu_capture(invocation: &mut Invocation<'_>, arguments: &Arguments<'_>) -> Re
             return Reply::OldD3d;
         }
     }
-    Reply::posted(
-        invocation
-            .backend
-            .pix_post(PixMessage::new(MESSAGE_GPU_CAPTURE, &payload)),
-    )
+    Reply::posted(invocation.backend.pix_post(MESSAGE_GPU_CAPTURE, &payload))
 }
 
 /// `r`: sample the counters into the trace ring and send the queued

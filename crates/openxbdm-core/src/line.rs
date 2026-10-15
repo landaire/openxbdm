@@ -63,6 +63,16 @@ impl<'a> CommandLine<'a> {
         }
     }
 
+    /// The `name=VALUE` parameter parsed by [`Value::dword`].
+    pub fn dword(&self, name: &str) -> Option<u32> {
+        self.param(name)?.dword()
+    }
+
+    /// The `name=VALUE` parameter parsed by [`Value::qword`].
+    pub fn qword(&self, name: &str) -> Option<u64> {
+        self.param(name)?.qword()
+    }
+
     /// Whether `name` appears as a bare flag or as a `name=VALUE` parameter.
     pub fn has(&self, name: &str) -> bool {
         self.find(name, false).is_some()

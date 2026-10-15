@@ -43,6 +43,7 @@ use crate::notify::Event;
 use crate::notify::ExceptionDetail;
 use crate::notify::ExecutionState;
 use crate::state::ServerState;
+use crate::text::ResponseText;
 use crate::text::Text;
 
 /// Threads that can be stopped at once.
@@ -182,7 +183,7 @@ pub fn process_events(
     backend: &mut dyn AnyBackend,
     network: &mut dyn Network,
 ) {
-    super::release_closed_snapshots(state, backend);
+    state.transfer_blocks.release_abandoned(backend);
     expire_title_stops(state, backend);
     let mut text = [0u8; NOTICE_TEXT_CAPACITY];
     while let Some(notification) = backend.next_direct_notification(&mut text) {
@@ -226,12 +227,12 @@ fn deliver_direct(
 ) {
     let notice = match notification.notice {
         DirectNotice::DebugString { address, length } => Notice::DebugString { address, length },
-        DirectNotice::ModuleLoad { .. } => match notification.module {
+        DirectNotice::ModuleLoad { .. } => match &notification.module {
             Some(module) if module.has_header => Notice::ModuleLoad(module),
             _ => return,
         },
         DirectNotice::ModuleUnload { line, .. } => {
-            let Some(module) = notification.module else {
+            let Some(module) = &notification.module else {
                 return;
             };
             state
@@ -249,9 +250,16 @@ fn deliver_direct(
         DirectNotice::Data { kind, address } => Notice::Data(kind, address),
         DirectNotice::Exception { first_chance } => Notice::Exception { first_chance },
     };
-    let (record, thread, iar) = (notification.record, notification.thread, notification.iar);
     deliver_notice(
-        state, backend, network, notice, &record, thread, iar, false, text,
+        state,
+        backend,
+        network,
+        notice,
+        &notification.record,
+        notification.thread,
+        notification.iar,
+        false,
+        text,
     );
 }
 
@@ -704,6 +712,7 @@ fn exception(
     let gpr3 = context.gpr3;
     let gpr4 = context.gpr4 as u16;
     let stop_on = state.debugger.stop_on;
+    let module: Option<ModuleEvent>;
 
     // Each arm yields the notification (if any), whether it stops, and the
     // resolution applied when the event ends.
@@ -725,7 +734,8 @@ fn exception(
             trap::MODULE_LOAD => {
                 dump = false;
                 let stop = !kd && can_stop && stop_on.contains(StopOn::MODULE_LOAD);
-                match backend.module_event(gpr3 as u32, context.gpr4 as u32, thread) {
+                module = backend.module_event(gpr3 as u32, context.gpr4 as u32, thread);
+                match &module {
                     Some(module) if module.has_header => {
                         Plan::notify(Notice::ModuleLoad(module), stop, Resolution::Final)
                     }
@@ -737,7 +747,8 @@ fn exception(
                 if gpr3 == 0 {
                     Plan::silent(Resolution::Final)
                 } else {
-                    match backend.module_event(gpr3 as u32, context.gpr4 as u32, thread) {
+                    module = backend.module_event(gpr3 as u32, context.gpr4 as u32, thread);
+                    match &module {
                         Some(module) => {
                             state.debugger.breakpoints.remove_range(
                                 module.base,
@@ -890,7 +901,9 @@ fn exception(
 }
 
 #[derive(Clone, Copy)]
-enum Notice {
+// Keeps the variant fields word-aligned in the plan.
+#[repr(C)]
+enum Notice<'a> {
     Break,
     SingleStep,
     NtAssert,
@@ -898,21 +911,21 @@ enum Notice {
     Assert { address: u32, length: u16 },
     Rip { address: u32, length: u16 },
     Data(u32, u32),
-    ModuleLoad(ModuleEvent),
-    ModuleUnload(ModuleEvent),
+    ModuleLoad(&'a ModuleEvent),
+    ModuleUnload(&'a ModuleEvent),
     Exception { first_chance: bool },
 }
 
-struct Plan {
-    notice: Option<Notice>,
+struct Plan<'a> {
+    notice: Option<Notice<'a>>,
     stop: bool,
     /// The event ends handled without a notification.
     handled: bool,
     resolution: Resolution,
 }
 
-impl Plan {
-    fn notify(notice: Notice, stop: bool, resolution: Resolution) -> Self {
+impl<'a> Plan<'a> {
+    fn notify(notice: Notice<'a>, stop: bool, resolution: Resolution) -> Self {
         Self {
             notice: Some(notice),
             stop,
@@ -1032,7 +1045,7 @@ fn target_text<'a>(
 /// Copy of the debug string or rip message a notice names.
 fn notice_text<'a>(
     backend: &mut dyn AnyBackend,
-    notice: &Notice,
+    notice: &Notice<'_>,
     buffer: &'a mut [u8; NOTICE_TEXT_CAPACITY],
 ) -> &'a [u8] {
     match *notice {
@@ -1050,7 +1063,7 @@ fn deliver_notice(
     state: &mut ServerState,
     backend: &mut dyn AnyBackend,
     network: &mut dyn Network,
-    notice: Notice,
+    notice: Notice<'_>,
     record: &ExceptionRecord,
     thread: ThreadId,
     iar: u32,
@@ -1409,7 +1422,7 @@ pub(super) fn release_all(
     backend: &mut dyn AnyBackend,
     network: &mut dyn Network,
 ) {
-    for process in [ProcessKind::Title, ProcessKind::System] {
+    for &process in &super::PROCESS_ORDER {
         for index in 0..MAX_PENDING {
             let Some(mut entry) = state.debugger.events.pending[index] else {
                 continue;
@@ -1537,45 +1550,23 @@ impl StopReason {
     /// The record words stock writes, in order; words past the count keep
     /// the caller's values.
     pub fn encode(&self) -> ([u32; 7], usize) {
-        let mut words = [0u32; 7];
-        let count = match *self {
-            Self::Unknown => 1,
-            Self::DebugString { thread } => {
-                words[..4].copy_from_slice(&[2, thread.0, 0, 0]);
-                4
-            }
-            Self::Breakpoint { address, thread } => {
-                words[..3].copy_from_slice(&[1, address, thread.0]);
-                3
-            }
+        let (head, count) = match *self {
+            Self::Unknown => ([0; 4], 1),
+            Self::DebugString { thread } => ([2, thread.0, 0, 0], 4),
+            Self::Breakpoint { address, thread } => ([1, address, thread.0, 0], 3),
             Self::Assert {
                 thread,
                 address,
                 length,
-            } => {
-                words[..4].copy_from_slice(&[0xc, thread.0, u32::from(length), address]);
-                4
-            }
+            } => ([0xc, thread.0, u32::from(length), address], 4),
             Self::Rip {
                 thread,
                 address,
                 length,
-            } => {
-                words[..4].copy_from_slice(&[0xe, thread.0, u32::from(length), address]);
-                4
-            }
-            Self::SingleStep { address, thread } => {
-                words[..3].copy_from_slice(&[4, address, thread.0]);
-                3
-            }
-            Self::DataBreakpoint { address, thread } => {
-                words[..3].copy_from_slice(&[0xd, address, thread.0]);
-                3
-            }
-            Self::NtAssert { address, thread } => {
-                words[..3].copy_from_slice(&[0x15, address, thread.0]);
-                3
-            }
+            } => ([0xe, thread.0, u32::from(length), address], 4),
+            Self::SingleStep { address, thread } => ([4, address, thread.0, 0], 3),
+            Self::DataBreakpoint { address, thread } => ([0xd, address, thread.0, 0], 3),
+            Self::NtAssert { address, thread } => ([0x15, address, thread.0, 0], 3),
             Self::Exception {
                 thread,
                 record,
@@ -1590,7 +1581,7 @@ impl StopReason {
                 } else {
                     (record.parameter_count, record.parameters_address())
                 };
-                words = [
+                let words = [
                     9,
                     thread.0,
                     record.code,
@@ -1599,10 +1590,10 @@ impl StopReason {
                     first,
                     second,
                 ];
-                7
+                return (words, 7);
             }
         };
-        (words, count)
+        ([head[0], head[1], head[2], head[3], 0, 0, 0], count)
     }
 }
 
@@ -1672,10 +1663,10 @@ pub(super) fn stop_reason(
 }
 
 /// `isstopped` text for a stop record (stock 0x91f48d90 and 0x91f391e0).
-pub(super) fn stop_description<const N: usize>(
+pub(super) fn stop_description(
     backend: &mut dyn AnyBackend,
     reason: &StopReason,
-    out: &mut Text<N>,
+    out: &mut ResponseText,
 ) {
     let _ = match *reason {
         StopReason::DebugString { thread } => {
@@ -1704,13 +1695,12 @@ pub(super) fn stop_description<const N: usize>(
             address,
             length,
         } => {
-            let mut buffer = [0u8; NOTICE_TEXT_CAPACITY];
+            let length = usize::from(length);
+            let bytes = backend
+                .target_bytes(address, length.min(NOTICE_TEXT_CAPACITY))
+                .unwrap_or_default();
             let mut padded = Text::<0x200>::new();
-            let text = pad_message(
-                target_text(backend, address, length, &mut buffer),
-                usize::from(length),
-                &mut padded,
-            );
+            let text = pad_message(bytes, length, &mut padded);
             write!(out, "rip thread=0x{:08x} string={text}", thread.0)
         }
         StopReason::SingleStep { address, thread } => write!(

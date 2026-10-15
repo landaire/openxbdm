@@ -4,8 +4,6 @@
 //! targets record endpoints that receive notifications, either connected
 //! outward by the console or attached by a `notify reconnectport=` peer.
 
-use core::fmt;
-
 use crate::commands::debugger::ModuleEvent;
 use crate::commands::debugger::module_flags;
 use crate::network::Endpoint;
@@ -227,9 +225,19 @@ pub enum Event<'a> {
 }
 
 /// `label` followed by `value` in eight hex digits.
-fn hex(out: &mut Text<EVENT_LINE_CAPACITY>, label: &[u8], value: u32) -> fmt::Result {
-    out.push_bytes(label)?;
-    out.push_hex32(value)
+fn hex(out: &mut Text<EVENT_LINE_CAPACITY>, label: &[u8], value: u32) {
+    put(out, label);
+    let _ = out.push_hex32(value);
+}
+
+/// Append `bytes`. A full line takes no more bytes, so later appends
+/// after a truncated one change nothing and need no check.
+fn put(out: &mut Text<EVENT_LINE_CAPACITY>, bytes: &[u8]) {
+    let _ = out.push_bytes(bytes);
+}
+
+fn decimal(out: &mut Text<EVENT_LINE_CAPACITY>, value: u32) {
+    let _ = out.push_decimal(value);
 }
 
 /// Text of the `stopped` suffix.
@@ -246,16 +254,16 @@ fn section_line(
     size: u32,
     index: u32,
     flags: u32,
-) -> fmt::Result {
-    out.push_bytes(kind)?;
-    out.push_bytes(b" name=\"")?;
-    out.push_bytes(name.as_bytes())?;
-    hex(out, b"\" base=0x", base)?;
-    hex(out, b" size=0x", size)?;
-    out.push_bytes(b" index=")?;
-    out.push_decimal(index)?;
-    out.push_bytes(b" flags=")?;
-    out.push_decimal(flags)
+) {
+    put(out, kind);
+    put(out, b" name=\"");
+    put(out, name.as_bytes());
+    hex(out, b"\" base=0x", base);
+    hex(out, b" size=0x", size);
+    put(out, b" index=");
+    decimal(out, index);
+    put(out, b" flags=");
+    decimal(out, flags);
 }
 
 /// `<kind><stop> thread=0x...`, then ` string=<text>` when present.
@@ -265,47 +273,46 @@ fn text_line(
     thread: u32,
     text: Option<&str>,
     stopped: bool,
-) -> fmt::Result {
-    out.push_bytes(kind)?;
-    out.push_bytes(stop(stopped))?;
-    hex(out, b" thread=0x", thread)?;
+) {
+    put(out, kind);
+    put(out, stop(stopped));
+    hex(out, b" thread=0x", thread);
     if let Some(text) = text {
-        out.push_bytes(b" string=")?;
-        out.push_bytes(text.as_bytes())?;
+        put(out, b" string=");
+        put(out, text.as_bytes());
     }
-    Ok(())
 }
 
 impl Event<'_> {
     /// Write the notification line (without CR LF) for line-formatted events.
-    fn write_line(&self, out: &mut Text<EVENT_LINE_CAPACITY>) -> fmt::Result {
+    fn write_line(&self, out: &mut Text<EVENT_LINE_CAPACITY>) {
         match *self {
             Self::Break {
                 address,
                 thread,
                 stopped,
             } => {
-                hex(out, b"break addr=0x", address)?;
-                hex(out, b" thread=0x", thread)?;
-                out.push_bytes(stop(stopped))
+                hex(out, b"break addr=0x", address);
+                hex(out, b" thread=0x", thread);
+                put(out, stop(stopped))
             }
             Self::Execution(state) => {
-                out.push_bytes(b"execution ")?;
-                out.push_bytes(state.name().as_bytes())
+                put(out, b"execution ");
+                put(out, state.name().as_bytes())
             }
             Self::ExecutionStop(state) => {
-                out.push_bytes(b"execution ")?;
-                out.push_bytes(state.name().as_bytes())?;
-                out.push_bytes(stop(true))
+                put(out, b"execution ");
+                put(out, state.name().as_bytes());
+                put(out, stop(true))
             }
             Self::SingleStep {
                 address,
                 thread,
                 stopped,
             } => {
-                hex(out, b"singlestep addr=0x", address)?;
-                hex(out, b" thread=0x", thread)?;
-                out.push_bytes(stop(stopped))
+                hex(out, b"singlestep addr=0x", address);
+                hex(out, b" thread=0x", thread);
+                put(out, stop(stopped));
             }
             Self::ModuleLoad {
                 module,
@@ -315,39 +322,39 @@ impl Event<'_> {
                 let flag = |bit: u32, text: &'static [u8]| {
                     if module.flags & bit != 0 { text } else { b"" }
                 };
-                out.push_bytes(b"modload name=\"")?;
-                out.push_bytes(&module.name[..module.name_length])?;
-                hex(out, b"\" base=0x", module.base)?;
-                hex(out, b" size=0x", module.size)?;
-                hex(out, b" check=0x", module.checksum)?;
-                hex(out, b" timestamp=0x", module.timestamp)?;
-                hex(out, b" pdata=0x", module.pdata)?;
-                hex(out, b" psize=0x", module.pdata_size)?;
-                out.push_bytes(flag(module_flags::XBE, b" xbe"))?;
-                out.push_bytes(flag(module_flags::TLS, b" tls"))?;
-                out.push_bytes(flag(module_flags::DLL, b" dll"))?;
-                hex(out, b" thread=0x", thread)?;
-                hex(out, b" osize=0x", module.image_size)?;
-                out.push_bytes(stop(stopped))
+                put(out, b"modload name=\"");
+                put(out, &module.name[..module.name_length]);
+                hex(out, b"\" base=0x", module.base);
+                hex(out, b" size=0x", module.size);
+                hex(out, b" check=0x", module.checksum);
+                hex(out, b" timestamp=0x", module.timestamp);
+                hex(out, b" pdata=0x", module.pdata);
+                hex(out, b" psize=0x", module.pdata_size);
+                put(out, flag(module_flags::XBE, b" xbe"));
+                put(out, flag(module_flags::TLS, b" tls"));
+                put(out, flag(module_flags::DLL, b" dll"));
+                hex(out, b" thread=0x", thread);
+                hex(out, b" osize=0x", module.image_size);
+                put(out, stop(stopped))
             }
             Self::ModuleUnload { name, base, size } => {
-                out.push_bytes(b"modunload name=\"")?;
-                out.push_bytes(name.as_bytes())?;
-                hex(out, b"\" base=0x", base)?;
-                hex(out, b" size=0x", size)
+                put(out, b"modunload name=\"");
+                put(out, name.as_bytes());
+                hex(out, b"\" base=0x", base);
+                hex(out, b" size=0x", size);
             }
             Self::ThreadCreate {
                 thread,
                 start,
                 stopped,
             } => {
-                hex(out, b"create thread=0x", thread)?;
-                hex(out, b" start=0x", start)?;
-                out.push_bytes(stop(stopped))
+                hex(out, b"create thread=0x", thread);
+                hex(out, b" start=0x", start);
+                put(out, stop(stopped))
             }
             Self::ThreadTerminate { thread, stopped } => {
-                hex(out, b"terminate thread=0x", thread)?;
-                out.push_bytes(stop(stopped))
+                hex(out, b"terminate thread=0x", thread);
+                put(out, stop(stopped))
             }
             Self::Exception {
                 code,
@@ -358,27 +365,27 @@ impl Event<'_> {
                 noncontinuable,
                 stopped,
             } => {
-                hex(out, b"exception code=0x", code)?;
-                hex(out, b" thread=0x", thread)?;
-                hex(out, b" address=0x", address)?;
+                hex(out, b"exception code=0x", code);
+                hex(out, b" thread=0x", thread);
+                hex(out, b" address=0x", address);
                 match detail {
                     ExceptionDetail::AccessViolation { write, address } => {
                         let label: &[u8] = if write { b" write=0x" } else { b" read=0x" };
-                        hex(out, label, address)?;
+                        hex(out, label, address);
                     }
                     ExceptionDetail::Parameters { count, address } => {
-                        out.push_bytes(b" nparam=")?;
-                        out.push_decimal(count)?;
-                        hex(out, b" params=0x", address)?;
+                        put(out, b" nparam=");
+                        decimal(out, count);
+                        hex(out, b" params=0x", address);
                     }
                 }
                 if first_chance {
-                    out.push_bytes(b" first")?;
+                    put(out, b" first");
                 }
                 if noncontinuable {
-                    out.push_bytes(b" noncont")?;
+                    put(out, b" noncont");
                 }
-                out.push_bytes(stop(stopped))
+                put(out, stop(stopped))
             }
             // The monitor's assert case appends the stop suffix and then
             // falls into the common suffix code, so stopped lines carry it
@@ -389,11 +396,11 @@ impl Event<'_> {
                 string_length,
                 stopped,
             } => {
-                hex(out, b"assert thread=0x", thread)?;
-                hex(out, b" straddr=0x", string_address)?;
-                hex(out, b" strlen=0x", string_length)?;
-                out.push_bytes(stop(stopped))?;
-                out.push_bytes(stop(stopped))
+                hex(out, b"assert thread=0x", thread);
+                hex(out, b" straddr=0x", string_address);
+                hex(out, b" strlen=0x", string_length);
+                put(out, stop(stopped));
+                put(out, stop(stopped))
             }
             Self::Data {
                 access,
@@ -402,12 +409,12 @@ impl Event<'_> {
                 thread,
                 stopped,
             } => {
-                out.push_bytes(b"data ")?;
-                out.push_bytes(access.name().as_bytes())?;
-                hex(out, b"=0x", value)?;
-                hex(out, b" addr=0x", address)?;
-                hex(out, b" thread=0x", thread)?;
-                out.push_bytes(stop(stopped))
+                put(out, b"data ");
+                put(out, access.name().as_bytes());
+                hex(out, b"=0x", value);
+                hex(out, b" addr=0x", address);
+                hex(out, b" thread=0x", thread);
+                put(out, stop(stopped))
             }
             Self::Rip {
                 thread,
@@ -438,9 +445,9 @@ impl Event<'_> {
                 thread,
                 stopped,
             } => {
-                hex(out, b"ntassert addr=0x", address)?;
-                hex(out, b" thread=0x", thread)?;
-                out.push_bytes(stop(stopped))
+                hex(out, b"ntassert addr=0x", address);
+                hex(out, b" thread=0x", thread);
+                put(out, stop(stopped))
             }
             Self::PogoModuleStartup {
                 name,
@@ -448,13 +455,13 @@ impl Event<'_> {
                 thread,
                 stopped,
             } => {
-                out.push_bytes(b"pogomodstartup name=\"")?;
-                out.push_bytes(name.as_bytes())?;
-                hex(out, b"\" module=0x", module)?;
-                hex(out, b" thread=0x", thread)?;
-                out.push_bytes(stop(stopped))
+                put(out, b"pogomodstartup name=\"");
+                put(out, name.as_bytes());
+                hex(out, b"\" module=0x", module);
+                hex(out, b" thread=0x", thread);
+                put(out, stop(stopped));
             }
-            Self::DebugString { .. } | Self::AssertString { .. } => Ok(()),
+            Self::DebugString { .. } | Self::AssertString { .. } => {}
         }
     }
 }
@@ -662,7 +669,7 @@ impl Notifications {
             }
             _ => {
                 let mut line = Text::<EVENT_LINE_CAPACITY>::new();
-                let _ = event.write_line(&mut line);
+                event.write_line(&mut line);
                 self.send_text(line.as_bytes(), network)
             }
         }
@@ -729,7 +736,7 @@ fn connect_target(
 ) -> Option<SocketId> {
     let socket = network.connect(endpoint, true).ok()?;
     let mut line = Text::<EVENT_LINE_CAPACITY>::new();
-    let _ = Event::Execution(execution).write_line(&mut line);
+    Event::Execution(execution).write_line(&mut line);
     if send_line(network, socket, line.as_bytes()).is_err() {
         network.close(socket);
         return None;
@@ -857,7 +864,7 @@ mod tests {
 
     fn line(event: Event<'_>) -> Text<EVENT_LINE_CAPACITY> {
         let mut text = Text::new();
-        event.write_line(&mut text).unwrap();
+        event.write_line(&mut text);
         text
     }
 

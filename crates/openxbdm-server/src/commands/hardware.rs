@@ -126,13 +126,7 @@ const fn entry(
     flags: DispatchFlags,
     handler: fn(&mut Invocation<'_>) -> Hresult,
 ) -> CommandEntry {
-    CommandEntry {
-        name,
-        any_of,
-        all_of: Access::NONE,
-        flags,
-        handler,
-    }
+    CommandEntry::new(name, any_of, Access::NONE, flags, handler)
 }
 
 const BAD_PARAMETER: Hresult = Hresult::from_error_code(ErrorCode::BAD_PARAMETER);
@@ -573,26 +567,21 @@ fn set_packet_resume(user: u32, cx: &mut ContinuationContext<'_>) -> Hresult {
     )
 }
 
-/// A dword parameter as the monitor's getter reads it.
-fn dword(invocation: &Invocation<'_>, name: &str) -> Option<u32> {
-    invocation.line.param(name).and_then(|value| value.dword())
-}
-
 /// `avatar`: run one avatar system test hook.
 fn avatar(invocation: &mut Invocation<'_>) -> Hresult {
     if !invocation.backend.avatar_hooks_available() {
         return Hresult::OK;
     }
     let clamp = |value: u32| (value as i32).max(0) as u32;
-    let hook = if let Some(value) = dword(invocation, "loadassetdelay") {
+    let hook = if let Some(value) = invocation.line.dword("loadassetdelay") {
         AvatarHook::LoadAssetDelay(clamp(value))
-    } else if let Some(value) = dword(invocation, "querymarketplacedelay") {
+    } else if let Some(value) = invocation.line.dword("querymarketplacedelay") {
         AvatarHook::QueryMarketplaceDelay(clamp(value))
-    } else if let Some(value) = dword(invocation, "changemetadata") {
+    } else if let Some(value) = invocation.line.dword("changemetadata") {
         AvatarHook::ChangeMetadata(value)
     } else if let (Some(kind), Some(value)) = (
-        dword(invocation, "simulateerrortype"),
-        dword(invocation, "simulateerrorvalue"),
+        invocation.line.dword("simulateerrortype"),
+        invocation.line.dword("simulateerrorvalue"),
     ) {
         if kind >= 1 {
             return Hresult::FAIL;
@@ -797,17 +786,6 @@ fn irt_sweep(invocation: &mut Invocation<'_>) -> Hresult {
     Hresult::error(0)
 }
 
-const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
-
-fn push_hex(invocation: &mut Invocation<'_>, bytes: &[u8]) {
-    for &byte in bytes {
-        let _ = invocation.text.push_bytes(&[
-            HEX_UPPER[usize::from(byte >> 4)],
-            HEX_UPPER[usize::from(byte & 0xf)],
-        ]);
-    }
-}
-
 /// Offset of the `mixcmd` subcommand: the monitor assumes `mixcmd ` precedes it.
 const MIX_SUBCOMMAND: usize = 7;
 /// Offset of the separator after `xamheap`.
@@ -820,12 +798,7 @@ fn buffer_byte(buffer: &[u8], offset: usize) -> u8 {
 
 /// The NUL-terminated text at `offset` of the receive buffer.
 fn buffer_text(buffer: &[u8], offset: usize) -> &[u8] {
-    let rest = buffer.get(offset..).unwrap_or(&[]);
-    let end = rest
-        .iter()
-        .position(|&byte| byte == 0)
-        .unwrap_or(rest.len());
-    &rest[..end]
+    console::c_string(buffer.get(offset..).unwrap_or(&[]))
 }
 
 /// `mixcmd`: memory statistics passed through as hex. The subcommand is
@@ -849,7 +822,7 @@ fn mix_command(invocation: &mut Invocation<'_>) -> Hresult {
             return SERVICE_FAILED;
         }
         invocation.text.set_bytes(b"OK querystats ");
-        push_hex(invocation, &block);
+        let _ = invocation.text.push_hex_upper(&block);
         return Hresult::OK;
     }
     if subcommand == b"countxamheaps" {
@@ -928,15 +901,11 @@ fn mix_xam_heap(invocation: &mut Invocation<'_>) -> Hresult {
             return SERVICE_FAILED;
         }
     }
-    let name_length = name
-        .iter()
-        .position(|&byte| byte == 0)
-        .unwrap_or(name.len());
     invocation.text.set_bytes(b"OK xamheap Name=");
-    let _ = invocation.text.push_bytes(&name[..name_length]);
+    let _ = invocation.text.push_bytes(console::c_string(&name));
     let _ = invocation.text.push_bytes(b" Data=");
-    push_hex(invocation, &usage);
-    push_hex(invocation, &limits);
+    let _ = invocation.text.push_hex_upper(&usage);
+    let _ = invocation.text.push_hex_upper(&limits);
     Hresult::OK
 }
 
@@ -950,7 +919,7 @@ fn mock_currency_value(invocation: &mut Invocation<'_>) -> Hresult {
     let mut message = [0u8; 0x14];
     match on_off(value.copy_into(&mut buffer)) {
         Some(true) => {
-            let Some(amount) = dword(invocation, "value") else {
+            let Some(amount) = invocation.line.dword("value") else {
                 return BAD_PARAMETER;
             };
             message[0..4].copy_from_slice(&1u32.to_be_bytes());
@@ -1132,9 +1101,10 @@ fn usb_port_control(invocation: &mut Invocation<'_>) -> Hresult {
     if !invocation.backend.usb_port_power_available() {
         return ACCESS_DENIED;
     }
-    let (Some(controller), Some(port)) =
-        (dword(invocation, "controller"), dword(invocation, "port"))
-    else {
+    let (Some(controller), Some(port)) = (
+        invocation.line.dword("controller"),
+        invocation.line.dword("port"),
+    ) else {
         return BAD_PARAMETER;
     };
     let enable = if invocation.line.has("enable") {

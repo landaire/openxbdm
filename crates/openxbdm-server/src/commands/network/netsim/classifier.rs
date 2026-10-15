@@ -9,7 +9,7 @@
 
 mod compile;
 mod grammar;
-mod variant;
+pub mod variant;
 
 pub use self::compile::Compiled;
 pub use self::compile::compile_text;
@@ -22,7 +22,7 @@ pub const NODE_LIMIT: usize = 0x20;
 /// Fields of the frame field table (0x91f0ca48).
 pub const FIELD_COUNT: u8 = 0x55;
 /// Bytes the program text of one blob can hold.
-const TEXT_CAPACITY: usize = 0xdc;
+pub const TEXT_CAPACITY: usize = 0xdc;
 /// Distinct strings while parsing: every reference takes at least two bytes
 /// of the blob.
 const STRING_LIMIT: usize = TEXT_CAPACITY / 2;
@@ -169,7 +169,7 @@ struct Span {
 }
 
 /// A parsed program.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Program {
     items: [Item; ITEM_LIMIT],
     item_count: u8,
@@ -284,6 +284,40 @@ impl Program {
     pub fn string(&self, id: StringId) -> &[u8] {
         let span = self.strings[usize::from(id.0)];
         &self.text[usize::from(span.start)..usize::from(span.start) + usize::from(span.len)]
+    }
+
+    /// The bytes of every string; string operands are ranges of it.
+    pub fn text(&self) -> &[u8] {
+        &self.text[..usize::from(self.text_len)]
+    }
+
+    /// A value as an operand: a string is its range of [`Program::text`],
+    /// the opaque type has no value.
+    pub fn variant(&self, value: Value) -> variant::Variant {
+        use variant::Variant;
+        match value {
+            Value::Null | Value::Opaque => Variant::Null,
+            Value::Bool(value) => Variant::Bool(value),
+            Value::I8(value) => Variant::I8(value),
+            Value::I16(value) => Variant::I16(value),
+            Value::I32(value) => Variant::I32(value),
+            Value::I64(value) => Variant::I64(value),
+            Value::U8(value) => Variant::U8(value),
+            Value::U16(value) => Variant::U16(value),
+            Value::U32(value) => Variant::U32(value),
+            Value::U64(value) => Variant::U64(value),
+            Value::Mac(bytes) => Variant::Mac(bytes),
+            Value::Ipv4(bytes) => Variant::Ipv4(bytes),
+            Value::Ipv6(bytes) => Variant::Ipv6(bytes),
+            Value::Str(id) => {
+                let span = self.strings[usize::from(id.0)];
+                let start = usize::from(span.start);
+                Variant::Str(variant::Text {
+                    start,
+                    end: start + usize::from(span.len),
+                })
+            }
+        }
     }
 
     /// Register a string, reusing an equal one (0x91f84938).

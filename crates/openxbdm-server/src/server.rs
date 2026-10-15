@@ -254,10 +254,9 @@ impl Server {
             .get_mut(index.0 as usize)
             .and_then(Option::take)
         {
-            crate::commands::debugger::connection_closed(
-                &mut self.state,
-                connection.session.socket,
-            );
+            let socket = connection.session.socket;
+            crate::commands::debugger::connection_closed(&mut self.state, socket);
+            self.state.transfer_blocks.abandon(socket);
             network.close(connection.session.socket);
         }
     }
@@ -366,7 +365,7 @@ impl Server {
                 &[line],
             );
             if let Some(entry) = entry
-                && !(entry.flags.contains(DispatchFlags::DEVKIT_ONLY)
+                && !(entry.flags().contains(DispatchFlags::DEVKIT_ONLY)
                     && invocation.backend.is_test_kit())
             {
                 (entry.handler)(&mut invocation);
@@ -745,6 +744,9 @@ impl Server {
             return Outcome::Released;
         };
         connection.session.continuation = Continuation::None;
+        self.state
+            .transfer_blocks
+            .abandon(connection.session.socket);
         connection.session.receive_remaining = None;
         connection.session.request = None;
         connection.transfer = Transfer::Idle;
@@ -836,7 +838,7 @@ impl Server {
             match registry::lookup(word) {
                 None => Hresult::from_error_code(ErrorCode::UNKNOWN_COMMAND),
                 Some(entry)
-                    if entry.flags.contains(DispatchFlags::DEVKIT_ONLY)
+                    if entry.flags().contains(DispatchFlags::DEVKIT_ONLY)
                         && backend.is_test_kit() =>
                 {
                     Hresult::from_error_code(ErrorCode::UNKNOWN_COMMAND)
@@ -847,8 +849,8 @@ impl Server {
                 // Handlers that run on their own thread skip the context check.
                 Some(entry)
                     if connection.owner != Owner::Main
-                        && !entry.flags.contains(DispatchFlags::ANY_CONTEXT)
-                        && !entry.flags.contains(DispatchFlags::OWN_THREAD) =>
+                        && !entry.flags().contains(DispatchFlags::ANY_CONTEXT)
+                        && !entry.flags().contains(DispatchFlags::OWN_THREAD) =>
                 {
                     Hresult::from_error_code(ErrorCode::DEDICATED_CONNECTION_REQUIRED)
                 }

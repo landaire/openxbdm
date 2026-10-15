@@ -229,7 +229,7 @@ impl netsim::Backend for MockBackend {
             .map(|queue| QueueSnapshot {
                 kind: queue.kind,
                 config: queue.config,
-                program: queue.program.clone(),
+                program: queue.program,
             })
             .ok_or(status::INVALID)
     }

@@ -4,8 +4,6 @@
 //! kernel objects in an unnamed object directory); this module applies the
 //! monitor's rules on top of it.
 
-use core::fmt::Write as _;
-
 use openxbdm_core::auth;
 use openxbdm_core::auth::DH_LENGTH;
 use openxbdm_core::auth::DhValue;
@@ -25,6 +23,7 @@ use crate::registry::DispatchFlags;
 use crate::state::LockMode;
 use crate::state::ServerState;
 use crate::text::Text;
+use crate::transfer_blocks::TransferBlock;
 
 /// Bytes of a stored user name, including the terminator.
 pub const USER_NAME_CAPACITY: usize = 0x40;
@@ -38,13 +37,7 @@ const fn entry(
     any_of: Access,
     handler: crate::registry::Handler,
 ) -> CommandEntry {
-    CommandEntry {
-        name,
-        any_of,
-        all_of: Access::NONE,
-        flags: DispatchFlags::NONE,
-        handler,
-    }
+    CommandEntry::new(name, any_of, Access::NONE, DispatchFlags::NONE, handler)
 }
 
 pub(crate) const COMMANDS: &[CommandEntry] = &[
@@ -143,10 +136,10 @@ pub enum Continuation {
 }
 
 /// `keyxchg` transfer: the client value is received, then the server value
-/// is sent in the same buffer.
+/// is sent in the same block (stock allocates it from pool memory).
 #[derive(Debug)]
 pub struct KeyExchange {
-    value: DhValue,
+    value: TransferBlock,
     phase: KeyExchangePhase,
 }
 
@@ -229,18 +222,11 @@ pub(crate) fn settings_lines(
         let _ = line.push_bytes(name.as_bytes());
         let _ = line.push_bytes(b"\"");
         if let Some(Password(password)) = user.password {
-            let _ = write!(
-                line,
-                " passwd=0q{:08x}{:08x}",
-                (password >> 32) as u32,
-                password as u32
-            );
+            let _ = line.push_bytes(b" passwd=0q");
+            let _ = line.push_hex32((password >> 32) as u32);
+            let _ = line.push_hex32(password as u32);
         }
-        for (bit, word) in PRIVILEGE_WORDS {
-            if user.privileges.intersects(bit) {
-                let _ = write!(line, " {word}");
-            }
-        }
+        let _ = line.push_bytes(privilege_words(user.privileges).as_bytes());
         system::write_bytes(backend, file, line.as_bytes());
         system::end_line(backend, file);
     }
@@ -253,13 +239,16 @@ fn parse_privileges(line: &CommandLine<'_>) -> Access {
         .fold(Access::NONE, |privileges, &(bit, _)| privileges.union(bit))
 }
 
-/// Append ` read`, ` write`, ... for each privilege held.
-fn push_privileges<const N: usize>(text: &mut Text<N>, privileges: Access) {
-    for (bit, word) in PRIVILEGE_WORDS {
+/// ` read`, ` write`, ... for each privilege held.
+fn privilege_words(privileges: Access) -> Text<48> {
+    let mut words = Text::new();
+    for &(bit, word) in &PRIVILEGE_WORDS {
         if privileges.intersects(bit) {
-            let _ = write!(text, " {word}");
+            let _ = words.push_bytes(b" ");
+            let _ = words.push_bytes(word.as_bytes());
         }
     }
+    words
 }
 
 fn qword(words: [u32; 2]) -> u64 {
@@ -276,11 +265,7 @@ fn lock_mode(invocation: &mut Invocation<'_>) -> Hresult {
     } else if lock.is_locked() {
         // Relocking keeps the box id and drops file encryption.
         lock.mode = LockMode::Locked;
-    } else if let Some(box_id) = invocation
-        .line
-        .param("boxid")
-        .and_then(|value| value.qword())
-    {
+    } else if let Some(box_id) = invocation.line.qword("boxid") {
         lock.box_id = [(box_id >> 32) as u32, box_id as u32];
         lock.mode = LockMode::Locked;
     } else {
@@ -341,11 +326,7 @@ fn admin_password(invocation: &mut Invocation<'_>) -> Hresult {
             None => return Hresult::from_error_code(ErrorCode::KEY_EXCHANGE_REQUIRED),
         },
     };
-    let Some(password) = invocation
-        .line
-        .param("passwd")
-        .and_then(|value| value.qword())
-    else {
+    let Some(password) = invocation.line.qword("passwd") else {
         invocation.set_text(format_args!("missing passwd"));
         return Hresult::FAIL;
     };
@@ -370,14 +351,12 @@ fn authenticate_user(invocation: &mut Invocation<'_>) -> Hresult {
         return Hresult::FAIL;
     };
     let line = invocation.line;
-    let password = session.session_key.and_then(|key| {
-        line.param("passwd")
-            .and_then(|value| value.qword())
-            .map(|password| password ^ key.0)
-    });
+    let password = session
+        .session_key
+        .and_then(|key| line.qword("passwd").map(|password| password ^ key.0));
     let (mut mode, value) = match password {
         Some(password) => (AuthMode::SetPassword, password),
-        None => match line.param("resp").and_then(|value| value.qword()) {
+        None => match line.qword("resp") {
             Some(response) => (AuthMode::Response, response),
             None => {
                 invocation.text.set_bytes(b"missing response");
@@ -477,8 +456,7 @@ fn get_user_privileges(invocation: &mut Invocation<'_>) -> Hresult {
     } else {
         // The monitor writes each word with a leading space one byte before
         // the reply text, so the first space is dropped.
-        let mut words = Text::<48>::new();
-        push_privileges(&mut words, privileges);
+        let words = privilege_words(privileges);
         invocation
             .text
             .set_bytes(words.as_bytes().get(1..).unwrap_or_default());
@@ -538,11 +516,7 @@ fn user(invocation: &mut Invocation<'_>) -> Hresult {
         return remove_user(invocation.state, invocation.backend, name);
     }
     let password = match invocation.session {
-        None => invocation
-            .line
-            .param("passwd")
-            .and_then(|value| value.qword())
-            .map(Password),
+        None => invocation.line.qword("passwd").map(Password),
         Some(_) => None,
     };
     let privileges = parse_privileges(&invocation.line);
@@ -651,22 +625,34 @@ fn resume_user_list(index: &mut u32, cx: &mut ContinuationContext<'_>) -> Hresul
     let _ = cx.line.push_bytes(b"name=\"");
     let _ = cx.line.push_bytes(name.as_bytes());
     let _ = cx.line.push_bytes(b"\"");
-    push_privileges(cx.line, user.privileges);
+    let _ = cx
+        .line
+        .push_bytes(privilege_words(user.privileges).as_bytes());
     Hresult::OK
 }
 
 /// `keyxchg`: receives the client's 0x60-byte public value, replies with
 /// the server's, and sets the session key from the shared secret.
 fn key_exchange(invocation: &mut Invocation<'_>) -> Hresult {
-    let Some(session) = invocation.session.as_deref_mut() else {
+    let Some(socket) = invocation.session.as_ref().map(|session| session.socket()) else {
         return Hresult::FAIL;
     };
-    session.continuation =
-        crate::continuation::Continuation::Security(Continuation::KeyExchange(KeyExchange {
-            value: DhValue([0; DH_LENGTH]),
-            phase: KeyExchangePhase::Receiving,
-        }));
-    session.receive_remaining = Some(DH_LENGTH as u32);
+    let Some(value) =
+        invocation
+            .state
+            .transfer_blocks
+            .acquire(invocation.backend, socket, DH_LENGTH as u32)
+    else {
+        return Hresult::OUT_OF_MEMORY;
+    };
+    if let Some(session) = invocation.session.as_deref_mut() {
+        session.continuation =
+            crate::continuation::Continuation::Security(Continuation::KeyExchange(KeyExchange {
+                value,
+                phase: KeyExchangePhase::Receiving,
+            }));
+        session.receive_remaining = Some(DH_LENGTH as u32);
+    }
     Hresult::SEND_BINARY
 }
 
@@ -680,26 +666,37 @@ fn resume_key_exchange(exchange: &mut KeyExchange, cx: &mut ContinuationContext<
             }
             let offset = DH_LENGTH - remaining;
             let count = cx.received.len().min(remaining);
-            exchange.value.0[offset..offset + count].copy_from_slice(&cx.received[..count]);
+            let value =
+                &mut cx.state.transfer_blocks.bytes(cx.backend, exchange.value)[..DH_LENGTH];
+            value[offset..offset + count].copy_from_slice(&cx.received[..count]);
             let remaining = remaining - count;
             cx.session.receive_remaining = Some(remaining as u32);
             if remaining != 0 {
                 return Hresult::OK;
             }
+            let mut client = DhValue([0; DH_LENGTH]);
+            client.0.copy_from_slice(value);
             let mut exponent = DhValue([0; DH_LENGTH]);
             cx.backend.random_bytes(&mut exponent.0);
-            let shared = auth::dh_mod_exp(Some(&exchange.value), &exponent);
-            exchange.value = auth::dh_mod_exp(None, &exponent);
+            let shared = auth::dh_mod_exp(Some(&client), &exponent);
+            let server = auth::dh_mod_exp(None, &exponent);
+            cx.state.transfer_blocks.bytes(cx.backend, exchange.value)[..DH_LENGTH]
+                .copy_from_slice(&server.0);
             exchange.phase = KeyExchangePhase::Sending;
             cx.session.session_key = Some(SessionKey::derive(&shared));
             Hresult::BINARY
         }
         KeyExchangePhase::Sending => {
-            cx.binary[..DH_LENGTH].copy_from_slice(&exchange.value.0);
+            cx.binary[..DH_LENGTH].copy_from_slice(
+                &cx.state.transfer_blocks.bytes(cx.backend, exchange.value)[..DH_LENGTH],
+            );
             cx.binary_len = DH_LENGTH;
             exchange.phase = KeyExchangePhase::Sent;
             Hresult::OK
         }
-        KeyExchangePhase::Sent => Hresult::END_OF_DATA,
+        KeyExchangePhase::Sent => {
+            cx.state.transfer_blocks.release(cx.backend, exchange.value);
+            Hresult::END_OF_DATA
+        }
     }
 }

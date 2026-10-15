@@ -5,7 +5,11 @@
 use openxbdm_server::commands::network::netsim::classifier::Node;
 use openxbdm_server::commands::network::netsim::classifier::Operator;
 use openxbdm_server::commands::network::netsim::classifier::Program;
+use openxbdm_server::commands::network::netsim::classifier::TEXT_CAPACITY;
 use openxbdm_server::commands::network::netsim::classifier::Value;
+use openxbdm_server::commands::network::netsim::classifier::variant;
+use openxbdm_server::commands::network::netsim::classifier::variant::Text;
+use openxbdm_server::commands::network::netsim::classifier::variant::Variant;
 
 use super::frame::ETHERNET_HEADER;
 use super::frame::Parsed;
@@ -16,108 +20,8 @@ pub(super) struct EvaluationFailed;
 
 type Result<T, E = EvaluationFailed> = core::result::Result<T, E>;
 
-/// Where a runtime string lives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Base {
-    /// A program string.
-    Program(u8),
-    /// The decoded DNS question name of the frame.
-    Name,
-}
-
-/// A runtime string: bytes `start..end` of its base.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Text {
-    base: Base,
-    start: u16,
-    end: u16,
-}
-
-/// Runtime values (stock variant types 0..9, 0xf, 0x10).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Variant {
-    Null,
-    Bool(bool),
-    I8(i8),
-    I16(i16),
-    I32(i32),
-    I64(i64),
-    U8(u8),
-    U16(u16),
-    U32(u32),
-    U64(u64),
-    Mac([u8; 6]),
-    Ipv4([u8; 4]),
-    Ipv6([u8; 16]),
-    Opaque,
-    Str(Text),
-}
-
-impl Variant {
-    fn from_value(value: Value) -> Variant {
-        match value {
-            Value::Null => Variant::Null,
-            Value::Bool(value) => Variant::Bool(value),
-            Value::I8(value) => Variant::I8(value),
-            Value::I16(value) => Variant::I16(value),
-            Value::I32(value) => Variant::I32(value),
-            Value::I64(value) => Variant::I64(value),
-            Value::U8(value) => Variant::U8(value),
-            Value::U16(value) => Variant::U16(value),
-            Value::U32(value) => Variant::U32(value),
-            Value::U64(value) => Variant::U64(value),
-            Value::Mac(bytes) => Variant::Mac(bytes),
-            Value::Ipv4(bytes) => Variant::Ipv4(bytes),
-            Value::Ipv6(bytes) => Variant::Ipv6(bytes),
-            Value::Opaque => Variant::Opaque,
-            Value::Str(id) => Variant::Str(Text {
-                base: Base::Program(id.0),
-                start: 0,
-                end: u16::MAX,
-            }),
-        }
-    }
-
-    /// Integer conversion source (0x91f8a0b8): the value widened to 64
-    /// bits.
-    fn integer(self) -> Result<u64> {
-        Ok(match self {
-            Variant::Bool(value) => u64::from(value),
-            Variant::I8(value) => value as i64 as u64,
-            Variant::I16(value) => value as i64 as u64,
-            Variant::I32(value) => value as i64 as u64,
-            Variant::I64(value) => value as u64,
-            Variant::U8(value) => u64::from(value),
-            Variant::U16(value) => u64::from(value),
-            Variant::U32(value) => u64::from(value),
-            Variant::U64(value) => value,
-            _ => return Err(EvaluationFailed),
-        })
-    }
-
-    /// 0x91f89fe0.
-    fn truth(self) -> Result<bool> {
-        match self {
-            Variant::Bool(value) => Ok(value),
-            other => Ok(other.integer()? != 0),
-        }
-    }
-
-    fn is_unsigned(self) -> bool {
-        matches!(
-            self,
-            Variant::U8(_) | Variant::U16(_) | Variant::U32(_) | Variant::U64(_)
-        )
-    }
-}
-
-/// Conversion to `i32` (0x91f8a0b8 to type 4): sources wider than 32 bits
-/// fail; narrower ones keep their bit pattern.
-fn int32(value: Variant) -> Result<i32> {
-    match value {
-        Variant::I64(_) | Variant::U64(_) => Err(EvaluationFailed),
-        other => Ok(other.integer()? as i32),
-    }
+fn truth(value: &Variant) -> Result<bool> {
+    variant::to_bool(value).map_err(|_| EvaluationFailed)
 }
 
 /// How a field reads its value (getters of the table at 0x91f0ca48).
@@ -302,6 +206,10 @@ const FIELDS: [Field; 0x55] = [
 /// Bytes of the DNS question name buffer (0x100 in stock).
 const NAME_CAPACITY: usize = 0x100;
 
+/// The decoded question name follows the program text in the evaluation
+/// text, so that every string is a range of one buffer.
+const NAME_START: usize = TEXT_CAPACITY;
+
 /// One evaluation of a program against a frame.
 pub(super) struct Evaluation<'a> {
     program: &'a Program,
@@ -311,8 +219,9 @@ pub(super) struct Evaluation<'a> {
     items: [Option<Variant>; 0x10],
     /// Operand node indices of every node.
     operands: [[u8; 5]; 0x20],
-    name: [u8; NAME_CAPACITY],
-    name_len: Option<u16>,
+    /// The program text, then the question name.
+    text: [u8; NAME_START + NAME_CAPACITY],
+    name_len: Option<usize>,
 }
 
 /// Whether the frame passes `program` (0x91f8c988).
@@ -327,9 +236,11 @@ pub(super) fn matches(
         parsed,
         items: [None; 0x10],
         operands: [[0; 5]; 0x20],
-        name: [0; NAME_CAPACITY],
+        text: [0; NAME_START + NAME_CAPACITY],
         name_len: None,
     };
+    let program_text = program.text();
+    evaluation.text[..program_text.len()].copy_from_slice(program_text);
     let nodes = program.nodes();
     let mut stack = [0u8; 0x20];
     let mut depth = 0;
@@ -345,28 +256,17 @@ pub(super) fn matches(
     }
     let root = evaluation.evaluate(nodes.len() - 1)?;
     // 0x91f84768: the result as a truth value.
-    root.truth()
+    truth(&root)
 }
 
 impl Evaluation<'_> {
-    fn text<'s>(&'s self, text: Text) -> &'s [u8] {
-        let bytes: &[u8] = match text.base {
-            Base::Program(id) => self
-                .program
-                .string(openxbdm_server::commands::network::netsim::classifier::StringId(id)),
-            Base::Name => &self.name[..usize::from(self.name_len.unwrap_or(0))],
-        };
-        let end = usize::from(text.end).min(bytes.len());
-        &bytes[usize::from(text.start).min(end)..end]
-    }
-
     fn operand(&mut self, node: usize, index: usize) -> Result<Variant> {
         self.evaluate(usize::from(self.operands[node][index]))
     }
 
     fn evaluate(&mut self, node: usize) -> Result<Variant> {
         match self.program.nodes()[node] {
-            Node::Constant(value) => Ok(Variant::from_value(value)),
+            Node::Constant(value) => Ok(self.program.variant(value)),
             // Names resolve against named items, which netsim programs do
             // not have; stock creates an item without a field and fails.
             Node::Name(_) => Err(EvaluationFailed),
@@ -379,47 +279,19 @@ impl Evaluation<'_> {
 
     fn operator(&mut self, node: usize, operator: Operator, count: usize) -> Result<Variant> {
         match operator.0 {
-            // Indexed names (op 3) need named items.
-            3 => Err(EvaluationFailed),
-            6 => {
-                let value = self.operand(node, 0)?;
-                arithmetic(Variant::I32(-1), 2, value)
-            }
-            8 => Ok(Variant::Bool(!self.operand(node, 0)?.truth()?)),
-            9 => complement(self.operand(node, 0)?),
-            0xa..=0x19 => {
-                let left = self.operand(node, 0)?;
-                let right = self.operand(node, 1)?;
-                let op = match operator.0 {
-                    0x11..=0x16 => return self.compare(left, operator.0 - 0x11, right),
-                    0xa => 2,
-                    0xb => 3,
-                    0xc => 4,
-                    0xd => 0,
-                    0xe => 1,
-                    0xf => 5,
-                    0x10 => 6,
-                    0x17 => 7,
-                    0x18 => 8,
-                    _ => 9,
-                };
-                arithmetic(left, op, right)
-            }
             0x1a | 0x1b => self.logical(node, operator.0 == 0x1a),
             0x1c => {
-                let condition = self.operand(node, 0)?.truth()?;
+                let condition = truth(&self.operand(node, 0)?)?;
                 self.operand(node, if condition { 1 } else { 2 })
             }
-            0x1e => match self.operand(node, 0)? {
-                Variant::Str(text) => Ok(Variant::I32(self.text(text).len() as i32)),
-                _ => Err(EvaluationFailed),
-            },
-            0x1f..=0x24 => {
+            // Indexed names (op 3) need named items.
+            6 | 8 | 9 | 0xa..=0x19 | 0x1e..=0x24 => {
                 let mut arguments = [Variant::Null; 5];
                 for (index, argument) in arguments.iter_mut().enumerate().take(count) {
                     *argument = self.operand(node, index)?;
                 }
-                self.string_function(operator.0, &arguments[..count])
+                variant::apply(&self.text, operator, &arguments[..count])
+                    .map_err(|_| EvaluationFailed)
             }
             _ => Err(EvaluationFailed),
         }
@@ -429,169 +301,21 @@ impl Evaluation<'_> {
     /// the left one (0x91f8a888); otherwise a deciding left operand skips
     /// the right one (0x91f85310).
     fn logical(&mut self, node: usize, and: bool) -> Result<Variant> {
-        let left = self.operand(node, 0)?;
+        let left = truth(&self.operand(node, 0)?);
         let right_node = usize::from(self.operands[node][1]);
         if let Node::Constant(value) = self.program.nodes()[right_node] {
-            let (left, right) = (left.truth()?, Variant::from_value(value).truth()?);
+            let (left, right) = (left?, truth(&self.program.variant(value))?);
             return Ok(Variant::Bool(if and {
                 left && right
             } else {
                 left || right
             }));
         }
-        let decided = left.truth()?;
+        let decided = left?;
         if decided != and {
             return Ok(Variant::Bool(decided));
         }
-        let right = self.evaluate(right_node)?.truth()?;
-        Ok(Variant::Bool(right))
-    }
-
-    /// 0x91f8b5e8: strings compare by signed bytes, addresses of one type
-    /// by unsigned bytes, integers as unsigned 64-bit when either is
-    /// unsigned and signed otherwise.
-    fn compare(&self, left: Variant, op: u8, right: Variant) -> Result<Variant> {
-        let order = match (left, right) {
-            (Variant::Str(a), Variant::Str(b)) => {
-                compare_text(self.text(a), self.text(b), false, false)
-            }
-            (Variant::Mac(a), Variant::Mac(b)) => a.cmp(&b) as i32,
-            (Variant::Ipv4(a), Variant::Ipv4(b)) => a.cmp(&b) as i32,
-            (Variant::Ipv6(a), Variant::Ipv6(b)) => a.cmp(&b) as i32,
-            (
-                Variant::Mac(_) | Variant::Ipv4(_) | Variant::Ipv6(_),
-                Variant::Mac(_) | Variant::Ipv4(_) | Variant::Ipv6(_),
-            ) => {
-                return Err(EvaluationFailed);
-            }
-            _ => {
-                let unsigned = left.is_unsigned() || right.is_unsigned();
-                let a = left.integer()?;
-                let b = right.integer()?;
-                let ordering = if unsigned {
-                    a.cmp(&b)
-                } else {
-                    (a as i64).cmp(&(b as i64))
-                };
-                ordering as i32
-            }
-        };
-        Ok(Variant::Bool(match op {
-            0 => order < 0,
-            1 => order > 0,
-            2 => order <= 0,
-            3 => order >= 0,
-            4 => order == 0,
-            _ => order != 0,
-        }))
-    }
-
-    /// The string functions; every failure is an evaluation error.
-    fn string_function(&self, function: u8, arguments: &[Variant]) -> Result<Variant> {
-        let Variant::Str(haystack) = arguments[0] else {
-            return Err(EvaluationFailed);
-        };
-        let text = self.text(haystack);
-        let fold = |value: Option<&Variant>| -> Result<bool> {
-            value.map_or(Ok(false), |value| value.truth())
-        };
-        let other = |value: Variant| -> Result<&[u8]> {
-            match value {
-                Variant::Str(other) => Ok(self.text(other)),
-                _ => Err(EvaluationFailed),
-            }
-        };
-        match function {
-            // String.Compare(a, b[, ignorecase]) (0x91f8a938).
-            0x1f => {
-                let other = other(arguments[1])?;
-                Ok(Variant::I32(compare_text(
-                    text,
-                    other,
-                    fold(arguments.get(2))?,
-                    false,
-                )))
-            }
-            // String.IndexOf(s, t[, start][, count][, ignorecase]) and
-            // String.Contains(s, t[, ignorecase]) (0x91f8a9f0). A boolean
-            // in the last position is the case flag.
-            0x20 | 0x21 => {
-                let needle = other(arguments[1])?;
-                let is_bool = |index: usize| matches!(arguments.get(index), Some(Variant::Bool(_)));
-                let (start, count, case) = match (function, arguments.len()) {
-                    (0x21, _) => (None, None, arguments.get(2)),
-                    (_, 3) if is_bool(2) => (None, None, arguments.get(2)),
-                    (_, 3) => (arguments.get(2), None, None),
-                    (_, 4) if is_bool(3) => (arguments.get(2), None, arguments.get(3)),
-                    (_, 4) => (arguments.get(2), arguments.get(3), None),
-                    (_, 5) => (arguments.get(2), arguments.get(3), arguments.get(4)),
-                    _ => (None, None, None),
-                };
-                let begin = match start {
-                    Some(&start) => {
-                        let start = int32(start)?;
-                        if start < 0 || start as usize >= text.len() {
-                            return Err(EvaluationFailed);
-                        }
-                        start as usize
-                    }
-                    None => 0,
-                };
-                let end = match count {
-                    Some(&count) => {
-                        let count = int32(count)?;
-                        if count <= 0 || begin + count as usize > text.len() {
-                            return Err(EvaluationFailed);
-                        }
-                        begin + count as usize
-                    }
-                    None => text.len(),
-                };
-                let found = search(&text[begin..end], needle, fold(case)?);
-                Ok(match function {
-                    0x21 => Variant::Bool(found >= 0),
-                    _ if found < 0 => Variant::I32(found),
-                    _ => Variant::I32(found + begin as i32),
-                })
-            }
-            // String.StartsWith and String.EndsWith (0x91f8abb0, 0x91f8ac90).
-            0x22 | 0x23 => {
-                let affix = other(arguments[1])?;
-                let fold = fold(arguments.get(2))?;
-                if text.is_empty() || affix.is_empty() || text.len() < affix.len() {
-                    return Ok(Variant::Bool(false));
-                }
-                Ok(Variant::Bool(if function == 0x22 {
-                    compare_text(text, affix, fold, true) == 0
-                } else {
-                    compare_text(&text[text.len() - affix.len()..], affix, fold, false) == 0
-                }))
-            }
-            // String.Substring(s, start[, length]) (0x91f8b0b0).
-            _ => {
-                let start = int32(arguments[1])?;
-                if start < 0 || start as usize > text.len() {
-                    return Err(EvaluationFailed);
-                }
-                let begin = start as usize;
-                let end = match arguments.get(2) {
-                    Some(&length) => {
-                        let length = int32(length)?;
-                        if length < 0 || begin + length as usize > text.len() {
-                            return Err(EvaluationFailed);
-                        }
-                        begin + length as usize
-                    }
-                    None => text.len(),
-                };
-                let offset = haystack.start;
-                Ok(Variant::Str(Text {
-                    base: haystack.base,
-                    start: offset + begin as u16,
-                    end: offset + end as u16,
-                }))
-            }
-        }
+        Ok(Variant::Bool(truth(&self.evaluate(right_node)?)?))
     }
 
     fn item(&mut self, index: usize) -> Result<Variant> {
@@ -599,9 +323,9 @@ impl Evaluation<'_> {
             return Ok(value);
         }
         let item = self.program.items()[index];
-        let value = match Variant::from_value(item.value) {
-            Variant::Null => self.read_field(usize::from(item.field.0) - 1)?,
-            declared => declared,
+        let value = match item.value {
+            Value::Null => self.read_field(usize::from(item.field.0) - 1)?,
+            declared => self.program.variant(declared),
         };
         self.items[index] = Some(value);
         Ok(value)
@@ -621,9 +345,8 @@ impl Evaluation<'_> {
                 Kind::Mac => Variant::Mac([0; 6]),
                 Kind::Ipv4 => Variant::Ipv4([0; 4]),
                 Kind::Str => Variant::Str(Text {
-                    base: Base::Name,
-                    start: 0,
-                    end: 0,
+                    start: NAME_START,
+                    end: NAME_START,
                 }),
             });
         }
@@ -676,14 +399,10 @@ impl Evaluation<'_> {
                 }
             }
             Getter::DnsCount(offset) => Variant::U16(self.dns_word(usize::from(offset))),
-            Getter::DnsName => {
-                self.decode_name();
-                Variant::Str(Text {
-                    base: Base::Name,
-                    start: 0,
-                    end: u16::MAX,
-                })
-            }
+            Getter::DnsName => Variant::Str(Text {
+                start: NAME_START,
+                end: NAME_START + self.decode_name(),
+            }),
         })
     }
 
@@ -705,42 +424,43 @@ impl Evaluation<'_> {
     }
 
     /// The first question name (0x91f68498 for question 0): labels joined
-    /// by dots; a failed or root name reads as empty.
-    fn decode_name(&mut self) {
-        if self.name_len.is_some() {
-            return;
+    /// by dots. Returns its length; a failed or root name reads as empty.
+    fn decode_name(&mut self) -> usize {
+        if let Some(length) = self.name_len {
+            return length;
         }
-        let length = self.dns().and_then(|dns| {
-            let header =
-                usize::from(self.frame.get(ETHERNET_HEADER).copied().unwrap_or(0) & 0xf) * 4;
-            let udp_length = u16::from_be_bytes(
-                bytes_at(self.frame, ETHERNET_HEADER + header + 4, 2)[..2]
-                    .try_into()
-                    .ok()?,
-            );
-            let questions =
-                u16::from_be_bytes(bytes_at(self.frame, dns + 4, 2)[..2].try_into().ok()?);
-            if questions == 0 {
-                return None;
-            }
-            let area_start = dns + 0xc;
-            let area_len = usize::from(udp_length).checked_sub(8 + 0xc)?;
-            let area = self
-                .frame
-                .get(area_start..(area_start + area_len).min(self.frame.len()))?;
-            decode_question(area, area_len, &mut self.name)
-        });
-        self.name_len = Some(length.unwrap_or(0) as u16);
+        let length = self
+            .dns()
+            .and_then(|dns| {
+                let header =
+                    usize::from(self.frame.get(ETHERNET_HEADER).copied().unwrap_or(0) & 0xf) * 4;
+                let udp_length = u16::from_be_bytes(
+                    bytes_at(self.frame, ETHERNET_HEADER + header + 4, 2)[..2]
+                        .try_into()
+                        .ok()?,
+                );
+                let questions =
+                    u16::from_be_bytes(bytes_at(self.frame, dns + 4, 2)[..2].try_into().ok()?);
+                if questions == 0 {
+                    return None;
+                }
+                let area_start = dns + 0xc;
+                let area_len = usize::from(udp_length).checked_sub(8 + 0xc)?;
+                let area = self
+                    .frame
+                    .get(area_start..(area_start + area_len).min(self.frame.len()))?;
+                decode_question(area, area_len, &mut self.text[NAME_START..])
+            })
+            .unwrap_or(0);
+        self.name_len = Some(length);
+        length
     }
 }
 
 /// Decode a question name into `output`; returns its length without the
 /// trailing dot.
-fn decode_question(
-    area: &[u8],
-    declared: usize,
-    output: &mut [u8; NAME_CAPACITY],
-) -> Option<usize> {
+fn decode_question(area: &[u8], declared: usize, output: &mut [u8]) -> Option<usize> {
+    let capacity = output.len();
     let mut position = 0usize;
     let mut limit = declared.min(area.len());
     let mut written = 0usize;
@@ -774,13 +494,13 @@ fn decode_question(
         if end > limit {
             return None;
         }
-        if written + label + 1 <= NAME_CAPACITY {
+        if written + label < capacity {
             output[written..written + label].copy_from_slice(&area[position..end]);
             output[written + label] = b'.';
         }
         written += label + 1;
         position = end;
-        if written > NAME_CAPACITY {
+        if written > capacity {
             return None;
         }
     }
@@ -793,125 +513,4 @@ fn bytes_at(frame: &[u8], offset: usize, size: usize) -> [u8; 8] {
         *byte = frame.get(offset + index).copied().unwrap_or(0);
     }
     bytes
-}
-
-/// 0x91f898e0 over plain strings: signed byte order, ASCII case folding,
-/// and in prefix mode a match once `right` is used up.
-fn compare_text(left: &[u8], right: &[u8], fold: bool, prefix: bool) -> i32 {
-    let map = |byte: u8| -> i8 {
-        (if fold {
-            byte.to_ascii_lowercase()
-        } else {
-            byte
-        }) as i8
-    };
-    for (index, &byte) in left.iter().enumerate() {
-        let Some(&other) = right.get(index) else {
-            return if prefix { 0 } else { 1 };
-        };
-        match map(byte).cmp(&map(other)) {
-            core::cmp::Ordering::Less => return -1,
-            core::cmp::Ordering::Greater => return 1,
-            core::cmp::Ordering::Equal => {}
-        }
-    }
-    if left.len() == right.len() { 0 } else { -1 }
-}
-
-/// 0x91f89a00: the first position where `needle` matches.
-fn search(haystack: &[u8], needle: &[u8], fold: bool) -> i32 {
-    if haystack.is_empty() || needle.is_empty() {
-        return -1;
-    }
-    for start in 0..haystack.len() {
-        if compare_text(&haystack[start..], needle, fold, true) == 0 {
-            return start as i32;
-        }
-    }
-    -1
-}
-
-/// 0x91f8a7b8: bitwise complement keeps the type; booleans become `i32`.
-fn complement(value: Variant) -> Result<Variant> {
-    Ok(match value {
-        Variant::Bool(value) => Variant::I32(!i32::from(value)),
-        Variant::I8(value) => Variant::I8(!value),
-        Variant::I16(value) => Variant::I16(!value),
-        Variant::I32(value) => Variant::I32(!value),
-        Variant::I64(value) => Variant::I64(!value),
-        Variant::U8(value) => Variant::U8(!value),
-        Variant::U16(value) => Variant::U16(!value),
-        Variant::U32(value) => Variant::U32(!value),
-        Variant::U64(value) => Variant::U64(!value),
-        _ => return Err(EvaluationFailed),
-    })
-}
-
-/// 0x91f8b1c0: 64-bit arithmetic, unsigned when either operand is
-/// unsigned; the result takes the type stock picks from the operand types.
-fn arithmetic(left: Variant, op: u8, right: Variant) -> Result<Variant> {
-    let unsigned = left.is_unsigned() || right.is_unsigned();
-    let a = left.integer()?;
-    let b = right.integer()?;
-    let (signed_a, signed_b) = (a as i64, b as i64);
-    let value = match op {
-        0 => a.wrapping_add(b),
-        1 => a.wrapping_sub(b),
-        2 => a.wrapping_mul(b),
-        3 | 4 if unsigned => {
-            if b == 0 {
-                return Err(EvaluationFailed);
-            }
-            if op == 3 { a / b } else { a % b }
-        }
-        // Stock traps on i64::MIN / -1.
-        3 | 4 => {
-            if b == 0 || (signed_a == i64::MIN && signed_b == -1) {
-                return Err(EvaluationFailed);
-            }
-            (if op == 3 {
-                signed_a / signed_b
-            } else {
-                signed_a % signed_b
-            }) as u64
-        }
-        5 | 6 if !unsigned && signed_b < 0 => return Err(EvaluationFailed),
-        5 => {
-            if b & 0x40 != 0 {
-                0
-            } else {
-                a << (b & 0x3f)
-            }
-        }
-        6 => {
-            let shift = if b & 0x40 != 0 { 63 } else { b & 0x3f };
-            if unsigned {
-                if b & 0x40 != 0 { 0 } else { a >> shift }
-            } else {
-                (signed_a >> shift) as u64
-            }
-        }
-        7 => a & b,
-        8 => a ^ b,
-        _ => a | b,
-    };
-    // Result type: the widest operand of the operation's signedness, with
-    // booleans counting as 32-bit.
-    let rank = |operand: Variant| match (operand, unsigned) {
-        (Variant::U64(_), true) | (Variant::I64(_), false) => 4,
-        (Variant::Bool(_), _) | (Variant::U32(_), true) | (Variant::I32(_), false) => 3,
-        (Variant::U16(_), true) | (Variant::I16(_), false) => 2,
-        (Variant::U8(_), true) | (Variant::I8(_), false) => 1,
-        _ => 0,
-    };
-    Ok(match (rank(left).max(rank(right)), unsigned) {
-        (4, true) => Variant::U64(value),
-        (4, false) => Variant::I64(value as i64),
-        (2, true) => Variant::U16(value as u16),
-        (2, false) => Variant::I16(value as i16),
-        (1, true) => Variant::U8(value as u8),
-        (1, false) => Variant::I8(value as i8),
-        (_, true) => Variant::U32(value as u32),
-        (_, false) => Variant::I32(value as i32),
-    })
 }

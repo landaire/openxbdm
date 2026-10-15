@@ -230,6 +230,8 @@ static COMPLETION_THREAD: HandleSlot = HandleSlot::new();
 static WRITE_HANDLE: HandleSlot = HandleSlot::new();
 static READ_HANDLE: HandleSlot = HandleSlot::new();
 static LOG_PATH: LogPath = LogPath(UnsafeCell::new(None));
+/// Record pool storage, obtained at the first start and kept; 0 before.
+static RECORDS: AtomicU32 = AtomicU32::new(0);
 
 /// Stock passes a positive (absolute, already past) timeout, so these
 /// waits return at once.
@@ -317,6 +319,35 @@ impl detour::Platform for ConsolePlatform {
 
     fn wait_for_record(&self) {
         kernel::KeWaitForSingleObject(RECORD_FREED.pointer(), 0, 0, 0, &ELAPSED_TIMEOUT);
+    }
+
+    fn records(&self) -> Option<&'static [AtomicU32]> {
+        let base = RECORDS.load(Ordering::Acquire);
+        if base == 0 {
+            return None;
+        }
+        // SAFETY: the pool block holds the storage, is aligned for words,
+        // and is never freed.
+        Some(unsafe {
+            core::slice::from_raw_parts(
+                base as usize as *const AtomicU32,
+                detour::RECORD_STORAGE_WORDS,
+            )
+        })
+    }
+
+    /// Stock 0x91f2cb28 allocates 0x1c00 bytes, tag `Detr`, pool type 2.
+    fn allocate_records(&self) -> bool {
+        if RECORDS.load(Ordering::Acquire) != 0 {
+            return true;
+        }
+        let base = kernel::ExAllocatePoolTypeWithTag(
+            (detour::RECORD_STORAGE_WORDS * 4) as u32,
+            u32::from_be_bytes(*b"Detr"),
+            2,
+        );
+        RECORDS.store(base, Ordering::Release);
+        base != 0
     }
 
     fn record_queued(&self) {
@@ -631,7 +662,11 @@ fn write_record(record: &[u8; RECORD_SIZE]) -> bool {
 
 /// Log writer (0x91f2d040).
 extern "C" fn writer_thread(_context: u32) -> u32 {
-    ENGINE.prepare_log();
+    if !ENGINE.prepare_log(&ConsolePlatform) {
+        ENGINE.abort_start();
+        WRITER_DONE.set();
+        return 1;
+    }
     let status = open_log();
     ENGINE.set_status(NtStatus(status));
     if (status as i32) < 0 {

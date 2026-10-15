@@ -40,7 +40,6 @@ pub use self::kd::load_extension;
 pub use self::kd::release_extension;
 use crate::access::Access;
 use crate::backend::Backend as AnyBackend;
-use crate::commands::filesystem::PoolBuffer;
 use crate::commands::system::SettingsFile;
 use crate::commands::system::end_line;
 use crate::commands::system::write_bytes;
@@ -54,23 +53,18 @@ use crate::notify::Event;
 use crate::notify::ExecutionState;
 use crate::registry::CommandEntry;
 use crate::registry::DispatchFlags;
-use crate::server::MAX_CONNECTIONS;
 use crate::state::ServerState;
 use crate::text::LineText;
 use crate::text::Text;
+use crate::transfer_blocks::TransferBlock;
+use crate::transfer_blocks::TransferBlocks;
 
 const fn entry(
     name: &'static str,
     flags: DispatchFlags,
     handler: fn(&mut Invocation<'_>) -> Hresult,
 ) -> CommandEntry {
-    CommandEntry {
-        name,
-        any_of: Access::CONTROL,
-        all_of: Access::NONE,
-        flags,
-        handler,
-    }
+    CommandEntry::new(name, Access::CONTROL, Access::NONE, flags, handler)
 }
 
 pub(crate) const COMMANDS: &[CommandEntry] = &[
@@ -114,6 +108,9 @@ pub enum ProcessKind {
     Title,
     System,
 }
+
+/// The order the monitor visits the processes in.
+static PROCESS_ORDER: [ProcessKind; 2] = [ProcessKind::Title, ProcessKind::System];
 
 /// Events that stop the reporting thread when they occur.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -265,6 +262,9 @@ pub mod module_flags {
 /// What the platform reports to the monitor. The reporting thread waits
 /// until [`Backend::complete_event`] is called for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// The C layout keeps every variant's words aligned, so building an event
+// stores fields directly instead of merging bytes.
+#[repr(C)]
 pub enum DebugEvent {
     /// A thread at passive level raised an exception. Its context is
     /// readable and writable through the thread context services until
@@ -483,6 +483,9 @@ pub trait Backend {
 /// A notification queued by a direct exception, with what the platform
 /// captured on the raising thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Declaration order keeps the copies between the queue node and the
+// caller word-aligned.
+#[repr(C)]
 pub struct DirectNotification {
     pub thread: ThreadId,
     pub iar: u32,
@@ -543,18 +546,7 @@ pub struct State {
     pub trap_passthrough: bool,
     /// Reply of a `break now` held until its thread is continued.
     held_reply: Option<HeldReply>,
-    /// Pool blocks of `getcontext` transfers in progress.
-    snapshots: [Option<Snapshot>; MAX_CONNECTIONS],
     events: events::Events,
-}
-
-/// The pool copy of a context a `getcontext` transfer sends from.
-#[derive(Debug, Clone, Copy)]
-struct Snapshot {
-    socket: SocketId,
-    buffer: PoolBuffer,
-    /// The connection closed before the transfer ended.
-    closed: bool,
 }
 
 /// A command reply sent when `thread` stops waiting at its event.
@@ -581,7 +573,6 @@ impl State {
             extension: None,
             trap_passthrough: false,
             held_reply: None,
-            snapshots: [None; MAX_CONNECTIONS],
             events: events::Events::new(),
         }
     }
@@ -674,8 +665,7 @@ fn send_held_reply(
     }
 }
 
-/// A connection closed: a reply held for it is dropped and its context
-/// snapshot is freed at the next event pass.
+/// A connection closed: a reply held for it is dropped.
 pub(crate) fn connection_closed(state: &mut ServerState, socket: SocketId) {
     if state
         .debugger
@@ -685,43 +675,24 @@ pub(crate) fn connection_closed(state: &mut ServerState, socket: SocketId) {
     {
         state.debugger.held_reply = None;
     }
-    for snapshot in state
-        .debugger
-        .snapshots
-        .iter_mut()
-        .flatten()
-        .filter(|snapshot| snapshot.socket == socket)
-    {
-        snapshot.closed = true;
-    }
-}
-
-/// Free the snapshots of closed connections.
-fn release_closed_snapshots(state: &mut ServerState, backend: &mut dyn AnyBackend) {
-    for slot in &mut state.debugger.snapshots {
-        if let Some(snapshot) = slot.take_if(|snapshot| snapshot.closed) {
-            backend.free_pool(snapshot.buffer);
-        }
-    }
 }
 
 /// Transfers started by this domain.
-// The thread list is captured when the command runs, as the monitor's
-// 0x400-byte list allocation is.
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Continuation {
+    /// Thread identifiers captured when the command ran, in a block of
+    /// stock's 0x400-byte list size.
     Threads {
-        ids: [ThreadId; THREAD_LIST_CAPACITY],
-        remaining: usize,
+        list: TransferBlock,
+        remaining: u16,
     },
     ThreadInfo {
-        line: Text<0x100>,
+        info: ThreadInfo,
         sent: bool,
     },
     /// Lines of the context copied into `snapshot` when the command ran.
     Context {
-        snapshot: PoolBuffer,
+        snapshot: TransferBlock,
         position: usize,
     },
 }
@@ -731,13 +702,13 @@ pub const THREAD_LIST_CAPACITY: usize = 0x100;
 
 pub(crate) fn resume(continuation: &mut Continuation, cx: &mut ContinuationContext<'_>) -> Hresult {
     match continuation {
-        Continuation::Threads { ids, remaining } => thread_lines(ids, remaining, cx),
-        Continuation::ThreadInfo { line, sent } => {
+        Continuation::Threads { list, remaining } => thread_lines(*list, remaining, cx),
+        Continuation::ThreadInfo { info, sent } => {
             if *sent {
                 return Hresult::END_OF_DATA;
             }
             *sent = true;
-            cx.line.set_bytes(line.as_bytes());
+            thread_info_line(info, cx.line);
             Hresult::OK
         }
         Continuation::Context { snapshot, position } => context_lines(*snapshot, position, cx),
@@ -777,6 +748,17 @@ fn get_process_id(invocation: &mut Invocation<'_>) -> Hresult {
     Hresult::OK
 }
 
+/// Keys of `break` that request more than `now`.
+static BREAK_FLAGS: [&str; 7] = [
+    "start",
+    "clearall",
+    "addr",
+    "read",
+    "write",
+    "readwrite",
+    "execute",
+];
+
 /// `break`: `now`, `start`, `clearall`, `addr=` with optional `clear`, or a
 /// data breakpoint `read=|write=|readwrite=|execute=` with `size=`. `now`
 /// stops the command thread at a trap; the reply follows once a debugger
@@ -785,18 +767,7 @@ fn set_breakpoint(invocation: &mut Invocation<'_>) -> Hresult {
     let line = invocation.line;
     let now = line.has("now");
     let stopped = if now { break_now(invocation) } else { None };
-    let flagged = [
-        "start",
-        "clearall",
-        "addr",
-        "read",
-        "write",
-        "readwrite",
-        "execute",
-    ]
-    .iter()
-    .any(|key| line.has(key));
-    let result = if now && !flagged {
+    let result = if now && !BREAK_FLAGS.iter().any(|key| line.has(key)) {
         Hresult::OK
     } else {
         breakpoint_flags(invocation)
@@ -855,7 +826,7 @@ fn breakpoint_flags(invocation: &mut Invocation<'_>) -> Hresult {
             set_software_breakpoint(invocation.state, invocation.backend, address)
         };
     }
-    let dword = |key: &str| line.param(key).and_then(|value| value.dword());
+    let dword = |key: &str| line.dword(key);
     let (address, kind) = if let Some(address) = dword("read") {
         (address, Some(DataKind::Read))
     } else if let Some(address) = dword("write") {
@@ -1089,10 +1060,7 @@ fn transition(
         (ExecutionState::PendingTitle, ExecutionState::RebootTitle) => ExecutionState::PendingTitle,
         _ => return false,
     };
-    for (index, process) in [ProcessKind::Title, ProcessKind::System]
-        .into_iter()
-        .enumerate()
-    {
+    for (index, &process) in PROCESS_ORDER.iter().enumerate() {
         if release[index] {
             events::release_stopped(state, backend, network, process);
         }
@@ -1231,32 +1199,53 @@ fn is_stopped(invocation: &mut Invocation<'_>) -> Hresult {
         Ok(reason) => reason,
         Err(result) => return result,
     };
-    let mut line = Text::<0x230>::new();
-    events::stop_description(invocation.backend, &reason, &mut line);
-    invocation.text.set_bytes(line.as_bytes());
+    invocation.text.clear();
+    events::stop_description(invocation.backend, &reason, invocation.text);
     Hresult::OK
 }
 
 /// `threads`: identifiers of the debuggable threads as signed decimal
 /// lines, in reverse enumeration order.
 fn threads(invocation: &mut Invocation<'_>) -> Hresult {
-    if invocation.session.is_none() {
+    let Some(socket) = invocation.session.as_ref().map(|session| session.socket()) else {
         return Hresult::FAIL;
-    }
+    };
+    let Some(list) = invocation.state.transfer_blocks.acquire(
+        invocation.backend,
+        socket,
+        THREAD_LIST_CAPACITY as u32 * 4,
+    ) else {
+        return Hresult::OUT_OF_MEMORY;
+    };
     let mut ids = [ThreadId(0); THREAD_LIST_CAPACITY];
     let count = if invocation.backend.execution_state() == ExecutionState::Pending {
         0
     } else {
         match invocation.backend.thread_ids(&mut ids) {
             Some(count) => count,
-            None => return Hresult::UNEXPECTED,
+            None => {
+                invocation
+                    .state
+                    .transfer_blocks
+                    .release(invocation.backend, list);
+                return Hresult::UNEXPECTED;
+            }
         }
     };
+    let words = invocation
+        .state
+        .transfer_blocks
+        .bytes(invocation.backend, list)
+        .as_chunks_mut::<4>()
+        .0;
+    for (word, id) in words.iter_mut().zip(&ids[..count]) {
+        *word = id.0.to_ne_bytes();
+    }
     start_transfer(
         invocation,
         Continuation::Threads {
-            ids,
-            remaining: count,
+            list,
+            remaining: count as u16,
         },
     );
     invocation.set_text(format_args!("thread list follows"));
@@ -1264,13 +1253,20 @@ fn threads(invocation: &mut Invocation<'_>) -> Hresult {
 }
 
 fn thread_lines(
-    ids: &[ThreadId; THREAD_LIST_CAPACITY],
-    remaining: &mut usize,
+    list: TransferBlock,
+    remaining: &mut u16,
     cx: &mut ContinuationContext<'_>,
 ) -> Hresult {
     if *remaining == 0 {
+        cx.state.transfer_blocks.release(cx.backend, list);
         return Hresult::END_OF_DATA;
     }
+    let ids = cx
+        .state
+        .transfer_blocks
+        .bytes(cx.backend, list)
+        .as_chunks::<4>()
+        .0;
     let mut out = BinaryWriter {
         buffer: cx.binary,
         len: 0,
@@ -1278,7 +1274,8 @@ fn thread_lines(
     // Leave room for one more line in the raw buffer.
     while *remaining > 0 && out.len + 16 <= out.buffer.len() {
         *remaining -= 1;
-        let _ = write!(out, "{}\r\n", ids[*remaining].0 as i32);
+        let id = u32::from_ne_bytes(ids[usize::from(*remaining)]);
+        let _ = write!(out, "{}\r\n", id as i32);
     }
     cx.binary_len = out.len;
     Hresult::OK
@@ -1317,12 +1314,17 @@ fn thread_info(invocation: &mut Invocation<'_>) -> Hresult {
         Ok(info) => info,
         Err(NoSuchThread) => return Hresult::from_error_code(ErrorCode::NO_SUCH_THREAD),
     };
+    start_transfer(invocation, Continuation::ThreadInfo { info, sent: false });
+    invocation.set_text(format_args!("thread info follows"));
+    Hresult::MULTILINE
+}
+
+fn thread_info_line(info: &ThreadInfo, line: &mut LineText) {
     let suspend = i32::from(info.suspend_count) - i32::from(info.monitor_suspended);
     let name = info.name.unwrap_or(ThreadName {
         address: 0,
         length: 0,
     });
-    let mut line = Text::<0x100>::new();
     let _ = write!(
         line,
         "suspend={suspend} priority={} tlsbase=0x{:08x} start=0x{:08x} base=0x{:08x} limit=0x{:08x} slack=0x{THREAD_SLACK:08x} \
@@ -1339,9 +1341,6 @@ fn thread_info(invocation: &mut Invocation<'_>) -> Hresult {
         info.processor,
         info.last_error,
     );
-    start_transfer(invocation, Continuation::ThreadInfo { line, sent: false });
-    invocation.set_text(format_args!("thread info follows"));
-    Hresult::MULTILINE
 }
 
 /// `getcontext thread= [control] [int] [fp] [vr] [full]`.
@@ -1377,32 +1376,25 @@ fn get_context(invocation: &mut Invocation<'_>) -> Hresult {
     let Some(socket) = invocation.session.as_ref().map(|session| session.socket()) else {
         return Hresult::FAIL;
     };
-    release_closed_snapshots(invocation.state, invocation.backend);
-    let Some(buffer) = invocation.backend.allocate_pool(SNAPSHOT_POOL_SIZE) else {
-        return Hresult::OUT_OF_MEMORY;
-    };
-    let Some(slot) = invocation
-        .state
-        .debugger
-        .snapshots
-        .iter_mut()
-        .find(|slot| slot.is_none())
+    let Some(snapshot) =
+        invocation
+            .state
+            .transfer_blocks
+            .acquire(invocation.backend, socket, SNAPSHOT_POOL_SIZE)
     else {
-        invocation.backend.free_pool(buffer);
         return Hresult::OUT_OF_MEMORY;
     };
-    *slot = Some(Snapshot {
-        socket,
-        buffer,
-        closed: false,
-    });
-    if let Some(bytes) = snapshot_bytes(invocation.backend, buffer) {
+    if let Some(bytes) = snapshot_bytes(
+        &mut invocation.state.transfer_blocks,
+        invocation.backend,
+        snapshot,
+    ) {
         context.encode(bytes);
     }
     start_transfer(
         invocation,
         Continuation::Context {
-            snapshot: buffer,
+            snapshot,
             position: 0,
         },
     );
@@ -1412,12 +1404,13 @@ fn get_context(invocation: &mut Invocation<'_>) -> Hresult {
 /// Pool bytes of a `getcontext` copy (stock 0x91f482b0 allocates 0xa50).
 const SNAPSHOT_POOL_SIZE: u32 = 0xa50;
 
-fn snapshot_bytes(
-    backend: &mut dyn AnyBackend,
-    buffer: PoolBuffer,
-) -> Option<&mut [u8; CONTEXT_SIZE]> {
-    backend
-        .pool(buffer)
+fn snapshot_bytes<'a>(
+    blocks: &'a mut TransferBlocks,
+    backend: &'a mut dyn AnyBackend,
+    snapshot: TransferBlock,
+) -> Option<&'a mut [u8; CONTEXT_SIZE]> {
+    blocks
+        .bytes(backend, snapshot)
         .get_mut(..CONTEXT_SIZE)
         .and_then(|bytes| bytes.try_into().ok())
 }
@@ -1425,24 +1418,15 @@ fn snapshot_bytes(
 /// Emit context lines from the copy the command made; the last call frees
 /// it.
 fn context_lines(
-    snapshot: PoolBuffer,
+    snapshot: TransferBlock,
     position: &mut usize,
     cx: &mut ContinuationContext<'_>,
 ) -> Hresult {
-    let context = snapshot_bytes(cx.backend, snapshot)
+    let context = snapshot_bytes(&mut cx.state.transfer_blocks, cx.backend, snapshot)
         .map(|bytes| Context::decode(bytes))
         .unwrap_or_default();
     if ContextLine::first_from(*position, context.flags).is_none() {
-        cx.backend.free_pool(snapshot);
-        if let Some(slot) = cx
-            .state
-            .debugger
-            .snapshots
-            .iter_mut()
-            .find(|slot| slot.is_some_and(|entry| entry.buffer == snapshot))
-        {
-            *slot = None;
-        }
+        cx.state.transfer_blocks.release(cx.backend, snapshot);
         return Hresult::END_OF_DATA;
     }
     let mut out = BinaryWriter {
@@ -1604,7 +1588,7 @@ fn debugger_identity(invocation: &mut Invocation<'_>) -> Hresult {
             None => 0,
         },
     };
-    let port = line.param("port").and_then(|value| value.dword());
+    let port = line.dword("port");
     let override_existing = line.has("override");
     let state = &mut *invocation.state;
     if line.has("connect") {
@@ -1679,19 +1663,19 @@ fn apply_identity(
 
 /// `isdebugger`.
 fn is_debugger(invocation: &mut Invocation<'_>) -> Hresult {
-    let record = invocation.state.debugger.debugger.clone();
+    let state = &*invocation.state;
+    let record = &state.debugger.debugger;
     if !record.attached {
         return Hresult::OK;
     }
-    if record.address != 0 && !debugger_target_exists(invocation.state, record.address, record.port)
-    {
+    if record.address != 0 && !debugger_target_exists(state, record.address, record.port) {
         return Hresult::OK;
     }
     if record.name.is_empty() && record.user.is_empty() {
         return Hresult::from_error_code(ErrorCode::FILE_ALREADY_EXISTS);
     }
-    invocation.text.clear();
     let text = &mut *invocation.text;
+    text.clear();
     if !record.name.is_empty() {
         let _ = text.push_bytes(b"name=\"");
         let _ = text.push_bytes(record.name.as_bytes());

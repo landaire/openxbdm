@@ -88,8 +88,36 @@ pub(super) const TABLE: [u8; 875] = [
     39, 39, 0, 0, 0, 39, 0, 0, 39, 0, 0, 0, 0, 38, 0, 0, 0, 0, 0, 0, 0, 0, 0, 39,
 ];
 
+/// Symbol or state that validates each [`TABLE`] entry, one byte each as
+/// [`check_symbol`] encodes it; 0xff marks an unused entry.
+pub(super) const CHECK: [u8; 875] = encode_check(&YYCHECK);
+
+/// A check symbol in one byte: states and the end token keep their value,
+/// token codes 0x100.. move to 0x80.., and the unused mark -1 is 0xff.
+pub(super) const fn check_symbol(symbol: i16) -> u8 {
+    if symbol >= 0x100 {
+        (symbol - 0x80) as u8
+    } else {
+        symbol as u8
+    }
+}
+
+const fn encode_check(source: &[i16; 875]) -> [u8; 875] {
+    let mut table = [0u8; 875];
+    let mut index = 0;
+    while index < source.len() {
+        let symbol = source[index];
+        // States stay below 0x80 and tokens below 0x17f, so the encoding
+        // keeps every pair of symbols distinct.
+        assert!(symbol >= -1 && (symbol < 0x80 || (symbol >= 0x100 && symbol < 0x17f)));
+        table[index] = check_symbol(symbol);
+        index += 1;
+    }
+    table
+}
+
 /// Symbol or state that validates each [`TABLE`] entry (yycheck).
-pub(super) const CHECK: [i16; 875] = [
+const YYCHECK: [i16; 875] = [
     262, 0, 270, 0, 275, 260, 259, 276, 5, 3, 4, 266, 6, 7, 277, 268, 267, 285, 271, 284, 257, 258,
     261, 285, 21, 263, 0, 264, 265, 266, 267, 267, 269, 72, 28, 29, 30, 274, 257, 258, 265, 272,
     273, 267, 269, 264, 265, 266, 282, 283, 269, 0, 31, 32, 41, 274, 278, 279, 280, 281, 35, 36,

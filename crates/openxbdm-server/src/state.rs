@@ -52,6 +52,7 @@ pub struct ServerState {
     pub performance: commands::performance::State,
     pub hardware: commands::hardware::State,
     pub services: commands::services::State,
+    pub transfer_blocks: crate::transfer_blocks::TransferBlocks,
 }
 
 impl ServerState {
@@ -71,6 +72,7 @@ impl ServerState {
             performance: commands::performance::State::new(),
             hardware: commands::hardware::State::new(),
             services: commands::services::State::new(),
+            transfer_blocks: crate::transfer_blocks::TransferBlocks::new(),
         }
     }
 }

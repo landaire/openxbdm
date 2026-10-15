@@ -671,6 +671,30 @@ fn detour_start_reports_a_log_that_fails_to_open_in_getstate() {
 }
 
 #[test]
+fn detour_start_without_pool_memory_for_the_records_stops_again() {
+    let server = TestServer::start();
+    let mut session = session(&server);
+    server.host.lock().backend.filesystem.pool_exhausted = true;
+    assert_eq!(
+        session.command("detour start file=e:\\detour.log"),
+        "200- hresult=0x2da0000"
+    );
+    assert_eq!(
+        session.command("detour getstate"),
+        "200- state=0x0 status=0x0"
+    );
+    server.host.lock().backend.filesystem.pool_exhausted = false;
+    assert_eq!(
+        session.command("detour start file=e:\\detour.log"),
+        "200- hresult=0x2da0000"
+    );
+    assert_eq!(
+        session.command("detour getstate"),
+        "200- state=0x2 status=0x0"
+    );
+}
+
+#[test]
 fn detour_entries_log_setinfo_and_release_records() {
     let server = TestServer::start();
     let mut session = session(&server);

@@ -23,7 +23,10 @@
 - Build with `-Cpanic=immediate-abort`, and write text replies of every capacity through one non-generic writer.
 - Add the `boot-guard` feature: a boot without `DEVKIT:\FlashEx\openxbdm.arm` removes the `DEVKIT:\FlashEx\xbdm.xex` override and restarts into the flash monitor.
 - Deploy the module as `DEVKIT:\FlashEx\xbdm.xex` with a matching bounding path; it removes that file at startup.
-- Pack the image on 4 KB pages (`.text` at `0x91f01000`; xex-link derives section alignment from the small-pages flag), so the image ends at `0x91fe5000`, below xshell.
+- Pack the image on 4 KB pages (`.text` at `0x91f01000`; xex-link derives section alignment from the small-pages flag), so the image ends below xshell at `0x92000000`.
+- Replace inline callee-saved register saves and restores with shared helpers (`openxbdm-asm-rewrite`, run by `build_xbox360.sh` on the assembled module; `--plain` builds without it), and fail the build on reservation instructions the kernel loader reports as unprotected.
+- Shrink static data to stock's layouts: 0x298-class connection slots, one static 0x488 breakpoint block with pool blocks after it, a static transfer block with pool fallback for `threads`, `getcontext`, and similar replies, and detour records from the pool at the first `detour start`.
+- Loaded footprint: image 0xbb000 bytes (stock 0xaf000); with xshell idle the console reports 22 more free pages than with stock XBDM.
 - Place the export table in an executable section (`.xexp`); the loader hypercall reads it only from protected code pages.
 - `threads` reads the process objects at debug monitor data +0x50 and +0x54; the listener sets SO_REUSEADDR before bind; `getmemex` missing texts are `missing ADDR` and `missing LENGTH`.
 - Boots on a devkit in place of stock XBDM; xshell loads against its exports.

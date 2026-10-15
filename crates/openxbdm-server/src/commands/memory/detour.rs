@@ -394,12 +394,21 @@ enum RecordType {
     Completion = 7,
 }
 
-/// The record pool, its free and filled queues, and the log counters
+/// A record taken from the pool and its words in the record storage.
+#[derive(Clone, Copy)]
+struct Record {
+    index: RecordIndex,
+    words: &'static [AtomicU32],
+}
+
+/// Words of the record storage the platform provides.
+pub const RECORD_STORAGE_WORDS: usize = RECORD_COUNT * RECORD_WORDS;
+
+/// The free and filled queues of the record pool, and the log counters
 /// (0x91f9f328..0x91f9f450). Records are reused without clearing, so a
 /// field a record type does not write keeps the value of an earlier use of
 /// the same record.
 struct RecordLog {
-    records: [[AtomicU32; RECORD_WORDS]; RECORD_COUNT],
     free: RecordQueue,
     filled: RecordQueue,
     /// Records may be allocated (0x91f9f330 == 2).
@@ -414,7 +423,6 @@ struct RecordLog {
 impl RecordLog {
     const fn new() -> Self {
         Self {
-            records: [const { [const { AtomicU32::new(0) }; RECORD_WORDS] }; RECORD_COUNT],
             free: RecordQueue::new(),
             filled: RecordQueue::new(),
             accepting: AtomicBool::new(false),
@@ -424,32 +432,35 @@ impl RecordLog {
         }
     }
 
-    fn set_u32(&self, record: RecordIndex, offset: usize, value: u32) {
-        self.records[record.0][offset / 4].store(value, Ordering::Relaxed);
+    fn set_u32(&self, record: Record, offset: usize, value: u32) {
+        record.words[offset / 4].store(value, Ordering::Relaxed);
     }
 
-    fn set_u64(&self, record: RecordIndex, offset: usize, value: u64) {
+    fn set_u64(&self, record: Record, offset: usize, value: u64) {
         self.set_u32(record, offset, (value >> 32) as u32);
         self.set_u32(record, offset + 4, value as u32);
     }
 
-    fn set_bytes(&self, record: RecordIndex, offset: usize, bytes: &[u8]) {
+    fn set_bytes(&self, record: Record, offset: usize, bytes: &[u8]) {
         for (index, word) in bytes.as_chunks::<4>().0.iter().enumerate() {
             self.set_u32(record, offset + index * 4, u32::from_be_bytes(*word));
         }
     }
 
-    fn bytes(&self, record: RecordIndex) -> [u8; RECORD_SIZE] {
+    fn bytes(&self, record: Record) -> [u8; RECORD_SIZE] {
         let mut bytes = [0u8; RECORD_SIZE];
-        for (chunk, word) in bytes
-            .as_chunks_mut::<4>()
-            .0
-            .iter_mut()
-            .zip(&self.records[record.0])
-        {
+        for (chunk, word) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(record.words) {
             chunk.copy_from_slice(&word.load(Ordering::Relaxed).to_be_bytes());
         }
         bytes
+    }
+}
+
+/// The words of record `index` in `storage`.
+fn record_in(storage: &'static [AtomicU32], index: RecordIndex) -> Record {
+    Record {
+        index,
+        words: &storage[index.0 * RECORD_WORDS..][..RECORD_WORDS],
     }
 }
 
@@ -463,6 +474,13 @@ pub trait Platform {
     /// Milliseconds since boot.
     fn tick_count(&self) -> u32;
     fn sleep(&self, milliseconds: u32);
+    /// Record pool storage of [`RECORD_STORAGE_WORDS`] words; `None` until
+    /// [`Platform::allocate_records`] succeeded.
+    fn records(&self) -> Option<&'static [AtomicU32]>;
+    /// Obtain the record pool storage from pool memory unless it is held.
+    /// Stock allocates it at every start and frees it at stop; here it is
+    /// kept once obtained. False when pool memory is short.
+    fn allocate_records(&self) -> bool;
     /// The record pool is empty; wait briefly for the writer to free one.
     fn wait_for_record(&self);
     /// A record was queued for the writer.
@@ -822,23 +840,29 @@ impl Engine {
     }
 
     /// Reset the counters and the record pool before the log files open
-    /// (0x91f2cb28). Fresh records read as zero.
-    pub fn prepare_log(&self) {
+    /// (0x91f2cb28). Fresh records read as zero. False when the record
+    /// storage cannot be obtained.
+    pub fn prepare_log(&self, platform: &dyn Platform) -> bool {
         let log = &self.log;
         self.status.store(0, Ordering::Relaxed);
         log.written.store(0, Ordering::Relaxed);
         log.read.store(0, Ordering::Relaxed);
         log.users.store(0, Ordering::Relaxed);
-        for record in &log.records {
-            for word in record {
-                word.store(0, Ordering::Relaxed);
-            }
+        if !platform.allocate_records() {
+            return false;
+        }
+        let Some(storage) = platform.records() else {
+            return false;
+        };
+        for word in storage {
+            word.store(0, Ordering::Relaxed);
         }
         log.free.reset();
         log.filled.reset();
         for index in 0..RECORD_COUNT {
             log.free.push(RecordIndex(index));
         }
+        true
     }
 
     /// Record the status of a log file open.
@@ -879,6 +903,9 @@ impl Engine {
         write: &mut dyn FnMut(&[u8; RECORD_SIZE]) -> bool,
     ) {
         let log = &self.log;
+        let Some(storage) = platform.records() else {
+            return;
+        };
         loop {
             log.users.fetch_add(1, Ordering::AcqRel);
             if !log.accepting.load(Ordering::Acquire) {
@@ -889,7 +916,7 @@ impl Engine {
                 log.users.fetch_sub(1, Ordering::AcqRel);
                 return;
             };
-            if write(&log.bytes(record)) {
+            if write(&log.bytes(record_in(storage, record))) {
                 log.written.fetch_add(1, Ordering::AcqRel);
             }
             if log.free.push(record) {
@@ -924,24 +951,28 @@ impl Engine {
 
     /// Take a record from the pool, waiting while it is empty (0x91f2be68).
     /// `None` while records are refused.
-    fn allocate(&self, platform: &dyn Platform) -> Option<RecordIndex> {
+    fn allocate(&self, platform: &dyn Platform) -> Option<Record> {
         let log = &self.log;
         log.users.fetch_add(1, Ordering::AcqRel);
-        if !log.accepting.load(Ordering::Acquire) {
+        // Records are accepted only after the storage was obtained.
+        let storage = platform
+            .records()
+            .filter(|_| log.accepting.load(Ordering::Acquire));
+        let Some(storage) = storage else {
             log.users.fetch_sub(1, Ordering::AcqRel);
             return None;
-        }
+        };
         loop {
             if let Some(record) = log.free.pop() {
-                return Some(record);
+                return Some(record_in(storage, record));
             }
             platform.wait_for_record();
         }
     }
 
     /// Queue a record for the writer (0x91f2c038).
-    fn submit(&self, platform: &dyn Platform, record: RecordIndex) {
-        if self.log.filled.push(record) {
+    fn submit(&self, platform: &dyn Platform, record: Record) {
+        if self.log.filled.push(record.index) {
             self.log.users.fetch_sub(1, Ordering::AcqRel);
             platform.record_queued();
         }

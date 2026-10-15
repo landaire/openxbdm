@@ -499,14 +499,18 @@ pub fn pcr() -> u32 {
 }
 
 pub fn current_irql() -> u8 {
-    // SAFETY: the processor control region is always mapped.
-    unsafe { core::ptr::read_volatile((pcr() + 0x18) as usize as *const u8) }
+    let value: u8;
+    // SAFETY: the processor control region in r13 is always mapped.
+    unsafe { core::arch::asm!("lbz {0}, 0x18(13)", out(reg) value) };
+    value
 }
 
 /// The current thread object.
 pub fn current_thread() -> u32 {
-    // SAFETY: the processor control region is always mapped.
-    unsafe { core::ptr::read_volatile((pcr() + 0x100) as usize as *const u32) }
+    let value: u32;
+    // SAFETY: the processor control region in r13 is always mapped.
+    unsafe { core::arch::asm!("lwz {0}, 0x100(13)", out(reg) value) };
+    value
 }
 
 /// A kernel synchronization event in static storage.
@@ -968,7 +972,11 @@ pub struct ObjectAttributes {
 
 /// Write a NUL-terminated message to the debug output.
 pub fn debug_print(message: &core::ffi::CStr) {
-    debug_print_bytes(message.to_bytes());
+    DbgPrint(
+        c"%s".as_ptr().cast(),
+        message.as_ptr() as u32,
+        core::ptr::null(),
+    );
 }
 
 /// Write `text` to the debug output as the argument of `%.*s`, so it is

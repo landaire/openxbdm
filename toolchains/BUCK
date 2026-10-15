@@ -3,23 +3,58 @@ load("@prelude//toolchains:cxx.bzl", "system_cxx_toolchain")
 load("@prelude//toolchains:genrule.bzl", "system_genrule_toolchain")
 load("@prelude//toolchains:python.bzl", "remote_python_toolchain")
 load("@prelude//toolchains:remote_test_execution.bzl", "remote_test_execution_toolchain")
-load(":rust.bzl", "rust_release_archives", "rust_release_toolchain", "rust_release_triple", "rust_sysroot")
+load(":rust.bzl", "release_tool", "rust_release", "rust_release_toolchain")
 
-rust_sysroot(
-    name = "rust-sysroot",
-    archives = rust_release_archives(["rustc", "rust-std", "clippy-preview"]),
-    assembler = "assemble_rust_sysroot.py",
+export_file(
+    name = "assemble_rust_sysroot.py",
+    visibility = ["PUBLIC"],
 )
+
+rust_release(
+    name = "rust-release",
+    hosts = "release",
+)
+
+# Downloaded only when something runs rustfmt.
+rust_release(
+    name = "rustfmt-nightly",
+    hosts = "rustfmt-nightly",
+)
+
+# `-c rust.profile=release` builds like Cargo's release profile (with the
+# workspace's `lto = "thin"`), which also strips the standard library's
+# debug information from executables. The dev profile uses rustc's
+# defaults. Only binaries take -Clto: rustc rejects it for proc-macro
+# crates, and libraries carry the bitcode that it uses.
+_PROFILE_RUSTC_FLAGS = {
+    "dev": [],
+    "release": ["-Copt-level=3", "-Cstrip=debuginfo"],
+}
+
+_PROFILE_RUSTC_BINARY_FLAGS = {
+    "dev": [],
+    "release": ["-Clto=thin"],
+}
+
+_PROFILE = read_config("rust", "profile", "dev")
+
+_PROFILE in _PROFILE_RUSTC_FLAGS or fail("rust.profile must be one of {}, not `{}`".format(_PROFILE_RUSTC_FLAGS.keys(), _PROFILE))
 
 rust_release_toolchain(
     name = "rust",
     default_edition = "2021",
-    executable_suffix = select({
-        "DEFAULT": "",
-        "prelude//os:windows": ".exe",
-    }),
-    rustc_target_triple = rust_release_triple(),
-    sysroot = ":rust-sysroot",
+    release = ":rust-release",
+    rustc_binary_flags = _PROFILE_RUSTC_BINARY_FLAGS[_PROFILE],
+    rustc_flags = _PROFILE_RUSTC_FLAGS[_PROFILE],
+    visibility = ["PUBLIC"],
+)
+
+# `buck2 run toolchains//:rustfmt -- ...` formats with the pinned nightly
+# rustfmt, which accepts every option in .rustfmt.toml.
+release_tool(
+    name = "rustfmt",
+    release = ":rustfmt-nightly",
+    tool = "rustfmt",
     visibility = ["PUBLIC"],
 )
 

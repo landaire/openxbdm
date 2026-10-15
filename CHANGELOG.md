@@ -44,10 +44,20 @@
 
 ### Build
 
-- Build with Buck2; Reindeer generates the rules from the workspace and the vendored dependencies, and `build_defs/rust_tests.bzl` declares the test targets.
+- Build, test and lint with Buck2. `build_defs/update_buck_files.py` generates `crates/<name>/BUCK` for each workspace crate from Cargo's resolution, including test targets and `-all-features` variants, and `third-party/rust/BUCK` through Reindeer.
+- Buck2 downloads each crates.io dependency and checks it against the SHA-256 in `Cargo.lock`; nothing is vendored. Cargo fetches from crates.io.
+- Keep the Xbox 360 module out of Buck2 host builds through `[package.metadata.buck2] compatible_with = ["//platforms:xbox360"]` in its `Cargo.toml`.
 - Pin Rust 1.98.0 in `rust-toolchain.toml`; Buck2 downloads the same release from the hashes in `toolchains/rust_release.bzl` instead of using the system Rust. On Linux the host C driver links with the lld bundled in `rustc`.
-- Report each libtest case as its own Buck2 test through the internal test runner; disabled in `.buckconfig` until the installed buck2 is 2026-10-01 or later.
-- Vendor all dependencies, including the standard library sources for the console build.
+- Format with a pinned nightly rustfmt (`.rustfmt.toml`); `build_defs/lint.py` checks formatting and clippy diagnostics through Buck2.
+- `-c rust.profile=release` builds with the optimization, stripping and thin LTO of Cargo's release profile.
+- Report each libtest case as its own Buck2 test through the internal test runner.
+- `devenv.nix` provides the Buck2 release that `toolchains/buck2_release.json` pins, and no C compiler.
+- CI builds and tests with Buck2 on Linux x86_64, macOS arm64 and Windows x86_64, with a bazel-remote action cache on Linux and macOS, and checks formatting, clippy diagnostics and the generated files on Linux x86_64.
+
+### Releases
+
+- A `vX.Y.Z` tag that names the workspace version publishes the `openxbdm` and `openxbdm-kd` executables (Buck2) and the FFI libraries with C++ headers (Cargo and diplomat-tool) for Linux x86_64, macOS arm64 and Windows x86_64.
+- The `nightly` pre-release is rebuilt each day the default branch has changed.
 
 ### Documentation
 

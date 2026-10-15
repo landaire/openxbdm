@@ -2,8 +2,11 @@
 
 ## Environment
 
-`devenv shell` (`devenv.nix`) provides Buck2, Reindeer, and the Rust
-release in `rust-toolchain.toml`.
+`devenv shell` (`devenv.nix`) provides Buck2 (the release that
+`toolchains/buck2_release.json` pins), Reindeer, Python, the LLVM tools
+for `build_xbox360.sh`, and the Rust release in `rust-toolchain.toml`. It
+provides no C compiler. `devenv --profile ci shell` adds `bazel-remote`
+for the CI action cache (`ci/start-action-cache.sh`).
 
 The Rust release is pinned in two places that must name the same version:
 
@@ -17,15 +20,17 @@ The Rust release is pinned in two places that must name the same version:
   and assembles them once into a sysroot for the host, so `buck2 build`
   needs no installed Rust. Buck2 builds only for the host it runs on.
 
-The channel must be an exact release. To change it, edit
-`rust-toolchain.toml` and run
+The channel must be an exact release. Formatting uses a nightly rustfmt,
+since `.rustfmt.toml` sets options that only a nightly accepts; the
+`RUSTFMT_NIGHTLY` date in `toolchains/update_rust_release.py` pins it, and
+`toolchains/rust_release.bzl` records its `rustc` and `rustfmt-preview`
+archives. After a change to either pin, run
 
     toolchains/update_rust_release.py
 
-which writes `toolchains/rust_release.bzl` from the release's channel
-manifest on static.rust-lang.org. `toolchains/update_rust_release.py
---check` verifies, without network access, that the two files name the
-same release.
+which writes `toolchains/rust_release.bzl` from the channel manifests on
+static.rust-lang.org. `toolchains/update_rust_release.py --check`
+verifies, without network access, that the file matches both pins.
 
 Buck2 links with the host's linker driver: `c++` (GCC or Clang) with the
 lld bundled in `rustc` on Linux, Xcode command line tools on macOS, and
@@ -38,9 +43,23 @@ Buck2 is the primary build system. Cargo builds the same sources.
 
     buck2 build //...
     buck2 test //...
+    build_defs/lint.py
 
     cargo build --workspace
     cargo test --workspace
+
+`buck2 build -c rust.profile=release` builds like Cargo's release profile:
+every crate gets `-Copt-level=3` and `-Cstrip=debuginfo`, and binaries
+and tests get the workspace's `lto = "thin"` as `-Clto=thin`. rustc
+rejects `-Clto` for proc-macro crates, so libraries do not get it.
+
+`build_defs/package_release.py` builds the released executables
+(`openxbdm` and `openxbdm-kd`) with that profile and archives them as
+`openxbdm-<version>-<target>`. `.github/workflows/release.yml` publishes
+a release for a `vX.Y.Z` tag that names the workspace version, and
+`.github/workflows/nightly.yml` replaces the `nightly` pre-release each
+day the default branch has changed. Both also publish the FFI libraries
+and C++ headers, which Cargo and diplomat-tool build.
 
 ## Xbox 360 module
 

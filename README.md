@@ -22,30 +22,69 @@ multi-line and binary bodies, and answer name discovery on UDP port 730.
 | `openxbdm-server-xbox360` | The Xbox 360 system-debugger module: console backends, control dispatcher, and the 253 exports |
 | `openxbdm-kd-core` | `no_std` kdnet packet codec and session |
 | `openxbdm-kd` | Kernel debugger client over kdnet: the `openxbdm-kd` binary, GDB server, and debugger host |
-| `openxbdm-testing` | Test-only dependencies for the Buck2 test targets |
+| `openxbdm-asm-rewrite` | Assembly rewrite, link record, and reservation audit tools that `build_xbox360.sh` runs |
 
 ## Build
 
-`devenv shell` (`devenv.nix`) provides Buck2, Reindeer, and the Rust
-release pinned in `rust-toolchain.toml`; Buck2 downloads the same release
-itself. Buck2 is the primary build system; Cargo builds the same sources
-from the vendored dependencies.
+Buck2 builds, tests and lints the workspace on Linux x86_64, macOS arm64
+and Windows x86_64. It downloads the Rust release that `rust-toolchain.toml`
+names, a pinned nightly rustfmt, a Python interpreter, and each crates.io
+dependency, and checks every download against a pinned SHA-256. The host
+provides the C++ compiler driver, which links: `c++` on Linux, Xcode's
+`clang++` on macOS, and the Visual Studio build tools on Windows.
 
-```text
-buck2 build //...
-buck2 test //...
-cargo build --workspace
-cargo test --workspace
-```
+Each workspace crate has a generated `crates/<name>/BUCK`; the crates.io
+dependencies are in the generated `third-party/rust/BUCK`. Cargo.toml stays
+the description of every crate. A crate with optional features also has
+`-all-features` variants of its library and binaries, so that builds and
+lints cover the optional code. Cargo builds the same sources
+(`cargo build --workspace`, `cargo test --workspace`).
+
+With [devenv](https://devenv.sh), `devenv shell` provides Buck2, reindeer,
+Python, the LLVM tools for `build_xbox360.sh`, and the same Rust release
+for Cargo and rust-analyzer; the C compiler stays the host's. Without
+devenv, install:
+
+- Buck2, the release that `toolchains/buck2_release.json` names. The test
+  rules require that release or a later one.
+- Python 3.11 or later.
+- rustup, which installs the release that `rust-toolchain.toml` names, and
+  [reindeer](https://github.com/facebookincubator/reindeer).
+
+| Command | Purpose |
+| --- | --- |
+| `buck2 build //...` | Build everything. |
+| `buck2 test //...` | Run the unit, integration and documentation tests. |
+| `buck2 run //crates/openxbdm-cli:openxbdm-bin -- ARGS` | Run a tool; each binary is `//crates/<crate>:<binary>-bin`. |
+| `buck2 build -c rust.profile=release //...` | Build with the optimizations of Cargo's release profile. |
+| `build_defs/lint.py` | Check formatting and clippy diagnostics. |
+| `build_defs/lint.py --format` | Format the workspace crates. |
+| `build_defs/package_release.py --version V --target T` | Archive the release executables. |
+| `build_defs/update_buck_files.py` | Regenerate the build files after a change to a `Cargo.toml` or `Cargo.lock`. |
+| `toolchains/update_rust_release.py` | Regenerate `toolchains/rust_release.bzl` after a change to the channel in `rust-toolchain.toml` or to `RUSTFMT_NIGHTLY` in the script. |
 
 The console module is built separately with `./build_xbox360.sh`, which
-needs the `llvm-xbox-360` toolchain. See `DEVELOPING.md` for the
-toolchain, vendoring, Buck rules, and console deployment.
+needs the `llvm-xbox-360` toolchain; Buck2 skips its crate. See
+`DEVELOPING.md` for the toolchain, Buck rules, and console deployment.
+
+## Releases
+
+A `vX.Y.Z` tag that names the workspace version publishes a GitHub release.
+Every day the `nightly` pre-release is rebuilt from the default branch when
+the branch has changed since the last one. Each release has, for Linux
+x86_64, macOS arm64 and Windows x86_64:
+
+- `openxbdm-<version>-<target>`: the `openxbdm` and `openxbdm-kd`
+  executables, built by Buck2.
+- `openxbdm-ffi-<version>-<target>`: the `openxbdm-ffi` shared and static
+  libraries and their C++ headers, built by Cargo and diplomat-tool.
+
+`<version>` is `nightly` for the nightly pre-release.
 
 ## Host server
 
 ```text
-cargo run -p openxbdm-server-host -- --listen 127.0.0.1:1730
+buck2 run //crates/openxbdm-server-host:openxbdm-server-bin -- --listen 127.0.0.1:1730
 openxbdm -H 127.0.0.1:1730 dmversion
 ```
 
@@ -67,7 +106,8 @@ monitor does.
 - Unit tests in `openxbdm-core`, `openxbdm-client`, `openxbdm-cli`, and
   `openxbdm-server`.
 
-Buck2 test targets are declared in `build_defs/rust_tests.bzl`.
+`build_defs/update_buck_files.py` generates a Buck2 test target for each
+unit test and `tests/*.rs` file.
 
 ## Client
 
@@ -110,7 +150,7 @@ If you need a verb that doesn't have a typed wrapper yet, drop down to
 Or use the CLI:
 
 ```
-cargo install openxbdm-cli
+cargo install --path crates/openxbdm-cli
 openxbdm -H 192.168.1.26 systime
 openxbdm -H 192.168.1.26 file ls 'DEVKIT:\'
 openxbdm -H 192.168.1.26 file get 'DEVKIT:\my-capture.xbm'
@@ -167,7 +207,7 @@ differences (`docs/re-notes/parity.md`). Usage: `DEVELOPING.md`.
 
 ## Documentation
 
-- `DEVELOPING.md`: environment, build, vendoring, deployment, recovery, differential testing.
+- `DEVELOPING.md`: environment, build, third-party code, deployment, recovery, differential testing.
 - `docs/re-notes/status.md`: component status.
 - `docs/re-notes/parity.md`: per-command, export, and control code coverage; gaps and deviations.
 - `docs/re-notes/xbdm.md`: protocol, command table, and feature map.

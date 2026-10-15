@@ -46,7 +46,11 @@ use openxbdm_client::transport::CaptureLog;
 use openxbdm_client::transport::MockTransport;
 
 fn fixture(name: &str) -> CaptureLog {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // Buck2 sets CARGO_MANIFEST_DIR at run time relative to the project
+    // root, where its tests run; the compile-time value does not serve.
+    let manifest_dir =
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("the test runner sets CARGO_MANIFEST_DIR");
+    let mut path = PathBuf::from(manifest_dir);
     path.push("tests/fixtures");
     path.push(format!("{name}.capture"));
     let text = std::fs::read_to_string(&path)

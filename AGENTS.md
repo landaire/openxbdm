@@ -22,7 +22,7 @@ Guidance for agents working in the openxbdm repository. These rules override def
 ## Development
 
 - We primarily use buck2 for building, testing, etc., but all code should compile with Cargo.
-- Vendor 3rd party code.
+- Do not vendor 3rd party code. Builds may download it, but every download must be pinned by checksum (crates through `Cargo.lock`), and no Buck2 action may reach the network otherwise.
 - Code should be explicitly cross-platform.
 - No cutting corners. Do things _the correct way_. Do not, for example, read an entire file into memory to parse it. We do not know how large files may be and this may consume a lot of memory. Instead, mmap it.
 - All tests, clippy, fixers get primarily run through buck2 to the best of our ability. Reference the rarchive repository (`../rarchive`) for test harnessing.

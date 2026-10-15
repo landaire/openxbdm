@@ -46,7 +46,7 @@ Buck2 is the primary build system. Cargo builds the same sources.
 
 `openxbdm-server-xbox360` targets `powerpc-unknown-xbox360`, which Buck2
 does not build. Its rule requires `//platforms:xbox360`
-(`fixups/openxbdm-server-xbox360/fixups.toml`), a constraint no Buck
+(`[package.metadata.buck2]` in its `Cargo.toml`), a constraint no Buck
 platform provides, so `buck2 build //...` skips it. Build the module with
 
     ./build_xbox360.sh [--plain | --no-rewrite] [output.xex]
@@ -191,62 +191,62 @@ the varying fields are described in `docs/re-notes/parity/hardware.md`.
 
 ## Buck rules
 
-`reindeer buckify` generates the root `BUCK` from the workspace `Cargo.toml`:
-rules for every vendored crate and for the workspace crates. Do not edit it.
-The generated rules list source files explicitly, so run `reindeer buckify`
-after adding or removing source files.
-Reindeer does not generate test rules; test targets are declared in
-`build_defs/rust_tests.bzl`, which the generated file loads through the
-`buckfile_imports` setting in `reindeer.toml`. Each `tests/*.rs` file of
-a crate listed there becomes a test target, with all of `tests/**` (shared
-modules such as `tests/common/mod.rs`, fixtures) in its sources. Update
-that file when a crate's test dependencies or features change.
+The build files follow the Cargo manifests. Do not edit them; after a
+change to a `Cargo.toml` or `Cargo.lock`, run
 
-The test rule in that file adds `InternalRunnerTestInfo` to the prelude's
-`ExternalRunnerTestInfo`. With Buck2's internal runner, `buck2 test` lists
-each binary's libtest cases (`--list --format terse`), runs every case in
-its own process (`--exact <name>`), and reports pass, failure (with the
-case's output), or skip (`#[ignore]`) per case. That needs buck2
-2026-10-01 or later; earlier releases fail every run with `end_of_tests
-was received twice` after the cases finish. `.buckconfig` therefore sets
-`test.use_internal_runner = false`, which runs each test binary as one
-test. With a recent buck2, remove that setting, or try it per command:
+    build_defs/update_buck_files.py
 
-    buck2 test //... -c test.use_internal_runner=true
+which writes:
 
-Test-only dependencies are normal dependencies of `openxbdm-testing`, so
-that reindeer generates rules for them.
+- `third-party/rust/BUCK`, through `reindeer buckify`: the rules for the
+  crates.io dependencies, each limited to the hosts that use it
+  (`build_defs/third_party.bzl`).
+- `crates/*/BUCK`: the rules for each workspace crate. A library becomes
+  `:<lib>`, a binary `:<bin>-bin`, their unit tests `:<lib>-lib-test` and
+  `:<bin>-bin-test`, the integration test `tests/<name>.rs`
+  `:<name>-test`, and an example `:<name>-example`. A crate whose
+  resolution changes with `--all-features` also gets its library and
+  binaries with `-all-features` after the target name.
+
+A crate that only Cargo builds names a constraint that no Buck2 platform
+provides in `[package.metadata.buck2] compatible_with`; host builds skip
+its rules. `CARGO_ONLY_CONSTRAINTS` in the script lists the accepted
+constraints. Build scripts of other workspace crates are not supported.
+
+Test-only and optional third-party dependencies, and third-party features
+that only `--all-features` enables, are normal dependencies of
+`third-party/rust/Cargo.toml`; the script names any that are missing.
+
+Tests run from the project root with `CARGO_MANIFEST_DIR` set to the
+crate directory, relative to that root. Read fixtures through
+`std::env::var_os("CARGO_MANIFEST_DIR")` at run time, not `env!`.
+
+`build_defs/rust_test.bzl` adds `InternalRunnerTestInfo` to the prelude's
+`ExternalRunnerTestInfo`. `buck2 test` lists each binary's libtest cases
+(`--list --format terse`), runs every case in its own process
+(`--exact <name>`), and reports pass, failure (with the case's output),
+or skip (`#[ignore]`) per case. That needs buck2 2026-10-01 or later.
+
+`build_defs/lint.py` checks formatting with the pinned nightly rustfmt
+(`.rustfmt.toml`) and the clippy diagnostics of every workspace target;
+`build_defs/lint.py --format` formats the sources.
 
 The test harness layout follows the rarchive repository (`../rarchive`).
 
 ## Third-party code
 
-All dependencies are vendored in `vendor`, and `.cargo/config.toml`
-redirects crates.io to that directory. The redirect also applies to the
-standard library sources that `build_xbox360.sh` builds with
-`-Zbuild-std`, so their dependencies are vendored as well.
+Dependencies are not vendored. Cargo fetches them from crates.io, and
+Buck2 downloads each crate from crates.io and checks it against the
+SHA-256 in `Cargo.lock`. `build_xbox360.sh` builds the standard library
+sources with `-Zbuild-std`; Cargo resolves their dependencies through the
+toolchain's `library/Cargo.lock`.
 
-To add or update a dependency, or after changing the Rust toolchain:
+To add or update a dependency:
 
 1. Edit the workspace `Cargo.toml` and the crate manifests.
-2. Run `reindeer --manifest-path <absolute path to Cargo.toml> vendor`.
-   This removes crates that the workspace does not use, including the
-   standard library dependencies.
-3. Vendor the standard library dependencies of the pinned toolchain,
-   from this directory so that rustup selects it:
-
-       RUSTC_BOOTSTRAP=1 cargo vendor --versioned-dirs --no-delete \
-           --manifest-path "$(rustc --print sysroot)/lib/rustlib/src/rust/library/Cargo.toml" \
-           vendor
-
-4. Run `reindeer buckify`.
-5. Add fixups under `fixups/<crate>/fixups.toml` for build scripts and
-   files that sources include at compile time.
-
-Some vendored files exceed the default jj snapshot size limit. Raise it
-once per clone:
-
-    jj config set --repo snapshot.max-new-file-size 2097152
+2. Run `build_defs/update_buck_files.py`.
+3. Add fixups under `third-party/rust/fixups/<crate>/fixups.toml` for
+   build scripts and files that sources include at compile time.
 
 ## Kernel debugger crates
 

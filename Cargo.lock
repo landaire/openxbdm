@@ -1020,8 +1020,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "openxbdm-testing"
-version = "0.1.0"
+name = "openxbdm-third-party"
+version = "0.0.0"
 dependencies = [
  "futures",
  "insta",

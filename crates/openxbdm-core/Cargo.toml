@@ -8,3 +8,6 @@ description = "XBDM wire-protocol definitions shared by the openxbdm client and 
 
 [lib]
 path = "src/lib.rs"
+# Buck2 links doctests against a staticlib of the crate, which this no_std
+# crate cannot be without a panic handler. It has no doctests.
+doctest = false

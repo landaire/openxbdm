@@ -14,7 +14,6 @@
 
 /buck-out
 /.cargo/*
-!/.cargo/config.toml
 /.devenv
 /.devenv.flake.nix
 /.direnv

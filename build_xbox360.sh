@@ -130,7 +130,7 @@ fi
 # interrupt-protected form.
 "$tools/openxbdm-asm-rewrite" reservations "$elf"
 
-# Run from the toolchain so this repository's vendored-source
+# Run from the toolchain so this repository's rustup and Cargo
 # configuration does not apply to xex-link.
 cd "$toolchain"
 cargo run --quiet \

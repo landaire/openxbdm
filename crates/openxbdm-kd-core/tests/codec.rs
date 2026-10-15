@@ -2,6 +2,7 @@
 
 use std::fmt::Write;
 use std::num::NonZeroU64;
+use std::path::PathBuf;
 
 use openxbdm_kd_core::NtStatus;
 use openxbdm_kd_core::file_io;
@@ -29,9 +30,19 @@ fn hex(text: &str) -> Vec<u8> {
         .collect()
 }
 
+/// Buck2 sets CARGO_MANIFEST_DIR at run time relative to the project root,
+/// where its tests run; the compile-time value does not serve.
+fn fixture_path(name: &str) -> PathBuf {
+    let manifest_dir =
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("the test runner sets CARGO_MANIFEST_DIR");
+    PathBuf::from(manifest_dir)
+        .join("tests/fixtures")
+        .join(name)
+}
+
 /// Datagrams from `tests/fixtures/kd.log` (`time peer length hex` lines).
 fn captured() -> Vec<Vec<u8>> {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/kd.log");
+    let path = fixture_path("kd.log");
     std::fs::read_to_string(path)
         .unwrap()
         .lines()
@@ -164,7 +175,7 @@ fn session_exchange() {
 /// host: two opens, three reads (first, a short one ending at a 0x800
 /// boundary, last) and the close.
 fn captured_file_io() -> Vec<Vec<u8>> {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/file_io.log");
+    let path = fixture_path("file_io.log");
     std::fs::read_to_string(path)
         .unwrap()
         .lines()

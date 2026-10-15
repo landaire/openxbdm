@@ -11,7 +11,7 @@ members = [
     "crates/openxbdm-server",
     "crates/openxbdm-server-host",
     "crates/openxbdm-server-xbox360",
-    "crates/openxbdm-testing",
+    "third-party/rust",
 ]
 
 [workspace.package]

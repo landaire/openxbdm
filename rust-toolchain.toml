@@ -1,7 +1,6 @@
 # Rust for Cargo, rust-analyzer and build_xbox360.sh, through rustup or
 # devenv.nix. Buck2 downloads the same release (toolchains/rust_release.bzl).
-# The Xbox 360 standard library overlay and the vendored standard library
-# dependencies are specific to this release.
+# The Xbox 360 standard library overlay is specific to this release.
 [toolchain]
 channel = "1.98.0"
 components = ["clippy", "rustfmt", "rust-src", "rust-analyzer"]

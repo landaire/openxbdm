@@ -19,3 +19,8 @@ boot-guard = []
 [dependencies]
 openxbdm-core = { path = "../openxbdm-core" }
 openxbdm-server = { path = "../openxbdm-server" }
+
+# The module targets powerpc-unknown-xbox360, which only build_xbox360.sh
+# builds; Buck2 host builds skip it (build_defs/update_buck_files.py).
+[package.metadata.buck2]
+compatible_with = ["//platforms:xbox360"]

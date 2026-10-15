@@ -12,9 +12,13 @@
 //! - `__openxbdm_restlr`: the link register part of the restore chain
 //!   ending at r30.
 
-use std::io::{self, Write};
+use std::io::Write;
+use std::io::{
+    self,
+};
 
-use crate::analysis::{SaveRange, save_slot};
+use crate::analysis::SaveRange;
+use crate::analysis::save_slot;
 use crate::isa::Gpr;
 
 pub fn save_name(range: SaveRange) -> String {

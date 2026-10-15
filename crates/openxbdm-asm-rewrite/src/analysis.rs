@@ -45,8 +45,18 @@ use std::collections::HashMap;
 
 use thiserror::Error;
 
-use crate::isa::{self, Access, Control, Effects, Gpr, GprSet};
-use crate::line::{Displacement, Instruction, Line, Operand};
+use crate::isa::Access;
+use crate::isa::Control;
+use crate::isa::Effects;
+use crate::isa::Gpr;
+use crate::isa::GprSet;
+use crate::isa::{
+    self,
+};
+use crate::line::Displacement;
+use crate::line::Instruction;
+use crate::line::Line;
+use crate::line::Operand;
 
 /// Offset of the link register save word from the incoming stack pointer.
 const LINK_SLOT: i64 = 4;

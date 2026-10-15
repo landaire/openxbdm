@@ -7,7 +7,9 @@
 
 use std::fmt;
 
-use crate::line::{Displacement, Instruction, Operand};
+use crate::line::Displacement;
+use crate::line::Instruction;
+use crate::line::Operand;
 
 /// General-purpose register number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -185,8 +187,12 @@ enum Role {
     IndexedIndex,
 }
 
-use Access::{Load, Store};
-use Role::{Def, DefUse, Other, Use};
+use Access::Load;
+use Access::Store;
+use Role::Def;
+use Role::DefUse;
+use Role::Other;
+use Role::Use;
 
 fn roles(mnemonic: &str, operand_count: usize) -> Option<Vec<Role>> {
     let mem = |access, size| Role::Memory { access, size };

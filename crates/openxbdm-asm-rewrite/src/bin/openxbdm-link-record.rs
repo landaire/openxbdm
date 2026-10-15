@@ -6,9 +6,13 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
-use std::process::{Command, ExitCode};
+use std::process::Command;
+use std::process::ExitCode;
 
-use openxbdm_asm_rewrite::link::{self, LinkRecord};
+use openxbdm_asm_rewrite::link::LinkRecord;
+use openxbdm_asm_rewrite::link::{
+    self,
+};
 
 const RECORD_VARIABLE: &str = "OPENXBDM_LINK_RECORD";
 

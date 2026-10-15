@@ -6,12 +6,21 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::{self, BufRead, Write};
+use std::io::BufRead;
+use std::io::Write;
+use std::io::{
+    self,
+};
 
 use thiserror::Error;
 
-use crate::analysis::{Function, FunctionAnalysis, Refusal};
-use crate::helpers::{self, HelperUse};
+use crate::analysis::Function;
+use crate::analysis::FunctionAnalysis;
+use crate::analysis::Refusal;
+use crate::helpers::HelperUse;
+use crate::helpers::{
+    self,
+};
 use crate::line::Line;
 
 #[derive(Debug, Error)]

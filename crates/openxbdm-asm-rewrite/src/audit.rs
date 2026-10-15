@@ -6,14 +6,19 @@
 //! are checked. Functions with inline assembly are skipped: the rewriter
 //! treats inline assembly as opaque, which the disassembly cannot show.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::fmt;
-use std::io::{self, BufRead};
+use std::io::BufRead;
+use std::io::{
+    self,
+};
 
 use thiserror::Error;
 
 use crate::analysis::Function;
-use crate::line::{Line, parse_integer};
+use crate::line::Line;
+use crate::line::parse_integer;
 use crate::rewrite::SiteCounts;
 
 #[derive(Debug, Error)]

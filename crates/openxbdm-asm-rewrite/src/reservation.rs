@@ -14,7 +14,12 @@
 
 use std::fmt;
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
+use std::io::{
+    self,
+};
 use std::path::Path;
 
 use thiserror::Error;

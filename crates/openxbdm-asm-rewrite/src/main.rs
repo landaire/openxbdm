@@ -1,10 +1,16 @@
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
-use std::path::{Path, PathBuf};
+use std::io::BufReader;
+use std::io::BufWriter;
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
-use openxbdm_asm_rewrite::{audit, link, reservation, rewrite};
+use clap::Parser;
+use clap::Subcommand;
+use openxbdm_asm_rewrite::audit;
+use openxbdm_asm_rewrite::link;
+use openxbdm_asm_rewrite::reservation;
+use openxbdm_asm_rewrite::rewrite;
 use thiserror::Error;
 
 /// Rewrites callee-saved register saves and restores in the Xbox 360

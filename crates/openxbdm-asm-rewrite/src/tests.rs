@@ -1,10 +1,19 @@
 use std::collections::HashMap;
 
-use crate::analysis::{Function, FunctionAnalysis, LivePath, Refusal};
-use crate::audit::{self, ScopeKind};
-use crate::isa::{Gpr, GprSet};
+use crate::analysis::Function;
+use crate::analysis::FunctionAnalysis;
+use crate::analysis::LivePath;
+use crate::analysis::Refusal;
+use crate::audit::ScopeKind;
+use crate::audit::{
+    self,
+};
+use crate::isa::Gpr;
+use crate::isa::GprSet;
 use crate::line::Line;
-use crate::rewrite::{Listings, Report, rewrite};
+use crate::rewrite::Listings;
+use crate::rewrite::Report;
+use crate::rewrite::rewrite;
 
 /// Wraps `body` in the framing LLVM prints around a compiled function.
 fn compiled(name: &str, body: &str) -> String {

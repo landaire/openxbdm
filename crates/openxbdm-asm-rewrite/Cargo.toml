@@ -1,0 +1,23 @@
+[package]
+name = "openxbdm-asm-rewrite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Replaces inline callee-saved register saves and restores in the Xbox 360 module assembly with shared helper routines"
+publish = false
+
+[[bin]]
+name = "openxbdm-asm-rewrite"
+path = "src/main.rs"
+
+[[bin]]
+name = "openxbdm-link-record"
+path = "src/bin/openxbdm-link-record.rs"
+
+[dependencies]
+clap = { version = "4.6.1", features = ["derive"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+insta = "1.47.2"

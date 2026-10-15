@@ -170,6 +170,13 @@ def _integration_tests(package, directory, deps, features = []):
 
 def rust_tests():
     _unit_test(
+        name = "openxbdm-asm-rewrite-test",
+        crate = "openxbdm_asm_rewrite",
+        directory = "crates/openxbdm-asm-rewrite",
+        crate_root = "src/lib.rs",
+        deps = [":insta", ":thiserror"],
+    )
+    _unit_test(
         name = "openxbdm-core-test",
         crate = "openxbdm_core",
         directory = "crates/openxbdm-core",

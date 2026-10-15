@@ -11,5 +11,7 @@
     pkgs.buck2
     # One of its tests fails on darwin.
     (pkgs.reindeer.overrideAttrs { doCheck = false; })
+    # llvm-mc and llvm-objdump for build_xbox360.sh.
+    pkgs.llvmPackages.llvm
   ];
 }

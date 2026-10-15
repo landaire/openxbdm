@@ -49,7 +49,7 @@ does not build. Its rule requires `//platforms:xbox360`
 (`fixups/openxbdm-server-xbox360/fixups.toml`), a constraint no Buck
 platform provides, so `buck2 build //...` skips it. Build the module with
 
-    ./build_xbox360.sh [output.xex]
+    ./build_xbox360.sh [--plain | --no-rewrite] [output.xex]
 
 which needs the `llvm-xbox-360` toolchain checkout in `../llvm-xbox-360`
 or at `$LLVM_XBOX_360`, and writes `target/openxbdm.xex` by default. It
@@ -60,10 +60,42 @@ outside the devenv shell. Apply the overlay once, from this directory:
 
     ../llvm-xbox-360/toolchain/rust-std-xbox360/apply.sh
 
+The script needs `patch`. Cargo does not notice the changed `rust-src`, so
+delete the cached standard library build (the `powerpc-unknown-xbox360`
+directory under the Cargo target directory) after applying the overlay.
+Outside the devenv shell, set `LLVM_MC` and `LLVM_OBJDUMP` to the devenv's
+LLVM tools.
+
 `OPENXBDM_FEATURES` passes Cargo features to the module build; the
 `DEVKIT:\FlashEx` deployment uses `boot-guard`:
 
     OPENXBDM_FEATURES=boot-guard ./build_xbox360.sh
+
+The module crate emits its LTO module as assembly, and
+`openxbdm-asm-rewrite` replaces the callee-saved register saves and
+restores in prologues and epilogues with shared helper routines (rules in
+`crates/openxbdm-asm-rewrite/src/analysis.rs`). `llvm-mc` assembles the
+result, and the link command rustc ran, recorded by
+`openxbdm-link-record`, links it. An audit of the `llvm-objdump`
+disassembly then fails the build if any rewritable sequence remains.
+`llvm-mc` and `llvm-objdump` come from the devenv shell, or from
+`$LLVM_MC` and `$LLVM_OBJDUMP`. Intermediate files and the linked image
+are in
+`target/powerpc-unknown-xbox360/xbox360/asm-rewrite/<features>-<toolchain>/`;
+`refusals` there lists each sequence left unchanged and why.
+
+`--no-rewrite` assembles the module without the rewrite; `--plain` links
+the object rustc emits, at
+`target/powerpc-unknown-xbox360/xbox360/openxbdm-server-xbox360`.
+
+In every mode the build fails if the image holds an `lwarx`, `ldarx`,
+`stwcx.`, or `stdcx.` outside the interrupt-protected form the kernel
+loader accepts (`crates/openxbdm-asm-rewrite/src/reservation.rs`). LLVM
+emits unprotected reservations for `core::sync::atomic` read-modify-write
+operations unless the active toolchain's `rust-src` carries the atomics
+overlay of `llvm-xbox-360/toolchain/rust-std-xbox360` (`apply.sh`). The
+devenv toolchain's `rust-src` is a read-only store path without it, so
+build with the rustup toolchain the overlay was applied to.
 
 ## Console deployment
 

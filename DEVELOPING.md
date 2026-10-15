@@ -3,118 +3,149 @@
 ## Environment
 
 `devenv shell` (`devenv.nix`) provides Buck2 (the release that
-`toolchains/buck2_release.json` pins), Reindeer, Python, the LLVM tools
-for `build_xbox360.sh`, and the Rust release in `rust-toolchain.toml`. It
-provides no C compiler. `devenv --profile ci shell` adds `bazel-remote`
-for the CI action cache (`ci/start-action-cache.sh`).
+`toolchains/buck2_release.json` pins), Reindeer, Python, and the Rust
+release in `rust-toolchain.toml`. It provides no C compiler.
+`devenv --profile ci shell` adds `bazel-remote` for the CI action cache
+(`ci/start-action-cache.sh`).
 
-The Rust release is pinned in two places that must name the same version:
+Buck2 takes its Rust toolchain from the `xbox360` cell,
+[rust-xbox360](https://github.com/landaire/rust-xbox360) at the commit in
+`[external_cell_xbox360]` of `.buckconfig`, which Buck2 fetches with git.
+The cell's `buck/rust_release.bzl` records the archives of one Rust
+release: `rustc` (rustc, rustdoc, and the bundled lld), `rust-std`,
+`clippy-preview` (clippy-driver), `llvm-tools-preview` (llvm-objdump), and
+`rust-src`. Buck2 verifies each archive's SHA-256 and assembles the host
+toolchain once, so `buck2 build` needs no installed Rust. Host code is
+built only for the host Buck2 runs on.
 
-- `rust-toolchain.toml`, which rustup and devenv read for Cargo,
-  rust-analyzer and `build_xbox360.sh`. It adds `clippy`, `rustfmt`,
-  `rust-analyzer`, and `rust-src`, the library source that the console
-  module builds with `-Zbuild-std`.
-- `toolchains/rust_release.bzl`, the archives that Buck2 downloads itself:
-  `rustc` (rustc, rustdoc, and the bundled lld), `rust-std`, and
-  `clippy-preview` (clippy-driver). Buck2 verifies each archive's SHA-256
-  and assembles them once into a sysroot for the host, so `buck2 build`
-  needs no installed Rust. Buck2 builds only for the host it runs on.
+`rust-toolchain.toml` names the same release for rustup and devenv, which
+provide Cargo and rust-analyzer. `//:rust-toolchain-test` fails when the
+two differ. To move to another release, update the cell (its
+`buck/update_rust_release.py` and standard library overlay) and
+`rust-toolchain.toml` together.
 
-The channel must be an exact release. Formatting uses a nightly rustfmt,
-since `.rustfmt.toml` sets options that only a nightly accepts; the
-`RUSTFMT_NIGHTLY` date in `toolchains/update_rust_release.py` pins it, and
-`toolchains/rust_release.bzl` records its `rustc` and `rustfmt-preview`
-archives. After a change to either pin, run
+Formatting uses a nightly rustfmt, since `.rustfmt.toml` sets options that
+only a nightly accepts. The `RUSTFMT_NIGHTLY` date in
+`toolchains/update_rustfmt_release.py` pins it, and
+`toolchains/rustfmt_release.bzl` records its `rustc` and `rustfmt-preview`
+archives. After a change to the date, run
 
-    toolchains/update_rust_release.py
+    toolchains/update_rustfmt_release.py
 
-which writes `toolchains/rust_release.bzl` from the channel manifests on
-static.rust-lang.org. `toolchains/update_rust_release.py --check`
-verifies, without network access, that the file matches both pins.
+which writes `toolchains/rustfmt_release.bzl` from the nightly's channel
+manifest on static.rust-lang.org. `--check` verifies, without network
+access, that the file matches the date.
 
-Buck2 links with the host's linker driver: `c++` (GCC or Clang) with the
-lld bundled in `rustc` on Linux, Xcode command line tools on macOS, and
-MSVC build tools on Windows. The prelude's Python tools run on a CPython
-that Buck2 downloads.
+`toolchains/BUCK` declares the toolchains through `xbox360_toolchains()`
+of the cell, with this project's flags: the release profile for host
+crates, separate processes for doctests, and the size settings of the
+console module.
+
+Buck2 links host executables with the host's linker driver: `c++` (GCC
+or Clang) with the lld bundled in `rustc` on Linux, Xcode command line
+tools on macOS, and MSVC build tools on Windows. Console executables are
+linked by the bundled rust-lld alone. The prelude's Python tools run on a
+CPython that Buck2 downloads.
+
+### Local changes to rust-xbox360
+
+To build against a rust-xbox360 working copy instead of the pinned
+commit, place the working copy at `rust-xbox360/` in this repository (the
+path of the cell in `.buckconfig`; Git ignores it) and make the cell an
+ordinary cell in `.buckconfig.local`:
+
+    [external_cells]
+      xbox360 = disabled
+
+Buck2 does not follow a symbolic link out of the repository, so the
+working copy must be a directory: a clone, a `git worktree`, or a jj
+workspace of an existing checkout, for example
+
+    jj -R ../llvm-xbox-360 workspace add --name xeedee rust-xbox360
+
+Buck2 then builds from the working copy as it changes. To pin a new
+commit, push it to GitHub, set `commit_hash` in `.buckconfig`, and remove
+the `.buckconfig.local` entry.
 
 ## Build and test
 
-Buck2 is the primary build system. Cargo builds the same sources.
+Buck2 is the primary build system. Cargo builds the host crates from the
+same sources.
 
-    buck2 build //crates/...
-    buck2 test //crates/...
+    buck2 build //: //bindings/... //crates/... //xbox360/...
+    buck2 test //: //bindings/... //crates/... //xbox360/...
     build_defs/lint.py
 
     cargo build --workspace
     cargo test --workspace
 
-`buck2 build -c rust.profile=release` builds like Cargo's release profile:
-every crate gets `-Copt-level=3` and `-Cstrip=debuginfo`, and binaries
-and tests get the workspace's `lto = "thin"` as `-Clto=thin`. rustc
-rejects `-Clto` for proc-macro crates, so libraries do not get it.
+`//third-party/rust` is not built as a whole: its rules for other hosts
+are incompatible with this one.
 
-`build_defs/package_release.py` builds the released executables
-(`openxbdm` and `openxbdm-kd`) with that profile and archives them as
-`openxbdm-<version>-<target>`. `.github/workflows/release.yml` publishes
-a release for a `vX.Y.Z` tag that names the workspace version, and
-`.github/workflows/nightly.yml` replaces the `nightly` pre-release each
-day the default branch has changed. Both also publish the FFI libraries
-and C++ headers, which Cargo and diplomat-tool build.
+`buck2 build -c rust.profile=release` builds host crates like Cargo's
+release profile: every crate gets `-Copt-level=3` and `-Cstrip=debuginfo`,
+and binaries and tests get the workspace's `lto = "thin"` as `-Clto=thin`.
+rustc rejects `-Clto` for proc-macro crates, so libraries do not get it.
+
+`build_defs/package_release.py` builds with that profile and archives the
+released executables (`xeedee` and `openxbdm-kd`) as
+`xeedee-<version>-<target>`, and the `openxbdm-ffi` shared and static
+libraries (the `[cdylib]` and `[staticlib]` subtargets of its library)
+with their C++ headers (`//bindings:cpp`, written by
+`openxbdm-ffi-bindgen`) as `xeedee-ffi-<version>-<target>`. The profile
+gives only binaries and tests `-Clto=thin`, so the FFI libraries are
+built without LTO.
+`build_defs/package_module.py` copies out the console module builds.
+`.github/workflows/release.yml` publishes a release for a `vX.Y.Z` tag
+that names the workspace version, and `.github/workflows/nightly.yml`
+replaces the `nightly` pre-release each day the default branch has
+changed. `build_defs/release_notes.py` writes the notes of both.
 
 ## Xbox 360 module
 
-`openxbdm-server-xbox360` targets `powerpc-unknown-xbox360`, which Buck2
-does not build. Its rule requires `//platforms:xbox360`
-(`[package.metadata.buck2]` in its `Cargo.toml`), a constraint no Buck
-platform provides, so `buck2 build //crates/...` skips it. Build the module with
+`openxbdm-server-xbox360` targets `powerpc-unknown-xbox360`. Its
+`[package.metadata.buck2.xbox360]` table names its linker script, and
+`build_defs/update_buck_files.py` makes each of its binaries an
+`xbox360_executable` (`build_defs/xbox360_module.bzl`). That rule
+configures itself and its dependencies for the console, with the `core`,
+`alloc` and `compiler_builtins` crates that the cell builds from the
+standard library overlay. `xbox360/BUCK` builds the module from it:
 
-    ./build_xbox360.sh [--plain | --no-rewrite] [output.xex]
+| Target | Module |
+| --- | --- |
+| `//xbox360:openxbdm` | `openxbdm.xex`, for the kd host |
+| `//xbox360:openxbdm-boot-guard` | `openxbdm-boot-guard.xex`, with the `boot-guard` feature, for `DEVKIT:\FlashEx` |
+| `//xbox360:openxbdm-no-rewrite` | `openxbdm-no-rewrite.xex`, without the save and restore rewrite |
 
-which needs the `llvm-xbox-360` toolchain checkout in `../llvm-xbox-360`
-or at `$LLVM_XBOX_360`, and writes `target/openxbdm.xex` by default. It
-runs the `cargo` in `PATH`. The standard library overlay must be applied
-to that toolchain's `rust-src`, which the read-only Nix store of the devenv
-toolchain does not allow, so build the module with rustup's toolchain
-outside the devenv shell. Apply the overlay once, from this directory:
+Console crates are built for size (`toolchains/BUCK`): `-Copt-level=z`,
+one code generation unit, `-Cpanic=immediate-abort`, and `-Clto=fat` for
+the executable. rustc writes the executable's one LTO code generation
+unit as assembly along with the image it links (the `[asm]` subtarget and
+the default output of the executable).
 
-    ../llvm-xbox-360/toolchain/rust-std-xbox360/apply.sh
-
-The script needs `patch`. Cargo does not notice the changed `rust-src`, so
-delete the cached standard library build (the `powerpc-unknown-xbox360`
-directory under the Cargo target directory) after applying the overlay.
-Outside the devenv shell, set `LLVM_MC` and `LLVM_OBJDUMP` to the devenv's
-LLVM tools.
-
-`OPENXBDM_FEATURES` passes Cargo features to the module build; the
-`DEVKIT:\FlashEx` deployment uses `boot-guard`:
-
-    OPENXBDM_FEATURES=boot-guard ./build_xbox360.sh
-
-The module crate emits its LTO module as assembly, and
 `openxbdm-asm-rewrite` replaces the callee-saved register saves and
 restores in prologues and epilogues with shared helper routines (rules in
-`crates/openxbdm-asm-rewrite/src/analysis.rs`). `llvm-mc` assembles the
-result, and the link command rustc ran, recorded by
-`openxbdm-link-record`, links it. An audit of the `llvm-objdump`
-disassembly then fails the build if any rewritable sequence remains.
-`llvm-mc` and `llvm-objdump` come from the devenv shell, or from
-`$LLVM_MC` and `$LLVM_OBJDUMP`. Intermediate files and the linked image
-are in
-`target/powerpc-unknown-xbox360/xbox360/asm-rewrite/<features>-<toolchain>/`;
-`refusals` there lists each sequence left unchanged and why.
+`crates/openxbdm-asm-rewrite/src/analysis.rs`). rustc assembles the
+result with the integrated assembler of its LLVM (a crate that holds only
+the assembly, in `global_asm!`), and rust-lld links it with
+`compiler_builtins`, which LTO leaves out, with the arguments rustc passes
+when it links the executable. The same link of the object that rustc
+linked (the executable's `[obj]` subtarget) must reproduce rustc's image,
+or the build fails. An audit of the `llvm-objdump` disassembly then fails
+the build if any rewritable sequence remains. Subtargets of
+the module targets hold the intermediate files: `[asm]`, `[elf]`,
+`[unstripped]`, `[disassembly]`, `[audit]`, `[rewrite-report]`, and
+`[refusals]`, which lists each sequence left unchanged and why.
 
-`--no-rewrite` assembles the module without the rewrite; `--plain` links
-the object rustc emits, at
-`target/powerpc-unknown-xbox360/xbox360/openxbdm-server-xbox360`.
-
-In every mode the build fails if the image holds an `lwarx`, `ldarx`,
+In every case the build fails if the image holds an `lwarx`, `ldarx`,
 `stwcx.`, or `stdcx.` outside the interrupt-protected form the kernel
 loader accepts (`crates/openxbdm-asm-rewrite/src/reservation.rs`). LLVM
 emits unprotected reservations for `core::sync::atomic` read-modify-write
-operations unless the active toolchain's `rust-src` carries the atomics
-overlay of `llvm-xbox-360/toolchain/rust-std-xbox360` (`apply.sh`). The
-devenv toolchain's `rust-src` is a read-only store path without it, so
-build with the rustup toolchain the overlay was applied to.
+operations unless `core` carries the atomics overlay of rust-xbox360
+(`toolchain/rust-std-xbox360`), as the cell's `core` does.
+
+xex-link (`xbox360//crates/xex-link:xex-link`) converts the image with the
+metadata in `xbox360/xex.toml`.
 
 ## Console deployment
 
@@ -129,9 +160,9 @@ flash.
 kdnet setup, once, through stock XBDM (the address and port are stored in
 flash):
 
-    openxbdm -H <console> kdnet set IP=<host> Port=50000
-    openxbdm -H <console> kdnet enable
-    openxbdm -H <console> reboot
+    xeedee -H <console> kdnet set IP=<host> Port=50000
+    xeedee -H <console> kdnet enable
+    xeedee -H <console> reboot
 
 The host must reach the kdnet target address on the local link. For an
 APIPA target address (169.254.x.y) add a host route, for example
@@ -140,10 +171,11 @@ APIPA target address (169.254.x.y) add a host route, for example
 
 Development loop:
 
-1. `./build_xbox360.sh` (no `boot-guard` needed).
+1. `buck2 build //xbox360:openxbdm --show-output` (no `boot-guard`
+   needed).
 2. Start the host and reboot the console:
 
-       openxbdm-kd host --file 'host:\Device\Harddisk0\Partition1\DEVKIT\FlashEx\xbdm.xex=target/openxbdm.xex'
+       openxbdm-kd host --file "host:\Device\Harddisk0\Partition1\DEVKIT\FlashEx\xbdm.xex=$(buck2 build //xbox360:openxbdm --show-simple-output)"
 
 3. Test against port 730. To return to stock XBDM, stop the host and
    reboot.
@@ -159,15 +191,15 @@ the network is available, until the file is removed. A build that stops
 the console during boot freezes every following boot until the file is
 removed. Use only `boot-guard` builds:
 
-1. Build with `OPENXBDM_FEATURES=boot-guard`.
-2. Upload `target/openxbdm.xex` to `DEVKIT:\FlashEx\xbdm.xex`.
+1. Build `//xbox360:openxbdm-boot-guard`.
+2. Upload it to `DEVKIT:\FlashEx\xbdm.xex`.
 3. Create the marker file `DEVKIT:\FlashEx\openxbdm.arm` (any content).
 4. Reboot the console cold.
 
 For example:
 
-    openxbdm -H <console> file put target/openxbdm.xex 'DEVKIT:\FlashEx\xbdm.xex'
-    openxbdm -H <console> file put empty.bin 'DEVKIT:\FlashEx\openxbdm.arm'
+    xeedee -H <console> file put "$(buck2 build //xbox360:openxbdm-boot-guard --show-simple-output)" 'DEVKIT:\FlashEx\xbdm.xex'
+    xeedee -H <console> file put openxbdm.arm 'DEVKIT:\FlashEx\openxbdm.arm'
 
 Boot behavior of a `boot-guard` build:
 
@@ -191,18 +223,18 @@ for the next run.
 
 ## Differential testing
 
-`openxbdm parity record` sends each line of a command list to a monitor
+`xeedee parity record` sends each line of a command list to a monitor
 and writes every reply (head, body lines, binary length and digest) as
-JSON; `openxbdm parity compare` compares two recordings and exits with
+JSON; `xeedee parity compare` compares two recordings and exits with
 status 1 when they differ outside the varying fields. Run the list once
 against stock XBDM (kd host stopped) and once against openxbdm (served by
 the kd host), each starting without `DEVKIT:\oxtest`:
 
-    openxbdm -H <console> parity record \
+    xeedee -H <console> parity record \
         --commands docs/re-notes/parity/hardware-commands.txt --output stock.json
-    openxbdm -H <console> parity record \
+    xeedee -H <console> parity record \
         --commands docs/re-notes/parity/hardware-commands.txt --output openxbdm.json
-    openxbdm parity compare \
+    xeedee parity compare \
         --variances docs/re-notes/parity/hardware-variances.txt stock.json openxbdm.json
 
 The list holds only lines that are safe to repeat; excluded commands and
@@ -210,8 +242,8 @@ the varying fields are described in `docs/re-notes/parity/hardware.md`.
 
 ## Buck rules
 
-The build files follow the Cargo manifests. Do not edit them; after a
-change to a `Cargo.toml` or `Cargo.lock`, run
+The build files of the crates follow the Cargo manifests. Do not edit
+them; after a change to a `Cargo.toml` or `Cargo.lock`, run
 
     build_defs/update_buck_files.py
 
@@ -225,12 +257,17 @@ which writes:
   `:<bin>-bin-test`, the integration test `tests/<name>.rs`
   `:<name>-test`, and an example `:<name>-example`. A crate whose
   resolution changes with `--all-features` also gets its library and
-  binaries with `-all-features` after the target name.
+  binaries with `-all-features` after the target name. A library with the
+  `cdylib` crate type gets Cargo's shared library name.
 
-A crate that only Cargo builds names a constraint that no Buck2 platform
-provides in `[package.metadata.buck2] compatible_with`; host builds skip
-its rules. `CARGO_ONLY_CONSTRAINTS` in the script lists the accepted
-constraints. Build scripts of other workspace crates are not supported.
+A crate built for the Xbox 360 has a `[package.metadata.buck2.xbox360]`
+table that names its linker script (`link_script`). It may have only
+binaries, which become `xbox360_executable` rules without tests. Build
+scripts of workspace crates are not supported.
+
+The other build files are written by hand: `BUCK` (the Rust release
+check), `bindings/BUCK` (the C++ headers), `xbox360/BUCK` (the console
+module), `build_defs/BUCK`, `platforms/BUCK` and `toolchains/BUCK`.
 
 Test-only and optional third-party dependencies, and third-party features
 that only `--all-features` enables, are normal dependencies of
@@ -247,8 +284,9 @@ crate directory, relative to that root. Read fixtures through
 or skip (`#[ignore]`) per case. That needs buck2 2026-10-01 or later.
 
 `build_defs/lint.py` checks formatting with the pinned nightly rustfmt
-(`.rustfmt.toml`) and the clippy diagnostics of every workspace target;
-`build_defs/lint.py --format` formats the sources.
+(`.rustfmt.toml`) and the clippy diagnostics of every host target;
+`build_defs/lint.py --format` formats the sources. Console executables
+have no clippy subtarget.
 
 The test harness layout follows the rarchive repository (`../rarchive`).
 
@@ -256,9 +294,9 @@ The test harness layout follows the rarchive repository (`../rarchive`).
 
 Dependencies are not vendored. Cargo fetches them from crates.io, and
 Buck2 downloads each crate from crates.io and checks it against the
-SHA-256 in `Cargo.lock`. `build_xbox360.sh` builds the standard library
-sources with `-Zbuild-std`; Cargo resolves their dependencies through the
-toolchain's `library/Cargo.lock`.
+SHA-256 in `Cargo.lock`. The xbox360 cell builds the console's standard
+library crates from the Rust release's `rust-src` archive with its
+overlay; it pins their crates.io dependencies by SHA-256 the same way.
 
 To add or update a dependency:
 
@@ -279,8 +317,8 @@ snapshots with `cargo insta review`. `tests/fixtures/file_io.log` holds the
 host file requests of one `xbdm.xex` load, captured with
 `openxbdm-kd host --file ... --log-file`.
 
-`openxbdm kdnet show` prints the kdnet record in flash;
-`openxbdm kdnet set --ip <host> --port 50000 [--mac AA-BB-CC-DD-EE-FF]`,
+`xeedee kdnet show` prints the kdnet record in flash;
+`xeedee kdnet set --ip <host> --port 50000 [--mac AA-BB-CC-DD-EE-FF]`,
 `kdnet enable` and `kdnet disable` write it.
 
 Live checks need kdnet enabled and nothing else bound to UDP 50000. Boot

@@ -15,77 +15,98 @@ multi-line and binary bodies, and answer name discovery on UDP port 730.
 | --- | --- |
 | `openxbdm-core` | `no_std` protocol grammar, status codes, value encodings, and the authentication response function shared by client and server |
 | `openxbdm-client` | Async client: transports (including `MockTransport`), response parsers, typed commands, discovery |
-| `openxbdm-cli` | The `openxbdm` command-line client, including `parity record` and `parity compare` for differential testing |
+| `openxbdm-cli` | The `xeedee` command-line client, including `parity record` and `parity compare` for differential testing |
 | `openxbdm-ffi` | C/C++ bindings for the client (`cdylib`, `staticlib`) |
+| `openxbdm-ffi-bindgen` | Generates the C++ headers of `openxbdm-ffi` with diplomat |
 | `openxbdm-server` | `no_std`, allocation-free command engine: all 177 stock commands in `src/commands/<domain>` over per-domain backend traits |
 | `openxbdm-server-host` | The engine over std TCP sockets with a simulated console (`openxbdm-server` binary), and the integration tests |
 | `openxbdm-server-xbox360` | The Xbox 360 system-debugger module: console backends, control dispatcher, and the 253 exports |
 | `openxbdm-kd-core` | `no_std` kdnet packet codec and session |
 | `openxbdm-kd` | Kernel debugger client over kdnet: the `openxbdm-kd` binary, GDB server, and debugger host |
-| `openxbdm-asm-rewrite` | Assembly rewrite, link record, and reservation audit tools that `build_xbox360.sh` runs |
+| `openxbdm-asm-rewrite` | Assembly rewrite and the rewrite and reservation audits of the console module build |
 
 ## Build
 
 Buck2 builds, tests and lints the workspace on Linux x86_64, macOS arm64
-and Windows x86_64. It downloads the Rust release that `rust-toolchain.toml`
-names, a pinned nightly rustfmt, a Python interpreter, and each crates.io
-dependency, and checks every download against a pinned SHA-256. The host
-provides the C++ compiler driver, which links: `c++` on Linux, Xcode's
-`clang++` on macOS, and the Visual Studio build tools on Windows.
+and Windows x86_64, including the console module. It downloads the Rust
+release, a pinned nightly rustfmt, a Python interpreter, each crates.io
+dependency, and the Xbox 360 toolchain, and checks every download against
+a pinned SHA-256 (crates and Rust archives) or commit (the toolchain). The
+host provides the C++ compiler driver, which links host executables: `c++`
+on Linux, Xcode's `clang++` on macOS, and the Visual Studio build tools on
+Windows.
+
+The Xbox 360 toolchain is the `xbox360` cell, the
+[rust-xbox360](https://github.com/landaire/rust-xbox360) repository at the
+commit that `.buckconfig` pins: the target specification, the standard
+library overlay that Buck2 builds the console's `core`, `alloc` and
+`compiler_builtins` from, and `xex-link`. The Rust release is the one that
+cell pins; `rust-toolchain.toml` names the same release for Cargo and
+rust-analyzer.
 
 Each workspace crate has a generated `crates/<name>/BUCK`; the crates.io
 dependencies are in the generated `third-party/rust/BUCK`. Cargo.toml stays
 the description of every crate. A crate with optional features also has
 `-all-features` variants of its library and binaries, so that builds and
-lints cover the optional code. Cargo builds the same sources
-(`cargo build --workspace`, `cargo test --workspace`).
+lints cover the optional code. Cargo builds the host crates from the same
+sources (`cargo build --workspace`, `cargo test --workspace`).
 
 With [devenv](https://devenv.sh), `devenv shell` provides Buck2, reindeer,
-Python, the LLVM tools for `build_xbox360.sh`, and the same Rust release
-for Cargo and rust-analyzer; the C compiler stays the host's. Without
-devenv, install:
+Python, and the same Rust release for Cargo and rust-analyzer; the C
+compiler stays the host's. Without devenv, install:
 
 - Buck2, the release that `toolchains/buck2_release.json` names. The test
   rules require that release or a later one.
+- git, which Buck2 runs to fetch the `xbox360` cell.
 - Python 3.11 or later.
 - rustup, which installs the release that `rust-toolchain.toml` names, and
-  [reindeer](https://github.com/facebookincubator/reindeer).
+  [reindeer](https://github.com/facebookincubator/reindeer), to regenerate
+  the build files.
 
 | Command | Purpose |
 | --- | --- |
-| `buck2 build //crates/...` | Build the workspace crates and the third-party crates they use on this host. |
-| `buck2 test //crates/...` | Run the unit, integration and documentation tests. |
-| `buck2 run //crates/openxbdm-cli:openxbdm-bin -- ARGS` | Run a tool; each binary is `//crates/<crate>:<binary>-bin`. |
-| `buck2 build -c rust.profile=release //crates/...` | Build with the optimizations of Cargo's release profile. |
+| `buck2 build //: //bindings/... //crates/... //xbox360/...` | Build everything: host crates, C++ headers, and the console module. |
+| `buck2 test //: //bindings/... //crates/... //xbox360/...` | Run the unit, integration and documentation tests, and check the Rust release pin. |
+| `buck2 build //xbox360:openxbdm --show-output` | Build the console module, `openxbdm.xex`. |
+| `buck2 run //crates/openxbdm-cli:xeedee-bin -- ARGS` | Run a tool; each binary is `//crates/<crate>:<binary>-bin`. |
+| `buck2 build -c rust.profile=release //crates/...` | Build the host crates with the optimizations of Cargo's release profile. |
 | `build_defs/lint.py` | Check formatting and clippy diagnostics. |
 | `build_defs/lint.py --format` | Format the workspace crates. |
-| `build_defs/package_release.py --version V --target T` | Archive the release executables. |
+| `build_defs/package_release.py --version V --target T` | Archive the host tools and the FFI libraries. |
+| `build_defs/package_module.py --version V` | Copy out the console module builds under release names. |
 | `build_defs/update_buck_files.py` | Regenerate the build files after a change to a `Cargo.toml` or `Cargo.lock`. |
-| `toolchains/update_rust_release.py` | Regenerate `toolchains/rust_release.bzl` after a change to the channel in `rust-toolchain.toml` or to `RUSTFMT_NIGHTLY` in the script. |
+| `toolchains/update_rustfmt_release.py` | Regenerate `toolchains/rustfmt_release.bzl` after a change to `RUSTFMT_NIGHTLY` in the script. |
 
-The console module is built separately with `./build_xbox360.sh`, which
-needs the `llvm-xbox-360` toolchain; Buck2 skips its crate. See
-`DEVELOPING.md` for the toolchain, Buck rules, and console deployment.
+`mise.toml` defines the same commands as tasks. See `DEVELOPING.md` for
+the console module build, local changes to rust-xbox360, the Buck rules,
+and console deployment.
 
 ## Releases
 
 A `vX.Y.Z` tag that names the workspace version publishes a GitHub release.
 Every day the `nightly` pre-release is rebuilt from the default branch when
-the branch has changed since the last one. Each release has, for Linux
-x86_64, macOS arm64 and Windows x86_64:
+the branch has changed since the last one. The notes of each release give
+its build date and commit and the console installation steps. Each release
+has:
 
-- `openxbdm-<version>-<target>`: the `openxbdm` and `openxbdm-kd`
-  executables, built by Buck2.
-- `openxbdm-ffi-<version>-<target>`: the `openxbdm-ffi` shared and static
-  libraries and their C++ headers, built by Cargo and diplomat-tool.
+- `openxbdm-boot-guard-<version>.xex`: the console module for
+  `DEVKIT:\FlashEx\xbdm.xex` on a development kit.
+- `openxbdm-<version>.xex`: the console module for the kernel debugger
+  host.
+- For Linux x86_64, macOS arm64 and Windows x86_64:
+  - `xeedee-<version>-<target>`: the `xeedee` and `openxbdm-kd`
+    executables.
+  - `xeedee-ffi-<version>-<target>`: the `openxbdm-ffi` shared and static
+    libraries and their C++ headers.
 
-`<version>` is `nightly` for the nightly pre-release.
+Buck2 builds every file. `<version>` is `nightly` for the nightly
+pre-release.
 
 ## Host server
 
 ```text
 buck2 run //crates/openxbdm-server-host:openxbdm-server-bin -- --listen 127.0.0.1:1730
-openxbdm -H 127.0.0.1:1730 dmversion
+xeedee -H 127.0.0.1:1730 dmversion
 ```
 
 The default listen address is `127.0.0.1:1730`; name discovery is served
@@ -151,10 +172,10 @@ Or use the CLI:
 
 ```
 cargo install --path crates/openxbdm-cli
-openxbdm -H 192.168.1.26 systime
-openxbdm -H 192.168.1.26 file ls 'DEVKIT:\'
-openxbdm -H 192.168.1.26 file get 'DEVKIT:\my-capture.xbm'
-openxbdm -H 192.168.1.26 dump-module xboxkrnl.exe /tmp/xboxkrnl.exe
+xeedee -H 192.168.1.26 systime
+xeedee -H 192.168.1.26 file ls 'DEVKIT:\'
+xeedee -H 192.168.1.26 file get 'DEVKIT:\my-capture.xbm'
+xeedee -H 192.168.1.26 dump-module xboxkrnl.exe /tmp/xboxkrnl.exe
 ```
 
 ### Features
@@ -178,29 +199,31 @@ PIX! video capture, and the `dangerous` helpers. MP4 output shells out to
 
 ## Xbox 360 module
 
-`./build_xbox360.sh` writes `target/openxbdm.xex`: load address
+`buck2 build //xbox360:openxbdm` builds `openxbdm.xex`: load address
 `0x91f00000`, system-debugger DLL flags, build 21256 import versions,
 small pages, compression, development-key encryption, and the bounding
-path `\Device\Harddisk0\Partition1\DEVKIT\FlashEx\xbdm.xex`. The module
-boots on a devkit in place of stock XBDM; see `docs/re-notes/status.md`.
+path `\Device\Harddisk0\Partition1\DEVKIT\FlashEx\xbdm.xex`
+(`xbox360/xex.toml`). `//xbox360:openxbdm-boot-guard` is the build for
+`DEVKIT:\FlashEx`. The module boots on a devkit in place of stock XBDM;
+see `docs/re-notes/status.md`.
 
 Development loop, without writing the console disk: with kdnet enabled,
 run the kernel debugger host and reboot the console; the kernel loads
 the module from the host.
 
 ```text
-openxbdm-kd host --file 'host:\Device\Harddisk0\Partition1\DEVKIT\FlashEx\xbdm.xex=target/openxbdm.xex'
+openxbdm-kd host --file "host:\Device\Harddisk0\Partition1\DEVKIT\FlashEx\xbdm.xex=$(buck2 build //xbox360:openxbdm --show-simple-output)"
 ```
 
 Stopping the host and rebooting returns to stock XBDM from flash. Placed
-at `DEVKIT:\FlashEx\xbdm.xex` the module also loads in place of the flash
-monitor and removes that file at startup; read the hazards and recovery
-in `DEVELOPING.md` before using that method.
+at `DEVKIT:\FlashEx\xbdm.xex` the boot-guard build also loads in place of
+the flash monitor and removes that file at startup; read the hazards and
+recovery in `DEVELOPING.md` before using that method.
 
 ## Differential testing
 
-`openxbdm parity record` sends a command list to a monitor and records
-the replies; `openxbdm parity compare` reports differences between two
+`xeedee parity record` sends a command list to a monitor and records
+the replies; `xeedee parity compare` reports differences between two
 recordings outside listed varying fields. Against stock XBDM on a devkit,
 the 399 lines of `docs/re-notes/parity/hardware-commands.txt` give 0
 differences (`docs/re-notes/parity.md`). Usage: `DEVELOPING.md`.

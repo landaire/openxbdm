@@ -20,7 +20,7 @@ ENV = {
 
 rust_binary(
     name = "openxbdm-bin",
-    srcs = glob(["src/**"]),
+    srcs = glob(["Cargo.toml", "src/**"]),
     crate = "openxbdm",
     crate_root = "src/main.rs",
     edition = "2024",
@@ -59,7 +59,7 @@ rust_binary(
 
 rust_test(
     name = "openxbdm-bin-test",
-    srcs = glob(["src/**", "tests/**"]),
+    srcs = glob(["Cargo.toml", "src/**", "tests/**"]),
     crate = "openxbdm",
     crate_root = "src/main.rs",
     edition = "2024",
@@ -99,7 +99,7 @@ rust_test(
 
 rust_binary(
     name = "cmdtbl-example",
-    srcs = glob(["src/**", "examples/**"]),
+    srcs = glob(["Cargo.toml", "src/**", "examples/**"]),
     crate = "cmdtbl",
     crate_root = "examples/cmdtbl.rs",
     edition = "2024",
@@ -139,7 +139,7 @@ rust_binary(
 
 rust_binary(
     name = "ppcdis-example",
-    srcs = glob(["src/**", "examples/**"]),
+    srcs = glob(["Cargo.toml", "src/**", "examples/**"]),
     crate = "ppcdis",
     crate_root = "examples/ppcdis.rs",
     edition = "2024",
@@ -179,7 +179,7 @@ rust_binary(
 
 rust_binary(
     name = "xexgrep-example",
-    srcs = glob(["src/**", "examples/**"]),
+    srcs = glob(["Cargo.toml", "src/**", "examples/**"]),
     crate = "xexgrep",
     crate_root = "examples/xexgrep.rs",
     edition = "2024",

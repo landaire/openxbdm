@@ -20,7 +20,7 @@ ENV = {
 
 rust_library(
     name = "openxbdm_kd_core",
-    srcs = glob(["src/**"]),
+    srcs = glob(["Cargo.toml", "src/**"]),
     crate = "openxbdm_kd_core",
     crate_root = "src/lib.rs",
     edition = "2024",
@@ -38,7 +38,7 @@ rust_library(
 
 rust_test(
     name = "openxbdm_kd_core-lib-test",
-    srcs = glob(["src/**", "tests/**"]),
+    srcs = glob(["Cargo.toml", "src/**", "tests/**"]),
     crate = "openxbdm_kd_core",
     crate_root = "src/lib.rs",
     edition = "2024",
@@ -56,7 +56,7 @@ rust_test(
 
 rust_test(
     name = "codec-test",
-    srcs = glob(["src/**", "tests/**"]),
+    srcs = glob(["Cargo.toml", "src/**", "tests/**"]),
     crate = "codec",
     crate_root = "tests/codec.rs",
     edition = "2024",

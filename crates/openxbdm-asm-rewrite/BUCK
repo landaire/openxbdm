@@ -20,7 +20,7 @@ ENV = {
 
 rust_library(
     name = "openxbdm_asm_rewrite",
-    srcs = glob(["src/**"]),
+    srcs = glob(["Cargo.toml", "src/**"]),
     crate = "openxbdm_asm_rewrite",
     crate_root = "src/lib.rs",
     edition = "2024",
@@ -38,7 +38,7 @@ rust_library(
 
 rust_test(
     name = "openxbdm_asm_rewrite-lib-test",
-    srcs = glob(["src/**", "tests/**"]),
+    srcs = glob(["Cargo.toml", "src/**", "tests/**"]),
     crate = "openxbdm_asm_rewrite",
     crate_root = "src/lib.rs",
     edition = "2024",
@@ -56,7 +56,7 @@ rust_test(
 
 rust_binary(
     name = "openxbdm-asm-rewrite-bin",
-    srcs = glob(["src/**"]),
+    srcs = glob(["Cargo.toml", "src/**"]),
     crate = "openxbdm_asm_rewrite",
     crate_root = "src/main.rs",
     edition = "2024",
@@ -74,7 +74,7 @@ rust_binary(
 
 rust_test(
     name = "openxbdm-asm-rewrite-bin-test",
-    srcs = glob(["src/**", "tests/**"]),
+    srcs = glob(["Cargo.toml", "src/**", "tests/**"]),
     crate = "openxbdm_asm_rewrite",
     crate_root = "src/main.rs",
     edition = "2024",
@@ -93,7 +93,7 @@ rust_test(
 
 rust_binary(
     name = "openxbdm-link-record-bin",
-    srcs = glob(["src/**"]),
+    srcs = glob(["Cargo.toml", "src/**"]),
     crate = "openxbdm_link_record",
     crate_root = "src/bin/openxbdm-link-record.rs",
     edition = "2024",
@@ -111,7 +111,7 @@ rust_binary(
 
 rust_test(
     name = "openxbdm-link-record-bin-test",
-    srcs = glob(["src/**", "tests/**"]),
+    srcs = glob(["Cargo.toml", "src/**", "tests/**"]),
     crate = "openxbdm_link_record",
     crate_root = "src/bin/openxbdm-link-record.rs",
     edition = "2024",

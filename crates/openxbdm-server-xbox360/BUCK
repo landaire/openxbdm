@@ -20,7 +20,7 @@ ENV = {
 
 rust_binary(
     name = "openxbdm-server-xbox360-bin",
-    srcs = glob(["src/**"]),
+    srcs = glob(["Cargo.toml", "src/**"]),
     crate = "openxbdm_server_xbox360",
     crate_root = "src/main.rs",
     edition = "2024",
@@ -40,7 +40,7 @@ rust_binary(
 
 rust_test(
     name = "openxbdm-server-xbox360-bin-test",
-    srcs = glob(["src/**", "tests/**"]),
+    srcs = glob(["Cargo.toml", "src/**", "tests/**"]),
     crate = "openxbdm_server_xbox360",
     crate_root = "src/main.rs",
     edition = "2024",
@@ -60,7 +60,7 @@ rust_test(
 
 rust_binary(
     name = "openxbdm-server-xbox360-all-features-bin",
-    srcs = glob(["src/**"]),
+    srcs = glob(["Cargo.toml", "src/**"]),
     crate = "openxbdm_server_xbox360",
     crate_root = "src/main.rs",
     edition = "2024",

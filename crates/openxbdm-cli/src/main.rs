@@ -92,7 +92,7 @@ use openxbdm_client::transport::tokio::connect_target_timeout;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "openxbdm",
+    name = "xeedee",
     about = "Async-first XBDM (Xbox Debug Monitor) client",
     version
 )]
@@ -319,8 +319,8 @@ enum Command {
     /// default if the counter only has one kind.
     ///
     /// Example:
-    ///   openxbdm pclist                         # discover names + types
-    ///   openxbdm querypc DX9Framerate --kind 1  # sample one
+    ///   xeedee pclist                         # discover names + types
+    ///   xeedee querypc DX9Framerate --kind 1  # sample one
     #[command(verbatim_doc_comment)]
     Querypc {
         /// Counter name, exactly as it appears in the `name` column of

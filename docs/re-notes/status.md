@@ -28,7 +28,7 @@ Status labels:
 | PGO runtime | `docs/re-notes/pgo.md` | implemented | Exports and `pogoctrl` |
 | Boot-time replacement | `docs/re-notes/module-loading.md` | verified | Loader rule; `DEVKIT:\FlashEx\xbdm.xex` with a matching bounding path loads in place of flash XBDM |
 | Boot from the kd host | `docs/re-notes/kd.md`, `crates/openxbdm-kd` | verified | With a kd host attached the kernel requests each module from the host before its own devices; `openxbdm-kd host --file` serves openxbdm without writing the disk |
-| Differential testing | `openxbdm parity record`, `openxbdm parity compare` | verified | Stock and openxbdm replies to `parity/hardware-commands.txt` |
+| Differential testing | `xeedee parity record`, `xeedee parity compare` | verified | Stock and openxbdm replies to `parity/hardware-commands.txt` |
 
 Per-command, export, and control code coverage, remaining gaps, and
 deliberate deviations: `parity.md`.

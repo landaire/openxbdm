@@ -8,7 +8,7 @@ description = "Command-line XBDM client built on the `openxbdm-client` library"
 publish = false
 
 [[bin]]
-name = "openxbdm"
+name = "xeedee"
 path = "src/main.rs"
 
 # One-shot reverse-engineering tools kept for future debugging. They

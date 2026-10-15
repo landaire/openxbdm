@@ -54,9 +54,9 @@ under debugger there.
 
 ## Hardware results
 
-`openxbdm parity record` sent the 399 lines of
+`xeedee parity record` sent the 399 lines of
 `parity/hardware-commands.txt` to stock XBDM 2.0.21256.0 and to openxbdm
-on the same devkit; `openxbdm parity compare` with
+on the same devkit; `xeedee parity compare` with
 `parity/hardware-variances.txt` reports:
 
 | Exchanges | Equal | Equal outside varying fields | Differ |

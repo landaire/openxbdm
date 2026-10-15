@@ -1,4 +1,4 @@
-# Command list for `openxbdm parity record`; see hardware.md.
+# Command list for `xeedee parity record`; see hardware.md.
 # Only read-only forms, error paths rejected before any side effect, and
 # scratch files under DEVKIT:\oxtest.
 

@@ -159,10 +159,10 @@ Unit tests in `automation.rs` cover the playback engine.
 
 ## Hardware differential results
 
-Method: `openxbdm parity record --commands
+Method: `xeedee parity record --commands
 docs/re-notes/parity/hardware-commands.txt` against stock XBDM 2.0.21256.0
 booted from flash and against openxbdm served by the kd host, each run
-starting without `DEVKIT:\oxtest`; then `openxbdm parity compare --variances
+starting without `DEVKIT:\oxtest`; then `xeedee parity compare --variances
 docs/re-notes/parity/hardware-variances.txt <stock> <openxbdm>`. Result:
 399 exchanges, 0 differences outside the varying fields. Two stock runs
 compared the same way also show 0 differences.

@@ -19,12 +19,12 @@ ENV = {
 }
 
 rust_binary(
-    name = "openxbdm-bin",
+    name = "xeedee-bin",
     srcs = glob(["Cargo.toml", "src/**"]),
-    crate = "openxbdm",
+    crate = "xeedee",
     crate_root = "src/main.rs",
     edition = "2024",
-    env = ENV | {"CARGO_BIN_NAME": "openxbdm"},
+    env = ENV | {"CARGO_BIN_NAME": "xeedee"},
     features = [
         "capture",
         "dangerous",
@@ -58,12 +58,12 @@ rust_binary(
 )
 
 rust_test(
-    name = "openxbdm-bin-test",
+    name = "xeedee-bin-test",
     srcs = glob(["Cargo.toml", "src/**", "tests/**"]),
-    crate = "openxbdm",
+    crate = "xeedee",
     crate_root = "src/main.rs",
     edition = "2024",
-    env = ENV | {"CARGO_BIN_NAME": "openxbdm"} | {"INSTA_WORKSPACE_ROOT": "."},
+    env = ENV | {"CARGO_BIN_NAME": "xeedee"} | {"INSTA_WORKSPACE_ROOT": "."},
     features = [
         "capture",
         "dangerous",

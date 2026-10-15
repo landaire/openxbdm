@@ -26,9 +26,10 @@ multi-line and binary bodies, and answer name discovery on UDP port 730.
 
 ## Build
 
-`devenv shell` (`devenv.nix`) provides the Rust toolchain, Buck2, and
-Reindeer. Buck2 is the primary build system; Cargo builds the same
-sources from the vendored dependencies.
+`devenv shell` (`devenv.nix`) provides Buck2, Reindeer, and the Rust
+release pinned in `rust-toolchain.toml`; Buck2 downloads the same release
+itself. Buck2 is the primary build system; Cargo builds the same sources
+from the vendored dependencies.
 
 ```text
 buck2 build //...

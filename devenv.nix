@@ -1,11 +1,10 @@
 { pkgs, ... }:
 
 {
+  # The release that rustup and Buck2 use; see rust-toolchain.toml.
   languages.rust = {
     enable = true;
-    channel = "stable";
-    # build_xbox360.sh builds `core` from source with -Zbuild-std.
-    components = [ "rustc" "cargo" "clippy" "rustfmt" "rust-analyzer" "rust-src" ];
+    toolchainFile = ./rust-toolchain.toml;
   };
 
   packages = [

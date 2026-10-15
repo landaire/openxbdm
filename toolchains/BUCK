@@ -1,3 +1,59 @@
-load("@prelude//toolchains:demo.bzl", "system_demo_toolchains")
+load("@prelude//tests:test_toolchain.bzl", "noop_test_toolchain")
+load("@prelude//toolchains:cxx.bzl", "system_cxx_toolchain")
+load("@prelude//toolchains:genrule.bzl", "system_genrule_toolchain")
+load("@prelude//toolchains:python.bzl", "remote_python_toolchain")
+load("@prelude//toolchains:remote_test_execution.bzl", "remote_test_execution_toolchain")
+load(":rust.bzl", "rust_release_archives", "rust_release_toolchain", "rust_release_triple", "rust_sysroot")
 
-system_demo_toolchains()
+rust_sysroot(
+    name = "rust-sysroot",
+    archives = rust_release_archives(["rustc", "rust-std", "clippy-preview"]),
+    assembler = "assemble_rust_sysroot.py",
+)
+
+rust_release_toolchain(
+    name = "rust",
+    default_edition = "2021",
+    executable_suffix = select({
+        "DEFAULT": "",
+        "prelude//os:windows": ".exe",
+    }),
+    rustc_target_triple = rust_release_triple(),
+    sysroot = ":rust-sysroot",
+    visibility = ["PUBLIC"],
+)
+
+# Links Rust binaries. On Linux the linker driver can be GCC or Clang: the
+# `-fuse-ld=lld` that the prelude adds resolves to the lld that rustc
+# bundles, so no system lld is needed. The C compilers keep the prelude's
+# defaults.
+system_cxx_toolchain(
+    name = "cxx",
+    linker = select({
+        "DEFAULT": None,
+        "prelude//os:linux": "c++",
+    }),
+    visibility = ["PUBLIC"],
+)
+
+# Required by the genrule that remote_python_toolchain declares.
+system_genrule_toolchain(
+    name = "genrule",
+    visibility = ["PUBLIC"],
+)
+
+# Runs the prelude's Python tools with a downloaded CPython.
+remote_python_toolchain(
+    name = "python",
+    visibility = ["PUBLIC"],
+)
+
+remote_test_execution_toolchain(
+    name = "remote_test_execution",
+    visibility = ["PUBLIC"],
+)
+
+noop_test_toolchain(
+    name = "test",
+    visibility = ["PUBLIC"],
+)

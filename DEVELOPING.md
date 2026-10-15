@@ -2,8 +2,35 @@
 
 ## Environment
 
-`devenv shell` (`devenv.nix`) provides the stable Rust toolchain (with
-`rust-src` for `build_xbox360.sh`), Buck2, and Reindeer.
+`devenv shell` (`devenv.nix`) provides Buck2, Reindeer, and the Rust
+release in `rust-toolchain.toml`.
+
+The Rust release is pinned in two places that must name the same version:
+
+- `rust-toolchain.toml`, which rustup and devenv read for Cargo,
+  rust-analyzer and `build_xbox360.sh`. It adds `clippy`, `rustfmt`,
+  `rust-analyzer`, and `rust-src`, the library source that the console
+  module builds with `-Zbuild-std`.
+- `toolchains/rust_release.bzl`, the archives that Buck2 downloads itself:
+  `rustc` (rustc, rustdoc, and the bundled lld), `rust-std`, and
+  `clippy-preview` (clippy-driver). Buck2 verifies each archive's SHA-256
+  and assembles them once into a sysroot for the host, so `buck2 build`
+  needs no installed Rust. Buck2 builds only for the host it runs on.
+
+The channel must be an exact release. To change it, edit
+`rust-toolchain.toml` and run
+
+    toolchains/update_rust_release.py
+
+which writes `toolchains/rust_release.bzl` from the release's channel
+manifest on static.rust-lang.org. `toolchains/update_rust_release.py
+--check` verifies, without network access, that the two files name the
+same release.
+
+Buck2 links with the host's linker driver: `c++` (GCC or Clang) with the
+lld bundled in `rustc` on Linux, Xcode command line tools on macOS, and
+MSVC build tools on Windows. The prelude's Python tools run on a CPython
+that Buck2 downloads.
 
 ## Build and test
 
@@ -25,7 +52,14 @@ platform provides, so `buck2 build //...` skips it. Build the module with
     ./build_xbox360.sh [output.xex]
 
 which needs the `llvm-xbox-360` toolchain checkout in `../llvm-xbox-360`
-or at `$LLVM_XBOX_360`, and writes `target/openxbdm.xex` by default.
+or at `$LLVM_XBOX_360`, and writes `target/openxbdm.xex` by default. It
+runs the `cargo` in `PATH`. The standard library overlay must be applied
+to that toolchain's `rust-src`, which the read-only Nix store of the devenv
+toolchain does not allow, so build the module with rustup's toolchain
+outside the devenv shell. Apply the overlay once, from this directory:
+
+    ../llvm-xbox-360/toolchain/rust-std-xbox360/apply.sh
+
 `OPENXBDM_FEATURES` passes Cargo features to the module build; the
 `DEVKIT:\FlashEx` deployment uses `boot-guard`:
 
@@ -154,8 +188,8 @@ To add or update a dependency, or after changing the Rust toolchain:
 2. Run `reindeer --manifest-path <absolute path to Cargo.toml> vendor`.
    This removes crates that the workspace does not use, including the
    standard library dependencies.
-3. Vendor the standard library dependencies with the toolchain that
-   builds the console module:
+3. Vendor the standard library dependencies of the pinned toolchain,
+   from this directory so that rustup selects it:
 
        RUSTC_BOOTSTRAP=1 cargo vendor --versioned-dirs --no-delete \
            --manifest-path "$(rustc --print sysroot)/lib/rustlib/src/rust/library/Cargo.toml" \

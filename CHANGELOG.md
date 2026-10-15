@@ -42,6 +42,7 @@
 
 - Build with Buck2; Reindeer generates the rules from the workspace and the vendored dependencies, and `build_defs/rust_tests.bzl` declares the test targets.
 - Pin Rust 1.98.0 in `rust-toolchain.toml`; Buck2 downloads the same release from the hashes in `toolchains/rust_release.bzl` instead of using the system Rust. On Linux the host C driver links with the lld bundled in `rustc`.
+- Report each libtest case as its own Buck2 test through the internal test runner; disabled in `.buckconfig` until the installed buck2 is 2026-10-01 or later.
 - Vendor all dependencies, including the standard library sources for the console build.
 
 ### Documentation

@@ -170,6 +170,18 @@ a crate listed there becomes a test target, with all of `tests/**` (shared
 modules such as `tests/common/mod.rs`, fixtures) in its sources. Update
 that file when a crate's test dependencies or features change.
 
+The test rule in that file adds `InternalRunnerTestInfo` to the prelude's
+`ExternalRunnerTestInfo`. With Buck2's internal runner, `buck2 test` lists
+each binary's libtest cases (`--list --format terse`), runs every case in
+its own process (`--exact <name>`), and reports pass, failure (with the
+case's output), or skip (`#[ignore]`) per case. That needs buck2
+2026-10-01 or later; earlier releases fail every run with `end_of_tests
+was received twice` after the cases finish. `.buckconfig` therefore sets
+`test.use_internal_runner = false`, which runs each test binary as one
+test. With a recent buck2, remove that setting, or try it per command:
+
+    buck2 test //... -c test.use_internal_runner=true
+
 Test-only dependencies are normal dependencies of `openxbdm-testing`, so
 that reindeer generates rules for them.
 

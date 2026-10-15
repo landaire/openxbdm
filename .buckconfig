@@ -24,3 +24,9 @@
 
 [project]
   ignore = .claude, .git, .jj, target
+
+[test]
+  # Per-case Rust test results (build_defs/rust_tests.bzl) need buck2
+  # 2026-10-01 or later; earlier releases fail every run after the tests
+  # finish. Remove this line once the installed buck2 is that recent.
+  use_internal_runner = false

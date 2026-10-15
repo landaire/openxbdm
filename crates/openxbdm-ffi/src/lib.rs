@@ -3,16 +3,9 @@
 //! Exposes a synchronous XBDM client plus the wire-protocol helpers. The
 //! async runtime is embedded; callers need not know tokio exists.
 //!
-//! The C++ wrappers are generated (not committed) into `bindings/cpp/`
-//! with:
-//!
-//! ```text
-//! diplomat-tool cpp crates/openxbdm-ffi/bindings/cpp \
-//!     --entry crates/openxbdm-ffi/src/lib.rs
-//! ```
-//!
-//! CI runs this on every build; the release workflow packages the output
-//! alongside the static / dynamic libraries.
+//! The C++ wrappers are generated, not committed: `buck2 build
+//! //bindings:cpp` runs `openxbdm-ffi-bindgen` on this crate. The release
+//! archives hold them with the static and shared libraries.
 
 mod inner;
 

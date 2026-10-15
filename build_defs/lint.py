@@ -20,13 +20,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# Rules of the workspace crates, including their tests. The generated rules
-# set compatible_with only for crates that only Cargo builds (see
-# CARGO_ONLY_CONSTRAINTS in build_defs/update_buck_files.py).
-WORKSPACE_TARGETS = (
-    'kind("^rust_(library|binary|test)$", root//crates/...)'
-    ' - attrregexfilter(compatible_with, ".", root//crates/...)'
-)
+# Rules of the workspace crates, including their tests. Console crates
+# (xbox360_executable rules) have no clippy subtarget.
+WORKSPACE_TARGETS = 'kind("^rust_(library|binary|test)$", root//crates/...)'
 
 
 def buck2(buck2_path, *args):

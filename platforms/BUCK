@@ -1,16 +1,6 @@
 load("@prelude//platforms:defs.bzl", "host_configuration")
 load(":defs.bzl", "cached_execution_platform")
 
-# No Buck platform provides this value, so targets that require it are
-# skipped by host builds. build_xbox360.sh builds the console module.
-constraint_setting(name = "console")
-
-constraint_value(
-    name = "xbox360",
-    constraint_setting = ":console",
-    visibility = ["PUBLIC"],
-)
-
 cached_execution_platform(
     name = "cached",
     cpu_configuration = host_configuration.cpu,

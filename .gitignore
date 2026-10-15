@@ -6,14 +6,13 @@
 /openxbdm-capture
 /screenshot.png
 
-# diplomat-generated C++ headers; regenerated in CI and at release time.
-/crates/openxbdm-ffi/bindings/
-
 # insta snapshot pending-review files (stay local until accepted/rejected).
 *.pending-snap
 
 /buck-out
 /.buckconfig.local
+# A local rust-xbox360 checkout for `xbox360 = disabled` (DEVELOPING.md).
+/rust-xbox360
 /.cargo/*
 /.devenv
 /.devenv.flake.nix

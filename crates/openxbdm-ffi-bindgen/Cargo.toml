@@ -1,0 +1,17 @@
+[package]
+name = "openxbdm-ffi-bindgen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Generates the C++ headers of openxbdm-ffi with diplomat"
+publish = false
+
+[[bin]]
+name = "openxbdm-ffi-bindgen"
+path = "src/main.rs"
+
+[dependencies]
+# The same release as the `diplomat` macros of openxbdm-ffi.
+diplomat-tool = "0.15"
+diplomat_core = "0.15"

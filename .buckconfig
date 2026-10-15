@@ -2,6 +2,7 @@
   root = .
   prelude = prelude
   toolchains = toolchains
+  xbox360 = rust-xbox360
   none = none
 
 [cell_aliases]
@@ -11,13 +12,22 @@
   fbsource = none
   buck = none
 
+# The Xbox 360 target, standard library overlay, toolchain rules and
+# xex-link come from rust-xbox360 at a pinned commit (DEVELOPING.md,
+# Local changes to rust-xbox360).
 [external_cells]
   prelude = bundled
+  xbox360 = git
+
+[external_cell_xbox360]
+  git_origin = https://github.com/landaire/rust-xbox360
+  commit_hash = aae3374b113adf9f7030cc06c5079fd1996d1247
 
 [parser]
   target_platform_detector_spec = target:root//...->prelude//platforms:default \
     target:prelude//...->prelude//platforms:default \
-    target:toolchains//...->prelude//platforms:default
+    target:toolchains//...->prelude//platforms:default \
+    target:xbox360//...->prelude//platforms:default
 
 [build]
   execution_platforms = prelude//platforms:default

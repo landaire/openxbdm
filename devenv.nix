@@ -29,11 +29,10 @@ let
     meta.mainProgram = "buck2";
   };
 
-  # Cargo, for reindeer, build_defs/update_buck_files.py and
-  # build_xbox360.sh, and rust-analyzer. Buck2 downloads the same release
-  # itself. The rust-overlay toolchain propagates a Nix C compiler for
-  # linking; only its files are taken, so the host's compiler stays the one
-  # on PATH.
+  # Cargo, for reindeer and build_defs/update_buck_files.py, and
+  # rust-analyzer. Buck2 downloads the same release itself. The
+  # rust-overlay toolchain propagates a Nix C compiler for linking; only its
+  # files are taken, so the host's compiler stays the one on PATH.
   rustToolchain = pkgs.buildEnv {
     name = "rust-toolchain";
     paths = [ (pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml) ];
@@ -52,8 +51,6 @@ in
     # One of its tests fails on darwin.
     (pkgs.reindeer.overrideAttrs { doCheck = false; })
     pkgs.python3
-    # llvm-mc and llvm-objdump for build_xbox360.sh.
-    pkgs.llvmPackages.llvm
   ];
 
   # bazel-remote serves the Buck2 action cache in CI.

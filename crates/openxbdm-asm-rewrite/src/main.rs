@@ -8,7 +8,6 @@ use std::process::ExitCode;
 use clap::Parser;
 use clap::Subcommand;
 use openxbdm_asm_rewrite::audit;
-use openxbdm_asm_rewrite::link;
 use openxbdm_asm_rewrite::reservation;
 use openxbdm_asm_rewrite::rewrite;
 use thiserror::Error;
@@ -34,18 +33,6 @@ enum Command {
         #[arg(long)]
         refusals: PathBuf,
     },
-    /// Replay a recorded link command with another module object.
-    Relink {
-        #[arg(long)]
-        record: PathBuf,
-        #[arg(long)]
-        object: PathBuf,
-        #[arg(long)]
-        output: PathBuf,
-        /// Also link a copy that keeps the symbol table.
-        #[arg(long)]
-        unstripped: Option<PathBuf>,
-    },
     /// Check `llvm-objdump -d --no-show-raw-insn` output of the linked
     /// image for sequences the rules still rewrite.
     Audit {
@@ -69,26 +56,13 @@ enum Error {
     #[error(transparent)]
     Rewrite(#[from] rewrite::Error),
     #[error(transparent)]
-    Link(#[from] link::Error),
-    #[error(transparent)]
     Audit(#[from] audit::Error),
     #[error(transparent)]
     Image(#[from] reservation::ElfError),
     #[error(
-        "{count} unprotected reservations; LLVM emits them for `core::sync::atomic` read-modify-write operations unless the active toolchain's rust-src carries the xbox360 atomics overlay (llvm-xbox-360/toolchain/rust-std-xbox360/apply.sh)"
+        "{count} unprotected reservations; LLVM emits them for `core::sync::atomic` read-modify-write operations unless the standard library carries the xbox360 atomics overlay (rust-xbox360 toolchain/rust-std-xbox360)"
     )]
     Unprotected { count: usize },
-    #[error("running {linker}")]
-    Spawn {
-        linker: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("{linker} failed with {status}")]
-    LinkFailed {
-        linker: PathBuf,
-        status: std::process::ExitStatus,
-    },
     #[error("{count} functions still hold rewritable sequences")]
     Rewritable { count: usize },
 }
@@ -111,26 +85,6 @@ fn create(path: &Path) -> Result<BufWriter<File>, Error> {
         })
 }
 
-fn relink(
-    record: &link::LinkRecord,
-    object: &Path,
-    output: &Path,
-    keep_symbols: bool,
-) -> Result<(), Error> {
-    let mut command = record.command(object, output, keep_symbols)?;
-    let status = command.status().map_err(|source| Error::Spawn {
-        linker: record.linker.clone(),
-        source,
-    })?;
-    if !status.success() {
-        return Err(Error::LinkFailed {
-            linker: record.linker.clone(),
-            status,
-        });
-    }
-    Ok(())
-}
-
 fn run(arguments: Arguments) -> Result<(), Error> {
     match arguments.command {
         Command::Rewrite {
@@ -145,18 +99,6 @@ fn run(arguments: Arguments) -> Result<(), Error> {
             };
             let report = rewrite::rewrite(open(&input)?, create(&output)?, listings)?;
             println!("{report}");
-        }
-        Command::Relink {
-            record,
-            object,
-            output,
-            unstripped,
-        } => {
-            let record = link::LinkRecord::read(open(&record)?)?;
-            relink(&record, &object, &output, false)?;
-            if let Some(unstripped) = unstripped {
-                relink(&record, &object, &unstripped, true)?;
-            }
         }
         Command::Audit { disassembly, scope } => {
             let scope = audit::read_scope(open(&scope)?)?;

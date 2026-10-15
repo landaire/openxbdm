@@ -1,0 +1,18 @@
+# XEX metadata of openxbdm.xex (xex-link manifest). The values match the
+# stock xbdm.xex that the module replaces.
+load_address = 0x91f00000
+version = "2.0.21256.0"
+base_version = "2.0.21256.0"
+image_flags = ["SMALL_PAGES"]
+module_flags = ["EXPORTS_TO_TITLE", "SYSTEM_DEBUGGER", "DLL"]
+compress = true
+bounding_path = '\Device\Harddisk0\Partition1\DEVKIT\FlashEx\xbdm.xex'
+encrypt = "devkit"
+
+[imports]
+version = "2.0.21256.0"
+min_version = "2.0.1861.0"
+
+[exports]
+module = "xbdm.xex"
+min_version = "2.0.1861.0"

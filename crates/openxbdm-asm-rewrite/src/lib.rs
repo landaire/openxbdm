@@ -13,7 +13,6 @@ pub mod audit;
 pub mod helpers;
 pub mod isa;
 pub mod line;
-pub mod link;
 pub mod reservation;
 pub mod rewrite;
 

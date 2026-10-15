@@ -1,31 +1,12 @@
-load("@prelude//tests:test_toolchain.bzl", "noop_test_toolchain")
-load("@prelude//toolchains:cxx.bzl", "system_cxx_toolchain")
-load("@prelude//toolchains:genrule.bzl", "system_genrule_toolchain")
-load("@prelude//toolchains:python.bzl", "remote_python_toolchain")
-load("@prelude//toolchains:remote_test_execution.bzl", "remote_test_execution_toolchain")
-load(":rust.bzl", "release_tool", "rust_release", "rust_release_toolchain")
+load("@xbox360//buck:rust.bzl", "release_tool", "rust_release")
+load("@xbox360//buck:toolchains.bzl", "xbox360_toolchains")
+load(":rustfmt_release.bzl", "RUSTFMT_HOSTS")
 
-export_file(
-    name = "assemble_rust_sysroot.py",
-    visibility = ["PUBLIC"],
-)
-
-rust_release(
-    name = "rust-release",
-    hosts = "release",
-)
-
-# Downloaded only when something runs rustfmt.
-rust_release(
-    name = "rustfmt-nightly",
-    hosts = "rustfmt-nightly",
-)
-
-# `-c rust.profile=release` builds like Cargo's release profile (with the
-# workspace's `lto = "thin"`), which also strips the standard library's
-# debug information from executables. The dev profile uses rustc's
-# defaults. Only binaries take -Clto: rustc rejects it for proc-macro
-# crates, and libraries carry the bitcode that it uses.
+# `-c rust.profile=release` builds host crates like Cargo's release profile
+# (with the workspace's `lto = "thin"`), which also strips the standard
+# library's debug information from executables. The dev profile uses
+# rustc's defaults. Only binaries take -Clto: rustc rejects it for
+# proc-macro crates, and libraries carry the bitcode that it uses.
 _PROFILE_RUSTC_FLAGS = {
     "dev": [],
     "release": ["-Copt-level=3", "-Cstrip=debuginfo"],
@@ -40,62 +21,35 @@ _PROFILE = read_config("rust", "profile", "dev")
 
 _PROFILE in _PROFILE_RUSTC_FLAGS or fail("rust.profile must be one of {}, not `{}`".format(_PROFILE_RUSTC_FLAGS.keys(), _PROFILE))
 
-rust_release_toolchain(
-    name = "rust",
-    default_edition = "2021",
-    release = ":rust-release",
-    rustc_binary_flags = _PROFILE_RUSTC_BINARY_FLAGS[_PROFILE],
-    rustc_flags = _PROFILE_RUSTC_FLAGS[_PROFILE],
+xbox360_toolchains(
     # The prelude runs doctests through a wrapper (`--test-runtool`), and
-    # rustdoc then runs merged edition 2024 doctests in one process. Separate
-    # binaries run each doctest in its own process, as Cargo does.
+    # rustdoc then runs merged edition 2024 doctests in one process.
+    # Separate binaries run each doctest in its own process, as Cargo does.
     rustdoc_flags = [
         "-Zunstable-options",
         "--merge-doctests=no",
     ],
-    visibility = ["PUBLIC"],
+    rustc_binary_flags = _PROFILE_RUSTC_BINARY_FLAGS[_PROFILE],
+    rustc_flags = _PROFILE_RUSTC_FLAGS[_PROFILE],
+    # The console module (xbox360/BUCK) shares the console's memory with the
+    # running title, so it is built for size in every profile: one LTO
+    # module, and panics that trap without formatting a message.
+    xbox360_rustc_binary_flags = ["-Clto=fat"],
+    xbox360_rustc_flags = ["-Cpanic=immediate-abort"],
+)
+
+# Downloaded only when something runs rustfmt.
+rust_release(
+    name = "rustfmt-nightly",
+    components = ["rustc", "rustfmt-preview"],
+    hosts = RUSTFMT_HOSTS,
 )
 
 # `buck2 run toolchains//:rustfmt -- ...` formats with the pinned nightly
 # rustfmt, which accepts every option in .rustfmt.toml.
 release_tool(
     name = "rustfmt",
+    path = "bin/rustfmt",
     release = ":rustfmt-nightly",
-    tool = "rustfmt",
-    visibility = ["PUBLIC"],
-)
-
-# Links Rust binaries. On Linux the linker driver can be GCC or Clang: the
-# `-fuse-ld=lld` that the prelude adds resolves to the lld that rustc
-# bundles, so no system lld is needed. The C compilers keep the prelude's
-# defaults.
-system_cxx_toolchain(
-    name = "cxx",
-    linker = select({
-        "DEFAULT": None,
-        "prelude//os:linux": "c++",
-    }),
-    visibility = ["PUBLIC"],
-)
-
-# Required by the genrule that remote_python_toolchain declares.
-system_genrule_toolchain(
-    name = "genrule",
-    visibility = ["PUBLIC"],
-)
-
-# Runs the prelude's Python tools with a downloaded CPython.
-remote_python_toolchain(
-    name = "python",
-    visibility = ["PUBLIC"],
-)
-
-remote_test_execution_toolchain(
-    name = "remote_test_execution",
-    visibility = ["PUBLIC"],
-)
-
-noop_test_toolchain(
-    name = "test",
     visibility = ["PUBLIC"],
 )

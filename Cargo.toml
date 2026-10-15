@@ -6,6 +6,7 @@ members = [
     "crates/openxbdm-client",
     "crates/openxbdm-cli",
     "crates/openxbdm-ffi",
+    "crates/openxbdm-ffi-bindgen",
     "crates/openxbdm-kd",
     "crates/openxbdm-kd-core",
     "crates/openxbdm-server",
@@ -35,12 +36,3 @@ winnow = "1.0.1"
 
 [profile.release]
 lto = "thin"
-
-# Console module build: the module shares limited system RAM, so size wins.
-[profile.xbox360]
-inherits = "release"
-opt-level = "z"
-lto = true
-codegen-units = 1
-panic = "abort"
-strip = true

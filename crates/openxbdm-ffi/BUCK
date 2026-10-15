@@ -38,6 +38,7 @@ rust_library(
     visibility = [
         "PUBLIC",
     ],
+    soname = select({"DEFAULT": "libopenxbdm_ffi.$(ext)", "prelude//os:windows": "openxbdm_ffi.$(ext)"}),
 )
 
 rust_test(

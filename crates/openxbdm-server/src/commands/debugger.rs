@@ -28,6 +28,7 @@ pub use self::direct::DirectException;
 pub use self::direct::DirectNotice;
 pub use self::direct::DirectOutcome;
 pub use self::direct::DirectPolicy;
+pub use self::direct::DirectRegisters;
 pub use self::direct::DirectStep;
 pub use self::direct::ThreadNameRequest;
 pub use self::direct::dispatch_direct;
@@ -494,7 +495,7 @@ pub struct DirectNotification {
 }
 
 /// The attached debugger as recorded by `debugger`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DebuggerRecord {
     pub attached: bool,
     /// Address word as the monitor stores it: `addr=` puts the first octet
@@ -503,6 +504,16 @@ pub struct DebuggerRecord {
     pub port: u32,
     pub name: Text<DEBUGGER_NAME_CAPACITY>,
     pub user: Text<DEBUGGER_USER_CAPACITY>,
+}
+
+impl DebuggerRecord {
+    pub const EMPTY: Self = Self {
+        attached: false,
+        address: 0,
+        port: 0,
+        name: Text::new(),
+        user: Text::new(),
+    };
 }
 
 pub const DEBUGGER_NAME_CAPACITY: usize = 0x7f;
@@ -555,23 +566,23 @@ struct HeldReply {
     text: LineText,
 }
 
-impl Default for State {
-    fn default() -> Self {
+impl State {
+    pub const fn new() -> Self {
         Self {
             process_id: None,
-            breakpoints: Breakpoints::default(),
+            breakpoints: Breakpoints::new(),
             data_breakpoint: None,
-            stop_on: StopOn::default(),
+            stop_on: StopOn(0),
             break_at_title_entry: false,
             saved_execution: ExecutionState::Stopped,
             kernel_debugger: None,
             kd_lite: true,
-            debugger: DebuggerRecord::default(),
+            debugger: DebuggerRecord::EMPTY,
             extension: None,
             trap_passthrough: false,
             held_reply: None,
             snapshots: [None; MAX_CONNECTIONS],
-            events: events::Events::default(),
+            events: events::Events::new(),
         }
     }
 }
@@ -1354,10 +1365,8 @@ fn get_context(invocation: &mut Invocation<'_>) -> Hresult {
             flags = flags.union(group);
         }
     }
-    let mut context = Context {
-        flags,
-        ..Context::default()
-    };
+    let mut context = Context::EMPTY;
+    context.flags = flags;
     if invocation
         .backend
         .thread_context(thread, &mut context)
@@ -1462,10 +1471,8 @@ fn set_context(invocation: &mut Invocation<'_>) -> Hresult {
     let Some(thread) = required_thread(invocation) else {
         return util::MISSING;
     };
-    let mut context = Context {
-        flags: ContextFlags::FULL,
-        ..Context::default()
-    };
+    let mut context = Context::EMPTY;
+    context.flags = ContextFlags::FULL;
     if invocation
         .backend
         .thread_context(thread, &mut context)
@@ -1626,7 +1633,7 @@ fn debugger_identity(invocation: &mut Invocation<'_>) -> Hresult {
         {
             return Hresult::from_error_code(ErrorCode::ACCESS_DENIED);
         }
-        state.debugger.debugger = DebuggerRecord::default();
+        state.debugger.debugger = DebuggerRecord::EMPTY;
         state.debugger.kernel_debugger = Some(true);
         state.settings_dirty = true;
         return Hresult::OK;

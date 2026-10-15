@@ -142,20 +142,20 @@ pub struct PublishedState {
     pub event_defer: u32,
     pub trace_mask: u32,
     /// Export 194 view of the lab server registration.
-    pub registration: console::HttpRegistration,
+    pub registration: console::RegistrationResult,
 }
 
 impl Default for PublishedState {
     /// The server's initial state.
     fn default() -> Self {
-        let state = console::State::default();
+        let state = console::State::new();
         Self {
             name: Vec::new(),
             dump_mode: state.dump_mode.raw(),
             dump_settings: state.dump_settings.to_block().to_vec(),
             event_defer: state.event_defer.0,
             trace_mask: state.trace_mask.0,
-            registration: state.http_registration,
+            registration: state.http_registration.result(),
         }
     }
 }
@@ -488,7 +488,7 @@ impl console::Backend for MockBackend {
             }
             Published::EventDefer(mask) => published.event_defer = mask.0,
             Published::TraceMask(mask) => published.trace_mask = mask.0,
-            Published::Registration(registration) => published.registration = *registration,
+            Published::Registration(registration) => published.registration = registration.result(),
         }
     }
 

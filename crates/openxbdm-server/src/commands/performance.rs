@@ -111,11 +111,14 @@ pub struct State {
     pub scratch: [CounterSample; MAX_CONNECTIONS],
 }
 
-impl Default for State {
-    fn default() -> Self {
+impl State {
+    pub const fn new() -> Self {
         Self {
-            pix: PixVersion::default(),
-            scratch: [CounterSample::default(); MAX_CONNECTIONS],
+            pix: PixVersion {
+                version: 0,
+                flags: 0,
+            },
+            scratch: [CounterSample::ZERO; MAX_CONNECTIONS],
         }
     }
 }

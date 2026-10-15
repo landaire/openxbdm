@@ -235,21 +235,52 @@ fn monitor_block() -> Option<u32> {
 /// Format `device` as XTAF (0x91f72e58): header, FAT, and an empty root
 /// directory cluster.
 fn format_xtaf(device: &[u8], cluster_size: u32) -> Result<(), NtStatus> {
-    let name = ansi(device);
-    let object = attributes(0, &name);
+    let handle = open_file(0, device, 0x10_0003, 0, 0x18)?.0;
+    let result = format_open_volume(handle, cluster_size);
+    kernel::NtClose(handle);
+    result
+}
+
+/// Open a file by name relative to directory `root` (0 for none).
+#[inline(never)]
+fn open_file(
+    root: u32,
+    name: &[u8],
+    access: u32,
+    share: u32,
+    options: u32,
+) -> Result<FileHandle, NtStatus> {
+    let name = ansi(name);
+    let object = attributes(root, &name);
     let mut io_status = IoStatusBlock::default();
     let mut handle = 0u32;
     status(kernel::NtOpenFile(
         &mut handle,
-        0x10_0003,
+        access,
         &object,
         &mut io_status,
-        0,
-        0x18,
+        share,
+        options,
     ))?;
-    let result = format_open_volume(handle, cluster_size);
-    kernel::NtClose(handle);
-    result
+    Ok(FileHandle(handle))
+}
+
+/// Synchronous device control without input that fills `output`.
+#[inline(never)]
+pub(crate) fn device_control(handle: u32, code: u32, output: &mut [u8]) -> Result<(), NtStatus> {
+    let mut io_status = IoStatusBlock::default();
+    status(kernel::NtDeviceIoControlFile(
+        handle,
+        0,
+        0,
+        0,
+        &mut io_status,
+        code,
+        core::ptr::null(),
+        0,
+        output.as_mut_ptr(),
+        output.len() as u32,
+    ))
 }
 
 fn format_open_volume(handle: u32, cluster_size: u32) -> Result<(), NtStatus> {
@@ -263,18 +294,7 @@ fn format_open_volume(handle: u32, cluster_size: u32) -> Result<(), NtStatus> {
         FILE_FS_DEVICE_INFORMATION,
     ))?;
     let mut geometry = [0u8; 8];
-    status(kernel::NtDeviceIoControlFile(
-        handle,
-        0,
-        0,
-        0,
-        &mut io_status,
-        IOCTL_DISK_GET_DRIVE_GEOMETRY,
-        core::ptr::null(),
-        0,
-        geometry.as_mut_ptr(),
-        8,
-    ))?;
+    device_control(handle, IOCTL_DISK_GET_DRIVE_GEOMETRY, &mut geometry)?;
     let bytes_per_sector = word(&geometry[4..]);
     let sector_shift = if bytes_per_sector == 0 {
         0
@@ -282,18 +302,7 @@ fn format_open_volume(handle: u32, cluster_size: u32) -> Result<(), NtStatus> {
         31 - bytes_per_sector.leading_zeros()
     };
     let mut partition = [0u8; 0x10];
-    status(kernel::NtDeviceIoControlFile(
-        handle,
-        0,
-        0,
-        0,
-        &mut io_status,
-        IOCTL_DISK_GET_PARTITION_INFO,
-        core::ptr::null(),
-        0,
-        partition.as_mut_ptr(),
-        0x10,
-    ))?;
+    device_control(handle, IOCTL_DISK_GET_PARTITION_INFO, &mut partition)?;
     let length = time(&partition[8..]).0;
     if length == 0 {
         return Err(nt::OBJECT_NAME_NOT_FOUND);
@@ -430,19 +439,7 @@ impl commands::filesystem::Backend for Console {
         share: ShareAccess,
         options: CreateOptions,
     ) -> Result<FileHandle, NtStatus> {
-        let name = ansi(name);
-        let object = attributes(root.0, &name);
-        let mut io_status = IoStatusBlock::default();
-        let mut handle = 0u32;
-        status(kernel::NtOpenFile(
-            &mut handle,
-            access.0,
-            &object,
-            &mut io_status,
-            share.0,
-            options.0,
-        ))?;
-        Ok(FileHandle(handle))
+        open_file(root.0, name, access.0, share.0, options.0)
     }
 
     fn close_file(&mut self, handle: FileHandle) {
@@ -752,6 +749,14 @@ impl commands::filesystem::Backend for Console {
 
     fn pool(&mut self, buffer: PoolBuffer) -> &mut [u8] {
         pool_bytes(buffer)
+    }
+
+    fn allocate_scratch(&mut self, size: u32) -> Option<&'static mut [u8]> {
+        allocate(size).map(pool_bytes)
+    }
+
+    fn free_scratch(&mut self, block: &'static mut [u8]) {
+        free(PoolBuffer(block.as_mut_ptr() as usize as u32));
     }
 
     fn open_close_tray(&mut self, value: u32) {

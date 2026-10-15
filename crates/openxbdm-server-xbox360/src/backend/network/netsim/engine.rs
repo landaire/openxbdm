@@ -76,6 +76,56 @@ fn now() -> u64 {
     }
 }
 
+/// A classifier copy in its own pool block, as stock keeps queue +0x08 and
+/// the redirect classifier: queues and redirects without one stay small.
+struct StoredProgram(NonNull<Program>);
+
+impl StoredProgram {
+    fn new(program: &Program) -> Result<Self, Hresult> {
+        let block = memory::allocate(core::mem::size_of::<Program>())
+            .ok_or(status::OUT_OF_MEMORY)?
+            .cast::<Program>();
+        // SAFETY: the block holds a `Program`; pool blocks are 8-aligned.
+        unsafe {
+            block.write(program.clone());
+            Ok(Self(NonNull::new_unchecked(block)))
+        }
+    }
+
+    fn store(program: Option<&Program>) -> Result<Option<Self>, Hresult> {
+        program.map(Self::new).transpose()
+    }
+
+    fn get(&self) -> &Program {
+        // SAFETY: the block lives until `drop`.
+        unsafe { self.0.as_ref() }
+    }
+
+    /// A copy for a queue or redirect snapshot.
+    #[inline(never)]
+    fn snapshot(program: &Option<Self>) -> Option<Program> {
+        program.as_ref().map(|program| program.get().clone())
+    }
+}
+
+impl Drop for StoredProgram {
+    fn drop(&mut self) {
+        memory::free(self.0.as_ptr().cast());
+    }
+}
+
+/// Whether a classifier takes the frame; none takes every frame.
+fn accepts(
+    program: &Option<StoredProgram>,
+    frame: &[u8],
+    parsed: &Parsed,
+) -> Result<bool, filter::EvaluationFailed> {
+    match program {
+        None => Ok(true),
+        Some(program) => filter::matches(program.get(), frame, parsed),
+    }
+}
+
 /// A queue (stock 0x78..0x110-byte object).
 struct Queue {
     next: *mut Queue,
@@ -84,7 +134,7 @@ struct Queue {
     stats: QueueStats,
     pipeline: Pipeline,
     /// Frames the queue takes; none takes every frame.
-    program: Option<Program>,
+    program: Option<StoredProgram>,
 }
 
 /// A remembered redirected flow: frames in the other direction from the
@@ -108,7 +158,7 @@ struct Session {
 struct Redirect {
     next: *mut Redirect,
     config: RedirectConfig,
-    program: Option<Program>,
+    program: Option<StoredProgram>,
 }
 
 impl Redirect {
@@ -557,12 +607,12 @@ impl Instance {
     ) -> Result<u32, Hresult> {
         let mut config = QueueConfig::default();
         config.merge(kind, update)?;
+        let program = StoredProgram::store(program)?;
         let queue = memory::allocate(core::mem::size_of::<Queue>())
             .ok_or(status::OUT_OF_MEMORY)?
             .cast::<Queue>();
         let mut pipeline = Pipeline::new(kind);
         pipeline.configure(update, now());
-        let program = program.cloned();
         // SAFETY: the block holds a `Queue`.
         unsafe {
             queue.write(Queue {
@@ -656,7 +706,7 @@ impl Instance {
         Ok(QueueSnapshot {
             kind: queue.kind,
             config: queue.config,
-            program: queue.program.clone(),
+            program: StoredProgram::snapshot(&queue.program),
         })
     }
 
@@ -667,12 +717,12 @@ impl Instance {
         config: &RedirectConfig,
         program: Option<&Program>,
     ) -> Result<u32, Hresult> {
+        let program = StoredProgram::store(program)?;
         let size = core::mem::size_of::<Redirect>()
             + usize::from(config.sessions) * core::mem::size_of::<Session>();
         let redirect = memory::allocate(size)
             .ok_or(status::OUT_OF_MEMORY)?
             .cast::<Redirect>();
-        let program = program.cloned();
         // SAFETY: the block holds the header and the session slots.
         unsafe {
             redirect.write(Redirect {
@@ -728,7 +778,7 @@ impl Instance {
         let redirect = unsafe { &*redirect };
         Some(RedirectSnapshot {
             config: redirect.config,
-            program: redirect.program.clone(),
+            program: StoredProgram::snapshot(&redirect.program),
         })
     }
 }
@@ -899,10 +949,7 @@ impl Instance {
         let mut target = None;
         for queue in inner.queues(direction).iter() {
             // SAFETY: members are live queues; the lock is held.
-            let accepted = match unsafe { &(*queue).program } {
-                None => Ok(true),
-                Some(program) => filter::matches(program, frame, &parsed),
-            };
+            let accepted = accepts(unsafe { &(*queue).program }, frame, &parsed);
             match accepted {
                 Ok(true) => {
                     target = Some(queue);
@@ -1052,10 +1099,7 @@ fn redirect(
         {
             continue;
         }
-        let accepted = match &entry.program {
-            None => Ok(true),
-            Some(program) => filter::matches(program, frame, parsed),
-        };
+        let accepted = accepts(&entry.program, frame, parsed);
         match accepted {
             Ok(true) => {
                 matched = Some((redirect, config));

@@ -194,9 +194,7 @@ fn open_on_server(
                 end += 1;
             }
             message[end..end + 2].copy_from_slice(b"\"\n");
-            if let Ok(text) = core::ffi::CStr::from_bytes_until_nul(&message) {
-                kernel::debug_print(text);
-            }
+            kernel::debug_print_bytes(&message[..end + 2]);
         }
     }
     0

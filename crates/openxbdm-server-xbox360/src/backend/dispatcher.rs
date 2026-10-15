@@ -4,6 +4,7 @@
 //! handler uses static state; requests that need the server's state are
 //! queued for the server thread.
 
+use core::cell::UnsafeCell;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
@@ -111,14 +112,24 @@ const STOP_CHECK_INTERVAL: i64 = -100 * 10_000;
 /// control-code work inline on the calling thread; until the loop starts,
 /// openxbdm does the same under `STARTUP_LOCK`, so callers that load during
 /// boot (system software that imports this module) never wait for a thread
-/// that is still starting the network.
-struct StartupHost(core::cell::UnsafeCell<Option<(Server, Console)>>);
+/// that is still starting the network. The state is a static built at
+/// compile time; the server thread's stack could not hold it.
+struct StartupHost {
+    /// Set by the server thread; callers before it see no state.
+    created: UnsafeCell<bool>,
+    server: UnsafeCell<Server>,
+    console: UnsafeCell<Console>,
+}
 
 // SAFETY: accessed only with `STARTUP_LOCK` held, or by the server thread
 // alone once `SERVING` is set.
 unsafe impl Sync for StartupHost {}
 
-static STARTUP_HOST: StartupHost = StartupHost(core::cell::UnsafeCell::new(None));
+static STARTUP_HOST: StartupHost = StartupHost {
+    created: UnsafeCell::new(false),
+    server: UnsafeCell::new(Server::new()),
+    console: UnsafeCell::new(Console::new()),
+};
 static STARTUP_LOCK: kernel::CriticalSection = kernel::CriticalSection::new();
 /// The command loop owns the server state; requests are queued to it.
 static SERVING: AtomicBool = AtomicBool::new(false);
@@ -131,14 +142,30 @@ pub(crate) fn initialize_host() {
     STARTUP_LOCK.initialize();
 }
 
-/// Create the server state. Called by the server thread, whose stack holds
-/// the temporaries.
+/// Make the server state available to callers.
 pub(crate) fn create_host() {
-    let host = (Server::new(), Console::new());
     STARTUP_LOCK.enter();
-    // SAFETY: the lock is held and the loop does not own the state yet.
-    unsafe { *STARTUP_HOST.0.get() = Some(host) };
+    // SAFETY: the lock is held.
+    unsafe { *STARTUP_HOST.created.get() = true };
     STARTUP_LOCK.leave();
+}
+
+/// The server state once created.
+///
+/// # Safety
+///
+/// `STARTUP_LOCK` is held, or the caller is the server thread after it set
+/// `SERVING`; the references must not outlive that exclusivity.
+unsafe fn host() -> Option<(&'static mut Server, &'static mut Console)> {
+    // SAFETY: exclusivity per the contract.
+    unsafe {
+        (*STARTUP_HOST.created.get()).then(|| {
+            (
+                &mut *STARTUP_HOST.server.get(),
+                &mut *STARTUP_HOST.console.get(),
+            )
+        })
+    }
 }
 
 /// Run `operation` on the server state during startup.
@@ -147,7 +174,7 @@ pub(crate) fn with_startup_host<R>(
 ) -> Option<R> {
     STARTUP_LOCK.enter();
     // SAFETY: the lock is held and the loop does not own the state yet.
-    let result = match unsafe { &mut *STARTUP_HOST.0.get() } {
+    let result = match unsafe { host() } {
         Some((server, console)) if !SERVING.load(Ordering::Acquire) => {
             Some(operation(server, console))
         }
@@ -161,18 +188,11 @@ pub(crate) fn with_startup_host<R>(
 pub(crate) fn begin_serving() -> Option<(&'static mut Server, &'static mut Console)> {
     STARTUP_LOCK.enter();
     // SAFETY: the lock is held; after `SERVING` is set only the server
-    // thread touches the state.
-    let host = unsafe { &mut *STARTUP_HOST.0.get() };
-    let result = host.as_mut().map(|(server, console)| {
+    // thread touches the state, which lives as long as the module.
+    let result = unsafe { host() };
+    if result.is_some() {
         SERVING.store(true, Ordering::Release);
-        // SAFETY: the static outlives the module; exclusivity as above.
-        unsafe {
-            (
-                &mut *(server as *mut Server),
-                &mut *(console as *mut Console),
-            )
-        }
-    });
+    }
     STARTUP_LOCK.leave();
     result
 }
@@ -210,7 +230,7 @@ fn call_on_server_counted(service: ServerService, argument: u32) -> Option<u32> 
                 let serving = SERVING.load(Ordering::Acquire);
                 // SAFETY: the lock is held; the loop owns the state only
                 // once `SERVING` is set, which takes the lock.
-                let result = match unsafe { &mut *STARTUP_HOST.0.get() } {
+                let result = match unsafe { host() } {
                     Some((server, console)) if !serving => {
                         Some(service(server, console, &mut network, argument))
                     }

@@ -461,21 +461,20 @@ fn push_call(block: u32) {
 /// Remove `block` from the queue; returns whether it was queued.
 fn unlink_call(block: u32) -> bool {
     RPC_QUEUE_LOCK.enter();
-    let mut previous = None::<u32>;
-    let mut current = RPC_QUEUE.load(Ordering::Relaxed);
+    // The word that links the current call: the head, then a call's link.
+    let mut link = &RPC_QUEUE;
     let mut found = false;
-    while current != 0 {
-        let next = read_u32(current + CALL_LINK);
+    loop {
+        let current = link.load(Ordering::Relaxed);
+        if current == 0 {
+            break;
+        }
         if current == block {
-            match previous {
-                Some(previous) => write_u32(previous + CALL_LINK, next),
-                None => RPC_QUEUE.store(next, Ordering::Relaxed),
-            }
+            link.store(read_u32(current + CALL_LINK), Ordering::Relaxed);
             found = true;
             break;
         }
-        previous = Some(current);
-        current = next;
+        link = call_atomic(current, CALL_LINK);
     }
     RPC_QUEUE_LOCK.leave();
     found
@@ -487,22 +486,20 @@ fn take_call(name: &[u8]) -> Option<u32> {
     if !RPC_QUEUE_LOCK.try_enter() {
         return None;
     }
-    let mut previous = None::<u32>;
-    let mut current = RPC_QUEUE.load(Ordering::Relaxed);
+    let mut link = &RPC_QUEUE;
     let mut taken = None;
-    while current != 0 {
-        let next = read_u32(current + CALL_LINK);
+    loop {
+        let current = link.load(Ordering::Relaxed);
+        if current == 0 {
+            break;
+        }
         if c_string(current + CALL_NAME, CALL_NAME_CAPACITY) == name {
-            match previous {
-                Some(previous) => write_u32(previous + CALL_LINK, next),
-                None => RPC_QUEUE.store(next, Ordering::Relaxed),
-            }
+            link.store(read_u32(current + CALL_LINK), Ordering::Relaxed);
             write_u32(current + CALL_LINK, 0);
             taken = Some(current);
             break;
         }
-        previous = Some(current);
-        current = next;
+        link = call_atomic(current, CALL_LINK);
     }
     RPC_QUEUE_LOCK.leave();
     taken
@@ -661,9 +658,11 @@ impl RpcBackend for Console {
             return Err(RpcCreateError::OutOfMemory);
         }
         let system = context == RpcContext::System;
-        for offset in [CALL_LINK, CALL_ABORT, CALL_THREAD, CALL_DONE, CALL_RELEASE] {
-            write_u32(block + offset, 0);
-        }
+        write_u32(block + CALL_LINK, 0);
+        write_u32(block + CALL_ABORT, 0);
+        write_u32(block + CALL_THREAD, 0);
+        write_u32(block + CALL_DONE, 0);
+        write_u32(block + CALL_RELEASE, 0);
         write_u32(block + CALL_SYSTEM, u32::from(system));
         write_u32(block + CALL_SIZE, size);
         write_u64(block + CALL_MARKER, 0x3e5);
@@ -671,14 +670,11 @@ impl RpcBackend for Console {
             RpcThread::Named(name) => &name[..name.len().min(CALL_NAME_CAPACITY - 1)],
             RpcThread::Own { .. } => &[],
         };
-        for (index, &byte) in name.iter().chain(core::iter::once(&0)).enumerate() {
-            // SAFETY: the name field holds CALL_NAME_CAPACITY bytes.
-            unsafe {
-                core::ptr::write_volatile(
-                    (block + CALL_NAME + index as u32) as usize as *mut u8,
-                    byte,
-                )
-            };
+        // SAFETY: the name field holds CALL_NAME_CAPACITY bytes.
+        unsafe {
+            let field = (block + CALL_NAME) as usize as *mut u8;
+            core::ptr::copy_nonoverlapping(name.as_ptr(), field, name.len());
+            field.add(name.len()).write(0);
         }
         if let RpcThread::Own { processor } = thread {
             // Only the low six bits of the processor reach the shift.

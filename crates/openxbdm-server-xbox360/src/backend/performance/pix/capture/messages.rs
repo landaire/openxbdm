@@ -13,6 +13,7 @@ use core::fmt::Write as _;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
+use super::super::backend::EVENT_NAME_BYTES;
 use super::super::status::Status;
 use super::super::status::post as post_status;
 use super::S;
@@ -222,7 +223,7 @@ static EVENT_DEPTH: AtomicU32 = AtomicU32::new(0);
 
 /// Begin of a named event on the trace capture thread (stock 0x91f557c0):
 /// the event `pixcmd k` names starts the trace once its countdown ends.
-fn trace_event_begin(name: &[u8; 0x24]) {
+fn trace_event_begin(name: &[u8; EVENT_NAME_BYTES]) {
     if !on_capture_thread() {
         return;
     }
@@ -256,7 +257,7 @@ fn on_capture_thread() -> bool {
 
 /// Timing request on the trace capture path (stock 0x91f558e0): type 0
 /// begins an event, type 1 ends one; true when the traced event ended.
-pub(super) fn trace_event(kind: u32, name: &[u8; 0x24]) -> bool {
+pub(super) fn trace_event(kind: u32, name: &[u8; EVENT_NAME_BYTES]) -> bool {
     match kind {
         0 => trace_event_begin(name),
         1 if on_capture_thread() => {
@@ -350,19 +351,12 @@ pub(super) fn record_configuration(s: S, payload: u32, restart: bool) {
     for index in 0..10 {
         s.set_word(requested + index * 4, 0);
     }
-    for (target, source) in [
-        (0, 4),
-        (4, 8),
-        (8, 0xc),
-        (0xc, 0x10),
-        (0x10, 0x14),
-        (0x14, 0x18),
-        (0x24, 0x20),
-        (0x1c, 0x28),
-        (0x20, 0x2c),
-    ] {
-        s.set_word(requested + target, rd(payload + source));
+    for index in 0..6 {
+        s.set_word(requested + index * 4, rd(payload + 4 + index * 4));
     }
+    s.set_word(requested + 0x24, rd(payload + 0x20));
+    s.set_word(requested + 0x1c, rd(payload + 0x28));
+    s.set_word(requested + 0x20, rd(payload + 0x2c));
     let stream = buffers::stream(1);
     for index in 0..buffers::TABLE_ENTRIES {
         super::wr8(s.0 + stream + buffers::STREAM_TABLE + index * 8 + 4, 0xcc);
@@ -515,11 +509,7 @@ fn resource_state(payload: u32, out: &mut u32) -> bool {
             crate::backend::session::service_send_notification(refusal.as_ptr() as usize as u32);
         }
     }
-    super::super::set_resource_information([
-        rd(payload + 0xc),
-        rd(payload + 0x10),
-        rd(payload + 0x14),
-    ]);
+    super::super::set_resource_information(payload + 0xc);
     true
 }
 
@@ -527,10 +517,7 @@ fn resource_state(payload: u32, out: &mut u32) -> bool {
 /// The frame thread services messages while paused; a message other than
 /// 11 resumes and is handled at the next frame.
 fn pause(s: S) -> bool {
-    let parts = u32::from(s.word(0) != super::OFF)
-        | u32::from(s.word(8) != super::OFF) << 1
-        | u32::from(s.word(0xc) != super::OFF) << 2;
-    super::super::ring::capture_timing(1, parts, kernel::timebase());
+    super::super::ring::capture_timing(1, super::active_parts(s), kernel::timebase());
     if s.word(FRAME_RECORD + 0x18) != 0 {
         relock(s, || {
             // SAFETY: the title's frame record names a routine taking one
@@ -573,10 +560,7 @@ fn pause(s: S) -> bool {
         }
     };
     resume_engine(s);
-    let parts = u32::from(s.word(0) != super::OFF)
-        | u32::from(s.word(8) != super::OFF) << 1
-        | u32::from(s.word(0xc) != super::OFF) << 2;
-    super::super::ring::capture_timing(2, parts, kernel::timebase());
+    super::super::ring::capture_timing(2, super::active_parts(s), kernel::timebase());
     if rd(resumed) == 11 {
         return true;
     }
@@ -702,23 +686,14 @@ pub(super) fn title_ended(s: S) {
     if s.word(super::FLAGS) & super::RUNNING != 0 {
         engine::stop(s, record.as_ptr() as usize as u32, true, false);
     }
-    for offset in [0x5f8, 0x600, 0x5fc] {
-        s.set_word(offset, 0);
-    }
+    s.set_word(0x5f8, 0);
+    s.set_word(0x600, 0);
+    s.set_word(0x5fc, 0);
     for k in 0..2 {
         s.set_word(buffers::stream(k) + 4, 0);
     }
     buffers::free(s);
-    for (offset, value) in [
-        (0x87e4, 0),
-        (0x87dc, 1),
-        (0x87e0, 1),
-        (0x87e8, 0),
-        (0x87ec, 0),
-        (0x87f0, 0),
-    ] {
-        s.set_word(offset, value);
-    }
+    super::super::session::reset_budget(s);
     if s.word(MESSAGE) == 5 {
         super::super::files::set_capture_file(None);
         if rd(payload(s)) != 0 {

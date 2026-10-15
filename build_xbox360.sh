@@ -14,7 +14,7 @@ mkdir -p "$(dirname -- "$output")"
 (
     cd "$root"
     RUSTC_BOOTSTRAP=1 \
-    RUSTFLAGS="-C link-arg=-T$root/crates/openxbdm-server-xbox360/link.x -C link-arg=--no-rosegment" \
+    RUSTFLAGS="-C link-arg=-T$root/crates/openxbdm-server-xbox360/link.x -C link-arg=--no-rosegment -Zunstable-options -Cpanic=immediate-abort" \
     cargo build \
         --profile xbox360 \
         --manifest-path crates/openxbdm-server-xbox360/Cargo.toml \

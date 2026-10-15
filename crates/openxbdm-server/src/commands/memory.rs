@@ -175,13 +175,25 @@ pub struct TrackingSettings {
 }
 
 /// Global state of this domain.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct State {
     /// Settings written to and loaded from the settings file.
     pub tracking: TrackingSettings,
     /// `detour start` file name, translated again by `detour stop` to
     /// delete the log (0x91f9f348).
     pub detour_log: DetourLogName,
+}
+
+impl State {
+    pub const fn new() -> Self {
+        Self {
+            tracking: TrackingSettings {
+                flags: TrackingFlags(0),
+                stack_depth: StackDepth(0),
+            },
+            detour_log: DetourLogName::EMPTY,
+        }
+    }
 }
 
 /// Bytes of the `detour start` file name buffer.
@@ -194,16 +206,12 @@ pub struct DetourLogName {
     len: usize,
 }
 
-impl Default for DetourLogName {
-    fn default() -> Self {
-        Self {
-            bytes: [0; DETOUR_LOG_NAME_CAPACITY],
-            len: 0,
-        }
-    }
-}
-
 impl DetourLogName {
+    pub const EMPTY: Self = Self {
+        bytes: [0; DETOUR_LOG_NAME_CAPACITY],
+        len: 0,
+    };
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes[..self.len]
     }
@@ -1472,7 +1480,7 @@ fn detour_entry(invocation: &mut Invocation<'_>) -> Hresult {
 fn detour_start(invocation: &mut Invocation<'_>) -> Hresult {
     // Stock leaves the name buffer uninitialized when `file` is absent; an
     // absent name is empty here and fails translation.
-    let mut name = DetourLogName::default();
+    let mut name = DetourLogName::EMPTY;
     if let Some(value) = invocation.line.param("file") {
         name.len = value.copy_into(&mut name.bytes).len();
     }

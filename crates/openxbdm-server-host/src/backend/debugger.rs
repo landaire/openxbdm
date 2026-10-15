@@ -18,6 +18,7 @@ use openxbdm_server::commands::debugger::DirectNotice;
 use openxbdm_server::commands::debugger::DirectNotification;
 use openxbdm_server::commands::debugger::DirectOutcome;
 use openxbdm_server::commands::debugger::DirectPolicy;
+use openxbdm_server::commands::debugger::DirectRegisters;
 use openxbdm_server::commands::debugger::DirectStep;
 use openxbdm_server::commands::debugger::Disposition;
 use openxbdm_server::commands::debugger::ExceptionRecord;
@@ -332,13 +333,23 @@ impl MockBackend {
             u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
         });
         let policy = self.debugger.policy;
+        let mut registers = DirectRegisters {
+            msr: context.msr,
+            iar,
+            gpr3: context.gpr[3],
+            gpr4: context.gpr[4],
+        };
         let outcome = dispatch_direct(
             &policy,
             &event,
-            context,
+            &mut registers,
             instruction,
             &mut self.debugger.direct_step,
         );
+        context.msr = registers.msr;
+        context.iar = registers.iar;
+        context.gpr[3] = registers.gpr3;
+        context.gpr[4] = registers.gpr4;
         if let Some(value) = outcome.data_breakpoint_register {
             self.debugger.data_breakpoint_register = value;
         }

@@ -5,6 +5,7 @@
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::AtomicBool;
+use core::sync::atomic::AtomicU8;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
@@ -91,7 +92,7 @@ fn boundary(frame: u32, record: u32) -> u32 {
                 }
             }
         }
-        for event in 3..=6u32 {
+        for event in 3..7u32 {
             let callback = events::callback(event);
             if callback != 0 {
                 call_event(callback);
@@ -115,26 +116,23 @@ fn boundary(frame: u32, record: u32) -> u32 {
 }
 
 /// One processor time counter of the sampler: counter name, history slot,
-/// old-protocol record number, and the halfword of the `XBDM` record.
+/// old-protocol record number, and the dword of the `XBDM` record with the
+/// shift of its halfword.
 struct TimeCounter {
     name: &'static [u8],
-    slot: usize,
-    record: u32,
-    halfword: usize,
+    slot: u8,
+    record: u8,
+    word: u8,
+    shift: u8,
 }
 
-const fn counter(
-    name: &'static [u8],
-    slot: usize,
-    record: u32,
-    word: usize,
-    high: bool,
-) -> TimeCounter {
+const fn counter(name: &'static [u8], slot: u8, record: u8, word: u8, high: bool) -> TimeCounter {
     TimeCounter {
         name,
         slot,
         record,
-        halfword: word * 2 + if high { 0 } else { 1 },
+        word,
+        shift: if high { 16 } else { 0 },
     }
 }
 
@@ -249,39 +247,26 @@ pub(super) fn sample_counters() {
     record[0] = 0x101;
     record[1] = (time >> 32) as u32;
     record[2] = time as u32;
-    let mut halfwords = [0u16; 2 * XBDM_WORDS];
     for counter in &TIME_COUNTERS {
         let Some(sample) = query_counter(counter.name) else {
             continue;
         };
         let Some(percent) = percentage(
-            counter.slot,
+            usize::from(counter.slot),
             sample.value as i64 as f64,
             sample.rate as i64 as f64,
         ) else {
             continue;
         };
-        halfwords[counter.halfword] = (percent * HALFWORD_SCALE) as i64 as u16;
+        let halfword = (percent * HALFWORD_SCALE) as i64 as u16;
+        record[usize::from(counter.word)] |= u32::from(halfword) << counter.shift;
         if legacy() {
-            write_float_record(TIME_RECORD_BASE | counter.record, percent);
+            write_float_record(TIME_RECORD_BASE | u32::from(counter.record), percent);
         }
-    }
-    for word in 0x17..0x20 {
-        record[word] = u32::from(halfwords[word * 2]) << 16 | u32::from(halfwords[word * 2 + 1]);
     }
     write_processor_statistics(time);
     write_memory_statistics(&mut record);
-    let mut bytes = [0u8; XBDM_WORDS * 4];
-    for (chunk, word) in bytes.chunks_exact_mut(4).zip(record) {
-        chunk.copy_from_slice(&word.to_be_bytes());
-    }
-    super::write_tagged_record(XBDM_TAG, &bytes);
-}
-
-fn words_to_bytes<const N: usize>(words: [u32; N], bytes: &mut [u8]) {
-    for (chunk, word) in bytes.chunks_exact_mut(4).zip(words) {
-        chunk.copy_from_slice(&word.to_be_bytes());
-    }
+    super::write_tagged_words(XBDM_TAG, &record);
 }
 
 /// Sums of the per-processor statistics as `Cntn` and `Cnt2` records.
@@ -312,9 +297,9 @@ fn write_processor_statistics(time: u64) {
         processor += 0x1000;
     }
     let (time_high, time_low) = ((time >> 32) as u32, time as u32);
-    let mut cntn = [0u8; 0x28];
-    words_to_bytes(
-        [
+    super::write_tagged_words(
+        CNTN_TAG,
+        &[
             time_high,
             time_low,
             (cycles >> 32) as u32,
@@ -326,12 +311,10 @@ fn write_processor_statistics(time: u64) {
             0x0001_0104,
             system,
         ],
-        &mut cntn,
     );
-    super::write_tagged_record(CNTN_TAG, &cntn);
-    let mut cnt2 = [0u8; 0x18];
-    words_to_bytes(
-        [
+    super::write_tagged_words(
+        CNT2_TAG,
+        &[
             time_high,
             time_low,
             (waits >> 32) as u32,
@@ -339,35 +322,16 @@ fn write_processor_statistics(time: u64) {
             title,
             system,
         ],
-        &mut cnt2,
     );
-    super::write_tagged_record(CNT2_TAG, &cnt2);
 }
 
-/// Memory statistics fields copied into the `XBDM` record: `(record word,
-/// statistics byte offset)`, with old-protocol record numbers 0x20 on.
-const MEMORY_FIELDS: [(usize, u32); 20] = [
-    (3, 0x0c),
-    (4, 0x14),
-    (5, 0x18),
-    (6, 0x1c),
-    (7, 0x20),
-    (8, 0x24),
-    (9, 0x28),
-    (10, 0x2c),
-    (11, 0x30),
-    (12, 0x34),
-    (13, 0x38),
-    (14, 0x40),
-    (15, 0x44),
-    (16, 0x48),
-    (17, 0x4c),
-    (18, 0x50),
-    (19, 0x54),
-    (20, 0x58),
-    (21, 0x5c),
-    (22, 0x60),
+/// Statistics dwords copied into `XBDM` record words 3 on, with
+/// old-protocol record numbers 0x20 on.
+const MEMORY_FIELDS: [u8; 20] = [
+    0x03, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x10, 0x11, 0x12, 0x13, 0x14,
+    0x15, 0x16, 0x17, 0x18,
 ];
+const FIRST_MEMORY_WORD: usize = 3;
 const MEMORY_STATISTICS_LENGTH: u32 = 0x68;
 const DEBUG_STATISTICS_LENGTH: u32 = 0x90;
 const DEBUG_MEMORY_STATISTICS: u32 = 8;
@@ -377,12 +341,13 @@ fn write_memory_statistics(record: &mut [u32; XBDM_WORDS]) {
     let mut statistics = [0u32; DEBUG_STATISTICS_LENGTH as usize / 4];
     statistics[0] = MEMORY_STATISTICS_LENGTH;
     if (kernel::MmQueryStatistics(statistics.as_mut_ptr()) as i32) >= 0 {
-        for (index, &(word, offset)) in MEMORY_FIELDS.iter().enumerate() {
-            record[word] = statistics[offset as usize / 4];
+        for (index, &field) in MEMORY_FIELDS.iter().enumerate() {
+            let value = statistics[usize::from(field)];
+            record[FIRST_MEMORY_WORD + index] = value;
             if legacy() {
                 write_float_record(
                     TIME_RECORD_BASE | (LEGACY_MEMORY_RECORD + index as u32),
-                    record[word] as f32,
+                    value as f32,
                 );
             }
         }
@@ -413,21 +378,23 @@ const PMC_SETUPS: [u32; 7] = [0, 1, 2, 3, 4, 5, 0x2c];
 const PMC_FLAGS: [u32; 6] = [1, 2, 5, 0xb, 0x28, 0x2ad];
 const PMC_COUNTERS: usize = 16;
 const PMCP_TAG: u32 = 0x504d_4350;
-static PMC_CACHE: [[AtomicU32; PMC_COUNTERS]; PMC_SETUPS.len()] =
-    [const { [const { AtomicU32::new(u32::MAX) }; PMC_COUNTERS] }; PMC_SETUPS.len()];
+const PMC_UNCACHED: u8 = u8::MAX;
+/// `PMC_FLAGS` index of each counter of each set; `PMC_UNCACHED` until found.
+static PMC_CACHE: [[AtomicU8; PMC_COUNTERS]; PMC_SETUPS.len()] =
+    [const { [const { AtomicU8::new(PMC_UNCACHED) }; PMC_COUNTERS] }; PMC_SETUPS.len()];
 
 /// Index of counter `counter`'s flag in `PMC_FLAGS` for the current set,
 /// cached once found (stock 0x91f55570).
 fn pmc_flag_index(counter: usize) -> u32 {
     let slot = &PMC_CACHE[PMC_SET.load(Ordering::Acquire) as usize][counter];
     let cached = slot.load(Ordering::Acquire);
-    if cached != u32::MAX {
-        return cached;
+    if cached != PMC_UNCACHED {
+        return u32::from(cached);
     }
     let flag = pmc::counter_flag(counter as u32);
     match PMC_FLAGS.iter().position(|&known| known == flag) {
         Some(index) => {
-            slot.store(index as u32, Ordering::Release);
+            slot.store(index as u8, Ordering::Release);
             index as u32
         }
         None => 0,
@@ -454,9 +421,7 @@ fn sample_pmc() {
             pmc::release(pmc::Owner::PIX);
         }
         PMC_ACTIVE.store(false, Ordering::Release);
-        let mut bytes = [0u8; 0x50];
-        words_to_bytes(record, &mut bytes);
-        super::write_tagged_record(PMCP_TAG, &bytes);
+        super::write_tagged_words(PMCP_TAG, &record);
     }
     let next = if set < 6 { set + 1 } else { 0 };
     PMC_SET.store(next, Ordering::Release);

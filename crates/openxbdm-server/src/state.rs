@@ -4,9 +4,8 @@ use crate::commands;
 use crate::notify::Notifications;
 
 /// Lock mode, which requires authentication on new connections.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockMode {
-    #[default]
     Unlocked,
     Locked,
     /// Locked with file encryption.
@@ -14,7 +13,7 @@ pub enum LockMode {
 }
 
 /// Lock state and the box identifier announced in the lock-mode banner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lock {
     pub mode: LockMode,
     /// High and low dwords of the box identifier.
@@ -22,13 +21,20 @@ pub struct Lock {
 }
 
 impl Lock {
+    pub const fn new() -> Self {
+        Self {
+            mode: LockMode::Unlocked,
+            box_id: [0; 2],
+        }
+    }
+
     pub fn is_locked(&self) -> bool {
         self.mode != LockMode::Unlocked
     }
 }
 
 /// Global server state.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ServerState {
     pub lock: Lock,
     pub notifications: Notifications,
@@ -46,4 +52,25 @@ pub struct ServerState {
     pub performance: commands::performance::State,
     pub hardware: commands::hardware::State,
     pub services: commands::services::State,
+}
+
+impl ServerState {
+    pub const fn new() -> Self {
+        Self {
+            lock: Lock::new(),
+            notifications: Notifications::new(),
+            settings_dirty: false,
+            session: commands::session::State::new(),
+            security: commands::security::State::new(),
+            console: commands::console::State::new(),
+            system: commands::system::State::new(),
+            filesystem: commands::filesystem::State::new(),
+            memory: commands::memory::State::new(),
+            debugger: commands::debugger::State::new(),
+            network: commands::network::State::new(),
+            performance: commands::performance::State::new(),
+            hardware: commands::hardware::State::new(),
+            services: commands::services::State::new(),
+        }
+    }
 }

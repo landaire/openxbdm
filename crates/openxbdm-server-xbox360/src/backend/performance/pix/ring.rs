@@ -44,31 +44,46 @@ const SWAP_ROUTINE_FLAG: u32 = 1;
 const CONTEXT_SWITCH_TAG: u32 = 0x4378_5377;
 
 /// A value group: values that packets with `ASSIGNS_VALUE` set and the
-/// frame boundary writes as one tagged record.
+/// frame boundary writes as one tagged record. `first` is the group's
+/// first slot in [`Ring::group_values`].
 #[derive(Clone, Copy)]
 pub(super) struct Group {
     tag: u32,
     count: usize,
+    first: usize,
 }
 
 /// Groups 0 to 4; 0 and 1 hold no values (group 0 index 0 starts a
 /// capture record instead).
 const GROUPS: [Group; 5] = [
-    Group { tag: 0, count: 0 },
-    Group { tag: 0, count: 0 },
+    Group {
+        tag: 0,
+        count: 0,
+        first: 0,
+    },
+    Group {
+        tag: 0,
+        count: 0,
+        first: 0,
+    },
     Group {
         tag: 0x4433_645f,
         count: 0x13,
+        first: 0,
     },
     Group {
         tag: 0x5841_4d5f,
         count: 7,
+        first: 0x13,
     },
     Group {
         tag: 0x5841_755f,
         count: 7,
+        first: 0x1a,
     },
 ];
+/// Values of every group.
+const GROUP_VALUES: usize = 0x21;
 /// Group 2 value index that the frame boundary sets to the frame number.
 const FRAME_VALUE: usize = 2;
 /// Group the frame boundary writes after storing the frame number.
@@ -78,7 +93,8 @@ pub(super) const FRAME_GROUP: usize = 2;
 #[derive(Clone, Copy)]
 enum ValueTarget {
     Captured,
-    Group { group: usize, index: usize },
+    /// Slot of [`Ring::group_values`].
+    Group(usize),
 }
 
 #[derive(Clone, Copy)]
@@ -126,7 +142,7 @@ pub(super) struct Ring {
     capture_end: u64,
     capture_frames: u32,
     value_target: Option<ValueTarget>,
-    group_values: [[u32; 0x13]; 5],
+    group_values: [u32; GROUP_VALUES],
     capturing: bool,
     /// Dwords left in the current packet after its first dword.
     packet_left: u32,
@@ -182,7 +198,7 @@ static RING: Locked = Locked {
         capture_end: 0,
         capture_frames: 0,
         value_target: None,
-        group_values: [[0; 0x13]; 5],
+        group_values: [0; GROUP_VALUES],
         capturing: false,
         packet_left: 0,
         captured_value: 0,
@@ -259,40 +275,55 @@ impl Ring {
         self.buffer.unwrap_or(0)
     }
 
-    /// Append `bytes` (a multiple of 4) at the write position without
-    /// committing (stock 0x91f62668). The ring never fills completely.
-    fn put(&mut self, source: u32, bytes: u32) -> bool {
-        let Some(base) = self.buffer else {
-            return false;
-        };
+    /// Copy `bytes` (a multiple of 4) to the write position without
+    /// committing (stock 0x91f62668); the write position after them. The
+    /// ring never fills completely.
+    fn place(&self, source: u32, bytes: u32) -> Option<u32> {
+        let base = self.buffer?;
         if !self.accepting {
-            return false;
+            return None;
         }
         let dwords = bytes >> 2;
         let to_end = (self.last.wrapping_sub(self.write).wrapping_add(4) as i32 >> 2) as u32;
         if to_end > dwords {
             if self.read > self.write && self.read <= self.write.wrapping_add(dwords << 2) {
-                return false;
+                return None;
             }
             copy_words(source, self.write, bytes);
-            self.write = self.write.wrapping_add(dwords << 2);
+            Some(self.write.wrapping_add(dwords << 2))
         } else {
             if self.read > self.write {
-                return false;
+                return None;
             }
             let rest = (dwords - to_end) << 2;
             if self.read <= base.wrapping_add(rest) {
-                return false;
+                return None;
             }
             copy_words(source, self.write, to_end << 2);
             copy_words(source + (to_end << 2), base, rest);
-            self.write = base.wrapping_add(rest);
+            Some(base.wrapping_add(rest))
         }
-        true
+    }
+
+    fn advance(&mut self, placed: Option<u32>) -> bool {
+        if let Some(write) = placed {
+            self.write = write;
+        }
+        placed.is_some()
+    }
+
+    fn put(&mut self, source: u32, bytes: u32) -> bool {
+        let placed = self.place(source, bytes);
+        self.advance(placed)
     }
 
     fn put_words(&mut self, words: &[u32]) -> bool {
         self.put(words.as_ptr() as usize as u32, (words.len() * 4) as u32)
+    }
+
+    /// [`Self::place`] for words of the ring state itself.
+    fn place_own(&self, words: &[u32]) -> Option<u32> {
+        self.place(words.as_ptr() as usize as u32, (words.len() * 4) as u32)
     }
 
     fn commit(&mut self) {
@@ -349,7 +380,7 @@ impl Ring {
         if let Some(target) = self.value_target.take() {
             match target {
                 ValueTarget::Captured => self.captured_value = word,
-                ValueTarget::Group { group, index } => self.group_values[group][index] = word,
+                ValueTarget::Group(slot) => self.group_values[slot] = word,
             }
         }
         if self.capturing
@@ -384,8 +415,10 @@ impl Ring {
             self.captured_index = None;
             return;
         }
-        if group < GROUPS.len() && index < GROUPS[group].count {
-            self.value_target = Some(ValueTarget::Group { group, index });
+        if let Some(&Group { count, first, .. }) = GROUPS.get(group)
+            && index < count
+        {
+            self.value_target = Some(ValueTarget::Group(first + index));
         }
     }
 
@@ -394,14 +427,16 @@ impl Ring {
         let time = kernel::timebase();
         let count = self.captured_index.map_or(u32::MAX, |index| index as u32);
         let header = (count.wrapping_add(4) << 24) & 0x7fff_ff9a | 0x65;
+        let stored = self.captured_index.unwrap_or(0).min(CAPTURED_DWORDS);
         let written = self.put_words(&[
             header,
             (time >> 32) as u32,
             time as u32,
             self.captured_value,
-        ]) && self.put_words(
-            &self.captured.clone()[..self.captured_index.unwrap_or(0).min(CAPTURED_DWORDS)],
-        );
+        ]) && {
+            let placed = self.place_own(&self.captured[..stored]);
+            self.advance(placed)
+        };
         if written {
             self.commit()
         } else {
@@ -438,7 +473,6 @@ impl Ring {
         }
         let header = ((self.dropped_count as u32 + 5) << 24) & 0x7fff_ff9b | 0x64;
         let first = self.first_drop_time;
-        let dropped = self.dropped;
         if written
             && self.put_words(&[
                 header,
@@ -447,7 +481,10 @@ impl Ring {
                 (time >> 32) as u32,
                 time as u32,
             ])
-            && self.put_words(&dropped[..self.dropped_count])
+            && {
+                let placed = self.place_own(&self.dropped[..self.dropped_count]);
+                self.advance(placed)
+            }
         {
             self.dropped_count = 0;
             self.capture_start = 0;
@@ -495,7 +532,7 @@ impl Ring {
 
     /// Write value group `group` as a tagged record (stock 0x91f63570).
     fn write_group(&mut self, group: usize) {
-        let Some(&Group { tag, count }) = GROUPS.get(group) else {
+        let Some(&Group { tag, count, first }) = GROUPS.get(group) else {
             return;
         };
         if self.legacy || count == 0 {
@@ -503,15 +540,16 @@ impl Ring {
         }
         let time = kernel::timebase();
         let header = ((count as u32 + 5) << 24) & 0x7fff_ff9d | KIND_TAGGED;
-        let values = self.group_values[group];
         if self.put_words(&[
             header,
             tag,
             (count as u32 + 2) << 2,
             (time >> 32) as u32,
             time as u32,
-        ]) && self.put_words(&values[..count])
-        {
+        ]) && {
+            let placed = self.place_own(&self.group_values[first..first + count]);
+            self.advance(placed)
+        } {
             self.commit();
         } else {
             self.drop_tag(tag);
@@ -528,30 +566,48 @@ pub(crate) fn stream_active() -> bool {
 /// Most payload dwords a tagged record carries; stock asserts below 0x7d.
 const TAGGED_PAYLOAD_DWORDS: usize = 0x7c;
 
+type TaggedRecord = [u32; TAGGED_PAYLOAD_DWORDS + 3];
+
 /// Write a tagged record `{header, tag, length, payload}` through the
 /// monitor control codes so a debugger extension sees it: code 0x5e with a
 /// block list, then code 0x43 with one block when 0x5e reports nothing
 /// (stock 0x91f788b8); whether it was written. Padding bytes after the
 /// payload are zero.
 pub(crate) fn write_tagged_record(tag: u32, payload: &[u8]) -> bool {
-    let dwords = payload.len().div_ceil(4);
-    if dwords > TAGGED_PAYLOAD_DWORDS {
+    if payload.len().div_ceil(4) > TAGGED_PAYLOAD_DWORDS {
         return false;
     }
     let mut record = [0u32; TAGGED_PAYLOAD_DWORDS + 3];
-    record[0] = ((dwords as u32 + 3) << 24) & 0x7fff_ff9d | KIND_TAGGED;
-    record[1] = tag;
-    record[2] = payload.len() as u32;
     for (index, chunk) in payload.chunks(4).enumerate() {
         let mut bytes = [0u8; 4];
         bytes[..chunk.len()].copy_from_slice(chunk);
         record[3 + index] = u32::from_be_bytes(bytes);
     }
+    send_tagged_record(&mut record, tag, payload.len() as u32)
+}
+
+/// [`write_tagged_record`] with a payload of dwords.
+pub(crate) fn write_tagged_words(tag: u32, words: &[u32]) -> bool {
+    if words.len() > TAGGED_PAYLOAD_DWORDS {
+        return false;
+    }
+    let mut record = [0u32; TAGGED_PAYLOAD_DWORDS + 3];
+    record[3..3 + words.len()].copy_from_slice(words);
+    send_tagged_record(&mut record, tag, (words.len() * 4) as u32)
+}
+
+/// Fill the header of `record`, whose payload of `length` bytes is in
+/// place, and write it.
+fn send_tagged_record(record: &mut TaggedRecord, tag: u32, length: u32) -> bool {
+    let dwords = length.div_ceil(4);
+    record[0] = ((dwords + 3) << 24) & 0x7fff_ff9d | KIND_TAGGED;
+    record[1] = tag;
+    record[2] = length;
     let address = record.as_ptr() as usize as u32;
-    let list = [address, 3, address + 12, dwords as u32, 0];
+    let list = [address, 3, address + 12, dwords, 0];
     match dispatcher::dispatch(0x5e, list.as_ptr() as usize as u32) as i32 {
         0 => {
-            let block = [address, dwords as u32 + 3];
+            let block = [address, dwords + 3];
             dispatcher::dispatch(0x43, block.as_ptr() as usize as u32) != 0
         }
         result => result > 0,
@@ -662,7 +718,7 @@ pub(super) fn write_group(group: usize) {
 /// 0x91f636c8).
 pub(super) fn write_frame_group(frame: u32) {
     with(|ring| {
-        ring.group_values[FRAME_GROUP][FRAME_VALUE] = frame;
+        ring.group_values[GROUPS[FRAME_GROUP].first + FRAME_VALUE] = frame;
         ring.write_group(FRAME_GROUP);
     });
 }

@@ -2,17 +2,13 @@
 //! simulator's redirects and classifiers read) and address rewriting for
 //! IPv4 redirects (0x91f8d008).
 
-use core::cell::UnsafeCell;
-use core::sync::atomic::AtomicBool;
-use core::sync::atomic::Ordering;
-
 pub(super) const ETHERNET_HEADER: usize = 14;
 const IPV4_HEADER: usize = 20;
 const ETHERTYPE_IPV4: u16 = 0x0800;
 const PROTOCOL_TCP: u8 = 6;
 const PROTOCOL_UDP: u8 = 17;
-/// Largest transport segment the checksum gather buffer holds
-/// (0x91f67e90).
+/// Largest transport segment stock checksums (its gather buffer at
+/// 0x91fa30a8 holds 0x5ea bytes).
 const GATHER_CAPACITY: usize = 0x5ea;
 
 /// Transport protocol bits of the frame classification, kept in redirect
@@ -126,10 +122,32 @@ impl<'a> Reader<'a> {
         copy.read(offset)?;
         copy.read(count)
     }
+
+    /// `read` of a fixed count, so indexing the bytes needs no checks.
+    #[inline(always)]
+    fn take<const N: usize>(&mut self) -> Option<&'a [u8; N]> {
+        self.read(N)?.try_into().ok()
+    }
+
+    #[inline(always)]
+    fn peek_array<const N: usize>(&self, offset: usize) -> Option<&'a [u8; N]> {
+        self.peek(offset, N)?.try_into().ok()
+    }
 }
 
-fn be32(bytes: &[u8]) -> u32 {
-    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+#[inline(always)]
+fn be16<const N: usize>(bytes: &[u8; N], offset: usize) -> u16 {
+    u16::from_be_bytes([bytes[offset], bytes[offset + 1]])
+}
+
+#[inline(always)]
+fn be32<const N: usize>(bytes: &[u8; N], offset: usize) -> u32 {
+    u32::from_be_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
 }
 
 /// Parse a frame (0x91f697a0 and the protocol parsers it calls).
@@ -138,24 +156,31 @@ pub(super) fn parse(frame: &[u8]) -> Parsed {
         flags: 0,
         info: [0; 0x40],
     };
+    classify(frame, &mut parsed);
+    parsed
+}
+
+/// Kept out of line: inlined, the optimizer spreads the information
+/// block over registers and grows every path that writes it.
+#[inline(never)]
+fn classify(frame: &[u8], parsed: &mut Parsed) {
     let mut reader = Reader {
         frame,
         position: 0,
         remaining: frame.len(),
     };
-    let Some(ethernet) = reader.read(ETHERNET_HEADER) else {
-        return parsed;
+    let Some(ethernet) = reader.take::<ETHERNET_HEADER>() else {
+        return;
     };
     parsed.flags |= flags::ETHERNET;
-    match word(ethernet, 12) {
-        ETHERTYPE_IPV4 => ipv4(&mut parsed, &mut reader, ethernet),
-        0x0806 => arp(&mut parsed, &mut reader),
+    match be16(ethernet, 12) {
+        ETHERTYPE_IPV4 => ipv4(parsed, &mut reader, ethernet),
+        0x0806 => arp(parsed, &mut reader),
         0x3c12 | 0x3c13 | 0x8863 | 0x8864 => parsed.flags |= flags::PPPOE,
         0x88d9 => parsed.flags |= flags::LLTD,
-        kind if kind > 0x5dc => payload(&mut parsed, &reader),
+        kind if kind > 0x5dc => payload(parsed, &reader),
         _ => parsed.flags |= flags::IEEE_802_3,
     }
-    parsed
 }
 
 fn payload(parsed: &mut Parsed, reader: &Reader<'_>) {
@@ -164,14 +189,14 @@ fn payload(parsed: &mut Parsed, reader: &Reader<'_>) {
 }
 
 /// 0x91f69660.
-fn ipv4(parsed: &mut Parsed, reader: &mut Reader<'_>, ethernet: &[u8]) {
-    let Some(header) = reader.read(IPV4_HEADER) else {
+fn ipv4(parsed: &mut Parsed, reader: &mut Reader<'_>, ethernet: &[u8; ETHERNET_HEADER]) {
+    let Some(header) = reader.take::<IPV4_HEADER>() else {
         parsed.flags |= flags::MALFORMED;
         return;
     };
     let length = usize::from(header[0] & 0xf) * 4;
-    let total = usize::from(word(header, 2));
-    let source = be32(&header[12..16]);
+    let total = usize::from(be16(header, 2));
+    let source = be32(header, 12);
     if header[0] & 0xf0 != 0x40
         || length < IPV4_HEADER
         || length > total
@@ -193,7 +218,7 @@ fn ipv4(parsed: &mut Parsed, reader: &mut Reader<'_>, ethernet: &[u8]) {
         1 => icmp(parsed, reader),
         2 => parsed.flags |= flags::IGMP,
         PROTOCOL_TCP => tcp(parsed, reader),
-        PROTOCOL_UDP => udp(parsed, reader, ethernet, be32(&header[16..20])),
+        PROTOCOL_UDP => udp(parsed, reader, ethernet, be32(header, 16)),
         0x32 => parsed.flags |= flags::IPV6_IN_IPV4,
         _ => payload(parsed, reader),
     }
@@ -201,7 +226,7 @@ fn ipv4(parsed: &mut Parsed, reader: &mut Reader<'_>, ethernet: &[u8]) {
 
 /// 0x91f68918: types 0..0x12 with their code limits.
 fn icmp(parsed: &mut Parsed, reader: &mut Reader<'_>) {
-    let Some(header) = reader.read(8) else {
+    let Some(header) = reader.take::<8>() else {
         parsed.flags |= flags::MALFORMED;
         return;
     };
@@ -224,7 +249,7 @@ fn icmp(parsed: &mut Parsed, reader: &mut Reader<'_>) {
 
 /// 0x91f689e8.
 fn tcp(parsed: &mut Parsed, reader: &mut Reader<'_>) {
-    let Some(header) = reader.read(20) else {
+    let Some(header) = reader.take::<20>() else {
         parsed.flags |= flags::MALFORMED;
         return;
     };
@@ -243,12 +268,17 @@ fn tcp(parsed: &mut Parsed, reader: &mut Reader<'_>) {
 }
 
 /// 0x91f69490.
-fn udp(parsed: &mut Parsed, reader: &mut Reader<'_>, ethernet: &[u8], destination: u32) {
-    let Some(header) = reader.read(8) else {
+fn udp(
+    parsed: &mut Parsed,
+    reader: &mut Reader<'_>,
+    ethernet: &[u8; ETHERNET_HEADER],
+    destination: u32,
+) {
+    let Some(header) = reader.take::<8>() else {
         parsed.flags |= flags::MALFORMED;
         return;
     };
-    let length = usize::from(word(header, 4));
+    let length = usize::from(be16(header, 4));
     if length < 8 || length - 8 > reader.remaining {
         parsed.flags |= flags::MALFORMED;
         return;
@@ -264,7 +294,7 @@ fn udp(parsed: &mut Parsed, reader: &mut Reader<'_>, ethernet: &[u8], destinatio
     if destination & 0xf000_0000 == 0xe000_0000 && destination != u32::MAX {
         return;
     }
-    let (source_port, destination_port) = (word(header, 0), word(header, 2));
+    let (source_port, destination_port) = (be16(header, 0), be16(header, 2));
     let either = |port: u16| source_port == port || destination_port == port;
     if either(53) {
         parsed.flags |= flags::DNS;
@@ -320,14 +350,14 @@ fn dhcp_option(mut reader: Reader<'_>, code: u8, mut overload: Option<&mut u8>) 
 /// then the file and server name fields when option 52 overloads them.
 fn dhcp(parsed: &mut Parsed, reader: &mut Reader<'_>) {
     let start = reader.position;
-    let Some(bootp) = reader.read(0xf0) else {
+    let Some(bootp) = reader.take::<0xf0>() else {
         parsed.flags |= flags::MALFORMED;
         return;
     };
     if bootp[1] != 1 {
         return;
     }
-    if bootp[2] != 6 || be32(&bootp[0xec..0xf0]) != 0x6382_5363 {
+    if bootp[2] != 6 || be32(bootp, 0xec) != 0x6382_5363 {
         parsed.flags |= flags::MALFORMED;
         return;
     }
@@ -365,30 +395,30 @@ fn dhcp(parsed: &mut Parsed, reader: &mut Reader<'_>) {
 
 /// Key exchange packets of the secure protocol (0x91f68ac0).
 fn key_exchange(parsed: &mut Parsed, reader: &mut Reader<'_>) -> Option<()> {
-    let header = reader.peek(0, 4)?;
-    let kind = word(header, 0);
-    let size = word(header, 2);
+    let header = reader.peek_array::<4>(0)?;
+    let kind = be16(header, 0);
+    let size = be16(header, 2);
     let swapped = usize::from(size.swap_bytes());
     let remaining = reader.remaining;
     let mut size_field = 0u32;
     let subtype = match kind {
         0x358 if size == 0x4000 => {
-            let body = reader.read(0x40)?;
+            let body = reader.take::<0x40>()?;
             parsed.put(0x1c, &body[8..16]);
             0xa_0000
         }
         0x258 if remaining == 0x534 && size == 0x1800 => {
-            let body = reader.read(0x18)?;
+            let body = reader.take::<0x18>()?;
             parsed.put(0x1c, &body[8..12]);
             0x9_0000
         }
         0x458 | 0x558 if size == 0x2e00 => {
-            let body = reader.read(0x2e)?;
+            let body = reader.take::<0x2e>()?;
             if reader.remaining != 0 {
                 return None;
             }
             parsed.put(0x36, &body[8..16]);
-            if word(body, 6) & 0x200 != 0 {
+            if be16(body, 6) & 0x200 != 0 {
                 parsed.info[0x32] |= 1;
             }
             if kind == 0x458 { 0xb_0000 } else { 0xc_0000 }
@@ -396,7 +426,7 @@ fn key_exchange(parsed: &mut Parsed, reader: &mut Reader<'_>) -> Option<()> {
         0x658 | 0x1158
             if size == if kind == 0x658 { 0x4e00 } else { 0x5600 } && swapped == remaining =>
         {
-            let body = reader.read(0x1a)?;
+            let body = reader.take::<0x1a>()?;
             parsed.put(0x36, &body[0x12..0x1a]);
             if kind == 0x658 { 0xd_0000 } else { 0x18_0000 }
         }
@@ -407,9 +437,9 @@ fn key_exchange(parsed: &mut Parsed, reader: &mut Reader<'_>) -> Option<()> {
         0xc58 | 0x1058
             if size == if kind == 0xc58 { 0x7600 } else { 0x8600 } && swapped == remaining =>
         {
-            let body = reader.read(0x22)?;
+            let body = reader.take::<0x22>()?;
             parsed.put(0x36, &body[8..16]);
-            if word(body, 6) & 0x100 != 0 {
+            if be16(body, 6) & 0x100 != 0 {
                 parsed.info[0x32] |= 1;
             } else {
                 parsed.put(0x1c, &body[0x10..0x14]);
@@ -428,7 +458,7 @@ fn key_exchange(parsed: &mut Parsed, reader: &mut Reader<'_>) -> Option<()> {
             if size != expected {
                 return None;
             }
-            let body = reader.read(0x80)?;
+            let body = reader.take::<0x80>()?;
             reader.read(swapped.checked_sub(0x80)?)?;
             parsed.put(0x36, &body[8..16]);
             parsed.put(0x1c, &body[0x10..0x18]);
@@ -452,7 +482,7 @@ fn xsp(parsed: &mut Parsed, reader: &mut Reader<'_>) {
 }
 
 fn xsp_header(parsed: &mut Parsed, reader: &mut Reader<'_>) -> Option<()> {
-    let first = be32(reader.read(4)?);
+    let first = be32(reader.take::<4>()?, 0);
     if first == 0 {
         return key_exchange(parsed, reader);
     }
@@ -527,16 +557,16 @@ fn xsp_header(parsed: &mut Parsed, reader: &mut Reader<'_>) -> Option<()> {
                 }
             } else {
                 if shown == 0 {
-                    parsed.put(0x8, reader.peek(base, 2)?);
+                    parsed.put(0x8, reader.peek_array::<2>(base)?);
                 }
                 if shown <= 2 {
-                    parsed.put(0xa, reader.peek(base + 2, 2)?);
+                    parsed.put(0xa, reader.peek_array::<2>(base + 2)?);
                 }
             }
         }
     }
     if subtype == 0x2_0000 {
-        let segment = reader.peek(trailer_end.checked_sub(0xc)?, 0xc)?;
+        let segment = reader.peek_array::<0xc>(trailer_end.checked_sub(0xc)?)?;
         let offset = usize::from(segment[8] & 0xf0) >> 2;
         if offset < 0x14 || offset > data_size - hidden + 0x14 {
             return None;
@@ -582,19 +612,19 @@ fn xsp_header(parsed: &mut Parsed, reader: &mut Reader<'_>) -> Option<()> {
 
 /// 0x91f68f48.
 fn arp(parsed: &mut Parsed, reader: &mut Reader<'_>) {
-    let Some(header) = reader.read(8) else {
+    let Some(header) = reader.take::<8>() else {
         parsed.flags |= flags::MALFORMED;
         return;
     };
-    let hardware = word(header, 0);
-    if !matches!(hardware, 1 | 6) || word(header, 2) != 0x800 {
+    let hardware = be16(header, 0);
+    if !matches!(hardware, 1 | 6) || be16(header, 2) != 0x800 {
         return;
     }
     if header[4] != 6 || header[5] != 4 {
         parsed.flags |= flags::MALFORMED;
         return;
     }
-    if !matches!(word(header, 6), 1 | 2) {
+    if !matches!(be16(header, 6), 1 | 2) {
         return;
     }
     let bad = |address: u32| {
@@ -602,8 +632,8 @@ fn arp(parsed: &mut Parsed, reader: &mut Reader<'_>) {
             || address & 0xf000_0000 == 0xe000_0000
             || address & 0xff00_0000 == 0x7f00_0000
     };
-    match reader.read(20) {
-        Some(body) if body[0] & 1 == 0 && !bad(be32(&body[6..10])) && !bad(be32(&body[16..20])) => {
+    match reader.take::<20>() {
+        Some(body) if body[0] & 1 == 0 && !bad(be32(body, 6)) && !bad(be32(body, 16)) => {
             parsed.flags |= flags::ARP;
         }
         _ => parsed.flags |= flags::MALFORMED,
@@ -662,25 +692,11 @@ fn ip_checksum(frame: &mut [u8]) {
     ip[10..12].copy_from_slice(&checksum.to_be_bytes());
 }
 
-/// Gather buffer of the transport checksums (0x91fa30a8), shared by all
-/// frames and guarded by a flag as stock does.
-struct Gather {
-    busy: AtomicBool,
-    bytes: UnsafeCell<[u8; GATHER_CAPACITY]>,
-}
-
-// SAFETY: `bytes` is only touched while `busy` is held.
-unsafe impl Sync for Gather {}
-
-static GATHER: Gather = Gather {
-    busy: AtomicBool::new(false),
-    bytes: UnsafeCell::new([0; GATHER_CAPACITY]),
-};
-
 /// Recompute a TCP or UDP checksum over a pseudo header and `length`
-/// transport bytes (0x91f681a8, 0x91f68098). The segment is copied into the
-/// gather buffer first; a segment the buffer cannot hold clears the frame
-/// headers instead, as stock does.
+/// transport bytes (0x91f681a8, 0x91f68098). Stock sums a copy in its
+/// 0x5ea-byte gather buffer (0x91fa30a8); the parser bounds `length` by the
+/// frame, so summing the frame gives the same result. A segment that copy
+/// cannot hold clears the frame headers instead, as stock does.
 fn transport_checksum(
     frame: &mut [u8],
     protocol: u8,
@@ -696,24 +712,11 @@ fn transport_checksum(
         frame[..cleared].fill(0);
         return;
     }
-    while GATHER
-        .busy
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        core::hint::spin_loop();
-    }
-    // SAFETY: the flag is held.
-    let gather = unsafe { &mut *GATHER.bytes.get() };
-    let segment = &frame[transport..];
-    let copied = segment.len().min(GATHER_CAPACITY);
-    gather[..copied].copy_from_slice(&segment[..copied]);
     let mut pseudo = [0u8; 12];
     pseudo[..8].copy_from_slice(&frame[ETHERNET_HEADER + 12..ETHERNET_HEADER + 20]);
     pseudo[9] = protocol;
     pseudo[10..12].copy_from_slice(&(length as u16).to_be_bytes());
-    let checksum = !fold(sum(sum(0, &pseudo), &gather[..length]));
-    GATHER.busy.store(false, Ordering::Release);
+    let checksum = !fold(sum(sum(0, &pseudo), &frame[transport..transport + length]));
     let checksum = if checksum == 0 { 0xffff } else { checksum };
     frame[transport + checksum_offset..transport + checksum_offset + 2]
         .copy_from_slice(&checksum.to_be_bytes());

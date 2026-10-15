@@ -140,13 +140,17 @@ pub trait Backend {
 }
 
 /// Global state of `netcap`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct State {
     /// Flags of the running capture (0x91f9f690 nonzero).
     capture: Option<CaptureFlags>,
 }
 
 impl State {
+    pub const fn new() -> Self {
+        Self { capture: None }
+    }
+
     pub fn is_capturing(&self) -> bool {
         self.capture.is_some()
     }

@@ -9,6 +9,7 @@
 //! A record is `{time << 7 | kind, dwords << 24 | id, data}`; `kind` 1 is
 //! a data record, 0x19 a formatted event, 0x1d a named begin, 0 an end.
 
+use super::super::backend::EVENT_NAME_BYTES;
 use super::S;
 use super::buffers;
 use super::engine::PCR_CURSOR;
@@ -418,8 +419,8 @@ pub(super) fn service_buffers(s: S) {
     super::gpu::service(s, false);
 }
 
-/// Event the owner callback learns for request types 0 to 2.
-const OWNER_EVENTS: [u32; 3] = [0xe0, 0xe1, 0xe2];
+/// Event the owner callback learns for request type 0 to 2: 0xe0 on.
+const OWNER_EVENT_BASE: u32 = 0xe0;
 
 /// Monitor control code 0x50 (stock 0x91f56080 and 0x91f61f08): `{+0
 /// type, +4, +8 text, +0xc arguments, +0x10 dwords (type 5)}`. The calling
@@ -454,14 +455,13 @@ pub(super) fn timing_request(argument: u32) -> u32 {
     if !tracing {
         replace_buffer(s, dwords);
     } else if kind != 3 {
-        let mut name = [0u8; 0x24];
+        let mut name = [0u8; EVENT_NAME_BYTES];
         if (kind == 0 || kind == 2) && text != 0 {
             _vsnprintf(name.as_mut_ptr(), 0x23, text, arguments);
         }
         name[0x23] = 0;
-        if let Some(&event) = OWNER_EVENTS.get(kind as usize)
-            && s.word(super::CURRENT_MESSAGE) == 5
-        {
+        if kind < 3 && s.word(super::CURRENT_MESSAGE) == 5 {
+            let event = OWNER_EVENT_BASE + kind;
             s.set_word(super::super::session::LOCK_OVERRIDE, 1);
             super::super::events::notify_owner(event, name.as_ptr() as usize as u32);
             s.set_word(super::super::session::LOCK_OVERRIDE, 0);

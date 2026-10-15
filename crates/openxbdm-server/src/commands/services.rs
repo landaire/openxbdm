@@ -52,8 +52,14 @@ const fn entry(
 }
 
 /// Global state of this domain.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct State {}
+
+impl State {
+    pub const fn new() -> Self {
+        Self {}
+    }
+}
 
 /// Transfers started by this domain.
 #[derive(Debug)]

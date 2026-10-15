@@ -84,6 +84,14 @@ fn frame_index(s: S) -> u32 {
     s.word(FLAGS) >> 5 & 0x00ff_ffff
 }
 
+/// Active parts as `Ccap` and capture timing report them: per-thread data,
+/// GPU, audio.
+fn active_parts(s: S) -> u32 {
+    u32::from(s.word(0) != OFF)
+        | u32::from(s.word(8) != OFF) << 1
+        | u32::from(s.word(0xc) != OFF) << 2
+}
+
 fn interrupts_off() {
     // SAFETY: mtmsrd r13, 1 copies the interrupt enable bit of the PCR
     // address, which is clear.

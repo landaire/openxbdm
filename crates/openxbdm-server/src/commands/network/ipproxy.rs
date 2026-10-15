@@ -22,8 +22,14 @@ const VERSION: u32 = 1;
 
 /// Global state of `ipproxy`; the proxy state lives in the backend, which
 /// shares it with the packet hook and the receive thread.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct State {}
+
+impl State {
+    pub const fn new() -> Self {
+        Self {}
+    }
+}
 
 /// The register or inject export of the network stack is missing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

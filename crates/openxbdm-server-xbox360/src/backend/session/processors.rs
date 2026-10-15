@@ -15,6 +15,7 @@
 
 use core::cell::UnsafeCell;
 use core::fmt::Write as _;
+use core::num::NonZeroU32;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
@@ -294,12 +295,16 @@ fn tag_context(tag: u32) -> u32 {
 }
 
 /// Trace text of the title command thread, under trace mask bit 0x1 (stock
-/// 0x91f504d8, 0x91f42ae8, 0x91f43104).
-fn trace_title_thread(arguments: core::fmt::Arguments<'_>) {
+/// 0x91f504d8, 0x91f42ae8, 0x91f43104): `text`, then `0x%08x` of `thread`
+/// and a line end when there is one.
+fn trace_title_thread(text: &str, thread: Option<u32>) {
     if super::super::console::trace_mask().contains(TraceMask::REPLIES) {
-        let mut text = Text::<0x40>::new();
-        let _ = text.write_fmt(arguments);
-        kernel::debug_print_bytes(text.as_bytes());
+        let mut line = Text::<0x40>::new();
+        let _ = line.push_bytes(text.as_bytes());
+        if let Some(thread) = thread {
+            let _ = writeln!(line, "0x{thread:08x}");
+        }
+        kernel::debug_print_bytes(line.as_bytes());
     }
 }
 
@@ -307,10 +312,10 @@ fn trace_title_thread(arguments: core::fmt::Arguments<'_>) {
 extern "C" fn executor_thread(tag: u32) -> u32 {
     let title = tag_context(tag) == TITLE_EXECUTOR;
     if title {
-        trace_title_thread(format_args!(
-            "XBDM: New title command processor thread = 0x{:08x}\n",
-            current_thread()
-        ));
+        trace_title_thread(
+            "XBDM: New title command processor thread = ",
+            Some(current_thread()),
+        );
     }
     let executor = &EXECUTORS[tag_context(tag) as usize];
     let current =
@@ -331,19 +336,16 @@ extern "C" fn executor_thread(tag: u32) -> u32 {
                         .is_ok()
             })
         {
-            let [first, second, third, fourth] = slot
-                .arguments
-                .each_ref()
-                .map(|argument| argument.load(Ordering::Relaxed));
+            let argument = |index: usize| slot.arguments[index].load(Ordering::Relaxed);
             // SAFETY: the routine is a handler or continuation of a
             // registered processor, called with the monitor's arguments.
             let result = unsafe {
                 kernel::call_export(
                     slot.routine.load(Ordering::Relaxed),
-                    first,
-                    second,
-                    third,
-                    fourth,
+                    argument(0),
+                    argument(1),
+                    argument(2),
+                    argument(3),
                 )
             };
             slot.result.store(result, Ordering::Relaxed);
@@ -354,10 +356,10 @@ extern "C" fn executor_thread(tag: u32) -> u32 {
             // The wake-up may have been meant for the executor's next thread.
             executor.work.set();
             if title {
-                trace_title_thread(format_args!(
-                    "XBDM: Terminating title command processor thread=0x{:08x}\n",
-                    current_thread()
-                ));
+                trace_title_thread(
+                    "XBDM: Terminating title command processor thread=",
+                    Some(current_thread()),
+                );
             }
             return 0;
         }
@@ -367,7 +369,7 @@ extern "C" fn executor_thread(tag: u32) -> u32 {
 /// An executor thread: its referenced kernel thread object and its tag.
 #[derive(Debug, PartialEq, Eq)]
 struct ExecutorThread {
-    object: u32,
+    object: NonZeroU32,
     tag: u32,
 }
 
@@ -395,12 +397,13 @@ impl ExecutorThread {
         if (status as i32) < 0 {
             return None;
         }
-        KeResumeThread(object);
+        let object = NonZeroU32::new(object)?;
+        KeResumeThread(object.get());
         Some(Self { object, tag })
     }
 
     fn ended(&self) -> bool {
-        kernel::KeWaitForSingleObject(self.object as usize as *mut u32, 0, 0, 0, &NO_WAIT)
+        kernel::KeWaitForSingleObject(self.object.get() as usize as *mut u32, 0, 0, 0, &NO_WAIT)
             == STATUS_WAIT_0
     }
 
@@ -420,14 +423,29 @@ impl ExecutorThread {
 
     /// Wait for a retired thread to exit and release the object.
     fn join(self) {
-        kernel::KeWaitForSingleObject(self.object as usize as *mut u32, 0, 0, 0, core::ptr::null());
-        kernel::ObDereferenceObject(self.object);
+        let object = self.object.get();
+        kernel::KeWaitForSingleObject(object as usize as *mut u32, 0, 0, 0, core::ptr::null());
+        kernel::ObDereferenceObject(object);
     }
 
     /// Make an idle thread exit and release the object.
     fn stop(self) {
         self.retire();
         self.join();
+    }
+
+    /// Stop an idle thread; a busy one is asked to exit after its call and
+    /// kept in `retired` until it does.
+    fn release(self, retired: &mut [Option<ExecutorThread>; MAX_CONNECTIONS + 1]) {
+        if self.busy() {
+            self.retire();
+            let slot = &mut retired[tag_context(self.tag) as usize];
+            if let Some(older) = slot.replace(self) {
+                older.join();
+            }
+        } else {
+            self.stop();
+        }
     }
 
     /// Release a thread that ended; its posted and running calls are lost.
@@ -437,7 +455,7 @@ impl ExecutorThread {
                 slot.state.store(SLOT_LOST, Ordering::Release);
             }
         }
-        kernel::ObDereferenceObject(self.object);
+        kernel::ObDereferenceObject(self.object.get());
     }
 }
 
@@ -458,18 +476,15 @@ enum Mode {
 struct Output {
     address: u32,
     length: u32,
-    /// CR LF follows the bytes.
-    line_end: bool,
+    /// `length`, plus 2 when CR LF follows the bytes.
+    total: u32,
     passed: u32,
 }
 
 impl Output {
-    fn total(&self) -> u32 {
-        self.length + if self.line_end { 2 } else { 0 }
-    }
-
-    /// Copy the next bytes into `binary`; the count copied.
-    fn stage(&mut self, binary: &mut [u8]) -> usize {
+    /// Copy the next bytes into `binary` and store their count in
+    /// `binary_len`; the output while bytes remain.
+    fn pass(mut self, binary: &mut [u8], binary_len: &mut usize) -> Option<Self> {
         let mut written = 0;
         if self.passed < self.length {
             let count = ((self.length - self.passed) as usize).min(binary.len());
@@ -484,12 +499,13 @@ impl Output {
             written = count;
             self.passed += count as u32;
         }
-        while written < binary.len() && self.passed < self.total() {
+        while written < binary.len() && self.passed < self.total {
             binary[written] = b"\r\n"[(self.passed - self.length) as usize];
             written += 1;
             self.passed += 1;
         }
-        written
+        *binary_len = written;
+        (self.passed < self.total).then_some(self)
     }
 }
 
@@ -587,9 +603,7 @@ impl Data {
                     ended.release_ended();
                 }
                 if self.title.is_none() {
-                    trace_title_thread(format_args!(
-                        "XBDM: Creating new title command processor thread\n"
-                    ));
+                    trace_title_thread("XBDM: Creating new title command processor thread\n", None);
                     self.title = Some(ExecutorThread::start(TITLE_EXECUTOR, true)?);
                 }
                 self.title.as_ref()
@@ -634,11 +648,11 @@ impl Data {
                 kernel::call_export(routine, first, second, third, fourth)
             });
         };
-        let (tag, object) = (executor.tag, executor.object);
+        let (tag, object) = (executor.tag, executor.object.get());
         let call = &SLOTS[slot];
         call.executor.store(tag, Ordering::Relaxed);
         call.routine.store(routine, Ordering::Relaxed);
-        for (stored, argument) in call.arguments.iter().zip(arguments) {
+        for (stored, &argument) in call.arguments.iter().zip(&arguments) {
             stored.store(argument, Ordering::Relaxed);
         }
         call.done.reset();
@@ -696,8 +710,7 @@ impl Data {
         }
         if connections
             .iter()
-            .flatten()
-            .any(|&(_, owner)| owner == Owner::Title)
+            .any(|connection| matches!(connection, Some((_, Owner::Title))))
         {
             self.title_idle_since = None;
         } else if self.title.as_ref().is_some_and(|thread| !thread.busy()) {
@@ -738,41 +751,30 @@ impl Data {
     fn release_title_threads(&mut self) {
         self.find_lost_calls();
         self.title_idle_since = None;
-        let dedicated = self
-            .dedicated
-            .iter_mut()
-            .filter_map(|slot| slot.take_if(|dedicated| dedicated.title));
-        let threads = self
-            .title
-            .take()
-            .into_iter()
-            .chain(dedicated.map(|dedicated| dedicated.thread));
-        for thread in threads {
-            if thread.busy() {
-                thread.retire();
-                let retired = &mut self.retired[tag_context(thread.tag) as usize];
-                if let Some(older) = retired.replace(thread) {
-                    older.join();
-                }
-            } else {
-                thread.stop();
+        if let Some(thread) = self.title.take() {
+            thread.release(&mut self.retired);
+        }
+        for slot in &mut self.dedicated {
+            if let Some(dedicated) = slot.take_if(|dedicated| dedicated.title) {
+                dedicated.thread.release(&mut self.retired);
             }
         }
     }
 
     /// Stop every thread; the server is exiting.
     fn release_all(&mut self) {
-        let dedicated = self.dedicated.iter_mut().filter_map(Option::take);
-        for thread in self
-            .title
-            .take()
-            .into_iter()
-            .chain(dedicated.map(|dedicated| dedicated.thread))
-        {
+        if let Some(thread) = self.title.take() {
             thread.stop();
         }
-        for thread in self.retired.iter_mut().filter_map(Option::take) {
-            thread.join();
+        for slot in &mut self.dedicated {
+            if let Some(dedicated) = slot.take() {
+                dedicated.thread.stop();
+            }
+        }
+        for slot in &mut self.retired {
+            if let Some(thread) = slot.take() {
+                thread.join();
+            }
         }
     }
 }
@@ -934,26 +936,26 @@ impl Console {
             } else {
                 usize::MAX
             };
+            let length = text_length(buffer, limit) as u32;
             Some(Output {
                 address: buffer,
-                length: text_length(buffer, limit) as u32,
-                line_end: true,
+                length,
+                total: length + 2,
                 passed: 0,
             })
         } else if count != 0 {
             Some(Output {
                 address: buffer,
                 length: count,
-                line_end: false,
+                total: count,
                 passed: 0,
             })
         } else {
             None
         };
         match output {
-            Some(mut output) => {
-                *transfer.binary_len = output.stage(transfer.binary);
-                calls.output = (output.passed < output.total()).then_some(output);
+            Some(output) => {
+                calls.output = output.pass(transfer.binary, transfer.binary_len);
             }
             None => *transfer.no_output = calls.mode == Mode::Lines,
         }
@@ -1067,10 +1069,9 @@ impl ProcessorBackend for Console {
             );
         }
         if !transfer.aborted
-            && let Some(mut output) = calls.output.take()
+            && let Some(output) = calls.output.take()
         {
-            *transfer.binary_len = output.stage(transfer.binary);
-            calls.output = (output.passed < output.total()).then_some(output);
+            calls.output = output.pass(transfer.binary, transfer.binary_len);
             return ProcessorProgress::Complete(Hresult::OK);
         }
         calls.output = None;

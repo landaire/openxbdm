@@ -214,13 +214,23 @@ struct DebugCapture {
 }
 
 /// Global state of this domain.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct State {
     capture: Option<DebugCapture>,
     /// FILETIME after which reverse persistent targets without a
     /// connection are dropped.
     reverse_deadline: Option<u64>,
     pub fast_pipes: FastPipes,
+}
+
+impl State {
+    pub const fn new() -> Self {
+        Self {
+            capture: None,
+            reverse_deadline: None,
+            fast_pipes: FastPipes::new(),
+        }
+    }
 }
 
 /// Transfers started by this domain.

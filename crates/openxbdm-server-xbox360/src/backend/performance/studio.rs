@@ -6,7 +6,6 @@
 //! through a table of six routines at the start of the transport object.
 
 use core::cell::UnsafeCell;
-use core::fmt::Write as _;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
@@ -24,7 +23,6 @@ use openxbdm_server::commands::performance::studio::PENDING;
 use openxbdm_server::commands::performance::studio::Slot;
 use openxbdm_server::commands::performance::studio::Stream;
 use openxbdm_server::commands::performance::studio::Transport;
-use openxbdm_server::text::Text;
 
 use crate::kernel;
 use crate::kernel::CriticalSection;
@@ -225,13 +223,7 @@ pub(crate) fn initialize() {
         .and_then(|request| Ok((request, resolve(c"xam.xex", STUDIO_SERVICE_ORDINAL)?)));
     match exports {
         Err(status) => {
-            let mut message = Text::<48>::new();
-            let _ = write!(
-                message,
-                "XStudio: Failed initialization {}\n",
-                status as i32
-            );
-            kernel::debug_print_bytes(message.as_bytes());
+            super::pmc::print(c"XStudio: Failed initialization %d\n", &[u64::from(status)]);
         }
         Ok((request, service)) => {
             NULL_CABLE_REQUEST.store(request, Ordering::Release);

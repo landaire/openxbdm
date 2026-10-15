@@ -377,10 +377,20 @@ fn check(v: V) -> u32 {
     result
 }
 
-/// Buffers of GPU request `first` up to request `next` (part of stock
-/// 0x91f5a4e0 and 0x91f5bc78); the list, its length and start offset.
-fn command_list(v: V, first: u32, next: u32) -> ([u32; 0xca], usize, u32) {
-    let mut list = [0u32; 0xca];
+type CommandList = [u32; 0xca];
+
+/// Part of a command list a request uses: first entry, entries, and the
+/// byte offset in the first.
+struct Commands {
+    start: usize,
+    count: usize,
+    offset: u32,
+}
+
+/// Buffers of GPU request `first` up to request `next` into `list` (part
+/// of stock 0x91f5a4e0 and 0x91f5bc78). An offset at the end of the first
+/// buffer starts at the next one.
+fn command_list(v: V, first: u32, next: u32, list: &mut CommandList) -> Commands {
     // Stock overruns its 0xca-entry list for larger counts.
     let count = u32::from(super::rd16(first + 0x1a)).min(0xc8);
     let mut index = u32::from(super::rd16(first + 4));
@@ -389,23 +399,27 @@ fn command_list(v: V, first: u32, next: u32) -> ([u32; 0xca], usize, u32) {
         index = if index + 1 < v.w(0xcc) { index + 1 } else { 0 };
     }
     list[count as usize] = v.buffer(u32::from(super::rd16(next + 4)));
-    (
-        list,
-        count as usize + 1,
-        u32::from(super::rd16(first + 0x18)),
-    )
+    let offset = u32::from(super::rd16(first + 0x18));
+    if offset == 0x4000 {
+        Commands {
+            start: 1,
+            count: count as usize,
+            offset: 0,
+        }
+    } else {
+        Commands {
+            start: 0,
+            count: count as usize + 1,
+            offset,
+        }
+    }
 }
 
 /// Submit one captured frame to the title (stock 0x91f5a4e0); the
 /// routine's result, 0 on success.
 fn replay_frame(v: V, first: u32, next: u32, extra: u32) -> u32 {
-    let (list, mut count, mut offset) = command_list(v, first, next);
-    let mut start = 0;
-    if offset == 0x4000 {
-        offset = 0;
-        count -= 1;
-        start = 1;
-    }
+    let mut list = [0u32; 0xca];
+    let commands = command_list(v, first, next, &mut list);
     // SAFETY: the title's submit routine takes seven arguments `(argument,
     // 0, buffers, count, offset, extra, 0x618)`.
     let result = unsafe {
@@ -413,9 +427,9 @@ fn replay_frame(v: V, first: u32, next: u32, extra: u32) -> u32 {
             v.record_routine(0x3c),
             v.record_argument(),
             0,
-            list[start..].as_ptr() as usize as u32,
-            count as u32,
-            offset,
+            list[commands.start..].as_ptr() as usize as u32,
+            commands.count as u32,
+            commands.offset,
             extra,
             0x618,
         )
@@ -452,10 +466,9 @@ fn report(v: V, start: u32) {
         // Stock traps on an empty range.
         let percent = (frames.wrapping_mul(100)).checked_div(range).unwrap_or(0);
         let rate = (frames as f32 * 1000.0) / elapsed as f32;
-        let arguments = [frames, percent].map(u64::from);
         let values = [
-            arguments[0],
-            arguments[1],
+            u64::from(frames),
+            u64::from(percent),
             f64::from(rate).to_bits(),
             u64::from(v.w(0x30)),
             u64::from(v.w(0x3c)),
@@ -471,7 +484,15 @@ fn report(v: V, start: u32) {
         };
     }
     if v.flags() & AUDIO != 0 {
-        let values = [v.w(0x24), v.w(0x34), v.w(0x40), v.w(0x2c), v.w(0x38), 0, 0].map(u64::from);
+        let values = [
+            u64::from(v.w(0x24)),
+            u64::from(v.w(0x34)),
+            u64::from(v.w(0x40)),
+            u64::from(v.w(0x2c)),
+            u64::from(v.w(0x38)),
+            0,
+            0,
+        ];
         // SAFETY: the format consumes five arguments.
         unsafe {
             super::super::super::pmc::debug_print(
@@ -937,11 +958,20 @@ extern "C" fn render(context: u32) {
 /// refuses (4 nothing to replay, or the title's check result).
 fn begin(v: V, audio: bool, no_gpu: bool) -> u32 {
     let s = v.s();
-    for offset in [
-        0x94, 0x98, 0xc8, 0xd0, 0xd4, 0xa0, 0xac, 0xa8, 0xb4, 0xb8, 0xbc, 0xc0, 0x58, 0x60,
-    ] {
-        v.set(offset, 0);
-    }
+    v.set(0x94, 0);
+    v.set(0x98, 0);
+    v.set(0xc8, 0);
+    v.set(0xd0, 0);
+    v.set(0xd4, 0);
+    v.set(0xa0, 0);
+    v.set(0xac, 0);
+    v.set(0xa8, 0);
+    v.set(0xb4, 0);
+    v.set(0xb8, 0);
+    v.set(0xbc, 0);
+    v.set(0xc0, 0);
+    v.set(0x58, 0);
+    v.set(0x60, 0);
     v.set(
         0xc0,
         u32::from(super::rd8(v.0 + 0xc3)) | (v.flags() << 7 & 0xffff_ff00),
@@ -1215,13 +1245,12 @@ fn movie_record(v: V, id: u32, bytes: u32) {
 /// Movie frame: the `PixV` image the title stored in the frame's command
 /// data (stock 0x91f5bc78); 6 when the data has no image.
 fn movie_frame(v: V, first: u32, next: u32) -> u32 {
-    let (list, mut count, mut offset) = command_list(v, first, next);
-    let mut index = 0;
-    if offset == 0x4000 {
-        offset = 0;
-        count -= 1;
-        index = 1;
-    }
+    let mut list = [0u32; 0xca];
+    let Commands {
+        start: mut index,
+        mut count,
+        offset,
+    } = command_list(v, first, next, &mut list);
     let image = cached(list[index] + offset);
     if rd(image) != 0x5069_7856 || rd(image + 4) != 0 || rd(image + 8) > 2 {
         return 6;

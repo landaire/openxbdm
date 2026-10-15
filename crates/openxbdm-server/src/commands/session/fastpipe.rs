@@ -117,8 +117,8 @@ pub struct FastPipes {
     orphans: [Option<PoolBuffer>; MAX_ORPHANS],
 }
 
-impl Default for FastPipes {
-    fn default() -> Self {
+impl FastPipes {
+    pub const fn new() -> Self {
         Self {
             slots: [None; PIPE_SLOTS],
             group_counter: 0,

@@ -191,22 +191,23 @@ fn handler_address(session: u32, kind: u32, index: u32) -> u32 {
 }
 
 /// Unlink every session for which `remove` holds; returns them through
-/// `removed`.
+/// `removed`. Called with the lock held exclusively.
 fn unlink_sessions(mut remove: impl FnMut(u32) -> bool, mut removed: impl FnMut(u32)) {
-    let mut previous: Option<u32> = None;
-    let mut current = SESSIONS.load(Ordering::Acquire);
-    while current != 0 {
-        let next = read_u32(current + SESSION_NEXT);
+    // The word that links the current session: the head, then a session's
+    // next field.
+    let mut link = &SESSIONS;
+    loop {
+        let current = link.load(Ordering::Relaxed);
+        if current == 0 {
+            return;
+        }
         if remove(current) {
-            match previous {
-                None => SESSIONS.store(next, Ordering::Release),
-                Some(previous) => write_u32(previous + SESSION_NEXT, next),
-            }
+            link.store(read_u32(current + SESSION_NEXT), Ordering::Release);
             removed(current);
         } else {
-            previous = Some(current);
+            // SAFETY: an aligned word of a linked session block.
+            link = unsafe { AtomicU32::from_ptr((current + SESSION_NEXT) as usize as *mut u32) };
         }
-        current = next;
     }
 }
 
@@ -276,7 +277,7 @@ extern "C" fn register_notification_handler(session: u32, kind: u32, handler: u3
     let _guard = LOCK.exclusive();
     if kind == 0 {
         if handler == 0 {
-            for kind in 1..=LAST_KIND {
+            for kind in 1..LAST_KIND + 1 {
                 write_u32(count_address(session, kind), 0);
                 refresh_kernel_hooks(kind);
             }
@@ -470,7 +471,9 @@ struct SectionRecord {
     flags: u16,
 }
 
-/// `name` as a NUL-terminated field, cut to fit.
+/// `name` as a NUL-terminated field, cut to fit; shared by the records, so
+/// not inlined.
+#[inline(never)]
 fn name_field(name: &[u8]) -> NameField {
     let mut field = NameField::default();
     let length = name.len().min(NAME_CAPACITY - 1);
@@ -479,7 +482,7 @@ fn name_field(name: &[u8]) -> NameField {
 }
 
 fn kind_of(kind: u32, stopped: bool) -> u32 {
-    if stopped { kind | KIND_STOPPED } else { kind }
+    kind | (KIND_STOPPED * u32::from(stopped))
 }
 
 fn address_of<T>(value: &T) -> u32 {
@@ -638,17 +641,8 @@ pub(crate) fn notify_event(event: &Event<'_>) {
             size,
             index,
             flags,
-        } => {
-            let record = SectionRecord {
-                name: name_field(name.as_bytes()),
-                base,
-                size,
-                index: index as u16,
-                flags: flags as u16,
-            };
-            notify_sessions(KIND_SECTION_LOAD, address_of(&record));
         }
-        Event::SectionUnload {
+        | Event::SectionUnload {
             name,
             base,
             size,
@@ -662,7 +656,12 @@ pub(crate) fn notify_event(event: &Event<'_>) {
                 index: index as u16,
                 flags: flags as u16,
             };
-            notify_sessions(KIND_SECTION_UNLOAD, address_of(&record));
+            let kind = if matches!(event, Event::SectionLoad { .. }) {
+                KIND_SECTION_LOAD
+            } else {
+                KIND_SECTION_UNLOAD
+            };
+            notify_sessions(kind, address_of(&record));
         }
         Event::PogoModuleStartup {
             name,
@@ -699,7 +698,7 @@ pub(crate) fn unlink_title_notification_sessions() {
         |session| read_u32(session + SESSION_FLAGS) & SESSION_TITLE != 0,
         |_| {},
     );
-    for kind in 2..=LAST_KIND + 1 {
+    for kind in 2..LAST_KIND + 2 {
         refresh_kernel_hooks(kind);
     }
 }

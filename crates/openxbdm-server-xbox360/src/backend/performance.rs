@@ -13,8 +13,6 @@ pub(crate) mod xtrace;
 
 pub(crate) use counters::memory_statistics;
 
-use core::fmt::Write as _;
-
 use openxbdm_core::status::Hresult;
 use openxbdm_server::commands::filesystem::DriveTable;
 use openxbdm_server::commands::performance;
@@ -31,7 +29,6 @@ use openxbdm_server::commands::performance::PixDogma;
 use openxbdm_server::commands::performance::PixMessage;
 use openxbdm_server::commands::performance::TILE_SIZE;
 use openxbdm_server::commands::performance::capture::CaptureFlags;
-use openxbdm_server::text::Text;
 
 use super::Console;
 use crate::kernel;
@@ -199,6 +196,21 @@ fn read_register(address: usize) -> u32 {
     unsafe { core::ptr::read_volatile(address as *const u32) }
 }
 
+/// Bytes of the NUL-terminated string at `address`, at most `limit`.
+#[inline(never)]
+fn c_string<'a>(address: u32, limit: usize) -> &'a [u8] {
+    let mut length = 0;
+    // SAFETY: callers pass a NUL-terminated string or one of at least
+    // `limit` readable bytes.
+    while length < limit
+        && unsafe { core::ptr::read_volatile((address as usize + length) as *const u8) } != 0
+    {
+        length += 1;
+    }
+    // SAFETY: the bytes were just read.
+    unsafe { core::slice::from_raw_parts(address as usize as *const u8, length) }
+}
+
 impl Console {
     fn encoder_extended(&mut self) -> bool {
         *self.performance.encoder_extended.get_or_insert_with(|| {
@@ -324,15 +336,10 @@ impl performance::Backend for Console {
             send_i2c_request(5);
         }
         if reply[1] != 0 {
-            let mut text: Text<0x60> = Text::new();
-            let _ = write!(
-                text,
-                "BD: Failed to write I2C bus address {register:X}, error code {}\n\0",
-                reply[1]
+            pmc::print(
+                c"BD: Failed to write I2C bus address %X, error code %u\n",
+                &[u64::from(register), u64::from(reply[1])],
             );
-            if let Ok(text) = core::ffi::CStr::from_bytes_until_nul(text.as_bytes()) {
-                kernel::debug_print(text);
-            }
         }
     }
 

@@ -167,10 +167,16 @@ const OOBE_DISABLED: u32 = 0x40;
 const OOBE_CHECKPOINT_DISABLED: u32 = 0x8000;
 
 /// Global state of this domain.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct State {
     /// Number used for the next default optical disc log file name.
     pub odd_log_index: u32,
+}
+
+impl State {
+    pub const fn new() -> Self {
+        Self { odd_log_index: 0 }
+    }
 }
 
 /// Transfers started by this domain.

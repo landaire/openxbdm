@@ -20,7 +20,6 @@ use openxbdm_server::commands::console::DebugName;
 use openxbdm_server::commands::console::ExportedSetting;
 use openxbdm_server::commands::console::HttpFailure;
 use openxbdm_server::commands::console::HttpProgress;
-use openxbdm_server::commands::console::HttpRegistration;
 use openxbdm_server::commands::console::HttpRequest;
 use openxbdm_server::commands::console::HttpStartFailure;
 use openxbdm_server::commands::console::HttpStartStage;
@@ -32,6 +31,7 @@ use openxbdm_server::commands::console::NetworkRaRecord;
 use openxbdm_server::commands::console::NetworkRaRequest;
 use openxbdm_server::commands::console::Published;
 use openxbdm_server::commands::console::REGISTRATION_RESPONSE_CAPACITY;
+use openxbdm_server::commands::console::RegistrationResult;
 use openxbdm_server::commands::console::SETTINGS_BLOCK_SIZE;
 use openxbdm_server::commands::console::STATUS_PROCEDURE_NOT_FOUND;
 use openxbdm_server::commands::console::SYSTEM_SETTINGS_SIZE;
@@ -604,7 +604,7 @@ impl commands::console::Backend for Console {
             Published::EventDefer(mask) => EVENT_DEFER.store(mask.0, Ordering::Release),
             Published::TraceMask(mask) => TRACE_MASK.store(mask.0, Ordering::Release),
             Published::Registration(registration) => {
-                REGISTRATION.with(|mirror| *mirror = *registration)
+                REGISTRATION.with(|mirror| *mirror = registration.result())
             }
         }
     }
@@ -653,7 +653,7 @@ static EVENT_DEFER: AtomicU32 = AtomicU32::new(0x27);
 static TRACE_MASK: AtomicU32 = AtomicU32::new(0);
 /// Mirror of the lab server registration (stock 0x91f9f638 state,
 /// 0x91f9f654 length, 0x91f9f658 transaction, 0x91fadee0 response).
-static REGISTRATION: SpinLocked<HttpRegistration> = SpinLocked::new(HttpRegistration::EMPTY);
+static REGISTRATION: SpinLocked<RegistrationResult> = SpinLocked::new(RegistrationResult::EMPTY);
 
 /// Result of a NULL output pointer.
 const BAD_PARAMETER: Hresult = Hresult::error(0x17);

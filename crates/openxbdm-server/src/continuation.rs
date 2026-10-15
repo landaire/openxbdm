@@ -84,6 +84,16 @@ pub struct ContinuationContext<'a> {
     pub network: &'a mut dyn Network,
 }
 
+/// The debugger continuation runs in a frame of its own: inlined, its
+/// frame (several KB) would be reserved under every other continuation.
+#[inline(never)]
+fn resume_debugger(
+    state: &mut commands::debugger::Continuation,
+    cx: &mut ContinuationContext<'_>,
+) -> Hresult {
+    commands::debugger::resume(state, cx)
+}
+
 /// Call the active continuation.
 pub(crate) fn resume(continuation: &mut Continuation, cx: &mut ContinuationContext<'_>) -> Hresult {
     match continuation {
@@ -94,7 +104,7 @@ pub(crate) fn resume(continuation: &mut Continuation, cx: &mut ContinuationConte
         Continuation::System(state) => commands::system::resume(state, cx),
         Continuation::FileSystem(state) => commands::filesystem::resume(state, cx),
         Continuation::Memory(state) => commands::memory::resume(state, cx),
-        Continuation::Debugger(state) => commands::debugger::resume(state, cx),
+        Continuation::Debugger(state) => resume_debugger(state, cx),
         Continuation::Network(state) => commands::network::resume(state, cx),
         Continuation::Performance(state) => commands::performance::resume(state, cx),
         Continuation::Hardware(state) => commands::hardware::resume(state, cx),

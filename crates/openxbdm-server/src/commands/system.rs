@@ -171,8 +171,16 @@ pub struct LaunchTitle {
     pub command_line: TitleText,
 }
 
+impl LaunchTitle {
+    pub const EMPTY: Self = Self {
+        image: TitleText::EMPTY,
+        drive: TitleText::EMPTY,
+        command_line: TitleText::EMPTY,
+    };
+}
+
 /// Global state of this domain.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct State {
     /// Boot-wait mode for the next boot.
     pub boot_wait: Option<BootWait>,
@@ -197,6 +205,23 @@ pub struct State {
     /// A launch fell back to a hardware reboot (stock 0x91fa2328); the
     /// launch title then stays for the settings file of the next boot.
     pub hard_reboot_pending: bool,
+}
+
+impl State {
+    pub const fn new() -> Self {
+        Self {
+            boot_wait: None,
+            settings_loaded: false,
+            clock_set: false,
+            recovery_requested: false,
+            recovery_boot: false,
+            title: LaunchTitle::EMPTY,
+            persistent_title: LaunchTitle::EMPTY,
+            boot_flags: BootFlags(0),
+            internal_drive_map: false,
+            hard_reboot_pending: false,
+        }
+    }
 }
 
 /// Transfers started by this domain.
@@ -743,32 +768,7 @@ fn title_settings_lines(state: &ServerState, backend: &mut dyn AnyBackend, file:
 /// consume a one-time boot-wait mode.
 pub fn load_settings(server: &mut Server, backend: &mut dyn AnyBackend, network: &mut dyn Network) {
     commands::console::initialize(&mut server.state, backend);
-    let mut buffer = [0u8; SETTINGS_READ_CAPACITY];
-    if let Some(file) = backend.open_settings(SettingsSource::Saved) {
-        if server
-            .state
-            .console
-            .trace_mask
-            .contains(TraceMask::SETTINGS)
-        {
-            trace_settings_file(&server.state, backend, file);
-        }
-        execute_settings_file(server, backend, network, file, &mut buffer);
-        backend.close_settings(file);
-    }
-    let text = format_args!("XBDM: g_fFinishedLoadingIniFile = TRUE\n");
-    trace(&server.state, backend, TraceMask::SETTINGS, text);
-    server.state.system.settings_loaded = true;
-    if let Some(file) = backend.open_settings(SettingsSource::Recint) {
-        execute_settings_file(server, backend, network, file, &mut buffer);
-        trace(
-            &server.state,
-            backend,
-            TraceMask::SETTINGS,
-            format_args!("XBDM: Finished loading recint.ini\n"),
-        );
-        backend.close_settings(file);
-    }
+    load_settings_files(server, backend, network);
     if server.state.system.internal_drive_map {
         server.state.filesystem.drives.map_internal_drives();
     } else {
@@ -780,6 +780,45 @@ pub fn load_settings(server: &mut Server, backend: &mut dyn AnyBackend, network:
         system.boot_wait = None;
         save_settings(&server.state, backend);
     }
+}
+
+/// Stock LoadIniFile allocates its 0x4000-byte read buffer from pool
+/// memory first and does nothing at all when that fails: no file is read,
+/// nothing is traced, and the settings stay marked as not loaded.
+fn load_settings_files(
+    server: &mut Server,
+    backend: &mut dyn AnyBackend,
+    network: &mut dyn Network,
+) {
+    let Some(buffer) = backend.allocate_scratch(SETTINGS_READ_CAPACITY as u32) else {
+        return;
+    };
+    if let Some(file) = backend.open_settings(SettingsSource::Saved) {
+        if server
+            .state
+            .console
+            .trace_mask
+            .contains(TraceMask::SETTINGS)
+        {
+            trace_settings_file(&server.state, backend, file);
+        }
+        execute_settings_file(server, backend, network, file, buffer);
+        backend.close_settings(file);
+    }
+    let text = format_args!("XBDM: g_fFinishedLoadingIniFile = TRUE\n");
+    trace(&server.state, backend, TraceMask::SETTINGS, text);
+    server.state.system.settings_loaded = true;
+    if let Some(file) = backend.open_settings(SettingsSource::Recint) {
+        execute_settings_file(server, backend, network, file, buffer);
+        trace(
+            &server.state,
+            backend,
+            TraceMask::SETTINGS,
+            format_args!("XBDM: Finished loading recint.ini\n"),
+        );
+        backend.close_settings(file);
+    }
+    backend.free_scratch(buffer);
 }
 
 /// The saved settings file before it is executed (stock 0x91f31758 and
@@ -812,7 +851,7 @@ fn execute_settings_file(
     backend: &mut dyn AnyBackend,
     network: &mut dyn Network,
     file: SettingsFile,
-    buffer: &mut [u8; SETTINGS_READ_CAPACITY],
+    buffer: &mut [u8],
 ) {
     let mut count = 0;
     loop {

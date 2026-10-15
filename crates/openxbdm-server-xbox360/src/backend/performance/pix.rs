@@ -18,6 +18,7 @@ use core::sync::atomic::Ordering;
 
 pub(crate) use ring::stream_active;
 pub(crate) use ring::write_tagged_record;
+pub(crate) use ring::write_tagged_words;
 
 use openxbdm_core::status::Hresult;
 use openxbdm_server::Server;
@@ -69,18 +70,16 @@ const HDD_TAG: u32 = 0x4844_4420;
 pub(crate) fn service_disk_start(argument: u32) -> u32 {
     let time = kernel::timebase();
     if stream_active() {
-        let mut payload = [0u8; 0x14];
-        let words = [
-            (time >> 32) as u32,
-            time as u32 & !1,
-            read_u32(argument),
-            read_u32(argument + 4),
-            read_u32(argument + 8),
-        ];
-        for (chunk, word) in payload.chunks_exact_mut(4).zip(words) {
-            chunk.copy_from_slice(&word.to_be_bytes());
-        }
-        write_tagged_record(HDD_TAG, &payload);
+        write_tagged_words(
+            HDD_TAG,
+            &[
+                (time >> 32) as u32,
+                time as u32 & !1,
+                read_u32(argument),
+                read_u32(argument + 4),
+                read_u32(argument + 8),
+            ],
+        );
     }
     0
 }
@@ -90,15 +89,7 @@ pub(crate) fn service_disk_start(argument: u32) -> u32 {
 pub(crate) fn service_disk_complete(status: u32) -> u32 {
     let time = kernel::timebase();
     if stream_active() {
-        let mut payload = [0u8; 0xc];
-        for (chunk, word) in
-            payload
-                .chunks_exact_mut(4)
-                .zip([(time >> 32) as u32, time as u32 | 1, status])
-        {
-            chunk.copy_from_slice(&word.to_be_bytes());
-        }
-        write_tagged_record(HDD_TAG, &payload);
+        write_tagged_words(HDD_TAG, &[(time >> 32) as u32, time as u32 | 1, status]);
     }
     0
 }
@@ -226,9 +217,10 @@ pub(crate) fn service_queue_message(argument: u32) -> u32 {
 /// session message 15.
 static RESOURCE_INFORMATION: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
 
-fn set_resource_information(words: [u32; 3]) {
-    for (slot, word) in RESOURCE_INFORMATION.iter().zip(words) {
-        slot.store(word, Ordering::Release);
+/// Store the three dwords at `source`.
+fn set_resource_information(source: u32) {
+    for (index, slot) in RESOURCE_INFORMATION.iter().enumerate() {
+        slot.store(read_u32(source + index as u32 * 4), Ordering::Release);
     }
 }
 
@@ -443,10 +435,15 @@ pub(crate) mod backend {
         ring::read_snapshot(output)
     }
 
-    /// Text of `pixcmd k` (stock 0x91fa280c, unbounded copy there).
+    /// Text of `pixcmd k` (stock 0x91fa280c, unbounded copy there). It is
+    /// only compared with event names of at most `EVENT_NAME_BYTES` bytes,
+    /// which a longer text never matches; one more byte and the NUL keep
+    /// that outcome.
     static CAPTURE_TEXT: CaptureText =
         CaptureText(core::cell::UnsafeCell::new([0; CAPTURE_TEXT_CAPACITY]));
-    const CAPTURE_TEXT_CAPACITY: usize = 0x200;
+    const CAPTURE_TEXT_CAPACITY: usize = EVENT_NAME_BYTES + 2;
+    /// Event name buffer of a timing request.
+    pub(super) const EVENT_NAME_BYTES: usize = 0x24;
 
     struct CaptureText(core::cell::UnsafeCell<[u8; CAPTURE_TEXT_CAPACITY]>);
 

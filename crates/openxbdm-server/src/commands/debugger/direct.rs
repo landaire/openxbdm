@@ -9,7 +9,6 @@
 //! [`DirectPolicy`] the server last published, applies the outcome, and
 //! queues the notification for the server.
 
-use super::Context;
 use super::DataBreakpoint;
 use super::Disposition;
 use super::ExceptionRecord;
@@ -141,14 +140,22 @@ pub struct ThreadNameRequest {
     pub address: u32,
 }
 
-/// The monitor's dispatch for a thread that cannot stop. `context` holds
-/// the control and integer registers and is updated in place;
-/// `instruction` is the word at Iar; `step` is the step state of direct
-/// exceptions.
+/// The registers [`dispatch_direct`] reads and changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectRegisters {
+    pub msr: u32,
+    pub iar: u32,
+    pub gpr3: u64,
+    pub gpr4: u64,
+}
+
+/// The monitor's dispatch for a thread that cannot stop. `context` is
+/// updated in place; `instruction` is the word at Iar; `step` is the step
+/// state of direct exceptions.
 pub fn dispatch_direct(
     policy: &DirectPolicy,
     event: &DirectException,
-    context: &mut Context,
+    context: &mut DirectRegisters,
     instruction: Option<u32>,
     step: &mut Option<DirectStep>,
 ) -> DirectOutcome {
@@ -187,8 +194,8 @@ pub fn dispatch_direct(
             Delivery::Discarded => false,
         };
         let queued = |defer_bit: u32| event.delivery == Delivery::Deferred && sent(Some(defer_bit));
-        let gpr3 = context.gpr[3];
-        let gpr4 = context.gpr[4];
+        let gpr3 = context.gpr3;
+        let gpr4 = context.gpr4;
         match record.code {
             ExceptionRecord::BREAKPOINT => match record.trap_code() {
                 trap::DEBUG_STRING => {
@@ -242,7 +249,7 @@ pub fn dispatch_direct(
                     }
                     if queued(bit) {
                         if code == trap::ASSERT_PROMPT {
-                            context.gpr[3] = ASSERT_IGNORE;
+                            context.gpr3 = ASSERT_IGNORE;
                         }
                         context.iar = context.iar.wrapping_add(4);
                         outcome.disposition.handled = true;
@@ -324,7 +331,7 @@ pub fn dispatch_direct(
     if policy.kd_lite {
         outcome.disposition.chain_kernel_debugger = true;
     } else if advance {
-        context.gpr[3] = 0;
+        context.gpr3 = 0;
         context.iar = context.iar.wrapping_add(4);
         outcome.disposition.handled = true;
     }

@@ -28,6 +28,7 @@ use openxbdm_server::commands::debugger::DirectException;
 use openxbdm_server::commands::debugger::DirectNotice;
 use openxbdm_server::commands::debugger::DirectNotification;
 use openxbdm_server::commands::debugger::DirectPolicy;
+use openxbdm_server::commands::debugger::DirectRegisters;
 use openxbdm_server::commands::debugger::DirectStep;
 use openxbdm_server::commands::debugger::Disposition;
 use openxbdm_server::commands::debugger::ExceptionRecord;
@@ -784,12 +785,13 @@ fn dispatch_in_place(
     chain: &dyn Fn() -> u32,
 ) -> u32 {
     let policy = load_policy();
-    let flags = ContextFlags::CONTROL.union(ContextFlags::INTEGER);
-    let mut registers = Context {
-        flags,
-        ..Context::default()
+    let gpr = |n: u32| context + context::GPR + 8 * n;
+    let mut registers = DirectRegisters {
+        msr: read_u32(context + context::MSR),
+        iar: read_u32(context + context::IAR),
+        gpr3: read_u64(gpr(3)),
+        gpr4: read_u64(gpr(4)),
     };
-    read_context(context, flags, &mut registers);
     let iar = registers.iar;
     let thread = ThreadId(read_u32(thread_object + thread::ID));
     let event = DirectException {
@@ -812,7 +814,10 @@ fn dispatch_in_place(
         step.map_or(0, |step| 1 + u32::from(step.saved_trace)),
         Ordering::Release,
     );
-    write_context(context, &registers);
+    write_u32(context + context::MSR, registers.msr);
+    write_u32(context + context::IAR, registers.iar);
+    write_u64(gpr(3), registers.gpr3);
+    write_u64(gpr(4), registers.gpr4);
     if let Some(value) = outcome.data_breakpoint_register {
         KeIpiGenericCall(
             set_data_breakpoint_entry as *const () as usize as u32,
@@ -1264,9 +1269,10 @@ pub(crate) struct ThreadList {
 /// Store the identifiers of the debuggable threads, title threads first,
 /// as stock export 15 (0x91f25f28) walks them: records are created on the
 /// way and the walk stops visiting threads once `capacity` are stored.
+#[inline(never)]
 pub(crate) fn collect_thread_ids(
     capacity: usize,
-    mut store: impl FnMut(usize, ThreadId),
+    store: &mut dyn FnMut(usize, ThreadId),
 ) -> ThreadList {
     let mut list = ThreadList {
         count: 0,
@@ -1293,7 +1299,7 @@ pub(crate) fn collect_thread_ids(
 /// Identifiers of the debuggable threads, title threads first (stock
 /// export 15); `None` when they do not fit.
 pub(crate) fn debuggable_thread_ids(ids: &mut [ThreadId]) -> Option<usize> {
-    let list = collect_thread_ids(ids.len(), |index, id| ids[index] = id);
+    let list = collect_thread_ids(ids.len(), &mut |index, id| ids[index] = id);
     (!list.overflow).then_some(list.count)
 }
 

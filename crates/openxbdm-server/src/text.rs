@@ -43,14 +43,23 @@ impl<const N: usize> Text<N> {
     }
 
     pub fn push_bytes(&mut self, bytes: &[u8]) -> fmt::Result {
-        let available = N - self.len;
-        let count = bytes.len().min(available);
-        self.bytes[self.len..self.len + count].copy_from_slice(&bytes[..count]);
-        self.len += count;
-        if count == bytes.len() {
-            Ok(())
-        } else {
-            Err(fmt::Error)
+        self.cursor().push(bytes)
+    }
+
+    /// `value` as eight lowercase hex digits, as `{:08x}` writes it.
+    pub fn push_hex32(&mut self, value: u32) -> fmt::Result {
+        self.cursor().push_hex32(value)
+    }
+
+    /// `value` in decimal, as `{}` writes it.
+    pub fn push_decimal(&mut self, value: u32) -> fmt::Result {
+        self.cursor().push_decimal(value)
+    }
+
+    fn cursor(&mut self) -> Cursor<'_> {
+        Cursor {
+            bytes: &mut self.bytes,
+            len: &mut self.len,
         }
     }
 }
@@ -61,9 +70,79 @@ impl<const N: usize> Default for Text<N> {
     }
 }
 
+// Every capacity forwards to `Cursor`, so the writes are instantiated once.
 impl<const N: usize> fmt::Write for Text<N> {
     fn write_str(&mut self, value: &str) -> fmt::Result {
         self.push_bytes(value.as_bytes())
+    }
+
+    fn write_char(&mut self, value: char) -> fmt::Result {
+        self.cursor().write_char(value)
+    }
+
+    fn write_fmt(&mut self, arguments: fmt::Arguments<'_>) -> fmt::Result {
+        self.cursor().write_fmt(arguments)
+    }
+}
+
+/// The written length and storage of a `Text` of any capacity.
+struct Cursor<'a> {
+    bytes: &'a mut [u8],
+    len: &'a mut usize,
+}
+
+impl Cursor<'_> {
+    #[inline(never)]
+    fn push(&mut self, bytes: &[u8]) -> fmt::Result {
+        let available = self.bytes.len() - *self.len;
+        let count = bytes.len().min(available);
+        self.bytes[*self.len..*self.len + count].copy_from_slice(&bytes[..count]);
+        *self.len += count;
+        if count == bytes.len() {
+            Ok(())
+        } else {
+            Err(fmt::Error)
+        }
+    }
+
+    #[inline(never)]
+    fn push_hex32(&mut self, value: u32) -> fmt::Result {
+        let mut digits = [0u8; 8];
+        for (index, digit) in digits.iter_mut().enumerate() {
+            *digit = b"0123456789abcdef"[(value >> (28 - 4 * index)) as usize & 0xf];
+        }
+        self.push(&digits)
+    }
+
+    #[inline(never)]
+    fn push_decimal(&mut self, mut value: u32) -> fmt::Result {
+        let mut digits = [0u8; 10];
+        let mut start = digits.len();
+        loop {
+            start -= 1;
+            digits[start] = b'0' + (value % 10) as u8;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+        self.push(&digits[start..])
+    }
+}
+
+impl fmt::Write for Cursor<'_> {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        self.push(value.as_bytes())
+    }
+
+    #[inline(never)]
+    fn write_char(&mut self, value: char) -> fmt::Result {
+        self.push(value.encode_utf8(&mut [0; 4]).as_bytes())
+    }
+
+    #[inline(never)]
+    fn write_fmt(&mut self, arguments: fmt::Arguments<'_>) -> fmt::Result {
+        fmt::write(self, arguments)
     }
 }
 

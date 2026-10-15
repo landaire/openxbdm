@@ -393,6 +393,10 @@ pub trait Backend {
     fn allocate_pool(&mut self, size: u32) -> Option<PoolBuffer>;
     fn free_pool(&mut self, buffer: PoolBuffer);
     fn pool(&mut self, buffer: PoolBuffer) -> &mut [u8];
+    /// Pool memory the caller holds directly, without a borrow of the
+    /// backend, until [`Backend::free_scratch`].
+    fn allocate_scratch(&mut self, size: u32) -> Option<&'static mut [u8]>;
+    fn free_scratch(&mut self, block: &'static mut [u8]);
     /// Open (nonzero) or close (zero) the optical drive tray.
     fn open_close_tray(&mut self, value: u32);
     /// Format a block device as XTAF.
@@ -411,9 +415,17 @@ pub trait Backend {
 }
 
 /// Global state of this domain.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct State {
     pub drives: DriveTable,
+}
+
+impl State {
+    pub const fn new() -> Self {
+        Self {
+            drives: DriveTable::new(),
+        }
+    }
 }
 
 /// Close a file a command may have changed and count the change.
@@ -642,13 +654,19 @@ pub struct DriveTable {
     network_share_len: usize,
 }
 
-impl Default for DriveTable {
-    fn default() -> Self {
+impl DriveTable {
+    pub const fn new() -> Self {
         Self {
             entries: DEFAULT_DRIVES,
             network_share: [0; NETWORK_SHARE_CAPACITY],
             network_share_len: 0,
         }
+    }
+}
+
+impl Default for DriveTable {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

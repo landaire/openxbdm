@@ -321,6 +321,17 @@ fn settings_loader_quirks() {
 }
 
 #[test]
+fn settings_are_skipped_when_the_read_buffer_cannot_be_allocated() {
+    let mut host = Host::default();
+    host.backend.system.settings = Some(b"[xbdm]\r\nwait forever\r\n".to_vec());
+    host.backend.filesystem.pool_exhausted = true;
+    let server = TestServer::with_host(host);
+    let host = server.host.lock();
+    assert_eq!(host.server.state.system.boot_wait, None);
+    assert!(!host.server.state.system.settings_loaded);
+}
+
+#[test]
 fn settings_are_not_written_before_load_completes_or_on_cd_boot() {
     let mut host = Host::default();
     host.backend.filesystem.write(GAME, b"xex");

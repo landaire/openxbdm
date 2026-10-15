@@ -9,7 +9,6 @@
 //! each record, on the block of the current processor, as stock does.
 
 use core::cell::UnsafeCell;
-use core::fmt::Write as _;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicU8;
 use core::sync::atomic::AtomicU32;
@@ -31,7 +30,6 @@ use openxbdm_server::commands::performance::capture::Instrumentation;
 use openxbdm_server::commands::performance::capture::MAX_PROCESSORS;
 use openxbdm_server::commands::performance::capture::Paths;
 use openxbdm_server::commands::performance::capture::RecordKind;
-use openxbdm_server::text::Text;
 
 use super::counters;
 use super::module_snapshot;
@@ -490,9 +488,7 @@ fn program_counters(flags: CaptureFlags) {
         // Stock prints the message and traps on every processor; the
         // capture records without programming instead.
         CounterSource::Unsupported(selector) => {
-            let mut text: Text<0x20> = Text::new();
-            let _ = write!(text, "Invalid counter ID {selector}\n");
-            kernel::debug_print_bytes(text.as_bytes());
+            pmc::print(c"Invalid counter ID %u\n", &[u64::from(selector)]);
         }
     }
 }
@@ -511,7 +507,7 @@ fn program_processor_counters(setup: CounterSetup) {
     if first != current_processor() {
         return;
     }
-    for (number, value) in COUNTER_NUMBERS.iter().zip(setup.counter_numbers()) {
+    for (number, &value) in COUNTER_NUMBERS.iter().zip(&setup.counter_numbers()) {
         number.store(value, Ordering::Relaxed);
     }
     let ready = pmc::configure(Owner::CAPTURE, &counters)
@@ -639,17 +635,13 @@ fn restore_swap_routine() {
 fn release_buffers() {
     free(BUFFER.load(Ordering::Relaxed));
     free(CHUNK_LIST.load(Ordering::Relaxed));
-    for value in [
-        &BUFFER,
-        &CHUNK_LIST,
-        &FIRST_PROCESSOR,
-        &NEXT_CHUNK,
-        &BUFFER_END,
-        &BUFFER_SIZE,
-        &CHUNKS_PER_PROCESSOR,
-    ] {
-        value.store(0, Ordering::Relaxed);
-    }
+    BUFFER.store(0, Ordering::Relaxed);
+    CHUNK_LIST.store(0, Ordering::Relaxed);
+    FIRST_PROCESSOR.store(0, Ordering::Relaxed);
+    NEXT_CHUNK.store(0, Ordering::Relaxed);
+    BUFFER_END.store(0, Ordering::Relaxed);
+    BUFFER_SIZE.store(0, Ordering::Relaxed);
+    CHUNKS_PER_PROCESSOR.store(0, Ordering::Relaxed);
     store_pair(&START_TIMEBASE, 0);
     for block in BLOCKS.iter().take(processor_count()) {
         if block.enabled.load(Ordering::Relaxed) {
@@ -1142,17 +1134,13 @@ impl capture::Engine for Engine {
     /// freed.
     fn discard(&mut self) {
         on_every_processor(reset_on_processor_entry, 0);
-        for value in [
-            &LOCK,
-            &BUFFER,
-            &NEXT_CHUNK,
-            &BUFFER_END,
-            &BUFFER_SIZE,
-            &CHUNK_LIST,
-            &CHUNKS_PER_PROCESSOR,
-        ] {
-            value.store(0, Ordering::Relaxed);
-        }
+        LOCK.store(0, Ordering::Relaxed);
+        BUFFER.store(0, Ordering::Relaxed);
+        NEXT_CHUNK.store(0, Ordering::Relaxed);
+        BUFFER_END.store(0, Ordering::Relaxed);
+        BUFFER_SIZE.store(0, Ordering::Relaxed);
+        CHUNK_LIST.store(0, Ordering::Relaxed);
+        CHUNKS_PER_PROCESSOR.store(0, Ordering::Relaxed);
     }
 }
 
@@ -1235,15 +1223,9 @@ fn start_on_server(
 /// Export 73: start a capture into the drive path `name`. The drive table
 /// is read on the server thread; the title waits for it.
 extern "C" fn title_start(name: *const u8, buffer_size: u32) -> u32 {
-    let mut length = 0;
-    // SAFETY: the title passes a NUL-terminated string; at most
-    // `TITLE_NAME_LIMIT` bytes are read (stock copies it unbounded into a
-    // 0x141-byte stack buffer).
-    while length < TITLE_NAME_LIMIT && unsafe { core::ptr::read_volatile(name.add(length)) } != 0 {
-        length += 1;
-    }
-    // SAFETY: `length` bytes were just read.
-    let name = unsafe { core::slice::from_raw_parts(name, length) };
+    // At most `TITLE_NAME_LIMIT` bytes are read (stock copies the name
+    // unbounded into a 0x141-byte stack buffer).
+    let name = super::c_string(name as usize as u32, TITLE_NAME_LIMIT);
     let request = TitleStart { name, buffer_size };
     dispatcher::call_on_server(start_on_server, &raw const request as usize as u32)
         .unwrap_or_else(|| start_for_title(&mut NoDriveTable, name, buffer_size).0)

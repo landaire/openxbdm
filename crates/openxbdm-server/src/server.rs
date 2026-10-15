@@ -133,10 +133,10 @@ impl Default for Server {
 }
 
 impl Server {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
-            connections: Default::default(),
-            state: ServerState::default(),
+            connections: [const { None }; MAX_CONNECTIONS],
+            state: ServerState::new(),
             line: [0; RECEIVE_CAPACITY],
             text: ResponseText::new(),
             line_text: LineText::new(),
@@ -180,8 +180,12 @@ impl Server {
             .and_then(Option::as_ref)
     }
 
+    // The socket event entry points stay out of line so the platform's
+    // service loop does not hold their frames while it handles other events.
+
     /// Accept a new socket. When every slot is in use the peer receives
     /// `401- max number of connections exceeded` and the socket is closed.
+    #[inline(never)]
     pub fn accept(
         &mut self,
         socket: SocketId,
@@ -211,14 +215,16 @@ impl Server {
                 (time as u32) ^ ((timebase >> 32) as u32),
             ];
             self.nonces[slot] = nonce;
-            let _ = write!(
-                banner,
-                "201- boxid=0q{:08x}{:08x} nonce=0q{:08x}{:08x}",
-                lock.box_id[0], lock.box_id[1], nonce[0], nonce[1]
-            );
+            // The banner always fits.
+            let _ = banner.push_bytes(b"201- boxid=0q");
+            let _ = banner.push_hex32(lock.box_id[0]);
+            let _ = banner.push_hex32(lock.box_id[1]);
+            let _ = banner.push_bytes(b" nonce=0q");
+            let _ = banner.push_hex32(nonce[0]);
+            let _ = banner.push_hex32(nonce[1]);
             (Access::NONE, nonce)
         } else {
-            let _ = banner.write_str("201- connected");
+            let _ = banner.push_bytes(b"201- connected");
             (Access::ALL, self.nonces[slot])
         };
         if send_line(network, socket, banner.as_bytes()).is_err() {
@@ -263,6 +269,7 @@ impl Server {
     }
 
     /// Process the debug events the platform has queued.
+    #[inline(never)]
     pub fn poll_debug_events(&mut self, backend: &mut dyn Backend, network: &mut dyn Network) {
         crate::commands::debugger::process_events(&mut self.state, backend, network);
     }
@@ -271,6 +278,7 @@ impl Server {
     /// targets and drive the lab server registration. The platform calls
     /// this on every pass of its loop and at least once per second; the
     /// result is the milliseconds until a timer needs it again.
+    #[inline(never)]
     pub fn poll_timers(&mut self, backend: &mut dyn Backend) -> Option<u32> {
         crate::commands::session::expire_reverse_targets(&mut self.state, backend);
         let registration = crate::commands::console::poll_registration(&mut self.state, backend);
@@ -285,6 +293,7 @@ impl Server {
     }
 
     /// A `fastpipe` socket is readable.
+    #[inline(never)]
     pub fn on_fast_pipe_readable(
         &mut self,
         socket: SocketId,
@@ -374,6 +383,7 @@ impl Server {
     }
 
     /// The connection socket is readable.
+    #[inline(never)]
     pub fn on_readable(
         &mut self,
         index: ConnectionIndex,
@@ -454,6 +464,7 @@ impl Server {
     }
 
     /// The connection socket is writable while a 202 or 203 transfer runs.
+    #[inline(never)]
     pub fn on_writable(
         &mut self,
         index: ConnectionIndex,

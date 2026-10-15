@@ -69,16 +69,35 @@ pub(super) fn close(entry: u32, kind: u32, cursor: u32) {
     );
 }
 
+/// Words of pool type `kind` (2 system, 1 title): budget and bytes used
+/// at +0x2b4/+0x2bc (title) and +0x2b8/+0x2c0 (system), physical block
+/// and its size at +0x2ac/+0x2c4 and +0x2b0/+0x2c8.
+fn budget(kind: u32) -> u32 {
+    0x2b0 + kind * 4
+}
+
+fn used(kind: u32) -> u32 {
+    0x2b8 + kind * 4
+}
+
+fn physical_block(kind: u32) -> u32 {
+    0x2a8 + kind * 4
+}
+
+fn physical_size(kind: u32) -> u32 {
+    0x2c0 + kind * 4
+}
+
 /// Allocate `size` zeroed bytes against the system budget, else the title
 /// budget (stock 0x91f5c418).
 pub(super) fn allocate(s: S, size: u32) -> u32 {
-    for (used, budget, kind) in [(0x2c0, 0x2b8, 2), (0x2bc, 0x2b4, 1)] {
-        if s.word(used).wrapping_add(size) <= s.word(budget) {
+    for kind in (1..3).rev() {
+        if s.word(used(kind)).wrapping_add(size) <= s.word(budget(kind)) {
             let block = kernel::ExAllocatePoolTypeWithTag(size, POOL_TAG, kind);
             if block != 0 {
                 // SAFETY: a fresh pool block of `size` bytes.
                 unsafe { core::ptr::write_bytes(block as usize as *mut u8, 0, size as usize) };
-                s.set_word(used, s.word(used).wrapping_add(size));
+                s.set_word(used(kind), s.word(used(kind)).wrapping_add(size));
                 return block;
             }
         }
@@ -86,11 +105,21 @@ pub(super) fn allocate(s: S, size: u32) -> u32 {
     0
 }
 
+/// [`allocate`] into session word `offset`; false when it failed.
+fn allocate_at(s: S, offset: u32, size: u32) -> bool {
+    let block = allocate(s, size);
+    s.set_word(offset, block);
+    block != 0
+}
+
+/// Buffers each part needs, in configuration word order.
+const PART_BUFFERS: [u32; 4] = [7, 6, 0x11, 3];
+
 /// Buffers the configuration needs (stock 0x91f5c820).
 fn needed(s: S) -> u32 {
     let mut count = 0;
     let mut streams = 0u32;
-    for (index, extra) in [7, 6, 0x11, 3].into_iter().enumerate() {
+    for (index, &extra) in PART_BUFFERS.iter().enumerate() {
         let k = s.word(index as u32 * 4);
         if k != super::OFF {
             count += extra;
@@ -121,22 +150,17 @@ pub(super) fn flush(start: u32, end: u32) {
 
 /// Release every capture allocation (stock 0x91f5d828).
 pub(super) fn free(s: S) {
-    for (block, size, kind) in [(0x2b0, 0x2c8, 2), (0x2ac, 0x2c4, 1)] {
-        let address = s.word(block);
+    for kind in (1..3).rev() {
+        let address = s.word(physical_block(kind));
         if address != 0 {
             let start = cached(address);
-            flush(start, start.wrapping_add(s.word(size)));
+            flush(start, start.wrapping_add(s.word(physical_size(kind))));
             kernel::MmFreePhysicalMemory(kind, address);
-            s.set_word(block, 0);
-            s.set_word(size, 0);
+            s.set_word(physical_block(kind), 0);
+            s.set_word(physical_size(kind), 0);
         }
-        if kind == 2 {
-            s.set_word(0x2b8, 0);
-            s.set_word(0x2c0, 0);
-        } else {
-            s.set_word(0x2b4, 0);
-            s.set_word(0x2bc, 0);
-        }
+        s.set_word(budget(kind), 0);
+        s.set_word(used(kind), 0);
     }
     let release = |offset: u32| {
         let block = s.word(offset);
@@ -157,10 +181,10 @@ pub(super) fn free(s: S) {
     for k in 0..2 {
         release(stream(k) + STREAM_QUEUE);
     }
-    for (ring, head) in [(0x138, 0x140), (0x13c, 0x148)] {
-        if release(ring) {
-            s.set_word(head, 0);
-            s.set_word(head + 4, 0);
+    for index in 0..2 {
+        if release(0x138 + index * 4) {
+            s.set_word(0x140 + index * 8, 0);
+            s.set_word(0x144 + index * 8, 0);
         }
     }
     let requests = s.word(0x120);
@@ -174,9 +198,9 @@ pub(super) fn free(s: S) {
             }
         }
         kernel::ExFreePool(requests);
-        for offset in [0x120, 0x124, 0x128] {
-            s.set_word(offset, 0);
-        }
+        s.set_word(0x120, 0);
+        s.set_word(0x124, 0);
+        s.set_word(0x128, 0);
     }
     s.set_word(0x87d8, 0);
 }
@@ -187,9 +211,10 @@ pub(super) fn free(s: S) {
 pub(super) fn allocate_all(s: S) {
     s.set_word(0x87d8, 1);
     if !try_allocate(s) {
-        for offset in [0xc, 8, 4, 0] {
-            s.set_word(offset, super::OFF);
-        }
+        s.set_word(0xc, super::OFF);
+        s.set_word(8, super::OFF);
+        s.set_word(4, super::OFF);
+        s.set_word(0, super::OFF);
         free(s);
     }
 }
@@ -235,52 +260,42 @@ fn try_allocate(s: S) -> bool {
             0
         },
     );
-    for offset in [0x2bc, 0x2c8, 0x2c4] {
-        s.set_word(offset, 0);
-    }
+    s.set_word(0x2bc, 0);
+    s.set_word(0x2c8, 0);
+    s.set_word(0x2c4, 0);
     for index in 0..6 {
-        let block = allocate(s, TEMPORARY_BYTES);
-        s.set_word(0x87a0 + index * 4, block);
-        if block == 0 {
+        if !allocate_at(s, 0x87a0 + index * 4, TEMPORARY_BYTES) {
             return false;
         }
     }
     let total = ((s.word(0x2b4) - s.word(0x2bc)) >> 14) + ((s.word(0x2b8) - s.word(0x2c0)) >> 14);
-    for (offset, size) in [
-        (0x12c, total * 8),
-        (stream(0) + STREAM_QUEUE, total * 4),
-        (stream(1) + STREAM_QUEUE, total * 4),
-        (0x138, total * 8),
-        (0x13c, total * 8),
-    ] {
-        let block = allocate(s, size);
-        s.set_word(offset, block);
-        if block == 0 {
-            return false;
-        }
+    if !(allocate_at(s, 0x12c, total * 8)
+        && allocate_at(s, stream(0) + STREAM_QUEUE, total * 4)
+        && allocate_at(s, stream(1) + STREAM_QUEUE, total * 4)
+        && allocate_at(s, 0x138, total * 8)
+        && allocate_at(s, 0x13c, total * 8))
+    {
+        return false;
     }
     let requests = ((total + 7) >> 3) + 1;
     s.set_word(0x124, requests);
-    let table = allocate(s, requests * REQUEST);
-    s.set_word(0x120, table);
-    if table == 0 {
+    if !allocate_at(s, 0x120, requests * REQUEST) {
         return false;
     }
-    for (base, used, size, block, kind) in [
-        (0x2c0, 0x2b8, 0x2c8, 0x2b0, 2),
-        (0x2bc, 0x2b4, 0x2c4, 0x2ac, 1),
-    ] {
-        let start = s.word(base).wrapping_add(0xffff) & !0xffff;
-        s.set_word(base, start);
-        let budget = s.word(used);
-        if budget > start {
-            let bytes = budget - start;
-            s.set_word(size, bytes);
+    let table = s.word(0x120);
+    // Physical memory after the pool allocations of each budget.
+    for kind in (1..3).rev() {
+        let start = s.word(used(kind)).wrapping_add(0xffff) & !0xffff;
+        s.set_word(used(kind), start);
+        let limit = s.word(budget(kind));
+        if limit > start {
+            let bytes = limit - start;
+            s.set_word(physical_size(kind), bytes);
             let address =
                 kernel::MmAllocatePhysicalMemoryEx(kind, bytes, 0x2000_0404, 0, u32::MAX, 0);
-            s.set_word(block, address);
+            s.set_word(physical_block(kind), address);
             if address == 0 {
-                s.set_word(size, 0);
+                s.set_word(physical_size(kind), 0);
                 if kind == 1 {
                     super::super::status::post(
                         super::super::status::Status::StreamEngineOutOfMemory,
@@ -289,7 +304,7 @@ fn try_allocate(s: S) -> bool {
                 }
             }
         } else {
-            s.set_word(size, 0);
+            s.set_word(physical_size(kind), 0);
         }
     }
     let system = s.word(0x2c8) >> 14;
@@ -301,9 +316,10 @@ fn try_allocate(s: S) -> bool {
     }
     s.set_word(0x130, system + title);
     let mut entry = s.word(0x12c);
-    for (block, number) in [(0x2ac, title), (0x2b0, system)] {
+    for kind in 1..3 {
+        let number = if kind == 1 { title } else { system };
         for index in 0..number {
-            wr(entry, s.word(block) + index * BUFFER_BYTES);
+            wr(entry, s.word(physical_block(kind)) + index * BUFFER_BYTES);
             entry += 8;
         }
     }
@@ -355,15 +371,7 @@ fn wrap(index: u32, count: u32) -> u32 {
 /// `STRE` stream record marking a wait for the writer (stock 0x91f5c968).
 fn stream_wait_record(waiting: u32) {
     let time = kernel::timebase();
-    let mut payload = [0u8; 0xc];
-    for (chunk, word) in
-        payload
-            .chunks_exact_mut(4)
-            .zip([(time >> 32) as u32, time as u32, waiting])
-    {
-        chunk.copy_from_slice(&word.to_be_bytes());
-    }
-    super::super::write_tagged_record(0x5354_5245, &payload);
+    super::super::write_tagged_words(0x5354_5245, &[(time >> 32) as u32, time as u32, waiting]);
 }
 
 /// Wait until a queued request completes (stock 0x91f5c9b0): titles wait

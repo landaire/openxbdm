@@ -658,18 +658,11 @@ extern "C" fn query_counter(handle: u32, query_type: u32, sample: *mut u32) -> u
     };
     let result = query(&mut counter, query_type, &mut out);
     counter.release();
-    for (offset, word) in [
-        (out.value >> 32) as u32,
-        out.value as u32,
-        (out.rate >> 32) as u32,
-        out.rate as u32,
-        out.sample_type,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        write(address + offset as u32 * 4, word);
-    }
+    write(address, (out.value >> 32) as u32);
+    write(address + 4, out.value as u32);
+    write(address + 8, (out.rate >> 32) as u32);
+    write(address + 0xc, out.rate as u32);
+    write(address + 0x10, out.sample_type);
     result.0
 }
 export!(27, query_counter);
@@ -768,8 +761,8 @@ fn sample_processors() {
         let idle = read(read(block + 8) + 0x58);
         let tick = kernel::tick_count();
         kernel::KfLowerIrql(irql);
-        for (word, value) in words.iter().zip([idle, tick, dpc, tick, interrupt, tick]) {
-            word.store(value, Ordering::Relaxed);
+        for (word, value) in words.iter().zip(&[idle, tick, dpc, tick, interrupt, tick]) {
+            word.store(*value, Ordering::Relaxed);
         }
     }
 }
@@ -780,7 +773,7 @@ fn sample_pages() {
     // Stock copies its uninitialized stack block when the query fails;
     // zeros are copied instead.
     let _ = memory_statistics(&mut statistics);
-    for (word, index) in SOURCES.pages.iter().zip(PAGE_STATISTICS) {
+    for (word, &index) in SOURCES.pages.iter().zip(&PAGE_STATISTICS) {
         word.store(statistics[index], Ordering::Relaxed);
     }
 }

@@ -46,8 +46,9 @@ mod xbox360 {
 
     const XBDM_PORT: u16 = 730;
     const LISTEN_BACKLOG: i32 = 8;
-    /// Stack of the server thread; the server state lives on it.
-    const SERVER_STACK_SIZE: u32 = 128 * 1024;
+    /// Stack of stock's server thread (docs framework notes). The server
+    /// state is static, and no frame on this thread may hold large buffers.
+    const SERVER_STACK_SIZE: u32 = 0x8000;
     /// `ExCreateThread` flags of stock's server thread (docs framework
     /// notes); bit 0x400 makes it not debuggable, so its own thread
     /// notifications never wait for it.
@@ -105,6 +106,9 @@ mod xbox360 {
         }
     }
 
+    // Startup work and rare paths stay out of line: a frame inlined into
+    // the server loop would stay allocated under every command.
+    #[inline(never)]
     fn initialize_network() -> bool {
         let mut startup = [0u8; 13];
         startup[0] = 0x0d;
@@ -139,6 +143,7 @@ mod xbox360 {
         crate::backend::debugger::end_event_service();
     }
 
+    #[inline(never)]
     fn serve_passes(
         server: &mut Server,
         console: &mut Console,
@@ -215,6 +220,7 @@ mod xbox360 {
         }
     }
 
+    #[inline(never)]
     fn answer_discovery(server: &Server, socket: u32) {
         let mut request = [0u8; session::DISCOVERY_PACKET_CAPACITY];
         let Ok((length, sender)) = net::receive_from(socket, &mut request) else {
@@ -246,11 +252,8 @@ mod xbox360 {
 
         // Stock initializes the studio subsystem last, once the network runs.
         crate::backend::performance::studio::initialize();
+        load_settings();
         let mut network = XamNetwork;
-        crate::backend::dispatcher::with_startup_host(|server, console| {
-            openxbdm_server::commands::system::load_settings(server, console, &mut network);
-            crate::backend::dvd_hotplug::install(server.state.console.trace_mask);
-        });
         // From here on the server thread takes queued requests until it
         // stops: in its passes, and between listen attempts.
         let Some((server, console)) = crate::backend::dispatcher::begin_serving() else {
@@ -293,7 +296,17 @@ mod xbox360 {
         crate::backend::session::release_processor_threads(console);
     }
 
+    #[inline(never)]
+    fn load_settings() {
+        let mut network = XamNetwork;
+        crate::backend::dispatcher::with_startup_host(|server, console| {
+            openxbdm_server::commands::system::load_settings(server, console, &mut network);
+            crate::backend::dvd_hotplug::install(server.state.console.trace_mask);
+        });
+    }
+
     /// Remove the override, retrying while the file system is not ready.
+    #[inline(never)]
     fn remove_override_module() -> Removal {
         let mut removal = delete_file(OVERRIDE_MODULE_PATH);
         for _ in 1..OVERRIDE_REMOVAL_ATTEMPTS {

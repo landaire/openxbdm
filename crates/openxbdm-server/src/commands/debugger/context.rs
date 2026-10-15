@@ -53,21 +53,25 @@ pub struct Context {
 
 impl Default for Context {
     fn default() -> Self {
-        Self {
-            flags: ContextFlags::NONE,
-            msr: 0,
-            iar: 0,
-            lr: 0,
-            ctr: 0,
-            gpr: [0; 32],
-            cr: 0,
-            xer: 0,
-            fpscr: 0,
-            fpr: [0; 32],
-            vscr: [0; 4],
-            vr: [[0; 4]; 128],
-        }
+        Self::EMPTY
     }
+}
+
+impl Context {
+    pub const EMPTY: Self = Self {
+        flags: ContextFlags::NONE,
+        msr: 0,
+        iar: 0,
+        lr: 0,
+        ctr: 0,
+        gpr: [0; 32],
+        cr: 0,
+        xer: 0,
+        fpscr: 0,
+        fpr: [0; 32],
+        vscr: [0; 4],
+        vr: [[0; 4]; 128],
+    };
 }
 
 /// Bytes of the kernel context layout (`ContextFlags` word first).

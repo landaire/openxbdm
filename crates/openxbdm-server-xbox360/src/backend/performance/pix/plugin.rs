@@ -94,9 +94,13 @@ pub(super) fn initialize() {
     }
 }
 
-fn call(procedure: u32) {
-    // SAFETY: a plugin export without arguments.
-    unsafe { kernel::call_export(procedure, 0, 0, 0, 0) };
+/// Call plugin export `5 + index` when the plugin has it.
+fn call(index: usize) {
+    let procedure = PROCEDURE[index].load(Ordering::Acquire);
+    if procedure != 0 {
+        // SAFETY: a plugin export without arguments.
+        unsafe { kernel::call_export(procedure, 0, 0, 0, 0) };
+    }
 }
 
 /// Load the plugin once (stock 0x91f55ad8).
@@ -129,10 +133,7 @@ fn attach(starting: bool) {
         slot.store(address, Ordering::Release);
     }
     if starting {
-        let start = PROCEDURE[START].load(Ordering::Acquire);
-        if start != 0 {
-            call(start);
-        }
+        call(START);
         // Stock calls the installer whenever export 7 exists, even without
         // an installer; a missing installer is skipped here.
         let install = PROCEDURE[INSTALL_CALLBACKS].load(Ordering::Acquire);
@@ -201,17 +202,10 @@ pub(super) fn stop() {
         return;
     }
     if kernel::KeGetCurrentProcessType() != SYSTEM_PROCESS {
-        let stop = PROCEDURE[STOP].load(Ordering::Acquire);
-        if stop != 0 {
-            call(stop);
-        }
+        call(STOP);
     }
-    for index in [RELEASE, UNINSTALL] {
-        let procedure = PROCEDURE[index].load(Ordering::Acquire);
-        if procedure != 0 {
-            call(procedure);
-        }
-    }
+    call(RELEASE);
+    call(UNINSTALL);
     events::notify_owner(SUBMIT_HOOK, 0);
     for slot in &PROCEDURE {
         slot.store(0, Ordering::Release);
@@ -306,10 +300,10 @@ fn submit_hook(image: u32, hook: &mut u32) -> u32 {
         kernel::ExFreePool(walk);
     }
     let ordinal = if returns {
-        debug_print(format_args!("Catma: Use Submit hook with returns\n"));
+        kernel::debug_print(c"Catma: Use Submit hook with returns\n");
         ORDINAL_SUBMIT_RETURNS
     } else {
-        debug_print(format_args!("Catma: Use Submit hook NO returns\n"));
+        kernel::debug_print(c"Catma: Use Submit hook NO returns\n");
         ORDINAL_SUBMIT
     };
     kernel::XexGetProcedureAddress(image, ordinal, hook)

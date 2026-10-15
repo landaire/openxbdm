@@ -82,8 +82,8 @@ pub struct Breakpoints {
     spare: Option<BlockId>,
 }
 
-impl Default for Breakpoints {
-    fn default() -> Self {
+impl Breakpoints {
+    pub const fn new() -> Self {
         Self {
             blocks: [Block::EMPTY; BREAKPOINT_BLOCKS],
             allocated: 0,
@@ -511,7 +511,7 @@ mod tests {
 
     #[test]
     fn full_block_splits_in_half_and_inserts_by_the_upper_first_address() {
-        let mut table = Breakpoints::default();
+        let mut table = Breakpoints::new();
         let mut code = Code::default();
         set_ascending(&mut table, &mut code, BLOCK_ENTRIES);
         assert_eq!(table.set(0x1004, &mut code), Ok(()));
@@ -524,7 +524,7 @@ mod tests {
 
     #[test]
     fn address_below_the_head_goes_to_the_last_block() {
-        let mut table = Breakpoints::default();
+        let mut table = Breakpoints::new();
         let mut code = Code::default();
         set_ascending(&mut table, &mut code, BLOCK_ENTRIES + 1);
         assert!(table.contains(0x1100));
@@ -542,7 +542,7 @@ mod tests {
 
     #[test]
     fn emptied_blocks_keep_steering_with_their_stale_first_address() {
-        let mut table = Breakpoints::default();
+        let mut table = Breakpoints::new();
         let mut code = Code::default();
         set_ascending(&mut table, &mut code, BLOCK_ENTRIES + 1);
         table.clear_all(&mut code);
@@ -553,7 +553,7 @@ mod tests {
 
     #[test]
     fn new_entry_keeps_the_saved_word_of_its_position() {
-        let mut table = Breakpoints::default();
+        let mut table = Breakpoints::new();
         let mut code = Code::mapped(&[(0x2000, 0x1122_3344)]);
         assert_eq!(table.set(0x2000, &mut code), Ok(()));
         assert_eq!(table.set(0x1000, &mut code), Ok(()));
@@ -565,7 +565,7 @@ mod tests {
 
     #[test]
     fn set_fails_once_no_spare_block_can_be_obtained() {
-        let mut table = Breakpoints::default();
+        let mut table = Breakpoints::new();
         let mut code = Code::default();
         let capacity = (BREAKPOINT_BLOCKS - 1) * BLOCK_ENTRIES / 2 + BLOCK_ENTRIES;
         set_ascending(&mut table, &mut code, capacity);
@@ -579,7 +579,7 @@ mod tests {
 
     #[test]
     fn rearm_targets_the_recorded_position() {
-        let mut table = Breakpoints::default();
+        let mut table = Breakpoints::new();
         let mut code = Code::mapped(&[(0x0ffc, 1), (0x1000, 2), (0x1004, 3)]);
         assert_eq!(table.set(0x1000, &mut code), Ok(()));
         assert_eq!(table.set(0x1004, &mut code), Ok(()));

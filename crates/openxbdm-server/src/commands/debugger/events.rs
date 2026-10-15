@@ -139,7 +139,7 @@ impl Pending {
 }
 
 /// Event processing state.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct Events {
     pending: [Option<Pending>; MAX_PENDING],
     deferred: [Option<DebugEvent>; MAX_DEFERRED],
@@ -156,6 +156,15 @@ const fn process_index(process: ProcessKind) -> usize {
 }
 
 impl Events {
+    pub(super) const fn new() -> Self {
+        Self {
+            pending: [None; MAX_PENDING],
+            deferred: [const { None }; MAX_DEFERRED],
+            steps: [None; 2],
+            dump_in_progress: false,
+        }
+    }
+
     pub(super) fn any_pending(&self) -> bool {
         self.pending.iter().any(Option::is_some)
     }
@@ -557,18 +566,50 @@ fn stack_overflow(
 }
 
 /// Registers of a thread in the monitor that the dispatch reads.
-fn registers(backend: &mut dyn AnyBackend, thread: ThreadId) -> Context {
-    let mut context = Context {
-        flags: ContextFlags::CONTROL.union(ContextFlags::INTEGER),
-        ..Context::default()
-    };
-    let _ = backend.thread_context(thread, &mut context);
-    context
+#[derive(Clone, Copy)]
+struct Registers {
+    msr: u32,
+    iar: u32,
+    gpr3: u64,
+    gpr4: u64,
 }
 
-fn write_registers(backend: &mut dyn AnyBackend, thread: ThreadId, context: &mut Context) {
+#[inline(never)]
+fn registers(backend: &mut dyn AnyBackend, thread: ThreadId) -> Registers {
+    let mut context = Context::EMPTY;
     context.flags = ContextFlags::CONTROL.union(ContextFlags::INTEGER);
-    let _ = backend.set_thread_context(thread, context);
+    let _ = backend.thread_context(thread, &mut context);
+    Registers {
+        msr: context.msr,
+        iar: context.iar,
+        gpr3: context.gpr[3],
+        gpr4: context.gpr[4],
+    }
+}
+
+/// Read the control and integer registers of `thread`, let `change` edit
+/// them, and write them back when it returns true. The context occupies
+/// only this frame.
+#[inline(never)]
+fn edit_registers(
+    backend: &mut dyn AnyBackend,
+    thread: ThreadId,
+    change: &mut dyn FnMut(&mut dyn AnyBackend, &mut Context) -> bool,
+) {
+    let mut context = Context::EMPTY;
+    context.flags = ContextFlags::CONTROL.union(ContextFlags::INTEGER);
+    let _ = backend.thread_context(thread, &mut context);
+    if change(backend, &mut context) {
+        context.flags = ContextFlags::CONTROL.union(ContextFlags::INTEGER);
+        let _ = backend.set_thread_context(thread, &context);
+    }
+}
+
+fn clear_single_step(backend: &mut dyn AnyBackend, thread: ThreadId) {
+    edit_registers(backend, thread, &mut |_, context| {
+        context.msr &= !MSR_SINGLE_STEP;
+        true
+    });
 }
 
 /// The monitor rewrites first-chance integer traps raised by trap
@@ -660,8 +701,8 @@ fn exception(
         can_stop &= state.debugger.debugger.attached;
     }
     let iar = context.iar;
-    let gpr3 = context.gpr[3];
-    let gpr4 = context.gpr[4] as u16;
+    let gpr3 = context.gpr3;
+    let gpr4 = context.gpr4 as u16;
     let stop_on = state.debugger.stop_on;
 
     // Each arm yields the notification (if any), whether it stops, and the
@@ -684,7 +725,7 @@ fn exception(
             trap::MODULE_LOAD => {
                 dump = false;
                 let stop = !kd && can_stop && stop_on.contains(StopOn::MODULE_LOAD);
-                match backend.module_event(gpr3 as u32, context.gpr[4] as u32, thread) {
+                match backend.module_event(gpr3 as u32, context.gpr4 as u32, thread) {
                     Some(module) if module.has_header => {
                         Plan::notify(Notice::ModuleLoad(module), stop, Resolution::Final)
                     }
@@ -696,7 +737,7 @@ fn exception(
                 if gpr3 == 0 {
                     Plan::silent(Resolution::Final)
                 } else {
-                    match backend.module_event(gpr3 as u32, context.gpr[4] as u32, thread) {
+                    match backend.module_event(gpr3 as u32, context.gpr4 as u32, thread) {
                         Some(module) => {
                             state.debugger.breakpoints.remove_range(
                                 module.base,
@@ -769,9 +810,7 @@ fn exception(
                     StepTarget::DataBreakpoint => {}
                 }
                 if !step.saved_trace {
-                    let mut context = registers(backend, thread);
-                    context.msr &= !MSR_SINGLE_STEP;
-                    write_registers(backend, thread, &mut context);
+                    clear_single_step(backend, thread);
                     reprogram_data_breakpoint(state, backend);
                     backend.complete_event(
                         thread,
@@ -783,9 +822,7 @@ fn exception(
                     return;
                 }
             }
-            let mut context = registers(backend, thread);
-            context.msr &= !MSR_SINGLE_STEP;
-            write_registers(backend, thread, &mut context);
+            clear_single_step(backend, thread);
             Plan::notify(Notice::SingleStep, !kd && can_stop, Resolution::SingleStep)
         }
         _ => {
@@ -1140,24 +1177,27 @@ fn step_over(
     thread: ThreadId,
     process: ProcessKind,
 ) -> bool {
-    let mut context = registers(backend, thread);
-    if let Some(slot) = state.debugger.breakpoints.lift(context.iar, backend) {
-        state.debugger.events.steps[process_index(process)] = Some(Step {
-            target: StepTarget::Breakpoint(slot),
-            saved_trace: context.msr & MSR_SINGLE_STEP != 0,
-        });
-        context.msr |= MSR_SINGLE_STEP;
-        write_registers(backend, thread, &mut context);
-        return true;
-    }
-    let word = backend
-        .target_bytes(context.iar, 4)
-        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok());
-    if word.map(u32::from_be_bytes) == Some(TRAP_INSTRUCTION) {
-        context.iar = context.iar.wrapping_add(4);
-        write_registers(backend, thread, &mut context);
-    }
-    false
+    let mut lifted = false;
+    edit_registers(backend, thread, &mut |backend, context| {
+        if let Some(slot) = state.debugger.breakpoints.lift(context.iar, backend) {
+            state.debugger.events.steps[process_index(process)] = Some(Step {
+                target: StepTarget::Breakpoint(slot),
+                saved_trace: context.msr & MSR_SINGLE_STEP != 0,
+            });
+            context.msr |= MSR_SINGLE_STEP;
+            lifted = true;
+            return true;
+        }
+        let word = backend
+            .target_bytes(context.iar, 4)
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok());
+        if word.map(u32::from_be_bytes) == Some(TRAP_INSTRUCTION) {
+            context.iar = context.iar.wrapping_add(4);
+            return true;
+        }
+        false
+    });
+    lifted
 }
 
 /// End an event: apply what the monitor does after its notification and
@@ -1187,23 +1227,26 @@ fn finish(
         }
         Resolution::Assert { iar, gpr3 } => {
             if resolved {
-                let mut context = registers(backend, thread);
-                if context.gpr[3] == gpr3 {
-                    context.gpr[3] = ASSERT_IGNORE;
-                }
-                if context.iar == iar {
-                    context.iar = iar.wrapping_add(4);
-                }
-                write_registers(backend, thread, &mut context);
+                edit_registers(backend, thread, &mut |_, context| {
+                    if context.gpr[3] == gpr3 {
+                        context.gpr[3] = ASSERT_IGNORE;
+                    }
+                    if context.iar == iar {
+                        context.iar = iar.wrapping_add(4);
+                    }
+                    true
+                });
             }
         }
         Resolution::Advance { iar } => {
             if resolved {
-                let mut context = registers(backend, thread);
-                if context.iar == iar {
-                    context.iar = iar.wrapping_add(4);
-                    write_registers(backend, thread, &mut context);
-                }
+                edit_registers(backend, thread, &mut |_, context| {
+                    let at_trap = context.iar == iar;
+                    if at_trap {
+                        context.iar = iar.wrapping_add(4);
+                    }
+                    at_trap
+                });
             }
         }
         Resolution::Exception { second_chance } => {
@@ -1220,21 +1263,23 @@ fn finish(
                     step_over(state, backend, thread, process);
                 }
             } else {
-                let mut context = registers(backend, thread);
-                context.msr |= MSR_SINGLE_STEP;
-                write_registers(backend, thread, &mut context);
+                edit_registers(backend, thread, &mut |_, context| {
+                    context.msr |= MSR_SINGLE_STEP;
+                    true
+                });
             }
         }
         Resolution::DataBreakpoint => {
             if resolved {
                 backend.set_data_breakpoint_register(0);
-                let mut context = registers(backend, thread);
-                state.debugger.events.steps[process_index(process)] = Some(Step {
-                    target: StepTarget::DataBreakpoint,
-                    saved_trace: context.msr & MSR_SINGLE_STEP != 0,
+                edit_registers(backend, thread, &mut |_, context| {
+                    state.debugger.events.steps[process_index(process)] = Some(Step {
+                        target: StepTarget::DataBreakpoint,
+                        saved_trace: context.msr & MSR_SINGLE_STEP != 0,
+                    });
+                    context.msr |= MSR_SINGLE_STEP;
+                    true
                 });
-                context.msr |= MSR_SINGLE_STEP;
-                write_registers(backend, thread, &mut context);
             }
         }
         Resolution::Final => resolved = false,
@@ -1286,10 +1331,11 @@ fn finish(
         if state.debugger.kd_lite {
             disposition.chain_kernel_debugger = true;
         } else if advance {
-            let mut context = registers(backend, thread);
-            context.gpr[3] = 0;
-            context.iar = context.iar.wrapping_add(4);
-            write_registers(backend, thread, &mut context);
+            edit_registers(backend, thread, &mut |_, context| {
+                context.gpr[3] = 0;
+                context.iar = context.iar.wrapping_add(4);
+                true
+            });
             handled = true;
         }
     }
@@ -1582,8 +1628,8 @@ pub(super) fn stop_reason(
     };
     let context = registers(backend, thread);
     let iar = context.iar;
-    let address = context.gpr[3] as u32;
-    let length = context.gpr[4] as u16;
+    let address = context.gpr3 as u32;
+    let length = context.gpr4 as u16;
     Ok(match record.code {
         ExceptionRecord::BREAKPOINT => match record.trap_code() {
             trap::DEBUG_STRING => StopReason::DebugString { thread },

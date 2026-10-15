@@ -7,6 +7,7 @@ pub(super) mod pgo;
 
 use core::cell::UnsafeCell;
 use core::fmt::Write as _;
+use core::num::NonZeroU32;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
@@ -52,6 +53,7 @@ use openxbdm_server::text::Text;
 
 use super::Console;
 use super::dispatcher;
+use super::network::xam_procedure;
 use super::performance::pix;
 use crate::exports::export;
 use crate::kernel;
@@ -110,39 +112,41 @@ const MAX_CONNECTIONS: usize = 8;
 
 /// Pool memory owned by a Rust value; freed on drop.
 struct PoolBlock {
-    address: u32,
+    address: NonZeroU32,
     len: usize,
 }
 
 impl PoolBlock {
     fn allocate(bytes: u64, tag: u32) -> Option<Self> {
         let size = u32::try_from(bytes).ok()?;
-        let address = kernel::ExAllocatePoolTypeWithTag(size, tag, POOL_TYPE);
-        if address == 0 {
-            return None;
-        }
-        // SAFETY: the pool returned `size` writable bytes at `address`.
-        unsafe { core::ptr::write_bytes(address as usize as *mut u8, 0, size as usize) };
-        Some(Self {
+        let address = NonZeroU32::new(kernel::ExAllocatePoolTypeWithTag(size, tag, POOL_TYPE))?;
+        let block = Self {
             address,
             len: size as usize,
-        })
+        };
+        // SAFETY: the pool returned `size` writable bytes at `address`.
+        unsafe { core::ptr::write_bytes(block.base(), 0, block.len) };
+        Some(block)
+    }
+
+    fn base(&self) -> *mut u8 {
+        self.address.get() as usize as *mut u8
     }
 
     fn bytes(&self) -> &[u8] {
         // SAFETY: the block owns `len` bytes at `address` until dropped.
-        unsafe { core::slice::from_raw_parts(self.address as usize as *const u8, self.len) }
+        unsafe { core::slice::from_raw_parts(self.base(), self.len) }
     }
 
     fn bytes_mut(&mut self) -> &mut [u8] {
         // SAFETY: as `bytes`, with exclusive access through `&mut self`.
-        unsafe { core::slice::from_raw_parts_mut(self.address as usize as *mut u8, self.len) }
+        unsafe { core::slice::from_raw_parts_mut(self.base(), self.len) }
     }
 }
 
 impl Drop for PoolBlock {
     fn drop(&mut self) {
-        kernel::ExFreePool(self.address);
+        kernel::ExFreePool(self.address.get());
     }
 }
 
@@ -156,12 +160,7 @@ impl AsRef<[QueueEntry]> for PoolEntries {
     fn as_ref(&self) -> &[QueueEntry] {
         // SAFETY: the block holds `count` zeroed entries, a valid bit
         // pattern, and pool memory is suitably aligned.
-        unsafe {
-            core::slice::from_raw_parts(
-                self.block.address as usize as *const QueueEntry,
-                self.count,
-            )
-        }
+        unsafe { core::slice::from_raw_parts(self.block.base().cast::<QueueEntry>(), self.count) }
     }
 }
 
@@ -169,10 +168,7 @@ impl AsMut<[QueueEntry]> for PoolEntries {
     fn as_mut(&mut self) -> &mut [QueueEntry] {
         // SAFETY: as `as_ref`, with exclusive access through `&mut self`.
         unsafe {
-            core::slice::from_raw_parts_mut(
-                self.block.address as usize as *mut QueueEntry,
-                self.count,
-            )
+            core::slice::from_raw_parts_mut(self.block.base().cast::<QueueEntry>(), self.count)
         }
     }
 }
@@ -266,13 +262,7 @@ impl CachedExport {
         if cached != 0 {
             return Some(cached);
         }
-        let module = kernel::module_handle(c"xam.xex").ok()?;
-        let mut address = 0u32;
-        if (kernel::XexGetProcedureAddress(module, ordinal, &mut address) as i32) < 0
-            || address == 0
-        {
-            return None;
-        }
+        let address = xam_procedure(ordinal).filter(|&address| address != 0)?;
         self.0.store(address, Ordering::Relaxed);
         Some(address)
     }
@@ -430,37 +420,24 @@ pub(crate) fn service_ignore_gdf_attributes(_argument: u32) -> u32 {
     u32::from(IGNORE_GDF_ATTRIBUTES.load(Ordering::Relaxed))
 }
 
-/// One optical disc log record.
-#[derive(Clone, Copy)]
-enum OddRecord {
-    Read {
-        start: u32,
-        count: u32,
-        requested: u64,
-        completed: u64,
-        status: u32,
-    },
-    Mount {
-        sector: u32,
-        size: u32,
-        time: u64,
-    },
-    SpeedChange {
-        current: u32,
-        target: u32,
-        status: u32,
-        time: u64,
-    },
-}
+/// Record words of a slot, laid out per record kind; a timebase value
+/// takes two words, high word first.
+type OddWords = [u32; 7];
 
 const ODD_RING: usize = 64;
+/// Slot states; a ready slot's state is the kind of its record.
 const SLOT_FREE: u32 = 0;
 const SLOT_WRITING: u32 = 1;
-const SLOT_READY: u32 = 2;
+/// `{start, count, requested, completed, status}`.
+const SLOT_READ: u32 = 2;
+/// `{sector, size, time}`.
+const SLOT_MOUNT: u32 = 3;
+/// `{current, target, status, time}`.
+const SLOT_SPEED_CHANGE: u32 = 4;
 
 struct OddSlot {
     state: AtomicU32,
-    record: UnsafeCell<OddRecord>,
+    words: UnsafeCell<OddWords>,
 }
 
 /// Optical disc log: a ring filled by drive events and drained by the
@@ -497,11 +474,7 @@ static ODD_LOG: OddLog = OddLog {
     slots: [const {
         OddSlot {
             state: AtomicU32::new(SLOT_FREE),
-            record: UnsafeCell::new(OddRecord::Mount {
-                sector: 0,
-                size: 0,
-                time: 0,
-            }),
+            words: UnsafeCell::new([0; 7]),
         }
     }; ODD_RING],
     pending_start: AtomicU32::new(0),
@@ -524,7 +497,8 @@ const ODD_WRITER_STACK: u32 = 0x8000;
 const ODD_WRITER_FLAGS: u32 = 0x0400_02a6;
 
 impl OddLog {
-    fn publish(&self, record: OddRecord) {
+    /// Queue a record of `kind` (a `SLOT_*` ready state).
+    fn publish(&self, kind: u32, words: OddWords) {
         if self.stopped.load(Ordering::Acquire) == 1 {
             return;
         }
@@ -546,8 +520,8 @@ impl OddLog {
             return;
         }
         // SAFETY: the slot is owned by this writer while its state is WRITING.
-        unsafe { *slot.record.get() = record };
-        slot.state.store(SLOT_READY, Ordering::Release);
+        unsafe { *slot.words.get() = words };
+        slot.state.store(kind, Ordering::Release);
         self.work.set();
     }
 }
@@ -555,7 +529,8 @@ impl OddLog {
 /// Timebase ticks per 100 ns unit.
 const TIMEBASE_PER_100NS: i64 = 5;
 
-fn hundred_ns(timebase: u64) -> u64 {
+fn hundred_ns(high: u32, low: u32) -> u64 {
+    let timebase = u64::from(high) << 32 | u64::from(low);
     (timebase as i64 / TIMEBASE_PER_100NS) as u64
 }
 
@@ -637,15 +612,19 @@ pub(crate) fn service_odd_read_complete(status: u32) -> u32 {
     let log = &ODD_LOG;
     let low = log.pending_time_low.load(Ordering::Acquire);
     let high = log.pending_time_high.load(Ordering::Relaxed);
-    let requested = (u64::from(high) << 32) | u64::from(low);
-    if requested != 0 {
-        log.publish(OddRecord::Read {
-            start: log.pending_start.load(Ordering::Relaxed),
-            count: log.pending_count.load(Ordering::Relaxed),
-            requested,
-            completed,
-            status,
-        });
+    if high != 0 || low != 0 {
+        log.publish(
+            SLOT_READ,
+            [
+                log.pending_start.load(Ordering::Relaxed),
+                log.pending_count.load(Ordering::Relaxed),
+                high,
+                low,
+                (completed >> 32) as u32,
+                completed as u32,
+                status,
+            ],
+        );
     }
     0
 }
@@ -654,11 +633,11 @@ pub(crate) fn service_odd_read_complete(status: u32) -> u32 {
 /// volume descriptor's root directory sector and size first.
 pub(crate) fn service_odd_mount(request: u32) -> u32 {
     let (sector, size) = (read_word(request), read_word(request + 4));
-    ODD_LOG.publish(OddRecord::Mount {
-        sector,
-        size,
-        time: kernel::timebase(),
-    });
+    let time = kernel::timebase();
+    ODD_LOG.publish(
+        SLOT_MOUNT,
+        [sector, size, (time >> 32) as u32, time as u32, 0, 0, 0],
+    );
     0
 }
 
@@ -670,12 +649,19 @@ pub(crate) fn service_odd_speed_change(request: u32) -> u32 {
         read_word(request + 4),
         read_word(request + 8),
     );
-    ODD_LOG.publish(OddRecord::SpeedChange {
-        current,
-        target,
-        status,
-        time: kernel::timebase(),
-    });
+    let time = kernel::timebase();
+    ODD_LOG.publish(
+        SLOT_SPEED_CHANGE,
+        [
+            current,
+            target,
+            status,
+            (time >> 32) as u32,
+            time as u32,
+            0,
+            0,
+        ],
+    );
     0
 }
 
@@ -702,11 +688,8 @@ const OPTICAL_DRIVE_ATTRIBUTES: u32 = 0x50;
 pub(crate) fn initialize() {
     pgo::initialize();
     odd_initialize();
-    if let Ok(module) = kernel::module_handle(c"xam.xex") {
-        let mut address = 0u32;
-        if (kernel::XexGetProcedureAddress(module, XAM_INPUT_FOCUS, &mut address) as i32) >= 0 {
-            INPUT_FOCUS.store(address, Ordering::Relaxed);
-        }
+    if let Some(address) = xam_procedure(XAM_INPUT_FOCUS) {
+        INPUT_FOCUS.store(address, Ordering::Relaxed);
     }
     nuicam::initialize();
 }
@@ -757,41 +740,45 @@ fn odd_initialize() {
     kernel::NtClose(handle);
 }
 
-fn odd_write_record(handle: u32, record: OddRecord) {
+fn odd_write_record(handle: u32, kind: u32, words: OddWords) {
     let mut line = Text::<0x100>::new();
-    let _ = match record {
-        OddRecord::Mount { sector, size, time } => {
+    let _ = match kind {
+        SLOT_MOUNT => {
+            let [sector, size, high, low, ..] = words;
             write!(
                 line,
                 "GMNT,0x{sector:08x},0x{:016x},0x{:016x}\r\n",
                 u64::from(size),
-                hundred_ns(time)
+                hundred_ns(high, low)
             )
         }
-        OddRecord::Read {
-            start,
-            count,
-            requested,
-            completed,
-            status,
-        } => write!(
-            line,
-            "READ,0x{start:08x},0x{count:08x},0x{:016x},0x{:016x},0x{status:08x}\r\n",
-            hundred_ns(requested),
-            hundred_ns(completed)
-        ),
-        OddRecord::SpeedChange {
-            current,
-            target,
-            status,
-            time,
-        } => write!(
-            line,
-            "SSC ,{},{},0x{status:08X},0x{:016x}\r\n",
-            speed_name(current),
-            speed_name(target),
-            hundred_ns(time)
-        ),
+        SLOT_READ => {
+            let [
+                start,
+                count,
+                requested_high,
+                requested_low,
+                high,
+                low,
+                status,
+            ] = words;
+            write!(
+                line,
+                "READ,0x{start:08x},0x{count:08x},0x{:016x},0x{:016x},0x{status:08x}\r\n",
+                hundred_ns(requested_high, requested_low),
+                hundred_ns(high, low)
+            )
+        }
+        _ => {
+            let [current, target, status, high, low, ..] = words;
+            write!(
+                line,
+                "SSC ,{},{},0x{status:08X},0x{:016x}\r\n",
+                speed_name(current),
+                speed_name(target),
+                hundred_ns(high, low)
+            )
+        }
     };
     write_text(handle, line.as_bytes());
 }
@@ -801,12 +788,13 @@ fn odd_drain(handle: u32) {
     loop {
         let index = log.read.load(Ordering::Relaxed);
         let slot = &log.slots[index as usize];
-        if slot.state.load(Ordering::Acquire) != SLOT_READY {
+        let kind = slot.state.load(Ordering::Acquire);
+        if kind < SLOT_READ {
             break;
         }
-        // SAFETY: a READY slot is owned by the writer thread.
-        let record = unsafe { *slot.record.get() };
-        odd_write_record(handle, record);
+        // SAFETY: a ready slot is owned by the writer thread.
+        let words = unsafe { *slot.words.get() };
+        odd_write_record(handle, kind, words);
         slot.state.store(SLOT_FREE, Ordering::Release);
         log.read
             .store((index + 1) % ODD_RING as u32, Ordering::Relaxed);
@@ -1389,10 +1377,5 @@ impl commands::hardware::Backend for Console {
 
 /// The avatar hook lookup; resolved on every use, as the monitor does.
 fn avatar_lookup() -> Option<u32> {
-    let module = kernel::module_handle(c"xam.xex").ok()?;
-    let mut address = 0u32;
-    if (kernel::XexGetProcedureAddress(module, XAM_AVATAR_HOOKS, &mut address) as i32) < 0 {
-        return None;
-    }
-    Some(address)
+    xam_procedure(XAM_AVATAR_HOOKS)
 }

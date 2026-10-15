@@ -115,7 +115,7 @@ pub(super) fn xam_feature_enabled(feature: u32) -> bool {
     const FEATURE_QUERY: u32 = 0x200;
     static QUERY: AtomicU32 = AtomicU32::new(0);
     let version = kernel::XamGetSystemVersion();
-    if !(0x2029_dc00..=0x202a_f700).contains(&version) && version < 0x202f_f100 {
+    if !(0x2029_dc00..0x202a_f701).contains(&version) && version < 0x202f_f100 {
         return true;
     }
     let mut query = QUERY.load(Ordering::Acquire);
@@ -175,20 +175,12 @@ pub(super) fn create() -> bool {
     unsafe { core::ptr::write_bytes(block as usize as *mut u8, 0, BLOCK_SIZE as usize) };
     kernel::RtlInitializeCriticalSectionAndSpinCount(session.at(LOCK), 10);
     kernel::RtlInitializeCriticalSectionAndSpinCount(session.at(ENGINE_LOCK), 10);
-    let device_type = kernel::IO_DEVICE_OBJECT_TYPE.load(Ordering::Relaxed);
     let mut path = PIX_STREAM;
     let mut device = 0u32;
-    let mut status =
-        kernel::ObReferenceObjectByName(&AnsiString::new(path), 0x40, device_type, 0, &mut device);
+    let mut status = reference_device(path, &mut device);
     if (status as i32) < 0 {
         path = PIX_DUMP;
-        status = kernel::ObReferenceObjectByName(
-            &AnsiString::new(path),
-            0x40,
-            device_type,
-            0,
-            &mut device,
-        );
+        status = reference_device(path, &mut device);
     }
     if (status as i32) >= 0 {
         let irql = kernel::IoAcquireDeviceObjectLock();
@@ -199,28 +191,10 @@ pub(super) fn create() -> bool {
         kernel::IoReleaseDeviceObjectLock(irql);
         kernel::ObDereferenceObject(device);
     }
-    let name = AnsiString::new(path);
-    let attributes = ObjectAttributes {
-        root_directory: 0,
-        object_name: &name,
-        attributes: kernel::OBJ_CASE_INSENSITIVE,
-    };
-    let mut io_status = IoStatusBlock::default();
     let mut handle = 0u32;
-    if (kernel::NtCreateFile(
-        &mut handle,
-        0xc010_0000,
-        &attributes,
-        &mut io_status,
-        core::ptr::null(),
-        4,
-        3,
-        1,
-        8,
-    ) as i32)
-        >= 0
-    {
+    if open_device(path, &mut handle) {
         session.set_word(DUMP_FILE, handle);
+        let mut io_status = IoStatusBlock::default();
         let mut size = [0u8; 0x18];
         kernel::NtQueryVolumeInformationFile(
             handle,
@@ -236,9 +210,14 @@ pub(super) fn create() -> bool {
     }
     session.set_word(CURRENT_MESSAGE, 0);
     session.set_word(0xc938, block + 0xc83c);
-    for offset in [0x0, 0x4, 0x8, 0xc, 0x28, 0x2c, 0x30, 0x34] {
-        session.set_word(offset, CONFIGURATION_OFF);
-    }
+    session.set_word(0x0, CONFIGURATION_OFF);
+    session.set_word(0x4, CONFIGURATION_OFF);
+    session.set_word(0x8, CONFIGURATION_OFF);
+    session.set_word(0xc, CONFIGURATION_OFF);
+    session.set_word(0x28, CONFIGURATION_OFF);
+    session.set_word(0x2c, CONFIGURATION_OFF);
+    session.set_word(0x30, CONFIGURATION_OFF);
+    session.set_word(0x34, CONFIGURATION_OFF);
     session.set_word(0xc83c, block);
     session.set_word(0xc934, block);
     for index in 0..0x800u32 {
@@ -256,44 +235,58 @@ pub(super) fn create() -> bool {
         .unwrap_or(0);
     session.set_word(KERNEL_ROUTINE, routine);
     session.set_word(REVISION, if routine != 0 { 0x5d } else { 0x55 });
-    for (offset, value) in [
-        (0x87e4, 0),
-        (0x87dc, 1),
-        (0x87e0, 1),
-        (0x87e8, 0),
-        (0x87ec, 0),
-        (0x87f0, 0),
-    ] {
-        session.set_word(offset, value);
-    }
+    reset_budget(session);
     SESSION.store(block, Ordering::Release);
     true
+}
+
+/// Memory budget switches and overrides of code 0x56 at their defaults.
+pub(super) fn reset_budget(session: Session) {
+    session.set_word(0x87e4, 0);
+    session.set_word(0x87dc, 1);
+    session.set_word(0x87e0, 1);
+    session.set_word(0x87e8, 0);
+    session.set_word(0x87ec, 0);
+    session.set_word(0x87f0, 0);
+}
+
+fn reference_device(path: &[u8], device: &mut u32) -> u32 {
+    kernel::ObReferenceObjectByName(
+        &AnsiString::new(path),
+        0x40,
+        kernel::IO_DEVICE_OBJECT_TYPE.load(Ordering::Relaxed),
+        0,
+        device,
+    )
+}
+
+/// Open the partition device `path` for capture writes.
+fn open_device(path: &[u8], handle: &mut u32) -> bool {
+    let name = AnsiString::new(path);
+    let attributes = ObjectAttributes {
+        root_directory: 0,
+        object_name: &name,
+        attributes: kernel::OBJ_CASE_INSENSITIVE,
+    };
+    let mut io_status = IoStatusBlock::default();
+    (kernel::NtCreateFile(
+        handle,
+        0xc010_0000,
+        &attributes,
+        &mut io_status,
+        core::ptr::null(),
+        4,
+        3,
+        1,
+        8,
+    ) as i32)
+        >= 0
 }
 
 /// Open a title handle to the dump partition (stock 0x91f5cb08):
 /// `PixStream`, else `PixDump`.
 pub(super) fn open_partition(handle: &mut u32) -> bool {
-    [PIX_STREAM, PIX_DUMP].into_iter().any(|path| {
-        let name = AnsiString::new(path);
-        let attributes = ObjectAttributes {
-            root_directory: 0,
-            object_name: &name,
-            attributes: kernel::OBJ_CASE_INSENSITIVE,
-        };
-        let mut io_status = IoStatusBlock::default();
-        (kernel::NtCreateFile(
-            handle,
-            0xc010_0000,
-            &attributes,
-            &mut io_status,
-            core::ptr::null(),
-            4,
-            3,
-            1,
-            8,
-        ) as i32)
-            >= 0
-    })
+    open_device(PIX_STREAM, handle) || open_device(PIX_DUMP, handle)
 }
 
 /// `KTHREAD` fields the lock checks before raising the priority.

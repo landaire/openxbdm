@@ -1754,12 +1754,13 @@ mod tests {
             b"Ethernet || IPv4 || ARP || LLTD || ICMP || IGMP || TCP || UDP || DNS || DHCP || XSP || Kerberosv5 \
             || ARP.OpCode || ICMP.Type || ICMP.Code || TCP.Flags || TCP.Window || DNS.Flags.QR";
         let (output, length) = compile(text).unwrap().unwrap();
+        let mut program = Program::EMPTY;
         let (expected, expected_length) = hex(
             "1010122301080101080501080d01081301081401081701081801082501082801083701083a01085501080e01081501081601081d010824010829220022013b22023b22033b22043b22053b22063b22073b22083b22093b220a3b220b3b220c3b220d3b220e3b220f3b22103b22113b",
         );
         assert_eq!(&output[..length], &expected[..expected_length]);
         assert_eq!(
-            Program::parse(&output[..length]).map(|_| ()),
+            Program::parse(&output[..length], &mut program),
             Err(ProgramError::OutOfMemory)
         );
 
@@ -1771,7 +1772,7 @@ mod tests {
         );
         assert_eq!(&output[..length], &expected[..expected_length]);
         assert_eq!(
-            Program::parse(&output[..length]).map(|_| ()),
+            Program::parse(&output[..length], &mut program),
             Err(ProgramError::OutOfMemory)
         );
     }

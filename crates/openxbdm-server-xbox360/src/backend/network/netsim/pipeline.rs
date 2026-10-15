@@ -287,6 +287,7 @@ impl PacketList {
 
     /// Release time of the front frame, not earlier than `now`
     /// (0x91f93b10).
+    #[inline(never)]
     fn next_time(&self, now: u64) -> u64 {
         if self.is_empty() {
             return NEVER;
@@ -537,11 +538,14 @@ impl Bucket {
             return;
         }
         let bytes_per_tick = f64::from(rate) / TIMEBASE_FREQUENCY as f64 * 1.0 * 0.125;
+        // SAFETY (both conversions): a nonzero u32 rate puts
+        // `bytes_per_tick` in (0, 11) and its reciprocal below 4e8, finite
+        // and within the i64 range.
         if bytes_per_tick >= 1.0 {
             self.period = 1;
-            self.step = bytes_per_tick as i64 as u64;
+            self.step = unsafe { bytes_per_tick.to_int_unchecked::<i64>() } as u64;
         } else {
-            self.period = (1.0 / bytes_per_tick * 1.0) as i64;
+            self.period = unsafe { (1.0 / bytes_per_tick * 1.0).to_int_unchecked::<i64>() };
             self.step = 1;
         }
     }

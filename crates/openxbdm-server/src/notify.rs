@@ -5,7 +5,6 @@
 //! outward by the console or attached by a `notify reconnectport=` peer.
 
 use core::fmt;
-use core::fmt::Write as _;
 
 use crate::commands::debugger::ModuleEvent;
 use crate::commands::debugger::module_flags;
@@ -227,79 +226,128 @@ pub enum Event<'a> {
     },
 }
 
+/// `label` followed by `value` in eight hex digits.
+fn hex(out: &mut Text<EVENT_LINE_CAPACITY>, label: &[u8], value: u32) -> fmt::Result {
+    out.push_bytes(label)?;
+    out.push_hex32(value)
+}
+
+/// Text of the `stopped` suffix.
+fn stop(stopped: bool) -> &'static [u8] {
+    if stopped { b" stop" } else { b"" }
+}
+
+/// `<kind> name="<name>" base=0x... size=0x... index=<n> flags=<n>`.
+fn section_line(
+    out: &mut Text<EVENT_LINE_CAPACITY>,
+    kind: &[u8],
+    name: &str,
+    base: u32,
+    size: u32,
+    index: u32,
+    flags: u32,
+) -> fmt::Result {
+    out.push_bytes(kind)?;
+    out.push_bytes(b" name=\"")?;
+    out.push_bytes(name.as_bytes())?;
+    hex(out, b"\" base=0x", base)?;
+    hex(out, b" size=0x", size)?;
+    out.push_bytes(b" index=")?;
+    out.push_decimal(index)?;
+    out.push_bytes(b" flags=")?;
+    out.push_decimal(flags)
+}
+
+/// `<kind><stop> thread=0x...`, then ` string=<text>` when present.
+fn text_line(
+    out: &mut Text<EVENT_LINE_CAPACITY>,
+    kind: &[u8],
+    thread: u32,
+    text: Option<&str>,
+    stopped: bool,
+) -> fmt::Result {
+    out.push_bytes(kind)?;
+    out.push_bytes(stop(stopped))?;
+    hex(out, b" thread=0x", thread)?;
+    if let Some(text) = text {
+        out.push_bytes(b" string=")?;
+        out.push_bytes(text.as_bytes())?;
+    }
+    Ok(())
+}
+
 impl Event<'_> {
     /// Write the notification line (without CR LF) for line-formatted events.
     fn write_line(&self, out: &mut Text<EVENT_LINE_CAPACITY>) -> fmt::Result {
-        let stop = |stopped: bool| if stopped { " stop" } else { "" };
         match *self {
             Self::Break {
                 address,
                 thread,
                 stopped,
             } => {
-                write!(
-                    out,
-                    "break addr=0x{address:08x} thread=0x{thread:08x}{}",
-                    stop(stopped)
-                )
+                hex(out, b"break addr=0x", address)?;
+                hex(out, b" thread=0x", thread)?;
+                out.push_bytes(stop(stopped))
             }
-            Self::Execution(state) => write!(out, "execution {}", state.name()),
-            Self::ExecutionStop(state) => write!(out, "execution {} stop", state.name()),
+            Self::Execution(state) => {
+                out.push_bytes(b"execution ")?;
+                out.push_bytes(state.name().as_bytes())
+            }
+            Self::ExecutionStop(state) => {
+                out.push_bytes(b"execution ")?;
+                out.push_bytes(state.name().as_bytes())?;
+                out.push_bytes(stop(true))
+            }
             Self::SingleStep {
                 address,
                 thread,
                 stopped,
             } => {
-                write!(
-                    out,
-                    "singlestep addr=0x{address:08x} thread=0x{thread:08x}{}",
-                    stop(stopped)
-                )
+                hex(out, b"singlestep addr=0x", address)?;
+                hex(out, b" thread=0x", thread)?;
+                out.push_bytes(stop(stopped))
             }
             Self::ModuleLoad {
                 module,
                 thread,
                 stopped,
             } => {
-                let flag =
-                    |bit: u32, text: &'static str| if module.flags & bit != 0 { text } else { "" };
+                let flag = |bit: u32, text: &'static [u8]| {
+                    if module.flags & bit != 0 { text } else { b"" }
+                };
                 out.push_bytes(b"modload name=\"")?;
                 out.push_bytes(&module.name[..module.name_length])?;
-                write!(
-                    out,
-                    "\" base=0x{:08x} size=0x{:08x} check=0x{:08x} timestamp=0x{:08x} pdata=0x{:08x} psize=0x{:08x}{}{}{} thread=0x{thread:08x} osize=0x{:08x}{}",
-                    module.base,
-                    module.size,
-                    module.checksum,
-                    module.timestamp,
-                    module.pdata,
-                    module.pdata_size,
-                    flag(module_flags::XBE, " xbe"),
-                    flag(module_flags::TLS, " tls"),
-                    flag(module_flags::DLL, " dll"),
-                    module.image_size,
-                    stop(stopped),
-                )
+                hex(out, b"\" base=0x", module.base)?;
+                hex(out, b" size=0x", module.size)?;
+                hex(out, b" check=0x", module.checksum)?;
+                hex(out, b" timestamp=0x", module.timestamp)?;
+                hex(out, b" pdata=0x", module.pdata)?;
+                hex(out, b" psize=0x", module.pdata_size)?;
+                out.push_bytes(flag(module_flags::XBE, b" xbe"))?;
+                out.push_bytes(flag(module_flags::TLS, b" tls"))?;
+                out.push_bytes(flag(module_flags::DLL, b" dll"))?;
+                hex(out, b" thread=0x", thread)?;
+                hex(out, b" osize=0x", module.image_size)?;
+                out.push_bytes(stop(stopped))
             }
             Self::ModuleUnload { name, base, size } => {
-                write!(
-                    out,
-                    "modunload name=\"{name}\" base=0x{base:08x} size=0x{size:08x}"
-                )
+                out.push_bytes(b"modunload name=\"")?;
+                out.push_bytes(name.as_bytes())?;
+                hex(out, b"\" base=0x", base)?;
+                hex(out, b" size=0x", size)
             }
             Self::ThreadCreate {
                 thread,
                 start,
                 stopped,
             } => {
-                write!(
-                    out,
-                    "create thread=0x{thread:08x} start=0x{start:08x}{}",
-                    stop(stopped)
-                )
+                hex(out, b"create thread=0x", thread)?;
+                hex(out, b" start=0x", start)?;
+                out.push_bytes(stop(stopped))
             }
             Self::ThreadTerminate { thread, stopped } => {
-                write!(out, "terminate thread=0x{thread:08x}{}", stop(stopped))
+                hex(out, b"terminate thread=0x", thread)?;
+                out.push_bytes(stop(stopped))
             }
             Self::Exception {
                 code,
@@ -310,27 +358,27 @@ impl Event<'_> {
                 noncontinuable,
                 stopped,
             } => {
-                write!(
-                    out,
-                    "exception code=0x{code:08x} thread=0x{thread:08x} address=0x{address:08x}"
-                )?;
+                hex(out, b"exception code=0x", code)?;
+                hex(out, b" thread=0x", thread)?;
+                hex(out, b" address=0x", address)?;
                 match detail {
-                    ExceptionDetail::AccessViolation { write, address } => write!(
-                        out,
-                        " {}=0x{address:08x}",
-                        if write { "write" } else { "read" }
-                    )?,
+                    ExceptionDetail::AccessViolation { write, address } => {
+                        let label: &[u8] = if write { b" write=0x" } else { b" read=0x" };
+                        hex(out, label, address)?;
+                    }
                     ExceptionDetail::Parameters { count, address } => {
-                        write!(out, " nparam={count} params=0x{address:08x}")?
+                        out.push_bytes(b" nparam=")?;
+                        out.push_decimal(count)?;
+                        hex(out, b" params=0x", address)?;
                     }
                 }
                 if first_chance {
-                    out.write_str(" first")?;
+                    out.push_bytes(b" first")?;
                 }
                 if noncontinuable {
-                    out.write_str(" noncont")?;
+                    out.push_bytes(b" noncont")?;
                 }
-                out.write_str(stop(stopped))
+                out.push_bytes(stop(stopped))
             }
             // The monitor's assert case appends the stop suffix and then
             // falls into the common suffix code, so stopped lines carry it
@@ -340,96 +388,79 @@ impl Event<'_> {
                 string_address,
                 string_length,
                 stopped,
-            } => write!(
-                out,
-                "assert thread=0x{thread:08x} straddr=0x{string_address:08x} strlen=0x{string_length:08x}{}{}",
-                stop(stopped),
-                stop(stopped)
-            ),
+            } => {
+                hex(out, b"assert thread=0x", thread)?;
+                hex(out, b" straddr=0x", string_address)?;
+                hex(out, b" strlen=0x", string_length)?;
+                out.push_bytes(stop(stopped))?;
+                out.push_bytes(stop(stopped))
+            }
             Self::Data {
                 access,
                 value,
                 address,
                 thread,
                 stopped,
-            } => write!(
-                out,
-                "data {}=0x{value:08x} addr=0x{address:08x} thread=0x{thread:08x}{}",
-                access.name(),
-                stop(stopped)
-            ),
+            } => {
+                out.push_bytes(b"data ")?;
+                out.push_bytes(access.name().as_bytes())?;
+                hex(out, b"=0x", value)?;
+                hex(out, b" addr=0x", address)?;
+                hex(out, b" thread=0x", thread)?;
+                out.push_bytes(stop(stopped))
+            }
             Self::Rip {
                 thread,
                 text,
                 stopped,
-            } => match text {
-                Some(text) => write!(
-                    out,
-                    "rip{} thread=0x{thread:08x} string={text}",
-                    stop(stopped)
-                ),
-                None => write!(out, "rip{} thread=0x{thread:08x}", stop(stopped)),
-            },
+            } => text_line(out, b"rip", thread, text, stopped),
             Self::SectionLoad {
                 name,
                 base,
                 size,
                 index,
                 flags,
-            } => write!(
-                out,
-                "sectload name=\"{name}\" base=0x{base:08x} size=0x{size:08x} index={index} flags={flags}"
-            ),
+            } => section_line(out, b"sectload", name, base, size, index, flags),
             Self::SectionUnload {
                 name,
                 base,
                 size,
                 index,
                 flags,
-            } => write!(
-                out,
-                "sectunload name=\"{name}\" base=0x{base:08x} size=0x{size:08x} index={index} flags={flags}"
-            ),
+            } => section_line(out, b"sectunload", name, base, size, index, flags),
             Self::StackTrace {
                 thread,
                 text,
                 stopped,
-            } => match text {
-                Some(text) => write!(
-                    out,
-                    "stacktrace{} thread=0x{thread:08x} string={text}",
-                    stop(stopped)
-                ),
-                None => write!(out, "stacktrace{} thread=0x{thread:08x}", stop(stopped)),
-            },
+            } => text_line(out, b"stacktrace", thread, text, stopped),
             Self::NtAssert {
                 address,
                 thread,
                 stopped,
             } => {
-                write!(
-                    out,
-                    "ntassert addr=0x{address:08x} thread=0x{thread:08x}{}",
-                    stop(stopped)
-                )
+                hex(out, b"ntassert addr=0x", address)?;
+                hex(out, b" thread=0x", thread)?;
+                out.push_bytes(stop(stopped))
             }
             Self::PogoModuleStartup {
                 name,
                 module,
                 thread,
                 stopped,
-            } => write!(
-                out,
-                "pogomodstartup name=\"{name}\" module=0x{module:08x} thread=0x{thread:08x}{}",
-                stop(stopped)
-            ),
+            } => {
+                out.push_bytes(b"pogomodstartup name=\"")?;
+                out.push_bytes(name.as_bytes())?;
+                hex(out, b"\" module=0x", module)?;
+                hex(out, b" thread=0x", thread)?;
+                out.push_bytes(stop(stopped))
+            }
             Self::DebugString { .. } | Self::AssertString { .. } => Ok(()),
         }
     }
 }
 
 /// Notification sockets and targets.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Notifications {
     sockets: [Option<SocketId>; MAX_NOTIFICATION_SOCKETS],
     targets: [Option<Target>; MAX_NOTIFICATION_TARGETS],
@@ -437,6 +468,14 @@ pub struct Notifications {
 }
 
 impl Notifications {
+    pub const fn new() -> Self {
+        Self {
+            sockets: [None; MAX_NOTIFICATION_SOCKETS],
+            targets: [None; MAX_NOTIFICATION_TARGETS],
+            debugger: None,
+        }
+    }
+
     pub fn targets(&self) -> impl Iterator<Item = &Target> {
         self.targets.iter().flatten()
     }
@@ -665,11 +704,12 @@ impl Notifications {
         network: &mut dyn Network,
     ) {
         let mut prefix = Text::<0x40>::new();
-        let _ = write!(
-            prefix,
-            "{kind} {}thread=0x{thread:08x} ",
-            if stopped { "stop " } else { "" }
-        );
+        let _ = prefix.push_bytes(kind.as_bytes()).and_then(|()| {
+            prefix.push_bytes(if stopped { b" stop " } else { b" " })?;
+            prefix.push_bytes(b"thread=0x")?;
+            prefix.push_hex32(thread)?;
+            prefix.push_bytes(b" ")
+        });
         for slot in 0..MAX_NOTIFICATION_SOCKETS {
             let Some(socket) = self.sockets[slot] else {
                 continue;
@@ -871,5 +911,158 @@ mod tests {
             line(Event::ModuleLoad { module: &module, thread: 1, stopped: false }).as_bytes(),
             b"modload name=\"m\xe9.xex\" base=0x82000000 size=0x00001000 check=0x00000000 timestamp=0x00000000 pdata=0x00000000 psize=0x00000000 dll thread=0x00000001 osize=0x00001000"
         );
+    }
+
+    #[test]
+    fn every_event_line() {
+        let module = ModuleEvent {
+            name: [b'a'; crate::commands::debugger::MODULE_NAME_CAPACITY],
+            name_length: 3,
+            base: 0x8200_0000,
+            size: 0xffff_ffff,
+            checksum: 0x1234_abcd,
+            timestamp: 7,
+            pdata: 0x10,
+            pdata_size: 0x20,
+            flags: module_flags::XBE | module_flags::TLS | module_flags::DLL,
+            image_size: 0x30,
+            has_header: true,
+        };
+        let events = [
+            Event::Break {
+                address: 1,
+                thread: 2,
+                stopped: false,
+            },
+            Event::ExecutionStop(ExecutionState::PendingTitle),
+            Event::SingleStep {
+                address: 0xdead_beef,
+                thread: 0,
+                stopped: true,
+            },
+            Event::ModuleLoad {
+                module: &module,
+                thread: 9,
+                stopped: true,
+            },
+            Event::ModuleUnload {
+                name: "x.xex",
+                base: 0x8000_0000,
+                size: 0x10,
+            },
+            Event::ModuleUnload {
+                name: "",
+                base: 0,
+                size: 0,
+            },
+            Event::ThreadCreate {
+                thread: 3,
+                start: 0x8200_1000,
+                stopped: false,
+            },
+            Event::ThreadTerminate {
+                thread: 4,
+                stopped: true,
+            },
+            Event::ThreadTerminate {
+                thread: 4,
+                stopped: false,
+            },
+            Event::Exception {
+                code: 0x8000_0003,
+                thread: 5,
+                address: 6,
+                detail: ExceptionDetail::Parameters {
+                    count: 4_294_967_295,
+                    address: 7,
+                },
+                first_chance: false,
+                noncontinuable: true,
+                stopped: false,
+            },
+            Event::Exception {
+                code: 0xc000_0005,
+                thread: 5,
+                address: 6,
+                detail: ExceptionDetail::AccessViolation {
+                    write: false,
+                    address: 8,
+                },
+                first_chance: true,
+                noncontinuable: true,
+                stopped: true,
+            },
+            Event::Assert {
+                thread: 1,
+                string_address: 2,
+                string_length: 3,
+                stopped: true,
+            },
+            Event::Assert {
+                thread: 1,
+                string_address: 2,
+                string_length: 3,
+                stopped: false,
+            },
+            Event::Data {
+                access: DataAccess::Write,
+                value: 0x11,
+                address: 0x22,
+                thread: 0x33,
+                stopped: true,
+            },
+            Event::Rip {
+                thread: 1,
+                text: Some("message"),
+                stopped: true,
+            },
+            Event::Rip {
+                thread: 1,
+                text: None,
+                stopped: false,
+            },
+            Event::SectionLoad {
+                name: ".text",
+                base: 1,
+                size: 2,
+                index: 0,
+                flags: 10,
+            },
+            Event::SectionUnload {
+                name: ".data",
+                base: 3,
+                size: 4,
+                index: 12345,
+                flags: 0,
+            },
+            Event::StackTrace {
+                thread: 2,
+                text: Some(""),
+                stopped: false,
+            },
+            Event::StackTrace {
+                thread: 2,
+                text: None,
+                stopped: true,
+            },
+            Event::NtAssert {
+                address: 0xffff_ffff,
+                thread: 0x10,
+                stopped: true,
+            },
+            Event::PogoModuleStartup {
+                name: "pogo",
+                module: 0x9000_0000,
+                thread: 1,
+                stopped: false,
+            },
+        ];
+        extern crate std;
+        let mut lines = std::string::String::new();
+        for event in events {
+            lines.push_str(core::str::from_utf8(line(event).as_bytes()).unwrap());
+            lines.push('\n');
+        }
+        insta::assert_snapshot!(lines);
     }
 }

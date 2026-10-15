@@ -323,13 +323,15 @@ fn build(
     processor: u32,
 ) -> Result<u32, u32> {
     let capacity = entries.wrapping_add(1);
-    let mut pending = descriptor(request.options, capacity);
+    let mut pending = [0u32; DESCRIPTOR_WORDS];
+    seed_descriptor(&mut pending, request.options, capacity);
     pending[0] |= REMOVE_WAITS | if request.block { INSERT_WAITS } else { 0 };
     pending[2] = engine.field(QUIT);
     pending[4] = NO_LIMIT;
     pending[6] = wait_for_item_or_quit as *const () as usize as u32;
     create_queue(engine, PENDING, request.options, &mut pending)?;
-    let mut free = descriptor(request.options, capacity);
+    let mut free = [0u32; DESCRIPTOR_WORDS];
+    seed_descriptor(&mut free, request.options, capacity);
     if request.block {
         free[4] = NO_LIMIT;
         free[3] = NO_LIMIT;
@@ -364,10 +366,9 @@ fn build(
     }
 }
 
-/// Queue descriptor seeded from the caller options, with the node count
-/// of `capacity`.
-fn descriptor(options: u32, capacity: u32) -> [u32; DESCRIPTOR_WORDS] {
-    let mut descriptor = [0u32; DESCRIPTOR_WORDS];
+/// Seed a zeroed queue descriptor from the caller options, with the node
+/// count of `capacity`.
+fn seed_descriptor(descriptor: &mut [u32; DESCRIPTOR_WORDS], options: u32, capacity: u32) {
     if options != 0 {
         // SAFETY: the caller passes a descriptor-sized options block.
         unsafe {
@@ -380,7 +381,6 @@ fn descriptor(options: u32, capacity: u32) -> [u32; DESCRIPTOR_WORDS] {
     }
     descriptor[8] = capacity;
     descriptor[9] = capacity;
-    descriptor
 }
 
 /// Create the queue whose cell the engine keeps at `offset`.
@@ -630,7 +630,7 @@ fn close_handle(handle: u32) {
 /// Free the queues, the worker handle and the object (stock 0x91f79320).
 fn destroy(engine: Engine) {
     let free_routine = engine.get(FREE_ROUTINE);
-    for offset in [PENDING, FREE] {
+    for &offset in &[PENDING, FREE] {
         let cell = engine.get(offset);
         if cell == 0 {
             continue;
@@ -755,6 +755,7 @@ fn store_byte(address: u32, value: u8) {
     unsafe { core::ptr::write_volatile(address as usize as *mut u8, value) }
 }
 
+/// Export 355: export 357 without options.
 extern "C" fn create_file_log(
     processor: u32,
     name: u32,
@@ -763,20 +764,11 @@ extern "C" fn create_file_log(
     block: u32,
     output: u32,
 ) -> u32 {
-    let request = Request {
-        processor,
-        name,
-        context: 0,
-        callback: 0,
-        entry_size,
-        entries,
-        block: block != 0,
-        options: 0,
-    };
-    create(&request, output)
+    create_file_log_with_options(processor, name, entry_size, entries, block, 0, output)
 }
 export!(355, create_file_log);
 
+/// Export 356: export 358 without options.
 extern "C" fn create_callback_log(
     processor: u32,
     context: u32,
@@ -786,20 +778,13 @@ extern "C" fn create_callback_log(
     block: u32,
     output: u32,
 ) -> u32 {
-    let request = Request {
-        processor,
-        name: 0,
-        context,
-        callback,
-        entry_size,
-        entries,
-        block: block != 0,
-        options: 0,
-    };
-    create(&request, output)
+    create_callback_log_with_options(
+        processor, context, callback, entry_size, entries, block, 0, output,
+    )
 }
 export!(356, create_callback_log);
 
+#[inline(never)]
 extern "C" fn create_file_log_with_options(
     processor: u32,
     name: u32,
@@ -824,6 +809,7 @@ extern "C" fn create_file_log_with_options(
 export!(357, create_file_log_with_options);
 
 #[allow(clippy::too_many_arguments)]
+#[inline(never)]
 extern "C" fn create_callback_log_with_options(
     processor: u32,
     context: u32,

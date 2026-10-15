@@ -19,7 +19,8 @@
 - Run server services inline under a startup lock until the command loop starts, so exports called during boot do not wait for the server thread.
 - Threads wait for the server thread only while it runs its pass loop: debug events, thread notifications, and queued services take their default disposition before the first pass and after the loop stops, and thread notifications are posted without waiting unless the thread may stop.
 - Enter the module entry point, the kernel debug routine, the thread notification, the control dispatcher, and the remaining kernel callbacks through the export bridge, and call console routines through frames that reserve the console argument area.
-- Create the server thread with stock's flags, which make it not debuggable.
+- Create the server thread with stock's flags, which make it not debuggable, and stock's 0x8000-byte stack: the server state is a static built at compile time, and the service loop keeps socket event handlers, continuations, and startup work in frames of their own.
+- Build with `-Cpanic=immediate-abort`, and write text replies of every capacity through one non-generic writer.
 - Add the `boot-guard` feature: a boot without `DEVKIT:\FlashEx\openxbdm.arm` removes the `DEVKIT:\FlashEx\xbdm.xex` override and restarts into the flash monitor.
 - Deploy the module as `DEVKIT:\FlashEx\xbdm.xex` with a matching bounding path; it removes that file at startup.
 - Pack the image on 4 KB pages (`.text` at `0x91f01000`; xex-link derives section alignment from the small-pages flag), so the image ends at `0x91fe5000`, below xshell.

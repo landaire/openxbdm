@@ -23,7 +23,6 @@ use super::IMAGE_FILE_DLL;
 use super::LoaderLock;
 use super::REGISTERED_TYPE_NAMES;
 use super::RtlImageDirectoryEntryToData;
-use super::RtlImageNtHeader;
 use super::RtlImageXexHeaderField;
 use super::SECTION_HEADER_SIZE;
 use super::TRACKING;
@@ -33,9 +32,14 @@ use super::Untracked;
 use super::all_entries;
 use super::code_view_of;
 use super::find_entry;
+use super::nt_header;
 use super::read_debug_byte;
+use super::read_le16;
+use super::read_le32;
 use super::read_u16;
 use super::read_u32;
+use super::section_info;
+use super::section_table;
 use super::track_allocation;
 use super::tracking_type_name_bytes;
 use super::untrack_allocation;
@@ -93,14 +97,6 @@ fn write_u8(address: u32, value: u8) {
 fn read_u8(address: u32) -> u8 {
     // SAFETY: the importer or the loader supplied a readable byte.
     unsafe { core::ptr::read_volatile(address as usize as *const u8) }
-}
-
-fn read_le32(address: u32) -> u32 {
-    read_u32(address).swap_bytes()
-}
-
-fn read_le16(address: u32) -> u16 {
-    read_u16(address).swap_bytes()
 }
 
 /// `strncpy`: copy up to `count` bytes of a NUL-terminated string and pad
@@ -302,7 +298,6 @@ fn fill_module_record(record: u32, entry: u32, header: u32) {
     write_u32(record + 0x114, read_le32(header + 0x58));
     write_u32(record + 0x110, read_le32(header + 8));
     write_u32(record + 0x128, read_le32(header + 0x50));
-    write_u32(record + 0x120, 0);
     let mut pdata_size = 0u32;
     let pdata = RtlImageDirectoryEntryToData(base, 1, IMAGE_DIRECTORY_EXCEPTION, &mut pdata_size);
     write_u32(record + 0x11c, pdata);
@@ -331,11 +326,12 @@ fn module_snapshot() -> Option<u32> {
         {
             let _lock = LoaderLock::acquire();
             for entry in all_entries() {
-                let base = read_u32(entry + ENTRY_BASE as u32);
-                let header = if base == 0 { 0 } else { RtlImageNtHeader(base) };
-                if read_u32(entry + ENTRY_FLAGS as u32) & ENTRY_FLAG_REPORTED == 0 || header == 0 {
+                if read_u32(entry + ENTRY_FLAGS as u32) & ENTRY_FLAG_REPORTED == 0 {
                     continue;
                 }
+                let Some(header) = nt_header(entry) else {
+                    continue;
+                };
                 let count = read_u32(snapshot);
                 if count < capacity {
                     fill_module_record(snapshot + 8 + count * MODULE_RECORD_SIZE, entry, header);
@@ -408,30 +404,13 @@ export!(51, walk_modules);
 
 /// Fill one export 52 record from a section header (0x91f33b88).
 fn fill_section_record(record: u32, section: u32, base: u32) {
-    let mut name = [0u8; 8];
-    for (offset, byte) in name.iter_mut().enumerate() {
-        *byte = read_u8(section + offset as u32);
+    let info = section_info(section, base);
+    for (offset, &byte) in info.name.iter().enumerate() {
+        write_u8(record + offset as u32, byte);
     }
-    let length = name
-        .iter()
-        .position(|&byte| byte == 0)
-        .unwrap_or(name.len());
-    copy_string(record, &name[..length], 8);
-    write_u32(record + 0x104, read_le32(section + 0xc).wrapping_add(base));
-    write_u32(record + 0x108, read_le32(section + 8));
-    let characteristics = read_le32(section + 0x24);
-    let mut flags = 0u16;
-    for (bit, flag) in [
-        (0x4000_0000, 2),
-        (0x8000_0000, 4),
-        (0x2000_0000, 8),
-        (0x80, 0x10),
-    ] {
-        if characteristics & bit != 0 {
-            flags |= flag;
-        }
-    }
-    write_u16(record + 0x10e, flags);
+    write_u32(record + 0x104, info.address);
+    write_u32(record + 0x108, info.size);
+    write_u16(record + 0x10e, info.flags() as u16);
 }
 
 /// Stock export 52 (0x91f340d0): `(walk, module name, record) ->
@@ -469,9 +448,8 @@ extern "C" fn walk_module_sections(walk: u32, name: u32, record: u32) -> u32 {
                 let _lock = LoaderLock::acquire();
                 if let Some(entry) = find_entry(name) {
                     let base = read_u32(entry + ENTRY_BASE as u32);
-                    let header = if base == 0 { 0 } else { RtlImageNtHeader(base) };
-                    if header != 0 {
-                        let sections = header + 0x18 + u32::from(read_le16(header + 0x14));
+                    if let Some(header) = nt_header(entry) {
+                        let sections = section_table(header);
                         let count = read_le16(header + 6);
                         result = Hresult::OK;
                         write_u16(snapshot, count);

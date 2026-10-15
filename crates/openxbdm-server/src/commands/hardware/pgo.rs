@@ -519,34 +519,37 @@ pub enum Fatal {
 }
 
 impl Fatal {
+    /// Texts in declaration order.
+    const TEXTS: [&'static str; 25] = [
+        "IrtClientAbort",
+        "Could not read base filename from object.",
+        "PCIAllocate: VirtualAlloc failed\n",
+        "PCILookupPGCHdr: CLIENTINFO not found\n",
+        "CreateMemoryRegion: MapViewOfFileEx failed\n",
+        "Pogo runtime: binary pathname too long",
+        "IrtPogoInit: GetModuleFileName failed\n",
+        "IrtPogoInit: GetModuleFileName result too long\n",
+        "Pogo Runtime BuildPath: path too long",
+        "Pogo Runtime Create Paths: Base PGC file name too long",
+        "Pogo Runtime Create Paths: GetModuleFileName failed",
+        "Pogo Runtime Create Paths: GetModuleFileName too long",
+        "Unable to write PGC file",
+        "Could not convert sweep phase name to Unicode.",
+        "Pogo Runtime: Invalid header signature",
+        "Pogo Runtime: Invalid header version",
+        "Invalid VPLH*\n",
+        "Invalid EPLH*\n",
+        "Invalid VPLE*\n",
+        "TlsAlloc failed\n",
+        "CreateEvent failed\n",
+        "IrtThreadList allocation failed\n",
+        "IrtThreadList DuplicateHandle(GetCurrentThread()) failed\n",
+        "counter overflowed 2^31\n",
+        "",
+    ];
+
     pub const fn text(self) -> &'static str {
-        match self {
-            Self::ClientAbort => "IrtClientAbort",
-            Self::BaseNameUnreadable => "Could not read base filename from object.",
-            Self::NodeAllocation => "PCIAllocate: VirtualAlloc failed\n",
-            Self::BlockLookup => "PCILookupPGCHdr: CLIENTINFO not found\n",
-            Self::BlockAllocation => "CreateMemoryRegion: MapViewOfFileEx failed\n",
-            Self::BinaryPathTooLong => "Pogo runtime: binary pathname too long",
-            Self::ModuleNameFailed => "IrtPogoInit: GetModuleFileName failed\n",
-            Self::ModuleNameTooLong => "IrtPogoInit: GetModuleFileName result too long\n",
-            Self::BuildPathTooLong => "Pogo Runtime BuildPath: path too long",
-            Self::BaseNameTooLong => "Pogo Runtime Create Paths: Base PGC file name too long",
-            Self::BaseModuleNameFailed => "Pogo Runtime Create Paths: GetModuleFileName failed",
-            Self::BaseModuleNameTooLong => "Pogo Runtime Create Paths: GetModuleFileName too long",
-            Self::WriteFailed => "Unable to write PGC file",
-            Self::PhaseUnconvertible => "Could not convert sweep phase name to Unicode.",
-            Self::InvalidSignature => "Pogo Runtime: Invalid header signature",
-            Self::InvalidVersion => "Pogo Runtime: Invalid header version",
-            Self::InvalidValueListHead => "Invalid VPLH*\n",
-            Self::InvalidTreeHead => "Invalid EPLH*\n",
-            Self::InvalidValueListEntry => "Invalid VPLE*\n",
-            Self::TlsAllocation => "TlsAlloc failed\n",
-            Self::EventCreation => "CreateEvent failed\n",
-            Self::ThreadListAllocation => "IrtThreadList allocation failed\n",
-            Self::ThreadHandle => "IrtThreadList DuplicateHandle(GetCurrentThread()) failed\n",
-            Self::CounterOverflow => "counter overflowed 2^31\n",
-            Self::ReservationExhausted => "",
-        }
+        Self::TEXTS[self as usize]
     }
 }
 
@@ -560,12 +563,15 @@ pub enum WriteWarning {
 }
 
 impl WriteWarning {
+    /// Texts in declaration order.
+    const TEXTS: [&'static str; 3] = [
+        "WritePGC: WriteFile failed\n",
+        "WritePGC: FlushFileBuffers failed\n",
+        "WritePGC: CloseHandle(hFile) failed\n",
+    ];
+
     pub const fn text(self) -> &'static str {
-        match self {
-            Self::Write => "WritePGC: WriteFile failed\n",
-            Self::Flush => "WritePGC: FlushFileBuffers failed\n",
-            Self::Close => "WritePGC: CloseHandle(hFile) failed\n",
-        }
+        Self::TEXTS[self as usize]
     }
 }
 

@@ -704,8 +704,8 @@ pub(super) fn install(owner: Owner, index: u32) -> bool {
     let Some(setup) = current_setup(index) else {
         return false;
     };
-    for core in [0, 2, 4] {
-        set_processor(core);
+    for core in 0..3 {
+        set_processor(core * 2);
         select_events(owner, &setup);
     }
     set_processor(processor);
@@ -930,21 +930,23 @@ fn print_statistics(state: &mut PmcState, flags: u32) {
     }
 }
 
-/// Stock 0x91f92020.
+/// Stock 0x91f92020: one line per field, A0Q0 in the top byte.
 fn print_ecc_counts() {
     let counts = get_pmw(PMW_L2_ECC);
     print(c"L2 ECC ERROR COUNTS\n", &[]);
-    let high = (counts >> 32) as u32;
-    let low = counts as u32;
-    let field = |word: u32, shift: u32| u64::from(word >> shift & 0x3f);
-    print(c"A0Q0 = %d\n", &[field(high, 24)]);
-    print(c"A1Q0 = %d\n", &[field(high, 16)]);
-    print(c"A0Q1 = %d\n", &[field(high, 8)]);
-    print(c"A1Q1 = %d\n", &[field(high, 0)]);
-    print(c"A0Q2 = %d\n", &[field(low, 24)]);
-    print(c"A1Q2 = %d\n", &[field(low, 16)]);
-    print(c"A0Q3 = %d\n", &[field(low, 8)]);
-    print(c"A1Q3 = %d\n", &[field(low, 0)]);
+    let words = [(counts >> 32) as u32, counts as u32];
+    for index in 0..8u32 {
+        let word = words[(index >> 2) as usize];
+        let field = word >> (24 - 8 * (index & 3)) & 0x3f;
+        print(
+            c"A%dQ%d = %d\n",
+            &[
+                u64::from(index & 1),
+                u64::from(index >> 1),
+                u64::from(field),
+            ],
+        );
+    }
 }
 
 /// Measure the processor clock over 100 ms of the interval counter (stock

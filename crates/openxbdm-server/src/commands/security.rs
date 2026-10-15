@@ -119,11 +119,19 @@ impl core::fmt::Debug for UserName {
 pub struct UserCreationFailed;
 
 /// Global state of this domain.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct State {
     /// Stored administrator password: the sent value XORed with the
     /// sender's session key.
     pub admin_password: Option<Password>,
+}
+
+impl State {
+    pub const fn new() -> Self {
+        Self {
+            admin_password: None,
+        }
+    }
 }
 
 /// Transfers started by this domain.

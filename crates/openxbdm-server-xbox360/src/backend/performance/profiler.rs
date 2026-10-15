@@ -748,10 +748,6 @@ fn write(address: u32, length: u32, offset: Option<u64>) -> bool {
     (status as i32) >= 0 && io_status.information == length
 }
 
-fn write_bytes(bytes: &[u8]) -> bool {
-    write(bytes.as_ptr() as usize as u32, bytes.len() as u32, None)
-}
-
 /// A module's exception directory copy (stock 0x91f32e90 entries).
 #[derive(Clone, Copy, Default)]
 struct FunctionTable {
@@ -769,7 +765,7 @@ fn copy_function_tables(tables: &mut [FunctionTable; MODULE_CAPACITY]) -> Option
     let irql = kernel::KfAcquireSpinLock(lock);
     let mut count = 0;
     let mut result = Some(0);
-    'lists: for head in [data.module_list(), data.secondary_module_list()] {
+    'lists: for &head in &[data.module_list(), data.secondary_module_list()] {
         // Stock reads a missing list head without a check.
         if head == 0 {
             continue;
@@ -901,13 +897,13 @@ fn write_prologue() -> bool {
     let modules = read_u32(snapshot.address() + 4) as usize;
     // Tables past the copied ones are zero and fail the base check.
     for (index, table) in tables.iter().enumerate().take(modules) {
-        let record = [table.base, table.image_size, table.size];
-        let mut bytes = [0u8; 12];
-        for (chunk, word) in bytes.chunks_exact_mut(4).zip(record) {
-            chunk.copy_from_slice(&word.to_be_bytes());
-        }
+        let record = [
+            table.base.to_be(),
+            table.image_size.to_be(),
+            table.size.to_be(),
+        ];
         let written = read_u32(snapshot.address() + 8 + index as u32 * 0x150) == table.base
-            && write_bytes(&bytes)
+            && write(record.as_ptr() as usize as u32, 12, None)
             && (table.size == 0 || {
                 let written = write(table.copy, table.size, None);
                 if written {
@@ -1297,26 +1293,13 @@ fn translate_on_server(
     0
 }
 
-/// The NUL-terminated string at `address`, at most the 0x140 characters
-/// `lopctrl` accepts.
-fn c_string<'a>(address: u32) -> &'a [u8] {
-    let mut length = 0;
-    // SAFETY: the caller passes a NUL-terminated string.
-    while length < 0x140
-        && unsafe { core::ptr::read_volatile((address + length) as usize as *const u8) } != 0
-    {
-        length += 1;
-    }
-    // SAFETY: the first `length` bytes were read above.
-    unsafe { core::slice::from_raw_parts(address as usize as *const u8, length as usize) }
-}
-
 /// Export 149: start profiling into drive path `name`. The drive table is
 /// read on the server thread; where that cannot wait, the name has no
 /// object path.
 extern "C" fn export_start(name: u32, interval: u32, flags: u32) -> u32 {
     let mut request = Translation {
-        name: c_string(name),
+        // At most the 0x140 characters `lopctrl` accepts.
+        name: super::c_string(name, 0x140),
         path: None,
         executable: [0; module_snapshot::PATH_LIMIT + 2],
         executable_length: 0,

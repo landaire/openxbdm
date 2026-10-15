@@ -84,12 +84,21 @@ pub mod status {
 pub const WSAEALREADY: u32 = 0x2735;
 
 /// Global state of `netsim`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct State {
     /// File the configuration is written to and reloaded from.
     pub file: FilePath,
     /// A reload is running (0x91f9f69c).
     pub reloading: bool,
+}
+
+impl State {
+    pub const fn new() -> Self {
+        Self {
+            file: FilePath::EMPTY,
+            reloading: false,
+        }
+    }
 }
 
 /// Stored configuration file name.
@@ -100,6 +109,11 @@ pub struct FilePath {
 }
 
 impl FilePath {
+    const EMPTY: Self = Self {
+        bytes: [0; PATH_LIMIT],
+        len: 0,
+    };
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes[..self.len]
     }
@@ -108,15 +122,6 @@ impl FilePath {
         let count = name.len().min(PATH_LIMIT);
         self.bytes[..count].copy_from_slice(&name[..count]);
         self.len = count;
-    }
-}
-
-impl Default for FilePath {
-    fn default() -> Self {
-        Self {
-            bytes: [0; PATH_LIMIT],
-            len: 0,
-        }
     }
 }
 
@@ -293,14 +298,17 @@ pub fn parse_queue_blob(
     Ok((kind, config, reader.bytes))
 }
 
-/// Parse the classifier program after a blob (0x91f8bb08); no bytes, no
-/// program.
-pub fn parse_program(bytes: &[u8]) -> Result<Option<Program>, Hresult> {
+/// Parse the classifier program after a blob (0x91f8bb08) into `slot`; no
+/// bytes, no program.
+pub fn parse_program<'p>(
+    bytes: &[u8],
+    slot: &'p mut Program,
+) -> Result<Option<&'p Program>, Hresult> {
     if bytes.is_empty() {
         return Ok(None);
     }
-    match Program::parse(bytes) {
-        Ok(program) => Ok(Some(program)),
+    match Program::parse(bytes, slot) {
+        Ok(()) => Ok(Some(slot)),
         Err(ProgramError::Invalid) => Err(status::INVALID),
         Err(ProgramError::OutOfMemory) => Err(status::OUT_OF_MEMORY),
     }
@@ -308,10 +316,13 @@ pub fn parse_program(bytes: &[u8]) -> Result<Option<Program>, Hresult> {
 
 /// An `insertq` blob in stock order: the settings, the classifier program,
 /// then validation (0x91f8c260, 0x91f8bb08, 0x91f8bc38).
-fn parse_insert_blob(blob: &[u8]) -> Result<(QueueKind, QueueConfig, Option<Program>), Hresult> {
+fn parse_insert_blob<'p>(
+    blob: &[u8],
+    slot: &'p mut Program,
+) -> Result<(QueueKind, QueueConfig, Option<&'p Program>), Hresult> {
     let (kind, config, program) = parse_queue_blob(blob, true)?;
     let kind = kind.ok_or(InvalidConfig)?;
-    let program = parse_program(program)?;
+    let program = parse_program(program, slot)?;
     Ok((kind, config.validate()?, program))
 }
 
@@ -640,113 +651,189 @@ impl Selection {
     }
 }
 
+/// Subcommands that take a [`Selection`] and an optional `cfg=` blob.
+#[derive(Clone, Copy)]
+enum Edit {
+    InsertQueue,
+    RemoveQueues,
+    ModifyQueue,
+    QueueStats,
+    Queue,
+    InsertRedirect,
+    RemoveRedirects,
+}
+
+/// A parsed `netsim` line. Execution does not read the line, so settings
+/// file lines run from the reader's pool buffer without a copy.
+enum Request {
+    Reload {
+        file: [u8; FILE_PARAMETER_CAPACITY],
+        length: usize,
+    },
+    QueueCounts,
+    RedirectCount,
+    Edit {
+        edit: Option<Edit>,
+        selection: Selection,
+        blob: [u8; CONFIG_CAPACITY],
+        blob_length: usize,
+    },
+}
+
+impl Request {
+    /// A bad `cfg=` digit is an unknown command.
+    fn parse(line: CommandLine<'_>) -> Result<Self, Hresult> {
+        if line.has("reload") {
+            let mut file = [0u8; FILE_PARAMETER_CAPACITY];
+            let length = match line.param("file") {
+                Some(value) => value.copy_into(&mut file).len(),
+                None => 0,
+            };
+            return Ok(Self::Reload { file, length });
+        }
+        if line.has("getnumqs") {
+            return Ok(Self::QueueCounts);
+        }
+        if line.has("getnumipv4redirs") {
+            return Ok(Self::RedirectCount);
+        }
+        let selection = Selection {
+            inbound: line.has("in"),
+            outbound: line.has("out"),
+            index: line
+                .param("index")
+                .and_then(|value| value.dword())
+                .filter(|&index| index != u32::MAX),
+        };
+        let mut blob = [0u8; CONFIG_CAPACITY];
+        let blob_length = match line.param("cfg") {
+            Some(value) => {
+                let raw = value.raw();
+                let text = raw.strip_prefix(b"\"").unwrap_or(raw);
+                decode_hex(text, &mut blob)
+                    .ok_or(Hresult::from_error_code(ErrorCode::UNKNOWN_COMMAND))?
+            }
+            None => 0,
+        };
+        const EDITS: [(&str, Edit); 7] = [
+            ("insertq", Edit::InsertQueue),
+            ("removeq", Edit::RemoveQueues),
+            ("modifyq", Edit::ModifyQueue),
+            ("getqstats", Edit::QueueStats),
+            ("getq", Edit::Queue),
+            ("insertipv4redir", Edit::InsertRedirect),
+            ("removeipv4redir", Edit::RemoveRedirects),
+        ];
+        let edit = EDITS
+            .iter()
+            .find(|(name, _)| line.has(name))
+            .map(|&(_, edit)| edit);
+        Ok(Self::Edit {
+            edit,
+            selection,
+            blob,
+            blob_length,
+        })
+    }
+}
+
 /// `netsim reload [file=<name>] | getnumqs | getnumipv4redirs |
 /// insertq in|out [index=<n>] cfg=<hex> | removeq [in] [out] [index=<n>] |
 /// modifyq in|out index=<n> cfg=<hex> | getqstats in|out index=<n> |
 /// getq in|out index=<n> | insertipv4redir [index=<n>] cfg=<hex> |
 /// removeipv4redir [index=<n>]`.
 pub(super) fn netsim(invocation: &mut Invocation<'_>) -> Hresult {
+    let request = Request::parse(invocation.line);
+    execute(invocation, request)
+}
+
+#[inline(never)]
+fn execute(invocation: &mut Invocation<'_>, request: Result<Request, Hresult>) -> Hresult {
     if super::Backend::system_version(invocation.backend) < NETSIM_VERSION {
         return Hresult::from_error_code(ErrorCode::UNKNOWN_COMMAND);
     }
-    let line = invocation.line;
-    if line.has("reload") {
-        let mut file = [0u8; FILE_PARAMETER_CAPACITY];
-        let name = match line.param("file") {
-            Some(value) => value.copy_into(&mut file).len(),
-            None => 0,
-        };
-        return reload(invocation, &file[..name]);
-    }
-    if line.has("getnumqs") {
-        return queue_counts_command(invocation);
-    }
-    if line.has("getnumipv4redirs") {
-        let count = redirect_count(invocation.backend);
-        invocation.set_text(format_args!("num={count}"));
-        return status::OK;
-    }
-
-    let selection = Selection {
-        inbound: line.has("in"),
-        outbound: line.has("out"),
-        index: line
-            .param("index")
-            .and_then(|value| value.dword())
-            .filter(|&index| index != u32::MAX),
-    };
-    let mut blob = [0u8; CONFIG_CAPACITY];
-    let blob_length = match line.param("cfg") {
-        Some(value) => {
-            let raw = value.raw();
-            let text = raw.strip_prefix(b"\"").unwrap_or(raw);
-            match decode_hex(text, &mut blob) {
-                Some(length) => length,
-                None => return Hresult::from_error_code(ErrorCode::UNKNOWN_COMMAND),
-            }
+    let (edit, selection, blob, blob_length) = match request {
+        Err(error) => return error,
+        Ok(Request::Reload { file, length }) => return reload(invocation, &file[..length]),
+        Ok(Request::QueueCounts) => return queue_counts_command(invocation),
+        Ok(Request::RedirectCount) => {
+            let count = redirect_count(invocation.backend);
+            invocation.set_text(format_args!("num={count}"));
+            return status::OK;
         }
-        None => 0,
+        Ok(Request::Edit {
+            edit,
+            selection,
+            blob,
+            blob_length,
+        }) => (edit, selection, blob, blob_length),
     };
     // An empty `cfg=` counts as missing.
     let blob = (blob_length != 0).then_some(&blob[..blob_length]);
     let persist = invocation.session.is_some();
-
-    if line.has("insertq") {
-        let (Some(direction), Some(blob)) = (selection.direction(), blob) else {
-            return status::INVALID;
-        };
-        insert_queue_command(
-            invocation,
-            direction,
-            selection.index.map(QueueIndex),
-            blob,
-            persist,
-        )
-    } else if line.has("removeq") {
-        let (inbound, outbound) = match selection.index {
-            None if !selection.inbound && !selection.outbound => (true, true),
-            None => (selection.inbound, selection.outbound),
-            Some(_) if selection.direction().is_none() => return status::INVALID,
-            Some(_) => (selection.inbound, selection.outbound),
-        };
-        remove_queues_command(
-            invocation,
-            inbound,
-            outbound,
-            selection.index.map(QueueIndex),
-            persist,
-        )
-    } else if line.has("modifyq") {
-        let (Some(direction), Some(index), Some(blob)) =
-            (selection.direction(), selection.index, blob)
-        else {
-            return status::INVALID;
-        };
-        modify_queue_command(invocation, direction, QueueIndex(index), blob, persist)
-    } else if line.has("getqstats") {
-        let (Some(direction), Some(index)) = (selection.direction(), selection.index) else {
-            return status::INVALID;
-        };
-        queue_stats_command(invocation, direction, QueueIndex(index))
-    } else if line.has("getq") {
-        let (Some(direction), Some(index)) = (selection.direction(), selection.index) else {
-            return status::INVALID;
-        };
-        queue_config(invocation, direction, QueueIndex(index))
-    } else if line.has("insertipv4redir") {
-        let Some(blob) = blob else {
-            return status::INVALID;
-        };
-        insert_redirect_command(
-            invocation,
-            selection.index.map(RedirectIndex),
-            blob,
-            persist,
-        )
-    } else if line.has("removeipv4redir") {
-        remove_redirects_command(invocation, selection.index.map(RedirectIndex), persist)
-    } else {
-        status::INVALID
+    let Some(edit) = edit else {
+        return status::INVALID;
+    };
+    match edit {
+        Edit::InsertQueue => {
+            let (Some(direction), Some(blob)) = (selection.direction(), blob) else {
+                return status::INVALID;
+            };
+            insert_queue_command(
+                invocation,
+                direction,
+                selection.index.map(QueueIndex),
+                blob,
+                persist,
+            )
+        }
+        Edit::RemoveQueues => {
+            let (inbound, outbound) = match selection.index {
+                None if !selection.inbound && !selection.outbound => (true, true),
+                None => (selection.inbound, selection.outbound),
+                Some(_) if selection.direction().is_none() => return status::INVALID,
+                Some(_) => (selection.inbound, selection.outbound),
+            };
+            remove_queues_command(
+                invocation,
+                inbound,
+                outbound,
+                selection.index.map(QueueIndex),
+                persist,
+            )
+        }
+        Edit::ModifyQueue => {
+            let (Some(direction), Some(index), Some(blob)) =
+                (selection.direction(), selection.index, blob)
+            else {
+                return status::INVALID;
+            };
+            modify_queue_command(invocation, direction, QueueIndex(index), blob, persist)
+        }
+        Edit::QueueStats | Edit::Queue => {
+            let (Some(direction), Some(index)) = (selection.direction(), selection.index) else {
+                return status::INVALID;
+            };
+            if matches!(edit, Edit::QueueStats) {
+                queue_stats_command(invocation, direction, QueueIndex(index))
+            } else {
+                queue_config(invocation, direction, QueueIndex(index))
+            }
+        }
+        Edit::InsertRedirect => {
+            let Some(blob) = blob else {
+                return status::INVALID;
+            };
+            insert_redirect_command(
+                invocation,
+                selection.index.map(RedirectIndex),
+                blob,
+                persist,
+            )
+        }
+        Edit::RemoveRedirects => {
+            remove_redirects_command(invocation, selection.index.map(RedirectIndex), persist)
+        }
     }
 }
 
@@ -823,8 +910,9 @@ pub fn insert_queue(
     persist: bool,
 ) -> Result<QueueIndex, Hresult> {
     let created = ensure_simulator(backend)?;
-    let inserted = parse_insert_blob(blob).and_then(|(kind, update, program)| {
-        backend.insert_queue(direction, position, kind, &update, program.as_ref())
+    let mut slot = Program::EMPTY;
+    let inserted = parse_insert_blob(blob, &mut slot).and_then(|(kind, update, program)| {
+        backend.insert_queue(direction, position, kind, &update, program)
     });
     match inserted {
         Ok(index) => {
@@ -1056,13 +1144,14 @@ pub fn insert_redirect(
     persist: bool,
 ) -> Result<RedirectIndex, Hresult> {
     let created = ensure_simulator(backend)?;
+    let mut slot = Program::EMPTY;
     let inserted =
         RedirectConfig::parse(blob)
             .map_err(Hresult::from)
             .and_then(|(redirect, program)| {
-                let program = parse_program(program)?;
+                let program = parse_program(program, &mut slot)?;
                 redirect.validate()?;
-                backend.insert_redirect(position, &redirect, program.as_ref())
+                backend.insert_redirect(position, &redirect, program)
             });
     match inserted {
         Ok(index) => {
@@ -1163,10 +1252,11 @@ fn reload(invocation: &mut Invocation<'_>, name: &[u8]) -> Hresult {
     }
     invocation.state.network.netsim.reloading = true;
     let result = run_reload(invocation, name);
-    let file = invocation.state.network.netsim.file;
     invocation.text.clear();
     let _ = invocation.text.write_str("file=\"");
-    let _ = invocation.text.push_bytes(file.as_bytes());
+    let _ = invocation
+        .text
+        .push_bytes(invocation.state.network.netsim.file.as_bytes());
     let _ = invocation.text.write_str("\"");
     invocation.state.network.netsim.reloading = false;
     result
@@ -1192,7 +1282,7 @@ fn run_reload(invocation: &mut Invocation<'_>, name: &[u8]) -> Hresult {
     {
         return error;
     }
-    let file = invocation.state.network.netsim.file;
+    let file = &invocation.state.network.netsim.file;
     let request = CreateRequest {
         access: FileAccess::GENERIC_READ,
         allocation_size: None,
@@ -1212,7 +1302,10 @@ fn run_reload(invocation: &mut Invocation<'_>, name: &[u8]) -> Hresult {
             // Stock rewrites before closing the reader, whose handle shares
             // nothing.
             if failed {
-                write_file(file.as_bytes(), invocation.backend);
+                write_file(
+                    invocation.state.network.netsim.file.as_bytes(),
+                    invocation.backend,
+                );
             }
             status::OK
         }
@@ -1227,7 +1320,6 @@ fn run_reload(invocation: &mut Invocation<'_>, name: &[u8]) -> Hresult {
 /// and text that fills the buffer or ends the file without a terminator
 /// loses its last byte. Returns whether a line failed.
 fn execute_file(invocation: &mut Invocation<'_>, handle: FileHandle, buffer: PoolBuffer) -> bool {
-    let mut line = [0u8; FILE_BUFFER_SIZE];
     let mut failed = false;
     let mut count = 0usize;
     loop {
@@ -1237,8 +1329,7 @@ fn execute_file(invocation: &mut Invocation<'_>, handle: FileHandle, buffer: Poo
             while position < count {
                 let byte = invocation.backend.pool(buffer)[position];
                 if matches!(byte, b'\n' | b'\r') {
-                    let length = copy_line(invocation, buffer, start..position, &mut line);
-                    failed |= execute_line(invocation, &line[..length]);
+                    failed |= execute_line(invocation, buffer, start..position);
                     start = position + 1;
                 }
                 position += 1;
@@ -1251,8 +1342,7 @@ fn execute_file(invocation: &mut Invocation<'_>, handle: FileHandle, buffer: Poo
                 invocation.backend.pool(buffer).copy_within(start..count, 0);
                 count -= start;
             } else {
-                let length = copy_line(invocation, buffer, 0..count - 1, &mut line);
-                failed |= execute_line(invocation, &line[..length]);
+                failed |= execute_line(invocation, buffer, 0..count - 1);
                 count = 0;
             }
         }
@@ -1270,49 +1360,49 @@ fn execute_file(invocation: &mut Invocation<'_>, handle: FileHandle, buffer: Poo
     }
 }
 
-fn copy_line(
+/// A file line the reader executes. One value lives briefly on the stack;
+/// there is no allocator to box the larger variant.
+#[allow(clippy::large_enum_variant)]
+enum FileLine {
+    Netsim(Result<Request, Hresult>),
+    LinkState(Result<Option<super::LinkFlags>, Hresult>),
+}
+
+/// Run a `netsim` or `linkstate` line of the reader's buffer without a
+/// connection; other lines are ignored. Returns whether it failed.
+fn execute_line(
     invocation: &mut Invocation<'_>,
     buffer: PoolBuffer,
     range: core::ops::Range<usize>,
-    line: &mut [u8; FILE_BUFFER_SIZE],
-) -> usize {
-    let length = range.len();
-    line[..length].copy_from_slice(&invocation.backend.pool(buffer)[range]);
-    length
-}
-
-/// Run a `netsim` or `linkstate` line without a connection; other lines are
-/// ignored. Returns whether it failed.
-fn execute_line(invocation: &mut Invocation<'_>, bytes: &[u8]) -> bool {
-    console::trace_text(
+) -> bool {
+    trace_line(
         invocation.state.console.trace_mask,
         invocation.backend,
-        TraceMask::SETTINGS,
-        |message| {
-            let _ = message.write_str("XBDM: NetSimReadIniLine '");
-            let _ = message.push_bytes(console::c_string(bytes));
-            let _ = message.write_str("'\n");
-        },
+        buffer,
+        range.clone(),
     );
-    let line = CommandLine::new(bytes);
-    let handler: fn(&mut Invocation<'_>) -> Hresult = if line.is_command("netsim") {
-        netsim
+    let line = CommandLine::new(&invocation.backend.pool(buffer)[range]);
+    let request = if line.is_command("netsim") {
+        FileLine::Netsim(Request::parse(line))
     } else if line.is_command("linkstate") {
-        super::link_state
+        FileLine::LinkState(super::parse_link_state(line))
     } else {
         return false;
     };
     let mut text = ResponseText::new();
     let mut nested = Invocation {
-        line,
-        buffer: bytes,
+        line: CommandLine::new(&[]),
+        buffer: &[],
         text: &mut text,
         session: None,
         state: &mut *invocation.state,
         backend: &mut *invocation.backend,
         network: &mut *invocation.network,
     };
-    let result = handler(&mut nested);
+    let result = match request {
+        FileLine::Netsim(request) => execute(&mut nested, request),
+        FileLine::LinkState(flags) => super::execute_link_state(&mut nested, flags),
+    };
     if result.is_failure() {
         console::trace(
             invocation.state,
@@ -1325,6 +1415,23 @@ fn execute_line(invocation: &mut Invocation<'_>, bytes: &[u8]) -> bool {
         );
     }
     result.is_failure()
+}
+
+#[inline(never)]
+fn trace_line(
+    mask: TraceMask,
+    backend: &mut dyn AnyBackend,
+    buffer: PoolBuffer,
+    range: core::ops::Range<usize>,
+) {
+    if !mask.contains(TraceMask::SETTINGS) {
+        return;
+    }
+    let mut message = console::MessageText::new();
+    let _ = message.write_str("XBDM: NetSimReadIniLine '");
+    let _ = message.push_bytes(console::c_string(&backend.pool(buffer)[range]));
+    let _ = message.write_str("'\n");
+    backend.debug_print(message.as_bytes());
 }
 
 /// Buffered writer over a pool block (0x91f319c8 and 0x91f31860).

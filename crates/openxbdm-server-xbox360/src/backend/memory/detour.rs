@@ -14,12 +14,19 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
 use openxbdm_core::status::NtStatus;
+use openxbdm_server::commands::filesystem::CreateDisposition;
+use openxbdm_server::commands::filesystem::CreateOptions;
+use openxbdm_server::commands::filesystem::CreateRequest;
+use openxbdm_server::commands::filesystem::FileAccess;
+use openxbdm_server::commands::filesystem::FileAttributes;
+use openxbdm_server::commands::filesystem::ShareAccess;
 use openxbdm_server::commands::memory::detour;
 use openxbdm_server::commands::memory::detour::BLOCK_SIZE;
 use openxbdm_server::commands::memory::detour::CallContext;
 use openxbdm_server::commands::memory::detour::Engine;
 use openxbdm_server::commands::memory::detour::RECORD_SIZE;
 
+use crate::backend::filesystem::create_file;
 use crate::kernel;
 use crate::kernel::AnsiString;
 use crate::kernel::CriticalSection;
@@ -235,11 +242,6 @@ const WORKER_FLAGS: u32 = 0x0400_02a6;
 const OBJ_CASE_INSENSITIVE: u32 = 0x40;
 const GENERIC_WRITE: u32 = 0x4000_0000;
 const GENERIC_READ_SYNCHRONIZE: u32 = 0x8010_0000;
-const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
-const FILE_SHARE_ALL: u32 = 7;
-const FILE_OPEN: u32 = 1;
-const FILE_OVERWRITE_IF: u32 = 5;
-const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
 const WAIT_ANY: u32 = 1;
 /// Bytes of an object path the log name translates to.
 const LOG_PATH_CAPACITY: usize = 0x141;
@@ -478,14 +480,14 @@ pub(super) fn with_engine(operation: &mut dyn FnMut(&Engine, &dyn detour::Platfo
 
 /// Create the writer and completion workers (0x91f2d378).
 pub(super) fn start(log: Option<&[u8]>) -> NtStatus {
-    let path = log.map(|log| {
-        let mut bytes = [0u8; LOG_PATH_CAPACITY];
-        let length = log.len().min(LOG_PATH_CAPACITY);
-        bytes[..length].copy_from_slice(&log[..length]);
-        (bytes, length)
-    });
     // SAFETY: no writer runs while the engine is starting.
-    unsafe { *LOG_PATH.0.get() = path };
+    let stored = unsafe { &mut *LOG_PATH.0.get() };
+    *stored = None;
+    if let Some(log) = log {
+        let length = log.len().min(LOG_PATH_CAPACITY);
+        let (bytes, _) = stored.insert(([0; LOG_PATH_CAPACITY], length));
+        bytes[..length].copy_from_slice(&log[..length]);
+    }
     kernel::KeResetEvent(WRITER_DONE.pointer());
     let mut writer = 0u32;
     let status = kernel::ExCreateThread(
@@ -565,51 +567,38 @@ pub(super) fn read_record(output: &mut [u8; RECORD_SIZE]) -> bool {
     true
 }
 
-fn open(path: &[u8], access: u32, disposition: u32) -> Result<u32, u32> {
-    let name = AnsiString::new(path);
-    let attributes = ObjectAttributes {
-        root_directory: 0,
-        object_name: &name,
-        attributes: OBJ_CASE_INSENSITIVE,
-    };
-    let mut handle = 0u32;
-    let mut io = IoStatusBlock::default();
-    let status = kernel::NtCreateFile(
-        &mut handle,
-        access,
-        &attributes,
-        &mut io,
-        core::ptr::null(),
-        FILE_ATTRIBUTE_NORMAL,
-        FILE_SHARE_ALL,
+/// Create request of the log with `access` and `disposition`.
+const fn log_request(access: u32, disposition: CreateDisposition) -> CreateRequest {
+    CreateRequest {
+        access: FileAccess(access),
+        allocation_size: None,
+        attributes: FileAttributes::NORMAL,
+        share: ShareAccess::ALL,
         disposition,
-        FILE_SYNCHRONOUS_IO_NONALERT,
-    );
-    if (status as i32) < 0 {
-        Err(status)
-    } else {
-        Ok(handle)
+        options: CreateOptions::SYNCHRONOUS_IO_NONALERT,
     }
 }
 
 /// Create the log for writing and open it again for reading
 /// (0x91f2cb28); the status of the last open.
 fn open_log() -> u32 {
+    const WRITE: CreateRequest = log_request(GENERIC_WRITE, CreateDisposition::OverwriteIf);
+    const READ: CreateRequest = log_request(GENERIC_READ_SYNCHRONIZE, CreateDisposition::Open);
     // SAFETY: the server thread wrote the path before creating this thread.
-    let Some((bytes, length)) = (unsafe { *LOG_PATH.0.get() }) else {
+    let Some((bytes, length)) = (unsafe { &*LOG_PATH.0.get() }) else {
         return STATUS_NO_SUCH_FILE;
     };
-    let path = &bytes[..length];
-    match open(path, GENERIC_WRITE, FILE_OVERWRITE_IF) {
-        Ok(handle) => WRITE_HANDLE.set(handle),
-        Err(status) => return status,
+    let path = &bytes[..*length];
+    match create_file(path, &WRITE) {
+        Ok(handle) => WRITE_HANDLE.set(handle.0),
+        Err(status) => return status.0,
     }
-    match open(path, GENERIC_READ_SYNCHRONIZE, FILE_OPEN) {
+    match create_file(path, &READ) {
         Ok(handle) => {
-            READ_HANDLE.set(handle);
+            READ_HANDLE.set(handle.0);
             0
         }
-        Err(status) => status,
+        Err(status) => status.0,
     }
 }
 

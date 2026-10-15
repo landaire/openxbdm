@@ -969,6 +969,22 @@ impl filesystem::Backend for MockBackend {
             .expect("allocated pool block")
     }
 
+    fn allocate_scratch(&mut self, size: u32) -> Option<&'static mut [u8]> {
+        if self.filesystem.pool_exhausted || size > POOL_LIMIT {
+            return None;
+        }
+        let block = Box::into_raw(vec![0; size as usize].into_boxed_slice());
+        // SAFETY: the caller owns the block until `free_scratch` rebuilds
+        // the box from it.
+        Some(unsafe { &mut *block })
+    }
+
+    fn free_scratch(&mut self, block: &'static mut [u8]) {
+        // SAFETY: `allocate_scratch` released this box and the caller gave
+        // up its only reference.
+        drop(unsafe { Box::from_raw(block as *mut [u8]) });
+    }
+
     fn open_close_tray(&mut self, value: u32) {
         self.filesystem.tray.push(value);
     }

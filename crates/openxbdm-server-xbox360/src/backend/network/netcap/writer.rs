@@ -52,49 +52,40 @@ fn failed(status: u32) -> bool {
 /// Positional access to the open capture file.
 struct FileIo(u32);
 
-impl CaptureIo for FileIo {
-    fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> Result<(), Hresult> {
+impl FileIo {
+    /// `NtReadFile` or `NtWriteFile` of exactly `length` bytes.
+    #[inline(never)]
+    fn transfer(
+        &mut self,
+        write: bool,
+        offset: u64,
+        buffer: *mut u8,
+        length: u32,
+    ) -> Result<(), Hresult> {
         let mut io = IoStatusBlock::default();
-        let status = kernel::NtReadFile(
-            self.0,
-            0,
-            0,
-            0,
-            &mut io,
-            buffer.as_mut_ptr(),
-            buffer.len() as u32,
-            &offset,
-        );
+        let status = if write {
+            kernel::NtWriteFile(self.0, 0, 0, 0, &mut io, buffer, length, &offset)
+        } else {
+            kernel::NtReadFile(self.0, 0, 0, 0, &mut io, buffer, length, &offset)
+        };
         if failed(status) {
             return Err(nt_failure(status));
         }
-        if io.information != buffer.len() as u32 {
+        if io.information != length {
             Err(capture_file::BAD_LENGTH)
         } else {
             Ok(())
         }
     }
+}
+
+impl CaptureIo for FileIo {
+    fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> Result<(), Hresult> {
+        self.transfer(false, offset, buffer.as_mut_ptr(), buffer.len() as u32)
+    }
 
     fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), Hresult> {
-        let mut io = IoStatusBlock::default();
-        let status = kernel::NtWriteFile(
-            self.0,
-            0,
-            0,
-            0,
-            &mut io,
-            data.as_ptr(),
-            data.len() as u32,
-            &offset,
-        );
-        if failed(status) {
-            return Err(nt_failure(status));
-        }
-        if io.information != data.len() as u32 {
-            Err(capture_file::BAD_LENGTH)
-        } else {
-            Ok(())
-        }
+        self.transfer(true, offset, data.as_ptr().cast_mut(), data.len() as u32)
     }
 
     fn truncate(&mut self, length: u64) -> Result<(), Hresult> {

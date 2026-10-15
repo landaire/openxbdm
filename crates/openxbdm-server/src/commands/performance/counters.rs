@@ -80,6 +80,14 @@ pub struct CounterSample {
     pub sample_type: u32,
 }
 
+impl CounterSample {
+    pub const ZERO: Self = Self {
+        value: 0,
+        rate: 0,
+        sample_type: 0,
+    };
+}
+
 /// Access to one counter object and its source.
 pub trait CounterObject {
     /// Big-endian read at a signed offset from the object start.

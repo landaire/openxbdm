@@ -79,36 +79,39 @@ pub(crate) fn post(status: Status, argument: u32) {
     send(status, argument);
 }
 
+/// Text of each status by code: NUL-terminated, or for `VideoOp`,
+/// `VideoOpError` and `Resource` the prefix of the argument text. `Text`
+/// sends the argument itself.
+const TEXTS: [&[u8]; 16] = [
+    b"PIX!CounterDataAvailable\0",
+    b"PIX!StreamEngineOutOfMemory\0",
+    b"PIX!Timing\0",
+    b"PIX!NO\0",
+    b"PIX!BadD3dVersion\0",
+    b"PIX!Gpu\0",
+    b"PIX!NoFrame\0",
+    b"PIX!Trace\0",
+    b"PIX!Pause\0",
+    b"",
+    b"PIX!NoHarddrive\0",
+    b"PIX!VideoOp ",
+    b"PIX!VideoOpError ",
+    b"PIX!MovieData\0",
+    b"PIX!Resource ",
+    b"PIX!Reboot\0",
+];
+
 /// Format and send the text of `status` (stock 0x91f63dd8).
 fn send(status: Status, argument: u32) {
-    let fixed: &[u8] = match status {
-        Status::CounterDataAvailable => b"PIX!CounterDataAvailable\0",
-        Status::StreamEngineOutOfMemory => b"PIX!StreamEngineOutOfMemory\0",
-        Status::Timing => b"PIX!Timing\0",
-        Status::No => b"PIX!NO\0",
-        Status::BadD3dVersion => b"PIX!BadD3dVersion\0",
-        Status::Gpu => b"PIX!Gpu\0",
-        Status::NoFrame => b"PIX!NoFrame\0",
-        Status::Trace => b"PIX!Trace\0",
-        Status::Pause => b"PIX!Pause\0",
-        Status::NoHarddrive => b"PIX!NoHarddrive\0",
-        Status::MovieData => b"PIX!MovieData\0",
-        Status::Reboot => b"PIX!Reboot\0",
-        Status::Text => {
-            session::service_send_notification(argument);
-            return;
-        }
+    let fixed = TEXTS[status as usize];
+    let text = match status {
+        Status::Text => argument,
         Status::VideoOp | Status::VideoOpError | Status::Resource => {
-            let prefix: &[u8] = match status {
-                Status::VideoOp => b"PIX!VideoOp ",
-                Status::VideoOpError => b"PIX!VideoOpError ",
-                _ => b"PIX!Resource ",
-            };
             // Stock formats into a 0x90-byte stack buffer; longer
             // arguments overflow it, here they are cut.
             let mut text = [0u8; 0x90];
-            text[..prefix.len()].copy_from_slice(prefix);
-            let mut length = prefix.len();
+            text[..fixed.len()].copy_from_slice(fixed);
+            let mut length = fixed.len();
             let mut address = argument;
             while address != 0 && length < text.len() - 1 {
                 let byte = super::read_u8(address);
@@ -122,8 +125,9 @@ fn send(status: Status, argument: u32) {
             session::service_send_notification(text.as_ptr() as usize as u32);
             return;
         }
+        _ => fixed.as_ptr() as usize as u32,
     };
-    session::service_send_notification(fixed.as_ptr() as usize as u32);
+    session::service_send_notification(text);
 }
 
 /// Monitor control code 0x1b (stock 0x91f3b6b0): post status 9 with the

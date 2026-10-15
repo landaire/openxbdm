@@ -24,10 +24,8 @@ use openxbdm_server::text::Text;
 
 use super::Console;
 use crate::kernel;
-use crate::kernel::AnsiString;
 use crate::kernel::IoStatusBlock;
 use crate::kernel::LIB_KERNEL;
-use crate::kernel::ObjectAttributes;
 use crate::kernel::import_thunk;
 use crate::kernel::import_variable;
 
@@ -83,8 +81,6 @@ const CODEVIEW_RSDS: u32 = u32::from_be_bytes(*b"RSDS");
 
 const FLASH_DEVICE: &[u8] = b"\\Device\\Flash";
 const FLASH_ACCESS: u32 = 0xc010_0000;
-const FILE_OPEN: u32 = 1;
-const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
 const IOCTL_FLASH_GEOMETRY: u32 = 0x3c_0028;
 const MEM_COMMIT_RESERVE: u32 = 0x3000;
 const MEM_RELEASE: u32 = 0x8000;
@@ -212,6 +208,32 @@ fn nt_header(entry: u32) -> Option<u32> {
         return None;
     }
     Some(RtlImageNtHeader(base)).filter(|&header| header != 0)
+}
+
+/// Address of the section table after the NT header `header`.
+fn section_table(header: u32) -> u32 {
+    header + 0x18 + u32::from(read_le16(header + 0x14))
+}
+
+/// The section header at `section` of the module loaded at `base`
+/// (also the export 52 record, 0x91f33b88).
+#[inline(never)]
+fn section_info(section: u32, base: u32) -> SectionInfo {
+    let mut name = [0u8; memory::SECTION_NAME_LENGTH];
+    for (offset, byte) in name.iter_mut().enumerate() {
+        // SAFETY: section headers are part of the mapped image header.
+        *byte = unsafe { core::ptr::read_volatile((section as usize + offset) as *const u8) };
+    }
+    // Stock copies the name with strncpy: bytes after a NUL are zero.
+    if let Some(end) = name.iter().position(|&byte| byte == 0) {
+        name[end..].fill(0);
+    }
+    SectionInfo {
+        name,
+        address: read_le32(section + 0xc).wrapping_add(base),
+        size: read_le32(section + 8),
+        characteristics: read_le32(section + 0x24),
+    }
 }
 
 /// Format a tracking diagnostic and report it as stock does: an assertion
@@ -542,30 +564,12 @@ pub(crate) fn service_adjust_memory_statistics(argument: u32) -> u32 {
 
 /// Open the raw flash device.
 fn open_flash() -> Result<u32, NtStatus> {
-    let name = AnsiString::new(FLASH_DEVICE);
-    let attributes = ObjectAttributes {
-        root_directory: 0,
-        object_name: &name,
-        attributes: kernel::OBJ_CASE_INSENSITIVE,
-    };
-    let mut handle = 0u32;
-    let mut io_status = IoStatusBlock::default();
-    let status = kernel::NtCreateFile(
-        &mut handle,
-        FLASH_ACCESS,
-        &attributes,
-        &mut io_status,
-        core::ptr::null(),
-        0,
-        0,
-        FILE_OPEN,
-        FILE_SYNCHRONOUS_IO_NONALERT,
+    const REQUEST: filesystem::CreateRequest = filesystem::CreateRequest::open(
+        filesystem::FileAccess(FLASH_ACCESS),
+        filesystem::ShareAccess::NONE,
+        filesystem::CreateOptions::SYNCHRONOUS_IO_NONALERT,
     );
-    if (status as i32) < 0 {
-        Err(NtStatus(status))
-    } else {
-        Ok(handle)
-    }
+    super::filesystem::create_file(FLASH_DEVICE, &REQUEST).map(|handle| handle.0)
 }
 
 fn status_result(status: u32) -> Result<(), NtStatus> {
@@ -580,20 +584,17 @@ fn status_result(status: u32) -> Result<(), NtStatus> {
 /// partial blocks are read, patched, and written back (stock 0x91f72c78).
 fn write_flash_blocks(handle: u32, mut offset: u32, mut data: &[u8]) -> Result<(), NtStatus> {
     let mut io_status = IoStatusBlock::default();
-    let mut geometry = [0u32; 5];
-    status_result(kernel::NtDeviceIoControlFile(
-        handle,
-        0,
-        0,
-        0,
-        &mut io_status,
-        IOCTL_FLASH_GEOMETRY,
-        core::ptr::null(),
-        0,
-        geometry.as_mut_ptr().cast(),
-        core::mem::size_of_val(&geometry) as u32,
-    ))?;
-    let block = geometry[2].wrapping_mul(geometry[0]);
+    let mut geometry = [0u8; 0x14];
+    super::filesystem::device_control(handle, IOCTL_FLASH_GEOMETRY, &mut geometry)?;
+    let word = |index: usize| {
+        u32::from_ne_bytes([
+            geometry[index * 4],
+            geometry[index * 4 + 1],
+            geometry[index * 4 + 2],
+            geometry[index * 4 + 3],
+        ])
+    };
+    let block = word(2).wrapping_mul(word(0));
     let mut bounce = 0u32;
     let mut bounce_size = block;
     let mut result = Ok(());
@@ -826,23 +827,8 @@ impl memory::Backend for Console {
         if index.0 == 0 || index.0 > count {
             return Ok(None);
         }
-        let sections = header + 0x18 + u32::from(read_le16(header + 0x14));
-        let section = sections + u32::from(index.0 - 1) * SECTION_HEADER_SIZE;
-        let mut name = [0u8; memory::SECTION_NAME_LENGTH];
-        for (offset, byte) in name.iter_mut().enumerate() {
-            // SAFETY: section headers are part of the mapped image header.
-            *byte = unsafe { core::ptr::read_volatile((section as usize + offset) as *const u8) };
-        }
-        // Stock copies the name with strncpy: bytes after a NUL are zero.
-        if let Some(end) = name.iter().position(|&byte| byte == 0) {
-            name[end..].fill(0);
-        }
-        Ok(Some(SectionInfo {
-            name,
-            address: read_le32(section + 0xc).wrapping_add(base),
-            size: read_le32(section + 8),
-            characteristics: read_le32(section + 0x24),
-        }))
+        let section = section_table(header) + u32::from(index.0 - 1) * SECTION_HEADER_SIZE;
+        Ok(Some(section_info(section, base)))
     }
 
     fn code_view(&mut self, base: u32) -> Option<CodeView> {

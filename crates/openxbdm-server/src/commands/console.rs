@@ -246,7 +246,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
 ];
 
 /// Console debug name: at most 20 bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DebugName {
     bytes: [u8; DEBUG_NAME_CAPACITY - 1],
     len: u8,
@@ -260,7 +260,7 @@ impl DebugName {
 
     /// The name, truncated to 20 bytes.
     pub fn new(name: &[u8]) -> Self {
-        let mut stored = Self::default();
+        let mut stored = Self::EMPTY;
         let length = name.len().min(stored.bytes.len());
         stored.bytes[..length].copy_from_slice(&name[..length]);
         stored.len = length as u8;
@@ -450,17 +450,15 @@ pub struct DumpSettings {
     path_len: u16,
 }
 
-impl Default for DumpSettings {
-    fn default() -> Self {
+impl DumpSettings {
+    pub const fn new() -> Self {
         Self {
             flags: 0,
             path: [0; DUMP_SETTINGS_PATH_SIZE],
             path_len: 0,
         }
     }
-}
 
-impl DumpSettings {
     /// The dump directory; empty when unset.
     pub fn path(&self) -> &[u8] {
         &self.path[..usize::from(self.path_len)]
@@ -496,7 +494,7 @@ impl DumpSettings {
     pub fn from_block(block: &[u8; DUMP_SETTINGS_SIZE]) -> Self {
         let mut settings = Self {
             flags: u32::from_be_bytes([block[0], block[1], block[2], block[3]]),
-            ..Self::default()
+            ..Self::new()
         };
         let path = &block[4..];
         settings.set_path(
@@ -545,13 +543,9 @@ impl EventDeferMask {
             .filter(move |(bit, _)| self.0 & (1 << bit) != 0)
             .map(|(_, name)| *name)
     }
-}
 
-impl Default for EventDeferMask {
     /// break, debugstring, singlestep, databreak.
-    fn default() -> Self {
-        Self(0x27)
-    }
+    pub const DEFAULT: Self = Self(0x27);
 }
 
 /// State of the HTTP registration with a lab server (stock 0x91f9f638).
@@ -583,13 +577,11 @@ pub struct RegistrationCheck {
     pub tick: u32,
 }
 
-impl Default for RegistrationCheck {
-    fn default() -> Self {
-        Self {
-            address: [0; NETWORK_ADDRESS_SIZE],
-            tick: 0,
-        }
-    }
+impl RegistrationCheck {
+    pub const EMPTY: Self = Self {
+        address: [0; NETWORK_ADDRESS_SIZE],
+        tick: 0,
+    };
 }
 
 /// Lab server registration set by `httpreg`.
@@ -605,12 +597,6 @@ pub struct HttpRegistration {
     pub transaction: u64,
     response: [u8; REGISTRATION_RESPONSE_CAPACITY],
     response_len: u16,
-}
-
-impl Default for HttpRegistration {
-    fn default() -> Self {
-        Self::EMPTY
-    }
 }
 
 impl HttpRegistration {
@@ -639,6 +625,30 @@ impl HttpRegistration {
         &self.response[..usize::from(self.response_len)]
     }
 
+    /// The part export 194 reads.
+    pub const fn result(&self) -> RegistrationResult {
+        RegistrationResult {
+            state: self.state,
+            transaction: self.transaction,
+            response: self.response,
+            response_len: self.response_len,
+        }
+    }
+}
+
+/// State, transaction, and response of a registration, as export 194
+/// reports them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegistrationResult {
+    pub state: RegistrationState,
+    pub transaction: u64,
+    response: [u8; REGISTRATION_RESPONSE_CAPACITY],
+    response_len: u16,
+}
+
+impl RegistrationResult {
+    pub const EMPTY: Self = HttpRegistration::EMPTY.result();
+
     /// Export 194 (stock 0x91f30b48) after its argument checks: copy the
     /// response of a registered console into `output`, the caller's buffer
     /// (`None` without a size pointer).
@@ -657,7 +667,7 @@ impl HttpRegistration {
             RegistrationState::Rejected => none(Hresult::error(0x10a)),
             RegistrationState::ResponseTooLarge => none(Hresult::error(0xf)),
             RegistrationState::Registered => {
-                let response = self.response();
+                let response = &self.response[..usize::from(self.response_len)];
                 let result = match output {
                     Some(output) if output.len() >= response.len() => {
                         output[..response.len()].copy_from_slice(response);
@@ -686,7 +696,7 @@ pub struct RegistrationResponse {
 }
 
 /// Global state of this domain.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct State {
     /// Loaded at startup only from the settings file.
     pub debug_name: DebugName,
@@ -697,6 +707,20 @@ pub struct State {
     pub http_registration: HttpRegistration,
     /// Kept across `httpreg` commands, as stock 0x91fae2e0 and 0x91f9f64c.
     pub registration_check: RegistrationCheck,
+}
+
+impl State {
+    pub const fn new() -> Self {
+        Self {
+            debug_name: DebugName::EMPTY,
+            trace_mask: TraceMask(0),
+            dump_mode: DumpMode::Smart,
+            dump_settings: DumpSettings::new(),
+            event_defer: EventDeferMask::DEFAULT,
+            http_registration: HttpRegistration::EMPTY,
+            registration_check: RegistrationCheck::EMPTY,
+        }
+    }
 }
 
 /// Lines of the `systeminfo` reply.
@@ -1726,7 +1750,7 @@ fn http_registration(invocation: &mut Invocation<'_>) -> Hresult {
         invocation.backend.http_close();
     }
     let registration = &mut invocation.state.console.http_registration;
-    *registration = HttpRegistration::default();
+    *registration = HttpRegistration::EMPTY;
     let result = if invocation.line.has("clear") {
         registration.state = RegistrationState::Cleared;
         Hresult::OK
@@ -2411,7 +2435,7 @@ mod tests {
 
     #[test]
     fn registration_response_follows_the_state() {
-        let mut registration = HttpRegistration::EMPTY;
+        let mut registration = RegistrationResult::EMPTY;
         let failed = |code| RegistrationResponse {
             result: Hresult::error(code),
             transaction: 0,

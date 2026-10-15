@@ -348,7 +348,7 @@ fn extract(
                         walker.write(buffer, first, u32::MAX);
                         clear_slot(&mut first_record, kind);
                     }
-                } else if (6..=11).contains(&kind) {
+                } else if (6..12).contains(&kind) {
                     walker.write(buffer, first, u32::MAX);
                 }
             }
@@ -416,7 +416,7 @@ fn extract(
                 let wanted = if per_thread {
                     kind <= 5 || kind == 0xe
                 } else {
-                    (6..=11).contains(&kind)
+                    (6..12).contains(&kind)
                 };
                 if wanted {
                     let buffer = walker.read(unit, 2);

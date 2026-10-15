@@ -1762,10 +1762,8 @@ fn initialize_module(node: Node, name: &ModuleFileName, values: u32) {
     }
     write_units(node.at(node::MODULE_NAME), &name.units[..=name.length]);
     let mut path = [0u8; 0x104];
-    let mut units = [0u16; PATH_UNITS + 1];
-    units[..name.length].copy_from_slice(name.units());
     // A name longer than the buffer in UTF-8 keeps the bytes that fit.
-    let _ = pgo::encode_utf8(&units[..=name.length], &mut path[..0x103]);
+    let _ = pgo::encode_utf8(&name.units[..=name.length], &mut path[..0x103]);
     write32(node.at(node::ALLOCATION_SCALE), 1);
     write32(node.at(node::BLOCK), 0);
     write8(node.at(node::EXTENDED), 1);
@@ -1830,9 +1828,8 @@ extern "C" fn export_register(
     let error = kernel::last_error();
     SECTION.enter();
     let name = module_file_name(address);
-    let mut terminated = [0u16; PATH_UNITS + 1];
-    terminated[..name.length].copy_from_slice(name.units());
-    let node = match find_module(address, Some(&terminated[..])) {
+    // The units past the name are zero, so the slice is terminated.
+    let node = match find_module(address, Some(&name.units[..])) {
         Some(node) => {
             write8(node.at(node::DEAD), 0);
             connect_interface(node, values);

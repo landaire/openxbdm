@@ -257,23 +257,21 @@ struct Strings<'a> {
 }
 
 impl Program {
-    fn new() -> Self {
-        Self {
-            items: [Item {
-                field: FieldId(0),
-                value: Value::Null,
-                fixed: false,
-                tag: None,
-            }; ITEM_LIMIT],
-            item_count: 0,
-            nodes: [Node::Constant(Value::Null); NODE_LIMIT],
-            node_count: 0,
-            strings: [Span::default(); STRING_LIMIT],
-            string_count: 0,
-            text: [0; TEXT_CAPACITY],
-            text_len: 0,
-        }
-    }
+    pub const EMPTY: Self = Self {
+        items: [Item {
+            field: FieldId(0),
+            value: Value::Null,
+            fixed: false,
+            tag: None,
+        }; ITEM_LIMIT],
+        item_count: 0,
+        nodes: [Node::Constant(Value::Null); NODE_LIMIT],
+        node_count: 0,
+        strings: [Span { start: 0, len: 0 }; STRING_LIMIT],
+        string_count: 0,
+        text: [0; TEXT_CAPACITY],
+        text_len: 0,
+    };
 
     pub fn items(&self) -> &[Item] {
         &self.items[..usize::from(self.item_count)]
@@ -385,9 +383,10 @@ impl Program {
     }
 
     /// Parse and check a program (0x91f87a48 with the checks of 0x91f8bb08
-    /// and the stored copy of 0x91f871f8).
-    pub fn parse(blob: &[u8]) -> Result<Program, ProgramError> {
-        let mut program = Program::new();
+    /// and the stored copy of 0x91f871f8) into `program`, which the caller
+    /// provides so that one copy exists.
+    pub fn parse(blob: &[u8], program: &mut Program) -> Result<(), ProgramError> {
+        *program = Program::EMPTY;
         let mut input = Input {
             bytes: blob,
             little_endian: false,
@@ -424,14 +423,10 @@ impl Program {
         {
             return Err(ProgramError::Invalid);
         }
-        let mut items = [Item {
-            field: FieldId(0),
-            value: Value::Null,
-            fixed: false,
-            tag: None,
-        }; PARSE_ITEM_LIMIT as usize];
+        // Entries past the stored limits are parsed and checked but not
+        // kept; only the kind of each node is needed for the checks.
         let mut parsed_items = 0usize;
-        let mut nodes = [Node::Constant(Value::Null); PARSE_NODE_LIMIT as usize];
+        let mut kinds = [NodeKind::Other; PARSE_NODE_LIMIT as usize];
 
         for _ in 0..item_count {
             let kind = input.byte()?;
@@ -456,12 +451,14 @@ impl Program {
                 return Err(ProgramError::Invalid);
             }
             let value = program.read_value(kind, &mut input, &strings)?;
-            items[parsed_items] = Item {
-                field: FieldId(field as u8),
-                value,
-                fixed: item_flags & 4 != 0,
-                tag: tag.filter(|&tag| tag != u64::MAX),
-            };
+            if let Some(slot) = program.items.get_mut(parsed_items) {
+                *slot = Item {
+                    field: FieldId(field as u8),
+                    value,
+                    fixed: item_flags & 4 != 0,
+                    tag: tag.filter(|&tag| tag != u64::MAX),
+                };
+            }
             parsed_items += 1;
         }
 
@@ -495,8 +492,8 @@ impl Program {
                             // The indexed operand must be a reference.
                             let first = depth
                                 .checked_sub(2)
-                                .map(|index| nodes[usize::from(stack[index])]);
-                            if !matches!(first, Some(Node::Name(_) | Node::Item(_))) {
+                                .map(|index| kinds[usize::from(stack[index])]);
+                            if first != Some(NodeKind::Reference) {
                                 return Err(ProgramError::Invalid);
                             }
                             2
@@ -529,7 +526,10 @@ impl Program {
                 return Err(ProgramError::Invalid);
             }
             depth -= operands;
-            nodes[parsed_nodes] = node;
+            kinds[parsed_nodes] = NodeKind::of(&node);
+            if let Some(slot) = program.nodes.get_mut(parsed_nodes) {
+                *slot = node;
+            }
             stack[depth] = parsed_nodes as u8;
             depth += 1;
             parsed_nodes += 1;
@@ -539,22 +539,39 @@ impl Program {
             return Err(ProgramError::Invalid);
         }
         // A constant result is refused by 0x91f8bb08.
-        if matches!(nodes[usize::from(stack[0])], Node::Constant(_)) {
+        if kinds[usize::from(stack[0])] == NodeKind::Constant {
             return Err(ProgramError::Invalid);
         }
         if parsed_items > ITEM_LIMIT || parsed_nodes > NODE_LIMIT {
             return Err(ProgramError::OutOfMemory);
         }
-        program.items[..parsed_items].copy_from_slice(&items[..parsed_items]);
         program.item_count = parsed_items as u8;
-        program.nodes[..parsed_nodes].copy_from_slice(&nodes[..parsed_nodes]);
         program.node_count = parsed_nodes as u8;
-        Ok(program)
+        Ok(())
     }
 
     /// Canonical form (0x91f87318). Returns the byte count.
     pub fn serialize(&self, output: &mut [u8]) -> Result<usize, SerializeError> {
         write_program(self.items(), self.nodes(), self, output)
+    }
+}
+
+/// What the parse checks need of a node.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NodeKind {
+    Constant,
+    /// A name or item reference.
+    Reference,
+    Other,
+}
+
+impl NodeKind {
+    fn of(node: &Node) -> Self {
+        match node {
+            Node::Constant(_) => Self::Constant,
+            Node::Name(_) | Node::Item(_) => Self::Reference,
+            Node::Operator { .. } => Self::Other,
+        }
     }
 }
 
@@ -755,7 +772,8 @@ mod tests {
 
     fn parse(text: &str) -> Result<Program, ProgramError> {
         let (input, length) = bytes(text);
-        Program::parse(&input[..length])
+        let mut program = Program::EMPTY;
+        Program::parse(&input[..length], &mut program).map(|()| program)
     }
 
     fn assert_canonical(input: &str, expected: &str) {
@@ -864,11 +882,12 @@ mod tests {
 
     #[test]
     fn stored_copy_limits() {
+        let mut program = Program::EMPTY;
         let (input, length) = chain(16, 1);
-        assert!(Program::parse(&input[..length]).is_ok());
+        assert!(Program::parse(&input[..length], &mut program).is_ok());
         let (input, length) = chain(17, 0);
         assert_eq!(
-            Program::parse(&input[..length]).map(|_| ()),
+            Program::parse(&input[..length], &mut program),
             Err(ProgramError::OutOfMemory)
         );
     }

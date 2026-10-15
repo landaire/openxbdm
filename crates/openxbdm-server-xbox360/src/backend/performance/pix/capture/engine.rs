@@ -12,11 +12,11 @@ use crate::kernel;
 use openxbdm_server::notify::ExecutionState;
 
 /// Processor control region fields of the capture buffers: cursor and
-/// limit of the first (types 0-5) and second (types 6-11) buffer, flags.
+/// limit of the first (types 0-5) and second (types 6-11) buffer, the
+/// four consecutive from `PCR_CURSOR`, and flags.
 pub(super) const PCR_CURSOR: u32 = 0x2b0;
 pub(super) const PCR_LIMIT: u32 = 0x2b4;
 const PCR_CURSOR2: u32 = 0x2b8;
-const PCR_LIMIT2: u32 = 0x2bc;
 const PCR_FLAGS: u32 = 0x2c0;
 pub(super) const PCR_PROCESSOR: u32 = 0x10c;
 /// Data bytes of a per-thread buffer the kernel and titles fill, and of
@@ -58,11 +58,13 @@ pub(super) fn start(s: S) {
             slot[3] = buffers::data(entry) + 4;
             slot[4] = buffers::data(entry) + THREAD_LIMIT2;
         }
-        for offset in [8, 0xc] {
-            let k = s.word(offset);
-            if k != super::OFF {
-                streams |= super::stream_bit(k);
-            }
+        let gpu = s.word(8);
+        if gpu != super::OFF {
+            streams |= super::stream_bit(gpu);
+        }
+        let audio = s.word(0xc);
+        if audio != super::OFF {
+            streams |= super::stream_bit(audio);
         }
     }
     crate::backend::debugger::KeIpiGenericCall(
@@ -139,11 +141,9 @@ extern "C" fn install(context: u32) -> u32 {
     super::interrupts_off();
     s.set_word(0x98 + processor * 4, pcr + PCR_CURSOR);
     s.set_word(0xb0 + processor * 4, pcr + PCR_CURSOR2);
-    for (index, field) in [PCR_CURSOR, PCR_LIMIT, PCR_CURSOR2, PCR_LIMIT2]
-        .into_iter()
-        .enumerate()
-    {
-        wr(pcr + field, rd(slot + 4 + index as u32 * 4));
+    // Cursor, limit, second cursor and second limit are consecutive.
+    for index in 0..4 {
+        wr(pcr + PCR_CURSOR + index * 4, rd(slot + 4 + index * 4));
     }
     wr(
         pcr + PCR_FLAGS,
@@ -161,7 +161,9 @@ extern "C" fn uninstall(context: u32) -> u32 {
     let s = S(rd(slot));
     let pcr = super::pcr();
     super::interrupts_off();
-    for (index, field) in [(processor, PCR_CURSOR), (processor + 6, PCR_CURSOR2)] {
+    for second in 0..2 {
+        let index = processor + second * 6;
+        let field = PCR_CURSOR + second * (PCR_CURSOR2 - PCR_CURSOR);
         let cursor = rd(pcr + field);
         let base = s.word(0x87a0 + index * 4);
         if (base..base.wrapping_add(0x800)).contains(&cursor) {
@@ -172,7 +174,7 @@ extern "C" fn uninstall(context: u32) -> u32 {
                     super::fence();
                     s.set_word(0x876c + index * 4, 0);
                     super::fence();
-                    if field == PCR_CURSOR {
+                    if second == 0 {
                         kernel::debug_print(
                             c"WRN[PIX]: EndStreaming discarded overflowed raised-IRQL data.\n",
                         );
@@ -184,8 +186,8 @@ extern "C" fn uninstall(context: u32) -> u32 {
     }
     wr(slot + 4, rd(pcr + PCR_CURSOR));
     wr(slot + 8, rd(pcr + PCR_CURSOR2));
-    for field in [PCR_CURSOR, PCR_LIMIT, PCR_CURSOR2, PCR_LIMIT2] {
-        wr(pcr + field, 0);
+    for index in 0..4 {
+        wr(pcr + PCR_CURSOR + index * 4, 0);
     }
     wr(pcr + PCR_FLAGS, rd(pcr + PCR_FLAGS) & 1);
     super::interrupts_on();
@@ -319,9 +321,9 @@ pub(super) fn stop(s: S, record: u32, closing: bool, notify: bool) {
         super::gpu::write_frame(s, marker.as_ptr() as usize as u32, false);
         marker[0] = (marker[0] & !0x07ff_fff8) | (s.word(super::FLAGS) >> 2 & 0x07ff_fff8);
         super::gpu::write_frame(s, marker.as_ptr() as usize as u32, false);
-        for offset in [0x1a4, 0x1a8, 0x1a0] {
-            s.set_word(offset, 0);
-        }
+        s.set_word(0x1a4, 0);
+        s.set_word(0x1a8, 0);
+        s.set_word(0x1a0, 0);
     }
     let frame = super::frame_index(s);
     super::gpu::flush_frame_buffers(s, frame.wrapping_sub(1));
@@ -366,9 +368,14 @@ pub(super) fn stop(s: S, record: u32, closing: bool, notify: bool) {
         }
     }
     buffers::drain(s);
-    for offset in [0x2a0, 0x2a4, 0x2a8, 0x1c8, 0x1cc, 0x298, 0x1_2280, 0x29c] {
-        s.set_word(offset, 0);
-    }
+    s.set_word(0x2a0, 0);
+    s.set_word(0x2a4, 0);
+    s.set_word(0x2a8, 0);
+    s.set_word(0x1c8, 0);
+    s.set_word(0x1cc, 0);
+    s.set_word(0x298, 0);
+    s.set_word(0x1_2280, 0);
+    s.set_word(0x29c, 0);
     s.set_word(super::FLAGS, s.word(super::FLAGS) & !super::PAUSED_OUTPUT);
 }
 
@@ -391,9 +398,10 @@ pub(super) fn frame_record(
     words[3] = s.word(buffers::stream(1) + buffers::STREAM_SEQUENCE);
     words[4] = super::timebase_low();
     words[5] = rd(0x7fc8_112c);
-    for index in (0..6u32).chain([0xe]) {
+    // Buffers 0 to 5, then the GPU buffer 0xe in halfword slot 6.
+    for slot in 0..7u32 {
+        let index = if slot == 6 { 0xe } else { slot };
         let value = position(s, record, context, index);
-        let slot = if index == 0xe { 6 } else { index };
         let halfword = 0x18 + ((slot << 1) ^ 2);
         let word = &mut words[(halfword / 4) as usize];
         let shift = if halfword & 2 == 0 { 16 } else { 0 };
@@ -457,18 +465,9 @@ fn position(
 /// the next frame when the ring dropped it.
 pub(super) fn capture_record(s: S) {
     let time = kernel::timebase();
-    let parts = u32::from(s.word(0) != super::OFF)
-        | u32::from(s.word(8) != super::OFF) << 1
-        | u32::from(s.word(0xc) != super::OFF) << 2;
-    let mut payload = [0u8; 0xc];
-    for (chunk, word) in payload
-        .chunks_exact_mut(4)
-        .zip([parts, (time >> 32) as u32, time as u32])
-    {
-        chunk.copy_from_slice(&word.to_be_bytes());
-    }
+    let words = [super::active_parts(s), (time >> 32) as u32, time as u32];
     s.set_word(
         0xe208,
-        u32::from(!super::super::write_tagged_record(0x4363_6170, &payload)),
+        u32::from(!super::super::write_tagged_words(0x4363_6170, &words)),
     );
 }

@@ -15,8 +15,6 @@ use openxbdm_server::Server;
 use openxbdm_server::commands::console::TraceMask;
 use openxbdm_server::commands::filesystem::Backend as _;
 use openxbdm_server::commands::session::debug_capture_print;
-use openxbdm_server::notify::POSTED_TEXT_CAPACITY;
-use openxbdm_server::notify::PostedTexts;
 use openxbdm_server::text::Text;
 
 use super::Console;
@@ -276,65 +274,263 @@ static DRIVE_REINITIALIZED: AtomicBool = AtomicBool::new(false);
 /// SMC notification registration `{routine, 1, 0, 0}` (stock 0x91f97454).
 static TRAY_REGISTRATION: KernelStorage<[u32; 4]> = KernelStorage::new([0; 4]);
 
-/// Texts of the stock trace producer (0x91f3ebb0) waiting for the server
-/// thread, which appends them to the debug capture ring.
-struct TraceQueue {
-    lock: UnsafeCell<u32>,
-    texts: UnsafeCell<PostedTexts>,
+/// Trace texts that can wait for the server thread; a text is dropped
+/// while every slot is taken.
+const TRACE_SLOTS: usize = 16;
+
+/// A text of the stock trace producer (0x91f3ebb0) with the values it
+/// prints. The server thread formats it, so the producer, which may run
+/// above dispatch level, stores only the values.
+#[derive(Clone, Copy)]
+enum Trace {
+    UpdatingDriver,
+    UpdatedChannelIsr,
+    Patched {
+        build: u16,
+    },
+    KernelVersion([u16; 4]),
+    ChannelNotFound,
+    ChannelExtension(u32),
+    ChannelOperational(u32),
+    CdromOperational,
+    ChannelDevice(u32),
+    CdromDevice(u32),
+    InvalidChannel,
+    PlugIn {
+        processor: u8,
+    },
+    CancellingWait {
+        reinitializing: bool,
+    },
+    CancellingReset,
+    CancellingRequest,
+    QueueReinit {
+        queued: i32,
+    },
+    AbortPending {
+        irp: u32,
+    },
+    StartIo {
+        processor: u8,
+        hotplug: u32,
+        queued: i32,
+        irp: u32,
+    },
+    StartReinit,
+    SkipReinit {
+        remaining: i32,
+    },
+    HotplugAbort {
+        irp: u32,
+    },
+    ReinitDelay {
+        processor: u8,
+    },
+    StartReinitialize {
+        processor: u8,
+        irp: u32,
+    },
+    DeviceBusy {
+        sstatus: u32,
+        scontrol: u32,
+        serror: u32,
+        status: u8,
+    },
+    FinishReinitialize {
+        processor: u8,
+        irp: u32,
+    },
+    ReinitTimedOut,
+    Tray {
+        name: &'static str,
+    },
 }
 
-// SAFETY: every access to `texts` holds the spin lock.
+impl Trace {
+    /// The text, cut as the producer cuts it.
+    #[allow(
+        clippy::write_with_newline,
+        reason = "the format strings are the stock texts verbatim"
+    )]
+    fn write(self, text: &mut Text<TRACE_TEXT_CAPACITY>) {
+        let _ = match self {
+            Self::UpdatingDriver => text.write_str("XBDM: Updating CD-ROM driver.\n"),
+            Self::UpdatedChannelIsr => text.write_str("XBDM: Updated Channel ISR.\n"),
+            Self::Patched { build } => write!(
+                text,
+                "XBDM: Patched CD-ROM driver for Kernel (ver={build:04})\n"
+            ),
+            Self::KernelVersion([major, minor, build, qfe]) => write!(
+                text,
+                "XBDM: DmSataFindCdromChannelObject - KernelVer ({major}.{minor}.{build}.{qfe:x})\n"
+            ),
+            Self::ChannelNotFound => {
+                text.write_str("XBDM: DmSataFindCdromChannelObject - Did not find Channel\n")
+            }
+            Self::ChannelExtension(channel) => {
+                write!(text, "XBDM:  ChannelExtension ({channel:08x})\n")
+            }
+            Self::ChannelOperational(registers) => write!(
+                text,
+                "XBDM:  ChannelExtension->Operational ({registers:08x})\n"
+            ),
+            Self::CdromOperational => {
+                const _: () = assert!(SATA_CDROM_REGISTERS == 0x7fea_1200);
+                text.write_str("XBDM:  SataCdromOperational (7fea1200)\n")
+            }
+            Self::ChannelDevice(device) => write!(
+                text,
+                "XBDM:  ChannelExtension==>DeviceObject ({device:08x})\n"
+            ),
+            Self::CdromDevice(device) => {
+                write!(text, "XBDM:  SataCdromDeviceObject ({device:08x})\n")
+            }
+            Self::InvalidChannel => {
+                text.write_str("XBDM: DmSataFindCdromChannelObject - Invalid channel address.\n")
+            }
+            Self::PlugIn { processor } => {
+                write!(text, "DMSATA: HotplugDPC - ({processor}) Plug In event\n")
+            }
+            Self::CancellingWait { reinitializing } => write!(
+                text,
+                "DMSATA: HotplugDPC - Cancelling Wait (Re-init={})\n",
+                u32::from(reinitializing)
+            ),
+            Self::CancellingReset => text.write_str("DMSATA: HotplugDPC - Cancelling RESET\n"),
+            Self::CancellingRequest => {
+                text.write_str("DMSATA: HotplugDPC - Cancelling current request\n")
+            }
+            Self::QueueReinit { queued } => {
+                write!(text, "DMSATA: Queue Re-Init IRP (count={queued})\n")
+            }
+            Self::AbortPending { irp } => {
+                write!(
+                    text,
+                    "DMSATA: HotplugDPC - Abort Pending IRP (IRP={irp:x})\n"
+                )
+            }
+            Self::StartIo {
+                processor,
+                hotplug,
+                queued,
+                irp,
+            } => write!(
+                text,
+                "DMSATA: DmSataCdRomStartIo - ({processor}) (Hotplug={hotplug:x}, Queued={queued}, Irp={irp:x})\n"
+            ),
+            Self::StartReinit => text.write_str("DMSATA: Start Re-Init\n"),
+            Self::SkipReinit { remaining } => {
+                write!(text, "DMSATA: Skip re-init (Count={remaining})\n")
+            }
+            Self::HotplugAbort { irp } => {
+                write!(text, "DMSATA: Hotplug/Pre-Init Aborting IRP ({irp:x})\n")
+            }
+            Self::ReinitDelay { processor } => {
+                const _: () = assert!(REINIT_DELAY_TICKS as u32 * TICK_MILLISECONDS == 300);
+                write!(
+                    text,
+                    "DMSATA: Start re-init request in 300 ms ({processor})\n"
+                )
+            }
+            Self::StartReinitialize { processor, irp } => write!(
+                text,
+                "DMSATA: StartReinitialize ({processor}) (Irp={irp:08x})\n"
+            ),
+            Self::DeviceBusy {
+                sstatus,
+                scontrol,
+                serror,
+                status,
+            } => write!(
+                text,
+                "DMSATA: StartReinitialize - Device busy\n  SStatus = {sstatus:08x}\n  SControl = {scontrol:08x}\n  SError = {serror:08x}\n  DevStatus = {status:02x}\n"
+            ),
+            Self::FinishReinitialize { processor, irp } => write!(
+                text,
+                "DMSATA: FinishReinitialize ({processor}) (Irp={irp:08x})\n"
+            ),
+            Self::ReinitTimedOut => {
+                text.write_str("DMSATA: Re-init command timed out.  Disable \\device\\cdrom0\n")
+            }
+            Self::Tray { name } => write!(text, "[XBDM] Tray notification - {name}\n"),
+        };
+    }
+}
+
+struct TraceRing {
+    traces: [Trace; TRACE_SLOTS],
+    first: usize,
+    count: usize,
+}
+
+/// Traces waiting for the server thread, which appends their texts to the
+/// debug capture ring.
+struct TraceQueue {
+    lock: UnsafeCell<u32>,
+    ring: UnsafeCell<TraceRing>,
+}
+
+// SAFETY: every access to `ring` holds the spin lock.
 unsafe impl Sync for TraceQueue {}
 
 static TRACE: TraceQueue = TraceQueue {
     lock: UnsafeCell::new(0),
-    texts: UnsafeCell::new(PostedTexts::new()),
+    ring: UnsafeCell::new(TraceRing {
+        traces: [Trace::UpdatingDriver; TRACE_SLOTS],
+        first: 0,
+        count: 0,
+    }),
 };
 
 impl TraceQueue {
-    /// Queue `text`; it is dropped when the queue is full. Above dispatch
+    /// Queue `trace`; it is dropped when the queue is full. Above dispatch
     /// level the producer may have interrupted the lock holder, so it only
     /// tries the lock.
-    fn push(&self, text: &[u8]) {
+    fn push(&self, trace: Trace) {
         let lock = self.lock.get();
         let irql = current_irql();
-        if irql < DISPATCH_LEVEL {
-            let previous = kernel::KfAcquireSpinLock(lock);
-            // SAFETY: the spin lock is held.
-            unsafe { (*self.texts.get()).push(text) };
-            kernel::KfReleaseSpinLock(lock, previous);
-            return;
-        }
-        let acquired = if irql == DISPATCH_LEVEL {
+        let previous = if irql < DISPATCH_LEVEL {
+            Some(kernel::KfAcquireSpinLock(lock))
+        } else if irql == DISPATCH_LEVEL {
             kernel::KeAcquireSpinLockAtRaisedIrql(lock);
-            true
+            None
+        } else if kernel::KeTryToAcquireSpinLockAtRaisedIrql(lock) & 0xff != 0 {
+            None
         } else {
-            kernel::KeTryToAcquireSpinLockAtRaisedIrql(lock) & 0xff != 0
+            return;
         };
-        if acquired {
-            // SAFETY: the spin lock is held.
-            unsafe { (*self.texts.get()).push(text) };
-            kernel::KeReleaseSpinLockFromRaisedIrql(lock);
+        // SAFETY: the spin lock is held.
+        let ring = unsafe { &mut *self.ring.get() };
+        if ring.count < TRACE_SLOTS {
+            ring.traces[(ring.first + ring.count) % TRACE_SLOTS] = trace;
+            ring.count += 1;
         }
+        match previous {
+            Some(previous) => kernel::KfReleaseSpinLock(lock, previous),
+            None => kernel::KeReleaseSpinLockFromRaisedIrql(lock),
+        };
     }
 
-    /// Take the oldest text; called on the server thread.
-    fn pop(&self, output: &mut [u8; POSTED_TEXT_CAPACITY]) -> Option<usize> {
+    /// Take the oldest trace; called on the server thread.
+    fn pop(&self) -> Option<Trace> {
         let lock = self.lock.get();
         let previous = kernel::KfAcquireSpinLock(lock);
         // SAFETY: the spin lock is held.
-        let length = unsafe { (*self.texts.get()).pop(output) };
+        let ring = unsafe { &mut *self.ring.get() };
+        let trace = (ring.count != 0).then(|| {
+            let trace = ring.traces[ring.first];
+            ring.first = (ring.first + 1) % TRACE_SLOTS;
+            ring.count -= 1;
+            trace
+        });
         kernel::KfReleaseSpinLock(lock, previous);
-        length
+        trace
     }
 }
 
-/// Stock trace producer 0x91f3ebb0: format and queue a text for the debug
-/// capture ring, cut as the producer cuts it.
-fn trace(arguments: core::fmt::Arguments<'_>) {
-    let mut text = Text::<TRACE_TEXT_CAPACITY>::new();
-    let _ = text.write_fmt(arguments);
-    TRACE.push(text.as_bytes());
+/// Stock trace producer 0x91f3ebb0.
+fn trace(trace: Trace) {
+    TRACE.push(trace);
 }
 
 fn processor() -> u8 {
@@ -581,7 +777,7 @@ enum PatchError {
 /// Patch the CD-ROM driver (0x91f40088).
 fn patch(device: Option<Device>) -> Result<(), PatchError> {
     let device = device.ok_or(PatchError::NoDevice)?;
-    trace(format_args!("XBDM: Updating CD-ROM driver.\n"));
+    trace(Trace::UpdatingDriver);
     let version = kernel::kernel_version();
     let channel = find_channel(device, version)?;
     initialize(device)?;
@@ -609,13 +805,10 @@ fn patch(device: Option<Device>) -> Result<(), PatchError> {
         interrupt_hook_entry as *const () as usize as u32,
     );
     lock.release(PASSIVE_LEVEL);
-    trace(format_args!("XBDM: Updated Channel ISR.\n"));
+    trace(Trace::UpdatedChannelIsr);
 
     detect_dvd_emulator(device);
-    trace(format_args!(
-        "XBDM: Patched CD-ROM driver for Kernel (ver={:04})\n",
-        version[2]
-    ));
+    trace(Trace::Patched { build: version[2] });
     Ok(())
 }
 
@@ -623,9 +816,7 @@ fn patch(device: Option<Device>) -> Result<(), PatchError> {
 /// `DmSataFindCdromChannelObject`).
 fn find_channel(device: Device, version: [u16; 4]) -> Result<Channel, PatchError> {
     let [major, minor, build, qfe] = version;
-    trace(format_args!(
-        "XBDM: DmSataFindCdromChannelObject - KernelVer ({major}.{minor}.{build}.{qfe:x})\n"
-    ));
+    trace(Trace::KernelVersion(version));
     if major != 2 || minor != 0 || qfe != 0x8000 {
         return Err(PatchError::UnsupportedKernel);
     }
@@ -649,9 +840,7 @@ fn find_channel(device: Device, version: [u16; 4]) -> Result<Channel, PatchError
                 data[2]
             };
             if channel == 0 {
-                trace(format_args!(
-                    "XBDM: DmSataFindCdromChannelObject - Did not find Channel\n"
-                ));
+                trace(Trace::ChannelNotFound);
                 return Err(PatchError::ChannelNotFound);
             }
             channel
@@ -662,28 +851,12 @@ fn find_channel(device: Device, version: [u16; 4]) -> Result<Channel, PatchError
         CHANNEL.store(channel.0, Ordering::Relaxed);
         return Ok(channel);
     }
-    trace(format_args!(
-        "XBDM:  ChannelExtension ({:08x})\n",
-        channel.0
-    ));
-    trace(format_args!(
-        "XBDM:  ChannelExtension->Operational ({:08x})\n",
-        channel.read(CHANNEL_REGISTERS)
-    ));
-    trace(format_args!(
-        "XBDM:  SataCdromOperational ({SATA_CDROM_REGISTERS:08x})\n"
-    ));
-    trace(format_args!(
-        "XBDM:  ChannelExtension==>DeviceObject ({:08x})\n",
-        channel.device().0
-    ));
-    trace(format_args!(
-        "XBDM:  SataCdromDeviceObject ({:08x})\n",
-        device.0
-    ));
-    trace(format_args!(
-        "XBDM: DmSataFindCdromChannelObject - Invalid channel address.\n"
-    ));
+    trace(Trace::ChannelExtension(channel.0));
+    trace(Trace::ChannelOperational(channel.read(CHANNEL_REGISTERS)));
+    trace(Trace::CdromOperational);
+    trace(Trace::ChannelDevice(channel.device().0));
+    trace(Trace::CdromDevice(device.0));
+    trace(Trace::InvalidChannel);
     Err(PatchError::InvalidChannel)
 }
 
@@ -747,10 +920,9 @@ extern "C" fn hotplug_dpc(_dpc: u32, device: u32, channel: u32, hotplug: u32) {
     let acknowledge = if hotplug & HOTPLUG_REMOVAL != 0 {
         acknowledge | HOTPLUG_REMOVED
     } else {
-        trace(format_args!(
-            "DMSATA: HotplugDPC - ({}) Plug In event\n",
-            processor()
-        ));
+        trace(Trace::PlugIn {
+            processor: processor(),
+        });
         queue_reinitialize(Device(device), channel);
         acknowledge | HOTPLUG_INSERTED
     };
@@ -767,23 +939,18 @@ fn queue_reinitialize(device: Device, channel: Channel) {
     let mut abort_current = false;
     if wait != 0 {
         let reinitializing = current == reinit_irp().0;
-        trace(format_args!(
-            "DMSATA: HotplugDPC - Cancelling Wait (Re-init={})\n",
-            u32::from(reinitializing)
-        ));
+        trace(Trace::CancellingWait { reinitializing });
         restart_timer = true;
         channel.write(CHANNEL_WAIT_ROUTINE, 0);
         abort_current = true;
     }
     if reset != 0 {
-        trace(format_args!("DMSATA: HotplugDPC - Cancelling RESET\n"));
+        trace(Trace::CancellingReset);
         restart_timer = true;
         channel.write(CHANNEL_RESET_ROUTINE, 0);
     }
     if interrupt != 0 {
-        trace(format_args!(
-            "DMSATA: HotplugDPC - Cancelling current request\n"
-        ));
+        trace(Trace::CancellingRequest);
         abort_current = true;
         channel.write(CHANNEL_INTERRUPT_ROUTINE, 0);
     }
@@ -797,15 +964,12 @@ fn queue_reinitialize(device: Device, channel: Channel) {
     if restart_timer {
         start_channel_timer(channel, HOTPLUG_TIMER_DUE, HOTPLUG_TIMER_PERIOD_MS);
     }
-    trace(format_args!(
-        "DMSATA: Queue Re-Init IRP (count={})\n",
-        QUEUED.load(Ordering::SeqCst)
-    ));
+    trace(Trace::QueueReinit {
+        queued: QUEUED.load(Ordering::SeqCst),
+    });
     start_packet(channel, reinit_irp());
     if abort_current {
-        trace(format_args!(
-            "DMSATA: HotplugDPC - Abort Pending IRP (IRP={current:x})\n"
-        ));
+        trace(Trace::AbortPending { irp: current });
         fail_request(channel, Irp::new(current));
     }
 }
@@ -842,19 +1006,19 @@ extern "C" fn start_io_hook(_device: u32, irp: u32) {
     }
     channel.write_u8(CHANNEL_UNKNOWN_AA, 0);
     channel.write_u8(CHANNEL_UNKNOWN_AB, 4);
-    trace(format_args!(
-        "DMSATA: DmSataCdRomStartIo - ({}) (Hotplug={:x}, Queued={}, Irp={irp:x})\n",
-        processor(),
-        HOTPLUG_FLAGS.load(Ordering::SeqCst),
-        QUEUED.load(Ordering::SeqCst),
-    ));
+    trace(Trace::StartIo {
+        processor: processor(),
+        hotplug: HOTPLUG_FLAGS.load(Ordering::SeqCst),
+        queued: QUEUED.load(Ordering::SeqCst),
+        irp,
+    });
     if irp == reinit_irp().0 {
         let remaining = QUEUED.fetch_sub(1, Ordering::SeqCst) - 1;
         if remaining == 0 {
-            trace(format_args!("DMSATA: Start Re-Init\n"));
+            trace(Trace::StartReinit);
             schedule_reinitialize(channel);
         } else {
-            trace(format_args!("DMSATA: Skip re-init (Count={remaining})\n"));
+            trace(Trace::SkipReinit { remaining });
             check(remaining > 0);
             start_next_packet(channel);
         }
@@ -862,20 +1026,16 @@ extern "C" fn start_io_hook(_device: u32, irp: u32) {
         // SAFETY: the channel's start routine takes (channel, irp).
         unsafe { kernel::call_export(channel.read(CHANNEL_START_IO), channel.0, irp, 0, 0) };
     } else {
-        trace(format_args!(
-            "DMSATA: Hotplug/Pre-Init Aborting IRP ({irp:x})\n"
-        ));
+        trace(Trace::HotplugAbort { irp });
         fail_request(channel, Irp::new(irp));
     }
 }
 
 /// Start the reinitialization after the delay ticks (0x91f3fe50).
 fn schedule_reinitialize(channel: Channel) {
-    trace(format_args!(
-        "DMSATA: Start re-init request in {} ms ({})\n",
-        u32::from(REINIT_DELAY_TICKS) * TICK_MILLISECONDS,
-        processor()
-    ));
+    trace(Trace::ReinitDelay {
+        processor: processor(),
+    });
     start_channel_timer(channel, TICK_DUE, TICK_MILLISECONDS);
     let lock = channel.lock(DISPATCH_LEVEL);
     channel.write_u8(CHANNEL_WAIT_TICKS, REINIT_DELAY_TICKS);
@@ -902,11 +1062,10 @@ extern "C" fn start_reinitialize(channel: u32) {
     let channel = Channel(channel);
     let device = channel.device();
     let registers = channel.registers();
-    trace(format_args!(
-        "DMSATA: StartReinitialize ({}) (Irp={:08x})\n",
-        processor(),
-        read_u32(device.0 + DEVICE_CURRENT_IRP)
-    ));
+    trace(Trace::StartReinitialize {
+        processor: processor(),
+        irp: read_u32(device.0 + DEVICE_CURRENT_IRP),
+    });
     write_u32(
         device.0 + DEVICE_FLAGS,
         read_u32(device.0 + DEVICE_FLAGS) | DEVICE_FLAG_REINITIALIZING,
@@ -919,9 +1078,12 @@ extern "C" fn start_reinitialize(channel: u32) {
         let scontrol = registers.read_reversed(SATA_SCONTROL);
         let serror = registers.read_reversed(SATA_SERROR);
         let status = registers.read_u8(SATA_COMMAND);
-        trace(format_args!(
-            "DMSATA: StartReinitialize - Device busy\n  SStatus = {sstatus:08x}\n  SControl = {scontrol:08x}\n  SError = {serror:08x}\n  DevStatus = {status:02x}\n"
-        ));
+        trace(Trace::DeviceBusy {
+            sstatus,
+            scontrol,
+            serror,
+            status,
+        });
         kernel::DbgBreakPoint();
         // Stock returns with the channel lock held, which hangs the next
         // acquisition.
@@ -960,10 +1122,10 @@ extern "C" fn reinit_interrupt(channel: u32, _registers: u32, status: u32) -> u3
 extern "C" fn finish_reinitialize(channel: u32, irp: u32, status: u32) {
     let channel = Channel(channel);
     let device = channel.device();
-    trace(format_args!(
-        "DMSATA: FinishReinitialize ({}) (Irp={irp:08x})\n",
-        processor()
-    ));
+    trace(Trace::FinishReinitialize {
+        processor: processor(),
+        irp,
+    });
     check(irp == reinit_irp().0);
     if (status as i32) >= 0 {
         HOTPLUG_FLAGS.fetch_and(!FLAG_REINITIALIZING, Ordering::SeqCst);
@@ -972,9 +1134,7 @@ extern "C" fn finish_reinitialize(channel: u32, irp: u32, status: u32) {
             read_u32(device.0 + DEVICE_FLAGS) & !DEVICE_FLAG_REINITIALIZING,
         );
     } else {
-        trace(format_args!(
-            "DMSATA: Re-init command timed out.  Disable \\device\\cdrom0\n"
-        ));
+        trace(Trace::ReinitTimedOut);
     }
     if INQUIRIES.fetch_add(1, Ordering::SeqCst) + 1 == 1 {
         issue_inquiry(channel);
@@ -1101,9 +1261,9 @@ extern "C" fn tray_notification(_registration: u32, message: *const u8) {
     // SAFETY: the kernel passes an SMC message of SMC_MESSAGE_SIZE bytes.
     let (kind, state) = unsafe { (*message, *message.add(1)) };
     if kind == SMC_TRAY_STATE
-        && let Some(name) = TRAY_STATES.get(usize::from(state.wrapping_sub(SMC_TRAY_STATE_BASE)))
+        && let Some(&name) = TRAY_STATES.get(usize::from(state.wrapping_sub(SMC_TRAY_STATE_BASE)))
     {
-        trace(format_args!("[XBDM] Tray notification - {name}\n"));
+        trace(Trace::Tray { name });
     }
 }
 
@@ -1111,9 +1271,10 @@ extern "C" fn tray_notification(_registration: u32, message: *const u8) {
 /// the debug capture ring (dropped while capture is off), then complete a
 /// finished reinitialization as the stock server loop does (0x91f510c4).
 pub(crate) fn drain(server: &mut Server, console: &mut Console) {
-    let mut text = [0u8; POSTED_TEXT_CAPACITY];
-    while let Some(length) = TRACE.pop(&mut text) {
-        debug_capture_print(&mut server.state, console, &text[..length]);
+    while let Some(trace) = TRACE.pop() {
+        let mut text = Text::<TRACE_TEXT_CAPACITY>::new();
+        trace.write(&mut text);
+        debug_capture_print(&mut server.state, console, text.as_bytes());
     }
     if DRIVE_REINITIALIZED.swap(false, Ordering::AcqRel) {
         let mut message = [0u8; SMC_MESSAGE_SIZE];

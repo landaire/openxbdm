@@ -5,6 +5,9 @@
 //! reports socket readiness to a [`Server`].
 #![no_std]
 #![forbid(unsafe_code)]
+// State types are built by `const fn new()` so the platform can keep the
+// server in a static; `Default` is implemented only where a caller needs it.
+#![allow(clippy::new_without_default)]
 
 pub mod access;
 pub mod backend;

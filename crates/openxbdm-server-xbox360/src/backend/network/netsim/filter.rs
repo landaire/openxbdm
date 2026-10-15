@@ -79,34 +79,28 @@ impl Variant {
     }
 
     /// Integer conversion source (0x91f8a0b8): the value widened to 64
-    /// bits, and whether it is signed. Booleans count as unsigned.
-    fn integer(self) -> Result<(u64, bool)> {
+    /// bits.
+    fn integer(self) -> Result<u64> {
         Ok(match self {
-            Variant::Bool(value) => (u64::from(value), false),
-            Variant::I8(value) => (value as i64 as u64, true),
-            Variant::I16(value) => (value as i64 as u64, true),
-            Variant::I32(value) => (value as i64 as u64, true),
-            Variant::I64(value) => (value as u64, true),
-            Variant::U8(value) => (u64::from(value), false),
-            Variant::U16(value) => (u64::from(value), false),
-            Variant::U32(value) => (u64::from(value), false),
-            Variant::U64(value) => (value, false),
+            Variant::Bool(value) => u64::from(value),
+            Variant::I8(value) => value as i64 as u64,
+            Variant::I16(value) => value as i64 as u64,
+            Variant::I32(value) => value as i64 as u64,
+            Variant::I64(value) => value as u64,
+            Variant::U8(value) => u64::from(value),
+            Variant::U16(value) => u64::from(value),
+            Variant::U32(value) => u64::from(value),
+            Variant::U64(value) => value,
             _ => return Err(EvaluationFailed),
         })
     }
 
     /// 0x91f89fe0.
     fn truth(self) -> Result<bool> {
-        Ok(match self {
-            Variant::Bool(value) => value,
-            Variant::I8(_) | Variant::I16(_) | Variant::I32(_) | Variant::I64(_) => {
-                self.integer()?.0 != 0
-            }
-            Variant::U8(_) | Variant::U16(_) | Variant::U32(_) | Variant::U64(_) => {
-                self.integer()?.0 != 0
-            }
-            _ => return Err(EvaluationFailed),
-        })
+        match self {
+            Variant::Bool(value) => Ok(value),
+            other => Ok(other.integer()? != 0),
+        }
     }
 
     fn is_unsigned(self) -> bool {
@@ -121,14 +115,8 @@ impl Variant {
 /// fail; narrower ones keep their bit pattern.
 fn int32(value: Variant) -> Result<i32> {
     match value {
-        Variant::Bool(value) => Ok(i32::from(value)),
-        Variant::I8(value) => Ok(i32::from(value)),
-        Variant::I16(value) => Ok(i32::from(value)),
-        Variant::I32(value) => Ok(value),
-        Variant::U8(value) => Ok(i32::from(value)),
-        Variant::U16(value) => Ok(i32::from(value)),
-        Variant::U32(value) => Ok(value as i32),
-        _ => Err(EvaluationFailed),
+        Variant::I64(_) | Variant::U64(_) => Err(EvaluationFailed),
+        other => Ok(other.integer()? as i32),
     }
 }
 
@@ -145,8 +133,9 @@ enum Getter {
     Bit(u8, u8),
     /// An address at a frame offset (0x91f8c850).
     Address(u8),
-    /// A masked DNS flag field and its shift (0x91f8dc88).
-    DnsFlags(u16, u8),
+    /// A masked DNS flag field, shifted down by the mask's trailing zeros
+    /// (0x91f8dc88).
+    DnsFlags(u16),
     /// A DNS header count (0x91f8dd48).
     DnsCount(u8),
     /// The first DNS question name (0x91f8de00).
@@ -165,23 +154,61 @@ enum Kind {
     Str,
 }
 
+/// XSP subtype values of the parse flags (bits 16..20).
+const XSP_MASK: u32 = 0x1f_0000;
+
+/// Parse flags a field needs: one flag bit (`BIT` plus its number), one
+/// XSP subtype, or any XSP subtype.
+#[derive(Clone, Copy)]
+struct Presence(u8);
+
+impl Presence {
+    const BIT: u8 = 0x20;
+    const ANY_XSP: u8 = (XSP_MASK >> 16) as u8;
+
+    /// From the stock table mask.
+    const fn of(mask: u32) -> Self {
+        if mask == XSP_MASK {
+            Self(Self::ANY_XSP)
+        } else if mask & XSP_MASK == 0 {
+            assert!(mask.is_power_of_two());
+            Self(Self::BIT | mask.trailing_zeros() as u8)
+        } else {
+            assert!(mask & !XSP_MASK == 0);
+            Self((mask >> 16) as u8)
+        }
+    }
+
+    fn test(self, flags: u32) -> bool {
+        let subtype = (flags & XSP_MASK) >> 16;
+        if self.0 & Self::BIT != 0 {
+            (flags >> (self.0 & !Self::BIT)) & 1 != 0
+        } else if self.0 == Self::ANY_XSP {
+            subtype != 0
+        } else {
+            subtype == u32::from(self.0)
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Field {
-    mask: u32,
+    presence: Presence,
     getter: Getter,
     kind: Kind,
 }
 
 const fn field(mask: u32, getter: Getter, kind: Kind) -> Field {
-    Field { mask, getter, kind }
+    Field {
+        presence: Presence::of(mask),
+        getter,
+        kind,
+    }
 }
 
 const fn present(mask: u32) -> Field {
     field(mask, Getter::Present, Kind::Bool)
 }
-
-/// XSP subtype values of the parse flags (bits 16..20).
-const XSP_MASK: u32 = 0x1f_0000;
 
 /// The frame field table (0x91f0ca48), by field number - 1.
 const FIELDS: [Field; 0x55] = [
@@ -225,15 +252,15 @@ const FIELDS: [Field; 0x55] = [
     field(0x100, Getter::Info(0x4, 2), Kind::U16),
     field(0x100, Getter::Info(0x6, 2), Kind::U16),
     present(0x200),
-    field(0x200, Getter::DnsFlags(0x8000, 0xf), Kind::Bool),
-    field(0x200, Getter::DnsFlags(0x7800, 0xb), Kind::U16),
-    field(0x200, Getter::DnsFlags(0x400, 0xa), Kind::Bool),
-    field(0x200, Getter::DnsFlags(0x200, 0x9), Kind::Bool),
-    field(0x200, Getter::DnsFlags(0x100, 0x8), Kind::Bool),
-    field(0x200, Getter::DnsFlags(0x80, 0x7), Kind::Bool),
-    field(0x200, Getter::DnsFlags(0x20, 0x5), Kind::Bool),
-    field(0x200, Getter::DnsFlags(0x10, 0x4), Kind::Bool),
-    field(0x200, Getter::DnsFlags(0xf, 0x0), Kind::U16),
+    field(0x200, Getter::DnsFlags(0x8000), Kind::Bool),
+    field(0x200, Getter::DnsFlags(0x7800), Kind::U16),
+    field(0x200, Getter::DnsFlags(0x400), Kind::Bool),
+    field(0x200, Getter::DnsFlags(0x200), Kind::Bool),
+    field(0x200, Getter::DnsFlags(0x100), Kind::Bool),
+    field(0x200, Getter::DnsFlags(0x80), Kind::Bool),
+    field(0x200, Getter::DnsFlags(0x20), Kind::Bool),
+    field(0x200, Getter::DnsFlags(0x10), Kind::Bool),
+    field(0x200, Getter::DnsFlags(0xf), Kind::U16),
     field(0x200, Getter::DnsCount(0x4), Kind::U16),
     field(0x200, Getter::DnsCount(0x6), Kind::U16),
     field(0x200, Getter::DnsCount(0x8), Kind::U16),
@@ -360,10 +387,11 @@ impl Evaluation<'_> {
             }
             8 => Ok(Variant::Bool(!self.operand(node, 0)?.truth()?)),
             9 => complement(self.operand(node, 0)?),
-            0xa..=0x10 | 0x17..=0x19 => {
+            0xa..=0x19 => {
                 let left = self.operand(node, 0)?;
                 let right = self.operand(node, 1)?;
                 let op = match operator.0 {
+                    0x11..=0x16 => return self.compare(left, operator.0 - 0x11, right),
                     0xa => 2,
                     0xb => 3,
                     0xc => 4,
@@ -376,11 +404,6 @@ impl Evaluation<'_> {
                     _ => 9,
                 };
                 arithmetic(left, op, right)
-            }
-            0x11..=0x16 => {
-                let left = self.operand(node, 0)?;
-                let right = self.operand(node, 1)?;
-                self.compare(left, operator.0 - 0x11, right)
             }
             0x1a | 0x1b => self.logical(node, operator.0 == 0x1a),
             0x1c => {
@@ -428,20 +451,13 @@ impl Evaluation<'_> {
     /// by unsigned bytes, integers as unsigned 64-bit when either is
     /// unsigned and signed otherwise.
     fn compare(&self, left: Variant, op: u8, right: Variant) -> Result<Variant> {
-        let byte_order = |a: &[u8], b: &[u8]| -> i32 {
-            a.iter()
-                .zip(b)
-                .map(|(&x, &y)| i32::from(x) - i32::from(y))
-                .find(|&difference| difference != 0)
-                .unwrap_or(0)
-        };
         let order = match (left, right) {
             (Variant::Str(a), Variant::Str(b)) => {
                 compare_text(self.text(a), self.text(b), false, false)
             }
-            (Variant::Mac(a), Variant::Mac(b)) => byte_order(&a, &b),
-            (Variant::Ipv4(a), Variant::Ipv4(b)) => byte_order(&a, &b),
-            (Variant::Ipv6(a), Variant::Ipv6(b)) => byte_order(&a, &b),
+            (Variant::Mac(a), Variant::Mac(b)) => a.cmp(&b) as i32,
+            (Variant::Ipv4(a), Variant::Ipv4(b)) => a.cmp(&b) as i32,
+            (Variant::Ipv6(a), Variant::Ipv6(b)) => a.cmp(&b) as i32,
             (
                 Variant::Mac(_) | Variant::Ipv4(_) | Variant::Ipv6(_),
                 Variant::Mac(_) | Variant::Ipv4(_) | Variant::Ipv6(_),
@@ -450,8 +466,8 @@ impl Evaluation<'_> {
             }
             _ => {
                 let unsigned = left.is_unsigned() || right.is_unsigned();
-                let (a, _) = left.integer()?;
-                let (b, _) = right.integer()?;
+                let a = left.integer()?;
+                let b = right.integer()?;
                 let ordering = if unsigned {
                     a.cmp(&b)
                 } else {
@@ -595,12 +611,7 @@ impl Evaluation<'_> {
     /// the protocol.
     fn read_field(&mut self, index: usize) -> Result<Variant> {
         let field = FIELDS[index];
-        let flags = self.parsed.flags;
-        let present = if field.mask & XSP_MASK == 0 || field.mask == XSP_MASK {
-            flags & field.mask != 0
-        } else {
-            flags & XSP_MASK == field.mask
-        };
+        let present = field.presence.test(self.parsed.flags);
         if !present {
             return Ok(match field.kind {
                 Kind::Bool => Variant::Bool(false),
@@ -628,10 +639,15 @@ impl Evaluation<'_> {
         };
         Ok(match field.getter {
             Getter::Present => Variant::Bool(true),
-            Getter::Frame(offset, size) => number(
-                &bytes_at(self.frame, usize::from(offset), usize::from(size)),
-                field.kind,
-            ),
+            // 0x91f8c7c0 copies `size` frame bytes in order and reads the
+            // value from them.
+            Getter::Frame(offset, size) => {
+                let size = usize::from(size);
+                number(
+                    &bytes_at(self.frame, usize::from(offset), size)[..size],
+                    field.kind,
+                )
+            }
             Getter::Info(offset, size) => {
                 let offset = usize::from(offset);
                 number(
@@ -651,27 +667,15 @@ impl Evaluation<'_> {
                     _ => Variant::Ipv4([bytes[0], bytes[1], bytes[2], bytes[3]]),
                 }
             }
-            Getter::DnsFlags(mask, shift) => {
-                let word = self.dns().map_or(0, |dns| {
-                    u16::from_be_bytes(
-                        bytes_at(self.frame, dns + 2, 2)[..2]
-                            .try_into()
-                            .unwrap_or([0; 2]),
-                    )
-                });
-                let value = word & mask;
+            Getter::DnsFlags(mask) => {
+                let value = self.dns_word(2) & mask;
                 if field.kind == Kind::Bool {
                     Variant::Bool(value != 0)
                 } else {
-                    Variant::U16(value >> shift)
+                    Variant::U16(value >> mask.trailing_zeros())
                 }
             }
-            Getter::DnsCount(offset) => {
-                let value = self.dns().map_or([0; 8], |dns| {
-                    bytes_at(self.frame, dns + usize::from(offset), 2)
-                });
-                Variant::U16(u16::from_be_bytes([value[0], value[1]]))
-            }
+            Getter::DnsCount(offset) => Variant::U16(self.dns_word(usize::from(offset))),
             Getter::DnsName => {
                 self.decode_name();
                 Variant::Str(Text {
@@ -680,6 +684,14 @@ impl Evaluation<'_> {
                     end: u16::MAX,
                 })
             }
+        })
+    }
+
+    /// A DNS header word, zero without a DNS header.
+    fn dns_word(&self, offset: usize) -> u16 {
+        self.dns().map_or(0, |dns| {
+            let bytes = bytes_at(self.frame, dns + offset, 2);
+            u16::from_be_bytes([bytes[0], bytes[1]])
         })
     }
 
@@ -839,98 +851,67 @@ fn complement(value: Variant) -> Result<Variant> {
 /// unsigned; the result takes the type stock picks from the operand types.
 fn arithmetic(left: Variant, op: u8, right: Variant) -> Result<Variant> {
     let unsigned = left.is_unsigned() || right.is_unsigned();
-    let (a, _) = left.integer()?;
-    let (b, _) = right.integer()?;
-    let value = if unsigned {
-        match op {
-            0 => a.wrapping_add(b),
-            1 => a.wrapping_sub(b),
-            2 => a.wrapping_mul(b),
-            3 => a.checked_div(b).ok_or(EvaluationFailed)?,
-            4 => a.checked_rem(b).ok_or(EvaluationFailed)?,
-            5 => {
-                if b & 0x40 != 0 {
-                    0
-                } else {
-                    a << (b & 0x3f)
-                }
+    let a = left.integer()?;
+    let b = right.integer()?;
+    let (signed_a, signed_b) = (a as i64, b as i64);
+    let value = match op {
+        0 => a.wrapping_add(b),
+        1 => a.wrapping_sub(b),
+        2 => a.wrapping_mul(b),
+        3 | 4 if unsigned => {
+            if b == 0 {
+                return Err(EvaluationFailed);
             }
-            6 => {
-                if b & 0x40 != 0 {
-                    0
-                } else {
-                    a >> (b & 0x3f)
-                }
-            }
-            7 => a & b,
-            8 => a ^ b,
-            _ => a | b,
+            if op == 3 { a / b } else { a % b }
         }
-    } else {
-        let (a, b) = (a as i64, b as i64);
-        (match op {
-            0 => a.wrapping_add(b),
-            1 => a.wrapping_sub(b),
-            2 => a.wrapping_mul(b),
-            // Stock traps on i64::MIN / -1.
-            3 => {
-                if b == 0 || (a == i64::MIN && b == -1) {
-                    return Err(EvaluationFailed);
-                } else {
-                    a / b
-                }
+        // Stock traps on i64::MIN / -1.
+        3 | 4 => {
+            if b == 0 || (signed_a == i64::MIN && signed_b == -1) {
+                return Err(EvaluationFailed);
             }
-            4 => {
-                if b == 0 || (a == i64::MIN && b == -1) {
-                    return Err(EvaluationFailed);
-                } else {
-                    a % b
-                }
+            (if op == 3 {
+                signed_a / signed_b
+            } else {
+                signed_a % signed_b
+            }) as u64
+        }
+        5 | 6 if !unsigned && signed_b < 0 => return Err(EvaluationFailed),
+        5 => {
+            if b & 0x40 != 0 {
+                0
+            } else {
+                a << (b & 0x3f)
             }
-            5 => {
-                if b < 0 {
-                    return Err(EvaluationFailed);
-                }
-                if b & 0x40 != 0 { 0 } else { a << (b & 0x3f) }
+        }
+        6 => {
+            let shift = if b & 0x40 != 0 { 63 } else { b & 0x3f };
+            if unsigned {
+                if b & 0x40 != 0 { 0 } else { a >> shift }
+            } else {
+                (signed_a >> shift) as u64
             }
-            6 => {
-                if b < 0 {
-                    return Err(EvaluationFailed);
-                }
-                if b & 0x40 != 0 {
-                    a >> 63
-                } else {
-                    a >> (b & 0x3f)
-                }
-            }
-            7 => a & b,
-            8 => a ^ b,
-            _ => a | b,
-        }) as u64
+        }
+        7 => a & b,
+        8 => a ^ b,
+        _ => a | b,
     };
-    let kinds = [left, right];
-    let any = |test: fn(Variant) -> bool| kinds.iter().any(|&value| test(value));
-    Ok(if unsigned {
-        if any(|value| matches!(value, Variant::U64(_))) {
-            Variant::U64(value)
-        } else if any(|value| matches!(value, Variant::Bool(_) | Variant::U32(_))) {
-            Variant::U32(value as u32)
-        } else if any(|value| matches!(value, Variant::U16(_))) {
-            Variant::U16(value as u16)
-        } else if any(|value| matches!(value, Variant::U8(_))) {
-            Variant::U8(value as u8)
-        } else {
-            Variant::U32(value as u32)
-        }
-    } else if any(|value| matches!(value, Variant::I64(_))) {
-        Variant::I64(value as i64)
-    } else if any(|value| matches!(value, Variant::Bool(_) | Variant::I32(_))) {
-        Variant::I32(value as i32)
-    } else if any(|value| matches!(value, Variant::I16(_))) {
-        Variant::I16(value as i16)
-    } else if any(|value| matches!(value, Variant::I8(_))) {
-        Variant::I8(value as i8)
-    } else {
-        Variant::I32(value as i32)
+    // Result type: the widest operand of the operation's signedness, with
+    // booleans counting as 32-bit.
+    let rank = |operand: Variant| match (operand, unsigned) {
+        (Variant::U64(_), true) | (Variant::I64(_), false) => 4,
+        (Variant::Bool(_), _) | (Variant::U32(_), true) | (Variant::I32(_), false) => 3,
+        (Variant::U16(_), true) | (Variant::I16(_), false) => 2,
+        (Variant::U8(_), true) | (Variant::I8(_), false) => 1,
+        _ => 0,
+    };
+    Ok(match (rank(left).max(rank(right)), unsigned) {
+        (4, true) => Variant::U64(value),
+        (4, false) => Variant::I64(value as i64),
+        (2, true) => Variant::U16(value as u16),
+        (2, false) => Variant::I16(value as i16),
+        (1, true) => Variant::U8(value as u8),
+        (1, false) => Variant::I8(value as i8),
+        (_, true) => Variant::U32(value as u32),
+        (_, false) => Variant::I32(value as i32),
     })
 }

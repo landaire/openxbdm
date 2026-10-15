@@ -7,6 +7,7 @@ pub mod xhttpproxy;
 
 use core::fmt::Write as _;
 
+use openxbdm_core::line::CommandLine;
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 
@@ -66,11 +67,21 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
 ];
 
 /// Global state of this domain.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct State {
     pub netcap: netcap::State,
     pub netsim: netsim::State,
     pub ipproxy: ipproxy::State,
+}
+
+impl State {
+    pub const fn new() -> Self {
+        Self {
+            netcap: netcap::State::new(),
+            netsim: netsim::State::new(),
+            ipproxy: ipproxy::State::new(),
+        }
+    }
 }
 
 /// Transfers started by this domain.
@@ -456,8 +467,13 @@ fn write_hex<const N: usize>(line: &mut Text<N>, bytes: &[u8]) -> core::fmt::Res
 /// report the Ethernet link state or force it through masks. The link
 /// state is always read first and reported as the old state.
 pub(crate) fn link_state(invocation: &mut Invocation<'_>) -> Hresult {
-    let line = invocation.line;
-    let flags = if line.has("restore") {
+    let flags = parse_link_state(invocation.line);
+    execute_link_state(invocation, flags)
+}
+
+/// The forced flags of a `linkstate` line, if any.
+pub(crate) fn parse_link_state(line: CommandLine<'_>) -> Result<Option<LinkFlags>, Hresult> {
+    Ok(if line.has("restore") {
         Some(LinkFlags::RESTORE)
     } else if line.has("disconnect") {
         Some(LinkFlags::DISCONNECT)
@@ -465,11 +481,21 @@ pub(crate) fn link_state(invocation: &mut Invocation<'_>) -> Hresult {
         let and = line.param("and").and_then(|value| value.dword());
         let or = line.param("or").and_then(|value| value.dword());
         let (Some(and), Some(or)) = (and, or) else {
-            return Hresult::from_error_code(ErrorCode::BAD_PARAMETER);
+            return Err(Hresult::from_error_code(ErrorCode::BAD_PARAMETER));
         };
         Some(LinkFlags { and, or })
     } else {
         None
+    })
+}
+
+pub(crate) fn execute_link_state(
+    invocation: &mut Invocation<'_>,
+    flags: Result<Option<LinkFlags>, Hresult>,
+) -> Hresult {
+    let flags = match flags {
+        Ok(flags) => flags,
+        Err(error) => return error,
     };
     let LinkStatus(old) = invocation.backend.link_status();
     let Some(flags) = flags else {

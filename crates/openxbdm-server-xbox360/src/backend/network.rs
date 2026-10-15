@@ -243,17 +243,16 @@ impl Snapshot {
         if index >= self.count {
             return None;
         }
-        let size = Self::record_size(self.table);
-        let address = self.buffer + index * size;
-        // SAFETY: the buffer holds `count` records of `size` bytes, written
-        // by the network stack.
-        let bytes =
-            unsafe { core::slice::from_raw_parts(address as usize as *const u8, size as usize) };
-        Some(decode(self.table, bytes))
+        let address = self.buffer + index * Self::record_size(self.table);
+        // SAFETY: the buffer holds `count` records of `record_size` bytes,
+        // written by the network stack.
+        Some(unsafe { decode(self.table, address as usize as *const u8) })
     }
 }
 
-fn dword(bytes: &[u8], offset: usize) -> u32 {
+/// Fixed offsets into a fixed-size block compile to plain loads.
+#[inline(always)]
+fn dword<const N: usize>(bytes: &[u8; N], offset: usize) -> u32 {
     u32::from_be_bytes([
         bytes[offset],
         bytes[offset + 1],
@@ -262,75 +261,96 @@ fn dword(bytes: &[u8], offset: usize) -> u32 {
     ])
 }
 
-fn word(bytes: &[u8], offset: usize) -> u16 {
+#[inline(always)]
+fn word<const N: usize>(bytes: &[u8; N], offset: usize) -> u16 {
     u16::from_be_bytes([bytes[offset], bytes[offset + 1]])
 }
 
-fn xnkid(bytes: &[u8], offset: usize) -> Xnkid {
-    let mut value = [0u8; 8];
-    value.copy_from_slice(&bytes[offset..offset + 8]);
-    Xnkid(value)
-}
-
-fn xnaddr(bytes: &[u8], offset: usize) -> XnAddr {
-    let mut value = [0u8; 0x24];
-    value.copy_from_slice(&bytes[offset..offset + 0x24]);
-    XnAddr(value)
+#[inline(always)]
+fn array<const N: usize, const M: usize>(bytes: &[u8; N], offset: usize) -> [u8; M] {
+    let mut value = [0u8; M];
+    value.copy_from_slice(&bytes[offset..offset + M]);
+    value
 }
 
 /// Record layouts of the stock table queries (see `getsockinfo`,
 /// `getxnkeyinfo`, `getxnsecassocinfo`, `getxnqoslookupinfo` specs).
-fn decode(table: Table, bytes: &[u8]) -> Record {
+///
+/// # Safety
+/// `record` points at a whole record of `table`.
+unsafe fn decode(table: Table, record: *const u8) -> Record {
+    /// # Safety
+    /// `record` points at `N` readable bytes.
+    unsafe fn bytes<'a, const N: usize>(record: *const u8) -> &'a [u8; N] {
+        // SAFETY: guaranteed by the caller.
+        unsafe { &*record.cast::<[u8; N]>() }
+    }
     match table {
-        Table::Sockets => Record::Socket(SocketRecord {
-            handle: dword(bytes, 0x00),
-            owner_type: dword(bytes, 0x04) as i32,
-            flags: dword(bytes, 0x08),
-            address_family: dword(bytes, 0x0c) as i32,
-            socket_type: dword(bytes, 0x10) as i32,
-            protocol: dword(bytes, 0x14) as i32,
-            local_address: dword(bytes, 0x18),
-            remote_address: dword(bytes, 0x1c),
-            local_port: word(bytes, 0x20),
-            remote_port: word(bytes, 0x22),
-            tcp_state: bytes[0x24],
-        }),
-        Table::Keys => Record::Key(KeyRecord {
-            xnkid: xnkid(bytes, 0x00),
-            owner_type: dword(bytes, 0x08) as i32,
-            flags: dword(bytes, 0x0c),
-            qos_data_size: dword(bytes, 0x10),
-            qos_bits_per_second: dword(bytes, 0x14),
-        }),
-        Table::SecurityAssociations => Record::SecurityAssociation(SecurityAssociationRecord {
-            secure_address: dword(bytes, 0x00),
-            owner_type: dword(bytes, 0x04) as i32,
-            flags: dword(bytes, 0x08),
-            xnkid: xnkid(bytes, 0x10),
-            xnaddr: xnaddr(bytes, 0x18),
-            service_id: dword(bytes, 0x3c) as i32,
-            remote_address: dword(bytes, 0x40),
-            remote_port: word(bytes, 0x44),
-            state: bytes[0x46],
-            nat_address: dword(bytes, 0x48),
-            nat_port: word(bytes, 0x4c),
-        }),
-        Table::QosLookups => Record::QosLookup(QosLookupRecord {
-            owner_type: dword(bytes, 0x04) as i32,
-            flags: dword(bytes, 0x08),
-            target_address: dword(bytes, 0x0c),
-            target_port: word(bytes, 0x10),
-            state: bytes[0x12],
-            retry: bytes[0x13],
-            secure_address: dword(bytes, 0x14),
-            probes_requested: dword(bytes, 0x18),
-            probes_sent: dword(bytes, 0x1c),
-            probes_received: dword(bytes, 0x20),
-            data_received: dword(bytes, 0x24),
-            bits_per_second: dword(bytes, 0x28),
-            xnkid: xnkid(bytes, 0x2c),
-            xnaddr: xnaddr(bytes, 0x34),
-        }),
+        Table::Sockets => {
+            // SAFETY: a socket record is 0x28 bytes.
+            let bytes = unsafe { bytes::<0x28>(record) };
+            Record::Socket(SocketRecord {
+                handle: dword(bytes, 0x00),
+                owner_type: dword(bytes, 0x04) as i32,
+                flags: dword(bytes, 0x08),
+                address_family: dword(bytes, 0x0c) as i32,
+                socket_type: dword(bytes, 0x10) as i32,
+                protocol: dword(bytes, 0x14) as i32,
+                local_address: dword(bytes, 0x18),
+                remote_address: dword(bytes, 0x1c),
+                local_port: word(bytes, 0x20),
+                remote_port: word(bytes, 0x22),
+                tcp_state: bytes[0x24],
+            })
+        }
+        Table::Keys => {
+            // SAFETY: a key record is 0x28 bytes.
+            let bytes = unsafe { bytes::<0x28>(record) };
+            Record::Key(KeyRecord {
+                xnkid: Xnkid(array(bytes, 0x00)),
+                owner_type: dword(bytes, 0x08) as i32,
+                flags: dword(bytes, 0x0c),
+                qos_data_size: dword(bytes, 0x10),
+                qos_bits_per_second: dword(bytes, 0x14),
+            })
+        }
+        Table::SecurityAssociations => {
+            // SAFETY: an association record is 0x78 bytes.
+            let bytes = unsafe { bytes::<0x78>(record) };
+            Record::SecurityAssociation(SecurityAssociationRecord {
+                secure_address: dword(bytes, 0x00),
+                owner_type: dword(bytes, 0x04) as i32,
+                flags: dword(bytes, 0x08),
+                xnkid: Xnkid(array(bytes, 0x10)),
+                xnaddr: XnAddr(array(bytes, 0x18)),
+                service_id: dword(bytes, 0x3c) as i32,
+                remote_address: dword(bytes, 0x40),
+                remote_port: word(bytes, 0x44),
+                state: bytes[0x46],
+                nat_address: dword(bytes, 0x48),
+                nat_port: word(bytes, 0x4c),
+            })
+        }
+        Table::QosLookups => {
+            // SAFETY: a QoS lookup record is 0x88 bytes.
+            let bytes = unsafe { bytes::<0x88>(record) };
+            Record::QosLookup(QosLookupRecord {
+                owner_type: dword(bytes, 0x04) as i32,
+                flags: dword(bytes, 0x08),
+                target_address: dword(bytes, 0x0c),
+                target_port: word(bytes, 0x10),
+                state: bytes[0x12],
+                retry: bytes[0x13],
+                secure_address: dword(bytes, 0x14),
+                probes_requested: dword(bytes, 0x18),
+                probes_sent: dword(bytes, 0x1c),
+                probes_received: dword(bytes, 0x20),
+                data_received: dword(bytes, 0x24),
+                bits_per_second: dword(bytes, 0x28),
+                xnkid: Xnkid(array(bytes, 0x2c)),
+                xnaddr: XnAddr(array(bytes, 0x34)),
+            })
+        }
     }
 }
 
@@ -490,10 +510,8 @@ impl network::Backend for Console {
     fn nic_stats(&mut self, device_flags: u32) -> NicStats {
         let mut block = NicStatsBlock([0; NIC_STATS_SIZE]);
         NicGetStats(device_flags, block.0.as_mut_ptr());
-        let raw = block.0;
-        let qword = |offset: usize| {
-            (u64::from(dword(&raw, offset)) << 32) | u64::from(dword(&raw, offset + 4))
-        };
+        let raw = &block.0;
+        let qword = |offset: usize| u64::from_be_bytes(array(raw, offset));
         NicStats {
             transmitted_bytes: qword(0x00),
             received_unicast_bytes: qword(0x08),
@@ -501,17 +519,17 @@ impl network::Backend for Console {
             received_unicast2_bytes: qword(0x18),
             received_multicast_bytes: qword(0x20),
             received_broadcast_bytes: qword(0x28),
-            transmitted_frames: dword(&raw, 0x30),
-            received_unicast_frames: dword(&raw, 0x34),
-            received_unicast1_frames: dword(&raw, 0x38),
-            received_unicast2_frames: dword(&raw, 0x3c),
-            received_multicast_frames: dword(&raw, 0x40),
-            received_broadcast_frames: dword(&raw, 0x44),
-            transmit_underrun_errors: dword(&raw, 0x48),
-            transmit_other_errors: dword(&raw, 0x4c),
-            receive_frame_errors: dword(&raw, 0x50),
-            receive_crc_errors: dword(&raw, 0x54),
-            receive_other_errors: dword(&raw, 0x58),
+            transmitted_frames: dword(raw, 0x30),
+            received_unicast_frames: dword(raw, 0x34),
+            received_unicast1_frames: dword(raw, 0x38),
+            received_unicast2_frames: dword(raw, 0x3c),
+            received_multicast_frames: dword(raw, 0x40),
+            received_broadcast_frames: dword(raw, 0x44),
+            transmit_underrun_errors: dword(raw, 0x48),
+            transmit_other_errors: dword(raw, 0x4c),
+            receive_frame_errors: dword(raw, 0x50),
+            receive_crc_errors: dword(raw, 0x54),
+            receive_other_errors: dword(raw, 0x58),
         }
     }
 

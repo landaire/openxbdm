@@ -233,12 +233,15 @@ impl security::Backend for Console {
     }
 
     fn user_name_at(&mut self, index: u32) -> Option<UserName> {
+        /// The kernel writes a counted name with a pointer at the start.
+        #[repr(C, align(4))]
+        struct Buffer([u8; QUERY_LENGTH]);
         let directory = self.security.directory()?;
-        let mut buffer = [0u32; QUERY_LENGTH / 4];
+        let mut buffer = Buffer([0; QUERY_LENGTH]);
         let mut context = index;
         let status = kernel::NtQueryDirectoryObject(
             directory,
-            buffer.as_mut_ptr().cast(),
+            buffer.0.as_mut_ptr(),
             QUERY_LENGTH as u32,
             u32::from(index == 0),
             &mut context,
@@ -247,10 +250,7 @@ impl security::Backend for Console {
         if failed(status) {
             return None;
         }
-        let mut bytes = [0u8; QUERY_LENGTH];
-        for (chunk, word) in bytes.chunks_exact_mut(4).zip(buffer) {
-            chunk.copy_from_slice(&word.to_be_bytes());
-        }
+        let bytes = &buffer.0;
         let length = usize::from(u16::from_be_bytes([bytes[0], bytes[1]]));
         UserName::new(bytes.get(QUERY_NAME_OFFSET..QUERY_NAME_OFFSET + length)?)
     }

@@ -168,7 +168,7 @@ extern "C" fn get_thread_list(ids: u32, count: u32) -> u32 {
         return Hresult::OK.0;
     }
     let capacity = read_u32(count) as usize;
-    let list = super::collect_thread_ids(capacity, |index, id| {
+    let list = super::collect_thread_ids(capacity, &mut |index, id| {
         write_u32(ids + 4 * index as u32, id.0)
     });
     write_u32(count, list.count as u32);

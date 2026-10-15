@@ -10,7 +10,6 @@
 //! stay in memory until export 137 writes them.
 
 use core::cell::UnsafeCell;
-use core::fmt::Write as _;
 use core::ptr::null_mut;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicPtr;
@@ -32,8 +31,8 @@ use openxbdm_server::commands::performance::xtrace::Encoder;
 use openxbdm_server::commands::performance::xtrace::Region;
 use openxbdm_server::commands::performance::xtrace::Sink;
 use openxbdm_server::commands::performance::xtrace::Thread;
-use openxbdm_server::text::Text;
 
+use super::c_string;
 use super::module_snapshot;
 use crate::backend::Console;
 use crate::backend::dispatcher;
@@ -300,31 +299,35 @@ fn break_trap() {
     unsafe { core::arch::asm!("twi 31, 0, 0x16", options(nostack)) };
 }
 
-fn print(arguments: core::fmt::Arguments<'_>) {
-    let mut text = Text::<0x200>::new();
-    // A message longer than the buffer is cut, as stock's sprintf buffer
-    // would hold it.
-    let _ = text.write_fmt(arguments);
-    output_debug_string(text.as_bytes());
-}
-
-/// Bytes of the NUL-terminated string at `address`, at most `limit`.
-fn c_string<'a>(address: u32, limit: usize) -> &'a [u8] {
-    let mut length = 0;
-    // SAFETY: callers pass a NUL-terminated string.
-    while length < limit
-        && unsafe { core::ptr::read_volatile((address as usize + length) as *const u8) } != 0
-    {
-        length += 1;
-    }
-    // SAFETY: the bytes were just read.
-    unsafe { core::slice::from_raw_parts(address as usize as *const u8, length) }
+/// Format `format` with up to four arguments, one per 8-byte va_list slot,
+/// and print it with `OutputDebugString`. A message longer than the buffer
+/// is cut, as stock's sprintf buffer would hold it.
+#[inline(never)]
+fn print(format: &core::ffi::CStr, arguments: &[u64]) {
+    let mut slots = [0u64; 4];
+    slots[..arguments.len()].copy_from_slice(arguments);
+    let mut text = [0u8; 0x200];
+    let length = kernel::_vsnprintf(
+        text.as_mut_ptr(),
+        text.len() as u32,
+        format.as_ptr() as usize as u32,
+        slots.as_ptr() as usize as u32,
+    );
+    let length = usize::try_from(length).map_or(text.len(), |length| length.min(text.len()));
+    output_debug_string(&text[..length]);
 }
 
 /// The session file name.
 fn file_name() -> ([u8; FILE_NAME_SIZE], usize) {
+    let mut name = [0u8; FILE_NAME_SIZE];
     // SAFETY: a plain cell; see `Shared`.
-    let name = unsafe { core::ptr::read_volatile(FILE_NAME.0.get()) };
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            FILE_NAME.0.get().cast::<u8>(),
+            name.as_mut_ptr(),
+            FILE_NAME_SIZE,
+        )
+    };
     let length = name
         .iter()
         .position(|&byte| byte == 0)
@@ -332,14 +335,22 @@ fn file_name() -> ([u8; FILE_NAME_SIZE], usize) {
     (name, length)
 }
 
+fn has_file_name() -> bool {
+    // SAFETY: a plain cell; see `Shared`.
+    unsafe { core::ptr::read_volatile(FILE_NAME.0.get().cast::<u8>()) != 0 }
+}
+
 /// Store the session file name as stock's bounded copy does: at most
 /// 0xff bytes and a terminator.
+#[inline(never)]
 fn set_file_name(name: &[u8]) {
-    let mut stored = [0u8; FILE_NAME_SIZE];
     let length = name.len().min(FILE_NAME_SIZE - 1);
-    stored[..length].copy_from_slice(&name[..length]);
+    let stored = FILE_NAME.0.get().cast::<u8>();
     // SAFETY: a plain cell; see `Shared`.
-    unsafe { core::ptr::write_volatile(FILE_NAME.0.get(), stored) };
+    unsafe {
+        core::ptr::copy_nonoverlapping(name.as_ptr(), stored, length);
+        core::ptr::write_bytes(stored.add(length), 0, FILE_NAME_SIZE - length);
+    }
 }
 
 /// Request of [`translate_on_server`].
@@ -494,6 +505,16 @@ fn queue_current() {
     );
     FILLED[buffer_index(buffer)].store(buffer, Ordering::Release);
     CURRENT.store(null_mut(), Ordering::Release);
+}
+
+/// Empty the free and filled buffer slots.
+fn clear_queues() {
+    for slot in &FREE {
+        slot.store(null_mut(), Ordering::Release);
+    }
+    for slot in &FILLED {
+        slot.store(null_mut(), Ordering::Release);
+    }
 }
 
 /// Writes words at a cursor in session memory.
@@ -883,11 +904,13 @@ fn flush() {
         if progress_mark() + interval > total {
             break;
         }
-        print(format_args!(
-            "Tracing: {} K instructions recorded of {} K.\r\n",
-            recorded / interval * interval / 1000,
-            total / interval * interval / 1000
-        ));
+        print(
+            c"Tracing: %I64d K instructions recorded of %I64d K.\r\n",
+            &[
+                (recorded / interval * interval / 1000) as u64,
+                (total / interval * interval / 1000) as u64,
+            ],
+        );
         set_progress_mark(progress_mark() + interval);
     }
 }
@@ -1209,12 +1232,14 @@ fn report_timing() {
         let elapsed = kernel::timebase().wrapping_sub(session.start_time) as i64;
         let frequency = kernel::performance_frequency() as i64;
         let deferred = i64::from(session.encoder.deferred());
-        print(format_args!(
-            "Tracing: {} ms to record {} instructions of {}.\n",
-            elapsed.wrapping_mul(1000) / frequency,
-            (session.encoder.recorded() as i64).wrapping_sub(deferred),
-            (session.encoder.total() as i64).wrapping_sub(deferred)
-        ));
+        print(
+            c"Tracing: %I64d ms to record %I64d instructions of %I64d.\n",
+            &[
+                (elapsed.wrapping_mul(1000) / frequency) as u64,
+                session.encoder.recorded().wrapping_sub(deferred as u64),
+                session.encoder.total().wrapping_sub(deferred as u64),
+            ],
+        );
     }
     if FAILED.load(Ordering::Acquire) {
         output_debug_string(b"Tracing: One or more trace recording errors occurred.\n");
@@ -1226,15 +1251,19 @@ fn report_mismatches() {
     let encoder = &mut session().encoder;
     let (count, kept) = encoder.mismatches();
     if count != 0 {
-        print(format_args!(
-            "{} tracing error(s) detected. Please send the debug prints,\ntrace file, and executable to gameds@microsoft.com.\n",
-            count as i32
-        ));
+        print(
+            c"%d tracing error(s) detected. Please send the debug prints,\ntrace file, and executable to gameds@microsoft.com.\n",
+            &[u64::from(count)],
+        );
         for mismatch in kept {
-            print(format_args!(
-                "\tInstnum {}, expected address {:08x}, found address {:08x}\n",
-                mismatch.instruction as i64, mismatch.expected, mismatch.found
-            ));
+            print(
+                c"\tInstnum %I64d, expected address %08x, found address %08x\n",
+                &[
+                    mismatch.instruction,
+                    u64::from(mismatch.expected),
+                    u64::from(mismatch.found),
+                ],
+            );
         }
     }
     encoder.clear_mismatches();
@@ -1253,11 +1282,9 @@ fn free_memory() {
 
 /// Stock 0x91f668c0: a session with a file frees its memory; the hooks go.
 fn release() {
-    if file_name().1 != 0 {
+    if has_file_name() {
         free_memory();
-        for slot in FREE.iter().chain(&FILLED) {
-            slot.store(null_mut(), Ordering::Release);
-        }
+        clear_queues();
         BASE.store(0, Ordering::Release);
         session().encoder.clear_start();
     }
@@ -1284,24 +1311,22 @@ extern "C" fn stop_recording() -> u32 {
     report_mismatches();
     release();
     if let Some(address) = session().stop_address.take() {
-        print(format_args!(
-            "Tracing stopped at IAR {address:08x} because\n"
-        ));
+        print(
+            c"Tracing stopped at IAR %08x because\n",
+            &[u64::from(address)],
+        );
         output_debug_string(
             b"the trace buffer filled up. Use XTraceSetBufferSize to increase the buffer\n",
         );
-        print(format_args!(
-            "size (currently {}).\n",
-            SIZE_LIMIT.load(Ordering::Relaxed) as i32
-        ));
+        print(
+            c"size (currently %d).\n",
+            &[u64::from(SIZE_LIMIT.load(Ordering::Relaxed))],
+        );
     }
-    let mut text = Text::<0x40>::new();
-    let _ = write!(
-        text,
-        "Spoofed {} functions.\n",
-        SPOOFED.swap(0, Ordering::Relaxed) as i32
+    super::pmc::print(
+        c"Spoofed %d functions.\n",
+        &[u64::from(SPOOFED.swap(0, Ordering::Relaxed))],
     );
-    kernel::debug_print_bytes(text.as_bytes());
     STOP_REQUESTED.store(false, Ordering::Release);
     u32::from(!FAILED.load(Ordering::Acquire))
 }
@@ -1367,9 +1392,7 @@ extern "C" fn title_terminated() {
     STOP_REQUESTED.store(false, Ordering::Release);
     FAILED.store(false, Ordering::Release);
     CURRENT.store(null_mut(), Ordering::Release);
-    for slot in FREE.iter().chain(&FILLED) {
-        slot.store(null_mut(), Ordering::Release);
-    }
+    clear_queues();
     WRITER_HANDLE.store(0, Ordering::Release);
     set_file_name(&[]);
     session().encoder.clear_start();

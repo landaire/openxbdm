@@ -13,6 +13,7 @@
 *.pending-snap
 
 /buck-out
+/.buckconfig.local
 /.cargo/*
 /.devenv
 /.devenv.flake.nix

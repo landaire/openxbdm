@@ -110,6 +110,7 @@ def _rust_release_toolchain_impl(ctx: AnalysisContext) -> list[Provider]:
             rustc_flags = ctx.attrs.rustc_flags,
             rustc_target_triple = release.host_triple,
             rustdoc = tool("rustdoc"),
+            rustdoc_flags = ctx.attrs.rustdoc_flags,
         ),
     ]
 
@@ -123,6 +124,7 @@ rust_release_toolchain = rule(
         # Also passed to tests, which the prelude builds as binaries.
         "rustc_binary_flags": attrs.list(attrs.string(), default = []),
         "rustc_flags": attrs.list(attrs.string(), default = []),
+        "rustdoc_flags": attrs.list(attrs.string(), default = []),
     },
     is_toolchain_rule = True,
 )

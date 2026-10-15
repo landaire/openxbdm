@@ -56,6 +56,10 @@ jobs:
     needs: [check, build]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check.outputs.head }}
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -75,8 +79,9 @@ jobs:
             gh api -X DELETE "repos/$GH_REPO/git/refs/tags/nightly"
           fi
           date=$(date -u +%Y-%m-%d)
+          python3 build_defs/release_notes.py --version nightly --commit "$HEAD" --date "$date" > "$RUNNER_TEMP/notes.md"
           gh release create nightly dist/* \
             --prerelease \
             --target "$HEAD" \
             --title "Nightly $date" \
-            --notes "Built from $HEAD on $date. Nightly builds are not versioned releases; each one replaces the previous."
+            --notes-file "$RUNNER_TEMP/notes.md"

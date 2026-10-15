@@ -38,16 +38,26 @@ jobs:
     secrets: inherit
 
   publish:
-    needs: build
+    needs: [check, build]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
+      - name: Write the release notes
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: python3 build_defs/release_notes.py --version "$VERSION" --commit "$GITHUB_SHA" > "$RUNNER_TEMP/notes.md"
+
+      # The generated notes (the changes since the previous release) follow
+      # the file.
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
           fail_on_unmatched_files: true
+          body_path: ${{ runner.temp }}/notes.md
           generate_release_notes: true

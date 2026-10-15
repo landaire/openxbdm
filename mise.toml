@@ -1,10 +1,14 @@
 [tasks.build]
-description = "Builds the workspace crates with Buck2"
-run = "buck2 build //crates/..."
+description = "Builds the host tools, the C++ headers and the console module with Buck2"
+run = "buck2 build //: //bindings/... //crates/... //xbox360/..."
 
 [tasks.test]
-description = "Runs the tests of the workspace crates with Buck2"
-run = "buck2 test //crates/..."
+description = "Runs the tests with Buck2"
+run = "buck2 test //: //bindings/... //crates/... //xbox360/..."
+
+[tasks.xex]
+description = "Builds the console module (openxbdm.xex and the boot-guard build)"
+run = "buck2 build //xbox360:openxbdm //xbox360:openxbdm-boot-guard --show-output"
 
 [tasks.lint]
 description = "Checks formatting and clippy diagnostics with Buck2"

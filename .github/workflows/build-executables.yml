@@ -1,15 +1,16 @@
 name: Build executables
 
-# Builds the released executables with the release profile on each release
-# platform, and the FFI libraries with their C++ headers, and uploads the
-# archives as artifacts of the calling run. release.yml and nightly.yml call
-# it and publish the archives.
+# Builds the release files and uploads them as artifacts of the calling run:
+# on each release platform, the host tools and the FFI libraries with their
+# C++ headers (build_defs/package_release.py); once, the console module
+# (build_defs/package_module.py), which is the same on every host.
+# release.yml and nightly.yml call it and publish the files.
 
 on:
   workflow_call:
     inputs:
       version:
-        description: Version in the archive names, for example 0.1.0 or nightly.
+        description: Version in the file names, for example 0.1.0 or nightly.
         required: true
         type: string
       ref:
@@ -25,8 +26,10 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            module: true
           - os: macos-15
             target: aarch64-apple-darwin
+            module: false
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -46,7 +49,7 @@ jobs:
       - name: Install devenv
         run: nix profile install nixpkgs#devenv
 
-      - name: Build and archive the executables
+      - name: Build and archive the host tools and FFI libraries
         env:
           VERSION: ${{ inputs.version }}
           TARGET: ${{ matrix.target }}
@@ -54,10 +57,19 @@ jobs:
           devenv --profile ci shell -- python3 build_defs/package_release.py
           --version "$VERSION" --target "$TARGET" --out-dir dist
 
+      - name: Build the console module
+        if: matrix.module
+        env:
+          VERSION: ${{ inputs.version }}
+        run: >-
+          devenv --profile ci shell -- python3 build_defs/package_module.py
+          --version "$VERSION" --out-dir dist
+
       - uses: actions/upload-artifact@v4
         with:
-          name: openxbdm-${{ matrix.target }}
+          name: xeedee-${{ matrix.target }}
           path: dist/*
+          if-no-files-found: error
 
   windows:
     name: x86_64-pc-windows-msvc
@@ -75,7 +87,7 @@ jobs:
         shell: pwsh
         run: ./ci/prepare-windows-runner.ps1 -Source $env:GITHUB_WORKSPACE -Destination C:\a -AlsoExclude C:\buck2
 
-      - name: Build and archive the executables
+      - name: Build and archive the host tools and FFI libraries
         shell: pwsh
         working-directory: C:\a
         env:
@@ -87,70 +99,6 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: openxbdm-x86_64-pc-windows-msvc
+          name: xeedee-x86_64-pc-windows-msvc
           path: dist/*
-
-  # The C++ headers come from diplomat-tool, an executable from crates.io
-  # that no workspace crate depends on, so Buck2 has no rule for it. Cargo,
-  # through rustup and rust-toolchain.toml, builds the libraries the headers
-  # describe and installs the tool.
-  ffi:
-    name: FFI ${{ matrix.target }}
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            libraries: libopenxbdm_ffi.so libopenxbdm_ffi.a
-          - os: macos-15
-            target: aarch64-apple-darwin
-            libraries: libopenxbdm_ffi.dylib libopenxbdm_ffi.a
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            libraries: openxbdm_ffi.dll openxbdm_ffi.lib
-    runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        shell: bash
-    env:
-      ARCHIVE: openxbdm-ffi-${{ inputs.version }}-${{ matrix.target }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref }}
-
-      - name: Build the FFI libraries
-        run: cargo build --locked --release -p openxbdm-ffi
-
-      - name: Generate the C++ bindings
-        run: |
-          cargo install diplomat-tool --version '^0.15' --locked --root "$RUNNER_TEMP/diplomat"
-          "$RUNNER_TEMP/diplomat/bin/diplomat-tool" cpp crates/openxbdm-ffi/bindings/cpp --entry crates/openxbdm-ffi/src/lib.rs
-
-      - name: Stage the archive
-        env:
-          LIBRARIES: ${{ matrix.libraries }}
-        run: |
-          mkdir -p "dist/$ARCHIVE/lib" "dist/$ARCHIVE/include"
-          for library in $LIBRARIES; do
-            cp "target/release/$library" "dist/$ARCHIVE/lib/"
-          done
-          cp -r crates/openxbdm-ffi/bindings/cpp/. "dist/$ARCHIVE/include/"
-          cp README.md "dist/$ARCHIVE/"
-
-      - name: Archive (tar.gz)
-        if: runner.os != 'Windows'
-        run: tar -C dist -czf "dist/$ARCHIVE.tar.gz" "$ARCHIVE"
-
-      - name: Archive (zip)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: Compress-Archive -Path "dist/$env:ARCHIVE" -DestinationPath "dist/$env:ARCHIVE.zip"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: openxbdm-ffi-${{ matrix.target }}
-          path: |
-            dist/*.tar.gz
-            dist/*.zip
           if-no-files-found: error

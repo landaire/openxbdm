@@ -7,139 +7,47 @@ on:
 permissions:
   contents: write
 
-env:
-  CARGO_TERM_COLOR: always
+# A `vX.Y.Z` tag publishes a GitHub release with the archives that
+# build-executables.yml builds from the tagged commit. The tag must name the
+# workspace version in Cargo.toml.
 
 jobs:
-  build-cli:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            bin: openxbdm
-            archive: tar.gz
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            bin: openxbdm
-            archive: tar.gz
-          - os: macos-13
-            target: x86_64-apple-darwin
-            bin: openxbdm
-            archive: tar.gz
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            bin: openxbdm.exe
-            archive: zip
-    runs-on: ${{ matrix.os }}
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release -p openxbdm-cli --bin openxbdm
 
-      - name: Package (tar.gz)
-        if: matrix.archive == 'tar.gz'
-        shell: bash
+      - name: Check that the tag names the workspace version
+        id: version
         run: |
-          mkdir dist
-          cp target/release/${{ matrix.bin }} dist/
-          cp README.md LICENSE-APACHE LICENSE-MIT dist/ 2>/dev/null || true
-          tar -C dist -czf openxbdm-${{ matrix.target }}.tar.gz .
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not name the workspace version ${version}"
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
 
-      - name: Package (zip)
-        if: matrix.archive == 'zip'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target/release/${{ matrix.bin }} dist/
-          Copy-Item README.md dist/ -ErrorAction SilentlyContinue
-          Compress-Archive -Path dist/* -DestinationPath openxbdm-${{ matrix.target }}.zip
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: cli-${{ matrix.target }}
-          path: |
-            openxbdm-${{ matrix.target }}.tar.gz
-            openxbdm-${{ matrix.target }}.zip
-
-  build-ffi:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            cdylib: libopenxbdm_ffi.so
-            staticlib: libopenxbdm_ffi.a
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            cdylib: libopenxbdm_ffi.dylib
-            staticlib: libopenxbdm_ffi.a
-          - os: macos-13
-            target: x86_64-apple-darwin
-            cdylib: libopenxbdm_ffi.dylib
-            staticlib: libopenxbdm_ffi.a
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            cdylib: openxbdm_ffi.dll
-            staticlib: openxbdm_ffi.lib
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install diplomat-tool
-        run: cargo install diplomat-tool --version '^0.15' --locked
-
-      - name: Build openxbdm-ffi (release)
-        run: cargo build --release -p openxbdm-ffi
-
-      - name: Generate C++ bindings
-        shell: bash
-        run: diplomat-tool cpp crates/openxbdm-ffi/bindings/cpp --entry crates/openxbdm-ffi/src/lib.rs
-
-      - name: Stage artifacts
-        shell: bash
-        run: |
-          mkdir -p dist/lib dist/include
-          cp target/release/${{ matrix.cdylib }} dist/lib/
-          cp target/release/${{ matrix.staticlib }} dist/lib/
-          cp -r crates/openxbdm-ffi/bindings/cpp/* dist/include/
-          cp README.md dist/ 2>/dev/null || true
-
-      - name: Package (tar.gz)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: tar -C dist -czf openxbdm-ffi-${{ matrix.target }}.tar.gz .
-
-      - name: Package (zip)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: Compress-Archive -Path dist/* -DestinationPath openxbdm-ffi-${{ matrix.target }}.zip
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ffi-${{ matrix.target }}
-          path: |
-            openxbdm-ffi-${{ matrix.target }}.tar.gz
-            openxbdm-ffi-${{ matrix.target }}.zip
+  build:
+    needs: check
+    uses: ./.github/workflows/build-executables.yml
+    with:
+      version: ${{ needs.check.outputs.version }}
+      ref: ${{ github.sha }}
+    secrets: inherit
 
   publish:
-    needs: [build-cli, build-ffi]
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          path: dist
           merge-multiple: true
-
-      - name: List artifacts
-        run: find artifacts -type f
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: |
-            artifacts/*.tar.gz
-            artifacts/*.zip
+          files: dist/*
+          fail_on_unmatched_files: true
           generate_release_notes: true

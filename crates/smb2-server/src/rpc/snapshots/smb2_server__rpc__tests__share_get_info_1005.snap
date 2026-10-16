@@ -1,0 +1,7 @@
+---
+source: "../../var/home/lander/dev/xeedee-smb/crates/smb2-server/src/rpc/tests.rs"
+expression: "hex(&reply(&mut pipe, &SHARE_GET_INFO_1005))"
+---
+0000: 05 00 02 03 10 00 00 00 28 00 00 00 04 00 00 00
+0010: 10 00 00 00 00 00 00 00 ed 03 00 00 00 00 02 00
+0020: 00 00 00 00 00 00 00 00

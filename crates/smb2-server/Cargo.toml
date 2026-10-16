@@ -1,0 +1,18 @@
+[package]
+name = "smb2-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sans-io, allocation-free SMB 2 file server"
+keywords = ["smb", "smb2", "cifs", "no_std", "sans-io"]
+categories = ["network-programming", "no-std::no-alloc"]
+
+[lib]
+path = "src/lib.rs"
+# Buck2 links doctests against a staticlib of the crate, which this no_std
+# crate cannot be without a panic handler. It has no doctests.
+doctest = false
+
+[dev-dependencies]
+insta = "1.47.2"

@@ -1,0 +1,6 @@
+---
+source: crates/smb2-server/tests/server/info.rs
+expression: hex(reply.output())
+---
+0000: 00 b0 2a 1c 6d 8f d9 01 78 56 34 12 00 00 00 00
+0010: 00 00 00 00 00 00 00 00

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Sans-io codec and session state for the Xbox 360 kernel debugger network transport"
+publish = false
 
 [lib]
 path = "src/lib.rs"

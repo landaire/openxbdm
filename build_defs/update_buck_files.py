@@ -350,10 +350,16 @@ def crate_rules(package, directory, resolved, suffix, default, console):
         }
         if "cdylib" in library["crate_types"]:
             # The `[cdylib]` subtarget gets Cargo's file name, which is also
-            # its soname, instead of one derived from the target label.
+            # its soname or install name, instead of one derived from the
+            # target label. The extension is spelled out because `$(ext)`
+            # expands to `.so` on macOS with these toolchains.
             crate = attributes["crate"]
             attributes["soname"] = Raw(
-                f'select({{"DEFAULT": "lib{crate}.$(ext)", "prelude//os:windows": "{crate}.$(ext)"}})'
+                "select({"
+                f'"DEFAULT": "lib{crate}.so", '
+                f'"prelude//os:macos": "lib{crate}.dylib", '
+                f'"prelude//os:windows": "{crate}.dll"'
+                "})"
             )
         rules.append(call("rust_library", attributes))
         if library["test"] and default:

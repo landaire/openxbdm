@@ -21,7 +21,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 # Rules of the workspace crates, including their tests. Console crates
-# (xbox360_executable rules) have no clippy subtarget.
+# (xbox360_executable_core rules) have no clippy subtarget.
 WORKSPACE_TARGETS = 'kind("^rust_(library|binary|test)$", root//crates/...)'
 
 

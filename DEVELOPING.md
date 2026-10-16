@@ -159,10 +159,12 @@ changed. `build_defs/release_notes.py` writes the notes of both.
 `openxbdm-server-xbox360` targets `powerpc-unknown-xbox360`. Its
 `[package.metadata.buck2.xbox360]` table names its linker script, and
 `build_defs/update_buck_files.py` makes each of its binaries an
-`xbox360_executable` (`build_defs/xbox360_module.bzl`). That rule
-configures itself and its dependencies for the console, with the `core`,
-`alloc` and `compiler_builtins` crates that the cell builds from the
-standard library overlay. `xbox360/BUCK` builds the module from it:
+`xbox360_executable_core` of the rust-xbox360 cell
+(`@xbox360//buck:xex.bzl`). That rule configures itself and its
+dependencies for the console, with the `core`, `alloc` and
+`compiler_builtins` crates that the cell builds from the standard library
+overlay. `xbox360/BUCK` builds the module from it with the cell's
+`xex_from_assembly`:
 
 | Target | Module |
 | --- | --- |
@@ -171,31 +173,28 @@ standard library overlay. `xbox360/BUCK` builds the module from it:
 | `//xbox360:openxbdm-no-rewrite` | `openxbdm-no-rewrite.xex`, without the save and restore rewrite |
 
 Console crates are built for size (`toolchains/BUCK`): `-Copt-level=z`,
-one code generation unit, `-Cpanic=immediate-abort`, and `-Clto=fat` for
-the executable. rustc writes the executable's one LTO code generation
-unit as assembly along with the image it links (the `[asm]` subtarget and
-the default output of the executable).
+one code generation unit, and `-Cpanic=immediate-abort`.
+`xbox360_executable_core` compiles the executable as one fat LTO code
+generation unit, and rustc writes that unit as assembly along with the
+image it links (the `[asm]` subtarget and the default output of the
+executable).
 
-`openxbdm-asm-rewrite` replaces the callee-saved register saves and
-restores in prologues and epilogues with shared helper routines (rules in
-`crates/openxbdm-asm-rewrite/src/analysis.rs`). rustc assembles the
-result with the integrated assembler of its LLVM (a crate that holds only
-the assembly, in `global_asm!`), and rust-lld links it with
-`compiler_builtins`, which LTO leaves out, with the arguments rustc passes
-when it links the executable. The same link of the object that rustc
-linked (the executable's `[obj]` subtarget) must reproduce rustc's image,
-or the build fails. An audit of the `llvm-objdump` disassembly then fails
-the build if any rewritable sequence remains. Subtargets of
-the module targets hold the intermediate files: `[asm]`, `[elf]`,
-`[unstripped]`, `[disassembly]`, `[audit]`, `[rewrite-report]`, and
-`[refusals]`, which lists each sequence left unchanged and why.
+The cell's `xbox360-asm-rewrite` replaces the callee-saved register saves
+and restores in prologues and epilogues with shared helper routines.
+rustc assembles the result, and rust-lld links it with
+`compiler_builtins` as rustc links the executable. The build fails unless
+the same link of rustc's own object reproduces rustc's image. An audit of
+the disassembly fails it if any rewritable sequence remains. The module
+targets have subtargets for the intermediate files: `[asm]`, `[elf]`,
+`[unstripped]`, `[disassembly]`, `[audit]`, `[rewrite-report]`,
+`[refusals]` (each sequence left unchanged and why) and `[reservations]`.
 
 In every case the build fails if the image holds an `lwarx`, `ldarx`,
 `stwcx.`, or `stdcx.` outside the interrupt-protected form the kernel
-loader accepts (`crates/openxbdm-asm-rewrite/src/reservation.rs`). LLVM
-emits unprotected reservations for `core::sync::atomic` read-modify-write
-operations unless `core` carries the atomics overlay of rust-xbox360
-(`toolchain/rust-std-xbox360`), as the cell's `core` does.
+loader accepts. LLVM emits unprotected reservations for
+`core::sync::atomic` read-modify-write operations unless `core` carries
+the atomics overlay of rust-xbox360 (`toolchain/rust-std-xbox360`), as the
+cell's `core` does.
 
 xex-link (`xbox360//crates/xex-link:xex-link`) converts the image with the
 metadata in `xbox360/xex.toml`.
@@ -310,8 +309,9 @@ which writes:
 
 A crate built for the Xbox 360 has a `[package.metadata.buck2.xbox360]`
 table that names its linker script (`link_script`). It may have only
-binaries, which become `xbox360_executable` rules without tests. Build
-scripts of workspace crates are not supported.
+binaries, which become `xbox360_executable_core` rules
+(`@xbox360//buck:xex.bzl`) without tests. Build scripts of workspace
+crates are not supported.
 
 The other build files are written by hand: `BUCK` (the Rust release
 check), `bindings/BUCK` (the C++ headers), `xbox360/BUCK` (the console

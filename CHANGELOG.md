@@ -32,7 +32,7 @@
 - Add the `boot-guard` feature: a boot without `DEVKIT:\FlashEx\openxbdm.arm` removes the `DEVKIT:\FlashEx\xbdm.xex` override and restarts into the flash monitor.
 - Deploy the module as `DEVKIT:\FlashEx\xbdm.xex` with a matching bounding path; it removes that file at startup.
 - Pack the image on 4 KB pages (`.text` at `0x91f01000`; xex-link derives section alignment from the small-pages flag), so the image ends below xshell at `0x92000000`.
-- Replace inline callee-saved register saves and restores with shared helpers (`openxbdm-asm-rewrite` on the module's LTO assembly; `//xbox360:openxbdm-no-rewrite` builds without it), and fail the build on reservation instructions the kernel loader reports as unprotected.
+- Replace inline callee-saved register saves and restores with shared helpers (`xbox360-asm-rewrite` of rust-xbox360 on the module's LTO assembly; `//xbox360:openxbdm-no-rewrite` builds without it), and fail the build on reservation instructions the kernel loader reports as unprotected.
 - Shrink static data to stock's layouts: 0x298-class connection slots, one static 0x488 breakpoint block with pool blocks after it, a static transfer block with pool fallback for `threads`, `getcontext`, and similar replies, and detour records from the pool at the first `detour start`.
 - Loaded footprint: image 0xbb000 bytes (stock 0xaf000); with xshell idle the console reports 22 more free pages than with stock XBDM.
 - Place the export table in an executable section (`.xexp`); the loader hypercall reads it only from protected code pages.
@@ -58,7 +58,7 @@
 
 - Build, test and lint with Buck2. `build_defs/update_buck_files.py` generates `crates/<name>/BUCK` for each workspace crate from Cargo's resolution, including test targets and `-all-features` variants, and `third-party/rust/BUCK` through Reindeer.
 - Buck2 downloads each crates.io dependency and checks it against the SHA-256 in `Cargo.lock`; nothing is vendored. Cargo fetches from crates.io.
-- Build the Xbox 360 module with Buck2 (`//xbox360:openxbdm`, `//xbox360:openxbdm-boot-guard`) on every host, with the toolchain, standard library overlay and xex-link of rust-xbox360 as the `xbox360` external cell pinned to a commit. rustc assembles the rewritten module, and llvm-objdump comes from the Rust release; no LLVM installation, overlay step or `build_xbox360.sh` is needed.
+- Build the Xbox 360 module with Buck2 (`//xbox360:openxbdm`, `//xbox360:openxbdm-boot-guard`) on every host, with the toolchain, standard library overlay, build rules, xex-link and xbox360-asm-rewrite of rust-xbox360 as the `xbox360` external cell pinned to a commit. rustc assembles the rewritten module, and llvm-objdump comes from the Rust release; no LLVM installation, overlay step or `build_xbox360.sh` is needed.
 - Buck2 uses the Rust release that the `xbox360` cell pins (1.98.0); `rust-toolchain.toml` names the same release for Cargo and rust-analyzer, and `//:rust-toolchain-test` checks that they match. On Linux the host C driver links with the lld bundled in `rustc`.
 - Generate the C++ headers of `openxbdm-ffi` with Buck2 (`//bindings:cpp`, through `openxbdm-ffi-bindgen`), and build its shared and static libraries as subtargets of its library.
 - Format with a pinned nightly rustfmt (`.rustfmt.toml`); `build_defs/lint.py` checks formatting and clippy diagnostics through Buck2.

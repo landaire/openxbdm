@@ -32,9 +32,9 @@ xbox360_toolchains(
     rustc_binary_flags = _PROFILE_RUSTC_BINARY_FLAGS[_PROFILE],
     rustc_flags = _PROFILE_RUSTC_FLAGS[_PROFILE],
     # The console module (xbox360/BUCK) shares the console's memory with the
-    # running title, so it is built for size in every profile: one LTO
-    # module, and panics that trap without formatting a message.
-    xbox360_rustc_binary_flags = ["-Clto=fat"],
+    # running title, so it is built for size in every profile, with panics
+    # that trap without formatting a message. `xbox360_executable_core`
+    # compiles it as one fat LTO module.
     xbox360_rustc_flags = ["-Cpanic=immediate-abort"],
 )
 

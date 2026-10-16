@@ -1,9 +1,9 @@
-load("//build_defs:xbox360_module.bzl", "xbox360_module")
+load("@xbox360//buck:xex.bzl", "xex_from_assembly")
 
 _MODULE = "//crates/openxbdm-server-xbox360:openxbdm-server-xbox360"
 
 # For the kd host (DEVELOPING.md, Console deployment).
-xbox360_module(
+xex_from_assembly(
     name = "openxbdm",
     executable = _MODULE + "-bin",
     manifest = "xex.toml",
@@ -13,7 +13,7 @@ xbox360_module(
 
 # For DEVKIT:\FlashEx. `boot-guard` is the module's only feature outside
 # the defaults, so the `-all-features` executable is the boot-guard build.
-xbox360_module(
+xex_from_assembly(
     name = "openxbdm-boot-guard",
     executable = _MODULE + "-all-features-bin",
     manifest = "xex.toml",
@@ -22,7 +22,7 @@ xbox360_module(
 )
 
 # Without the save and restore rewrite.
-xbox360_module(
+xex_from_assembly(
     name = "openxbdm-no-rewrite",
     executable = _MODULE + "-bin",
     manifest = "xex.toml",

@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/openxbdm-asm-rewrite",
     "crates/openxbdm-core",
     "crates/openxbdm-client",
     "crates/openxbdm-cli",

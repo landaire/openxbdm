@@ -23,7 +23,7 @@ Cargo.toml stays the description of every crate; the build files follow it:
 A crate built for the Xbox 360, the console module, has a
 `[package.metadata.buck2.xbox360]` table in its Cargo.toml that names its
 linker script (`link_script`). Each of its binaries becomes an
-`xbox360_executable` (build_defs/xbox360_module.bzl), which configures
+`xbox360_executable_core` (`@xbox360//buck:xex.bzl`), which configures
 itself for the console; it has no tests. Build scripts are not supported.
 
 Reindeer generates rules and aliases only for the normal dependencies that
@@ -387,7 +387,7 @@ def crate_rules(package, directory, resolved, suffix, default, console):
             if console is not None:
                 # xbox360/BUCK builds the module from every feature selection.
                 attributes = attributes | {"link_script": console["link_script"], "visibility": ["PUBLIC"]}
-                rules.append(call("xbox360_executable", attributes))
+                rules.append(call("xbox360_executable_core", attributes))
                 continue
             rules.append(call("rust_binary", attributes))
             if target["test"] and default:
@@ -470,7 +470,7 @@ def crate_build_file(workspace, package, aliases):
     if any(rule.startswith("rust_test(") for _, rule in rules):
         text += '\nload("//build_defs:rust_test.bzl", "rust_test")\n'
     if console is not None:
-        text += '\nload("//build_defs:xbox360_module.bzl", "xbox360_executable")\n'
+        text += '\nload("@xbox360//buck:xex.bzl", "xbox360_executable_core")\n'
     text += "\nENV = " + starlark(package_env(package)) + "\n"
     for _, rule in rules:
         text += "\n" + rule

@@ -21,7 +21,7 @@
 
 [external_cell_xbox360]
   git_origin = https://github.com/landaire/rust-xbox360
-  commit_hash = aae3374b113adf9f7030cc06c5079fd1996d1247
+  commit_hash = 1fd7a04e90c7dadb8d18eea0881bf0997c3154e3
 
 [parser]
   target_platform_detector_spec = target:root//...->prelude//platforms:default \

@@ -16,6 +16,8 @@ use openxbdm_server::commands::performance::DisplayInformation;
 use openxbdm_server::commands::performance::PixDogma;
 use openxbdm_server::commands::performance::PixMessage;
 use openxbdm_server::commands::performance::capture::CaptureFlags;
+use openxbdm_server::commands::performance::profiler::ProfilerError;
+use openxbdm_server::commands::performance::profiler::ProfilerFlags;
 use openxbdm_server_host::backend::performance::CaptureSession;
 use openxbdm_server_host::backend::performance::Display;
 use openxbdm_server_host::backend::performance::PAGES;
@@ -317,7 +319,7 @@ fn capctrl_replies_with_the_result() {
             .performance
             .capture
             .previous_flags,
-        5
+        CaptureFlags(5)
     );
 
     assert_eq!(
@@ -379,7 +381,7 @@ fn capctrl_call_cap_and_full_buffers() {
         let host = server.host.lock();
         let capture = &host.backend.performance.capture;
         assert_eq!(capture.kernel_call_cap, [true, false]);
-        assert_eq!(capture.previous_flags, 0x8002_0000);
+        assert_eq!(capture.previous_flags, CaptureFlags(0x8002_0000));
         assert_eq!(capture.written, [CAPTURE_PATH.as_bytes().to_vec()]);
     }
 
@@ -412,6 +414,25 @@ fn capctrl_hands_bit_31_sizes_to_the_title() {
     assert_eq!(
         session.command("capctrl start name=e:\\cap.cap buffersize=0x80400000"),
         "200- HRESULT 0x02da0000"
+    );
+    // A title answering 0 leaves the command without a status line; the
+    // start clears the title-terminated mark.
+    {
+        let mut host = server.host.lock();
+        let capture = &mut host.backend.performance.capture;
+        capture.title_capture = Some(Hresult::NO_REPLY);
+        capture.title_terminated = true;
+    }
+    session.send("capctrl start name=e:\\cap.cap buffersize=0x80400000");
+    server.wait_until(|host| !host.backend.performance.capture.title_terminated);
+    assert_eq!(
+        session.command("capctrl profilingstatus"),
+        "424- HRESULT 0x82da0018"
+    );
+    server.host.lock().backend.performance.capture.title_capture = Some(Hresult(0x0000_0035));
+    assert_eq!(
+        session.command("capctrl start name=e:\\cap.cap buffersize=0x80400000"),
+        "200- HRESULT 0x00000035"
     );
     assert_eq!(server.host.lock().backend.performance.capture.session, None);
 }
@@ -447,7 +468,7 @@ fn lopctrl_tracks_the_running_profiler() {
         .backend
         .performance
         .cpu_profiler
-        .stop_result = Hresult::error(0x2d);
+        .stop_result = Err(ProfilerError::NotCounterOwner);
     assert_eq!(session.command("lopctrl stop"), "445- HRESULT 0x82da002d");
     server
         .host
@@ -455,10 +476,10 @@ fn lopctrl_tracks_the_running_profiler() {
         .backend
         .performance
         .cpu_profiler
-        .initialize_result = Hresult::error(0x105);
+        .initialize_result = Err(ProfilerError::NoKernel);
     assert_eq!(
         session.command("lopctrl start name=e:\\c.cpu"),
-        "400- HRESULT 0x82da0105"
+        "403- HRESULT 0x82da0003"
     );
     assert_eq!(session.command("lopctrl info"), "424- HRESULT 0x82da0018");
     server
@@ -467,7 +488,7 @@ fn lopctrl_tracks_the_running_profiler() {
         .backend
         .performance
         .cpu_profiler
-        .initialize_result = Hresult::OK;
+        .initialize_result = Ok(());
     // A name without a drive has no object path; the engine reports the
     // writer thread failure and stays initialized.
     assert_eq!(
@@ -482,7 +503,10 @@ fn lopctrl_tracks_the_running_profiler() {
 
     let host = server.host.lock();
     let profiler = &host.backend.performance.cpu_profiler;
-    assert_eq!(profiler.initializations, [0x41, 0, 0]);
+    assert_eq!(
+        profiler.initializations,
+        [ProfilerFlags(0x41), ProfilerFlags(0), ProfilerFlags(0)]
+    );
     assert_eq!(profiler.abandons, 1);
     let started = [
         (

@@ -19,6 +19,7 @@ impl NtStatus {
     pub const BREAKPOINT: Self = Self(0x8000_0003);
     pub const SINGLE_STEP: Self = Self(0x8000_0004);
     pub const ACCESS_VIOLATION: Self = Self(0xc000_0005);
+    pub const ILLEGAL_INSTRUCTION: Self = Self(0xc000_001d);
     /// Exception code of `twi 31, r0, 0x19`.
     pub const ASSERTION_FAILURE: Self = Self(0xc000_0420);
 

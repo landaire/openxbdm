@@ -13,6 +13,8 @@ use openxbdm_core::status::Hresult;
 use super::Backoff;
 use super::CREATE_FAILED;
 use super::Creation;
+use super::Failure;
+use super::InvalidArgument;
 use super::MARK;
 use super::OPTIONS_SIZE;
 use super::Object;
@@ -20,13 +22,13 @@ use super::SPIN_ATTEMPTS;
 use super::SUCCESS;
 use super::Shape;
 use super::Side;
-use super::Status;
 use super::Tagged;
 use super::UNIQUE_FLAG;
 use super::Wait;
 use super::call;
 use super::copy;
 use super::exchange;
+use super::export_result;
 use super::fetch_add;
 use super::fetch_sub;
 use super::insert_result;
@@ -40,7 +42,6 @@ use super::remove_result;
 use super::store;
 use super::swap_tagged;
 use super::walk;
-use super::win32_result;
 use crate::exports::export;
 
 const LFPQ: u32 = u32::from_be_bytes(*b"LFPQ");
@@ -93,7 +94,10 @@ pub(super) struct SortedOptions {
 
 /// Options from a creation and a compare descriptor (optional): the
 /// routines default to unsigned order and multiplicative hashing.
-pub(super) fn sorted_options(creation: &Creation, compare: u32) -> Result<SortedOptions, Hresult> {
+pub(super) fn sorted_options(
+    creation: &Creation,
+    compare: u32,
+) -> Result<SortedOptions, InvalidArgument> {
     let mut words = [0; SORTED_OPTIONS_SIZE as usize / 4];
     words[0] = default_compare as extern "C" fn(u32, u32) -> i32 as usize as u32;
     words[1] = super::routine(default_hash);
@@ -108,7 +112,7 @@ pub(super) fn sorted_options(creation: &Creation, compare: u32) -> Result<Sorted
     if compare != 0 {
         let compare = compare as usize;
         if load(compare + 8) != COMPARE_DESCRIPTOR_SIZE {
-            return Err(Hresult::INVALID_ARGUMENT);
+            return Err(InvalidArgument);
         }
         let routine = load(compare);
         if routine != 0 {
@@ -247,11 +251,14 @@ fn find(list: Object, head: usize, key: Key, search: Search) -> Position {
 }
 
 /// Insert an item; a found key (unique keys only) fails like a timeout.
-pub(super) fn insert(list: Object, head: usize, item: Item, wait: &Wait, search: Search) -> Status {
-    let node = match list.acquire_node(wait) {
-        Ok(node) => node,
-        Err(status) => return status,
-    };
+pub(super) fn insert(
+    list: Object,
+    head: usize,
+    item: Item,
+    wait: &Wait,
+    search: Search,
+) -> Result<(), Failure> {
+    let node = list.acquire_node(wait)?;
     let address = node as usize;
     store(address, 0);
     store(address + 4, (load(address + 4) & !MARK).wrapping_add(1));
@@ -262,7 +269,7 @@ pub(super) fn insert(list: Object, head: usize, item: Item, wait: &Wait, search:
         let position = find(list, head, key, search);
         if position.outcome == Outcome::Found {
             list.release_node(node);
-            return Status::TIMEOUT;
+            return Err(Failure::Timeout);
         }
         store(address, position.current);
         store(address + 4, load(address + 4) & !MARK);
@@ -276,7 +283,7 @@ pub(super) fn insert(list: Object, head: usize, item: Item, wait: &Wait, search:
     }
     list.count_added();
     list.signal_item();
-    Status::SUCCESS
+    Ok(())
 }
 
 /// Mark and unlink the node the search finds by `item`'s key, and store its
@@ -338,7 +345,7 @@ pub(super) fn remove(
     search: Search,
     blocking: Blocking,
     handoff: Handoff,
-) -> Status {
+) -> Result<(), Failure> {
     let mut attempt = || try_remove(list, head, item, search);
     let found = 'found: {
         let Some(semaphore) = list.item_semaphore() else {
@@ -366,10 +373,9 @@ pub(super) fn remove(
             if wait.spin {
                 backoff.pause();
             }
-            let status = wait.block(semaphore);
-            if status != Status::SUCCESS {
+            if let Err(failure) = wait.block(semaphore) {
                 fetch_sub(waiters, 1);
-                return status;
+                return Err(failure);
             }
             outcome = attempt();
             let pass_on = match handoff {
@@ -384,10 +390,10 @@ pub(super) fn remove(
         true
     };
     if !found {
-        return Status::TIMEOUT;
+        return Err(Failure::Timeout);
     }
     list.count_removed();
-    Status::SUCCESS
+    Ok(())
 }
 
 /// Whether the list holds a node that is not deleted.
@@ -431,11 +437,11 @@ extern "C" fn create_export(descriptor: u32, compare: u32, output: u32) -> u32 {
     store(output as usize, 0);
     let creation = match Creation::read(descriptor) {
         Ok(creation) => creation,
-        Err(result) => return result.0,
+        Err(error) => return Hresult::from(error).0,
     };
     let options = match sorted_options(&creation, compare) {
         Ok(options) => options,
-        Err(result) => return result.0,
+        Err(error) => return Hresult::from(error).0,
     };
     let Some(queue) = super::queue::create(&SHAPE, &creation, SORTED_OPTIONS_SIZE) else {
         return CREATE_FAILED.0;
@@ -482,7 +488,7 @@ fn take(queue: u32, key: Key, search: Search, output: u32) -> u32 {
     };
     let wait = options_wait(queue.options() + RECORD, Side::Remove).unwrap_or(Wait::NONE);
     let mut item = Item { value: 0, key };
-    let status = remove(
+    if let Err(failure) = remove(
         queue,
         queue.base + HEAD,
         &mut item,
@@ -490,9 +496,8 @@ fn take(queue: u32, key: Key, search: Search, output: u32) -> u32 {
         search,
         Blocking::Wait,
         Handoff::Missing,
-    );
-    if status != Status::SUCCESS {
-        return remove_result(status);
+    ) {
+        return remove_result(failure);
     }
     if output != 0 {
         store(output as usize, item.value);
@@ -519,8 +524,8 @@ extern "C" fn enumerate(queue: u32, context: u32, callback: u32) -> u32 {
         .flatten()
     {
         Some(queue) => walk(first(queue.base + HEAD), VALUE, context, callback),
-        _ => Status::INVALID_PARAMETER.0,
+        _ => Err(Failure::InvalidParameter),
     };
-    win32_result(result).0
+    export_result(result)
 }
 export!(328, enumerate);

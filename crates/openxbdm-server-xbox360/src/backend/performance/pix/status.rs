@@ -5,6 +5,8 @@
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
+use openxbdm_core::status::Hresult;
+
 use crate::backend::session;
 
 /// Status codes of the PIX engine.
@@ -150,6 +152,6 @@ pub(crate) fn service_filter_control(argument: u32) -> u32 {
             super::write_u32(data + 8, previous);
             0
         }
-        _ => 0x8000_ffff,
+        _ => Hresult::UNEXPECTED.0,
     }
 }

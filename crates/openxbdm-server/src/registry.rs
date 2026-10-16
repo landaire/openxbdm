@@ -1,6 +1,6 @@
 //! Built-in command table entries and lookup.
 
-use openxbdm_core::status::Hresult;
+use crate::reply::CommandResult;
 
 use crate::access::Access;
 use crate::invocation::Invocation;
@@ -28,10 +28,10 @@ impl DispatchFlags {
     }
 }
 
-/// A built-in command handler. Returning [`Hresult::NO_REPLY`] sends no
-/// status line; the handler has written its own reply or closed the
-/// connection.
-pub type Handler = fn(&mut Invocation<'_>) -> Hresult;
+/// A built-in command handler. Returning [`crate::reply::Reply::Sent`]
+/// sends no status line; the handler has written its own reply or closed
+/// the connection.
+pub type Handler = fn(&mut Invocation<'_>) -> CommandResult;
 
 /// One row of the built-in command table. Access masks and flags are
 /// kept in bytes so a row takes 16 bytes.

@@ -12,20 +12,41 @@ use openxbdm_core::status::Hresult;
 
 use super::Operator;
 
-/// The value has no type (0x80070483).
-const NO_VALUE: Hresult = Hresult(0x8007_0483);
-/// The operation does not accept the value's type (0x80070545).
-const WRONG_TYPE: Hresult = Hresult(0x8007_0545);
-/// The value is wider than the target integer (0x800700ea).
-const TOO_WIDE: Hresult = Hresult(0x8007_00ea);
-/// Signed value to unsigned target or the reverse (0x800700d1).
-const SIGN_MISMATCH: Hresult = Hresult(0x8007_00d1);
-const DIVIDE_BY_ZERO: Hresult = Hresult(0x8002_0012);
-/// Signed division of `i64::MIN` by -1 (0x80070216).
-const OVERFLOW: Hresult = Hresult(0x8007_0216);
-const NEGATIVE_SHIFT: Hresult = Hresult(0x8007_0083);
-const BAD_INDEX: Hresult = Hresult(0x8007_0585);
-const BAD_LENGTH: Hresult = Hresult(0x8007_0018);
+/// Why a value operation failed. Constant folding hands the result value
+/// to titles through the simulator exports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VariantError {
+    /// The value has no type.
+    NoValue,
+    /// The operation does not accept the value's type.
+    WrongType,
+    /// The value is wider than the target integer.
+    TooWide,
+    /// Signed value to unsigned target or the reverse.
+    SignMismatch,
+    DivideByZero,
+    /// Signed division of `i64::MIN` by -1.
+    Overflow,
+    NegativeShift,
+    BadIndex,
+    BadLength,
+}
+
+impl From<VariantError> for Hresult {
+    fn from(error: VariantError) -> Self {
+        Self(match error {
+            VariantError::NoValue => 0x8007_0483,
+            VariantError::WrongType => 0x8007_0545,
+            VariantError::TooWide => 0x8007_00ea,
+            VariantError::SignMismatch => 0x8007_00d1,
+            VariantError::DivideByZero => 0x8002_0012,
+            VariantError::Overflow => 0x8007_0216,
+            VariantError::NegativeShift => 0x8007_0083,
+            VariantError::BadIndex => 0x8007_0585,
+            VariantError::BadLength => 0x8007_0018,
+        })
+    }
+}
 
 /// A string value: a byte range of the text the operators receive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,10 +119,10 @@ struct Integer {
     sign: Sign,
 }
 
-fn integer(value: &Variant) -> Result<Integer, Hresult> {
+fn integer(value: &Variant) -> Result<Integer, VariantError> {
     use Variant::*;
     let (bits, width, sign) = match *value {
-        Null => return Err(NO_VALUE),
+        Null => return Err(VariantError::NoValue),
         Bool(value) => (u64::from(value), 1, Sign::Bool),
         I8(value) => (value as u64, 8, Sign::Signed),
         I16(value) => (value as u64, 16, Sign::Signed),
@@ -111,7 +132,7 @@ fn integer(value: &Variant) -> Result<Integer, Hresult> {
         U16(value) => (value.into(), 16, Sign::Unsigned),
         U32(value) => (value.into(), 32, Sign::Unsigned),
         U64(value) => (value, 64, Sign::Unsigned),
-        Mac(_) | Ipv4(_) | Ipv6(_) | Str(_) => return Err(WRONG_TYPE),
+        Mac(_) | Ipv4(_) | Ipv6(_) | Str(_) => return Err(VariantError::WrongType),
     };
     Ok(Integer { bits, width, sign })
 }
@@ -124,33 +145,33 @@ fn is_unsigned(value: &Variant) -> bool {
 }
 
 /// 0x91f89fe0.
-pub fn to_bool(value: &Variant) -> Result<bool, Hresult> {
+pub fn to_bool(value: &Variant) -> Result<bool, VariantError> {
     integer(value).map(|value| value.bits != 0)
 }
 
 /// 0x91f8a0b8 with target type i64 and the signedness check enabled.
-pub fn to_i64(value: &Variant) -> Result<i64, Hresult> {
+pub fn to_i64(value: &Variant) -> Result<i64, VariantError> {
     let value = integer(value)?;
     if value.sign == Sign::Unsigned {
-        return Err(SIGN_MISMATCH);
+        return Err(VariantError::SignMismatch);
     }
     Ok(value.bits as i64)
 }
 
 /// 0x91f8a0b8 with target type u64 and the signedness check enabled.
-pub fn to_u64(value: &Variant) -> Result<u64, Hresult> {
+pub fn to_u64(value: &Variant) -> Result<u64, VariantError> {
     let value = integer(value)?;
     if value.sign == Sign::Signed {
-        return Err(SIGN_MISMATCH);
+        return Err(VariantError::SignMismatch);
     }
     Ok(value.bits)
 }
 
 /// 0x91f8a0b8 with target type i32 and the signedness check disabled.
-fn to_i32(value: &Variant) -> Result<i32, Hresult> {
+fn to_i32(value: &Variant) -> Result<i32, VariantError> {
     let value = integer(value)?;
     if value.width > 32 {
-        return Err(TOO_WIDE);
+        return Err(VariantError::TooWide);
     }
     Ok(value.bits as i32)
 }
@@ -174,7 +195,7 @@ fn rank(value: &Variant, unsigned: bool) -> u8 {
 ///
 /// Signed division of `i64::MIN` by -1 executes a trap instruction in
 /// stock; here it fails.
-fn arithmetic(left: &Variant, op: Arithmetic, right: &Variant) -> Result<Variant, Hresult> {
+fn arithmetic(left: &Variant, op: Arithmetic, right: &Variant) -> Result<Variant, VariantError> {
     let unsigned = is_unsigned(left) || is_unsigned(right);
     let l = integer(left)?.bits;
     let r = integer(right)?.bits;
@@ -182,13 +203,19 @@ fn arithmetic(left: &Variant, op: Arithmetic, right: &Variant) -> Result<Variant
         Arithmetic::Add => l.wrapping_add(r),
         Arithmetic::Subtract => l.wrapping_sub(r),
         Arithmetic::Multiply => l.wrapping_mul(r),
-        Arithmetic::Divide | Arithmetic::Remainder if r == 0 => return Err(DIVIDE_BY_ZERO),
+        Arithmetic::Divide | Arithmetic::Remainder if r == 0 => {
+            return Err(VariantError::DivideByZero);
+        }
         Arithmetic::Divide if unsigned => l / r,
-        Arithmetic::Divide => (l as i64).checked_div(r as i64).ok_or(OVERFLOW)? as u64,
+        Arithmetic::Divide => (l as i64)
+            .checked_div(r as i64)
+            .ok_or(VariantError::Overflow)? as u64,
         Arithmetic::Remainder if unsigned => l % r,
-        Arithmetic::Remainder => (l as i64).checked_rem(r as i64).ok_or(OVERFLOW)? as u64,
+        Arithmetic::Remainder => (l as i64)
+            .checked_rem(r as i64)
+            .ok_or(VariantError::Overflow)? as u64,
         Arithmetic::ShiftLeft | Arithmetic::ShiftRight if !unsigned && (r as i64) < 0 => {
-            return Err(NEGATIVE_SHIFT);
+            return Err(VariantError::NegativeShift);
         }
         // The shift instructions use the low seven bits of the count.
         Arithmetic::ShiftLeft => l.checked_shl((r & 0x7f) as u32).unwrap_or(0),
@@ -230,12 +257,12 @@ fn compare(
     op: Comparison,
     right: &Variant,
     text: &[u8],
-) -> Result<Variant, Hresult> {
+) -> Result<Variant, VariantError> {
     use core::cmp::Ordering;
     let ordering = match (left, right) {
         (Variant::Str(l), Variant::Str(r)) => compare_text(text, *l, *r, false).cmp(&0),
         _ => match (address(left), address(right)) {
-            (Some(l), Some(r)) if l.len() != r.len() => return Err(WRONG_TYPE),
+            (Some(l), Some(r)) if l.len() != r.len() => return Err(VariantError::WrongType),
             (Some(l), Some(r)) => l.cmp(r),
             _ => {
                 let unsigned = is_unsigned(left) || is_unsigned(right);
@@ -261,10 +288,10 @@ fn compare(
 
 /// 0x91f8a7b8. Bitwise complement; a bool becomes the i32 complement of
 /// 0 or 1.
-fn complement(value: &Variant) -> Result<Variant, Hresult> {
+fn complement(value: &Variant) -> Result<Variant, VariantError> {
     use Variant::*;
     Ok(match *value {
-        Null => return Err(NO_VALUE),
+        Null => return Err(VariantError::NoValue),
         Bool(value) => I32(!i32::from(value)),
         I8(value) => I8(!value),
         I16(value) => I16(!value),
@@ -274,12 +301,12 @@ fn complement(value: &Variant) -> Result<Variant, Hresult> {
         U16(value) => U16(!value),
         U32(value) => U32(!value),
         U64(value) => U64(!value),
-        Mac(_) | Ipv4(_) | Ipv6(_) | Str(_) => return Err(WRONG_TYPE),
+        Mac(_) | Ipv4(_) | Ipv6(_) | Str(_) => return Err(VariantError::WrongType),
     })
 }
 
 /// 0x91f8a888. Both operands are converted before either is tested.
-fn logical(left: &Variant, and: bool, right: &Variant) -> Result<Variant, Hresult> {
+fn logical(left: &Variant, and: bool, right: &Variant) -> Result<Variant, VariantError> {
     let left = to_bool(left)?;
     let right = to_bool(right)?;
     Ok(Variant::Bool(if and {
@@ -289,15 +316,15 @@ fn logical(left: &Variant, and: bool, right: &Variant) -> Result<Variant, Hresul
     }))
 }
 
-fn strings(left: &Variant, right: &Variant) -> Result<(Text, Text), Hresult> {
+fn strings(left: &Variant, right: &Variant) -> Result<(Text, Text), VariantError> {
     match (left, right) {
         (Variant::Str(left), Variant::Str(right)) => Ok((*left, *right)),
-        _ => Err(WRONG_TYPE),
+        _ => Err(VariantError::WrongType),
     }
 }
 
 /// An absent ignore-case argument selects a case-sensitive comparison.
-fn ignore_case(value: Option<&Variant>) -> Result<bool, Hresult> {
+fn ignore_case(value: Option<&Variant>) -> Result<bool, VariantError> {
     value.map_or(Ok(false), to_bool)
 }
 
@@ -307,7 +334,7 @@ fn string_compare(
     left: &Variant,
     right: &Variant,
     ignore_case_value: Option<&Variant>,
-) -> Result<Variant, Hresult> {
+) -> Result<Variant, VariantError> {
     let (left, right) = strings(left, right)?;
     let ignore_case = ignore_case(ignore_case_value)?;
     Ok(Variant::I32(compare_text(text, left, right, ignore_case)))
@@ -324,21 +351,21 @@ fn index_of(
     length: Option<&Variant>,
     ignore_case_value: Option<&Variant>,
     contains: bool,
-) -> Result<Variant, Hresult> {
+) -> Result<Variant, VariantError> {
     let (source, pattern) = strings(source, pattern)?;
     let mut window = source;
     if let Some(start) = start {
-        let offset = usize::try_from(to_i32(start)?).map_err(|_| BAD_INDEX)?;
+        let offset = usize::try_from(to_i32(start)?).map_err(|_| VariantError::BadIndex)?;
         window.start += offset;
         if window.start >= source.end {
-            return Err(BAD_INDEX);
+            return Err(VariantError::BadIndex);
         }
     }
     if let Some(length) = length {
         let length = to_i32(length)?;
-        window.end = window.start + usize::try_from(length).map_err(|_| BAD_LENGTH)?;
+        window.end = window.start + usize::try_from(length).map_err(|_| VariantError::BadLength)?;
         if length == 0 || window.end > source.end {
-            return Err(BAD_LENGTH);
+            return Err(VariantError::BadLength);
         }
     }
     let found = search(text, window, pattern, ignore_case(ignore_case_value)?);
@@ -355,7 +382,7 @@ fn starts_with(
     source: &Variant,
     pattern: &Variant,
     ignore_case_value: Option<&Variant>,
-) -> Result<Variant, Hresult> {
+) -> Result<Variant, VariantError> {
     let (source, pattern) = strings(source, pattern)?;
     let ignore_case = ignore_case(ignore_case_value)?;
     Ok(Variant::Bool(
@@ -371,7 +398,7 @@ fn ends_with(
     source: &Variant,
     pattern: &Variant,
     ignore_case_value: Option<&Variant>,
-) -> Result<Variant, Hresult> {
+) -> Result<Variant, VariantError> {
     let (source, pattern) = strings(source, pattern)?;
     let ignore_case = ignore_case(ignore_case_value)?;
     let tail = Text {
@@ -388,20 +415,27 @@ fn ends_with(
 
 /// 0x91f8b0b0. The range of `source` from `start` (at most its length)
 /// spanning `length` bytes, or to its end.
-fn substring(source: &Variant, start: &Variant, length: Option<&Variant>) -> Result<Text, Hresult> {
+fn substring(
+    source: &Variant,
+    start: &Variant,
+    length: Option<&Variant>,
+) -> Result<Text, VariantError> {
     let Variant::Str(source) = *source else {
-        return Err(WRONG_TYPE);
+        return Err(VariantError::WrongType);
     };
-    let start = source.start + usize::try_from(to_i32(start)?).map_err(|_| BAD_INDEX)?;
+    let start =
+        source.start + usize::try_from(to_i32(start)?).map_err(|_| VariantError::BadIndex)?;
     if start > source.end {
-        return Err(BAD_INDEX);
+        return Err(VariantError::BadIndex);
     }
     let end = match length {
-        Some(length) => start + usize::try_from(to_i32(length)?).map_err(|_| BAD_LENGTH)?,
+        Some(length) => {
+            start + usize::try_from(to_i32(length)?).map_err(|_| VariantError::BadLength)?
+        }
         None => source.end,
     };
     if end > source.end {
-        return Err(BAD_LENGTH);
+        return Err(VariantError::BadLength);
     }
     Ok(Text { start, end })
 }
@@ -410,7 +444,11 @@ fn substring(source: &Variant, start: &Variant, length: Option<&Variant>) -> Res
 /// operators, arithmetic, comparisons, `&&` and `||` over two values, and
 /// the string functions. Callers pass the operand count the operator
 /// takes.
-pub fn apply(text: &[u8], operator: Operator, operands: &[Variant]) -> Result<Variant, Hresult> {
+pub fn apply(
+    text: &[u8],
+    operator: Operator,
+    operands: &[Variant],
+) -> Result<Variant, VariantError> {
     let first = &operands[0];
     let optional = |index: usize| operands.get(index);
     match operator.0 {
@@ -446,11 +484,11 @@ pub fn apply(text: &[u8], operator: Operator, operands: &[Variant]) -> Result<Va
         0x1a | 0x1b => logical(first, operator.0 == 0x1a, &operands[1]),
         0x1e => {
             let Variant::Str(string) = *first else {
-                return Err(WRONG_TYPE);
+                return Err(VariantError::WrongType);
             };
             match i32::try_from(string.len()) {
                 Ok(length) => Ok(Variant::I32(length)),
-                Err(_) => Err(BAD_LENGTH),
+                Err(_) => Err(VariantError::BadLength),
             }
         }
         0x1f => string_compare(text, first, &operands[1], optional(2)),
@@ -472,7 +510,7 @@ pub fn apply(text: &[u8], operator: Operator, operands: &[Variant]) -> Result<Va
         0x22 => starts_with(text, first, &operands[1], optional(2)),
         0x23 => ends_with(text, first, &operands[1], optional(2)),
         0x24 => substring(first, &operands[1], optional(2)).map(Variant::Str),
-        _ => Err(WRONG_TYPE),
+        _ => Err(VariantError::WrongType),
     }
 }
 
@@ -544,15 +582,15 @@ mod tests {
     fn conversions() {
         assert_eq!(to_bool(&I8(-1)), Ok(true));
         assert_eq!(to_bool(&U64(0)), Ok(false));
-        assert_eq!(to_bool(&Null), Err(NO_VALUE));
-        assert_eq!(to_bool(&Mac([0; 6])), Err(WRONG_TYPE));
+        assert_eq!(to_bool(&Null), Err(VariantError::NoValue));
+        assert_eq!(to_bool(&Mac([0; 6])), Err(VariantError::WrongType));
         assert_eq!(to_i64(&Bool(true)), Ok(1));
         assert_eq!(to_i64(&I64(-5)), Ok(-5));
-        assert_eq!(to_i64(&U8(200)), Err(SIGN_MISMATCH));
+        assert_eq!(to_i64(&U8(200)), Err(VariantError::SignMismatch));
         assert_eq!(to_u64(&U64(5)), Ok(5));
-        assert_eq!(to_u64(&I8(-1)), Err(SIGN_MISMATCH));
-        assert_eq!(to_u64(&Null), Err(NO_VALUE));
-        assert_eq!(to_i64(&s(0, 1)), Err(WRONG_TYPE));
+        assert_eq!(to_u64(&I8(-1)), Err(VariantError::SignMismatch));
+        assert_eq!(to_u64(&Null), Err(VariantError::NoValue));
+        assert_eq!(to_i64(&s(0, 1)), Err(VariantError::WrongType));
     }
 
     // Expected values: stock 0x91f8b1c0 run in the emulator.
@@ -566,12 +604,17 @@ mod tests {
             (I8(100), Multiply, I8(3), Ok(I8(44))),
             (Bool(true), Add, I8(1), Ok(I32(2))),
             (I64(-1), Divide, I32(2), Ok(I64(0))),
-            (I32(7), Divide, I32(0), Err(DIVIDE_BY_ZERO)),
-            (I64(i64::MIN), Divide, I32(-1), Err(OVERFLOW)),
-            (I64(i64::MIN), Remainder, I64(-1), Err(OVERFLOW)),
-            (U8(7), Remainder, U8(0), Err(DIVIDE_BY_ZERO)),
+            (I32(7), Divide, I32(0), Err(VariantError::DivideByZero)),
+            (I64(i64::MIN), Divide, I32(-1), Err(VariantError::Overflow)),
+            (
+                I64(i64::MIN),
+                Remainder,
+                I64(-1),
+                Err(VariantError::Overflow),
+            ),
+            (U8(7), Remainder, U8(0), Err(VariantError::DivideByZero)),
             (I32(-7), Remainder, I32(3), Ok(I32(-1))),
-            (I32(1), ShiftLeft, I32(-1), Err(NEGATIVE_SHIFT)),
+            (I32(1), ShiftLeft, I32(-1), Err(VariantError::NegativeShift)),
             (I32(1), ShiftLeft, I32(64), Ok(I32(0))),
             (I32(-8), ShiftRight, I32(1), Ok(I32(-4))),
             (I32(-8), ShiftRight, I32(200), Ok(I32(-1))),
@@ -584,9 +627,9 @@ mod tests {
             (I64(12), And, I64(10), Ok(I64(8))),
             (I64(12), Xor, I64(10), Ok(I64(6))),
             (I64(12), Or, I64(10), Ok(I64(14))),
-            (Null, Add, I32(1), Err(NO_VALUE)),
-            (I32(1), Add, Mac([0; 6]), Err(WRONG_TYPE)),
-            (s(0, 1), Add, I32(1), Err(WRONG_TYPE)),
+            (Null, Add, I32(1), Err(VariantError::NoValue)),
+            (I32(1), Add, Mac([0; 6]), Err(VariantError::WrongType)),
+            (s(0, 1), Add, I32(1), Err(VariantError::WrongType)),
         ];
         for (left, op, right, expected) in cases {
             assert_eq!(
@@ -608,12 +651,12 @@ mod tests {
             (Bool(true), Equal, U8(1), Ok(Bool(true))),
             (mac, Less, Mac([0, 1, 2, 3, 4, 0x80]), Ok(Bool(true))),
             (mac, NotEqual, mac, Ok(Bool(false))),
-            (mac, Equal, Ipv4([0; 4]), Err(WRONG_TYPE)),
-            (mac, Equal, I32(0), Err(WRONG_TYPE)),
+            (mac, Equal, Ipv4([0; 4]), Err(VariantError::WrongType)),
+            (mac, Equal, I32(0), Err(VariantError::WrongType)),
             (s(0, 3), Less, s(3, 6), Ok(Bool(false))),
             (s(0, 3), Equal, s(6, 9), Ok(Bool(false))),
-            (s(0, 3), Equal, I32(1), Err(WRONG_TYPE)),
-            (Null, Equal, I32(0), Err(NO_VALUE)),
+            (s(0, 3), Equal, I32(1), Err(VariantError::WrongType)),
+            (Null, Equal, I32(0), Err(VariantError::NoValue)),
             (
                 Ipv4([1, 2, 3, 4]),
                 GreaterEqual,
@@ -640,12 +683,15 @@ mod tests {
         assert_eq!(complement(&I8(5)), Ok(I8(-6)));
         assert_eq!(complement(&U16(1)), Ok(U16(0xfffe)));
         assert_eq!(complement(&U64(0)), Ok(U64(u64::MAX)));
-        assert_eq!(complement(&Null), Err(NO_VALUE));
-        assert_eq!(complement(&Ipv6([0; 16])), Err(WRONG_TYPE));
+        assert_eq!(complement(&Null), Err(VariantError::NoValue));
+        assert_eq!(complement(&Ipv6([0; 16])), Err(VariantError::WrongType));
         assert_eq!(logical(&Bool(true), true, &I32(0)), Ok(Bool(false)));
         assert_eq!(logical(&Bool(true), false, &I32(0)), Ok(Bool(true)));
-        assert_eq!(logical(&Null, true, &s(0, 1)), Err(NO_VALUE));
-        assert_eq!(logical(&I32(1), true, &s(0, 1)), Err(WRONG_TYPE));
+        assert_eq!(logical(&Null, true, &s(0, 1)), Err(VariantError::NoValue));
+        assert_eq!(
+            logical(&I32(1), true, &s(0, 1)),
+            Err(VariantError::WrongType)
+        );
     }
 
     // Expected values: stock 0x91f8a938, 0x91f8abb0 and 0x91f8ac90 run in
@@ -659,9 +705,14 @@ mod tests {
             (s(0, 3), s(0, 2), None, Ok((1, true, false))),
             (s(0, 2), s(0, 3), None, Ok((-1, false, false))),
             (s(0, 3), s(6, 8), None, Ok((1, true, false))),
-            (s(0, 3), I32(1), None, Err(WRONG_TYPE)),
-            (s(0, 3), s(3, 6), Some(Null), Err(NO_VALUE)),
-            (s(0, 3), s(3, 6), Some(Ipv4([0; 4])), Err(WRONG_TYPE)),
+            (s(0, 3), I32(1), None, Err(VariantError::WrongType)),
+            (s(0, 3), s(3, 6), Some(Null), Err(VariantError::NoValue)),
+            (
+                s(0, 3),
+                s(3, 6),
+                Some(Ipv4([0; 4])),
+                Err(VariantError::WrongType),
+            ),
         ];
         for (left, right, case, expected) in cases {
             let case = case.as_ref();
@@ -699,20 +750,55 @@ mod tests {
                 Ok(I32(-1)),
             ),
             (s(6, 8), Some(I32(2)), Some(I32(6)), None, false, Ok(I32(6))),
-            (s(0, 2), Some(I32(-1)), None, None, false, Err(BAD_INDEX)),
-            (s(0, 2), Some(I32(11)), None, None, false, Err(BAD_INDEX)),
-            (s(0, 2), Some(I64(1)), None, None, false, Err(TOO_WIDE)),
+            (
+                s(0, 2),
+                Some(I32(-1)),
+                None,
+                None,
+                false,
+                Err(VariantError::BadIndex),
+            ),
+            (
+                s(0, 2),
+                Some(I32(11)),
+                None,
+                None,
+                false,
+                Err(VariantError::BadIndex),
+            ),
+            (
+                s(0, 2),
+                Some(I64(1)),
+                None,
+                None,
+                false,
+                Err(VariantError::TooWide),
+            ),
             (
                 s(0, 2),
                 Some(U32(1)),
                 Some(I32(0)),
                 None,
                 false,
-                Err(BAD_LENGTH),
+                Err(VariantError::BadLength),
             ),
-            (s(0, 2), None, Some(I32(12)), None, false, Err(BAD_LENGTH)),
+            (
+                s(0, 2),
+                None,
+                Some(I32(12)),
+                None,
+                false,
+                Err(VariantError::BadLength),
+            ),
             (s(5, 5), None, None, None, true, Ok(Bool(false))),
-            (I32(1), None, None, None, false, Err(WRONG_TYPE)),
+            (
+                I32(1),
+                None,
+                None,
+                None,
+                false,
+                Err(VariantError::WrongType),
+            ),
         ];
         for (pattern, start, length, case, contains, expected) in cases {
             let actual = index_of(
@@ -737,12 +823,12 @@ mod tests {
             (source, I32(1), None, text(3, 8)),
             (source, I32(1), Some(I32(2)), text(3, 5)),
             (source, I32(6), Some(I32(0)), text(8, 8)),
-            (source, I32(7), None, Err(BAD_INDEX)),
-            (source, I32(-1), None, Err(BAD_INDEX)),
-            (source, I32(1), Some(I32(6)), Err(BAD_LENGTH)),
-            (source, I32(1), Some(I32(-1)), Err(BAD_LENGTH)),
-            (source, U64(1), None, Err(TOO_WIDE)),
-            (I32(1), I32(0), None, Err(WRONG_TYPE)),
+            (source, I32(7), None, Err(VariantError::BadIndex)),
+            (source, I32(-1), None, Err(VariantError::BadIndex)),
+            (source, I32(1), Some(I32(6)), Err(VariantError::BadLength)),
+            (source, I32(1), Some(I32(-1)), Err(VariantError::BadLength)),
+            (source, U64(1), None, Err(VariantError::TooWide)),
+            (I32(1), I32(0), None, Err(VariantError::WrongType)),
         ];
         for (source, start, length, expected) in cases {
             assert_eq!(substring(&source, &start, length.as_ref()), expected);

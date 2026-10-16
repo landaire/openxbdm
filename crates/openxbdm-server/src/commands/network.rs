@@ -6,10 +6,12 @@ pub mod netsim;
 pub mod xhttpproxy;
 
 use core::fmt::Write as _;
+use core::num::NonZeroI32;
 
 use openxbdm_core::line::CommandLine;
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::Win32Error;
 
 use crate::access::Access;
 use crate::backend::Backend as AnyBackend;
@@ -22,6 +24,9 @@ use crate::invocation::Invocation;
 use crate::network::Ipv4Address;
 use crate::registry::CommandEntry;
 use crate::registry::DispatchFlags;
+use crate::reply::CommandError;
+use crate::reply::CommandResult;
+use crate::reply::Reply;
 use crate::state::ServerState;
 use crate::text::Text;
 
@@ -32,8 +37,6 @@ pub(crate) use xhttpproxy::settings_lines as xhttpproxy_settings_lines;
 /// First system version with the key, QoS lookup, and security association
 /// tables.
 const XN_TABLES_VERSION: SystemVersion = SystemVersion(0x200a_9a00);
-/// `XNetSetOpt` result that `linkstate` reports as an unknown command.
-const WSAEINVAL: WsaError = WsaError(10022);
 /// Visible characters of one table line: the line buffer is 0x100 bytes and
 /// its last byte is always the terminator.
 const TABLE_LINE_LIMIT: usize = 0xff;
@@ -127,9 +130,100 @@ impl Default for AddressSettings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SystemVersion(pub u32);
 
-/// A Winsock error code.
+/// A Winsock error code. Calls that report a Winsock error can also return
+/// a negative result value, which passes through unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WsaError(pub i32);
+pub struct WsaError(NonZeroI32);
+
+impl WsaError {
+    /// `WSAEINVAL`.
+    pub const INVALID_ARGUMENT: Self = Self::known(10022);
+    /// `WSAEALREADY`.
+    pub const ALREADY: Self = Self::known(10037);
+    /// `WSAENOBUFS`.
+    pub const NO_BUFFERS: Self = Self::known(10055);
+
+    /// `None` for no error.
+    pub const fn new(code: i32) -> Option<Self> {
+        match NonZeroI32::new(code) {
+            Some(code) => Some(Self(code)),
+            None => None,
+        }
+    }
+
+    const fn known(code: i32) -> Self {
+        match Self::new(code) {
+            Some(error) => error,
+            None => panic!("zero is not an error"),
+        }
+    }
+
+    pub const fn code(self) -> i32 {
+        self.0.get()
+    }
+}
+
+/// Positive codes move to the Win32 facility; others are result values.
+impl From<WsaError> for Win32Error {
+    fn from(error: WsaError) -> Self {
+        let Some(error) = Win32Error::new(error.code() as u32) else {
+            unreachable!("a Winsock error is nonzero");
+        };
+        error
+    }
+}
+
+/// `linkstate setflags` without both masks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissingLinkMask;
+
+impl From<MissingLinkMask> for CommandError {
+    fn from(_: MissingLinkMask) -> Self {
+        ErrorCode::BadParameter.into()
+    }
+}
+
+/// A failed network command as its status reports it. A result of the
+/// monitor facility keeps its value; any other reads as 0x82da0000, the
+/// common exit of the stock handlers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkError {
+    Netsim(netsim::NetsimError),
+    CaptureStart(netcap::StartError),
+    /// `ipproxy stop` without a running proxy (426, no default text).
+    ProxyNotStarted,
+    /// `netcap stop` without a capture (435, no default text).
+    NotCapturing,
+    /// Frames were lost to a full capture write buffer.
+    FramesLost,
+    /// A certificate upload was cut short by the connection.
+    UploadAborted,
+}
+
+impl From<NetworkError> for Hresult {
+    #[inline(never)]
+    fn from(error: NetworkError) -> Self {
+        let result = match error {
+            NetworkError::Netsim(error) => error.into(),
+            NetworkError::CaptureStart(error) => error.into(),
+            NetworkError::ProxyNotStarted => Hresult::error(0x1a),
+            NetworkError::NotCapturing => Hresult::error(0x23),
+            NetworkError::FramesLost => Hresult::error(0x26),
+            NetworkError::UploadAborted => Hresult::error(0x101),
+        };
+        if result.0 & 0x1fff_0000 == Hresult::OK.0 & 0x1fff_0000 {
+            result
+        } else {
+            Hresult::from_error_code(ErrorCode::Undefined)
+        }
+    }
+}
+
+impl From<NetworkError> for CommandError {
+    fn from(error: NetworkError) -> Self {
+        Self::Network(error)
+    }
+}
 
 /// Ethernet link status bits (`XNetGetEthernetLinkStatus`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,7 +394,10 @@ pub trait Backend:
     fn set_address_field(&mut self, field: AddressField, value: u32);
 }
 
-pub(crate) fn resume(continuation: &mut Continuation, cx: &mut ContinuationContext<'_>) -> Hresult {
+pub(crate) fn resume(
+    continuation: &mut Continuation,
+    cx: &mut ContinuationContext<'_>,
+) -> CommandResult {
     match continuation {
         Continuation::Table {
             table: _,
@@ -313,39 +410,39 @@ pub(crate) fn resume(continuation: &mut Continuation, cx: &mut ContinuationConte
     }
 }
 
-fn socket_info(invocation: &mut Invocation<'_>) -> Hresult {
+fn socket_info(invocation: &mut Invocation<'_>) -> CommandResult {
     open_table(invocation, Table::Sockets)
 }
 
-fn key_info(invocation: &mut Invocation<'_>) -> Hresult {
+fn key_info(invocation: &mut Invocation<'_>) -> CommandResult {
     open_xn_table(invocation, Table::Keys)
 }
 
-fn qos_lookup_info(invocation: &mut Invocation<'_>) -> Hresult {
+fn qos_lookup_info(invocation: &mut Invocation<'_>) -> CommandResult {
     open_xn_table(invocation, Table::QosLookups)
 }
 
-fn security_association_info(invocation: &mut Invocation<'_>) -> Hresult {
+fn security_association_info(invocation: &mut Invocation<'_>) -> CommandResult {
     open_xn_table(invocation, Table::SecurityAssociations)
 }
 
-fn open_xn_table(invocation: &mut Invocation<'_>, table: Table) -> Hresult {
+fn open_xn_table(invocation: &mut Invocation<'_>, table: Table) -> CommandResult {
     if invocation.backend.system_version() < XN_TABLES_VERSION {
-        return Hresult::from_error_code(ErrorCode::UNKNOWN_COMMAND);
+        return Err(ErrorCode::UnknownCommand.into());
     }
     open_table(invocation, table)
 }
 
 /// Snapshot the table and stream one line per record. Settings-file lines
 /// have no connection to stream to.
-fn open_table(invocation: &mut Invocation<'_>, table: Table) -> Hresult {
+fn open_table(invocation: &mut Invocation<'_>, table: Table) -> CommandResult {
     let Some(session) = invocation.session.as_deref_mut() else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     let count = match invocation.backend.open_table(session.index(), table) {
         Ok(count) => count,
-        Err(TableError::Unavailable) => return Hresult::from_error_code(ErrorCode::ACCESS_DENIED),
-        Err(TableError::OutOfMemory) => return Hresult::from_error_code(ErrorCode::OUT_OF_MEMORY),
+        Err(TableError::Unavailable) => return Err(ErrorCode::AccessDenied.into()),
+        Err(TableError::OutOfMemory) => return Err(ErrorCode::OutOfMemory.into()),
     };
     session.receive_remaining = None;
     session.continuation = AnyContinuation::Network(Continuation::Table {
@@ -353,14 +450,14 @@ fn open_table(invocation: &mut Invocation<'_>, table: Table) -> Hresult {
         next: 0,
         count,
     });
-    Hresult::MULTILINE
+    Ok(Reply::Multiline)
 }
 
-fn table_line(next: &mut u32, count: u32, cx: &mut ContinuationContext<'_>) -> Hresult {
+fn table_line(next: &mut u32, count: u32, cx: &mut ContinuationContext<'_>) -> CommandResult {
     let connection = cx.session.index();
     if *next >= count {
         cx.backend.close_table(connection);
-        return Hresult::END_OF_DATA;
+        return Err(CommandError::EndOfData);
     }
     let record = cx.backend.table_record(connection, *next);
     *next += 1;
@@ -370,7 +467,7 @@ fn table_line(next: &mut u32, count: u32, cx: &mut ContinuationContext<'_>) -> H
         let _ = write_record(&mut line, &record);
     }
     cx.line.set_bytes(line.as_bytes());
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 fn write_record(line: &mut Text<TABLE_LINE_LIMIT>, record: &Record) -> core::fmt::Result {
@@ -449,13 +546,15 @@ fn write_record(line: &mut Text<TABLE_LINE_LIMIT>, record: &Record) -> core::fmt
 /// `linkstate [restore | disconnect | setflags and=<dword> or=<dword>]`:
 /// report the Ethernet link state or force it through masks. The link
 /// state is always read first and reported as the old state.
-pub(crate) fn link_state(invocation: &mut Invocation<'_>) -> Hresult {
+pub(crate) fn link_state(invocation: &mut Invocation<'_>) -> CommandResult {
     let flags = parse_link_state(invocation.line);
     execute_link_state(invocation, flags)
 }
 
 /// The forced flags of a `linkstate` line, if any.
-pub(crate) fn parse_link_state(line: CommandLine<'_>) -> Result<Option<LinkFlags>, Hresult> {
+pub(crate) fn parse_link_state(
+    line: CommandLine<'_>,
+) -> Result<Option<LinkFlags>, MissingLinkMask> {
     Ok(if line.has("restore") {
         Some(LinkFlags::RESTORE)
     } else if line.has("disconnect") {
@@ -464,7 +563,7 @@ pub(crate) fn parse_link_state(line: CommandLine<'_>) -> Result<Option<LinkFlags
         let and = line.dword("and");
         let or = line.dword("or");
         let (Some(and), Some(or)) = (and, or) else {
-            return Err(Hresult::from_error_code(ErrorCode::BAD_PARAMETER));
+            return Err(MissingLinkMask);
         };
         Some(LinkFlags { and, or })
     } else {
@@ -474,16 +573,13 @@ pub(crate) fn parse_link_state(line: CommandLine<'_>) -> Result<Option<LinkFlags
 
 pub(crate) fn execute_link_state(
     invocation: &mut Invocation<'_>,
-    flags: Result<Option<LinkFlags>, Hresult>,
-) -> Hresult {
-    let flags = match flags {
-        Ok(flags) => flags,
-        Err(error) => return error,
-    };
+    flags: Result<Option<LinkFlags>, MissingLinkMask>,
+) -> CommandResult {
+    let flags = flags?;
     let LinkStatus(old) = invocation.backend.link_status();
     let Some(flags) = flags else {
         invocation.set_text(format_args!("state=0x{old:08x}"));
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     };
     match invocation.backend.set_link_flags(flags) {
         Ok(()) => {
@@ -491,28 +587,28 @@ pub(crate) fn execute_link_state(
                 "set, andflags=0x{:08x} orflags=0x{:08x} oldstate=0x{old:08x}",
                 flags.and, flags.or
             ));
-            Hresult::OK
+            Ok(Reply::Ok)
         }
-        Err(WsaError(error)) => {
-            invocation.set_text(format_args!("err={error}"));
-            link_error(WsaError(error))
+        Err(error) => {
+            invocation.set_text(format_args!("err={}", error.code()));
+            Err(link_error(error))
         }
     }
 }
 
 /// Result of a refused link state change (0x91f35990): 10022 reads as an
 /// unknown command, anything else as a generic failure.
-pub fn link_error(error: WsaError) -> Hresult {
-    if error == WSAEINVAL {
-        Hresult::from_error_code(ErrorCode::UNKNOWN_COMMAND)
+pub fn link_error(error: WsaError) -> CommandError {
+    if error == WsaError::INVALID_ARGUMENT {
+        ErrorCode::UnknownCommand.into()
     } else {
-        Hresult::from_error_code(ErrorCode::UNDEFINED)
+        ErrorCode::Undefined.into()
     }
 }
 
 /// `nicstats [deviceflags=<dword>]`: adapter counters; all adapters by
 /// default.
-fn nic_stats(invocation: &mut Invocation<'_>) -> Hresult {
+fn nic_stats(invocation: &mut Invocation<'_>) -> CommandResult {
     let device_flags = invocation.line.dword("deviceflags").unwrap_or(u32::MAX);
     let stats = invocation.backend.nic_stats(device_flags);
     invocation.set_text(format_args!(
@@ -536,7 +632,7 @@ fn nic_stats(invocation: &mut Invocation<'_>) -> Hresult {
         stats.receive_crc_errors,
         stats.receive_other_errors,
     ));
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// Decode the hex text of a `cert=` or `cfg=` value (stock 0x91f364f0):

@@ -219,7 +219,8 @@ pub(crate) struct FrameHook {
 pub(crate) fn xam_procedure(ordinal: u32) -> Option<u32> {
     let module = kernel::module_handle(c"xam.xex").ok()?;
     let mut address = 0u32;
-    ((kernel::XexGetProcedureAddress(module, ordinal, &mut address) as i32) >= 0).then_some(address)
+    ((kernel::XexGetProcedureAddress(module.raw(), ordinal, &mut address) as i32) >= 0)
+        .then_some(address)
 }
 
 /// A pool allocation holding raw table records.
@@ -453,15 +454,13 @@ pub(crate) fn set_link_flags(flags: LinkFlags) -> Result<(), WsaError> {
     let mut value = [0u8; 8];
     value[..4].copy_from_slice(&flags.and.to_be_bytes());
     value[4..].copy_from_slice(&flags.or.to_be_bytes());
-    match NetDll_XNetSetOpt(
+    let error = NetDll_XNetSetOpt(
         XNCALLER_SYSAPP,
         XNET_OPT_LINK_FLAGS,
         value.as_ptr(),
         value.len() as u32,
-    ) {
-        0 => Ok(()),
-        error => Err(WsaError(error)),
-    }
+    );
+    WsaError::new(error).map_or(Ok(()), Err)
 }
 
 impl network::Backend for Console {

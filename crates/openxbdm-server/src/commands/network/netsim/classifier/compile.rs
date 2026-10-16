@@ -24,6 +24,7 @@ use super::grammar;
 use super::variant;
 use super::variant::Text;
 use super::variant::Variant;
+use super::variant::VariantError;
 use super::write_program;
 
 /// Node objects (library limit 0x40); freed nodes are reused.
@@ -38,28 +39,69 @@ const REFERENCE_LIMIT: usize = NODE_LIMIT + ITEM_LIMIT + 1;
 /// Parser state stack entries (YYSTACKSIZE).
 const STACK_DEPTH: usize = 500;
 
-const SYNTAX_ERROR: Hresult = Hresult(0x8007_0545);
-const STACK_OVERFLOW: Hresult = Hresult(0x8007_03e9);
-const OUT_OF_MEMORY: Hresult = Hresult(0x8007_000e);
-const INVALID_CHARACTER: Hresult = Hresult(0x8007_000d);
-const UNTERMINATED_COMMENT: Hresult = Hresult(0x8007_0026);
-const TRUNCATED_NUMBER: Hresult = Hresult(0x8007_044c);
-const NUMBER_OVERFLOW: Hresult = Hresult(0x8007_0216);
-const SUFFIX_OVERFLOW: Hresult = Hresult(0x8007_00ea);
-const MISSING_OPERAND: Hresult = Hresult(0x8007_10d2);
-const EMPTY_NAME: Hresult = Hresult(0x8007_007b);
-const NAME_TOO_LONG: Hresult = Hresult(0x8007_009a);
-const TOO_MANY_ITEMS: Hresult = Hresult(0x8007_0044);
-const NOT_SCALAR: Hresult = Hresult(0x8007_0099);
-const WRONG_ITEM_KIND: Hresult = Hresult(0x8007_048a);
-const NEGATIVE_INDEX: Hresult = Hresult(0x8007_0083);
-const INDEX_OUT_OF_RANGE: Hresult = Hresult(0x8007_0585);
-const TOO_FEW_ARGUMENTS: Hresult = Hresult(0x8002_0004);
-const TOO_MANY_ARGUMENTS: Hresult = Hresult(0x8002_000e);
-/// The program is a constant false: it would match nothing.
-const ALWAYS_FALSE: Hresult = Hresult(0x82da_0010);
-/// A name that is not in the field table.
-const UNKNOWN_FIELD: Hresult = Hresult(0x82da_0025);
+/// Why classifier text did not compile. Titles receive the result value
+/// through the simulator exports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompileError {
+    Syntax,
+    StackOverflow,
+    OutOfMemory,
+    InvalidCharacter,
+    UnterminatedComment,
+    TruncatedNumber,
+    NumberOverflow,
+    SuffixOverflow,
+    MissingOperand,
+    EmptyName,
+    NameTooLong,
+    TooManyItems,
+    NotScalar,
+    WrongItemKind,
+    NegativeIndex,
+    IndexOutOfRange,
+    TooFewArguments,
+    TooManyArguments,
+    /// The program is a constant false: it would match nothing.
+    AlwaysFalse,
+    /// A name that is not in the field table.
+    UnknownField,
+    /// Constant folding failed.
+    Value(VariantError),
+}
+
+impl From<VariantError> for CompileError {
+    fn from(error: VariantError) -> Self {
+        Self::Value(error)
+    }
+}
+
+impl From<CompileError> for Hresult {
+    fn from(error: CompileError) -> Self {
+        Self(match error {
+            CompileError::Syntax => 0x8007_0545,
+            CompileError::StackOverflow => 0x8007_03e9,
+            CompileError::OutOfMemory => 0x8007_000e,
+            CompileError::InvalidCharacter => 0x8007_000d,
+            CompileError::UnterminatedComment => 0x8007_0026,
+            CompileError::TruncatedNumber => 0x8007_044c,
+            CompileError::NumberOverflow => 0x8007_0216,
+            CompileError::SuffixOverflow => 0x8007_00ea,
+            CompileError::MissingOperand => 0x8007_10d2,
+            CompileError::EmptyName => 0x8007_007b,
+            CompileError::NameTooLong => 0x8007_009a,
+            CompileError::TooManyItems => 0x8007_0044,
+            CompileError::NotScalar => 0x8007_0099,
+            CompileError::WrongItemKind => 0x8007_048a,
+            CompileError::NegativeIndex => 0x8007_0083,
+            CompileError::IndexOutOfRange => 0x8007_0585,
+            CompileError::TooFewArguments => 0x8002_0004,
+            CompileError::TooManyArguments => 0x8002_000e,
+            CompileError::AlwaysFalse => 0x82da_0010,
+            CompileError::UnknownField => 0x82da_0025,
+            CompileError::Value(error) => return error.into(),
+        })
+    }
+}
 
 const IDENTIFIER: i16 = 0x101;
 const CONSTANT: i16 = 0x102;
@@ -304,7 +346,7 @@ struct Compiler<'a> {
     text: &'a [u8],
     cursor: usize,
     /// First syntax error, or the latest lexer or builder error.
-    status: Option<Hresult>,
+    status: Option<CompileError>,
     nodes: [Node; NODE_LIMIT],
     allocated: u8,
     free: Option<NodeId>,
@@ -331,19 +373,19 @@ pub struct Compiled<'a> {
 
 /// Compile classifier text (0x91f8bdd0). `Ok(None)` is a constant true
 /// program, which classifies every frame.
-pub fn compile_text(text: &[u8]) -> Result<Option<Compiled<'_>>, Hresult> {
+pub fn compile_text(text: &[u8]) -> Result<Option<Compiled<'_>>, CompileError> {
     let mut compiler = Compiler::new(text);
     compiler.parse();
     if let Some(error) = compiler.status {
         return Err(error);
     }
     // An accepted program leaves exactly its root on the stack.
-    let root = compiler.stack.ok_or(SYNTAX_ERROR)?;
+    let root = compiler.stack.ok_or(CompileError::Syntax)?;
     if let Kind::Constant(value) = compiler.node(root).kind {
         return if variant::to_bool(&value)? {
             Ok(None)
         } else {
-            Err(ALWAYS_FALSE)
+            Err(CompileError::AlwaysFalse)
         };
     }
     // Every item carries a name until it is bound (stock skips unnamed
@@ -357,7 +399,7 @@ pub fn compile_text(text: &[u8]) -> Result<Option<Compiled<'_>>, Hresult> {
         let Some(name) = compiler.items[position].name.take() else {
             continue;
         };
-        *bound = field_id(&text[name.start..name.end]).ok_or(UNKNOWN_FIELD)?;
+        *bound = field_id(&text[name.start..name.end]).ok_or(CompileError::UnknownField)?;
         compiler.release(Holder::Item(ItemIndex(position as u8)));
     }
     Ok(Some(Compiled {
@@ -570,8 +612,8 @@ impl<'a> Compiler<'a> {
 
     /// Push a new lexer node; a failed allocation is a lexer error. The
     /// node is allocated before its string is registered.
-    fn push_new(&mut self, kind: Kind) -> Result<(), Hresult> {
-        let id = self.allocate(kind).ok_or(OUT_OF_MEMORY)?;
+    fn push_new(&mut self, kind: Kind) -> Result<(), CompileError> {
+        let id = self.allocate(kind).ok_or(CompileError::OutOfMemory)?;
         let kind = match kind {
             Kind::Constant(Variant::Str(text)) => {
                 Kind::Constant(Variant::Str(self.intern(Holder::Node(id), text)))
@@ -608,7 +650,7 @@ impl<'a> Compiler<'a> {
                 };
                 if let Some(index) = row(grammar::SHIFT_BASE[usize::from(state)], token) {
                     if top >= STACK_DEPTH - 1 {
-                        return self.syntax_error(STACK_OVERFLOW);
+                        return self.syntax_error(CompileError::StackOverflow);
                     }
                     state = grammar::TABLE[index];
                     top += 1;
@@ -621,7 +663,7 @@ impl<'a> Compiler<'a> {
                     rule = grammar::TABLE[index];
                 } else {
                     if recovering == 0 {
-                        self.syntax_error(SYNTAX_ERROR);
+                        self.syntax_error(CompileError::Syntax);
                     }
                     if recovering == 3 {
                         if token == 0 {
@@ -637,7 +679,7 @@ impl<'a> Compiler<'a> {
                             grammar::ERROR_TOKEN,
                         ) {
                             if top >= STACK_DEPTH - 1 {
-                                return self.syntax_error(STACK_OVERFLOW);
+                                return self.syntax_error(CompileError::StackOverflow);
                             }
                             state = grammar::TABLE[index];
                             top += 1;
@@ -678,7 +720,7 @@ impl<'a> Compiler<'a> {
                 None => grammar::GOTO_DEFAULT[symbol],
             };
             if top >= STACK_DEPTH - 1 {
-                return self.syntax_error(STACK_OVERFLOW);
+                return self.syntax_error(CompileError::StackOverflow);
             }
             top += 1;
             states[top] = state;
@@ -686,7 +728,7 @@ impl<'a> Compiler<'a> {
     }
 
     /// The parser's error report (0x91f89238): only the first error is kept.
-    fn syntax_error(&mut self, code: Hresult) {
+    fn syntax_error(&mut self, code: CompileError) {
         if self.status.is_none() {
             self.status = Some(code);
             self.cursor = self.text.len();
@@ -716,7 +758,7 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    fn scan(&mut self) -> Result<(i16, usize), Hresult> {
+    fn scan(&mut self) -> Result<(i16, usize), CompileError> {
         let text = self.text;
         let end = text.len();
         let at = |position: usize| (position < end).then(|| text[position]);
@@ -773,7 +815,7 @@ impl<'a> Compiler<'a> {
                 b'=' => {
                     return match at(p + 1) {
                         Some(b'=') => Ok((0x11a, p + 2)),
-                        _ => Err(INVALID_CHARACTER),
+                        _ => Err(CompileError::InvalidCharacter),
                     };
                 }
                 b'|' => {
@@ -812,7 +854,7 @@ impl<'a> Compiler<'a> {
                         let mut q = p + 2;
                         loop {
                             if q >= end {
-                                return Err(UNTERMINATED_COMMENT);
+                                return Err(CompileError::UnterminatedComment);
                             }
                             if text[q] == b'*' && at(q + 1) == Some(b'/') {
                                 break;
@@ -828,7 +870,7 @@ impl<'a> Compiler<'a> {
                     loop {
                         p += 1;
                         if p >= end {
-                            return Err(INVALID_CHARACTER);
+                            return Err(CompileError::InvalidCharacter);
                         }
                         if text[p] == b'"' {
                             break;
@@ -841,7 +883,7 @@ impl<'a> Compiler<'a> {
                     })))?;
                     return Ok((CONSTANT, p));
                 }
-                0 | b'\\' | b'\'' => return Err(INVALID_CHARACTER),
+                0 | b'\\' | b'\'' => return Err(CompileError::InvalidCharacter),
                 b' ' | b'\t' | b'\r' | b'\n' => p += 1,
                 _ => {
                     if pending.is_none() {
@@ -853,16 +895,16 @@ impl<'a> Compiler<'a> {
                             b'0' if at(p + 1) == Some(b'x') => {
                                 p += 2;
                                 if p >= end {
-                                    return Err(TRUNCATED_NUMBER);
+                                    return Err(CompileError::TruncatedNumber);
                                 }
                                 base = 16;
                                 Pending::Number
                             }
                             b'0'..=b'9' => Pending::Number,
                             b'.' => match at(p + 1) {
-                                None => return Err(TRUNCATED_NUMBER),
+                                None => return Err(CompileError::TruncatedNumber),
                                 Some(b'0'..=b'9') => Pending::Number,
-                                Some(_) => return Err(INVALID_CHARACTER),
+                                Some(_) => return Err(CompileError::InvalidCharacter),
                             },
                             _ => Pending::Identifier,
                         });
@@ -880,25 +922,25 @@ impl<'a> Compiler<'a> {
                             (_, Some(_)) | (b'a'..=b'f' | b'A'..=b'F', None)
                                 if suffix.is_some() =>
                             {
-                                return Err(INVALID_CHARACTER);
+                                return Err(CompileError::InvalidCharacter);
                             }
                             (_, Some(digit)) => {
                                 let product = value.wrapping_mul(base);
                                 if value > product {
-                                    return Err(NUMBER_OVERFLOW);
+                                    return Err(CompileError::NumberOverflow);
                                 }
                                 value = product.wrapping_add(u64::from(digit));
                             }
                             // `f` and `.` start a float literal, which netsim disables.
-                            (b'f' | b'F' | b'.', None) => return Err(SYNTAX_ERROR),
+                            (b'f' | b'F' | b'.', None) => return Err(CompileError::Syntax),
                             (b'l' | b'L', None) => {
                                 if !valid_long_suffix(text, suffix, p) {
-                                    return Err(INVALID_CHARACTER);
+                                    return Err(CompileError::InvalidCharacter);
                                 }
                                 suffix.get_or_insert(p);
                             }
                             (b'u' | b'U', None) if suffix.is_none() => suffix = Some(p),
-                            _ => return Err(INVALID_CHARACTER),
+                            _ => return Err(CompileError::InvalidCharacter),
                         }
                     }
                     p += 1;
@@ -926,13 +968,13 @@ impl<'a> Compiler<'a> {
 
     /// The operator builder (0x91f88668): pops `arity` operands, folds
     /// constant ones or pushes an operator node over them.
-    fn apply(&mut self, operator: Operator, arity: u8) -> Result<(), Hresult> {
+    fn apply(&mut self, operator: Operator, arity: u8) -> Result<(), CompileError> {
         let mut list = None;
         let mut constant = true;
         for _ in 0..arity {
             let Some(id) = self.pop() else {
                 self.free_list(list);
-                return Err(MISSING_OPERAND);
+                return Err(CompileError::MissingOperand);
             };
             constant &= matches!(self.node(id).kind, Kind::Constant(_));
             self.node_mut(id).next = list;
@@ -957,8 +999,8 @@ impl<'a> Compiler<'a> {
         operator: Operator,
         first: NodeId,
         constant: bool,
-    ) -> Result<(), (Hresult, Option<NodeId>)> {
-        let fail = |code| (code, Some(first));
+    ) -> Result<(), (CompileError, Option<NodeId>)> {
+        let fail = |code: CompileError| (code, Some(first));
         let second = self.next(first);
         let value = |compiler: &Self, id: Option<NodeId>| match id.map(|id| compiler.node(id).kind)
         {
@@ -972,7 +1014,7 @@ impl<'a> Compiler<'a> {
                 return Ok(());
             }
             1 => return self.declare(first).map_err(fail),
-            3 => return self.index(first, second.ok_or(fail(MISSING_OPERAND))?),
+            3 => return self.index(first, second.ok_or(fail(CompileError::MissingOperand))?),
             4 => return self.call(first),
             // A constant left operand decides `&&` and `||` when it is false
             // and true respectively; otherwise the operator stays.
@@ -980,7 +1022,7 @@ impl<'a> Compiler<'a> {
                 let Kind::Constant(left) = self.node(first).kind else {
                     return self.generic(operator, first);
                 };
-                let truth = variant::to_bool(&left).map_err(fail)?;
+                let truth = variant::to_bool(&left).map_err(|error| fail(error.into()))?;
                 if truth == (operator.0 == 0x1a) {
                     return self.generic(operator, first);
                 }
@@ -990,7 +1032,8 @@ impl<'a> Compiler<'a> {
             _ if !constant => return self.generic(operator, first),
             6 | 8 | 9 | 0xa..=0x1b => {
                 let operands = [value(self, Some(first)), value(self, second)];
-                variant::apply(self.text, operator, &operands).map_err(fail)?
+                variant::apply(self.text, operator, &operands)
+                    .map_err(|error| fail(error.into()))?
             }
             // Operator 5 and the comma are never folded.
             _ => return self.generic(operator, first),
@@ -1000,16 +1043,17 @@ impl<'a> Compiler<'a> {
     }
 
     /// The ternary operator: a constant condition selects its branch.
-    fn select(&mut self, first: NodeId) -> Result<(), (Hresult, Option<NodeId>)> {
+    fn select(&mut self, first: NodeId) -> Result<(), (CompileError, Option<NodeId>)> {
         let Kind::Constant(condition) = self.node(first).kind else {
             return self.generic(Operator::CONDITIONAL, first);
         };
-        let truth = variant::to_bool(&condition).map_err(|code| (code, Some(first)))?;
+        let truth = variant::to_bool(&condition)
+            .map_err(|error| (CompileError::Value(error), Some(first)))?;
         let (Some(then), Some(otherwise)) = (
             self.next(first),
             self.next(first).and_then(|then| self.next(then)),
         ) else {
-            return Err((MISSING_OPERAND, Some(first)));
+            return Err((CompileError::MissingOperand, Some(first)));
         };
         let (chosen, other) = if truth {
             (then, otherwise)
@@ -1059,13 +1103,13 @@ impl<'a> Compiler<'a> {
         &mut self,
         operator: Operator,
         first: NodeId,
-    ) -> Result<(), (Hresult, Option<NodeId>)> {
+    ) -> Result<(), (CompileError, Option<NodeId>)> {
         let id = self
             .allocate(Kind::Operator {
                 operator,
                 operands: Some(first),
             })
-            .ok_or((OUT_OF_MEMORY, Some(first)))?;
+            .ok_or((CompileError::OutOfMemory, Some(first)))?;
         self.push(id);
         Ok(())
     }
@@ -1080,17 +1124,17 @@ impl<'a> Compiler<'a> {
     }
 
     /// Declare an item (0x91f84f88).
-    fn create_item(&mut self, name: Text, index: Option<u64>) -> Result<ItemIndex, Hresult> {
+    fn create_item(&mut self, name: Text, index: Option<u64>) -> Result<ItemIndex, CompileError> {
         let length = name.end - name.start;
         if length == 0 {
-            return Err(EMPTY_NAME);
+            return Err(CompileError::EmptyName);
         }
         if length >= NAME_LIMIT {
-            return Err(NAME_TOO_LONG);
+            return Err(CompileError::NameTooLong);
         }
         let position = usize::from(self.item_count);
         if position >= ITEM_LIMIT {
-            return Err(TOO_MANY_ITEMS);
+            return Err(CompileError::TooManyItems);
         }
         let name = self.intern(Holder::Item(ItemIndex(position as u8)), name);
         self.items[position] = Item {
@@ -1104,14 +1148,16 @@ impl<'a> Compiler<'a> {
 
     /// Rule 3: a name becomes a reference to its item, declared on first
     /// use (builder operator 1).
-    fn declare(&mut self, first: NodeId) -> Result<(), Hresult> {
+    fn declare(&mut self, first: NodeId) -> Result<(), CompileError> {
         // Rule 3 always pops the node its own identifier pushed.
         let Kind::Name(name) = self.node(first).kind else {
             self.keep(first, None);
             return Ok(());
         };
         let item = match self.find_item(name, None) {
-            Some(item) if self.items[usize::from(item.0)].array => return Err(NOT_SCALAR),
+            Some(item) if self.items[usize::from(item.0)].array => {
+                return Err(CompileError::NotScalar);
+            }
             Some(item) => item,
             None => self.create_item(name, None)?,
         };
@@ -1123,13 +1169,17 @@ impl<'a> Compiler<'a> {
 
     /// Rule 4, `name[index]` (builder operator 3): declares the array item
     /// and, for a constant index, the element item.
-    fn index(&mut self, first: NodeId, second: NodeId) -> Result<(), (Hresult, Option<NodeId>)> {
-        let fail = |code| (code, Some(first));
+    fn index(
+        &mut self,
+        first: NodeId,
+        second: NodeId,
+    ) -> Result<(), (CompileError, Option<NodeId>)> {
+        let fail = |code: CompileError| (code, Some(first));
         let array = match self.node(first).kind {
             Kind::Name(name) => {
                 let array = match self.find_item(name, None) {
                     Some(item) if !self.items[usize::from(item.0)].array => {
-                        return Err(fail(WRONG_ITEM_KIND));
+                        return Err(fail(CompileError::WrongItemKind));
                     }
                     Some(item) => item,
                     None => {
@@ -1150,11 +1200,11 @@ impl<'a> Compiler<'a> {
                 {
                     ItemIndex(word as u8)
                 }
-                _ => return Err(fail(WRONG_ITEM_KIND)),
+                _ => return Err(fail(CompileError::WrongItemKind)),
             },
             // Item references never name an array. An operator's word is a
             // pointer, which stock dereferences as an item and faults.
-            Kind::Item(_) | Kind::Operator { .. } => return Err(fail(WRONG_ITEM_KIND)),
+            Kind::Item(_) | Kind::Operator { .. } => return Err(fail(CompileError::WrongItemKind)),
         };
         let Kind::Constant(index) = self.node(second).kind else {
             return self.generic(Operator::INDEX, first);
@@ -1163,16 +1213,16 @@ impl<'a> Compiler<'a> {
             Variant::I8(_) | Variant::I16(_) | Variant::I32(_) | Variant::I64(_) => {
                 // Signed values always convert.
                 let index = variant::to_i64(&index).unwrap_or(0);
-                u64::try_from(index).map_err(|_| fail(NEGATIVE_INDEX))?
+                u64::try_from(index).map_err(|_| fail(CompileError::NegativeIndex))?
             }
-            _ => variant::to_u64(&index).map_err(fail)?,
+            _ => variant::to_u64(&index).map_err(|error| fail(error.into()))?,
         };
         if index == u64::MAX {
-            return Err(fail(INDEX_OUT_OF_RANGE));
+            return Err(fail(CompileError::IndexOutOfRange));
         }
         let array_name = self.items[usize::from(array.0)]
             .name
-            .ok_or(fail(WRONG_ITEM_KIND))?;
+            .ok_or(fail(CompileError::WrongItemKind))?;
         let element = match self.find_item(array_name, Some(index)) {
             Some(item) => item,
             None => self.create_item(array_name, Some(index)).map_err(fail)?,
@@ -1211,22 +1261,22 @@ impl<'a> Compiler<'a> {
 
     /// Rules 5 and 6, `name(arguments)` (builder operator 4): a built-in
     /// function over its flattened arguments.
-    fn call(&mut self, first: NodeId) -> Result<(), (Hresult, Option<NodeId>)> {
-        let fail = |code| (code, Some(first));
+    fn call(&mut self, first: NodeId) -> Result<(), (CompileError, Option<NodeId>)> {
+        let fail = |code: CompileError| (code, Some(first));
         // As in `index`, stock reads the item of any other node; such an
         // item is never a function.
         let Kind::Name(name) = self.node(first).kind else {
-            return Err(fail(WRONG_ITEM_KIND));
+            return Err(fail(CompileError::WrongItemKind));
         };
         if self.find_item(name, None).is_some() {
-            return Err(fail(WRONG_ITEM_KIND));
+            return Err(fail(CompileError::WrongItemKind));
         }
         let bytes = &self.text[name.start..name.end];
         let (_, function) = *FUNCTIONS
             .iter()
             .find(|(name, _)| *name == bytes)
-            .ok_or(fail(SYNTAX_ERROR))?;
-        let (minimum, maximum) = function.count_range().ok_or(fail(SYNTAX_ERROR))?;
+            .ok_or(fail(CompileError::Syntax))?;
+        let (minimum, maximum) = function.count_range().ok_or(fail(CompileError::Syntax))?;
         let mut count = 0u32;
         let mut constant = true;
         let mut previous = first;
@@ -1261,13 +1311,13 @@ impl<'a> Compiler<'a> {
             count += 1;
         }
         if count < minimum {
-            return Err(fail(TOO_FEW_ARGUMENTS));
+            return Err(fail(CompileError::TooFewArguments));
         }
         if count > maximum {
-            return Err(fail(TOO_MANY_ARGUMENTS));
+            return Err(fail(CompileError::TooManyArguments));
         }
         let Some(arguments) = self.next(first) else {
-            return Err(fail(TOO_FEW_ARGUMENTS));
+            return Err(fail(CompileError::TooFewArguments));
         };
         self.node_mut(first).next = None;
         self.free_list(Some(first));
@@ -1281,7 +1331,7 @@ impl<'a> Compiler<'a> {
         first: NodeId,
         count: u32,
         constant: bool,
-    ) -> Result<(), (Hresult, Option<NodeId>)> {
+    ) -> Result<(), (CompileError, Option<NodeId>)> {
         if !constant {
             return self.generic(operator, first);
         }
@@ -1295,7 +1345,7 @@ impl<'a> Compiler<'a> {
             id = self.next(node);
         }
         let result = variant::apply(self.text, operator, &values[..count as usize])
-            .map_err(|code| (code, Some(first)))?;
+            .map_err(|error| (CompileError::Value(error), Some(first)))?;
         self.fold(first, result);
         Ok(())
     }
@@ -1377,7 +1427,7 @@ fn number_value(
     suffix: Option<usize>,
     base: u64,
     value: u64,
-) -> Result<Variant, Hresult> {
+) -> Result<Variant, CompileError> {
     let wide = |digits: usize| {
         value > 0xffff_ffff || (base == 10 && digits > 10) || (base == 16 && digits > 8)
     };
@@ -1395,7 +1445,7 @@ fn number_value(
     }
     if suffix + 1 >= end {
         if wide(digits) {
-            return Err(SUFFIX_OVERFLOW);
+            return Err(CompileError::SuffixOverflow);
         }
         return Ok(if unsigned {
             Variant::U32(value as u32)
@@ -1657,7 +1707,7 @@ mod tests {
         (bytes, digits.len() / 2)
     }
 
-    fn compile(text: &[u8]) -> Result<Option<([u8; CAPACITY], usize)>, Hresult> {
+    fn compile(text: &[u8]) -> Result<Option<([u8; CAPACITY], usize)>, CompileError> {
         compile_text(text).map(|program| {
             program.map(|program| {
                 let mut output = [0u8; CAPACITY];
@@ -1705,7 +1755,11 @@ mod tests {
     #[test]
     fn errors() {
         for (text, code) in ERRORS {
-            assert_eq!(compile(text.as_bytes()), Err(Hresult(code)), "{text}");
+            assert_eq!(
+                compile(text.as_bytes()).map_err(Hresult::from),
+                Err(Hresult(code)),
+                "{text}"
+            );
         }
     }
 
@@ -1785,26 +1839,26 @@ mod tests {
         );
         assert_eq!(
             compile(nested(&mut buffer, b"(", 499, b"UDP", b")")),
-            Err(STACK_OVERFLOW)
+            Err(CompileError::StackOverflow)
         );
         assert_eq!(
             compile(nested(&mut buffer, b"-", 499, b"UDP", b"")),
-            Err(STACK_OVERFLOW)
+            Err(CompileError::StackOverflow)
         );
         // 498 negations fit the stack but exhaust the node objects; the
         // freed operand then leaves the next negation without one.
         assert_eq!(
             compile(nested(&mut buffer, b"-", 498, b"UDP", b"")),
-            Err(MISSING_OPERAND)
+            Err(CompileError::MissingOperand)
         );
         // 65 live nodes exceed the 0x40 node objects.
         assert_eq!(
             compile(nested(&mut buffer, b"UDP+", 32, b"UDP", b"")),
-            Err(OUT_OF_MEMORY)
+            Err(CompileError::OutOfMemory)
         );
         assert_eq!(
             compile(nested(&mut buffer, b"a", 0x80, b"", b"")),
-            Err(NAME_TOO_LONG)
+            Err(CompileError::NameTooLong)
         );
     }
 }

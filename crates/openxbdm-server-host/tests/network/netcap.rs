@@ -1,9 +1,11 @@
 //! `netcap` over TCP.
 
-use openxbdm_core::status::Hresult;
+use openxbdm_core::status::KernelError;
 use openxbdm_server::commands::network::WsaError;
 use openxbdm_server::commands::network::netcap::BufferSizes;
 use openxbdm_server::commands::network::netcap::capture_file;
+use openxbdm_server::commands::network::netcap::capture_file::CaptureFileError;
+use openxbdm_server::commands::network::netsim::NetsimError;
 use openxbdm_server_host::backend::MockBackend;
 use openxbdm_server_host::backend::network::netcap::Attachment;
 use openxbdm_server_host::backend::network::netcap::LOCAL_TIME;
@@ -233,7 +235,7 @@ fn captures_chain_into_the_network_simulator() {
     // intercept, so an intercept failure does not apply.
     assert_eq!(session.command(NETSIM_INSERT), "200- index=0");
     with_mock(&server, |mock| {
-        mock.intercept_error = Some(WsaError(0x2735))
+        mock.intercept_error = Some(WsaError::ALREADY)
     });
     assert_eq!(
         session.command(r"netcap start file=e:\chained.bin"),
@@ -260,7 +262,9 @@ fn failed_simulator_creation_leaves_the_capture_unrouted() {
         session.command(r"netcap start file=e:\cap.bin"),
         "200- started"
     );
-    server.host.lock().backend.network.netsim.create_error = Some(Hresult::OUT_OF_MEMORY);
+    // ERROR_OUTOFMEMORY from the intercept registration.
+    server.host.lock().backend.network.netsim.create_error =
+        WsaError::new(14).map(NetsimError::Intercept);
     assert_eq!(session.command(NETSIM_INSERT), "400- err=0x8007000e");
     assert_eq!(
         with_mock(&server, |mock| mock.attachment),
@@ -451,7 +455,7 @@ fn close_failures_map_kernel_status() {
         "200- started"
     );
     with_mock(&server, |mock| {
-        mock.finish_error = Some(Hresult(0xd000_007f))
+        mock.finish_error = Some(CaptureFileError::Kernel(KernelError::DiskFull))
     });
     assert_eq!(
         session.command("netcap stop"),
@@ -464,7 +468,7 @@ fn start_failures_report_the_result() {
     let server = TestServer::start();
     let mut session = session(&server);
     with_mock(&server, |mock| {
-        mock.open_error = Some(Hresult::OUT_OF_MEMORY)
+        mock.open_error = Some(CaptureFileError::OutOfMemory)
     });
     assert_eq!(
         session.command(r"netcap start file=e:\a.bin"),
@@ -472,7 +476,7 @@ fn start_failures_report_the_result() {
     );
 
     with_mock(&server, |mock| {
-        mock.intercept_error = Some(WsaError(0x2735))
+        mock.intercept_error = Some(WsaError::ALREADY)
     });
     assert_eq!(
         session.command(r"netcap start file=e:\b.bin flags=1"),
@@ -489,13 +493,15 @@ fn start_failures_report_the_result() {
     );
     assert_eq!(session.command("netcap stop"), "435- ");
 
-    with_mock(&server, |mock| mock.intercept_error = Some(WsaError(10055)));
+    with_mock(&server, |mock| {
+        mock.intercept_error = Some(WsaError::NO_BUFFERS)
+    });
     assert_eq!(
         session.command(r"netcap start file=e:\c.bin"),
         "400- err=0x80072747"
     );
     with_mock(&server, |mock| {
-        mock.intercept_error = Some(WsaError(-0x7ff8_fff2))
+        mock.intercept_error = WsaError::new(-0x7ff8_fff2)
     });
     assert_eq!(
         session.command(r"netcap start file=e:\d.bin"),

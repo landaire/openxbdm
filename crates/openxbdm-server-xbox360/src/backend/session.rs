@@ -11,6 +11,7 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
 use openxbdm_server::Server;
 use openxbdm_server::commands;
@@ -18,14 +19,15 @@ use openxbdm_server::commands::filesystem::FileHandle;
 use openxbdm_server::commands::session::DEBUG_CAPTURE_SIZE;
 use openxbdm_server::commands::session::FastPipeBackend;
 use openxbdm_server::commands::session::FileEventId;
+use openxbdm_server::commands::session::LogEngineError;
 use openxbdm_server::commands::session::ProcessorNumber;
 use openxbdm_server::commands::session::RpcBackend;
 use openxbdm_server::commands::session::RpcCall;
 use openxbdm_server::commands::session::RpcContext;
 use openxbdm_server::commands::session::RpcCreateError;
 use openxbdm_server::commands::session::RpcThread;
-use openxbdm_server::commands::session::TELL_LOG_AREA_CRITICAL_SECTIONS;
 use openxbdm_server::commands::session::TELL_LOG_LINE_LIMIT;
+use openxbdm_server::commands::session::TellLogAreas;
 use openxbdm_server::commands::session::TellLogBackend;
 use openxbdm_server::commands::session::TellLogConfig;
 use openxbdm_server::commands::session::TellLogCounters;
@@ -310,12 +312,9 @@ impl commands::session::Backend for Console {
         }
     }
 
-    fn flush_file(&mut self, handle: FileHandle) -> Result<(), NtStatus> {
+    fn flush_file(&mut self, handle: FileHandle) -> Result<(), KernelError> {
         let mut io_status = IoStatusBlock::default();
-        match kernel::NtFlushBuffersFile(handle.0, &mut io_status) {
-            status if (status as i32) < 0 => Err(NtStatus(status)),
-            _ => Ok(()),
-        }
+        NtStatus(kernel::NtFlushBuffersFile(handle.0, &mut io_status)).result()
     }
 
     fn switch_file_events(&mut self, enable: bool) -> FileEventId {
@@ -698,9 +697,9 @@ impl RpcBackend for Console {
                 block,
                 flags,
             );
-            if (status as i32) < 0 {
+            if let Err(error) = NtStatus(status).result() {
                 kernel::ExFreePool(block);
-                return Err(RpcCreateError::Thread(NtStatus(status)));
+                return Err(RpcCreateError::Thread(error));
             }
             write_u32(block + CALL_THREAD, object);
         }
@@ -851,11 +850,11 @@ extern "C" fn tell_log_write(_context: u32, entry: u32, length: u32) -> u32 {
     let mut write = |bytes: &[u8]| write_log(file, bytes);
     match writer.process(entry, closing, &mut write) {
         Ok(()) => TELL_LOG_STATUS_FLAG,
-        Err(status) => status.0 | TELL_LOG_STATUS_FLAG,
+        Err(error) => Hresult::from(error).0,
     }
 }
 
-fn write_log(file: u32, bytes: &[u8]) -> Result<(), NtStatus> {
+fn write_log(file: u32, bytes: &[u8]) -> Result<(), KernelError> {
     let mut io_status = IoStatusBlock::default();
     let status = kernel::NtWriteFile(
         file,
@@ -867,28 +866,24 @@ fn write_log(file: u32, bytes: &[u8]) -> Result<(), NtStatus> {
         bytes.len() as u32,
         core::ptr::null(),
     );
-    if (status as i32) < 0 {
-        Err(NtStatus(status))
-    } else {
-        Ok(())
-    }
+    NtStatus(status).result()
 }
 
 impl TellLogBackend for Console {
-    fn tell_log_area(&mut self) -> Option<u32> {
-        tell_log_engine().map(|_| TELL_LOG.area.load(Ordering::Acquire))
+    fn tell_log_area(&mut self) -> Option<TellLogAreas> {
+        tell_log_engine().map(|_| TellLogAreas(TELL_LOG.area.load(Ordering::Acquire)))
     }
 
-    fn set_tell_log_area(&mut self, area: u32) {
-        TELL_LOG.area.store(area, Ordering::Release);
+    fn set_tell_log_area(&mut self, area: TellLogAreas) {
+        TELL_LOG.area.store(area.0, Ordering::Release);
     }
 
     fn tell_log_start(
         &mut self,
         file: FileHandle,
-        area: u32,
+        area: TellLogAreas,
         config: TellLogConfig,
-    ) -> Result<Hresult, Hresult> {
+    ) -> Result<(), LogEngineError> {
         TELL_LOG.file.store(file.0, Ordering::Release);
         let context = &TELL_LOG as *const TellLog as usize as u32;
         match log_engine::create_for_callback(
@@ -896,20 +891,20 @@ impl TellLogBackend for Console {
             tell_log_write as *const () as usize as u32,
             config,
         ) {
-            Ok((engine, status)) => {
+            Ok(engine) => {
                 TELL_LOG
                     .entry_size
                     .store(config.entry_size, Ordering::Release);
-                TELL_LOG.area.store(area, Ordering::Release);
+                TELL_LOG.area.store(area.0, Ordering::Release);
                 TELL_LOG
                     .worker
                     .store(log_engine::worker_id(engine), Ordering::Release);
                 TELL_LOG.engine.store(engine.address(), Ordering::SeqCst);
-                Ok(status)
+                Ok(())
             }
-            Err(status) => {
+            Err(error) => {
                 TELL_LOG.file.store(0, Ordering::Release);
-                Err(status)
+                Err(error)
             }
         }
     }
@@ -1038,7 +1033,8 @@ extern "C" fn reset_title_wait_counts(_context: u32) -> u32 {
 /// Write an `E:` or `L:` line into the log when area bit 2 is set (stock
 /// 0x91f2b680 and line writer 0x91f2b530).
 fn trace_wait(trace: WaitTrace, section: u32, entry_stack: u32) {
-    if dispatcher::dispatch(0x8a, 0) & TELL_LOG_AREA_CRITICAL_SECTIONS == 0 {
+    let open = TellLogAreas(dispatcher::dispatch(0x8a, 0));
+    if !open.intersects(TellLogAreas::CRITICAL_SECTIONS) {
         return;
     }
     let thread = current_thread();

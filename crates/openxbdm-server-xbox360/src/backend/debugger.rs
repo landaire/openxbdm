@@ -15,6 +15,7 @@ pub(crate) use self::exports::apply_pending_stop_on;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
+use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
 use openxbdm_server::commands::console::DumpMode;
 use openxbdm_server::commands::debugger;
@@ -31,7 +32,9 @@ use openxbdm_server::commands::debugger::DirectPolicy;
 use openxbdm_server::commands::debugger::DirectRegisters;
 use openxbdm_server::commands::debugger::DirectStep;
 use openxbdm_server::commands::debugger::Disposition;
+use openxbdm_server::commands::debugger::ExceptionFlags;
 use openxbdm_server::commands::debugger::ExceptionRecord;
+use openxbdm_server::commands::debugger::ExitStatus;
 use openxbdm_server::commands::debugger::ExtensionHandle;
 use openxbdm_server::commands::debugger::HARDWARE_KERNEL_DEBUGGER;
 use openxbdm_server::commands::debugger::MODULE_NAME_CAPACITY;
@@ -39,13 +42,14 @@ use openxbdm_server::commands::debugger::ModuleEvent;
 use openxbdm_server::commands::debugger::NOTICE_TEXT_CAPACITY;
 use openxbdm_server::commands::debugger::NoSuchThread;
 use openxbdm_server::commands::debugger::ProcessKind;
-use openxbdm_server::commands::debugger::SetContextError;
 use openxbdm_server::commands::debugger::StopOn;
+use openxbdm_server::commands::debugger::StoppedThreadError;
 use openxbdm_server::commands::debugger::ThreadId;
 use openxbdm_server::commands::debugger::ThreadInfo;
 use openxbdm_server::commands::debugger::ThreadName;
 use openxbdm_server::commands::debugger::dispatch_direct;
 use openxbdm_server::commands::debugger::module_flags;
+use openxbdm_server::commands::services::ThreadHandle;
 use openxbdm_server::notify::ExecutionState;
 
 use super::Console;
@@ -611,7 +615,7 @@ extern "C" fn debug_routine(trap_frame: u32, record: u32, context: u32, second_c
     let server = thread_object == SERVER_THREAD.load(Ordering::Relaxed);
     if server
         && irql == 0
-        && read_u32(record) == ExceptionRecord::BREAKPOINT
+        && NtStatus(read_u32(record)) == ExceptionRecord::BREAKPOINT
         && BREAK_NOW_ARMED.swap(false, Ordering::AcqRel)
     {
         capture_break_now(record, context);
@@ -661,9 +665,6 @@ extern "C" fn debug_routine(trap_frame: u32, record: u32, context: u32, second_c
     }
     u32::from(handled)
 }
-
-/// Status code of the stack overflow stop record.
-const STATUS_STACK_OVERFLOW: u32 = 0xc000_00fd;
 
 /// Kernel trap frame offsets.
 mod trap_frame {
@@ -727,8 +728,8 @@ extern "C" fn stack_overflow(frame: u32) -> u32 {
     context.0[..4].copy_from_slice(&ContextFlags::FULL.0.to_be_bytes());
     KeContextFromKframes(frame, context.0.as_mut_ptr());
     let mut record = [0u32; 0x14];
-    record[0] = STATUS_STACK_OVERFLOW;
-    record[1] = ExceptionRecord::NONCONTINUABLE;
+    record[0] = ExceptionRecord::STACK_OVERFLOW.0;
+    record[1] = ExceptionFlags::NONCONTINUABLE.0;
     record[3] = address;
     let record_address = record.as_mut_ptr() as usize as u32;
     let context_address = context.0.as_mut_ptr() as usize as u32;
@@ -766,8 +767,8 @@ extern "C" fn stack_overflow(frame: u32) -> u32 {
 
 fn read_exception_record(raw: u32) -> ExceptionRecord {
     ExceptionRecord {
-        code: read_u32(raw),
-        flags: read_u32(raw + 4),
+        code: NtStatus(read_u32(raw)),
+        flags: ExceptionFlags(read_u32(raw + 4)),
         address: read_u32(raw + 0xc),
         parameter_count: read_u32(raw + 0x10),
         parameters: core::array::from_fn(|n| read_u32(raw + 0x14 + 4 * n as u32)),
@@ -1617,19 +1618,18 @@ pub(crate) fn read_thread_context(thread: ThreadId, out: &mut Context) -> Result
 pub(crate) fn write_thread_context(
     thread: ThreadId,
     source: &Context,
-) -> Result<(), SetContextError> {
-    let reference =
-        ThreadRef::lookup(thread).map_err(|NoSuchThread| SetContextError::NoSuchThread)?;
+) -> Result<(), StoppedThreadError> {
+    let reference = ThreadRef::lookup(thread)?;
     let object = reference.0;
     let process = read_u32(object + thread::PROCESS);
     let irql = kernel::KfAcquireSpinLock(process as usize as *mut u32);
     let result = if record_of(object).is_none() {
-        Err(SetContextError::NoSuchThread)
+        Err(StoppedThreadError::NoSuchThread)
     } else if let Some(address) = slot_context(object) {
         write_context(address, source);
         Ok(())
     } else {
-        Err(SetContextError::NotStopped)
+        Err(StoppedThreadError::NotStopped)
     };
     kernel::KfReleaseSpinLock(process as usize as *mut u32, irql);
     result
@@ -1763,7 +1763,7 @@ impl debugger::Backend for Console {
         &mut self,
         thread: ThreadId,
         source: &Context,
-    ) -> Result<(), SetContextError> {
+    ) -> Result<(), StoppedThreadError> {
         write_thread_context(thread, source)
     }
 
@@ -1771,17 +1771,19 @@ impl debugger::Backend for Console {
         name_thread(Some(thread), address);
     }
 
-    fn thread_exit_status(&mut self, handle: u32) -> Result<u32, u32> {
+    fn thread_exit_status(&mut self, handle: ThreadHandle) -> Result<ExitStatus, KernelError> {
         let object_type = kernel::EX_THREAD_OBJECT_TYPE.load(Ordering::Relaxed);
         let mut object = 0u32;
-        let status = kernel::ObReferenceObjectByHandle(handle, object_type, &mut object);
-        if (status as i32) < 0 {
-            return Err(kernel::RtlNtStatusToDosError(status));
-        }
+        NtStatus(kernel::ObReferenceObjectByHandle(
+            handle.0,
+            object_type,
+            &mut object,
+        ))
+        .result()?;
         let code = if read_u32(object + 4) & 0xff == 0 {
-            0x103
+            ExitStatus::STILL_ACTIVE
         } else {
-            read_u32(object + thread::EXIT_STATUS)
+            ExitStatus(read_u32(object + thread::EXIT_STATUS))
         };
         kernel::ObDereferenceObject(object);
         Ok(code)
@@ -2033,15 +2035,12 @@ impl debugger::Backend for Console {
         kernel::kernel_version()[2]
     }
 
-    fn load_extension(&mut self, path: &[u8]) -> Result<ExtensionHandle, NtStatus> {
+    fn load_extension(&mut self, path: &[u8]) -> Result<ExtensionHandle, KernelError> {
         let mut name = [0u8; 0x6c];
         let length = path.len().min(name.len() - 1);
         name[..length].copy_from_slice(&path[..length]);
         let mut handle = 0u32;
-        let status = kernel::XexLoadImage(name.as_ptr(), 0xc, 0, &mut handle);
-        if (status as i32) < 0 {
-            return Err(NtStatus(status));
-        }
+        NtStatus(kernel::XexLoadImage(name.as_ptr(), 0xc, 0, &mut handle)).result()?;
         let export = |export_name: &core::ffi::CStr| {
             let mut address = 0u32;
             // Extensions export by name; the loader takes the name pointer
@@ -2065,7 +2064,7 @@ impl debugger::Backend for Console {
         Ok(ExtensionHandle(handle))
     }
 
-    fn unload_extension(&mut self, handle: ExtensionHandle) -> Result<(), NtStatus> {
+    fn unload_extension(&mut self, handle: ExtensionHandle) -> Result<(), KernelError> {
         EXTENSION_TELL_DEBUGGER.store(0, Ordering::Release);
         while EXTENSION_CALLS.load(Ordering::Acquire) != 0 {
             kernel::sleep_milliseconds(1);
@@ -2076,11 +2075,6 @@ impl debugger::Backend for Console {
             // takes no arguments.
             unsafe { kernel::call_export(prepare, 0, 0, 0, 0) };
         }
-        let status = XexUnloadImage(handle.0);
-        if (status as i32) < 0 {
-            Err(NtStatus(status))
-        } else {
-            Ok(())
-        }
+        NtStatus(XexUnloadImage(handle.0)).result()
     }
 }

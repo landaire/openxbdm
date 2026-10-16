@@ -13,6 +13,7 @@ use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
+use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
 use openxbdm_server::commands::filesystem::CreateDisposition;
 use openxbdm_server::commands::filesystem::CreateOptions;
@@ -238,7 +239,6 @@ static RECORDS: AtomicU32 = AtomicU32::new(0);
 const ELAPSED_TIMEOUT: i64 = 1_000_000;
 const COMPLETION_POLL: i64 = -(detour::COMPLETION_POLL_MILLISECONDS as i64) * 10_000;
 const STATUS_TIMEOUT: u32 = 0x102;
-const STATUS_NO_SUCH_FILE: u32 = 0xc000_000f;
 const WORKER_STACK_SIZE: u32 = 0x8000;
 const WORKER_FLAGS: u32 = 0x0400_02a6;
 const OBJ_CASE_INSENSITIVE: u32 = 0x40;
@@ -458,7 +458,7 @@ fn load_context(address: u32) -> CallContext {
         flags: detour::HookFlags(field(CallContext::FLAGS)),
         param_size: field(CallContext::PARAM_SIZE),
         function: optional(field(CallContext::FUNCTION)),
-        return_value: field(CallContext::RETURN_VALUE),
+        return_value: detour::ReturnValue(field(CallContext::RETURN_VALUE)),
         registers: core::array::from_fn(|index| {
             detour::Platform::read_u64(
                 &ConsolePlatform,
@@ -478,7 +478,7 @@ fn store_context(call: &CallContext) {
     store(CallContext::FLAGS, call.flags.0);
     store(CallContext::PARAM_SIZE, call.param_size);
     store(CallContext::FUNCTION, call.function.unwrap_or(0));
-    store(CallContext::RETURN_VALUE, call.return_value);
+    store(CallContext::RETURN_VALUE, call.return_value.0);
     store(CallContext::OVERLAPPED, call.overlapped.unwrap_or(0));
 }
 
@@ -510,7 +510,7 @@ pub(super) fn with_engine(operation: &mut dyn FnMut(&Engine, &dyn detour::Platfo
 }
 
 /// Create the writer and completion workers (0x91f2d378).
-pub(super) fn start(log: Option<&[u8]>) -> NtStatus {
+pub(super) fn start(log: Option<&[u8]>) -> Result<(), KernelError> {
     // SAFETY: no writer runs while the engine is starting.
     let stored = unsafe { &mut *LOG_PATH.0.get() };
     *stored = None;
@@ -521,7 +521,7 @@ pub(super) fn start(log: Option<&[u8]>) -> NtStatus {
     }
     kernel::KeResetEvent(WRITER_DONE.pointer());
     let mut writer = 0u32;
-    let status = kernel::ExCreateThread(
+    let created = kernel::ExCreateThread(
         &mut writer,
         WORKER_STACK_SIZE,
         core::ptr::null_mut(),
@@ -530,11 +530,9 @@ pub(super) fn start(log: Option<&[u8]>) -> NtStatus {
         0,
         WORKER_FLAGS,
     );
-    if (status as i32) < 0 {
-        return NtStatus(status);
-    }
+    NtStatus(created).result()?;
     let mut completion = 0u32;
-    let status = kernel::ExCreateThread(
+    let created = kernel::ExCreateThread(
         &mut completion,
         WORKER_STACK_SIZE,
         core::ptr::null_mut(),
@@ -543,10 +541,9 @@ pub(super) fn start(log: Option<&[u8]>) -> NtStatus {
         0,
         WORKER_FLAGS,
     );
-    if (status as i32) >= 0 {
-        COMPLETION_THREAD.set(completion);
-    }
-    NtStatus(status)
+    NtStatus(created).result()?;
+    COMPLETION_THREAD.set(completion);
+    Ok(())
 }
 
 /// The rest of `stop` (0x91f2cd54).
@@ -611,26 +608,18 @@ const fn log_request(access: u32, disposition: CreateDisposition) -> CreateReque
 }
 
 /// Create the log for writing and open it again for reading
-/// (0x91f2cb28); the status of the last open.
-fn open_log() -> u32 {
+/// (0x91f2cb28).
+fn open_log() -> Result<(), KernelError> {
     const WRITE: CreateRequest = log_request(GENERIC_WRITE, CreateDisposition::OverwriteIf);
     const READ: CreateRequest = log_request(GENERIC_READ_SYNCHRONIZE, CreateDisposition::Open);
     // SAFETY: the server thread wrote the path before creating this thread.
     let Some((bytes, length)) = (unsafe { &*LOG_PATH.0.get() }) else {
-        return STATUS_NO_SUCH_FILE;
+        return Err(KernelError::NoSuchFile);
     };
     let path = &bytes[..*length];
-    match create_file(path, &WRITE) {
-        Ok(handle) => WRITE_HANDLE.set(handle.0),
-        Err(status) => return status.0,
-    }
-    match create_file(path, &READ) {
-        Ok(handle) => {
-            READ_HANDLE.set(handle.0);
-            0
-        }
-        Err(status) => status.0,
-    }
+    WRITE_HANDLE.set(create_file(path, &WRITE)?.0);
+    READ_HANDLE.set(create_file(path, &READ)?.0);
+    Ok(())
 }
 
 /// 0x91f2b930.
@@ -667,9 +656,9 @@ extern "C" fn writer_thread(_context: u32) -> u32 {
         WRITER_DONE.set();
         return 1;
     }
-    let status = open_log();
-    ENGINE.set_status(NtStatus(status));
-    if (status as i32) < 0 {
+    let opened = open_log();
+    ENGINE.set_log_result(opened);
+    if opened.is_err() {
         close_log();
         ENGINE.abort_start();
         WRITER_DONE.set();

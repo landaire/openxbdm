@@ -35,9 +35,9 @@ use openxbdm_core::status::Hresult;
 use super::Allocator;
 use super::Backoff;
 use super::CREATE_FAILED;
+use super::Failure;
 use super::SPIN_ATTEMPTS;
 use super::SUCCESS;
-use super::Status;
 use super::Tagged;
 use super::Timeout;
 use super::Wait;
@@ -59,7 +59,6 @@ use super::set_event;
 use super::store;
 use super::store_quad;
 use super::swap_tagged;
-use super::win32_result;
 use super::zero;
 use crate::exports::export;
 use crate::kernel::CreateEventA;
@@ -118,26 +117,45 @@ const CALLER_RECORD: u32 = 0x1_0000;
 const INDEX_SHIFT: u32 = 17;
 const INDEX: u32 = 0xfffe_0000;
 
-/// Internal results that [`result`] maps to facility 0x31 HRESULTs.
-const NOT_HELD: Status = Status(0xe000_0001);
-const UPGRADE_PENDING: Status = Status(0xe000_0002);
-const EXCLUSIVE_WAITING: Status = Status(0xe000_0003);
-const NOT_RECURSIVE: Status = Status(0xe000_0004);
+/// A failed lock operation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LockFailure {
+    Failure(Failure),
+    NotHeld,
+    UpgradePending,
+    ExclusiveWaiting,
+    NotRecursive,
+}
+
+/// Stock keeps its internal codes 0xe0000001-0xe0000004 and wait routine
+/// results in one status word, so a wait result equal to a code reports as
+/// that code.
+impl From<Failure> for LockFailure {
+    fn from(failure: Failure) -> Self {
+        match failure {
+            Failure::Wait(error) => match error.code() {
+                0xe000_0001 => Self::NotHeld,
+                0xe000_0002 => Self::UpgradePending,
+                0xe000_0003 => Self::ExclusiveWaiting,
+                0xe000_0004 => Self::NotRecursive,
+                _ => Self::Failure(failure),
+            },
+            failure => Self::Failure(failure),
+        }
+    }
+}
+
 /// 351 with a mode other than shared or exclusive.
 const BAD_MODE: Hresult = Hresult(0x8031_0003);
-const NOT_HELD_RESULT: Hresult = Hresult(0x8031_0004);
-const UPGRADE_PENDING_RESULT: Hresult = Hresult(0x8031_0005);
-const EXCLUSIVE_WAITING_RESULT: Hresult = Hresult(0x8031_0006);
-const NOT_RECURSIVE_RESULT: Hresult = Hresult(0x8031_0007);
 
-fn result(status: Status) -> Hresult {
-    match status {
-        Status::SUCCESS => SUCCESS,
-        NOT_HELD => NOT_HELD_RESULT,
-        UPGRADE_PENDING => UPGRADE_PENDING_RESULT,
-        EXCLUSIVE_WAITING => EXCLUSIVE_WAITING_RESULT,
-        NOT_RECURSIVE => NOT_RECURSIVE_RESULT,
-        Status(code) => win32_result(code),
+fn result(result: Result<(), LockFailure>) -> Hresult {
+    match result {
+        Ok(()) => SUCCESS,
+        Err(LockFailure::NotHeld) => Hresult(0x8031_0004),
+        Err(LockFailure::UpgradePending) => Hresult(0x8031_0005),
+        Err(LockFailure::ExclusiveWaiting) => Hresult(0x8031_0006),
+        Err(LockFailure::NotRecursive) => Hresult(0x8031_0007),
+        Err(LockFailure::Failure(failure)) => failure.into(),
     }
 }
 
@@ -485,13 +503,13 @@ impl Request {
 
     /// Give the waiters word an entry index, taking an entry when it has
     /// none.
-    fn attach(&mut self, waiters: u32) -> Result<u32, Status> {
+    fn attach(&mut self, waiters: u32) -> Result<u32, Failure> {
         if waiters & INDEX != 0 {
             return Ok(waiters);
         }
         let entry = match self.entry {
             Some(entry) => entry,
-            None => self.pool.take_entry().ok_or(Status::NOT_ENOUGH_MEMORY)?,
+            None => self.pool.take_entry().ok_or(Failure::NotEnoughMemory)?,
         };
         self.entry = Some(entry);
         Ok(waiters.wrapping_add(entry.index() << INDEX_SHIFT))
@@ -533,7 +551,7 @@ impl Request {
 
     /// Finish a take after waiting: the entry returns to the free list once
     /// the record names none.
-    fn taken(&mut self, stored: u32, taker: Taker) -> Status {
+    fn taken(&mut self, stored: u32, taker: Taker) -> Result<(), LockFailure> {
         if stored & INDEX == 0 {
             self.release_entry();
         }
@@ -543,11 +561,13 @@ impl Request {
         if taker == Taker::SpinningExclusive {
             lwsync();
         }
-        Status::SUCCESS
+        Ok(())
     }
 
-    fn block(&self, handle: u32) -> Status {
-        self.wait.block(WaitObject::handle(handle))
+    fn block(&self, handle: u32) -> Result<(), LockFailure> {
+        self.wait
+            .block(WaitObject::handle(handle))
+            .map_err(LockFailure::from)
     }
 
     fn take_shared(&self) -> Take {
@@ -568,10 +588,10 @@ impl Request {
         }
     }
 
-    fn shared(&mut self) -> Status {
+    fn shared(&mut self) -> Result<(), LockFailure> {
         if self.owned_by_caller() {
             if self.pool.kind() == Kind::Owned {
-                return NOT_RECURSIVE;
+                return Err(LockFailure::NotRecursive);
             }
             loop {
                 let old = self.read();
@@ -583,7 +603,7 @@ impl Request {
                         waiters,
                     },
                 ) {
-                    return Status::SUCCESS;
+                    return Ok(());
                 }
             }
         }
@@ -599,17 +619,17 @@ impl Request {
                     },
                 ) {
                     self.release_entry();
-                    return Status::SUCCESS;
+                    return Ok(());
                 }
                 continue;
             }
             if !self.may_wait(waiters) {
                 self.release_entry();
-                return Status::TIMEOUT;
+                return Err(Failure::Timeout.into());
             }
             let waiters = match self.attach(waiters) {
                 Ok(waiters) => waiters.wrapping_add(1),
-                Err(status) => return status,
+                Err(failure) => return Err(failure.into()),
             };
             if self.swap(old, State { holders, waiters }) {
                 break waiters;
@@ -620,8 +640,7 @@ impl Request {
             return self.taken(stored, Taker::Shared);
         }
         loop {
-            let status = self.block(entry.semaphore());
-            if status != Status::SUCCESS {
+            if let Err(failure) = self.block(entry.semaphore()) {
                 let stored = loop {
                     let old = self.read();
                     let waiters = State {
@@ -642,7 +661,7 @@ impl Request {
                 if stored & INDEX == 0 {
                     self.release_entry();
                 }
-                return status;
+                return Err(failure);
             }
             loop {
                 match self.take_shared() {
@@ -676,7 +695,12 @@ impl Request {
     /// Leave the waiters after a failed wait. `holders` gives the holders
     /// word to store; shared waiters run when no exclusive holder or waiter
     /// remains.
-    fn abandon(&mut self, entry: Entry, status: Status, holders: impl Fn(u32) -> u32) -> Status {
+    fn abandon(
+        &mut self,
+        entry: Entry,
+        failure: LockFailure,
+        holders: impl Fn(u32) -> u32,
+    ) -> Result<(), LockFailure> {
         let (holders, waiters) = loop {
             let old = self.read();
             let holders = holders(old.holders);
@@ -695,13 +719,13 @@ impl Request {
         if holders & HELD == 0 && waiters & SHARED != 0 {
             release_semaphore(entry.semaphore(), waiters & SHARED);
         }
-        status
+        Err(failure)
     }
 
-    fn exclusive(&mut self) -> Status {
+    fn exclusive(&mut self) -> Result<(), LockFailure> {
         if self.owned_by_caller() {
             if self.pool.kind() == Kind::Owned {
-                return NOT_RECURSIVE;
+                return Err(LockFailure::NotRecursive);
             }
             let recursion = self.recursion_field();
             store(recursion, load(recursion).wrapping_add(1));
@@ -723,7 +747,7 @@ impl Request {
                 }
             }
             lwsync();
-            return Status::SUCCESS;
+            return Ok(());
         }
         let registered = loop {
             let old = self.read();
@@ -740,17 +764,17 @@ impl Request {
                 ) {
                     self.release_entry();
                     self.record_owner();
-                    return Status::SUCCESS;
+                    return Ok(());
                 }
                 continue;
             }
             if !self.may_wait(waiters) {
                 self.release_entry();
-                return Status::TIMEOUT;
+                return Err(Failure::Timeout.into());
             }
             let waiters = match self.attach(waiters) {
                 Ok(waiters) => waiters,
-                Err(status) => return status,
+                Err(failure) => return Err(failure.into()),
             };
             if self.swap(
                 old,
@@ -767,9 +791,8 @@ impl Request {
             return self.taken(stored, Taker::SpinningExclusive);
         }
         loop {
-            let status = self.block(entry.event());
-            if status != Status::SUCCESS {
-                return self.abandon(entry, status, |holders| holders.wrapping_sub(WAITER));
+            if let Err(failure) = self.block(entry.event()) {
+                return self.abandon(entry, failure, |holders| holders.wrapping_sub(WAITER));
             }
             loop {
                 match self.take_exclusive() {
@@ -788,12 +811,12 @@ impl Request {
     }
 
     /// Exclusive to shared; a recursive owner gives up one recursion level.
-    fn downgrade(&mut self) -> Status {
+    fn downgrade(&mut self) -> Result<(), LockFailure> {
         let kind = self.pool.kind();
         let recursion = self.recursion_field();
         if kind != Kind::Plain {
             if load(self.owner_field()) != GetCurrentThreadId() {
-                return NOT_HELD;
+                return Err(LockFailure::NotHeld);
             }
             if load(recursion) == 0 {
                 store(self.owner_field(), 0);
@@ -804,7 +827,7 @@ impl Request {
             let mut holders = old.holders;
             if kind == Kind::Plain || load(recursion) == 0 {
                 if holders & EXCLUSIVE == 0 {
-                    return NOT_HELD;
+                    return Err(LockFailure::NotHeld);
                 }
                 holders &= !EXCLUSIVE;
             }
@@ -816,12 +839,12 @@ impl Request {
         };
         if kind != Kind::Plain && load(recursion) != 0 {
             store(recursion, load(recursion).wrapping_sub(1));
-            return Status::SUCCESS;
+            return Ok(());
         }
         if holders & WAITERS == 0 && waiters & SHARED != 0 {
             release_semaphore(self.pool.entry_of(waiters).semaphore(), waiters & SHARED);
         }
-        Status::SUCCESS
+        Ok(())
     }
 
     fn take_upgrade(&self) -> Take {
@@ -844,12 +867,12 @@ impl Request {
     }
 
     /// Shared to exclusive.
-    fn upgrade(&mut self, precedence: Precedence) -> Status {
+    fn upgrade(&mut self, precedence: Precedence) -> Result<(), LockFailure> {
         if self.owned_by_caller() {
             loop {
                 let old = self.read();
                 if old.holders & SHARED == 0 {
-                    return Status::INVALID_PARAMETER;
+                    return Err(Failure::InvalidParameter.into());
                 }
                 let waiters = if self.wait.spin {
                     old.waiters
@@ -868,23 +891,23 @@ impl Request {
             }
             let recursion = self.recursion_field();
             store(recursion, load(recursion).wrapping_add(1));
-            return Status::SUCCESS;
+            return Ok(());
         }
         let registered = loop {
             let old = self.read();
             let (holders, waiters) = (old.holders, old.waiters);
             let failure = if holders & SHARED == 0 {
-                Some(Status::INVALID_PARAMETER)
+                Some(LockFailure::Failure(Failure::InvalidParameter))
             } else if holders & UPGRADING != 0 {
-                Some(UPGRADE_PENDING)
+                Some(LockFailure::UpgradePending)
             } else if holders & WAITERS != 0 && precedence == Precedence::Behind {
-                Some(EXCLUSIVE_WAITING)
+                Some(LockFailure::ExclusiveWaiting)
             } else {
                 None
             };
-            if let Some(status) = failure {
+            if let Some(failure) = failure {
                 self.release_entry();
-                return status;
+                return Err(failure);
             }
             let remaining = holders.wrapping_sub(1);
             if remaining & (EXCLUSIVE | SHARED) == 0 {
@@ -897,17 +920,17 @@ impl Request {
                 ) {
                     self.release_entry();
                     self.record_owner();
-                    return Status::SUCCESS;
+                    return Ok(());
                 }
                 continue;
             }
             if !self.may_wait(waiters) {
                 self.release_entry();
-                return Status::TIMEOUT;
+                return Err(Failure::Timeout.into());
             }
             let waiters = match self.attach(waiters) {
                 Ok(waiters) => waiters,
-                Err(status) => return status,
+                Err(failure) => return Err(failure.into()),
             };
             if self.swap(
                 old,
@@ -924,9 +947,8 @@ impl Request {
             return self.taken(stored, Taker::Exclusive);
         }
         loop {
-            let status = self.block(entry.event());
-            if status != Status::SUCCESS {
-                return self.abandon(entry, status, |holders| {
+            if let Err(failure) = self.block(entry.event()) {
+                return self.abandon(entry, failure, |holders| {
                     (holders.wrapping_sub(WAITER) & !UPGRADING).wrapping_add(1)
                 });
             }
@@ -940,11 +962,11 @@ impl Request {
         }
     }
 
-    fn release_shared(&mut self) -> Status {
+    fn release_shared(&mut self) -> Result<(), LockFailure> {
         let (holders, waiters) = loop {
             let old = self.read();
             if old.holders & SHARED == 0 {
-                return NOT_HELD;
+                return Err(LockFailure::NotHeld);
             }
             let holders = old.holders.wrapping_sub(1);
             if self.swap(
@@ -960,26 +982,26 @@ impl Request {
         if holders & (EXCLUSIVE | SHARED) == 0 && holders & WAITERS != 0 {
             set_event(self.pool.entry_of(waiters).event());
         }
-        Status::SUCCESS
+        Ok(())
     }
 
-    fn release_exclusive(&mut self) -> Status {
+    fn release_exclusive(&mut self) -> Result<(), LockFailure> {
         if self.pool.kind() != Kind::Plain {
             if load(self.owner_field()) != GetCurrentThreadId() {
-                return NOT_HELD;
+                return Err(LockFailure::NotHeld);
             }
             let recursion = self.recursion_field();
             let depth = load(recursion);
             if depth != 0 {
                 store(recursion, depth.wrapping_sub(1));
-                return Status::SUCCESS;
+                return Ok(());
             }
             store(self.owner_field(), 0);
         }
         let (holders, waiters) = loop {
             let old = self.read();
             if old.holders & EXCLUSIVE == 0 {
-                return NOT_HELD;
+                return Err(LockFailure::NotHeld);
             }
             let holders = old.holders & !EXCLUSIVE;
             if self.swap(
@@ -999,7 +1021,7 @@ impl Request {
         } else if waiters & SHARED != 0 {
             release_semaphore(self.pool.entry_of(waiters).semaphore(), waiters & SHARED);
         }
-        Status::SUCCESS
+        Ok(())
     }
 }
 
@@ -1059,15 +1081,15 @@ extern "C" fn operate(pool: u32, operation: u32, lock: u32) -> u32 {
         request.immediate = flags & MAY_WAIT == 0;
     }
     request.immediate |= operation & IMMEDIATE != 0;
-    let status = match Operation::decode(operation) {
+    let outcome = match Operation::decode(operation) {
         Some(Operation::Shared) => request.shared(),
         Some(Operation::Exclusive) => request.exclusive(),
         Some(Operation::Downgrade) => request.downgrade(),
         Some(Operation::Upgrade) => request.upgrade(Precedence::Behind),
         Some(Operation::UpgradeAhead) => request.upgrade(Precedence::Ahead),
-        None => Status::INVALID_PARAMETER,
+        None => Err(Failure::InvalidParameter.into()),
     };
-    result(status).0
+    result(outcome).0
 }
 export!(340, operate);
 

@@ -1,6 +1,9 @@
 //! File system, object namespace, and block device services.
 
+use openxbdm_core::status::Hresult;
+use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::Win32Error;
 use openxbdm_server::commands;
 use openxbdm_server::commands::filesystem::BasicInformation;
 use openxbdm_server::commands::filesystem::CreateOptions;
@@ -20,7 +23,6 @@ use openxbdm_server::commands::filesystem::PoolRange;
 use openxbdm_server::commands::filesystem::ShareAccess;
 use openxbdm_server::commands::filesystem::TransferDirection;
 use openxbdm_server::commands::filesystem::VolumeSize;
-use openxbdm_server::commands::filesystem::nt;
 
 use super::Console;
 use crate::exports::export;
@@ -120,12 +122,13 @@ impl Data {
     }
 }
 
-fn status(raw: u32) -> Result<(), NtStatus> {
-    if (raw as i32) < 0 {
-        Err(NtStatus(raw))
-    } else {
-        Ok(())
-    }
+fn status(raw: u32) -> Result<(), KernelError> {
+    NtStatus(raw).result()
+}
+
+/// `RtlNtStatusToDosError` of a failed kernel call.
+fn dos_error(error: KernelError) -> Option<Win32Error> {
+    Win32Error::new(kernel::RtlNtStatusToDosError(NtStatus::from(error).0))
 }
 
 /// A counted name; the kernel copies it, so the bytes only live for the
@@ -153,7 +156,7 @@ fn complete(handle: u32, raw: u32, io_status: &IoStatusBlock) -> u32 {
 }
 
 /// Create or open a file by object name.
-pub(crate) fn create_file(path: &[u8], request: &CreateRequest) -> Result<FileHandle, NtStatus> {
+pub(crate) fn create_file(path: &[u8], request: &CreateRequest) -> Result<FileHandle, KernelError> {
     let name = ansi(path);
     let object = attributes(0, &name);
     let mut io_status = IoStatusBlock::default();
@@ -176,7 +179,7 @@ pub(crate) fn create_file(path: &[u8], request: &CreateRequest) -> Result<FileHa
     Ok(FileHandle(handle))
 }
 
-fn set_information(handle: FileHandle, class: u32, information: &[u8]) -> Result<(), NtStatus> {
+fn set_information(handle: FileHandle, class: u32, information: &[u8]) -> Result<(), KernelError> {
     let mut io_status = IoStatusBlock::default();
     status(kernel::NtSetInformationFile(
         handle.0,
@@ -234,43 +237,52 @@ fn monitor_block() -> Option<u32> {
 
 /// Format `device` as XTAF (0x91f72e58): header, FAT, and an empty root
 /// directory cluster.
-fn format_xtaf(device: &[u8], cluster_size: u32) -> Result<(), NtStatus> {
-    let handle = open_file(0, device, 0x10_0003, 0, 0x18)?.0;
+fn format_xtaf(device: &[u8], cluster_size: u32) -> Result<(), KernelError> {
+    const ACCESS: FileAccess = FileAccess::SYNCHRONIZE
+        .union(FileAccess::READ_DATA)
+        .union(FileAccess::WRITE_DATA);
+    const OPTIONS: CreateOptions =
+        CreateOptions::SYNCHRONOUS_IO_ALERT.union(CreateOptions::NO_INTERMEDIATE_BUFFERING);
+    let handle = open_file(None, device, ACCESS, ShareAccess::NONE, OPTIONS)?;
     let result = format_open_volume(handle, cluster_size);
-    kernel::NtClose(handle);
+    kernel::NtClose(handle.0);
     result
 }
 
-/// Open a file by name relative to directory `root` (0 for none).
+/// Open a file by name relative to directory `root`.
 #[inline(never)]
 fn open_file(
-    root: u32,
+    root: Option<ObjectDirectory>,
     name: &[u8],
-    access: u32,
-    share: u32,
-    options: u32,
-) -> Result<FileHandle, NtStatus> {
+    access: FileAccess,
+    share: ShareAccess,
+    options: CreateOptions,
+) -> Result<FileHandle, KernelError> {
     let name = ansi(name);
-    let object = attributes(root, &name);
+    let object = attributes(root.map_or(0, |root| root.0), &name);
     let mut io_status = IoStatusBlock::default();
     let mut handle = 0u32;
     status(kernel::NtOpenFile(
         &mut handle,
-        access,
+        access.0,
         &object,
         &mut io_status,
-        share,
-        options,
+        share.0,
+        options.0,
     ))?;
     Ok(FileHandle(handle))
 }
 
 /// Synchronous device control without input that fills `output`.
 #[inline(never)]
-pub(crate) fn device_control(handle: u32, code: u32, output: &mut [u8]) -> Result<(), NtStatus> {
+pub(crate) fn device_control(
+    handle: FileHandle,
+    code: u32,
+    output: &mut [u8],
+) -> Result<(), KernelError> {
     let mut io_status = IoStatusBlock::default();
     status(kernel::NtDeviceIoControlFile(
-        handle,
+        handle.0,
         0,
         0,
         0,
@@ -283,11 +295,11 @@ pub(crate) fn device_control(handle: u32, code: u32, output: &mut [u8]) -> Resul
     ))
 }
 
-fn format_open_volume(handle: u32, cluster_size: u32) -> Result<(), NtStatus> {
+fn format_open_volume(handle: FileHandle, cluster_size: u32) -> Result<(), KernelError> {
     let mut io_status = IoStatusBlock::default();
     let mut device = [0u8; 8];
     status(NtQueryVolumeInformationFile(
-        handle,
+        handle.0,
         &mut io_status,
         device.as_mut_ptr(),
         8,
@@ -305,13 +317,13 @@ fn format_open_volume(handle: u32, cluster_size: u32) -> Result<(), NtStatus> {
     device_control(handle, IOCTL_DISK_GET_PARTITION_INFO, &mut partition)?;
     let length = time(&partition[8..]).0;
     if length == 0 {
-        return Err(nt::OBJECT_NAME_NOT_FOUND);
+        return Err(KernelError::ObjectNameNotFound);
     }
     let page = (bytes_per_sector + 0xfff) & !0xfff;
     let cluster = cluster_size.max(page);
     let header = page.max(0x1000);
     if u64::from(header) >= length {
-        return Err(nt::DISK_FULL);
+        return Err(KernelError::DiskFull);
     }
     let clusters = (length / u64::from(cluster)) as u32 + 1;
     let fat16 = clusters < 0xfff0 && word(&device) != FILE_DEVICE_FORCE_FAT32;
@@ -323,10 +335,10 @@ fn format_open_volume(handle: u32, cluster_size: u32) -> Result<(), NtStatus> {
     let fat = entries.wrapping_add(page - 1) & !(page - 1);
     let space = length - u64::from(header);
     if u64::from(fat) > space || u64::from(cluster) > space - u64::from(fat) {
-        return Err(nt::DISK_FULL);
+        return Err(KernelError::DiskFull);
     }
     let Some(base) = allocate(page) else {
-        return Err(NtStatus(0xc000_009a));
+        return Err(KernelError::InsufficientResources);
     };
     let buffer = pool_bytes(base);
     let result = write_format(
@@ -340,13 +352,13 @@ fn format_open_volume(handle: u32, cluster_size: u32) -> Result<(), NtStatus> {
         sector_shift,
     );
     free(base);
-    IoDismountVolumeByFileHandle(handle);
+    IoDismountVolumeByFileHandle(handle.0);
     result
 }
 
 #[allow(clippy::too_many_arguments)]
 fn write_format(
-    handle: u32,
+    handle: FileHandle,
     buffer: &mut [u8],
     page: u32,
     header: u32,
@@ -354,12 +366,12 @@ fn write_format(
     cluster: u32,
     fat16: bool,
     sector_shift: u32,
-) -> Result<(), NtStatus> {
+) -> Result<(), KernelError> {
     let mut offset = 0u64;
-    let write = |buffer: &mut [u8], offset: &mut u64| -> Result<(), NtStatus> {
+    let write = |buffer: &mut [u8], offset: &mut u64| -> Result<(), KernelError> {
         let mut io_status = IoStatusBlock::default();
         status(kernel::NtWriteFile(
-            handle,
+            handle.0,
             0,
             0,
             0,
@@ -427,7 +439,7 @@ impl commands::filesystem::Backend for Console {
         &mut self,
         path: &[u8],
         request: &CreateRequest,
-    ) -> Result<FileHandle, NtStatus> {
+    ) -> Result<FileHandle, KernelError> {
         create_file(path, request)
     }
 
@@ -438,8 +450,8 @@ impl commands::filesystem::Backend for Console {
         access: FileAccess,
         share: ShareAccess,
         options: CreateOptions,
-    ) -> Result<FileHandle, NtStatus> {
-        open_file(root.0, name, access.0, share.0, options.0)
+    ) -> Result<FileHandle, KernelError> {
+        open_file(Some(root), name, access, share, options)
     }
 
     fn close_file(&mut self, handle: FileHandle) {
@@ -455,7 +467,7 @@ impl commands::filesystem::Backend for Console {
         handle: FileHandle,
         offset: Option<u64>,
         target: PoolRange,
-    ) -> Result<u32, NtStatus> {
+    ) -> Result<u32, KernelError> {
         let buffer = pool_range(target);
         let mut io_status = IoStatusBlock::default();
         let offset_pointer = offset
@@ -480,7 +492,7 @@ impl commands::filesystem::Backend for Console {
         handle: FileHandle,
         offset: Option<u64>,
         data: FileData<'_>,
-    ) -> Result<(), NtStatus> {
+    ) -> Result<(), KernelError> {
         let bytes: &[u8] = match data {
             FileData::Bytes(bytes) => bytes,
             FileData::Pool(range) => pool_range(range),
@@ -502,15 +514,19 @@ impl commands::filesystem::Backend for Console {
         status(complete(handle.0, raw, &io_status))
     }
 
-    fn set_delete_disposition(&mut self, handle: FileHandle, delete: bool) -> Result<(), NtStatus> {
+    fn set_delete_disposition(
+        &mut self,
+        handle: FileHandle,
+        delete: bool,
+    ) -> Result<(), KernelError> {
         set_information(handle, FILE_DISPOSITION_INFORMATION, &[u8::from(delete)])
     }
 
-    fn set_end_of_file(&mut self, handle: FileHandle, size: u64) -> Result<(), NtStatus> {
+    fn set_end_of_file(&mut self, handle: FileHandle, size: u64) -> Result<(), KernelError> {
         set_information(handle, FILE_END_OF_FILE_INFORMATION, &size.to_be_bytes())
     }
 
-    fn set_file_position(&mut self, handle: FileHandle, position: u64) -> Result<(), NtStatus> {
+    fn set_file_position(&mut self, handle: FileHandle, position: u64) -> Result<(), KernelError> {
         set_information(handle, FILE_POSITION_INFORMATION, &position.to_be_bytes())
     }
 
@@ -518,7 +534,7 @@ impl commands::filesystem::Backend for Console {
         &mut self,
         handle: FileHandle,
         information: &BasicInformation,
-    ) -> Result<(), NtStatus> {
+    ) -> Result<(), KernelError> {
         let mut bytes = [0u8; 0x28];
         let times = [
             information.creation_time,
@@ -538,7 +554,7 @@ impl commands::filesystem::Backend for Console {
         handle: FileHandle,
         target: &[u8],
         replace: bool,
-    ) -> Result<(), NtStatus> {
+    ) -> Result<(), KernelError> {
         #[repr(C)]
         struct RenameInformation {
             replace: u8,
@@ -561,7 +577,10 @@ impl commands::filesystem::Backend for Console {
         ))
     }
 
-    fn query_file_information(&mut self, handle: FileHandle) -> Result<FileInformation, NtStatus> {
+    fn query_file_information(
+        &mut self,
+        handle: FileHandle,
+    ) -> Result<FileInformation, KernelError> {
         let mut bytes = [0u8; 0x38];
         let mut io_status = IoStatusBlock::default();
         status(kernel::NtQueryInformationFile(
@@ -574,7 +593,7 @@ impl commands::filesystem::Backend for Console {
         Ok(network_open_information(&bytes))
     }
 
-    fn query_full_attributes(&mut self, path: &[u8]) -> Result<FileInformation, NtStatus> {
+    fn query_full_attributes(&mut self, path: &[u8]) -> Result<FileInformation, KernelError> {
         let name = ansi(path);
         let object = attributes(0, &name);
         let mut bytes = [0u8; 0x38];
@@ -590,7 +609,7 @@ impl commands::filesystem::Backend for Console {
         handle: FileHandle,
         restart: bool,
         name: &mut [u8],
-    ) -> Result<DirectoryEntry, NtStatus> {
+    ) -> Result<DirectoryEntry, KernelError> {
         let mut bytes = [0u8; DIRECTORY_BUFFER];
         let mut io_status = IoStatusBlock::default();
         let raw = NtQueryDirectoryFile(
@@ -607,7 +626,7 @@ impl commands::filesystem::Backend for Console {
         status(complete(handle.0, raw, &io_status))?;
         let length = (word(&bytes[0x3c..]) as usize).min(DIRECTORY_BUFFER - DIRECTORY_NAME_OFFSET);
         if length > name.len() {
-            return Err(nt::BUFFER_OVERFLOW);
+            return Err(KernelError::BufferOverflow);
         }
         name[..length]
             .copy_from_slice(&bytes[DIRECTORY_NAME_OFFSET..DIRECTORY_NAME_OFFSET + length]);
@@ -626,7 +645,7 @@ impl commands::filesystem::Backend for Console {
         })
     }
 
-    fn query_volume_size(&mut self, handle: FileHandle) -> Result<VolumeSize, NtStatus> {
+    fn query_volume_size(&mut self, handle: FileHandle) -> Result<VolumeSize, KernelError> {
         let mut bytes = [0u8; 0x18];
         let mut io_status = IoStatusBlock::default();
         status(NtQueryVolumeInformationFile(
@@ -648,7 +667,7 @@ impl commands::filesystem::Backend for Console {
         &mut self,
         link: &[u8],
         target: &mut [u8],
-    ) -> Result<usize, NtStatus> {
+    ) -> Result<usize, KernelError> {
         let name = ansi(link);
         let object = attributes(0, &name);
         let mut output = AnsiString {
@@ -660,7 +679,7 @@ impl commands::filesystem::Backend for Console {
         Ok(usize::from(output.length))
     }
 
-    fn open_object_directory(&mut self, path: &[u8]) -> Result<ObjectDirectory, NtStatus> {
+    fn open_object_directory(&mut self, path: &[u8]) -> Result<ObjectDirectory, KernelError> {
         let name = ansi(path);
         let object = attributes(0, &name);
         let mut handle = 0u32;
@@ -674,7 +693,7 @@ impl commands::filesystem::Backend for Console {
         restart: bool,
         context: &mut u32,
         name: &mut [u8],
-    ) -> Result<usize, NtStatus> {
+    ) -> Result<usize, KernelError> {
         #[repr(C, align(4))]
         struct Buffer([u8; OBJECT_DIRECTORY_BUFFER]);
         let mut buffer = Buffer([0; OBJECT_DIRECTORY_BUFFER]);
@@ -700,7 +719,7 @@ impl commands::filesystem::Backend for Console {
         kernel::NtClose(directory.0);
     }
 
-    fn reference_device(&mut self, name: &[u8]) -> Result<DeviceObject, NtStatus> {
+    fn reference_device(&mut self, name: &[u8]) -> Result<DeviceObject, KernelError> {
         let name = ansi(name);
         let slot = IO_DEVICE_OBJECT_TYPE.load(core::sync::atomic::Ordering::Relaxed);
         let mut object = 0u32;
@@ -724,7 +743,7 @@ impl commands::filesystem::Backend for Console {
         direction: TransferDirection,
         offset: u64,
         buffer: PoolRange,
-    ) -> Result<(), NtStatus> {
+    ) -> Result<(), KernelError> {
         let major = match direction {
             TransferDirection::Read => IRP_MJ_READ,
             TransferDirection::Write => IRP_MJ_WRITE,
@@ -763,7 +782,7 @@ impl commands::filesystem::Backend for Console {
         HalOpenCloseODDTray(value);
     }
 
-    fn format_partition(&mut self, device: &[u8], cluster_size: u32) -> Result<(), NtStatus> {
+    fn format_partition(&mut self, device: &[u8], cluster_size: u32) -> Result<(), KernelError> {
         format_xtaf(device, cluster_size)
     }
 
@@ -773,8 +792,8 @@ impl commands::filesystem::Backend for Console {
         unsafe { core::ptr::read_volatile((address + 0x12) as usize as *const u16) }
     }
 
-    fn dos_error(&mut self, status: NtStatus) -> u32 {
-        kernel::RtlNtStatusToDosError(status.0)
+    fn dos_error(&mut self, error: KernelError) -> Option<Win32Error> {
+        dos_error(error)
     }
 
     fn start_dvd_trace(&mut self) {
@@ -851,14 +870,15 @@ pub(crate) fn service_dvd_emulator_state(_argument: u32) -> u32 {
 }
 
 /// Control code 0x03, run on the server thread: a title maps or removes a
-/// drive.
+/// drive. The control code always returns 0.
 pub(crate) fn service_set_drive_mapping(
     server: &mut openxbdm_server::Server,
     console: &mut Console,
     _network: &mut crate::net::XamNetwork,
     request: u32,
 ) -> u32 {
-    commands::filesystem::map_title_drive(&mut server.state, console, request)
+    commands::filesystem::map_title_drive(&mut server.state, console, request);
+    0
 }
 
 /// Closes of files commands may have changed (0x91f9feec).
@@ -873,7 +893,7 @@ extern "C" fn file_change_count(count: u32) -> u32 {
             FILE_CHANGES.load(core::sync::atomic::Ordering::Relaxed),
         )
     };
-    openxbdm_core::status::Hresult::OK.0
+    Hresult::OK.0
 }
 export!(85, file_change_count);
 
@@ -883,7 +903,6 @@ import_thunk!(
     ordinal = 0x103
 );
 
-const STATUS_OBJECT_NAME_COLLISION: u32 = 0xc000_0035;
 /// `KeGetCurrentProcessType` of the system process.
 const SYSTEM_PROCESS: u32 = 2;
 
@@ -897,18 +916,18 @@ extern "C" fn map_devkit_drive() -> u32 {
         (b"\\??\\E:", b"\\??\\DEVKIT:")
     };
     let target = ansi(b"\\Device\\Harddisk0\\Partition1\\DEVKIT");
-    let mut status = ObCreateSymbolicLink(&ansi(drive), &target);
-    if (status as i32) >= 0 || status == STATUS_OBJECT_NAME_COLLISION {
-        status = match ObCreateSymbolicLink(&ansi(devkit), &target) {
-            STATUS_OBJECT_NAME_COLLISION => 0,
-            status => status,
-        };
-    }
-    let error = kernel::RtlNtStatusToDosError(status);
-    if (error as i32) > 0 {
-        0x8007_0000 | (error & 0xffff)
-    } else {
-        error
+    let link = |name: &[u8]| status(ObCreateSymbolicLink(&ansi(name), &target));
+    let linked = match link(drive) {
+        Ok(()) | Err(KernelError::ObjectNameCollision) => match link(devkit) {
+            Err(KernelError::ObjectNameCollision) => Ok(()),
+            other => other,
+        },
+        Err(error) => Err(error),
+    };
+    // ERROR_SUCCESS and S_OK are 0.
+    match linked.err().and_then(dos_error) {
+        Some(error) => Hresult::from(error).0,
+        None => 0,
     }
 }
 export!(141, map_devkit_drive);
@@ -932,8 +951,12 @@ extern "C" fn call_kernel_routine(a: u32, b: u32, c: u32, d: u32) -> u32 {
     if routine == 0 && !KERNEL_ROUTINE_CLAIMED.swap(true, Ordering::AcqRel) {
         let mut address = 0u32;
         let resolved = kernel::module_handle(c"xboxkrnl.exe").is_ok_and(|module| {
-            (kernel::XexGetProcedureAddress(module, KERNEL_ROUTINE_ORDINAL, &mut address) as i32)
-                >= 0
+            status(kernel::XexGetProcedureAddress(
+                module.raw(),
+                KERNEL_ROUTINE_ORDINAL,
+                &mut address,
+            ))
+            .is_ok()
         });
         routine = if resolved { address } else { 0 };
         KERNEL_ROUTINE.store(routine, Ordering::Release);

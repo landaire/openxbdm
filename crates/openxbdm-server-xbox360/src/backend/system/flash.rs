@@ -6,14 +6,14 @@
 use core::num::NonZeroU32;
 use core::ptr::NonNull;
 
+use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::Win32Error;
+use openxbdm_server::commands::filesystem::CreateDisposition;
+use openxbdm_server::commands::filesystem::FileAccess;
 
-use super::FILE_OPEN;
 use super::FILE_SYNCHRONOUS_IO_NONALERT;
-use super::GENERIC_READ;
-use super::GENERIC_WRITE;
 use super::POOL_TAG;
-use super::SYNCHRONIZE;
 use crate::kernel;
 use crate::kernel::AnsiString;
 use crate::kernel::IoStatusBlock;
@@ -32,10 +32,8 @@ const MEM_RELEASE: u32 = 0x8000;
 const PAGE_READWRITE: u32 = 4;
 /// `MmAllocatePhysicalMemory` protection of the boot loader buffer.
 const BOOT_LOADER_PROTECT: u32 = 0x2000_0004;
-const STATUS_INVALID_PARAMETER: NtStatus = NtStatus(0xc000_000d);
-const STATUS_NO_MEMORY: NtStatus = NtStatus(0xc000_0017);
-const ERROR_BAD_FORMAT: NonZeroU32 = NonZeroU32::new(0xb).unwrap();
-const ERROR_REVISION_MISMATCH: NonZeroU32 = NonZeroU32::new(0x51a).unwrap();
+const ERROR_BAD_FORMAT: Win32Error = Win32Error::new(0xb).unwrap();
+const ERROR_REVISION_MISMATCH: Win32Error = Win32Error::new(0x51a).unwrap();
 const HEADER_WRITE_SIZE: u32 = 0x80;
 const BODY_START: u32 = 0x100;
 /// Stock traps when the patch block ends past this offset but continues.
@@ -79,12 +77,12 @@ impl FlashImage {
         unsafe { core::slice::from_raw_parts_mut(self.base.as_ptr(), self.size as usize) }
     }
 
-    /// Write the image to flash. The error is a Win32 error code.
+    /// Write the image to flash.
     pub fn program(
         &mut self,
         ignore_version_checking: bool,
         stock_image: bool,
-    ) -> Result<(), NonZeroU32> {
+    ) -> Result<(), Win32Error> {
         let image = Image {
             base: self.base.as_ptr(),
         };
@@ -99,13 +97,13 @@ impl FlashImage {
         buffers.release();
         match result {
             Ok(()) => Ok(()),
-            Err(Failure::Status(status)) => {
-                match NonZeroU32::new(kernel::RtlNtStatusToDosError(status.0)) {
+            Err(Failure::Kernel(error)) => {
+                match Win32Error::new(kernel::RtlNtStatusToDosError(error.status().0)) {
                     Some(error) => Err(error),
                     None => Ok(()),
                 }
             }
-            Err(Failure::Error(error)) => Err(error),
+            Err(Failure::Win32(error)) => Err(error),
         }
     }
 }
@@ -118,13 +116,13 @@ impl Drop for FlashImage {
 
 enum Failure {
     /// Reported through `RtlNtStatusToDosError`.
-    Status(NtStatus),
-    Error(NonZeroU32),
+    Kernel(KernelError),
+    Win32(Win32Error),
 }
 
-impl From<NtStatus> for Failure {
-    fn from(status: NtStatus) -> Self {
-        Self::Status(status)
+impl From<KernelError> for Failure {
+    fn from(error: KernelError) -> Self {
+        Self::Kernel(error)
     }
 }
 
@@ -200,15 +198,6 @@ impl PatchBlock {
     }
 }
 
-fn check(status: u32) -> Result<(), NtStatus> {
-    let status = NtStatus(status);
-    if status.is_success() {
-        Ok(())
-    } else {
-        Err(status)
-    }
-}
-
 fn trap_patch_layout() {
     // SAFETY: the same trap stock executes; the kernel resumes after it.
     unsafe { core::arch::asm!("twi 31, 0, 0x19") };
@@ -222,10 +211,10 @@ fn flash_kernel_image(
     buffers: &mut Buffers,
 ) -> Result<(), Failure> {
     if size & (PAGE_SIZE - 1) != 0 {
-        return Err(STATUS_INVALID_PARAMETER.into());
+        return Err(KernelError::InvalidParameter.into());
     }
     if !ignore_version_checking && !hardware_matches(image) {
-        return Err(Failure::Error(ERROR_REVISION_MISMATCH));
+        return Err(Failure::Win32(ERROR_REVISION_MISMATCH));
     }
     align_to_write_unit(image)?;
 
@@ -239,13 +228,13 @@ fn flash_kernel_image(
         0,
     );
     buffers.patch = NonZeroU32::new(patch_base);
-    check(status)?;
+    NtStatus(status).result()?;
 
     let patch = match read_patch_block(image, patch_base as usize as *mut u8, patch_size) {
         Some(patch) => patch,
         // Stock continues with the cleared outputs, so no region is kept.
         None if ignore_version_checking => PatchBlock::Absent,
-        None => return Err(Failure::Error(ERROR_BAD_FORMAT)),
+        None => return Err(Failure::Win32(ERROR_BAD_FORMAT)),
     };
     if let PatchBlock::Present {
         offset,
@@ -266,7 +255,7 @@ fn flash_kernel_image(
         loader_size,
         BOOT_LOADER_PROTECT,
     ))
-    .ok_or(STATUS_NO_MEMORY)?;
+    .ok_or(KernelError::NoMemory)?;
     buffers.boot_loader = Some(loader);
     let status = kernel::XeKeysSaveBootLoader(&mut flags, &mut loader_size, loader.get());
     if !NtStatus(status).is_success() || flags != 0 {
@@ -296,7 +285,7 @@ fn hardware_matches(image: Image) -> bool {
 }
 
 /// Stock 0x91f732a8.
-fn align_to_write_unit(image: Image) -> Result<(), NtStatus> {
+fn align_to_write_unit(image: Image) -> Result<(), KernelError> {
     let mut device = Device::open_read()?;
     let unit = device.write_unit()?;
     let field_70 = image.word(HEADER_FIELD_70);
@@ -343,10 +332,10 @@ fn write_ranges(
     total: u32,
     patch: Option<NonZeroU32>,
     patch_size: u32,
-) -> Result<(), NtStatus> {
+) -> Result<(), KernelError> {
     if patch.is_some_and(|offset| offset.get() < BODY_START) {
         trap_patch_layout();
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(KernelError::InvalidParameter);
     }
     // Stock adds the size to a zero offset when there is no patch block.
     let patch_end = patch.map_or(0, NonZeroU32::get).wrapping_add(patch_size);
@@ -397,48 +386,53 @@ impl Device {
         }
     }
 
-    fn open_read() -> Result<Self, NtStatus> {
+    fn open_read() -> Result<Self, KernelError> {
         let name = Self::name();
         let attributes = Self::attributes(&name);
         let mut device = Self {
             handle: 0,
             io_status: IoStatusBlock::default(),
         };
-        check(kernel::NtOpenFile(
+        NtStatus(kernel::NtOpenFile(
             &mut device.handle,
-            GENERIC_READ | SYNCHRONIZE,
+            FileAccess::GENERIC_READ.union(FileAccess::SYNCHRONIZE).0,
             &attributes,
             &mut device.io_status,
             0,
             FILE_SYNCHRONOUS_IO_NONALERT,
-        ))?;
+        ))
+        .result()?;
         Ok(device)
     }
 
-    fn open_read_write() -> Result<Self, NtStatus> {
+    fn open_read_write() -> Result<Self, KernelError> {
         let name = Self::name();
         let attributes = Self::attributes(&name);
         let mut device = Self {
             handle: 0,
             io_status: IoStatusBlock::default(),
         };
-        check(kernel::NtCreateFile(
+        NtStatus(kernel::NtCreateFile(
             &mut device.handle,
-            GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE,
+            FileAccess::GENERIC_READ
+                .union(FileAccess::GENERIC_WRITE)
+                .union(FileAccess::SYNCHRONIZE)
+                .0,
             &attributes,
             &mut device.io_status,
             core::ptr::null(),
             0,
             0,
-            FILE_OPEN,
+            CreateDisposition::Open as u32,
             FILE_SYNCHRONOUS_IO_NONALERT,
-        ))?;
+        ))
+        .result()?;
         Ok(device)
     }
 
-    fn write_unit(&mut self) -> Result<u32, NtStatus> {
+    fn write_unit(&mut self) -> Result<u32, KernelError> {
         let mut geometry = [0u32; GEOMETRY_SIZE as usize / 4];
-        check(kernel::NtDeviceIoControlFile(
+        NtStatus(kernel::NtDeviceIoControlFile(
             self.handle,
             0,
             0,
@@ -449,12 +443,13 @@ impl Device {
             0,
             geometry.as_mut_ptr().cast(),
             GEOMETRY_SIZE,
-        ))?;
+        ))
+        .result()?;
         Ok(geometry[0].wrapping_mul(geometry[2]))
     }
 
-    fn read(&mut self, buffer: *mut u8, length: u32, offset: u64) -> Result<(), NtStatus> {
-        check(kernel::NtReadFile(
+    fn read(&mut self, buffer: *mut u8, length: u32, offset: u64) -> Result<(), KernelError> {
+        NtStatus(kernel::NtReadFile(
             self.handle,
             0,
             0,
@@ -464,10 +459,11 @@ impl Device {
             length,
             &offset,
         ))
+        .result()
     }
 
-    fn write(&mut self, buffer: *const u8, length: u32, offset: u64) -> Result<(), NtStatus> {
-        check(kernel::NtWriteFile(
+    fn write(&mut self, buffer: *const u8, length: u32, offset: u64) -> Result<(), KernelError> {
+        NtStatus(kernel::NtWriteFile(
             self.handle,
             0,
             0,
@@ -477,6 +473,7 @@ impl Device {
             length,
             &offset,
         ))
+        .result()
     }
 }
 
@@ -491,7 +488,7 @@ pub(in crate::backend) fn device_read(
     offset: u32,
     buffer: *mut u8,
     length: u32,
-) -> Result<(), NtStatus> {
+) -> Result<(), KernelError> {
     Device::open_read_write()?.read(buffer, length, u64::from(offset))
 }
 
@@ -502,7 +499,7 @@ struct Scratch {
 }
 
 impl Scratch {
-    fn page(&mut self) -> Result<*mut u8, NtStatus> {
+    fn page(&mut self) -> Result<*mut u8, KernelError> {
         if let Some(base) = self.base {
             return Ok(base.get() as usize as *mut u8);
         }
@@ -515,7 +512,7 @@ impl Scratch {
             0,
         );
         self.base = NonZeroU32::new(base);
-        check(status)?;
+        NtStatus(status).result()?;
         Ok(base as usize as *mut u8)
     }
 
@@ -534,7 +531,7 @@ pub(in crate::backend) fn device_write(
     offset: u32,
     source: *const u8,
     length: u32,
-) -> Result<(), NtStatus> {
+) -> Result<(), KernelError> {
     let mut device = Device::open_read_write()?;
     let unit = device.write_unit()?;
     let mut scratch = Scratch {
@@ -553,7 +550,7 @@ fn write_units(
     mut offset: u32,
     mut source: *const u8,
     mut length: u32,
-) -> Result<(), NtStatus> {
+) -> Result<(), KernelError> {
     while length != 0 {
         let misalignment = offset & unit.wrapping_sub(1);
         let (data, position, chunk) = if misalignment == 0 && length >= unit {

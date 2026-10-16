@@ -15,6 +15,7 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::NtStatus;
 use openxbdm_server::Server;
 use openxbdm_server::commands::filesystem::CreateDisposition;
 use openxbdm_server::commands::filesystem::CreateOptions;
@@ -29,6 +30,7 @@ use openxbdm_server::commands::performance::profiler::BLOCK_SIZE;
 use openxbdm_server::commands::performance::profiler::BufferLayout;
 use openxbdm_server::commands::performance::profiler::BufferMemory;
 use openxbdm_server::commands::performance::profiler::MAX_BLOCKS;
+use openxbdm_server::commands::performance::profiler::ProfilerError;
 use openxbdm_server::commands::performance::profiler::ProfilerFlags;
 
 use super::module_snapshot;
@@ -106,15 +108,6 @@ const PHYSICAL_MEMORY: u32 = 1;
 const IMAGE_DIRECTORY_EXCEPTION: u32 = 3;
 /// Interval timer control: interrupt when the interval expires.
 const INTERVAL_INTERRUPT: u64 = 0x8000 << 32;
-
-const NO_KERNEL: Hresult = Hresult::error(0x03);
-const NO_PROFILE_EXPORT: Hresult = Hresult::error(0x07);
-const PROFILE_INTERRUPT_REFUSED: Hresult = Hresult::error(0x17);
-const NO_BUFFERS: Hresult = Hresult::error(0x1c);
-const NO_COUNTERS: Hresult = Hresult::error(0x2c);
-const NOT_COUNTER_OWNER: Hresult = Hresult::error(0x2d);
-/// Result of a started engine (stock 0x91f90258 returns 1).
-const SAMPLING: Hresult = Hresult(1);
 
 /// Header word offsets; per-processor arrays have six words.
 mod header {
@@ -607,22 +600,22 @@ extern "C" fn profile_interrupt_entry() {
 
 /// Call profile interrupt export `ordinal` of the kernel (stock
 /// 0x91f8eeb0, 0x91f8ef48, 0x91f8efd0).
-fn call_kernel(ordinal: u32, argument: u32) -> Result<u32, Hresult> {
-    let kernel = kernel::module_handle(c"xboxkrnl.exe").map_err(|_| NO_KERNEL)?;
-    let function = kernel::resolve_export(kernel, ordinal).map_err(|_| NO_PROFILE_EXPORT)?;
+fn call_kernel(ordinal: u32, argument: u32) -> Result<u32, ProfilerError> {
+    let kernel = kernel::module_handle(c"xboxkrnl.exe").map_err(|_| ProfilerError::NoKernel)?;
+    let function =
+        kernel::resolve_export(kernel, ordinal).map_err(|_| ProfilerError::NoProfileExport)?;
     // SAFETY: the profile exports take one register argument.
     Ok(unsafe { kernel::call_export(function, argument, 0, 0, 0) })
 }
 
-fn set_profile_routine(routine: u32) -> Hresult {
-    call_kernel(SET_PROFILE_ROUTINE, routine).map_or_else(|result| result, |_| Hresult::OK)
+fn set_profile_routine(routine: u32) -> Result<(), ProfilerError> {
+    call_kernel(SET_PROFILE_ROUTINE, routine).map(|_| ())
 }
 
-fn enable_profile_interrupt(mask: u32) -> Hresult {
-    match call_kernel(ENABLE_PROFILE_INTERRUPT, mask) {
-        Ok(enabled) if enabled & 0xff != 0 => Hresult::OK,
-        Ok(_) => PROFILE_INTERRUPT_REFUSED,
-        Err(result) => result,
+fn enable_profile_interrupt(mask: u32) -> Result<(), ProfilerError> {
+    match call_kernel(ENABLE_PROFILE_INTERRUPT, mask)? {
+        enabled if enabled & 0xff != 0 => Ok(()),
+        _ => Err(ProfilerError::ProfileInterruptRefused),
     }
 }
 
@@ -954,10 +947,12 @@ extern "C" fn writer_thread(_context: u32) -> u32 {
     };
     let handle = match filesystem::create_file(&paths.file[..paths.file_length], &request) {
         Ok(handle) => handle,
-        Err(status) => {
+        Err(error) => {
             print(
                 c"[LOP] Error! %d\n",
-                &[u64::from(kernel::RtlNtStatusToDosError(status.0))],
+                &[u64::from(kernel::RtlNtStatusToDosError(
+                    NtStatus::from(error).0,
+                ))],
             );
             return fail_writer();
         }
@@ -1082,7 +1077,7 @@ fn start_sampling(interval: u32) -> bool {
 /// Undo the interrupt hook and release the counters and buffers.
 fn unhook() {
     disable_profile_interrupt();
-    set_profile_routine(0);
+    let _ = set_profile_routine(0);
     HOOKED.store(false, Ordering::Release);
     pmc::release(Owner::PROFILER);
 }
@@ -1094,11 +1089,11 @@ impl profiler::Engine for Sampler {
     /// Stock 0x91f90768. Stock also reads the memory statistics into a
     /// local it discards and seeds a random interval generator whose output
     /// it never uses; the latter is omitted.
-    fn initialize(&mut self, flags: ProfilerFlags) -> Hresult {
+    fn initialize(&mut self, flags: ProfilerFlags) -> Result<(), ProfilerError> {
         FLAGS.store(flags.0, Ordering::Relaxed);
         if !create_buffers(flags) {
             print(c"[LOP] CreateSharedBuffers Failed!!!\n", &[]);
-            return NO_BUFFERS;
+            return Err(ProfilerError::NoBuffers);
         }
         for word in &HEADER {
             word.store(0, Ordering::Relaxed);
@@ -1115,18 +1110,13 @@ impl profiler::Engine for Sampler {
             busy.store(0, Ordering::Relaxed);
         }
         if !pmc::acquire(Owner::PROFILER) {
-            return NO_COUNTERS;
+            return Err(ProfilerError::NoCounters);
         }
         HOOKED.store(true, Ordering::Release);
-        let result = set_profile_routine(profile_interrupt_entry as *const () as usize as u32);
-        if result != Hresult::OK {
-            return result;
-        }
-        let result = enable_profile_interrupt(flags.processors());
-        if result == Hresult::OK {
-            pmc::reset();
-        }
-        result
+        set_profile_routine(profile_interrupt_entry as *const () as usize as u32)?;
+        enable_profile_interrupt(flags.processors())?;
+        pmc::reset();
+        Ok(())
     }
 
     /// Stock 0x91f90220.
@@ -1158,10 +1148,10 @@ impl profiler::Engine for Sampler {
     }
 
     /// Stock 0x91f90258.
-    fn start(&mut self, path: Option<&[u8]>, interval: u32) -> Hresult {
+    fn start(&mut self, path: Option<&[u8]>, interval: u32) -> Result<(), ProfilerError> {
         if SAMPLING_ACTIVE.load(Ordering::Acquire) {
             print(c"[LOP] Already started\n", &[]);
-            return profiler::ALREADY_RUNNING;
+            return Err(ProfilerError::AlreadyRunning);
         }
         let started = path.is_some_and(|path| {
             // SAFETY: see `WriterPaths`; no writer runs.
@@ -1173,7 +1163,7 @@ impl profiler::Engine for Sampler {
         });
         if !started {
             print(c"[LOP] Prologue Failed!!!\n", &[]);
-            return profiler::PROLOGUE_FAILED;
+            return Err(ProfilerError::PrologueFailed);
         }
         set_header_time(header::START_TIME, kernel::system_time());
         let timebase = kernel::timebase();
@@ -1181,21 +1171,21 @@ impl profiler::Engine for Sampler {
         START_TIMEBASE[1].store(timebase as u32, Ordering::Relaxed);
         if !start_sampling(interval) {
             stop_writer();
-            return NO_COUNTERS;
+            return Err(ProfilerError::NoCounters);
         }
         SAMPLING_ACTIVE.store(true, Ordering::Release);
-        SAMPLING
+        Ok(())
     }
 
     /// Stock 0x91f90310, 0x91f901d0.
-    fn stop(&mut self) -> Hresult {
+    fn stop(&mut self) -> Result<(), ProfilerError> {
         SAMPLING_ACTIVE.store(false, Ordering::Release);
         let result = if pmc::stop(Owner::PROFILER) {
             pmc::clear(Owner::PROFILER);
             INTERVAL.store(0, Ordering::Relaxed);
-            Hresult::OK
+            Ok(())
         } else {
-            NOT_COUNTER_OWNER
+            Err(ProfilerError::NotCounterOwner)
         };
         unhook();
         stop_writer();
@@ -1228,18 +1218,23 @@ fn store_executable_path(executable: &[u8]) {
 
 /// `lopctrl start` and export 149: `path` is the object name of the
 /// requested file, `executable` the drive path of the running executable.
-pub(super) fn start(path: Option<&[u8]>, executable: &[u8], interval: u32, flags: u32) -> Hresult {
+pub(super) fn start(
+    path: Option<&[u8]>,
+    executable: &[u8],
+    interval: u32,
+    flags: ProfilerFlags,
+) -> Result<(), ProfilerError> {
     if !CONTROL.running() {
         store_executable_path(executable);
     }
-    CONTROL.start(&mut Sampler, path, interval, ProfilerFlags(flags))
+    CONTROL.start(&mut Sampler, path, interval, flags)
 }
 
-pub(super) fn stop() -> Hresult {
+pub(super) fn stop() -> Result<(), ProfilerError> {
     CONTROL.stop(&mut Sampler)
 }
 
-pub(super) fn info() -> Result<CpuProfilerInfo, Hresult> {
+pub(super) fn info() -> Result<CpuProfilerInfo, ProfilerError> {
     CONTROL.info(&mut Sampler)
 }
 
@@ -1307,35 +1302,39 @@ extern "C" fn export_start(name: u32, interval: u32, flags: u32) -> u32 {
         request.executable_length = length;
     }
     let path = request.path.as_ref().map(|path| path.as_bytes());
-    start(
+    export_result(start(
         path,
         &request.executable[..request.executable_length],
         interval,
-        flags,
-    )
-    .0
+        ProfilerFlags(flags),
+    ))
+}
+
+/// The result word of the profiler exports.
+fn export_result(result: Result<(), ProfilerError>) -> u32 {
+    match result {
+        Ok(()) => Hresult::OK.0,
+        Err(error) => Hresult::from(error).0,
+    }
 }
 
 /// Export 150.
 extern "C" fn export_stop() -> u32 {
-    stop().0
+    export_result(stop())
 }
 
 /// Export 151: elapsed seconds, total samples, and overhead interrupts;
 /// the outputs are written only on success.
 extern "C" fn export_info(elapsed: *mut u32, samples: *mut u32, overhead: *mut u32) -> u32 {
-    match info() {
-        Ok(info) => {
-            // SAFETY: the caller passes three writable u32.
-            unsafe {
-                core::ptr::write_volatile(elapsed, info.elapsed_time);
-                core::ptr::write_volatile(samples, info.total_samples);
-                core::ptr::write_volatile(overhead, info.overhead_interrupts);
-            }
-            Hresult::OK.0
+    let result = info().map(|info| {
+        // SAFETY: the caller passes three writable u32.
+        unsafe {
+            core::ptr::write_volatile(elapsed, info.elapsed_time);
+            core::ptr::write_volatile(samples, info.total_samples);
+            core::ptr::write_volatile(overhead, info.overhead_interrupts);
         }
-        Err(result) => result.0,
-    }
+    });
+    export_result(result)
 }
 
 export!(149, export_start);

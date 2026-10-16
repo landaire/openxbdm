@@ -17,6 +17,7 @@ use super::ALLOCATOR_SIZE;
 use super::Allocator;
 use super::CREATE_FAILED;
 use super::Creation;
+use super::Failure;
 use super::KeInitializeSemaphore;
 use super::MARK;
 use super::OPTIONS_SIZE;
@@ -26,12 +27,12 @@ use super::SUCCESS;
 use super::SemaphoreKind;
 use super::Shape;
 use super::Side;
-use super::Status;
 use super::UNLIMITED;
 use super::Wait;
 use super::copy;
 use super::counts;
 use super::exchange;
+use super::export_result;
 use super::insert_result;
 use super::load;
 use super::load_tagged;
@@ -43,7 +44,6 @@ use super::remove_waiting;
 use super::store;
 use super::swap_tagged;
 use super::walk;
-use super::win32_result;
 use super::zero;
 use crate::exports::export;
 
@@ -143,11 +143,8 @@ pub(super) fn create(shape: &'static Shape, creation: &Creation, extra: u32) -> 
 }
 
 /// Link `value` behind the tail.
-fn append(queue: Object, value: u32, wait: &Wait) -> Status {
-    let node = match queue.acquire_node(wait) {
-        Ok(node) => node,
-        Err(status) => return status,
-    };
+fn append(queue: Object, value: u32, wait: &Wait) -> Result<(), Failure> {
+    let node = queue.acquire_node(wait)?;
     let address = node as usize;
     store(address + ITEM, value);
     store(address + ITEM + 4, 0);
@@ -171,7 +168,7 @@ fn append(queue: Object, value: u32, wait: &Wait) -> Status {
     }
     queue.signal_item();
     queue.count_added();
-    Status::SUCCESS
+    Ok(())
 }
 
 /// Unlink the first item; its value, or nothing when the queue is empty.
@@ -231,7 +228,7 @@ pub(crate) extern "C" fn create_export(descriptor: u32, output: u32) -> u32 {
     store(output as usize, 0);
     let creation = match Creation::read(descriptor) {
         Ok(creation) => creation,
-        Err(result) => return result.0,
+        Err(error) => return Hresult::from(error).0,
     };
     let options = creation.keeps_options();
     let Some(queue) = create(&SHAPE, &creation, if options { OPTIONS_SIZE } else { 0 }) else {
@@ -300,7 +297,7 @@ pub(crate) extern "C" fn dequeue(queue: u32, output: u32) -> u32 {
     };
     let taken = match (wait, queue.item_semaphore()) {
         (Some(wait), Some(semaphore)) => remove_waiting(queue, semaphore, &wait, || take(queue)),
-        _ => take(queue).ok_or(Status::TIMEOUT),
+        _ => take(queue).ok_or(Failure::Timeout),
     };
     match taken {
         Ok(value) => {
@@ -310,7 +307,7 @@ pub(crate) extern "C" fn dequeue(queue: u32, output: u32) -> u32 {
             }
             SUCCESS.0
         }
-        Err(status) => remove_result(status),
+        Err(failure) => remove_result(failure),
     }
 }
 export!(308, dequeue);
@@ -329,8 +326,8 @@ extern "C" fn enumerate(queue: u32, context: u32, callback: u32) -> u32 {
             context,
             callback,
         ),
-        _ => Status::INVALID_PARAMETER.0,
+        _ => Err(Failure::InvalidParameter),
     };
-    win32_result(result).0
+    export_result(result)
 }
 export!(309, enumerate);

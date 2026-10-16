@@ -41,12 +41,15 @@ pub use rpc::RpcContext;
 pub use rpc::RpcCreateError;
 pub use rpc::RpcThread;
 pub use rpc::RpcTransfer;
-pub use telllog::TELL_LOG_AREA_CRITICAL_SECTIONS;
+pub use telllog::LogEngineError;
 pub use telllog::TELL_LOG_BUFFER_SIZE;
 pub use telllog::TELL_LOG_LINE_LIMIT;
+pub use telllog::TellLogAreas;
 pub use telllog::TellLogBackend;
 pub use telllog::TellLogConfig;
 pub use telllog::TellLogCounters;
+pub use telllog::TellLogFailed;
+pub use telllog::TellLogReply;
 pub use telllog::TellLogWriter;
 pub use telllog::WaitTrace;
 pub use telllog::WaitTraceLine;
@@ -55,8 +58,7 @@ pub use telllog::format_wait_trace;
 use core::fmt::Write as _;
 
 use openxbdm_core::status::ErrorCode;
-use openxbdm_core::status::Hresult;
-use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::KernelError;
 
 use crate::access::Access;
 use crate::backend::Backend as AnyBackend;
@@ -80,6 +82,10 @@ use crate::notify::POSTED_TEXT_CAPACITY;
 use crate::notify::TargetFlags;
 use crate::registry::CommandEntry;
 use crate::registry::DispatchFlags;
+use crate::reply;
+use crate::reply::CommandError;
+use crate::reply::CommandResult;
+use crate::reply::Reply;
 use crate::state::ServerState;
 use crate::text::Text;
 
@@ -253,7 +259,7 @@ pub trait Backend: RpcBackend + FastPipeBackend + TellLogBackend {
     /// Restrict the server thread to `processor`.
     fn set_server_processor(&mut self, processor: ProcessorNumber);
     /// Write a file's buffered data to its device.
-    fn flush_file(&mut self, handle: FileHandle) -> Result<(), NtStatus>;
+    fn flush_file(&mut self, handle: FileHandle) -> Result<(), KernelError>;
     /// Switch file I/O event notifications and take the next event
     /// identifier, which the I/O events share.
     fn switch_file_events(&mut self, enable: bool) -> FileEventId;
@@ -276,7 +282,10 @@ pub fn send_posted_notifications(
     }
 }
 
-pub(crate) fn resume(continuation: &mut Continuation, cx: &mut ContinuationContext<'_>) -> Hresult {
+pub(crate) fn resume(
+    continuation: &mut Continuation,
+    cx: &mut ContinuationContext<'_>,
+) -> CommandResult {
     match continuation {
         Continuation::DebugPrint => debug_print_record(cx),
         Continuation::Rpc(transfer) => rpc::resume(transfer, cx),
@@ -284,26 +293,26 @@ pub(crate) fn resume(continuation: &mut Continuation, cx: &mut ContinuationConte
 }
 
 /// `bye`: reply `200- bye` and close the connection.
-fn bye(invocation: &mut Invocation<'_>) -> Hresult {
+fn bye(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(session) = invocation.session.as_deref_mut() else {
-        return Hresult::INVALID_ARGUMENT;
+        return Err(CommandError::InvalidArgument);
     };
     session.request(SessionRequest::Close);
     let _ = invocation.send_line(b"200- bye");
-    Hresult::NO_REPLY
+    Ok(Reply::Sent)
 }
 
 /// `notify` and `notifyport [reconnectport=<dword>] [debug] [reverse]`:
 /// turn the connection into a notification channel. The channel receives
 /// `205- now a notification channel` and the execution state line; no
 /// status line follows.
-fn notify(invocation: &mut Invocation<'_>) -> Hresult {
+fn notify(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(socket) = invocation
         .session
         .as_deref()
         .map(|session| session.socket())
     else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     let (endpoint, persist) = match invocation.line.dword("reconnectport") {
         None => (
@@ -315,7 +324,7 @@ fn notify(invocation: &mut Invocation<'_>) -> Hresult {
         ),
         Some(port) => match invocation.network.peer(socket) {
             // The monitor ends the command without any reply.
-            Err(_) => return Hresult::NO_REPLY,
+            Err(_) => return Ok(Reply::Sent),
             Ok(peer) => (
                 Endpoint {
                     address: peer.address,
@@ -357,7 +366,7 @@ fn notify(invocation: &mut Invocation<'_>) -> Hresult {
             invocation.state.notifications.detach_socket(socket);
         }
         invocation.text.set_bytes(b"notification limit exceeded");
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     if let Some(session) = invocation.session.as_deref_mut() {
         session.request(SessionRequest::ReleaseSocket);
@@ -365,7 +374,7 @@ fn notify(invocation: &mut Invocation<'_>) -> Hresult {
     if persist {
         invocation.state.settings_dirty = true;
     }
-    Hresult::NO_REPLY
+    Ok(Reply::Sent)
 }
 
 fn send_execution_line(
@@ -392,19 +401,19 @@ fn target_flags(invocation: &Invocation<'_>) -> TargetFlags {
 /// `notifyat port=<dword> [addr=<a.b.c.d>] [drop] [debug] [reverse]`:
 /// register a notification target (connected now unless `reverse`) or
 /// drop every target with the endpoint.
-fn notify_at(invocation: &mut Invocation<'_>) -> Hresult {
+fn notify_at(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(socket) = invocation
         .session
         .as_deref()
         .map(|session| session.socket())
     else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     if !register_from_line(invocation, Some(socket), false) {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     invocation.state.settings_dirty = true;
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// A settings-file `notifyat` line: the target is recorded without a
@@ -607,70 +616,68 @@ pub fn expire_reverse_targets(state: &mut ServerState, backend: &mut dyn AnyBack
 /// `dedicate global` or `dedicate handler=<name>`: move the connection to
 /// the main server context or to a command processor. Success sends only
 /// `205- connection dedicated`.
-fn dedicate(invocation: &mut Invocation<'_>) -> Hresult {
+fn dedicate(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.session.is_none() {
-        return Hresult::INVALID_ARGUMENT;
+        return Err(CommandError::InvalidArgument);
     }
     let target = if invocation.line.has("global") {
         DedicateTarget::Main
     } else {
         let Some(value) = invocation.line.param("handler") else {
             invocation.text.set_bytes(b"missing handler");
-            return Hresult::FAIL;
+            return Err(CommandError::Fail);
         };
         let mut buffer = [0u8; HANDLER_NAME_CAPACITY];
         let name = value.copy_into(&mut buffer);
         match invocation.backend.find_processor(name) {
             Some((index, _)) => DedicateTarget::Processor(index),
-            None => return Hresult::from_error_code(ErrorCode::FILE_NOT_FOUND),
+            None => return Err(ErrorCode::FileNotFound.into()),
         }
     };
     if let Some(session) = invocation.session.as_deref_mut() {
         session.request(SessionRequest::Dedicate(target));
     }
-    Hresult::NO_REPLY
+    Ok(Reply::Sent)
 }
 
 /// `dbgprint start=` | `stop=` | `[reset=]`: control the debug capture ring
 /// or stream its records.
-fn debug_print(invocation: &mut Invocation<'_>) -> Hresult {
+fn debug_print(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.session.is_none() {
-        return Hresult::from_error_code(ErrorCode::BAD_PARAMETER);
+        return Err(ErrorCode::BadParameter.into());
     }
     let state = &mut invocation.state.session;
     if invocation.line.param("start").is_some() {
         if state.capture.is_some() {
             invocation.text.set_bytes(b"Debug capture already started");
-            return Hresult::FAIL;
+            return Err(CommandError::Fail);
         }
         let result = if invocation.backend.allocate_debug_capture() {
             if let Some(ring) = invocation.backend.debug_capture() {
                 ring[0] = 0;
             }
             state.capture = Some(DebugCapture::default());
-            Hresult::OK
+            Ok(Reply::Ok)
         } else {
-            Hresult::from_error_code(ErrorCode::OUT_OF_MEMORY)
+            Err(ErrorCode::OutOfMemory.into())
         };
         invocation
             .text
-            .set_bytes(result.default_message().as_bytes());
+            .set_bytes(reply::hresult(result).default_message().as_bytes());
         return result;
     }
     if invocation.line.param("stop").is_some() {
         if state.capture.take().is_some() {
             invocation.backend.free_debug_capture();
         }
-        invocation
-            .text
-            .set_bytes(Hresult::OK.default_message().as_bytes());
-        return Hresult::OK;
+        invocation.text.set_bytes(b"OK");
+        return Ok(Reply::Ok);
     }
     let Some(capture) = state.capture.as_mut() else {
         invocation
             .text
             .set_bytes(b"Debug capture not started (use 'start' option to start capture)");
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     if invocation.line.param("reset").is_some() {
         capture.read = 0;
@@ -679,24 +686,24 @@ fn debug_print(invocation: &mut Invocation<'_>) -> Hresult {
         session.continuation = AnyContinuation::Session(Continuation::DebugPrint);
     }
     invocation.text.set_bytes(b"Debug print strings follow");
-    Hresult::MULTILINE
+    Ok(Reply::Multiline)
 }
 
 /// Send the next capture record without its trailing LF.
-fn debug_print_record(cx: &mut ContinuationContext<'_>) -> Hresult {
+fn debug_print_record(cx: &mut ContinuationContext<'_>) -> CommandResult {
     let Some(capture) = cx.state.session.capture.as_mut() else {
-        return Hresult::END_OF_DATA;
+        return Err(CommandError::EndOfData);
     };
     let Some(ring) = cx.backend.debug_capture() else {
-        return Hresult::END_OF_DATA;
+        return Err(CommandError::EndOfData);
     };
     let Some((start, end)) = next_record(ring, capture) else {
-        return Hresult::END_OF_DATA;
+        return Err(CommandError::EndOfData);
     };
     let record = &ring[start..end];
     let record = record.strip_suffix(b"\n").unwrap_or(record);
     cx.line.set_bytes(record);
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// Find the record at the read cursor: bytes up to and including an LF,
@@ -757,13 +764,13 @@ pub fn debug_capture_print(state: &mut ServerState, backend: &mut dyn AnyBackend
 /// `fileevent advise` | `fileevent unadvise`: switch file I/O event
 /// notifications and announce `XBDMFE!Start` or `XBDMFE!Stop` with a new
 /// sequence number on every notification channel.
-fn file_event(invocation: &mut Invocation<'_>) -> Hresult {
+fn file_event(invocation: &mut Invocation<'_>) -> CommandResult {
     let enable = if invocation.line.has("advise") {
         true
     } else if invocation.line.has("unadvise") {
         false
     } else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     // Texts posted before the switch go out first, as the monitor sends
     // them in their threads.
@@ -774,37 +781,37 @@ fn file_event(invocation: &mut Invocation<'_>) -> Hresult {
         .state
         .notifications
         .send_text(line.as_bytes(), invocation.network);
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `spew <text>`: write the command line to the debug output.
-fn spew(invocation: &mut Invocation<'_>) -> Hresult {
+fn spew(invocation: &mut Invocation<'_>) -> CommandResult {
     let mut output = Text::<{ crate::server::RECEIVE_CAPACITY + 8 }>::new();
     let _ = output.push_bytes(b"SPEW: ");
     let _ = output.push_bytes(invocation.line.as_bytes());
     let _ = output.push_bytes(b"\n");
     invocation.backend.debug_print(output.as_bytes());
     invocation.text.set_bytes(b"OK");
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `srvproc [num=<dword>]`: report the processor running the server thread
 /// and bind the thread to processor `num` (default 2).
-fn server_processor(invocation: &mut Invocation<'_>) -> Hresult {
+fn server_processor(invocation: &mut Invocation<'_>) -> CommandResult {
     // An absent or malformed value selects the default.
     let number = invocation
         .line
         .dword("num")
         .unwrap_or(DEFAULT_SERVER_PROCESSOR);
     if number >= PROCESSOR_COUNT {
-        return Hresult::from_error_code(ErrorCode::UNKNOWN_COMMAND);
+        return Err(ErrorCode::UnknownCommand.into());
     }
     let previous = invocation.backend.current_processor();
     invocation.set_text(format_args!("prev={}", previous.0));
     invocation
         .backend
         .set_server_processor(ProcessorNumber(number as u8));
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// Where a discovery reply goes.

@@ -36,6 +36,10 @@ use crate::processors::ProcessorProgress;
 use crate::processors::ProcessorThread;
 use crate::registry;
 use crate::registry::DispatchFlags;
+use crate::reply;
+use crate::reply::CommandError;
+use crate::reply::CommandResult;
+use crate::reply::Reply;
 use crate::state::ServerState;
 use crate::text::LineText;
 use crate::text::ResponseText;
@@ -368,7 +372,8 @@ impl Server {
                 && !(entry.flags().contains(DispatchFlags::DEVKIT_ONLY)
                     && invocation.backend.is_test_kit())
             {
-                (entry.handler)(&mut invocation);
+                // Settings lines send no reply.
+                let _ = (entry.handler)(&mut invocation);
             }
         }
         self.save_settings_if_dirty(backend);
@@ -505,14 +510,14 @@ impl Server {
 
         match transfer {
             Transfer::Multiline => {
-                if result == Hresult::END_OF_DATA {
+                if result == Err(CommandError::EndOfData) {
                     let sent = send_line(network, socket, b".");
                     finish_transfer(connection);
                     if sent.is_err() {
                         self.close(index, network);
                         return Outcome::Released;
                     }
-                } else if result.is_failure() {
+                } else if result.is_err() {
                     self.close(index, network);
                     return Outcome::Released;
                 } else {
@@ -527,9 +532,9 @@ impl Server {
                 }
             }
             Transfer::BinarySend => {
-                if result == Hresult::END_OF_DATA {
+                if result == Err(CommandError::EndOfData) {
                     finish_transfer(connection);
-                } else if result.is_failure() {
+                } else if result.is_err() {
                     self.close(index, network);
                     return Outcome::Released;
                 } else if send_all(network, socket, &self.transfer[..binary_len]).is_err() {
@@ -547,7 +552,8 @@ impl Server {
                         backend,
                         network,
                     };
-                    continuation::resume(&mut continuation, &mut cx);
+                    // The connection closes; the final call's result is not sent.
+                    let _ = continuation::resume(&mut continuation, &mut cx);
                     self.close(index, network);
                     return Outcome::Released;
                 } else {
@@ -681,7 +687,7 @@ impl Server {
     fn finish_receive(
         &mut self,
         index: ConnectionIndex,
-        mut result: Hresult,
+        mut result: CommandResult,
         backend: &mut dyn Backend,
         network: &mut dyn Network,
     ) -> Outcome {
@@ -690,11 +696,11 @@ impl Server {
         };
         connection.session.receive_remaining = None;
         connection.transfer = Transfer::Idle;
-        if result == Hresult::MULTILINE {
+        if result == Ok(Reply::Multiline) {
             connection.transfer = Transfer::Multiline;
-        } else if result == Hresult::BINARY {
+        } else if result == Ok(Reply::Binary) {
             connection.transfer = Transfer::BinarySend;
-        } else if result != Hresult::FAST_PIPE {
+        } else if result != Ok(Reply::FastPipe) {
             connection.session.continuation = Continuation::None;
         }
         if connection.transfer != Transfer::Idle && connection.session.continuation.is_none() {
@@ -702,9 +708,9 @@ impl Server {
             // The monitor picks the text before it replaces the result.
             if self.line_text.is_empty() {
                 self.line_text
-                    .set_bytes(result.default_message().as_bytes());
+                    .set_bytes(reply::hresult(result).default_message().as_bytes());
             }
-            result = Hresult::UNEXPECTED;
+            result = Err(CommandError::Unexpected);
         }
         let socket = connection.session.socket;
         let sent = send_status(
@@ -759,9 +765,9 @@ impl Server {
 
         let result = if let Some(bang) = word.iter().position(|&byte| byte == b'!') {
             match backend.find_processor(&word[..bang]) {
-                None => Hresult::from_error_code(ErrorCode::UNKNOWN_COMMAND),
+                None => Err(ErrorCode::UnknownCommand.into()),
                 Some(_) if !access.intersects(Access::CONTROL) => {
-                    Hresult::from_error_code(ErrorCode::ACCESS_DENIED)
+                    Err(ErrorCode::AccessDenied.into())
                 }
                 Some((processor_index, processor)) => {
                     let previous = (connection.owner, connection.title_process);
@@ -826,33 +832,31 @@ impl Server {
                             }
                             ProcessorProgress::Unavailable => {
                                 (connection.owner, connection.title_process) = previous;
-                                Hresult::from_error_code(ErrorCode::DEDICATED_CONNECTION_REQUIRED)
+                                Err(ErrorCode::DedicatedConnectionRequired.into())
                             }
                         }
                     } else {
-                        Hresult::from_error_code(ErrorCode::DEDICATED_CONNECTION_REQUIRED)
+                        Err(ErrorCode::DedicatedConnectionRequired.into())
                     }
                 }
             }
         } else {
             match registry::lookup(word) {
-                None => Hresult::from_error_code(ErrorCode::UNKNOWN_COMMAND),
+                None => Err(ErrorCode::UnknownCommand.into()),
                 Some(entry)
                     if entry.flags().contains(DispatchFlags::DEVKIT_ONLY)
                         && backend.is_test_kit() =>
                 {
-                    Hresult::from_error_code(ErrorCode::UNKNOWN_COMMAND)
+                    Err(ErrorCode::UnknownCommand.into())
                 }
-                Some(entry) if !entry.permits(access) => {
-                    Hresult::from_error_code(ErrorCode::ACCESS_DENIED)
-                }
+                Some(entry) if !entry.permits(access) => Err(ErrorCode::AccessDenied.into()),
                 // Handlers that run on their own thread skip the context check.
                 Some(entry)
                     if connection.owner != Owner::Main
                         && !entry.flags().contains(DispatchFlags::ANY_CONTEXT)
                         && !entry.flags().contains(DispatchFlags::OWN_THREAD) =>
                 {
-                    Hresult::from_error_code(ErrorCode::DEDICATED_CONNECTION_REQUIRED)
+                    Err(ErrorCode::DedicatedConnectionRequired.into())
                 }
                 Some(entry) => {
                     let mut invocation = Invocation {
@@ -875,7 +879,7 @@ impl Server {
     fn reply(
         &mut self,
         index: ConnectionIndex,
-        mut result: Hresult,
+        mut result: CommandResult,
         external: Option<ExternalContinuation>,
         backend: &mut dyn Backend,
         network: &mut dyn Network,
@@ -890,21 +894,22 @@ impl Server {
         }
 
         let request = connection.session.request.take();
-        if result != Hresult::NO_REPLY {
-            if result == Hresult::MULTILINE {
+        if result != Ok(Reply::Sent) {
+            if result == Ok(Reply::Multiline) {
                 connection.transfer = Transfer::Multiline;
-            } else if result == Hresult::BINARY {
+            } else if result == Ok(Reply::Binary) {
                 connection.transfer = Transfer::BinarySend;
-            } else if result == Hresult::SEND_BINARY {
+            } else if result == Ok(Reply::SendBinary) {
                 connection.transfer = Transfer::BinaryReceive;
             }
             if connection.transfer != Transfer::Idle && connection.session.continuation.is_none() {
                 connection.transfer = Transfer::Idle;
                 // The monitor picks the text before it replaces the result.
                 if self.text.is_empty() {
-                    self.text.set_bytes(result.default_message().as_bytes());
+                    self.text
+                        .set_bytes(reply::hresult(result).default_message().as_bytes());
                 }
-                result = Hresult::UNEXPECTED;
+                result = Err(CommandError::Unexpected);
             }
             if send_status(
                 &self.state,
@@ -926,7 +931,7 @@ impl Server {
             return outcome;
         }
 
-        if result == Hresult::SEND_BINARY
+        if result == Ok(Reply::SendBinary)
             && self.connections[slot]
                 .as_ref()
                 .is_some_and(|c| c.session.receive_remaining == Some(0))
@@ -982,7 +987,7 @@ impl Server {
                         return Outcome::Open;
                     }
                     ProcessorProgress::Unavailable => {
-                        Hresult::from_error_code(ErrorCode::DEDICATED_CONNECTION_REQUIRED)
+                        Err(ErrorCode::DedicatedConnectionRequired.into())
                     }
                 };
                 self.reply(index, result, external, backend, network)
@@ -1075,20 +1080,20 @@ fn processor_result(
     backend: &mut dyn Backend,
     processor: u8,
     result: Hresult,
-) -> Hresult {
+) -> CommandResult {
     if result == Hresult::NO_REPLY {
-        Hresult::OK
+        Ok(Reply::Ok)
     } else if result == Hresult::DEDICATED {
         // The dedicate routine fails for a processor unregistered meanwhile.
         if backend.processor(processor).is_none() {
-            return Hresult::FAIL;
+            return Err(CommandError::Fail);
         }
         session.request(SessionRequest::Dedicate(DedicateTarget::Processor(
             processor,
         )));
-        Hresult::NO_REPLY
+        Ok(Reply::Sent)
     } else {
-        result
+        reply::from_processor(result)
     }
 }
 
@@ -1119,9 +1124,10 @@ pub(crate) fn send_status(
     backend: &mut dyn Backend,
     network: &mut dyn Network,
     socket: SocketId,
-    result: Hresult,
+    result: CommandResult,
     text: &[u8],
 ) -> Result<(), crate::network::NetError> {
+    let result = reply::hresult(result);
     let [first, second, third] = result.status_digits();
     let head = [first, second, third, b'-', b' '];
     let message = if text.is_empty() {

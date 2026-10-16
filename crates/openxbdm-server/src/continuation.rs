@@ -1,24 +1,24 @@
 //! Continuations of 202, 203, and 204 transfers.
 //!
 //! A handler stores a continuation in its session and returns
-//! [`Hresult::MULTILINE`], [`Hresult::BINARY`], or [`Hresult::SEND_BINARY`].
+//! [`Reply::Multiline`], [`Reply::Binary`], or [`Reply::SendBinary`].
 //! The server then calls the continuation once per socket event:
 //!
 //! - 202: write one line into [`ContinuationContext::line`]. A continuation
 //!   that produces several lines at once writes them, each ending in CR LF,
 //!   into [`ContinuationContext::binary`] and sets
 //!   [`ContinuationContext::binary_len`]; those bytes are sent unchanged
-//!   instead of the line. Return [`Hresult::END_OF_DATA`] to end with `.`.
+//!   instead of the line. Fail with [`CommandError::EndOfData`] to end
+//!   with `.`.
 //! - 203: fill [`ContinuationContext::binary`] and set
-//!   [`ContinuationContext::binary_len`]; return [`Hresult::END_OF_DATA`] to
-//!   end. Data written by the final call is not sent.
+//!   [`ContinuationContext::binary_len`]; fail with
+//!   [`CommandError::EndOfData`] to end. Data written by the final call is
+//!   not sent.
 //! - 204: consume [`ContinuationContext::received`] and decrement
 //!   `session.receive_remaining`. When it reaches zero, the result selects
 //!   the next step and the reply text comes from [`ContinuationContext::line`].
 //!
 //! Any other failure closes the connection.
-
-use openxbdm_core::status::Hresult;
 
 use crate::backend::Backend;
 use crate::commands;
@@ -27,6 +27,10 @@ use crate::network::Network;
 use crate::processors::ExternalContinuation;
 use crate::processors::ExternalTransfer;
 use crate::processors::ProcessorProgress;
+use crate::reply;
+use crate::reply::CommandError;
+use crate::reply::CommandResult;
+use crate::reply::Reply;
 use crate::state::ServerState;
 use crate::text::LineText;
 
@@ -90,14 +94,17 @@ pub struct ContinuationContext<'a> {
 fn resume_debugger(
     state: &mut commands::debugger::Continuation,
     cx: &mut ContinuationContext<'_>,
-) -> Hresult {
+) -> CommandResult {
     commands::debugger::resume(state, cx)
 }
 
 /// Call the active continuation.
-pub(crate) fn resume(continuation: &mut Continuation, cx: &mut ContinuationContext<'_>) -> Hresult {
+pub(crate) fn resume(
+    continuation: &mut Continuation,
+    cx: &mut ContinuationContext<'_>,
+) -> CommandResult {
     match continuation {
-        Continuation::None => Hresult::UNEXPECTED,
+        Continuation::None => Err(CommandError::Unexpected),
         Continuation::Session(state) => commands::session::resume(state, cx),
         Continuation::Security(state) => commands::security::resume(state, cx),
         Continuation::Console(state) => commands::console::resume(state, cx),
@@ -120,11 +127,11 @@ pub(crate) fn resume(continuation: &mut Continuation, cx: &mut ContinuationConte
                 aborted: cx.aborted,
             };
             match cx.backend.resume_processor(state, transfer) {
-                ProcessorProgress::Complete(result) => result,
-                ProcessorProgress::Unavailable => Hresult::FAIL,
+                ProcessorProgress::Complete(result) => reply::from_processor(result),
+                ProcessorProgress::Unavailable => Err(CommandError::Fail),
                 ProcessorProgress::Running => {
                     cx.processor_running = true;
-                    Hresult::OK
+                    Ok(Reply::Ok)
                 }
             }
         }

@@ -1,6 +1,8 @@
 //! Debug execution control: stop, go, halt, continue, suspend, resume,
 //! breakpoint management, stop-reason queries, and crash dumps.
 
+pub use openxbdm_core::status::NtStatus;
+
 use crate::commands::kv::KvLine;
 use crate::commands::kv::parse_kv_line;
 use crate::commands::kv::value_u32;
@@ -11,6 +13,7 @@ use crate::protocol::ArgBuilder;
 use crate::protocol::Command;
 use crate::protocol::ErrorCode;
 use crate::protocol::ExpectedBody;
+use crate::protocol::RemoteStatus;
 use crate::protocol::Response;
 
 fn report_parse(err: ParseError) -> rootcause::Report<Error> {
@@ -254,7 +257,7 @@ pub enum DataAccess {
 /// `exception code= thread= address= ... [first] [noncont]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExceptionStop {
-    pub code: u32,
+    pub code: NtStatus,
     pub thread: ThreadId,
     pub address: u32,
     pub detail: ExceptionDetail,
@@ -301,13 +304,10 @@ impl Command for IsStopped {
 
     fn handle_remote(
         &self,
-        code: ErrorCode,
+        code: RemoteStatus,
         _message: &str,
     ) -> Option<Result<Self::Output, rootcause::Report<Error>>> {
-        match code {
-            ErrorCode::NOT_STOPPED => Some(Ok(StopState::Running)),
-            _ => None,
-        }
+        (code == ErrorCode::NotStopped).then_some(Ok(StopState::Running))
     }
 }
 
@@ -379,7 +379,7 @@ fn parse_stop_reason(head: &str) -> Result<StopReason, ParseError> {
                 }
             };
             Ok(StopReason::Exception(ExceptionStop {
-                code: require_u32(&kv, "code")?,
+                code: NtStatus(require_u32(&kv, "code")?),
                 thread: require_thread(&kv)?,
                 address: require_u32(&kv, "address")?,
                 detail,

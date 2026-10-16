@@ -25,6 +25,8 @@ mod stack;
 use core::num::NonZeroU32;
 
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::Win32Error;
 
 use crate::exports::export;
 use crate::kernel;
@@ -349,40 +351,76 @@ impl Backoff {
     }
 }
 
-/// Status of an internal routine: 0, a Win32 error, a wait status or a
-/// result of a caller wait routine.
+const ERROR_NOT_ENOUGH_MEMORY: Win32Error = Win32Error::new(8).unwrap();
+const ERROR_INVALID_PARAMETER: Win32Error = Win32Error::new(87).unwrap();
+/// WAIT_TIMEOUT, equal to STATUS_TIMEOUT.
+const WAIT_TIMEOUT: Win32Error = Win32Error::new(258).unwrap();
+
+/// A failed container routine.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Status(u32);
-
-impl Status {
-    const SUCCESS: Self = Self(0);
-    const NOT_ENOUGH_MEMORY: Self = Self(8);
-    const INVALID_PARAMETER: Self = Self(87);
-    const TIMEOUT: Self = Self(258);
+enum Failure {
+    NotEnoughMemory,
+    InvalidParameter,
+    /// No node or item in time, or a wait that timed out.
+    Timeout,
+    /// Another wait status or caller wait routine result.
+    Wait(Win32Error),
+    /// The first nonzero result of an enumeration callback.
+    Callback(Win32Error),
 }
 
-/// HRESULT_FROM_WIN32 for positive codes; other values pass through.
-const fn win32_result(code: u32) -> Hresult {
-    if code as i32 > 0 {
-        Hresult(0x8007_0000 | (code & 0xffff))
-    } else {
-        Hresult(code)
+impl Failure {
+    /// Outcome of a wait or of a caller wait routine; stock treats both
+    /// as Win32 codes.
+    fn of_wait(status: u32) -> Result<(), Self> {
+        match Win32Error::new(status) {
+            None => Ok(()),
+            Some(error) if error == WAIT_TIMEOUT => Err(Self::Timeout),
+            Some(error) => Err(Self::Wait(error)),
+        }
     }
 }
 
-fn insert_result(status: Status) -> u32 {
-    match status {
-        Status::SUCCESS => SUCCESS.0,
-        Status::TIMEOUT => INSERT_TIMEOUT.0,
-        Status(code) => win32_result(code).0,
+/// HRESULT_FROM_WIN32 of the failure's code.
+impl From<Failure> for Hresult {
+    fn from(failure: Failure) -> Self {
+        Self::from(match failure {
+            Failure::NotEnoughMemory => ERROR_NOT_ENOUGH_MEMORY,
+            Failure::InvalidParameter => ERROR_INVALID_PARAMETER,
+            Failure::Timeout => WAIT_TIMEOUT,
+            Failure::Wait(error) | Failure::Callback(error) => error,
+        })
     }
 }
 
-fn remove_result(status: Status) -> u32 {
-    match status {
-        Status::SUCCESS => SUCCESS.0,
-        Status::TIMEOUT => REMOVE_TIMEOUT.0,
-        Status(code) => win32_result(code).0,
+/// A malformed caller record.
+struct InvalidArgument;
+
+impl From<InvalidArgument> for Hresult {
+    fn from(_: InvalidArgument) -> Self {
+        Self::INVALID_ARGUMENT
+    }
+}
+
+/// Export result of an operation without a timeout result of its own.
+fn export_result(result: Result<(), Failure>) -> u32 {
+    match result {
+        Ok(()) => SUCCESS.0,
+        Err(failure) => Hresult::from(failure).0,
+    }
+}
+
+fn insert_result(result: Result<(), Failure>) -> u32 {
+    match result {
+        Err(Failure::Timeout) => INSERT_TIMEOUT.0,
+        result => export_result(result),
+    }
+}
+
+fn remove_result(failure: Failure) -> u32 {
+    match failure {
+        Failure::Timeout => REMOVE_TIMEOUT.0,
+        failure => Hresult::from(failure).0,
     }
 }
 
@@ -445,12 +483,12 @@ impl WaitObject {
         }
     }
 
-    fn wait(self, timeout: Timeout, alertable: bool) -> Status {
+    fn wait(self, timeout: Timeout, alertable: bool) -> Result<(), Failure> {
         let interval = timeout.interval();
         let pointer = interval
             .as_ref()
             .map_or(core::ptr::null(), |value| value as *const i64);
-        Status(match self.kind {
+        Failure::of_wait(match self.kind {
             SemaphoreKind::Object => kernel::KeWaitForSingleObject(
                 self.raw as usize as *mut u32,
                 USER_REQUEST,
@@ -471,35 +509,32 @@ impl WaitObject {
 /// Unnamed semaphore at count 0; failures set the thread's last error.
 fn create_semaphore() -> u32 {
     let mut handle = 0;
-    let status = NtCreateSemaphore(&mut handle, 0, 0, SEMAPHORE_LIMIT);
-    if (status as i32) < 0 {
-        kernel::set_last_error(status);
+    if let Err(error) = NtStatus(NtCreateSemaphore(&mut handle, 0, 0, SEMAPHORE_LIMIT)).result() {
+        kernel::set_last_error(error);
         return 0;
     }
     // Stock records ERROR_SUCCESS, the conversion of STATUS_SUCCESS.
-    kernel::set_last_error(0);
+    kernel::set_last_error_value(None);
     handle
 }
 
-fn release_semaphore(handle: u32, count: u32) {
-    let status = NtReleaseSemaphore(handle, count, 0);
-    if (status as i32) < 0 {
-        kernel::set_last_error(status);
+/// Record a failed kernel call as the thread's last error.
+fn record_failure(status: NtStatus) {
+    if let Err(error) = status.result() {
+        kernel::set_last_error(error);
     }
+}
+
+fn release_semaphore(handle: u32, count: u32) {
+    record_failure(NtStatus(NtReleaseSemaphore(handle, count, 0)));
 }
 
 fn close_handle(handle: u32) {
-    let status = kernel::NtClose(handle);
-    if (status as i32) < 0 {
-        kernel::set_last_error(status);
-    }
+    record_failure(NtStatus(kernel::NtClose(handle)));
 }
 
 fn set_event(handle: u32) {
-    let status = kernel::NtSetEvent(handle, core::ptr::null_mut());
-    if (status as i32) < 0 {
-        kernel::set_last_error(status);
-    }
+    record_failure(NtStatus(kernel::NtSetEvent(handle, core::ptr::null_mut())));
 }
 
 /// Wait behavior of one operation, from the container options.
@@ -524,16 +559,16 @@ impl Wait {
         alertable: false,
     };
 
-    fn block(&self, object: WaitObject) -> Status {
+    fn block(&self, object: WaitObject) -> Result<(), Failure> {
         match self.routine {
-            Some(routine) => Status(call(
+            Some(routine) => Failure::of_wait(call(
                 routine.get(),
                 self.context,
                 object.raw,
                 self.timeout.0,
                 u32::from(self.alertable),
             )),
-            None if self.timeout.0 == 0 => Status::TIMEOUT,
+            None if self.timeout.0 == 0 => Err(Failure::Timeout),
             None => object.wait(self.timeout, self.alertable),
         }
     }
@@ -698,7 +733,7 @@ struct Creation {
 }
 
 impl Creation {
-    fn read(descriptor: u32) -> Result<Self, Hresult> {
+    fn read(descriptor: u32) -> Result<Self, InvalidArgument> {
         let descriptor = descriptor as usize;
         let mut creation = Self {
             descriptor,
@@ -711,13 +746,13 @@ impl Creation {
             return Ok(creation);
         }
         if load(descriptor + 0x1c) != DESCRIPTOR_SIZE {
-            return Err(Hresult::INVALID_ARGUMENT);
+            return Err(InvalidArgument);
         }
         let allocate = load(descriptor + 0x28);
         if allocate != 0 {
             let free = load(descriptor + 0x2c);
             if free == 0 {
-                return Err(Hresult::INVALID_ARGUMENT);
+                return Err(InvalidArgument);
             }
             creation.allocator = [ALLOCATOR_ALIGNMENT, load(descriptor + 0x30), allocate, free];
         }
@@ -920,16 +955,16 @@ impl Object {
     }
 
     /// Take a node for an insertion; with a node limit, wait per `wait`.
-    fn acquire_node(self, wait: &Wait) -> Result<u32, Status> {
+    fn acquire_node(self, wait: &Wait) -> Result<u32, Failure> {
         let shape = self.shape;
         let Some(semaphore) = self.free_semaphore() else {
             if let Some(node) = self.pop_node() {
                 return Ok(node);
             }
             if load(self.field(shape.remaining)) == 0 {
-                return Err(Status::TIMEOUT);
+                return Err(Failure::Timeout);
             }
-            return self.grow().ok_or(Status::TIMEOUT);
+            return self.grow().ok_or(Failure::Timeout);
         };
         let credits = self.field(shape.credits);
         let mut node = None;
@@ -956,10 +991,9 @@ impl Object {
             if wait.spin {
                 backoff.pause();
             }
-            let status = wait.block(semaphore);
-            if status != Status::SUCCESS {
+            if let Err(failure) = wait.block(semaphore) {
                 fetch_add(credits, 1);
-                return Err(status);
+                return Err(failure);
             }
             node = self.pop_node();
         }
@@ -984,7 +1018,7 @@ fn remove_waiting<T>(
     semaphore: WaitObject,
     wait: &Wait,
     mut attempt: impl FnMut() -> Option<T>,
-) -> Result<T, Status> {
+) -> Result<T, Failure> {
     if let Some(item) = attempt() {
         return Ok(item);
     }
@@ -1007,26 +1041,25 @@ fn remove_waiting<T>(
         if wait.spin {
             backoff.pause();
         }
-        let status = wait.block(semaphore);
-        if status != Status::SUCCESS {
+        if let Err(failure) = wait.block(semaphore) {
             fetch_sub(waiters, 1);
-            return Err(status);
+            return Err(failure);
         }
     }
 }
 
 /// Call `callback(context, value, node)` for each node from `first`,
 /// following the link at +0, until a callback returns nonzero.
-fn walk(first: u32, value: usize, context: u32, callback: u32) -> u32 {
+fn walk(first: u32, value: usize, context: u32, callback: u32) -> Result<(), Failure> {
     let mut node = first;
     while node != 0 {
         let result = call(callback, context, load(node as usize + value), node, 0);
-        if result != 0 {
-            return result;
+        if let Some(result) = Win32Error::new(result) {
+            return Err(Failure::Callback(result));
         }
         node = load(node as usize);
     }
-    0
+    Ok(())
 }
 
 /// Store a word of a validated container through `output`.

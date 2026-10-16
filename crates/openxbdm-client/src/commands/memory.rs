@@ -9,6 +9,7 @@ use crate::protocol::ArgBuilder;
 use crate::protocol::Command;
 use crate::protocol::ErrorCode;
 use crate::protocol::ExpectedBody;
+use crate::protocol::RemoteStatus;
 use crate::protocol::Response;
 
 fn report_parse(err: ParseError) -> rootcause::Report<Error> {
@@ -143,10 +144,10 @@ impl Command for SetMem {
 
     fn handle_remote(
         &self,
-        code: ErrorCode,
+        code: RemoteStatus,
         message: &str,
     ) -> Option<Result<Self::Output, rootcause::Report<Error>>> {
-        (code == ErrorCode::MEMORY_NOT_MAPPED).then(|| self.bytes_written(message))
+        (code == ErrorCode::MemoryNotMapped).then(|| self.bytes_written(message))
     }
 }
 

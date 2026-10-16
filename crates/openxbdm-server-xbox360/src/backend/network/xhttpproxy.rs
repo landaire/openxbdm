@@ -6,8 +6,6 @@ use core::ptr::null_mut;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::Ordering;
 
-use openxbdm_core::status::ErrorCode;
-use openxbdm_core::status::Hresult;
 use openxbdm_server::commands::network::decode_hex;
 use openxbdm_server::commands::network::xhttpproxy;
 use openxbdm_server::commands::network::xhttpproxy::Certificate;
@@ -15,6 +13,7 @@ use openxbdm_server::commands::network::xhttpproxy::Inserted;
 use openxbdm_server::commands::network::xhttpproxy::NAME_CAPACITY;
 use openxbdm_server::commands::network::xhttpproxy::NewProxy;
 use openxbdm_server::commands::network::xhttpproxy::ProxyEntry;
+use openxbdm_server::commands::network::xhttpproxy::ProxyError;
 use openxbdm_server::commands::network::xhttpproxy::ProxyFlags;
 use openxbdm_server::commands::network::xhttpproxy::ProxyId;
 use openxbdm_server::commands::network::xhttpproxy::ProxyOutcome;
@@ -168,10 +167,9 @@ impl xhttpproxy::Backend for Console {
             .wrapping_add(size_of::<Entry>() as u32);
         let entry = kernel::ExAllocatePoolWithTag(size, PROXY_TAG) as usize as *mut Entry;
         if entry.is_null() {
-            let error = Hresult::from_error_code(ErrorCode::OUT_OF_MEMORY);
             return ProxyOutcome {
                 cleared,
-                inserted: Some(Err(error)),
+                inserted: Some(Err(ProxyError::OutOfMemory)),
             };
         }
         // SAFETY: the allocation holds the header, the name, and the
@@ -213,7 +211,7 @@ impl xhttpproxy::Backend for Console {
                         _ => {
                             guard.unlink(entry);
                             kernel::ExFreePool(entry as usize as u32);
-                            Err(Hresult::from_error_code(ErrorCode::UNKNOWN_COMMAND))
+                            Err(ProxyError::BadCertificate)
                         }
                     }
                 }

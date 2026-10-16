@@ -10,7 +10,7 @@ use core::fmt::Write as _;
 
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
-use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::KernelError;
 
 use crate::backend::Backend as AnyBackend;
 use crate::commands::filesystem::CreateDisposition;
@@ -21,12 +21,42 @@ use crate::commands::filesystem::FileAttributes;
 use crate::commands::filesystem::FileHandle;
 use crate::commands::filesystem::ShareAccess;
 use crate::invocation::Invocation;
+use crate::reply;
+use crate::reply::CommandError;
+use crate::reply::CommandResult;
+use crate::reply::Reply;
 use crate::text::Text;
 
 /// Bytes the writer collects before writing to the file.
 pub const TELL_LOG_BUFFER_SIZE: usize = 0x2000;
-/// Area bit that enables the critical section wait trace lines.
-pub const TELL_LOG_AREA_CRITICAL_SECTIONS: u32 = 2;
+
+/// Area bits of the open log; each producer component owns bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TellLogAreas(pub u32);
+
+impl TellLogAreas {
+    pub const NONE: Self = Self(0);
+    /// Enables the critical section wait trace lines.
+    pub const CRITICAL_SECTIONS: Self = Self(2);
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// The bits of `self` not in `other`.
+    pub const fn difference(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
+    pub const fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
 /// Longest trace line the monitor formats.
 pub const TELL_LOG_LINE_LIMIT: u32 = 0x400;
 const PATH_PREFIX: &[u8] = br"\Device\Harddisk0\Partition1\DEVKIT\";
@@ -36,12 +66,6 @@ const DEFAULT_ENTRY_SIZE: u32 = 0x80;
 const DEFAULT_ENTRIES: u32 = 0x200;
 /// Results carry this bit on top of a kernel or engine status.
 const STATUS_FLAG: u32 = 0x1000_0000;
-/// `start` while the log is open, with no new area bit.
-const ALREADY_OPEN: Hresult = Hresult(0x420);
-/// `stop` while no log is open.
-const NOT_OPEN: Hresult = Hresult(0x494);
-/// The command sends no reply line.
-const SILENT: Hresult = Hresult(0);
 
 /// Record engine parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,19 +86,71 @@ pub struct TellLogCounters {
     pub missed: u32,
 }
 
+/// Why the platform log engine could not be created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogEngineError {
+    /// The engine or a queue cell could not be allocated.
+    OutOfMemory,
+    /// A lock-free queue call failed with this result.
+    Queue(Hresult),
+    /// The worker thread could not be created.
+    Thread(KernelError),
+}
+
+/// The engine's result word: a kernel status passes unchanged.
+impl From<LogEngineError> for Hresult {
+    fn from(error: LogEngineError) -> Self {
+        match error {
+            LogEngineError::OutOfMemory => Hresult::OUT_OF_MEMORY,
+            LogEngineError::Queue(result) => result,
+            LogEngineError::Thread(error) => Hresult(error.status().0),
+        }
+    }
+}
+
+/// A `dmtelllog` success result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TellLogReply {
+    /// `start` while the log is open, with no new area bit.
+    AlreadyOpen,
+    /// `stop` while no log is open.
+    NotOpen,
+    Started,
+    Stopped,
+}
+
+impl From<TellLogReply> for Hresult {
+    fn from(reply: TellLogReply) -> Self {
+        match reply {
+            TellLogReply::AlreadyOpen => Hresult(0x420),
+            TellLogReply::NotOpen => Hresult(0x494),
+            TellLogReply::Started | TellLogReply::Stopped => Hresult(STATUS_FLAG),
+        }
+    }
+}
+
+/// `dmtelllog start` could not start the log engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TellLogFailed(pub LogEngineError);
+
+impl From<TellLogFailed> for Hresult {
+    fn from(TellLogFailed(error): TellLogFailed) -> Self {
+        Hresult(Hresult::from(error).0 | STATUS_FLAG)
+    }
+}
+
 /// Platform log engine and open-log state.
 pub trait TellLogBackend {
     /// Area bits while a log is open.
-    fn tell_log_area(&mut self) -> Option<u32>;
-    fn set_tell_log_area(&mut self, area: u32);
-    /// Start the engine that writes records to `file`; the engine status,
-    /// which is negative on failure.
+    fn tell_log_area(&mut self) -> Option<TellLogAreas>;
+    fn set_tell_log_area(&mut self, area: TellLogAreas);
+    /// Start the engine that writes records to `file`.
     fn tell_log_start(
         &mut self,
         file: FileHandle,
-        area: u32,
+        area: TellLogAreas,
         config: TellLogConfig,
-    ) -> Result<Hresult, Hresult>;
+    ) -> Result<(), LogEngineError>;
     /// Mark the log closing and queue the closing record that makes the
     /// writer flush; the engine counters.
     fn tell_log_close(&mut self) -> Option<TellLogCounters>;
@@ -110,8 +186,8 @@ impl TellLogWriter {
         &mut self,
         entry: &[u8],
         closing: bool,
-        write: &mut dyn FnMut(&[u8]) -> Result<(), NtStatus>,
-    ) -> Result<(), NtStatus> {
+        write: &mut dyn FnMut(&[u8]) -> Result<(), KernelError>,
+    ) -> Result<(), KernelError> {
         let length = entry
             .iter()
             .position(|&byte| byte == 0)
@@ -131,8 +207,8 @@ impl TellLogWriter {
 
     fn flush(
         &mut self,
-        write: &mut dyn FnMut(&[u8]) -> Result<(), NtStatus>,
-    ) -> Result<(), NtStatus> {
+        write: &mut dyn FnMut(&[u8]) -> Result<(), KernelError>,
+    ) -> Result<(), KernelError> {
         if self.count == 0 {
             return Ok(());
         }
@@ -225,8 +301,8 @@ pub fn format_wait_trace(
 
 /// `dmtelllog start file=<name> area=<dword> [block=<dword>] [size=<dword>]
 /// [entries=<dword>]` | `dmtelllog stop [area=<dword>]`. The reply text is
-/// `hresult=0x%x`; a zero result sends no reply line.
-pub(super) fn tell_log(invocation: &mut Invocation<'_>) -> Hresult {
+/// `hresult=0x%x`.
+pub(super) fn tell_log(invocation: &mut Invocation<'_>) -> CommandResult {
     let result = if invocation.line.has("start") {
         let mut file = [0u8; FILE_NAME_CAPACITY];
         let Some(file) = invocation
@@ -234,10 +310,10 @@ pub(super) fn tell_log(invocation: &mut Invocation<'_>) -> Hresult {
             .param("file")
             .map(|value| value.copy_into(&mut file))
         else {
-            return Hresult::from_error_code(ErrorCode::BAD_PARAMETER);
+            return Err(ErrorCode::BadParameter.into());
         };
-        let Some(area) = invocation.line.dword("area") else {
-            return Hresult::from_error_code(ErrorCode::BAD_PARAMETER);
+        let Some(area) = invocation.line.dword("area").map(TellLogAreas) else {
+            return Err(ErrorCode::BadParameter.into());
         };
         // Absent values select blocking off and the engine defaults.
         let block = invocation
@@ -249,33 +325,33 @@ pub(super) fn tell_log(invocation: &mut Invocation<'_>) -> Hresult {
         start(invocation.backend, file, area, block, size, entries)
     } else if invocation.line.has("stop") {
         // An absent area stops the log for every component.
-        let area = invocation.line.dword("area").unwrap_or(0);
+        let area = invocation
+            .line
+            .dword("area")
+            .map_or(TellLogAreas::NONE, TellLogAreas);
         stop(invocation.backend, area)
     } else {
-        return Hresult::from_error_code(ErrorCode::UNKNOWN_COMMAND);
+        return Err(ErrorCode::UnknownCommand.into());
     };
-    invocation.set_text(format_args!("hresult=0x{:x}", result.0));
-    if result == SILENT {
-        Hresult::NO_REPLY
-    } else {
-        result
-    }
+    // A result of 0 sends no reply line.
+    invocation.set_text(format_args!("hresult=0x{:x}", reply::hresult(result).0));
+    result
 }
 
 fn start(
     backend: &mut dyn AnyBackend,
     file: &[u8],
-    area: u32,
+    area: TellLogAreas,
     block: bool,
     size: u32,
     entries: u32,
-) -> Hresult {
+) -> CommandResult {
     if let Some(open) = backend.tell_log_area() {
-        if area != 0 && open & area == 0 {
-            backend.set_tell_log_area(open | area);
-            return SILENT;
+        if !area.is_empty() && !open.intersects(area) {
+            backend.set_tell_log_area(open.union(area));
+            return Ok(Reply::Sent);
         }
-        return ALREADY_OPEN;
+        return Ok(Reply::TellLog(TellLogReply::AlreadyOpen));
     }
     let mut path = Text::<{ PATH_PREFIX.len() + FILE_NAME_CAPACITY }>::new();
     let _ = path.push_bytes(PATH_PREFIX);
@@ -294,15 +370,16 @@ fn start(
         options: CreateOptions::SYNCHRONOUS_IO_NONALERT.union(CreateOptions::NON_DIRECTORY_FILE),
     };
     let opened = backend.create_file(path.as_bytes(), &request);
-    if let Err(status) = opened {
+    if let Err(error) = opened {
         debug_print(
             backend,
-            format_args!("DmTellLog: Failed to open file 0x{:x}\n", status.0),
+            format_args!("DmTellLog: Failed to open file 0x{:x}\n", error.status().0),
         );
     }
-    debug_print(backend, format_args!("Logging mask = 0x{area:x}\n"));
+    debug_print(backend, format_args!("Logging mask = 0x{:x}\n", area.0));
+    // An unopened file sends no reply line.
     let Ok(file) = opened else {
-        return SILENT;
+        return Ok(Reply::Sent);
     };
     let config = TellLogConfig {
         entry_size: if size == 0 { DEFAULT_ENTRY_SIZE } else { size },
@@ -314,26 +391,27 @@ fn start(
         block,
     };
     match backend.tell_log_start(file, area, config) {
-        Ok(status) => Hresult(status.0 | STATUS_FLAG),
-        Err(status) => {
+        Ok(()) => Ok(Reply::TellLog(TellLogReply::Started)),
+        Err(error) => {
             debug_print(backend, format_args!("DmTellLog: Unable to start Log\n"));
             backend.close_file(file);
-            Hresult(status.0 | STATUS_FLAG)
+            Err(CommandError::TellLog(TellLogFailed(error)))
         }
     }
 }
 
-fn stop(backend: &mut dyn AnyBackend, area: u32) -> Hresult {
+fn stop(backend: &mut dyn AnyBackend, area: TellLogAreas) -> CommandResult {
+    let not_open = Ok(Reply::TellLog(TellLogReply::NotOpen));
     let Some(open) = backend.tell_log_area() else {
-        return NOT_OPEN;
+        return not_open;
     };
-    let remaining = open & !area;
+    let remaining = open.difference(area);
     backend.set_tell_log_area(remaining);
-    if remaining != 0 && area != 0 {
-        return SILENT;
+    if !remaining.is_empty() && !area.is_empty() {
+        return Ok(Reply::Sent);
     }
     let Some(counters) = backend.tell_log_close() else {
-        return NOT_OPEN;
+        return not_open;
     };
     debug_print(
         backend,
@@ -343,12 +421,12 @@ fn stop(backend: &mut dyn AnyBackend, area: u32) -> Hresult {
         ),
     );
     let Some(file) = backend.tell_log_stop() else {
-        return NOT_OPEN;
+        return not_open;
     };
     // The monitor ignores the flush status.
     let _ = backend.flush_file(file);
     backend.close_file(file);
-    Hresult(STATUS_FLAG)
+    Ok(Reply::TellLog(TellLogReply::Stopped))
 }
 
 fn debug_print(backend: &mut dyn AnyBackend, arguments: core::fmt::Arguments<'_>) {

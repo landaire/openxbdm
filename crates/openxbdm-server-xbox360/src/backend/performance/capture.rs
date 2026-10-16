@@ -15,12 +15,17 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::Win32Error;
 use openxbdm_server::Server;
 use openxbdm_server::commands::filesystem::DriveTable;
+use openxbdm_server::commands::filesystem::FileHandle;
 use openxbdm_server::commands::filesystem::ObjectPath;
 use openxbdm_server::commands::performance::capture;
+use openxbdm_server::commands::performance::capture::BufferRequest;
 use openxbdm_server::commands::performance::capture::CHUNK_RESERVE_WORDS;
+use openxbdm_server::commands::performance::capture::CaptureError;
 use openxbdm_server::commands::performance::capture::CaptureFlags;
 use openxbdm_server::commands::performance::capture::ControlRecord;
 use openxbdm_server::commands::performance::capture::CounterSetup;
@@ -30,6 +35,10 @@ use openxbdm_server::commands::performance::capture::Instrumentation;
 use openxbdm_server::commands::performance::capture::MAX_PROCESSORS;
 use openxbdm_server::commands::performance::capture::Paths;
 use openxbdm_server::commands::performance::capture::RecordKind;
+use openxbdm_server::commands::performance::capture::Started;
+use openxbdm_server::reply;
+use openxbdm_server::reply::CommandError;
+use openxbdm_server::reply::Reply;
 
 use super::counters;
 use super::module_snapshot;
@@ -81,11 +90,6 @@ const FILE_OVERWRITE_IF: u32 = 5;
 const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
 const FILE_END_OF_FILE_INFORMATION: u32 = 0x14;
 const FILE_ALLOCATION_INFORMATION: u32 = 0x13;
-const STATUS_UNSUCCESSFUL: u32 = 0xc000_0001;
-const STATUS_NO_SUCH_FILE: u32 = 0xc000_000f;
-const STATUS_NO_MEMORY: u32 = 0xc000_0017;
-/// `capctrl start` and export 73 when the capture file cannot be created.
-const CAPTURE_FILE_FAILED: Hresult = Hresult::error(0x0d);
 /// Loader data table entry: XEX header pointer.
 const ENTRY_XEX_HEADER: u32 = 0x58;
 /// Processor control region: processor number.
@@ -663,12 +667,12 @@ fn file_attributes(name: &AnsiString) -> ObjectAttributes {
 }
 
 /// Create (overwrite) the capture file `path`.
-fn create_file(path: &[u8]) -> Result<u32, u32> {
+fn create_file(path: &[u8]) -> Result<FileHandle, KernelError> {
     let name = AnsiString::new(path);
     let attributes = file_attributes(&name);
     let mut handle = 0u32;
     let mut io_status = IoStatusBlock::default();
-    let status = kernel::NtCreateFile(
+    NtStatus(kernel::NtCreateFile(
         &mut handle,
         FILE_ACCESS,
         &attributes,
@@ -678,12 +682,9 @@ fn create_file(path: &[u8]) -> Result<u32, u32> {
         FILE_SHARE_READ,
         FILE_OVERWRITE_IF,
         FILE_SYNCHRONOUS_IO_NONALERT,
-    );
-    if NtStatus(status).is_success() {
-        Ok(handle)
-    } else {
-        Err(status)
-    }
+    ))
+    .result()?;
+    Ok(FileHandle(handle))
 }
 
 fn delete_file(path: &[u8]) {
@@ -691,10 +692,10 @@ fn delete_file(path: &[u8]) {
     kernel::NtDeleteFile(&file_attributes(&name));
 }
 
-fn write_file(handle: u32, address: u32, length: u32) -> u32 {
+fn write_file(handle: FileHandle, address: u32, length: u32) -> Result<(), KernelError> {
     let mut io_status = IoStatusBlock::default();
-    kernel::NtWriteFile(
-        handle,
+    NtStatus(kernel::NtWriteFile(
+        handle.0,
         0,
         0,
         0,
@@ -702,7 +703,8 @@ fn write_file(handle: u32, address: u32, length: u32) -> u32 {
         address as usize as *const u8,
         length,
         core::ptr::null(),
-    )
+    ))
+    .result()
 }
 
 /// A recorded chunk of one processor, or `None` after printing `message`
@@ -739,11 +741,8 @@ fn store_data_sizes(snapshot: u32) -> bool {
 }
 
 /// Write the snapshot and every recorded chunk to `handle`.
-fn write_capture(handle: u32, snapshot: u32) -> u32 {
-    let status = write_file(handle, snapshot, capture::FILE_HEADER_SIZE);
-    if !NtStatus(status).is_success() {
-        return status;
-    }
+fn write_capture(handle: FileHandle, snapshot: u32) -> Result<(), KernelError> {
+    write_file(handle, snapshot, capture::FILE_HEADER_SIZE)?;
     let mut total = 0u32;
     for block in BLOCKS
         .iter()
@@ -754,7 +753,7 @@ fn write_capture(handle: u32, snapshot: u32) -> u32 {
             let Some((start, end)) =
                 chunk_bounds(block, chunk, c"DmCapWrite: Invalid bufstart and bufend!\n")
             else {
-                return STATUS_UNSUCCESSFUL;
+                return Err(KernelError::Unsuccessful);
             };
             total = total.wrapping_add(end - start);
             if start & (PAGE_SIZE - 1) != 0 {
@@ -765,31 +764,27 @@ fn write_capture(handle: u32, snapshot: u32) -> u32 {
                     core::ptr::null(),
                 );
             }
-            let status = write_file(handle, start, end - start);
-            if !NtStatus(status).is_success() {
-                return status;
-            }
+            write_file(handle, start, end - start)?;
         }
     }
     let size = u64::from(total.wrapping_add(capture::FILE_HEADER_SIZE)).to_be_bytes();
     let mut io_status = IoStatusBlock::default();
-    let status = kernel::NtSetInformationFile(
-        handle,
+    NtStatus(kernel::NtSetInformationFile(
+        handle.0,
         &mut io_status,
         size.as_ptr(),
         8,
         FILE_END_OF_FILE_INFORMATION,
-    );
-    if !NtStatus(status).is_success() {
-        return status;
-    }
-    kernel::NtSetInformationFile(
-        handle,
+    ))
+    .result()?;
+    NtStatus(kernel::NtSetInformationFile(
+        handle.0,
         &mut io_status,
         size.as_ptr(),
         8,
         FILE_ALLOCATION_INFORMATION,
-    )
+    ))
+    .result()
 }
 
 /// The capture engine over this module's state.
@@ -816,8 +811,8 @@ impl capture::Engine for Engine {
         found
     }
 
-    fn set_kernel_call_cap(&mut self, enable: bool) -> NtStatus {
-        NtStatus(kernel::ExDebugMonitorService(2, u32::from(enable), 0, 0))
+    fn set_kernel_call_cap(&mut self, enable: bool) -> Result<(), KernelError> {
+        NtStatus(kernel::ExDebugMonitorService(2, u32::from(enable), 0, 0)).result()
     }
 
     fn set_title_terminated(&mut self, terminated: bool) {
@@ -828,43 +823,48 @@ impl capture::Engine for Engine {
     /// and poll for its answer. The pointers are read again at every use,
     /// as stock does; a pointer the title cleared fails the request where
     /// stock dereferences null.
-    fn request_title_capture(&mut self, megabytes: u8) -> Hresult {
+    fn request_title_capture(&mut self, megabytes: u8) -> Result<Started, CaptureError> {
         let request = counters::title_capture_request();
         let (Some(control), Some(_)) = (request.control, request.result) else {
-            return capture::TITLE_CAPTURE_FAILED;
+            return Err(CaptureError::TitleCaptureFailed);
         };
         write(control, read(control) | u32::from(megabytes));
         let Some(control) = counters::title_capture_request().control else {
-            return capture::TITLE_CAPTURE_FAILED;
+            return Err(CaptureError::TitleCaptureFailed);
         };
         write(control, read(control) | 0x100);
         let start = kernel::tick_count();
         loop {
             kernel::sleep_milliseconds(TITLE_CAPTURE_POLL_MS);
             if kernel::tick_count().wrapping_sub(start) > TITLE_CAPTURE_TIMEOUT_MS {
-                return capture::TITLE_CAPTURE_FAILED;
+                return Err(CaptureError::TitleCaptureFailed);
             }
             let request = counters::title_capture_request();
             let Some(control) = request.control else {
-                return capture::TITLE_CAPTURE_FAILED;
+                return Err(CaptureError::TitleCaptureFailed);
             };
             if read(control) == 0 {
                 return counters::title_capture_request()
                     .result
-                    .map_or(capture::TITLE_CAPTURE_FAILED, |result| {
-                        Hresult(read(result))
+                    .map_or(Err(CaptureError::TitleCaptureFailed), |result| {
+                        capture::title_result(Hresult(read(result)))
                     });
             }
         }
     }
 
     /// Stock 0x91f29210.
-    fn begin(&mut self, name: &[u8], buffer_size: u32, exclusive: bool) -> Hresult {
+    fn begin(
+        &mut self,
+        name: &[u8],
+        buffer_size: u32,
+        exclusive: bool,
+    ) -> Result<Started, CaptureError> {
         if LOCK
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            return capture::BUSY;
+            return Err(CaptureError::Busy);
         }
         let flags =
             CaptureFlags(FLAGS.load(Ordering::Relaxed)).for_start(current_processor() as u8);
@@ -872,7 +872,7 @@ impl capture::Engine for Engine {
         let continued = recording();
         if continued && exclusive {
             LOCK.store(0, Ordering::Release);
-            return capture::ALREADY_RUNNING;
+            return Err(CaptureError::AlreadyRunning);
         }
         // SAFETY: `LOCK` is held.
         let file_name = unsafe { &mut *FILE_NAME.0.get() };
@@ -905,7 +905,7 @@ impl capture::Engine for Engine {
                 0 => {
                     BUFFER_SIZE.store(previous_size, Ordering::Relaxed);
                     LOCK.store(0, Ordering::Release);
-                    return capture::NO_BUFFER_MEMORY;
+                    return Err(CaptureError::NoBufferMemory);
                 }
                 megabytes => capture::default_buffer_size(megabytes),
             },
@@ -915,7 +915,7 @@ impl capture::Engine for Engine {
         if flags.counters() && !pmc::acquire(Owner::CAPTURE) {
             BUFFER_SIZE.store(previous_size, Ordering::Relaxed);
             LOCK.store(0, Ordering::Release);
-            return capture::COUNTERS_UNAVAILABLE;
+            return Err(CaptureError::CountersUnavailable);
         }
         let mut list = CHUNK_LIST.load(Ordering::Relaxed);
         if BUFFER.load(Ordering::Relaxed) != 0 {
@@ -959,14 +959,14 @@ impl capture::Engine for Engine {
                 capture::Engine::release_counters(self);
             }
             LOCK.store(0, Ordering::Release);
-            return capture::NO_BUFFER_MEMORY;
+            return Err(CaptureError::NoBufferMemory);
         }
 
         let state = disable_interrupts();
         if TITLE_TERMINATED.load(Ordering::Relaxed) {
             // Stock keeps the interlock until the next title terminates.
             restore_interrupts(state);
-            return capture::TITLE_TERMINATED;
+            return Err(CaptureError::TitleTerminated);
         }
         let mut arguments = StartArguments {
             chunks: [0; MAX_PROCESSORS],
@@ -1011,27 +1011,27 @@ impl capture::Engine for Engine {
         }
         LOCK.store(0, Ordering::Release);
         if continued {
-            capture::CONTINUED
+            Ok(Started::Continued)
         } else {
-            Hresult::OK
+            Ok(Started::Recording)
         }
     }
 
     /// Stock 0x91f29830.
-    fn end(&mut self) -> Hresult {
+    fn end(&mut self) -> Result<(), CaptureError> {
         if LOCK
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            return capture::BUSY;
+            return Err(CaptureError::Busy);
         }
         if !recording() {
             LOCK.store(0, Ordering::Release);
-            return capture::NO_CAPTURE;
+            return Err(CaptureError::NoCapture);
         }
         if kernel::timebase().wrapping_sub(load_pair(&START_TIMEBASE)) > TIMEBASE_LIMIT {
             LOCK.store(0, Ordering::Release);
-            return capture::TOO_LONG;
+            return Err(CaptureError::TooLong);
         }
         let state = disable_interrupts();
         if let Some(slot) = swap_routine_slot() {
@@ -1045,9 +1045,9 @@ impl capture::Engine for Engine {
         restore_interrupts(state);
         LOCK.store(0, Ordering::Release);
         if full {
-            capture::BUFFER_FULL
+            Err(CaptureError::BufferFull)
         } else {
-            Hresult::OK
+            Ok(())
         }
     }
 
@@ -1055,24 +1055,24 @@ impl capture::Engine for Engine {
         CaptureFlags(FLAGS.load(Ordering::Relaxed))
     }
 
-    fn retire_flags(&mut self, previous: u32) {
+    fn retire_flags(&mut self, previous: CaptureFlags) {
         FLAGS.store(CaptureFlags::IDLE.0, Ordering::Relaxed);
-        PREVIOUS_FLAGS.store(previous, Ordering::Relaxed);
+        PREVIOUS_FLAGS.store(previous.0, Ordering::Relaxed);
     }
 
     /// Stock 0x91f27db8.
-    fn finish_counters(&mut self, flags: CaptureFlags) -> Hresult {
+    fn finish_counters(&mut self, flags: CaptureFlags) -> Result<(), CaptureError> {
         match flags.counter_source() {
             CounterSource::Processor(_) => {
                 if pmc::stop(Owner::CAPTURE) {
-                    Hresult::OK
+                    Ok(())
                 } else {
-                    capture::COUNTERS_LOST
+                    Err(CaptureError::CountersLost)
                 }
             }
             _ => {
                 write_register(MEMORY_COUNTER_CONTROL, MEMORY_COUNTER_STOP);
-                Hresult::OK
+                Ok(())
             }
         }
     }
@@ -1096,38 +1096,37 @@ impl capture::Engine for Engine {
     }
 
     /// Stock 0x91f28540; an open failure keeps the buffers.
-    fn write(&mut self, paths: &mut dyn Paths) -> NtStatus {
+    fn write(&mut self, paths: &mut dyn Paths) -> Result<(), KernelError> {
         // SAFETY: the caller holds `LOCK`.
         let file_name = unsafe { &*FILE_NAME.0.get() };
         let length = file_name
             .iter()
             .position(|&byte| byte == 0)
             .unwrap_or(NAME_CAPACITY);
-        let Some(path) = paths.object_path(&file_name[..length]) else {
-            return NtStatus(STATUS_NO_SUCH_FILE);
-        };
-        let handle = match create_file(path.as_bytes()) {
-            Ok(handle) => handle,
-            Err(status) => return NtStatus(status),
-        };
+        let path = paths
+            .object_path(&file_name[..length])
+            .ok_or(KernelError::NoSuchFile)?;
+        let handle = create_file(path.as_bytes())?;
         let mut executable = [0u8; module_snapshot::PATH_LIMIT + 2];
         let executable_length = paths.executable_drive_path(&mut executable);
         let snapshot = module_snapshot::build(&executable[..executable_length], snapshot_fields());
-        let status = match &snapshot {
-            None => STATUS_NO_MEMORY,
-            Some(snapshot) if !store_data_sizes(snapshot.address()) => STATUS_UNSUCCESSFUL,
+        let written = match &snapshot {
+            None => Err(KernelError::NoMemory),
+            Some(snapshot) if !store_data_sizes(snapshot.address()) => {
+                Err(KernelError::Unsuccessful)
+            }
             Some(snapshot) => write_capture(handle, snapshot.address()),
         };
-        kernel::NtClose(handle);
+        kernel::NtClose(handle.0);
         if let Some(snapshot) = snapshot {
             module_snapshot::free(snapshot);
         }
         release_buffers();
-        NtStatus(status)
+        written
     }
 
-    fn dos_error(&mut self, status: NtStatus) -> u32 {
-        kernel::RtlNtStatusToDosError(status.0)
+    fn dos_error(&mut self, error: KernelError) -> Option<Win32Error> {
+        Win32Error::new(kernel::RtlNtStatusToDosError(NtStatus::from(error).0))
     }
 
     /// Stock 0x91f28a10 after the flags: the buffers are forgotten, not
@@ -1175,34 +1174,43 @@ pub(crate) fn buffer_allocated() -> bool {
     BUFFER.load(Ordering::Relaxed) != 0
 }
 
+/// The result word of the capture exports.
+fn export_result(result: Result<Reply, CaptureError>) -> u32 {
+    reply::hresult(result.map_err(CommandError::from)).0
+}
+
 /// `capctrl start` after the server validated the file (stock 0x91f29d08).
-pub(super) fn start(name: &[u8], path: &[u8], buffer_size: u32) -> Hresult {
+pub(super) fn start(
+    name: &[u8],
+    path: &[u8],
+    buffer: BufferRequest,
+) -> Result<Started, CaptureError> {
     delete_file(path);
     store_pair(&START_TIME, kernel::system_time());
-    capture::start(&mut Engine, name, buffer_size, true)
+    capture::start(&mut Engine, name, buffer, true)
 }
 
 /// Export 73 with `paths` (stock 0x91f29c00): a running capture continues
 /// under the new name without touching the file.
-fn start_for_title(paths: &mut dyn Paths, name: &[u8], buffer_size: u32) -> Hresult {
+fn start_for_title(
+    paths: &mut dyn Paths,
+    name: &[u8],
+    buffer: BufferRequest,
+) -> Result<Started, CaptureError> {
     if !recording() {
-        let Some(path) = paths.object_path(name) else {
-            return CAPTURE_FILE_FAILED;
-        };
-        match create_file(path.as_bytes()) {
-            Ok(handle) => kernel::NtClose(handle),
-            Err(_) => return CAPTURE_FILE_FAILED,
-        };
+        let path = paths.object_path(name).ok_or(CaptureError::FileFailed)?;
+        let handle = create_file(path.as_bytes()).map_err(|_| CaptureError::FileFailed)?;
+        kernel::NtClose(handle.0);
         delete_file(path.as_bytes());
     }
     store_pair(&START_TIME, kernel::system_time());
-    capture::start(&mut Engine, name, buffer_size, false)
+    capture::start(&mut Engine, name, buffer, false)
 }
 
 /// Export 73 request posted to the server thread.
 struct TitleStart<'a> {
     name: &'a [u8],
-    buffer_size: u32,
+    buffer: BufferRequest,
 }
 
 fn start_on_server(
@@ -1217,7 +1225,7 @@ fn start_on_server(
         drives: &server.state.filesystem.drives,
         backend: console,
     };
-    start_for_title(&mut paths, request.name, request.buffer_size).0
+    export_result(start_for_title(&mut paths, request.name, request.buffer).map(Reply::from))
 }
 
 /// Export 73: start a capture into the drive path `name`. The drive table
@@ -1226,15 +1234,17 @@ extern "C" fn title_start(name: *const u8, buffer_size: u32) -> u32 {
     // At most `TITLE_NAME_LIMIT` bytes are read (stock copies the name
     // unbounded into a 0x141-byte stack buffer).
     let name = super::c_string(name as usize as u32, TITLE_NAME_LIMIT);
-    let request = TitleStart { name, buffer_size };
-    dispatcher::call_on_server(start_on_server, &raw const request as usize as u32)
-        .unwrap_or_else(|| start_for_title(&mut NoDriveTable, name, buffer_size).0)
+    let buffer = BufferRequest(buffer_size);
+    let request = TitleStart { name, buffer };
+    dispatcher::call_on_server(start_on_server, &raw const request as usize as u32).unwrap_or_else(
+        || export_result(start_for_title(&mut NoDriveTable, name, buffer).map(Reply::from)),
+    )
 }
 bridged!(title_start_entry, title_start);
 export_raw!(73, title_start_entry);
 
 /// `capctrl stop` on the server thread.
-pub(super) fn stop(console: &mut Console, drives: &DriveTable) -> Hresult {
+pub(super) fn stop(console: &mut Console, drives: &DriveTable) -> Result<(), CaptureError> {
     capture::stop(
         &mut Engine,
         &mut DrivePaths {
@@ -1250,14 +1260,15 @@ fn stop_on_server(
     _network: &mut XamNetwork,
     _argument: u32,
 ) -> u32 {
-    stop(console, &server.state.filesystem.drives).0
+    export_result(stop(console, &server.state.filesystem.drives).map(|()| Reply::Ok))
 }
 
 /// Export 74: stop and write the capture file; the drive table is read on
 /// the server thread.
 extern "C" fn title_stop() -> u32 {
-    dispatcher::call_on_server(stop_on_server, 0)
-        .unwrap_or_else(|| capture::stop(&mut Engine, &mut NoDriveTable).0)
+    dispatcher::call_on_server(stop_on_server, 0).unwrap_or_else(|| {
+        export_result(capture::stop(&mut Engine, &mut NoDriveTable).map(|()| Reply::Ok))
+    })
 }
 bridged!(title_stop_entry, title_stop);
 export_raw!(74, title_stop_entry);
@@ -1272,11 +1283,7 @@ pub(super) fn call_cap_present() -> bool {
 
 /// Export 84.
 extern "C" fn fast_cap_result() -> u32 {
-    if fast_cap_present() {
-        Hresult::success(0x07).0
-    } else {
-        Hresult::error(0x1b).0
-    }
+    export_result(capture::fast_cap_state(fast_cap_present()).map(Reply::Capture))
 }
 export!(84, fast_cap_result);
 
@@ -1292,12 +1299,12 @@ extern "C" fn set_flags_export(value: u32) -> u32 {
 export!(90, set_flags_export);
 
 /// `capctrl profilingstatus` (stock 0x91f28940).
-pub(super) fn status() -> Hresult {
+pub(super) fn status() -> Result<(), CaptureError> {
     if TITLE_TERMINATED.load(Ordering::Relaxed) {
-        return capture::TITLE_TERMINATED;
+        return Err(CaptureError::TitleTerminated);
     }
     if !recording() {
-        return capture::NO_CAPTURE;
+        return Err(CaptureError::NoCapture);
     }
     let full = BLOCKS.iter().take(processor_count()).any(|block| {
         block.enabled.load(Ordering::Relaxed)
@@ -1305,24 +1312,24 @@ pub(super) fn status() -> Hresult {
             && block.flags.load(Ordering::Relaxed) & STOPPED != 0
     });
     if full {
-        capture::BUFFER_FULL
+        Err(CaptureError::BufferFull)
     } else {
-        Hresult::OK
+        Ok(())
     }
 }
 
 extern "C" fn status_export() -> u32 {
-    status().0
+    export_result(status().map(|()| Reply::Ok))
 }
 export!(146, status_export);
 
 /// `capctrl abort` (export 162).
-pub(super) fn abort() -> Hresult {
+pub(super) fn abort() -> Result<(), CaptureError> {
     capture::abort(&mut Engine)
 }
 
 extern "C" fn abort_export() -> u32 {
-    abort().0
+    export_result(abort().map(|()| Reply::Ok))
 }
 export!(162, abort_export);
 

@@ -11,14 +11,46 @@ use openxbdm_core::status::Hresult;
 
 /// Request slots of one transport.
 pub const REQUEST_SLOTS: usize = 4;
-/// Result of a request that is still queued.
-pub const PENDING: Hresult = Hresult(0x8000_000a);
-/// The connection is closed.
-pub const NOT_CONNECTED: Hresult = Hresult(0x8000_4002);
-/// Status of a request removed by a cancel or a disconnect.
-pub const ABORTED: Hresult = Hresult(0x8000_4004);
-/// Status of a completed request.
-pub const COMPLETED: Hresult = Hresult(0);
+
+/// A failed transport routine or request, as the studio service receives
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StudioError {
+    /// The request is still queued.
+    Pending,
+    /// The connection is closed.
+    NotConnected,
+    /// Removed by a cancel or a disconnect.
+    Aborted,
+    /// No request slot or memory is free.
+    OutOfMemory,
+    /// A message longer than the receive buffer, or an unknown request.
+    InvalidArgument,
+    NotImplemented,
+    Fail,
+}
+
+impl From<StudioError> for Hresult {
+    fn from(error: StudioError) -> Self {
+        match error {
+            StudioError::Pending => Hresult(0x8000_000a),
+            StudioError::NotConnected => Hresult(0x8000_4002),
+            StudioError::Aborted => Hresult(0x8000_4004),
+            StudioError::OutOfMemory => Hresult::OUT_OF_MEMORY,
+            StudioError::InvalidArgument => Hresult::INVALID_ARGUMENT,
+            StudioError::NotImplemented => Hresult(0x8000_4001),
+            StudioError::Fail => Hresult::FAIL,
+        }
+    }
+}
+
+/// The result word of a transport routine; success is 0.
+pub fn routine_result(result: Result<(), StudioError>) -> Hresult {
+    match result {
+        Ok(()) => Hresult(0),
+        Err(error) => error.into(),
+    }
+}
 
 const LENGTH_SIZE: u32 = 4;
 /// Largest receive used to drop the body of a rejected message.
@@ -95,7 +127,8 @@ struct Request {
     buffer: u32,
     length: u32,
     progress: u32,
-    status: Hresult,
+    /// `None` while queued.
+    status: Option<Result<(), StudioError>>,
 }
 
 /// State of one socket transport.
@@ -122,7 +155,7 @@ impl Transport {
             buffer: 0,
             length: 0,
             progress: 0,
-            status: COMPLETED,
+            status: Some(Ok(())),
         };
         Self {
             requests: [FREE; REQUEST_SLOTS],
@@ -151,18 +184,18 @@ impl Transport {
         self.requests[slot.index()].queue = queue;
     }
 
-    fn finish(&mut self, slot: Slot, status: Hresult, stream: &mut impl Stream) {
-        self.requests[slot.index()].status = status;
+    fn finish(&mut self, slot: Slot, status: Result<(), StudioError>, stream: &mut impl Stream) {
+        self.requests[slot.index()].status = Some(status);
         self.move_to(slot, Queue::Completed);
         stream.signal();
     }
 
     /// The slot the next request takes (stock checks of 0x91f840d8).
-    pub fn reserve(&self) -> Result<Slot, Hresult> {
+    pub fn reserve(&self) -> Result<Slot, StudioError> {
         if !self.connected {
-            return Err(NOT_CONNECTED);
+            return Err(StudioError::NotConnected);
         }
-        self.head(Queue::Free).ok_or(Hresult::OUT_OF_MEMORY)
+        self.head(Queue::Free).ok_or(StudioError::OutOfMemory)
     }
 
     /// Queue a request in the slot from [`Self::reserve`] and make progress.
@@ -178,7 +211,7 @@ impl Transport {
         request.buffer = buffer.address;
         request.length = buffer.length;
         request.progress = 0;
-        request.status = PENDING;
+        request.status = None;
         let queue = match direction {
             Direction::Send => Queue::Send,
             Direction::Receive => Queue::Receive,
@@ -188,24 +221,22 @@ impl Transport {
     }
 
     pub fn is_pending(&self, slot: Slot) -> bool {
-        self.requests[slot.index()].status == PENDING
+        self.requests[slot.index()].status.is_none()
     }
 
     /// Free a finished slot, returning its status and the bytes moved.
-    pub fn complete(&mut self, slot: Slot) -> Option<(Hresult, u32)> {
+    pub fn complete(&mut self, slot: Slot) -> Option<(Result<(), StudioError>, u32)> {
         let request = self.requests[slot.index()];
-        if request.status == PENDING {
-            return None;
-        }
+        let status = request.status?;
         self.move_to(slot, Queue::Free);
-        Some((request.status, request.progress))
+        Some((status, request.progress))
     }
 
     /// Abort every queued send, then every queued receive (0x91f84538).
     pub fn cancel(&mut self, stream: &mut impl Stream) {
         for queue in [Queue::Send, Queue::Receive] {
             while let Some(slot) = self.head(queue) {
-                self.finish(slot, ABORTED, stream);
+                self.finish(slot, Err(StudioError::Aborted), stream);
             }
         }
     }
@@ -258,7 +289,7 @@ impl Transport {
                     request.progress = 0;
                 }
             } else if request.progress >= request.length {
-                self.finish(slot, COMPLETED, stream);
+                self.finish(slot, Ok(()), stream);
             }
         }
     }
@@ -300,7 +331,7 @@ impl Transport {
                         continue;
                     }
                     if request.framed {
-                        self.finish(slot, COMPLETED, stream);
+                        self.finish(slot, Ok(()), stream);
                         continue;
                     }
                     let length = stream.read_length(request.buffer);
@@ -313,7 +344,7 @@ impl Transport {
                         // length, so the rest of the body is read as the next
                         // length prefix.
                         let capacity = request.length;
-                        self.finish(slot, Hresult::INVALID_ARGUMENT, stream);
+                        self.finish(slot, Err(StudioError::InvalidArgument), stream);
                         self.discard = self.discard.wrapping_add(capacity);
                     }
                 }
@@ -458,7 +489,7 @@ mod tests {
         let mut transport = Transport::new();
         let slot = queue(&mut transport, Direction::Send, 0x10, 3, &mut stream);
         assert_eq!(stream.sent, [0, 0, 0, 3, b'a', b'b', b'c']);
-        assert_eq!(transport.complete(slot), Some((COMPLETED, 3)));
+        assert_eq!(transport.complete(slot), Some((Ok(()), 3)));
         assert_eq!(stream.signals, 1);
     }
 
@@ -474,7 +505,7 @@ mod tests {
         stream.deliver(&[0, 5, b'h', b'e']);
         stream.deliver(b"llo");
         transport.pump(&mut stream);
-        assert_eq!(transport.complete(slot), Some((COMPLETED, 5)));
+        assert_eq!(transport.complete(slot), Some((Ok(()), 5)));
         assert_eq!(&stream.memory[0x20..0x25], b"hello");
     }
 
@@ -488,13 +519,13 @@ mod tests {
         transport.pump(&mut stream);
         assert_eq!(
             transport.complete(first),
-            Some((Hresult::INVALID_ARGUMENT, 4))
+            Some((Err(StudioError::InvalidArgument), 4))
         );
         // Four of the six body bytes were dropped; the last two start the
         // next length prefix.
         assert_eq!(
             transport.complete(second),
-            Some((Hresult::INVALID_ARGUMENT, 4))
+            Some((Err(StudioError::InvalidArgument), 4))
         );
         assert!(transport.is_connected());
     }
@@ -514,10 +545,13 @@ mod tests {
         let slots: Vec<Slot> = (0..REQUEST_SLOTS)
             .map(|_| queue(&mut transport, Direction::Receive, 0x20, 8, &mut stream))
             .collect();
-        assert_eq!(transport.reserve(), Err(Hresult::OUT_OF_MEMORY));
+        assert_eq!(transport.reserve(), Err(StudioError::OutOfMemory));
         transport.cancel(&mut stream);
         assert_eq!(stream.signals, 4);
-        assert_eq!(transport.complete(slots[2]), Some((ABORTED, 0)));
+        assert_eq!(
+            transport.complete(slots[2]),
+            Some((Err(StudioError::Aborted), 0))
+        );
         assert_eq!(transport.reserve(), Ok(slots[2]));
     }
 
@@ -527,8 +561,8 @@ mod tests {
         let mut transport = Transport::new();
         let first = queue(&mut transport, Direction::Send, 0x10, 0, &mut stream);
         let second = queue(&mut transport, Direction::Send, 0x10, 0, &mut stream);
-        transport.complete(second).unwrap();
-        transport.complete(first).unwrap();
+        assert_eq!(transport.complete(second), Some((Ok(()), 0)));
+        assert_eq!(transport.complete(first), Some((Ok(()), 0)));
         let order: Vec<Slot> = (0..REQUEST_SLOTS)
             .map(|_| queue(&mut transport, Direction::Receive, 0x20, 8, &mut stream))
             .collect();
@@ -545,6 +579,9 @@ mod tests {
         stream.closed = true;
         transport.pump(&mut stream);
         assert!(!transport.is_connected());
-        assert_eq!(transport.complete(slot), Some((ABORTED, 0)));
+        assert_eq!(
+            transport.complete(slot),
+            Some((Err(StudioError::Aborted), 0))
+        );
     }
 }

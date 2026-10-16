@@ -37,7 +37,7 @@
 //! notify channel:
 //!
 //! ```text
-//! PIX!{CaptureFileCreationEnded}<index>
+//! PIX!{CaptureFileCreationEnded}<hresult>
 //! PIX!{CaptureEnded}
 //! ```
 //!
@@ -55,10 +55,12 @@ use core::fmt::Write as _;
 
 use futures_util::io::AsyncRead;
 use futures_util::io::AsyncWrite;
+use openxbdm_core::status::Hresult;
 
 use crate::client::Client;
 use crate::client::Connected;
 use crate::error::Error;
+use crate::error::ParseError;
 use crate::protocol::Response;
 use crate::protocol::SuccessCode;
 
@@ -79,6 +81,16 @@ pub enum PixError {
     /// xbmovie restricts visible filenames to 38 bytes.
     #[error("pix capture filename exceeds xbmovie's 38-byte visible-name limit")]
     CaptureNameTooLong,
+    /// `PIX!{CaptureFileCreationEnded}` reported a failure result.
+    #[error("capture file creation failed on the console with result {:#010x}", .result.0)]
+    CaptureFileCreationFailed { result: Hresult },
+    /// No `PIX!{CaptureFileCreationEnded}` arrived in time.
+    #[error("no capture file creation result within {}s", .timeout.as_secs())]
+    CaptureFileCreationTimedOut { timeout: core::time::Duration },
+    /// The notification channel closed while a capture notification was
+    /// awaited.
+    #[error("notification channel closed")]
+    NotificationChannelClosed,
 }
 
 /// One line off the notification channel, parsed into the PIX event
@@ -87,8 +99,9 @@ pub enum PixError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Notification {
     // xbmovie / capture (emitted by the title).
-    /// `PIX!{CaptureFileCreationEnded}<index>` -- segment done.
-    CaptureFileCreationEnded { index: u32 },
+    /// `PIX!{CaptureFileCreationEnded}<hresult>`: result of creating the
+    /// file requested by `{BeginCaptureFileCreation}`.
+    CaptureFileCreationEnded { result: Hresult },
     /// `PIX!{CaptureEnded}` -- whole session finished.
     CaptureEnded,
 
@@ -111,34 +124,37 @@ pub enum Notification {
 impl Notification {
     /// Parse one CRLF-stripped line. Returns `None` for lines that
     /// aren't `PIX!`-prefixed.
-    pub fn parse(line: &str) -> Option<Self> {
-        let body = line.strip_prefix("PIX!")?;
+    pub fn parse(line: &str) -> Result<Option<Self>, ParseError> {
+        line.strip_prefix("PIX!").map(Self::parse_body).transpose()
+    }
+
+    fn parse_body(body: &str) -> Result<Self, ParseError> {
         // Capture notifications first -- they're brace-wrapped so they
         // can't collide with the profiler token names.
         if let Some(rest) = body.strip_prefix("{CaptureFileCreationEnded}") {
-            let index: u32 = rest.trim().parse().unwrap_or(0);
-            return Some(Notification::CaptureFileCreationEnded { index });
+            let result = parse_result(rest)?;
+            return Ok(Notification::CaptureFileCreationEnded { result });
         }
         if body.starts_with("{CaptureEnded}") {
-            return Some(Notification::CaptureEnded);
+            return Ok(Notification::CaptureEnded);
         }
         if let Some(rest) = body.strip_prefix("MovieData") {
-            return Some(Notification::MovieData(rest.trim_start().to_owned()));
+            return Ok(Notification::MovieData(rest.trim_start().to_owned()));
         }
         if let Some(rest) = body.strip_prefix("VideoOpError") {
-            return Some(Notification::VideoOp {
+            return Ok(Notification::VideoOp {
                 error: true,
                 detail: rest.trim_start().to_owned(),
             });
         }
         if let Some(rest) = body.strip_prefix("VideoOp") {
-            return Some(Notification::VideoOp {
+            return Ok(Notification::VideoOp {
                 error: false,
                 detail: rest.trim_start().to_owned(),
             });
         }
         if let Some(rest) = body.strip_prefix("Resource") {
-            return Some(Notification::Resource(rest.trim_start().to_owned()));
+            return Ok(Notification::Resource(rest.trim_start().to_owned()));
         }
         const STATUS_TOKENS: &[&str] = &[
             "NotActive ResourceCapture",
@@ -157,11 +173,23 @@ impl Notification {
         ];
         for tok in STATUS_TOKENS {
             if body == *tok || body.starts_with(&format!("{tok} ")) {
-                return Some(Notification::Status(body.to_owned()));
+                return Ok(Notification::Status(body.to_owned()));
             }
         }
-        Some(Notification::Other(body.to_owned()))
+        Ok(Notification::Other(body.to_owned()))
     }
+}
+
+/// The hex result word after `{CaptureFileCreationEnded}`, with or
+/// without a `0x` prefix.
+fn parse_result(text: &str) -> Result<Hresult, ParseError> {
+    let text = text.trim();
+    let digits = text.strip_prefix("0x").unwrap_or(text);
+    u32::from_str_radix(digits, 16)
+        .map(Hresult)
+        .map_err(|_| ParseError::InvalidHexDigits {
+            key: "CaptureFileCreationEnded",
+        })
 }
 
 /// Thin wrapper over `pixcmd <subcommand>` for driving the PIX
@@ -342,15 +370,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_segment_done_notification() {
-        let ev = Notification::parse("PIX!{CaptureFileCreationEnded}3").unwrap();
-        assert_eq!(ev, Notification::CaptureFileCreationEnded { index: 3 });
+    fn parses_capture_file_creation_result() {
+        let parse = |line| match Notification::parse(line).unwrap() {
+            Some(Notification::CaptureFileCreationEnded { result }) => result,
+            other => panic!("got {other:?}"),
+        };
+        assert_eq!(parse("PIX!{CaptureFileCreationEnded}0"), Hresult(0));
+        assert_eq!(
+            parse("PIX!{CaptureFileCreationEnded} 80070005"),
+            Hresult(0x8007_0005)
+        );
+        assert_eq!(
+            parse("PIX!{CaptureFileCreationEnded}0x8007000e"),
+            Hresult(0x8007_000e)
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_capture_file_creation_result() {
+        for line in [
+            "PIX!{CaptureFileCreationEnded}",
+            "PIX!{CaptureFileCreationEnded} done",
+        ] {
+            assert!(matches!(
+                Notification::parse(line),
+                Err(ParseError::InvalidHexDigits { .. })
+            ));
+        }
     }
 
     #[test]
     fn parses_capture_ended() {
         assert_eq!(
-            Notification::parse("PIX!{CaptureEnded}"),
+            Notification::parse("PIX!{CaptureEnded}").unwrap(),
             Some(Notification::CaptureEnded)
         );
     }
@@ -358,7 +410,7 @@ mod tests {
     #[test]
     fn parses_movie_data_bare() {
         assert_eq!(
-            Notification::parse("PIX!MovieData"),
+            Notification::parse("PIX!MovieData").unwrap(),
             Some(Notification::MovieData(String::new()))
         );
     }
@@ -366,14 +418,14 @@ mod tests {
     #[test]
     fn parses_video_op_variants() {
         assert_eq!(
-            Notification::parse("PIX!VideoOpError timeout"),
+            Notification::parse("PIX!VideoOpError timeout").unwrap(),
             Some(Notification::VideoOp {
                 error: true,
                 detail: "timeout".into()
             })
         );
         assert_eq!(
-            Notification::parse("PIX!VideoOp paused"),
+            Notification::parse("PIX!VideoOp paused").unwrap(),
             Some(Notification::VideoOp {
                 error: false,
                 detail: "paused".into()
@@ -400,13 +452,13 @@ mod tests {
         ] {
             assert!(matches!(
                 Notification::parse(tok),
-                Some(Notification::Status(_))
+                Ok(Some(Notification::Status(_)))
             ));
         }
     }
 
     #[test]
     fn rejects_non_pix_lines() {
-        assert_eq!(Notification::parse("FOO!{Stuff}"), None);
+        assert_eq!(Notification::parse("FOO!{Stuff}").unwrap(), None);
     }
 }

@@ -10,7 +10,9 @@ use std::net::TcpListener;
 use std::time::Duration;
 
 use common::TestServer;
-use openxbdm_core::status::Hresult;
+use openxbdm_core::status::ErrorCode;
+use openxbdm_core::status::KernelError;
+use openxbdm_core::status::Win32Error;
 use openxbdm_server::commands::console::TraceMask;
 use openxbdm_server::commands::system::BootFlags;
 use openxbdm_server::commands::system::BootWait;
@@ -19,7 +21,6 @@ use openxbdm_server::commands::system::RebootKind;
 use openxbdm_server::commands::system::SettingsCopy;
 use openxbdm_server::commands::system::TitleFlags;
 use openxbdm_server::commands::system::TitleRebootStop;
-use openxbdm_server::commands::system::Win32Error;
 use openxbdm_server::commands::system::copy_settings;
 use openxbdm_server::commands::system::launch_from_paths;
 use openxbdm_server::commands::system::launch_image_exists;
@@ -32,6 +33,8 @@ use openxbdm_server::commands::system::title_reboot_stop;
 use openxbdm_server::commands::system::trace_title_reboot;
 use openxbdm_server::commands::system::wipe_settings;
 use openxbdm_server::notify::ExecutionState;
+use openxbdm_server::reply::CommandError;
+use openxbdm_server::reply::Reply;
 use openxbdm_server_host::Host;
 
 const GAME: &str = "\\Device\\Harddisk0\\Partition1\\DEVKIT\\game.xex";
@@ -186,7 +189,7 @@ fn setreset_stores_and_reports_the_chord() {
     assert_eq!(session.command("setreset"), "200- ABCD");
     server.host.lock().backend.console.xconfig.failures.insert(
         openxbdm_server::commands::console::ConfigSetting::new(2, 5),
-        openxbdm_core::status::NtStatus(0xc000_0001),
+        KernelError::Unsuccessful,
     );
     assert_eq!(
         session.command("setreset"),
@@ -485,8 +488,7 @@ fn flash_receives_the_image_for_this_hardware() {
         assert!(write.image[0x5000..].iter().all(|&byte| byte == 0));
         assert!(write.options.stock_image && !write.options.ignore_version_checking);
     }
-    server.host.lock().backend.system.flash_result =
-        Err(Win32Error(std::num::NonZeroU32::new(0xb).unwrap()));
+    server.host.lock().backend.system.flash_result = Err(Win32Error::new(0xb).unwrap());
     assert_eq!(
         session.command("flash size_t=1 ignoreversionchecking=1"),
         "204- send=t"
@@ -782,7 +784,7 @@ fn set_title_export_sets_or_clears_titles() {
     let state = &mut core.state;
     assert_eq!(
         set_title_from_paths(state, backend, None, None, None, TitleFlags::default()),
-        Hresult::INVALID_ARGUMENT
+        Err(CommandError::InvalidArgument)
     );
     assert_eq!(
         set_title_from_paths(
@@ -793,7 +795,7 @@ fn set_title_export_sets_or_clears_titles() {
             None,
             TitleFlags::default()
         ),
-        Hresult(0x82da_0002)
+        Err(ErrorCode::FileNotFound.into())
     );
     backend.filesystem.write(GAME, b"xex");
     let flags = TitleFlags::PERSIST;
@@ -806,7 +808,7 @@ fn set_title_export_sets_or_clears_titles() {
             Some(b"-x"),
             flags
         ),
-        Hresult::OK
+        Ok(Reply::Ok)
     );
     assert_eq!(state.system.title.image.as_bytes(), GAME.as_bytes());
     assert_eq!(
@@ -824,7 +826,7 @@ fn set_title_export_sets_or_clears_titles() {
             None,
             TitleFlags::CLEAR_PERSISTENT
         ),
-        Hresult::OK
+        Ok(Reply::Ok)
     );
     assert!(state.system.persistent_title.image.is_empty());
     assert_eq!(state.system.title.image.as_bytes(), GAME.as_bytes());
@@ -842,11 +844,11 @@ fn launch_export_translates_relaunches_or_reboots() {
     let none = BootFlags::default();
     assert_eq!(
         launch_from_paths(core, backend, network, none, None, Some(b"e:\\"), None),
-        Hresult::INVALID_ARGUMENT
+        Err(CommandError::InvalidArgument)
     );
     assert_eq!(
         launch_from_paths(core, backend, network, none, Some(b"nodrive"), None, None),
-        Hresult(0x82da_0002)
+        Err(ErrorCode::FileNotFound.into())
     );
     assert_eq!(
         launch_from_paths(
@@ -858,7 +860,7 @@ fn launch_export_translates_relaunches_or_reboots() {
             Some(b"nodrive"),
             None
         ),
-        Hresult(0x82da_001e)
+        Err(ErrorCode::PathNotFound.into())
     );
     backend.filesystem.write(GAME, b"xex");
     backend.system.relaunch_routine = true;
@@ -873,7 +875,7 @@ fn launch_export_translates_relaunches_or_reboots() {
             None,
             None
         ),
-        Hresult::OK
+        Ok(Reply::Ok)
     );
     assert_eq!(backend.system.relaunches, 1);
     assert_eq!(core.state.system.boot_flags, object_paths);
@@ -883,7 +885,7 @@ fn launch_export_translates_relaunches_or_reboots() {
     let cold_wait = BootFlags(BootFlags::WAIT.0 | BootFlags::COLD.0);
     assert_eq!(
         launch_without_connection(core, backend, network, cold_wait, None),
-        Hresult::NO_REPLY
+        Ok(Reply::Sent)
     );
     assert_eq!(backend.system.reboots, [RebootKind::Normal]);
     assert!(core.state.system.hard_reboot_pending);
@@ -1010,7 +1012,7 @@ fn settings_copy_wipe_and_gate_traces() {
     let clear = TitleFlags::CLEAR_PERSISTENT;
     assert_eq!(
         set_title_from_paths(&mut core.state, backend, None, None, None, clear),
-        Hresult::OK
+        Ok(Reply::Ok)
     );
     let lines = settings_traced(&host);
     assert_eq!(
@@ -1031,7 +1033,7 @@ fn settings_copy_wipe_and_gate_traces() {
     backend.system.cd_boot = true;
     assert_eq!(
         set_title_from_paths(&mut core.state, backend, None, None, None, clear),
-        Hresult::OK
+        Ok(Reply::Ok)
     );
     assert_eq!(
         settings_traced(&host),
@@ -1051,7 +1053,7 @@ fn settings_copy_wipe_and_gate_traces() {
     assert!(copy_settings(&core.state, backend, memory).is_some());
     assert_eq!(
         set_title_from_paths(&mut core.state, backend, None, None, None, clear),
-        Hresult::OK
+        Ok(Reply::Ok)
     );
     assert!(settings_traced(&host).is_empty());
 }

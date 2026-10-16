@@ -33,12 +33,12 @@ pub(crate) const TABLES: &[&[CommandEntry]] = &[
 
 /// Helpers shared by command handlers.
 pub(crate) mod util {
-    use openxbdm_core::status::Hresult;
+    use crate::reply::CommandError;
 
     use crate::invocation::Invocation;
 
     /// A required dword parameter. When absent, the reply text becomes
-    /// `missing <name>` and the caller fails with [`Hresult::FAIL`].
+    /// `missing <name>` and the caller fails with [`MISSING`].
     pub fn required_dword(invocation: &mut Invocation<'_>, name: &str) -> Option<u32> {
         let value = invocation.line.dword(name);
         if value.is_none() {
@@ -48,5 +48,5 @@ pub(crate) mod util {
     }
 
     /// The reply for a missing required parameter.
-    pub const MISSING: Hresult = Hresult::FAIL;
+    pub const MISSING: CommandError = CommandError::Fail;
 }

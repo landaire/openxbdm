@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use openxbdm_core::status::Hresult;
+use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
 use openxbdm_server::ConnectionIndex;
 use openxbdm_server::commands::hardware;
@@ -18,6 +18,13 @@ use openxbdm_server::commands::hardware::PgoModule;
 use openxbdm_server::commands::hardware::PlayToCommand;
 use openxbdm_server::commands::hardware::PlayToState;
 use openxbdm_server::commands::hardware::StackAddresses;
+use openxbdm_server::commands::hardware::SystemApp;
+use openxbdm_server::commands::hardware::SystemMessage;
+use openxbdm_server::commands::hardware::UsbController;
+use openxbdm_server::commands::hardware::UsbPort;
+use openxbdm_server::commands::hardware::XamError;
+use openxbdm_server::commands::hardware::XamHeapId;
+use openxbdm_server::commands::hardware::XamHeapInfoClass;
 use openxbdm_server::commands::hardware::automation;
 use openxbdm_server::commands::hardware::automation::Automation;
 use openxbdm_server::commands::hardware::automation::AutomationError;
@@ -97,12 +104,28 @@ impl Controllers for Mock {
 /// A simulated XAM heap.
 #[derive(Debug, Clone)]
 pub struct XamHeap {
-    pub id: u32,
+    pub id: XamHeapId,
     pub name: Vec<u8>,
     /// Information class 3 after its size dword.
     pub usage: [u8; 0x14],
     /// Information class 2 after its size dword.
     pub limits: [u8; 0x18],
+}
+
+/// A message sent to a system service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentMessage {
+    pub app: SystemApp,
+    pub message: SystemMessage,
+    pub buffer: Vec<u8>,
+}
+
+/// A USB port power request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsbPortRequest {
+    pub controller: UsbController,
+    pub port: UsbPort,
+    pub enable: bool,
 }
 
 /// A registered instrumented module.
@@ -127,8 +150,8 @@ pub struct OddLog {
     pub busy: bool,
     /// The writer is told to stop.
     pub stopped: bool,
-    /// Status of the next file creation.
-    pub file_status: NtStatus,
+    /// Result of the next file creation.
+    pub file_result: Result<(), KernelError>,
     /// Paths of started logs.
     pub files: Vec<Vec<u8>>,
 }
@@ -138,7 +161,7 @@ impl Default for OddLog {
         Self {
             busy: false,
             stopped: true,
-            file_status: NtStatus::SUCCESS,
+            file_result: Ok(()),
             files: Vec::new(),
         }
     }
@@ -161,22 +184,22 @@ pub struct Mock {
     pub avatar_failures: BTreeMap<u32, AvatarError>,
     pub avatar_calls: Vec<AvatarHook>,
 
-    pub radio_status: NtStatus,
+    pub radio_result: Result<(), KernelError>,
     pub radio_requests: Vec<bool>,
 
-    pub memory_statistics_status: NtStatus,
+    pub memory_statistics_result: Result<(), KernelError>,
     pub xam_heap_count_available: bool,
     pub xam_heap_info_available: bool,
-    pub xam_heap_count_result: Hresult,
+    pub xam_heap_count_result: Result<(), XamError>,
     /// System and cooperative heap counts.
     pub xam_heap_counts: (u32, u32),
     pub xam_heaps: Vec<XamHeap>,
 
     /// Result of every system message.
-    pub system_message_result: Hresult,
-    /// Messages sent: application, message, buffer.
-    pub system_messages: Vec<(u32, u32, Vec<u8>)>,
-    pub play_to: Result<PlayToState, Hresult>,
+    pub system_message_result: Result<(), XamError>,
+    /// Messages sent.
+    pub system_messages: Vec<SentMessage>,
+    pub play_to: Result<PlayToState, XamError>,
     pub play_to_requests: Vec<PlayToCommand>,
     pub addresses: StackAddresses,
 
@@ -185,9 +208,8 @@ pub struct Mock {
     pub ignore_gdf_attributes: bool,
 
     pub usb_port_available: bool,
-    pub usb_port_status: NtStatus,
-    /// Requests: controller, port, enable.
-    pub usb_port_requests: Vec<(u32, u32, bool)>,
+    pub usb_port_result: Result<(), KernelError>,
+    pub usb_port_requests: Vec<UsbPortRequest>,
 }
 
 impl Default for Mock {
@@ -201,22 +223,22 @@ impl Default for Mock {
             avatar_available: true,
             avatar_failures: BTreeMap::new(),
             avatar_calls: Vec::new(),
-            radio_status: NtStatus::SUCCESS,
+            radio_result: Ok(()),
             radio_requests: Vec::new(),
-            memory_statistics_status: NtStatus::SUCCESS,
+            memory_statistics_result: Ok(()),
             xam_heap_count_available: true,
             xam_heap_info_available: true,
-            xam_heap_count_result: Hresult(0),
+            xam_heap_count_result: Ok(()),
             xam_heap_counts: (3, 5),
             xam_heaps: vec![XamHeap {
-                id: 0x1a,
+                id: XamHeapId(0x1a),
                 name: b"XamSystemHeap".to_vec(),
                 usage: core::array::from_fn(|index| index as u8),
                 limits: core::array::from_fn(|index| 0xe0 | index as u8),
             }],
             // The marketplace service rejects the mock currency message
             // with E_INVALIDARG, which the monitor treats as success.
-            system_message_result: Hresult::INVALID_ARGUMENT,
+            system_message_result: Err(XamError::InvalidArgument),
             system_messages: Vec::new(),
             play_to: Ok(PlayToState::default()),
             play_to_requests: Vec::new(),
@@ -228,7 +250,7 @@ impl Default for Mock {
             pgo_records: Vec::new(),
             ignore_gdf_attributes: false,
             usb_port_available: true,
-            usb_port_status: NtStatus::SUCCESS,
+            usb_port_result: Ok(()),
             usb_port_requests: Vec::new(),
         }
     }
@@ -349,18 +371,18 @@ impl hardware::Backend for MockBackend {
         Ok(())
     }
 
-    fn set_wireless_radio(&mut self, enabled: bool) -> NtStatus {
+    fn set_wireless_radio(&mut self, enabled: bool) -> Result<(), KernelError> {
         self.hardware.radio_requests.push(enabled);
-        self.hardware.radio_status
+        self.hardware.radio_result
     }
 
-    fn devkit_memory_statistics(&mut self, block: &mut [u8; 0x90]) -> NtStatus {
-        if self.hardware.memory_statistics_status.is_success() {
+    fn devkit_memory_statistics(&mut self, block: &mut [u8; 0x90]) -> Result<(), KernelError> {
+        if self.hardware.memory_statistics_result.is_ok() {
             for (index, byte) in block.iter_mut().enumerate().skip(8) {
                 *byte = index as u8;
             }
         }
-        self.hardware.memory_statistics_status
+        self.hardware.memory_statistics_result
     }
 
     fn xam_heap_count_available(&mut self) -> bool {
@@ -371,43 +393,55 @@ impl hardware::Backend for MockBackend {
         self.hardware.xam_heap_info_available
     }
 
-    fn xam_heap_count(&mut self, block: &mut [u8; 12]) -> Hresult {
+    fn xam_heap_count(&mut self, block: &mut [u8; 12]) -> Result<(), XamError> {
         let (system, cooperative) = self.hardware.xam_heap_counts;
         block[4..8].copy_from_slice(&system.to_be_bytes());
         block[8..12].copy_from_slice(&cooperative.to_be_bytes());
         self.hardware.xam_heap_count_result
     }
 
-    fn xam_heap_name(&mut self, id: u32, name: &mut [u8; 0x20]) -> Hresult {
+    fn xam_heap_name(&mut self, id: XamHeapId, name: &mut [u8; 0x20]) -> Result<(), XamError> {
         let Some(heap) = self.hardware.xam_heaps.iter().find(|heap| heap.id == id) else {
-            return Hresult::INVALID_ARGUMENT;
+            return Err(XamError::InvalidArgument);
         };
         let length = heap.name.len().min(name.len() - 1);
         name[..length].copy_from_slice(&heap.name[..length]);
         name[length] = 0;
-        Hresult(0)
+        Ok(())
     }
 
-    fn xam_heap_info(&mut self, id: u32, class: u32, block: &mut [u8]) -> Hresult {
+    fn xam_heap_info(
+        &mut self,
+        id: XamHeapId,
+        class: XamHeapInfoClass,
+        block: &mut [u8],
+    ) -> Result<(), XamError> {
         let Some(heap) = self.hardware.xam_heaps.iter().find(|heap| heap.id == id) else {
-            return Hresult::INVALID_ARGUMENT;
+            return Err(XamError::InvalidArgument);
         };
         match class {
-            3 => block[4..].copy_from_slice(&heap.usage),
-            2 => block[4..].copy_from_slice(&heap.limits),
-            _ => return Hresult::INVALID_ARGUMENT,
+            XamHeapInfoClass::Usage => block[4..].copy_from_slice(&heap.usage),
+            XamHeapInfoClass::Limits => block[4..].copy_from_slice(&heap.limits),
+            XamHeapInfoClass::Name => return Err(XamError::InvalidArgument),
         }
-        Hresult(0)
+        Ok(())
     }
 
-    fn system_message(&mut self, app: u32, message: u32, buffer: &mut [u8]) -> Hresult {
-        self.hardware
-            .system_messages
-            .push((app, message, buffer.to_vec()));
+    fn system_message(
+        &mut self,
+        app: SystemApp,
+        message: SystemMessage,
+        buffer: &mut [u8],
+    ) -> Result<(), XamError> {
+        self.hardware.system_messages.push(SentMessage {
+            app,
+            message,
+            buffer: buffer.to_vec(),
+        });
         self.hardware.system_message_result
     }
 
-    fn play_to(&mut self, command: PlayToCommand) -> Result<PlayToState, Hresult> {
+    fn play_to(&mut self, command: PlayToCommand) -> Result<PlayToState, XamError> {
         self.hardware.play_to_requests.push(command);
         self.hardware.play_to
     }
@@ -416,27 +450,25 @@ impl hardware::Backend for MockBackend {
         self.hardware.addresses
     }
 
-    fn odd_log_start(&mut self, path: Result<&[u8], NtStatus>) -> Result<(), OddLogStartError> {
+    fn odd_log_start(&mut self, path: Result<&[u8], KernelError>) -> Result<(), OddLogStartError> {
         let log = &mut self.hardware.odd_log;
         if log.busy {
             return Err(OddLogStartError::Busy);
         }
         log.busy = true;
         log.stopped = false;
-        let status = match path {
+        let error = match path.and_then(|path| log.file_result.map(|()| path)) {
             Ok(path) => {
-                if log.file_status.is_success() {
-                    log.files.push(path.to_vec());
-                }
-                log.file_status
+                log.files.push(path.to_vec());
+                return Ok(());
             }
-            Err(status) => status,
+            Err(error) => error,
         };
         // The writer reports a failure only for statuses with both
         // severity bits set; it then exits without clearing the stop flag.
-        if status.0 & 0xc000_0000 == 0xc000_0000 {
+        if NtStatus::from(error).0 & 0xc000_0000 == 0xc000_0000 {
             log.busy = false;
-            return Err(OddLogStartError::Failed(status));
+            return Err(OddLogStartError::Failed(error));
         }
         Ok(())
     }
@@ -480,12 +512,15 @@ impl hardware::Backend for MockBackend {
         Ok(())
     }
 
-    fn pgo_set_allocation_scale(&mut self, module: u32, scale: u32) -> Result<(), PgoError> {
+    fn pgo_set_allocation_scale(&mut self, module: PgoModule, scale: u32) -> Result<(), PgoError> {
+        let PgoModule::Record(address) = module else {
+            return Err(PgoError::NoSuchModule);
+        };
         let record = self
             .hardware
             .pgo_records
             .iter_mut()
-            .find(|record| module != 0 && record.address == module)
+            .find(|record| record.address == address)
             .ok_or(PgoError::NoSuchModule)?;
         if record.counts_allocated {
             return Err(PgoError::Busy);
@@ -506,10 +541,17 @@ impl hardware::Backend for MockBackend {
         self.hardware.usb_port_available
     }
 
-    fn set_usb_port_power(&mut self, controller: u32, port: u32, enable: bool) -> NtStatus {
-        self.hardware
-            .usb_port_requests
-            .push((controller, port, enable));
-        self.hardware.usb_port_status
+    fn set_usb_port_power(
+        &mut self,
+        controller: UsbController,
+        port: UsbPort,
+        enable: bool,
+    ) -> Result<(), KernelError> {
+        self.hardware.usb_port_requests.push(UsbPortRequest {
+            controller,
+            port,
+            enable,
+        });
+        self.hardware.usb_port_result
     }
 }

@@ -20,6 +20,7 @@ use openxbdm_server::commands::network::WsaError;
 use openxbdm_server::commands::network::ipproxy;
 use openxbdm_server::commands::network::ipproxy::RegisterStatus;
 use openxbdm_server::commands::network::ipproxy::RoutineMissing;
+use openxbdm_server::commands::network::ipproxy::SocketFailed;
 use openxbdm_server::commands::network::ipproxy::ThreadFailed;
 use openxbdm_server::commands::network::ipproxy::tunnel;
 use openxbdm_server::commands::network::ipproxy::tunnel::Inbound;
@@ -52,8 +53,8 @@ pub struct Link {
 pub struct Mock {
     /// Export the network stack lacks.
     pub missing_routine: Option<Routine>,
-    /// Error of the next socket open.
-    pub socket_failure: Option<WsaError>,
+    /// Failure of the next socket open.
+    pub socket_failure: Option<SocketFailed>,
     /// Result of the next register routine call.
     pub register_failure: Option<RegisterStatus>,
     /// The next receive thread creation fails.
@@ -140,7 +141,7 @@ fn lock(link: &Mutex<Link>) -> MutexGuard<'_, Link> {
 /// Winsock code of a host socket error. Host errors without a Winsock
 /// counterpart report the network as down.
 fn wsa_error(error: &io::Error) -> WsaError {
-    WsaError(match error.kind() {
+    let code = match error.kind() {
         ErrorKind::PermissionDenied => 10013,
         ErrorKind::InvalidInput => 10022,
         ErrorKind::AddrInUse => 10048,
@@ -149,7 +150,8 @@ fn wsa_error(error: &io::Error) -> WsaError {
         ErrorKind::ConnectionRefused => 10061,
         ErrorKind::HostUnreachable => 10065,
         _ => 10050,
-    })
+    };
+    WsaError::new(code).expect("Winsock codes are nonzero")
 }
 
 fn connect(host: Endpoint) -> Result<(UdpSocket, u16), WsaError> {
@@ -224,7 +226,7 @@ impl ipproxy::Backend for MockBackend {
         self.network.ipproxy.inject_routine = false;
     }
 
-    fn open_proxy_socket(&mut self, host: Endpoint) -> Result<(), WsaError> {
+    fn open_proxy_socket(&mut self, host: Endpoint) -> Result<(), SocketFailed> {
         let mock = &mut self.network.ipproxy;
         mock.host = Some(host);
         let now = Instant::now();
@@ -236,7 +238,7 @@ impl ipproxy::Backend for MockBackend {
         if let Some(error) = mock.socket_failure.take() {
             return Err(error);
         }
-        let (socket, port) = connect(host)?;
+        let (socket, port) = connect(host).map_err(|error| SocketFailed(Some(error)))?;
         // The local address is the first dword of the debug XNADDR.
         let record = self.console.debug_address.record;
         mock.local = Endpoint {

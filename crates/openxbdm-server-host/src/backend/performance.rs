@@ -4,7 +4,8 @@
 use std::collections::BTreeMap;
 
 use openxbdm_core::status::Hresult;
-use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::KernelError;
+use openxbdm_core::status::Win32Error;
 use openxbdm_server::commands::filesystem;
 use openxbdm_server::commands::filesystem::Backend as _;
 use openxbdm_server::commands::filesystem::CreateOptions;
@@ -26,12 +27,18 @@ use openxbdm_server::commands::performance::PixDogma;
 use openxbdm_server::commands::performance::PixMessage;
 use openxbdm_server::commands::performance::TILE_SIZE;
 use openxbdm_server::commands::performance::capture;
+use openxbdm_server::commands::performance::capture::CaptureError;
 use openxbdm_server::commands::performance::capture::CaptureFlags;
 use openxbdm_server::commands::performance::capture::Instrumentation;
+use openxbdm_server::commands::performance::capture::Started;
 use openxbdm_server::commands::performance::counters;
+use openxbdm_server::commands::performance::counters::CounterError;
 use openxbdm_server::commands::performance::counters::CounterObject;
 use openxbdm_server::commands::performance::counters::CounterRegistration;
+use openxbdm_server::commands::performance::counters::Evaluation;
 use openxbdm_server::commands::performance::profiler;
+use openxbdm_server::commands::performance::profiler::ProfilerError;
+use openxbdm_server::commands::performance::studio::StudioError;
 
 use super::MockBackend;
 
@@ -41,8 +48,6 @@ const OBJECT_HEADER: usize = 0x10;
 const BUCKETS: u32 = 10;
 /// Capacity of the PIX message queue.
 const PIX_QUEUE_CAPACITY: usize = 8;
-/// Kernel status of a name the drive table cannot translate.
-const STATUS_NO_SUCH_FILE: u32 = 0xc000_000f;
 const ERROR_FILE_NOT_FOUND: u32 = 2;
 
 /// Built-in counters in the order the counter directory enumerates them.
@@ -278,23 +283,27 @@ impl CounterObject for View<'_> {
         (u64::from(self.source_u32(offset)) << 32) | u64::from(self.source_u32(offset + 4))
     }
 
-    fn call_reader(&mut self, value: &mut u64, _rate: Option<&mut u64>) -> Hresult {
+    fn call_reader(
+        &mut self,
+        value: &mut u64,
+        _rate: Option<&mut u64>,
+    ) -> Result<(), CounterError> {
         let reading = match self.counter.source {
             Source::Frames => self.counters.frame_counter,
             Source::FrameTicks => self.counters.frame_ticks,
             Source::Words(_) => None,
         };
-        match reading {
-            Some(reading) => {
-                *value = u64::from(reading);
-                Hresult::OK
-            }
-            None => counters::DATA_NOT_AVAILABLE,
-        }
+        let reading = reading.ok_or(CounterError::DataNotAvailable)?;
+        *value = u64::from(reading);
+        Ok(())
     }
 
-    fn call_handler(&mut self, _query: u32, _out: &mut CounterSample) -> Hresult {
-        Hresult::FAIL
+    fn call_handler(
+        &mut self,
+        _query: counters::CounterQuery,
+        _out: &mut CounterSample,
+    ) -> Result<Evaluation, CounterError> {
+        Err(CounterError::Routine(Hresult::FAIL))
     }
 
     // The simulated sampler runs only between commands.
@@ -393,13 +402,13 @@ pub struct Capture {
     /// Calls of the kernel call-cap service (debug monitor service 2).
     pub kernel_call_cap: Vec<bool>,
     pub flags: CaptureFlags,
-    pub previous_flags: u32,
+    pub previous_flags: CaptureFlags,
     /// Buffers of a running or stopped capture.
     pub session: Option<CaptureSession>,
     /// A processor buffer filled up.
     pub full: bool,
     pub title_terminated: bool,
-    /// Result of a capture handed to the title; `None` when the title
+    /// Result word of a capture handed to the title; `None` when the title
     /// published no control words.
     pub title_capture: Option<Hresult>,
     pub counters_ready: bool,
@@ -422,7 +431,7 @@ impl Default for Capture {
             call_cap: false,
             kernel_call_cap: Vec::new(),
             flags: CaptureFlags::IDLE,
-            previous_flags: 0,
+            previous_flags: CaptureFlags(0),
             session: None,
             full: false,
             title_terminated: false,
@@ -434,19 +443,19 @@ impl Default for Capture {
 }
 
 impl Capture {
-    fn status(&self) -> Hresult {
+    fn status(&self) -> Result<(), CaptureError> {
         if self.title_terminated {
-            return capture::TITLE_TERMINATED;
+            return Err(CaptureError::TitleTerminated);
         }
         match &self.session {
             Some(session) if session.recording => {
                 if self.full {
-                    capture::BUFFER_FULL
+                    Err(CaptureError::BufferFull)
                 } else {
-                    Hresult::OK
+                    Ok(())
                 }
             }
-            _ => capture::NO_CAPTURE,
+            _ => Err(CaptureError::NoCapture),
         }
     }
 }
@@ -459,26 +468,32 @@ impl capture::Engine for Capture {
         }
     }
 
-    fn set_kernel_call_cap(&mut self, enable: bool) -> NtStatus {
+    fn set_kernel_call_cap(&mut self, enable: bool) -> Result<(), KernelError> {
         self.kernel_call_cap.push(enable);
-        NtStatus::SUCCESS
+        Ok(())
     }
 
     fn set_title_terminated(&mut self, terminated: bool) {
         self.title_terminated = terminated;
     }
 
-    fn request_title_capture(&mut self, _megabytes: u8) -> Hresult {
-        self.title_capture.unwrap_or(capture::TITLE_CAPTURE_FAILED)
+    fn request_title_capture(&mut self, _megabytes: u8) -> Result<Started, CaptureError> {
+        self.title_capture
+            .map_or(Err(CaptureError::TitleCaptureFailed), capture::title_result)
     }
 
-    fn begin(&mut self, name: &[u8], buffer_size: u32, exclusive: bool) -> Hresult {
+    fn begin(
+        &mut self,
+        name: &[u8],
+        buffer_size: u32,
+        exclusive: bool,
+    ) -> Result<Started, CaptureError> {
         if let Some(session) = self.session.as_mut().filter(|session| session.recording) {
             if exclusive {
-                return capture::ALREADY_RUNNING;
+                return Err(CaptureError::AlreadyRunning);
             }
             session.name = name.to_vec();
-            return capture::CONTINUED;
+            return Ok(Started::Continued);
         }
         self.full = false;
         self.session = Some(CaptureSession {
@@ -486,20 +501,20 @@ impl capture::Engine for Capture {
             buffer_size,
             recording: true,
         });
-        Hresult::OK
+        Ok(Started::Recording)
     }
 
-    fn end(&mut self) -> Hresult {
+    fn end(&mut self) -> Result<(), CaptureError> {
         match &mut self.session {
             Some(session) if session.recording => {
                 session.recording = false;
                 if self.full {
-                    capture::BUFFER_FULL
+                    Err(CaptureError::BufferFull)
                 } else {
-                    Hresult::OK
+                    Ok(())
                 }
             }
-            _ => capture::NO_CAPTURE,
+            _ => Err(CaptureError::NoCapture),
         }
     }
 
@@ -507,13 +522,13 @@ impl capture::Engine for Capture {
         self.flags
     }
 
-    fn retire_flags(&mut self, previous: u32) {
+    fn retire_flags(&mut self, previous: CaptureFlags) {
         self.flags = CaptureFlags::IDLE;
         self.previous_flags = previous;
     }
 
-    fn finish_counters(&mut self, _flags: CaptureFlags) -> Hresult {
-        Hresult::OK
+    fn finish_counters(&mut self, _flags: CaptureFlags) -> Result<(), CaptureError> {
+        Ok(())
     }
 
     fn release_counters(&mut self) {
@@ -531,24 +546,22 @@ impl capture::Engine for Capture {
     fn unlock(&mut self) {}
 
     /// An untranslatable name fails the open and keeps the buffers.
-    fn write(&mut self, paths: &mut dyn capture::Paths) -> NtStatus {
+    fn write(&mut self, paths: &mut dyn capture::Paths) -> Result<(), KernelError> {
         let Some(session) = &self.session else {
-            return NtStatus::SUCCESS;
+            return Ok(());
         };
-        match paths.object_path(&session.name) {
-            Some(path) => {
-                self.written.push(path.as_bytes().to_vec());
-                self.session = None;
-                NtStatus::SUCCESS
-            }
-            None => NtStatus(STATUS_NO_SUCH_FILE),
-        }
+        let path = paths
+            .object_path(&session.name)
+            .ok_or(KernelError::NoSuchFile)?;
+        self.written.push(path.as_bytes().to_vec());
+        self.session = None;
+        Ok(())
     }
 
-    fn dos_error(&mut self, status: NtStatus) -> u32 {
-        match status.0 {
-            STATUS_NO_SUCH_FILE => ERROR_FILE_NOT_FOUND,
-            _ => 0,
+    fn dos_error(&mut self, error: KernelError) -> Option<Win32Error> {
+        match error {
+            KernelError::NoSuchFile => Win32Error::new(ERROR_FILE_NOT_FOUND),
+            _ => None,
         }
     }
 
@@ -560,10 +573,10 @@ impl capture::Engine for Capture {
 /// Simulated CPU sampling profiler engine.
 #[derive(Debug, Clone)]
 pub struct CpuProfiler {
-    pub initialize_result: Hresult,
-    pub start_result: Hresult,
-    pub stop_result: Hresult,
-    pub initializations: Vec<u32>,
+    pub initialize_result: Result<(), ProfilerError>,
+    pub start_result: Result<(), ProfilerError>,
+    pub stop_result: Result<(), ProfilerError>,
+    pub initializations: Vec<profiler::ProfilerFlags>,
     pub abandons: u32,
     /// Paths whose parent directories were created.
     pub directories: Vec<Vec<u8>>,
@@ -576,9 +589,9 @@ pub struct CpuProfiler {
 impl Default for CpuProfiler {
     fn default() -> Self {
         Self {
-            initialize_result: Hresult::OK,
-            start_result: Hresult::OK,
-            stop_result: Hresult::OK,
+            initialize_result: Ok(()),
+            start_result: Ok(()),
+            stop_result: Ok(()),
             initializations: Vec::new(),
             abandons: 0,
             directories: Vec::new(),
@@ -590,8 +603,8 @@ impl Default for CpuProfiler {
 }
 
 impl profiler::Engine for CpuProfiler {
-    fn initialize(&mut self, flags: profiler::ProfilerFlags) -> Hresult {
-        self.initializations.push(flags.0);
+    fn initialize(&mut self, flags: profiler::ProfilerFlags) -> Result<(), ProfilerError> {
+        self.initializations.push(flags);
         self.initialize_result
     }
 
@@ -604,15 +617,15 @@ impl profiler::Engine for CpuProfiler {
     }
 
     /// A name without an object path fails as the console engine reports it.
-    fn start(&mut self, path: Option<&[u8]>, interval: u32) -> Hresult {
+    fn start(&mut self, path: Option<&[u8]>, interval: u32) -> Result<(), ProfilerError> {
         let Some(path) = path else {
-            return profiler::PROLOGUE_FAILED;
+            return Err(ProfilerError::PrologueFailed);
         };
         self.starts.push((path.to_vec(), interval));
         self.start_result
     }
 
-    fn stop(&mut self) -> Hresult {
+    fn stop(&mut self) -> Result<(), ProfilerError> {
         self.stops += 1;
         self.stop_result
     }
@@ -689,17 +702,17 @@ impl performance::Backend for MockBackend {
         &mut self,
         context: &mut u32,
         name: &mut [u8; COUNTER_NAME_CAPACITY],
-    ) -> Result<CounterEntry, Hresult> {
+    ) -> Result<CounterEntry, CounterError> {
         let counters = &self.performance.counters;
         if !counters.directory {
-            return Err(Hresult::END_OF_DATA);
+            return Err(CounterError::End);
         }
         let Some(counter) = counters.objects.get(*context as usize) else {
-            return Err(Hresult::END_OF_DATA);
+            return Err(CounterError::End);
         };
         *context += 1;
         if counter.name.len() >= COUNTER_NAME_CAPACITY {
-            return Err(Hresult::error(0x105));
+            return Err(CounterError::NameTooLong);
         }
         name[..counter.name.len()].copy_from_slice(&counter.name);
         Ok(CounterEntry {
@@ -708,10 +721,15 @@ impl performance::Backend for MockBackend {
         })
     }
 
-    fn query_counter(&mut self, name: &[u8], query: u32, out: &mut CounterSample) -> Hresult {
+    fn query_counter(
+        &mut self,
+        name: &[u8],
+        query: counters::CounterQuery,
+        out: &mut CounterSample,
+    ) -> Result<Evaluation, CounterError> {
         let counters = &mut self.performance.counters;
         if !counters.directory {
-            return Hresult::error(0x02);
+            return Err(CounterError::NoDirectory);
         }
         let sources = counters.sources_view();
         let locked = counters
@@ -723,10 +741,10 @@ impl performance::Backend for MockBackend {
             .iter_mut()
             .find(|counter| counter.name.eq_ignore_ascii_case(name))
         else {
-            return Hresult::error(0x0e);
+            return Err(CounterError::NotFound);
         };
         if locked {
-            return Hresult::error(0x0e);
+            return Err(CounterError::NotFound);
         }
         counters::query(
             &mut View {
@@ -792,18 +810,23 @@ impl performance::Backend for MockBackend {
         }
     }
 
-    fn dedicate_studio_socket(&mut self) -> Result<u16, Hresult> {
-        self.performance.studio_port.ok_or(Hresult::FAIL)
+    fn dedicate_studio_socket(&mut self) -> Result<u16, StudioError> {
+        self.performance.studio_port.ok_or(StudioError::Fail)
     }
 
-    fn capture_start(&mut self, name: &[u8], path: &[u8], buffer_size: u32) -> Hresult {
+    fn capture_start(
+        &mut self,
+        name: &[u8],
+        path: &[u8],
+        buffer: capture::BufferRequest,
+    ) -> Result<Started, CaptureError> {
         let request =
             CreateRequest::open(FileAccess::DELETE, ShareAccess::ALL, CreateOptions::NONE);
         if let Ok(handle) = filesystem::Backend::create_file(self, path, &request) {
             let _ = self.set_delete_disposition(handle, true);
             self.close_file(handle);
         }
-        capture::start(&mut self.performance.capture, name, buffer_size, true)
+        capture::start(&mut self.performance.capture, name, buffer, true)
     }
 
     fn fast_cap_present(&mut self) -> bool {
@@ -814,7 +837,7 @@ impl performance::Backend for MockBackend {
         self.performance.capture.call_cap
     }
 
-    fn capture_stop(&mut self, drives: &DriveTable) -> Hresult {
+    fn capture_stop(&mut self, drives: &DriveTable) -> Result<(), CaptureError> {
         let mut engine = std::mem::take(&mut self.performance.capture);
         let result = capture::stop(
             &mut engine,
@@ -831,11 +854,11 @@ impl performance::Backend for MockBackend {
         self.performance.capture.flags = flags;
     }
 
-    fn capture_status(&mut self) -> Hresult {
+    fn capture_status(&mut self) -> Result<(), CaptureError> {
         self.performance.capture.status()
     }
 
-    fn capture_abort(&mut self) -> Hresult {
+    fn capture_abort(&mut self) -> Result<(), CaptureError> {
         capture::abort(&mut self.performance.capture)
     }
 
@@ -844,26 +867,26 @@ impl performance::Backend for MockBackend {
         drives: &DriveTable,
         name: &[u8],
         interval: u32,
-        flags: u32,
-    ) -> Hresult {
+        flags: profiler::ProfilerFlags,
+    ) -> Result<(), ProfilerError> {
         let path = drives.translate(self, name);
         let performance = &mut self.performance;
         performance.cpu_profiler_control.start(
             &mut performance.cpu_profiler,
             path.as_ref().map(|path| path.as_bytes()),
             interval,
-            profiler::ProfilerFlags(flags),
+            flags,
         )
     }
 
-    fn cpu_profiler_stop(&mut self) -> Hresult {
+    fn cpu_profiler_stop(&mut self) -> Result<(), ProfilerError> {
         let performance = &mut self.performance;
         performance
             .cpu_profiler_control
             .stop(&mut performance.cpu_profiler)
     }
 
-    fn cpu_profiler_info(&mut self) -> Result<CpuProfilerInfo, Hresult> {
+    fn cpu_profiler_info(&mut self) -> Result<CpuProfilerInfo, ProfilerError> {
         let performance = &mut self.performance;
         performance
             .cpu_profiler_control

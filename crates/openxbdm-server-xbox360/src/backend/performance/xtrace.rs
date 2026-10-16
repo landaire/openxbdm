@@ -17,6 +17,7 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 use core::sync::atomic::fence;
 
+use openxbdm_core::status::NtStatus;
 use openxbdm_server::Server;
 use openxbdm_server::commands::filesystem::CreateDisposition;
 use openxbdm_server::commands::filesystem::CreateOptions;
@@ -439,11 +440,12 @@ fn append(name: &[u8], data: u32, length: u32) -> bool {
         FILE_NETWORK_OPEN_INFORMATION,
     );
     // Stock seeks to the end; when that fails the write goes to the start.
-    let offset = if is_failure(status) {
-        kernel::set_last_error(status);
-        0
-    } else {
-        u64::from_be_bytes(information[0x28..0x30].try_into().unwrap_or([0; 8]))
+    let offset = match NtStatus(status).result() {
+        Err(error) => {
+            kernel::set_last_error(error);
+            0
+        }
+        Ok(()) => u64::from_be_bytes(information[0x28..0x30].try_into().unwrap_or([0; 8])),
     };
     let mut io_status = IoStatusBlock::default();
     let mut status = kernel::NtWriteFile(
@@ -467,8 +469,8 @@ fn append(name: &[u8], data: u32, length: u32) -> bool {
     } else {
         0
     };
-    if is_failure(status) {
-        kernel::set_last_error(status);
+    if let Err(error) = NtStatus(status).result() {
+        kernel::set_last_error(error);
     }
     kernel::NtClose(handle);
     written == length
@@ -1072,8 +1074,8 @@ impl AddressSpace for KernelSpace {
     fn query(&mut self, address: u32) -> Option<Region> {
         let mut information = [0u32; 7];
         let status = NtQueryVirtualMemory(address, information.as_mut_ptr(), 0);
-        if is_failure(status) {
-            kernel::set_last_error(status);
+        if let Err(error) = NtStatus(status).result() {
+            kernel::set_last_error(error);
             return None;
         }
         Some(Region {

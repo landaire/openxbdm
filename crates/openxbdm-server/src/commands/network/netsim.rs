@@ -11,12 +11,17 @@ use core::fmt::Write as _;
 use openxbdm_core::line::CommandLine;
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::Win32Error;
 
+use self::classifier::CompileError;
 pub use self::classifier::Program;
 use self::classifier::ProgramError;
 use self::classifier::SerializeError;
 pub use self::classifier::Source;
+use super::NetworkError;
 use super::SystemVersion;
+use super::WsaError;
 use super::decode_hex;
 use crate::backend::Backend as AnyBackend;
 use crate::commands::console;
@@ -32,6 +37,9 @@ use crate::commands::filesystem::PoolBuffer;
 use crate::commands::filesystem::PoolRange;
 use crate::commands::filesystem::ShareAccess;
 use crate::invocation::Invocation;
+use crate::reply::CommandError;
+use crate::reply::CommandResult;
+use crate::reply::Reply;
 use crate::text::HEX_UPPER;
 use crate::text::ResponseText;
 
@@ -55,34 +63,92 @@ const REDIRECT_SESSION_LIMIT: u16 = 500;
 /// Loss rates count per this many frames.
 pub const LOSS_SCALE: u32 = 100_000;
 
-/// Result codes of the simulator library and its handler helpers.
-pub mod status {
-    use openxbdm_core::status::Hresult;
-
-    /// Success of every helper.
-    pub const OK: Hresult = Hresult::OK;
-    /// Results outside facility 0x2da are reported with this status.
-    pub const GENERIC: Hresult = Hresult::error(0);
-    pub const NO_INSTANCE: Hresult = Hresult::error(0x2);
+/// Why a simulator operation failed. Titles receive the result value
+/// through the simulator exports; commands report it as `err=` text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetsimError {
+    NoInstance,
     /// The instance already exists (0x91f365e8).
-    pub const INSTANCE_EXISTS: Hresult = Hresult::error(0x8);
-    /// No file name is stored or given.
-    pub const NO_FILE: Hresult = Hresult::error(0xc);
+    InstanceExists,
+    /// The network stack lacks the frame transmit routine the instance
+    /// forwards unchanged frames through.
+    RoutineMissing,
     /// The Ethernet intercept is owned by another client (`WSAEALREADY`).
-    pub const INTERCEPT_BUSY: Hresult = Hresult::error(0x10);
+    InterceptBusy,
+    /// Registering the Ethernet intercept failed.
+    Intercept(WsaError),
     /// Malformed or rejected blob, or an index past the end.
-    pub const INVALID: Hresult = Hresult::error(0x17);
+    Invalid,
     /// The instance changed while it was being destroyed.
-    pub const INSTANCE_CHANGED: Hresult = Hresult::error(0x1a);
-    pub const OUT_OF_MEMORY: Hresult = Hresult::error(0x1c);
+    InstanceChanged,
+    OutOfMemory,
     /// A serialized blob does not fit its buffer.
-    pub const SHORT_BUFFER: Hresult = Hresult::error(0x26);
+    ShortBuffer,
+    /// A program item holds a string, which the item encoder rejects.
+    Unencodable,
+    /// Classifier text of an export did not compile.
+    Compile(CompileError),
     /// A reload is already running.
-    pub const BUSY: Hresult = Hresult::error(0x150);
+    Busy,
 }
 
-/// `WSAEALREADY` from `XnpEthernetInterceptSetCallbacks`.
-pub const WSAEALREADY: u32 = 0x2735;
+impl From<NetsimError> for Hresult {
+    #[inline(never)]
+    fn from(error: NetsimError) -> Self {
+        match error {
+            NetsimError::NoInstance => Hresult::error(0x2),
+            NetsimError::InstanceExists => Hresult::error(0x8),
+            NetsimError::RoutineMissing => Hresult::error(0xe),
+            NetsimError::InterceptBusy => Hresult::error(0x10),
+            NetsimError::Intercept(error) => Win32Error::from(error).into(),
+            NetsimError::Invalid => Hresult::error(0x17),
+            NetsimError::InstanceChanged => Hresult::error(0x1a),
+            NetsimError::OutOfMemory => Hresult::error(0x1c),
+            NetsimError::ShortBuffer => Hresult::error(0x26),
+            NetsimError::Unencodable => Hresult(0x8007_0545),
+            NetsimError::Compile(error) => error.into(),
+            NetsimError::Busy => Hresult::error(0x150),
+        }
+    }
+}
+
+impl From<NetsimError> for NetworkError {
+    fn from(error: NetsimError) -> Self {
+        Self::Netsim(error)
+    }
+}
+
+impl From<NetsimError> for CommandError {
+    fn from(error: NetsimError) -> Self {
+        NetworkError::Netsim(error).into()
+    }
+}
+
+impl From<CompileError> for NetsimError {
+    fn from(error: CompileError) -> Self {
+        Self::Compile(error)
+    }
+}
+
+impl From<ProgramError> for NetsimError {
+    fn from(error: ProgramError) -> Self {
+        match error {
+            ProgramError::Invalid => Self::Invalid,
+            ProgramError::OutOfMemory => Self::OutOfMemory,
+        }
+    }
+}
+
+/// The program encoder's failures as the blob builders report them
+/// (0x91f847c0 within 0x91f8c058 and 0x91f8c418).
+impl From<SerializeError> for NetsimError {
+    fn from(error: SerializeError) -> Self {
+        match error {
+            SerializeError::TooLarge => Self::ShortBuffer,
+            SerializeError::Unencodable => Self::Unencodable,
+        }
+    }
+}
 
 /// Global state of `netsim`.
 #[derive(Debug)]
@@ -227,9 +293,9 @@ pub struct QueueConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidConfig;
 
-impl From<InvalidConfig> for Hresult {
+impl From<InvalidConfig> for NetsimError {
     fn from(_: InvalidConfig) -> Self {
-        status::INVALID
+        Self::Invalid
     }
 }
 
@@ -304,15 +370,12 @@ pub fn parse_queue_blob(
 pub fn parse_program<'p>(
     bytes: &[u8],
     slot: &'p mut Program,
-) -> Result<Option<&'p Program>, Hresult> {
+) -> Result<Option<&'p Program>, NetsimError> {
     if bytes.is_empty() {
         return Ok(None);
     }
-    match Program::parse(bytes, slot) {
-        Ok(()) => Ok(Some(slot)),
-        Err(ProgramError::Invalid) => Err(status::INVALID),
-        Err(ProgramError::OutOfMemory) => Err(status::OUT_OF_MEMORY),
-    }
+    Program::parse(bytes, slot)?;
+    Ok(Some(slot))
 }
 
 /// An `insertq` blob in stock order: the settings, the classifier program,
@@ -320,7 +383,7 @@ pub fn parse_program<'p>(
 fn parse_insert_blob<'p>(
     blob: &[u8],
     slot: &'p mut Program,
-) -> Result<(QueueKind, QueueConfig, Option<&'p Program>), Hresult> {
+) -> Result<(QueueKind, QueueConfig, Option<&'p Program>), NetsimError> {
     let (kind, config, program) = parse_queue_blob(blob, true)?;
     let kind = kind.ok_or(InvalidConfig)?;
     let program = parse_program(program, slot)?;
@@ -334,23 +397,16 @@ fn append_program(
     program: Option<Source<'_>>,
     blob: &mut [u8; CONFIG_CAPACITY],
     length: usize,
-) -> Result<usize, Hresult> {
+) -> Result<usize, NetsimError> {
     let Some(program) = program else {
         return Ok(length);
     };
-    match program.serialize(&mut blob[length..]) {
-        Ok(written) => Ok(length + written),
-        Err(SerializeError::TooLarge) => Err(status::SHORT_BUFFER),
-        Err(SerializeError::Unencodable) => Err(UNENCODABLE),
-    }
+    Ok(length + program.serialize(&mut blob[length..])?)
 }
-
-/// The item value encoder's refusal of strings.
-const UNENCODABLE: Hresult = Hresult(0x8007_0545);
 
 impl QueueSnapshot {
     /// The `cfg=` blob of `getq` and the settings file.
-    pub fn serialize(&self, blob: &mut [u8; CONFIG_CAPACITY]) -> Result<usize, Hresult> {
+    pub fn serialize(&self, blob: &mut [u8; CONFIG_CAPACITY]) -> Result<usize, NetsimError> {
         api::queue_blob(
             self.kind as u32,
             &self.config,
@@ -362,7 +418,7 @@ impl QueueSnapshot {
 
 impl RedirectSnapshot {
     /// The `cfg=` blob of the settings file.
-    pub fn serialize(&self, blob: &mut [u8; CONFIG_CAPACITY]) -> Result<usize, Hresult> {
+    pub fn serialize(&self, blob: &mut [u8; CONFIG_CAPACITY]) -> Result<usize, NetsimError> {
         api::redirect_blob(
             &self.config,
             self.program.as_ref().map(Source::Parsed),
@@ -570,10 +626,10 @@ pub trait Backend {
     fn simulator_exists(&mut self) -> bool;
     /// Create the instance and attach it to the Ethernet intercept
     /// (0x91f365e8).
-    fn create_simulator(&mut self) -> Result<(), Hresult>;
+    fn create_simulator(&mut self) -> Result<(), NetsimError>;
     /// Detach and free the instance, restoring a running capture's own
     /// intercept (0x91f36750).
-    fn destroy_simulator(&mut self) -> Result<(), Hresult>;
+    fn destroy_simulator(&mut self) -> Result<(), NetsimError>;
     fn queue_count(&mut self, direction: Direction) -> u32;
     fn redirect_count(&mut self) -> u32;
     /// Create a queue from validated settings and insert it before
@@ -585,53 +641,48 @@ pub trait Backend {
         kind: QueueKind,
         update: &QueueConfig,
         program: Option<&Program>,
-    ) -> Result<QueueIndex, Hresult>;
+    ) -> Result<QueueIndex, NetsimError>;
     /// Apply validated settings to a queue (0x91f8ec80).
     fn modify_queue(
         &mut self,
         direction: Direction,
         index: QueueIndex,
         update: &QueueConfig,
-    ) -> Result<(), Hresult>;
+    ) -> Result<(), NetsimError>;
     /// Remove the queue at `position`, or every queue (0x91f8e0e8); returns
     /// the number removed.
     fn remove_queues(
         &mut self,
         direction: Direction,
         position: Option<QueueIndex>,
-    ) -> Result<u32, Hresult>;
+    ) -> Result<u32, NetsimError>;
     fn queue_stats(
         &mut self,
         direction: Direction,
         index: QueueIndex,
-    ) -> Result<QueueStats, Hresult>;
-    fn queue(&mut self, direction: Direction, index: QueueIndex) -> Result<QueueSnapshot, Hresult>;
+    ) -> Result<QueueStats, NetsimError>;
+    fn queue(
+        &mut self,
+        direction: Direction,
+        index: QueueIndex,
+    ) -> Result<QueueSnapshot, NetsimError>;
     /// Insert a redirect before `position`, or append it (0x91f8d7c0).
     fn insert_redirect(
         &mut self,
         position: Option<RedirectIndex>,
         redirect: &RedirectConfig,
         program: Option<&Program>,
-    ) -> Result<RedirectIndex, Hresult>;
+    ) -> Result<RedirectIndex, NetsimError>;
     /// Remove the redirect at `position`, or every redirect (0x91f8d960).
-    fn remove_redirects(&mut self, position: Option<RedirectIndex>) -> Result<u32, Hresult>;
+    fn remove_redirects(&mut self, position: Option<RedirectIndex>) -> Result<u32, NetsimError>;
     fn redirect(&mut self, index: RedirectIndex) -> Option<RedirectSnapshot>;
     fn key_status(&mut self) -> KeyStatus;
 }
 
-/// Facility 0x2da results keep their status; others are reported as
-/// 0x82da0000 (the common exit of the stock helpers).
-pub fn reported(result: Hresult) -> Hresult {
-    if result.0 & 0x1fff_0000 == status::OK.0 & 0x1fff_0000 {
-        result
-    } else {
-        status::GENERIC
-    }
-}
-
-fn fail(invocation: &mut Invocation<'_>, result: Hresult) -> Hresult {
-    invocation.set_text(format_args!("err=0x{:08x}", result.0));
-    reported(result)
+/// The `err=` text of a failed helper, with its reported status.
+fn fail(invocation: &mut Invocation<'_>, error: NetsimError) -> CommandResult {
+    invocation.set_text(format_args!("err=0x{:08x}", Hresult::from(error).0));
+    Err(error.into())
 }
 
 /// Parameters shared by the queue and redirect subcommands.
@@ -683,7 +734,7 @@ enum Request {
 
 impl Request {
     /// A bad `cfg=` digit is an unknown command.
-    fn parse(line: CommandLine<'_>) -> Result<Self, Hresult> {
+    fn parse(line: CommandLine<'_>) -> Result<Self, CommandError> {
         if line.has("reload") {
             let mut file = [0u8; FILE_PARAMETER_CAPACITY];
             let length = match line.param("file") {
@@ -708,8 +759,7 @@ impl Request {
             Some(value) => {
                 let raw = value.raw();
                 let text = raw.strip_prefix(b"\"").unwrap_or(raw);
-                decode_hex(text, &mut blob)
-                    .ok_or(Hresult::from_error_code(ErrorCode::UNKNOWN_COMMAND))?
+                decode_hex(text, &mut blob).ok_or(ErrorCode::UnknownCommand)?
             }
             None => 0,
         };
@@ -740,42 +790,44 @@ impl Request {
 /// modifyq in|out index=<n> cfg=<hex> | getqstats in|out index=<n> |
 /// getq in|out index=<n> | insertipv4redir [index=<n>] cfg=<hex> |
 /// removeipv4redir [index=<n>]`.
-pub(super) fn netsim(invocation: &mut Invocation<'_>) -> Hresult {
+pub(super) fn netsim(invocation: &mut Invocation<'_>) -> CommandResult {
     let request = Request::parse(invocation.line);
     execute(invocation, request)
 }
 
 #[inline(never)]
-fn execute(invocation: &mut Invocation<'_>, request: Result<Request, Hresult>) -> Hresult {
+fn execute(
+    invocation: &mut Invocation<'_>,
+    request: Result<Request, CommandError>,
+) -> CommandResult {
     if super::Backend::system_version(invocation.backend) < NETSIM_VERSION {
-        return Hresult::from_error_code(ErrorCode::UNKNOWN_COMMAND);
+        return Err(ErrorCode::UnknownCommand.into());
     }
-    let (edit, selection, blob, blob_length) = match request {
-        Err(error) => return error,
-        Ok(Request::Reload { file, length }) => return reload(invocation, &file[..length]),
-        Ok(Request::QueueCounts) => return queue_counts_command(invocation),
-        Ok(Request::RedirectCount) => {
+    let (edit, selection, blob, blob_length) = match request? {
+        Request::Reload { file, length } => return reload(invocation, &file[..length]),
+        Request::QueueCounts => return queue_counts_command(invocation),
+        Request::RedirectCount => {
             let count = redirect_count(invocation.backend);
             invocation.set_text(format_args!("num={count}"));
-            return status::OK;
+            return Ok(Reply::Ok);
         }
-        Ok(Request::Edit {
+        Request::Edit {
             edit,
             selection,
             blob,
             blob_length,
-        }) => (edit, selection, blob, blob_length),
+        } => (edit, selection, blob, blob_length),
     };
     // An empty `cfg=` counts as missing.
     let blob = (blob_length != 0).then_some(&blob[..blob_length]);
     let persist = invocation.session.is_some();
     let Some(edit) = edit else {
-        return status::INVALID;
+        return Err(NetsimError::Invalid.into());
     };
     match edit {
         Edit::InsertQueue => {
             let (Some(direction), Some(blob)) = (selection.direction(), blob) else {
-                return status::INVALID;
+                return Err(NetsimError::Invalid.into());
             };
             insert_queue_command(
                 invocation,
@@ -789,7 +841,9 @@ fn execute(invocation: &mut Invocation<'_>, request: Result<Request, Hresult>) -
             let (inbound, outbound) = match selection.index {
                 None if !selection.inbound && !selection.outbound => (true, true),
                 None => (selection.inbound, selection.outbound),
-                Some(_) if selection.direction().is_none() => return status::INVALID,
+                Some(_) if selection.direction().is_none() => {
+                    return Err(NetsimError::Invalid.into());
+                }
                 Some(_) => (selection.inbound, selection.outbound),
             };
             remove_queues_command(
@@ -804,13 +858,13 @@ fn execute(invocation: &mut Invocation<'_>, request: Result<Request, Hresult>) -
             let (Some(direction), Some(index), Some(blob)) =
                 (selection.direction(), selection.index, blob)
             else {
-                return status::INVALID;
+                return Err(NetsimError::Invalid.into());
             };
             modify_queue_command(invocation, direction, QueueIndex(index), blob, persist)
         }
         Edit::QueueStats | Edit::Queue => {
             let (Some(direction), Some(index)) = (selection.direction(), selection.index) else {
-                return status::INVALID;
+                return Err(NetsimError::Invalid.into());
             };
             if matches!(edit, Edit::QueueStats) {
                 queue_stats_command(invocation, direction, QueueIndex(index))
@@ -820,7 +874,7 @@ fn execute(invocation: &mut Invocation<'_>, request: Result<Request, Hresult>) -
         }
         Edit::InsertRedirect => {
             let Some(blob) = blob else {
-                return status::INVALID;
+                return Err(NetsimError::Invalid.into());
             };
             insert_redirect_command(
                 invocation,
@@ -865,14 +919,14 @@ pub fn redirect_count(backend: &mut dyn AnyBackend) -> u32 {
     }
 }
 
-fn queue_counts_command(invocation: &mut Invocation<'_>) -> Hresult {
+fn queue_counts_command(invocation: &mut Invocation<'_>) -> CommandResult {
     let (inbound, outbound) = queue_counts(invocation.backend);
     invocation.set_text(format_args!("in={inbound} out={outbound}"));
-    status::OK
+    Ok(Reply::Ok)
 }
 
 /// Create the instance when it is missing; returns whether it was created.
-fn ensure_simulator(backend: &mut dyn AnyBackend) -> Result<bool, Hresult> {
+fn ensure_simulator(backend: &mut dyn AnyBackend) -> Result<bool, NetsimError> {
     if backend.simulator_exists() {
         return Ok(false);
     }
@@ -880,7 +934,7 @@ fn ensure_simulator(backend: &mut dyn AnyBackend) -> Result<bool, Hresult> {
 }
 
 /// Destroy the instance once it has no queues and no redirects.
-fn release_if_idle(backend: &mut dyn AnyBackend) -> Result<(), Hresult> {
+fn release_if_idle(backend: &mut dyn AnyBackend) -> Result<(), NetsimError> {
     let idle = backend.queue_count(Direction::Inbound) == 0
         && backend.queue_count(Direction::Outbound) == 0
         && backend.redirect_count() == 0;
@@ -906,7 +960,7 @@ pub fn insert_queue(
     position: Option<QueueIndex>,
     blob: &[u8],
     persist: bool,
-) -> Result<QueueIndex, Hresult> {
+) -> Result<QueueIndex, NetsimError> {
     let created = ensure_simulator(backend)?;
     let mut slot = Program::EMPTY;
     let inserted = parse_insert_blob(blob, &mut slot).and_then(|(kind, update, program)| {
@@ -932,7 +986,7 @@ fn insert_queue_command(
     position: Option<QueueIndex>,
     blob: &[u8],
     persist: bool,
-) -> Hresult {
+) -> CommandResult {
     match insert_queue(
         &invocation.state.network.netsim,
         invocation.backend,
@@ -943,7 +997,7 @@ fn insert_queue_command(
     ) {
         Ok(QueueIndex(index)) => {
             invocation.set_text(format_args!("index={index}"));
-            status::OK
+            Ok(Reply::Ok)
         }
         Err(error) => fail(invocation, error),
     }
@@ -966,10 +1020,10 @@ pub fn remove_queues(
     outbound: bool,
     position: Option<QueueIndex>,
     persist: bool,
-) -> Result<QueueRemoval, Hresult> {
+) -> Result<QueueRemoval, NetsimError> {
     if !backend.simulator_exists() {
         if position.is_some() {
-            return Err(status::NO_INSTANCE);
+            return Err(NetsimError::NoInstance);
         }
         return Ok(QueueRemoval {
             removed: 0,
@@ -1003,7 +1057,7 @@ fn remove_queues_command(
     outbound: bool,
     position: Option<QueueIndex>,
     persist: bool,
-) -> Hresult {
+) -> CommandResult {
     match remove_queues(
         &invocation.state.network.netsim,
         invocation.backend,
@@ -1020,7 +1074,7 @@ fn remove_queues_command(
             invocation.set_text(format_args!(
                 "removed={removed} inleft={inbound_left} outleft={outbound_left}"
             ));
-            status::OK
+            Ok(Reply::Ok)
         }
         Err(error) => fail(invocation, error),
     }
@@ -1034,9 +1088,9 @@ pub fn modify_queue(
     index: QueueIndex,
     blob: &[u8],
     persist: bool,
-) -> Result<(), Hresult> {
+) -> Result<(), NetsimError> {
     if !backend.simulator_exists() {
-        return Err(status::NO_INSTANCE);
+        return Err(NetsimError::NoInstance);
     }
     let update = parse_queue_blob(blob, false).and_then(|(_, config, program)| {
         if program.is_empty() {
@@ -1056,7 +1110,7 @@ fn modify_queue_command(
     index: QueueIndex,
     blob: &[u8],
     persist: bool,
-) -> Hresult {
+) -> CommandResult {
     match modify_queue(
         &invocation.state.network.netsim,
         invocation.backend,
@@ -1065,7 +1119,7 @@ fn modify_queue_command(
         blob,
         persist,
     ) {
-        Ok(()) => status::OK,
+        Ok(()) => Ok(Reply::Ok),
         Err(error) => fail(invocation, error),
     }
 }
@@ -1075,9 +1129,9 @@ pub fn queue_stats(
     backend: &mut dyn AnyBackend,
     direction: Direction,
     index: QueueIndex,
-) -> Result<QueueStats, Hresult> {
+) -> Result<QueueStats, NetsimError> {
     if !backend.simulator_exists() {
-        return Err(status::NO_INSTANCE);
+        return Err(NetsimError::NoInstance);
     }
     backend.queue_stats(direction, index)
 }
@@ -1086,7 +1140,7 @@ fn queue_stats_command(
     invocation: &mut Invocation<'_>,
     direction: Direction,
     index: QueueIndex,
-) -> Hresult {
+) -> CommandResult {
     match queue_stats(invocation.backend, direction, index) {
         Ok(stats) => {
             invocation.set_text(format_args!(
@@ -1098,7 +1152,7 @@ fn queue_stats_command(
                 (stats.dropped_bytes >> 32) as u32,
                 stats.dropped_bytes as u32,
             ));
-            status::OK
+            Ok(Reply::Ok)
         }
         Err(error) => fail(invocation, error),
     }
@@ -1109,11 +1163,11 @@ fn queue_config(
     invocation: &mut Invocation<'_>,
     direction: Direction,
     index: QueueIndex,
-) -> Hresult {
+) -> CommandResult {
     let result = if invocation.backend.simulator_exists() {
         invocation.backend.queue(direction, index)
     } else {
-        Err(status::NO_INSTANCE)
+        Err(NetsimError::NoInstance)
     };
     match result {
         Ok(snapshot) => {
@@ -1123,7 +1177,7 @@ fn queue_config(
                     invocation.text.clear();
                     let _ = invocation.text.write_str("cfg=");
                     let _ = invocation.text.push_hex_upper(&blob[..length]);
-                    status::OK
+                    Ok(Reply::Ok)
                 }
                 Err(error) => fail(invocation, error),
             }
@@ -1140,17 +1194,16 @@ pub fn insert_redirect(
     position: Option<RedirectIndex>,
     blob: &[u8],
     persist: bool,
-) -> Result<RedirectIndex, Hresult> {
+) -> Result<RedirectIndex, NetsimError> {
     let created = ensure_simulator(backend)?;
     let mut slot = Program::EMPTY;
-    let inserted =
-        RedirectConfig::parse(blob)
-            .map_err(Hresult::from)
-            .and_then(|(redirect, program)| {
-                let program = parse_program(program, &mut slot)?;
-                redirect.validate()?;
-                backend.insert_redirect(position, &redirect, program)
-            });
+    let inserted = RedirectConfig::parse(blob)
+        .map_err(NetsimError::from)
+        .and_then(|(redirect, program)| {
+            let program = parse_program(program, &mut slot)?;
+            redirect.validate()?;
+            backend.insert_redirect(position, &redirect, program)
+        });
     match inserted {
         Ok(index) => {
             persist_file(state, backend, persist);
@@ -1170,7 +1223,7 @@ fn insert_redirect_command(
     position: Option<RedirectIndex>,
     blob: &[u8],
     persist: bool,
-) -> Hresult {
+) -> CommandResult {
     match insert_redirect(
         &invocation.state.network.netsim,
         invocation.backend,
@@ -1180,7 +1233,7 @@ fn insert_redirect_command(
     ) {
         Ok(RedirectIndex(index)) => {
             invocation.set_text(format_args!("index={index}"));
-            status::OK
+            Ok(Reply::Ok)
         }
         Err(error) => fail(invocation, error),
     }
@@ -1200,10 +1253,10 @@ pub fn remove_redirects(
     backend: &mut dyn AnyBackend,
     position: Option<RedirectIndex>,
     persist: bool,
-) -> Result<RedirectRemoval, Hresult> {
+) -> Result<RedirectRemoval, NetsimError> {
     if !backend.simulator_exists() {
         if position.is_some() {
-            return Err(status::NO_INSTANCE);
+            return Err(NetsimError::NoInstance);
         }
         return Ok(RedirectRemoval {
             removed: 0,
@@ -1221,7 +1274,7 @@ fn remove_redirects_command(
     invocation: &mut Invocation<'_>,
     position: Option<RedirectIndex>,
     persist: bool,
-) -> Hresult {
+) -> CommandResult {
     match remove_redirects(
         &invocation.state.network.netsim,
         invocation.backend,
@@ -1230,7 +1283,7 @@ fn remove_redirects_command(
     ) {
         Ok(RedirectRemoval { removed, left }) => {
             invocation.set_text(format_args!("removed={removed} left={left}"));
-            status::OK
+            Ok(Reply::Ok)
         }
         Err(error) => fail(invocation, error),
     }
@@ -1238,9 +1291,9 @@ fn remove_redirects_command(
 
 /// `reload` (0x91f36818): replace the instance with the file's
 /// configuration. The reply text is always `file="<stored name>"`.
-fn reload(invocation: &mut Invocation<'_>, name: &[u8]) -> Hresult {
+fn reload(invocation: &mut Invocation<'_>, name: &[u8]) -> CommandResult {
     if invocation.state.network.netsim.reloading {
-        return status::BUSY;
+        return Err(NetsimError::Busy.into());
     }
     invocation.state.network.netsim.reloading = true;
     let result = run_reload(invocation, name);
@@ -1254,7 +1307,7 @@ fn reload(invocation: &mut Invocation<'_>, name: &[u8]) -> Hresult {
     result
 }
 
-fn run_reload(invocation: &mut Invocation<'_>, name: &[u8]) -> Hresult {
+fn run_reload(invocation: &mut Invocation<'_>, name: &[u8]) -> CommandResult {
     if !name.is_empty() {
         let translated = invocation
             .state
@@ -1267,12 +1320,12 @@ fn run_reload(invocation: &mut Invocation<'_>, name: &[u8]) -> Hresult {
             None => file.set(name),
         }
     } else if invocation.state.network.netsim.file.as_bytes().is_empty() {
-        return status::NO_FILE;
+        return Err(ErrorCode::FilenameInvalid.into());
     }
     if invocation.backend.simulator_exists()
         && let Err(error) = invocation.backend.destroy_simulator()
     {
-        return error;
+        return Err(error.into());
     }
     let file = &invocation.state.network.netsim.file;
     let request = CreateRequest {
@@ -1285,7 +1338,12 @@ fn run_reload(invocation: &mut Invocation<'_>, name: &[u8]) -> Hresult {
     };
     let handle = match invocation.backend.create_file(file.as_bytes(), &request) {
         Ok(handle) => handle,
-        Err(status) => return Hresult::from_nt_status(status, status::GENERIC),
+        Err(error) => {
+            return Err(CommandError::from_kernel(
+                error,
+                ErrorCode::Undefined.into(),
+            ));
+        }
     };
     let result = match invocation.backend.allocate_pool(FILE_BUFFER_SIZE as u32) {
         Some(buffer) => {
@@ -1299,9 +1357,9 @@ fn run_reload(invocation: &mut Invocation<'_>, name: &[u8]) -> Hresult {
                     invocation.backend,
                 );
             }
-            status::OK
+            Ok(Reply::Ok)
         }
-        None => status::OUT_OF_MEMORY,
+        None => Err(NetsimError::OutOfMemory.into()),
     };
     invocation.backend.close_file(handle);
     result
@@ -1356,8 +1414,8 @@ fn execute_file(invocation: &mut Invocation<'_>, handle: FileHandle, buffer: Poo
 /// there is no allocator to box the larger variant.
 #[allow(clippy::large_enum_variant)]
 enum FileLine {
-    Netsim(Result<Request, Hresult>),
-    LinkState(Result<Option<super::LinkFlags>, Hresult>),
+    Netsim(Result<Request, CommandError>),
+    LinkState(Result<Option<super::LinkFlags>, super::MissingLinkMask>),
 }
 
 /// Run a `netsim` or `linkstate` line of the reader's buffer without a
@@ -1395,18 +1453,19 @@ fn execute_line(
         FileLine::Netsim(request) => execute(&mut nested, request),
         FileLine::LinkState(flags) => super::execute_link_state(&mut nested, flags),
     };
-    if result.is_failure() {
-        console::trace(
-            invocation.state,
-            invocation.backend,
-            TraceMask::SETTINGS,
-            format_args!(
-                "XBDM: NetSimReadIniLine processing command failed (0x{:08x})\n",
-                result.0
-            ),
-        );
-    }
-    result.is_failure()
+    let Err(error) = result else {
+        return false;
+    };
+    console::trace(
+        invocation.state,
+        invocation.backend,
+        TraceMask::SETTINGS,
+        format_args!(
+            "XBDM: NetSimReadIniLine processing command failed (0x{:08x})\n",
+            Hresult::from(error).0
+        ),
+    );
+    true
 }
 
 #[inline(never)]
@@ -1515,12 +1574,12 @@ fn write_file(name: &[u8], backend: &mut dyn AnyBackend) {
     };
     let handle = match backend.create_file(name, &request) {
         Ok(handle) => handle,
-        Err(status) => {
+        Err(error) => {
             trace(
                 backend,
                 format_args!(
                     "XBDM: NetSimWriteIniFile - Failed to create file: 0x{:08x}\n",
-                    status.0
+                    NtStatus::from(error).0
                 ),
             );
             backend.free_pool(buffer);

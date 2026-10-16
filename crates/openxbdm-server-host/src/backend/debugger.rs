@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 
-use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::KernelError;
 use openxbdm_server::commands::debugger;
 use openxbdm_server::commands::debugger::Context;
 use openxbdm_server::commands::debugger::ContextFlags;
@@ -22,16 +22,18 @@ use openxbdm_server::commands::debugger::DirectRegisters;
 use openxbdm_server::commands::debugger::DirectStep;
 use openxbdm_server::commands::debugger::Disposition;
 use openxbdm_server::commands::debugger::ExceptionRecord;
+use openxbdm_server::commands::debugger::ExitStatus;
 use openxbdm_server::commands::debugger::ExtensionHandle;
 use openxbdm_server::commands::debugger::ModuleEvent;
 use openxbdm_server::commands::debugger::NOTICE_TEXT_CAPACITY;
 use openxbdm_server::commands::debugger::NoSuchThread;
 use openxbdm_server::commands::debugger::ProcessKind;
-use openxbdm_server::commands::debugger::SetContextError;
+use openxbdm_server::commands::debugger::StoppedThreadError;
 use openxbdm_server::commands::debugger::ThreadId;
 use openxbdm_server::commands::debugger::ThreadInfo;
 use openxbdm_server::commands::debugger::ThreadName;
 use openxbdm_server::commands::debugger::dispatch_direct;
+use openxbdm_server::commands::services::ThreadHandle;
 use openxbdm_server::notify::ExecutionState;
 
 use super::MockBackend;
@@ -113,8 +115,8 @@ pub struct Mock {
     pub data_breakpoint_register: u32,
     pub crash_dumps: u32,
     pub kernel_build: u16,
-    /// Exit status per thread handle (`Err` is the Win32 error).
-    pub thread_handles: BTreeMap<u32, Result<u32, u32>>,
+    /// Exit status per thread handle.
+    pub thread_handles: BTreeMap<ThreadHandle, Result<ExitStatus, KernelError>>,
     /// Module descriptions keyed by (name string, entry) addresses.
     pub modules: BTreeMap<(u32, u32), ModuleEvent>,
     /// Extension paths the loader accepts, with their handles.
@@ -524,19 +526,19 @@ impl debugger::Backend for MockBackend {
         &mut self,
         thread: ThreadId,
         context: &Context,
-    ) -> Result<(), SetContextError> {
+    ) -> Result<(), StoppedThreadError> {
         let found = self
             .debugger
             .thread(thread)
             .filter(|thread| thread.has_record);
         if found.is_none() {
-            return Err(SetContextError::NoSuchThread);
+            return Err(StoppedThreadError::NoSuchThread);
         }
         let saved = self
             .debugger
             .in_monitor
             .get_mut(&thread.0)
-            .ok_or(SetContextError::NotStopped)?;
+            .ok_or(StoppedThreadError::NotStopped)?;
         copy_groups(context, saved, context.flags);
         Ok(())
     }
@@ -563,13 +565,13 @@ impl debugger::Backend for MockBackend {
         }
     }
 
-    fn thread_exit_status(&mut self, handle: u32) -> Result<u32, u32> {
-        // ERROR_INVALID_HANDLE for handles the simulated table lacks.
+    fn thread_exit_status(&mut self, handle: ThreadHandle) -> Result<ExitStatus, KernelError> {
+        // Handles the simulated table lacks are invalid, as for the kernel.
         self.debugger
             .thread_handles
             .get(&handle)
             .copied()
-            .unwrap_or(Err(6))
+            .unwrap_or(Err(KernelError::InvalidHandle))
     }
 
     fn replace_code_word(&mut self, address: u32, value: u32) -> Option<u32> {
@@ -659,19 +661,19 @@ impl debugger::Backend for MockBackend {
         self.debugger.kernel_build
     }
 
-    fn load_extension(&mut self, path: &[u8]) -> Result<ExtensionHandle, NtStatus> {
+    fn load_extension(&mut self, path: &[u8]) -> Result<ExtensionHandle, KernelError> {
         let handle = self
             .debugger
             .extension_images
             .get(path)
             .copied()
             .map(ExtensionHandle)
-            .ok_or(NtStatus(0xc000_0034))?;
+            .ok_or(KernelError::ObjectNameNotFound)?;
         self.debugger.loaded_extensions.push(handle);
         Ok(handle)
     }
 
-    fn unload_extension(&mut self, handle: ExtensionHandle) -> Result<(), NtStatus> {
+    fn unload_extension(&mut self, handle: ExtensionHandle) -> Result<(), KernelError> {
         self.debugger.unloaded_extensions.push(handle);
         Ok(())
     }

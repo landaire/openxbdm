@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
-use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::KernelError;
 use openxbdm_server::backend::Platform as _;
 use openxbdm_server::commands::console::Backend as _;
 use openxbdm_server::commands::filesystem::Backend as _;
@@ -27,6 +27,7 @@ use openxbdm_server::commands::memory::detour::BLOCK_SIZE;
 use openxbdm_server::commands::memory::detour::CallContext;
 use openxbdm_server::commands::memory::detour::Engine;
 use openxbdm_server::commands::memory::detour::RECORD_SIZE;
+use openxbdm_server::commands::memory::detour::ReturnValue;
 
 use super::Region;
 use crate::backend::MockBackend;
@@ -39,7 +40,6 @@ pub const ENTRY_STUB: u32 = 0x91f1_3000;
 const TRAMPOLINE_FILL: u32 = 0x7c00_0038;
 /// `NtCreateFile` options of both log handles.
 const LOG_OPTIONS: CreateOptions = CreateOptions::SYNCHRONOUS_IO_NONALERT;
-const STATUS_NO_SUCH_FILE: NtStatus = NtStatus(0xc000_000f);
 
 /// The stub page and the trampoline area after module init: each
 /// trampoline starts with `li r12, id` and `b ENTRY_STUB`. The stubs are
@@ -109,7 +109,7 @@ pub struct SimulatedCall {
     /// Vector save area (logged when the entry sets `VECTOR`).
     pub vector: u32,
     /// What the original function returns when it runs.
-    pub original_result: u32,
+    pub original_result: ReturnValue,
 }
 
 /// What the stub returns to the caller.
@@ -117,7 +117,7 @@ pub struct SimulatedCall {
 pub struct CallOutcome {
     /// The original function ran.
     pub called: bool,
-    pub returned: u32,
+    pub returned: ReturnValue,
 }
 
 /// Platform services over the simulated console.
@@ -271,27 +271,25 @@ impl MockBackend {
 
     /// The writer worker's start (0x91f2cb28): reset the pool, then create
     /// the log for writing and open it again for reading.
-    pub(super) fn start_detour_writer(&mut self, log: Option<&[u8]>) -> NtStatus {
+    pub(super) fn start_detour_writer(&mut self, log: Option<&[u8]>) -> Result<(), KernelError> {
         let engine = Arc::clone(&self.memory.detour.engine);
         if !self.with_detour(|engine, platform| engine.prepare_log(platform)) {
             engine.abort_start();
-            return NtStatus::SUCCESS;
+            return Ok(());
         }
-        let status = self.open_detour_log(log);
-        engine.set_status(status);
-        if status.is_success() {
+        let opened = self.open_detour_log(log);
+        engine.set_log_result(opened);
+        if opened.is_ok() {
             engine.mark_running();
         } else {
             self.close_detour_log();
             engine.abort_start();
         }
-        NtStatus::SUCCESS
+        Ok(())
     }
 
-    fn open_detour_log(&mut self, log: Option<&[u8]>) -> NtStatus {
-        let Some(path) = log else {
-            return STATUS_NO_SUCH_FILE;
-        };
+    fn open_detour_log(&mut self, log: Option<&[u8]>) -> Result<(), KernelError> {
+        let path = log.ok_or(KernelError::NoSuchFile)?;
         let write = CreateRequest {
             access: FileAccess::GENERIC_WRITE,
             allocation_size: None,
@@ -300,22 +298,14 @@ impl MockBackend {
             disposition: CreateDisposition::OverwriteIf,
             options: LOG_OPTIONS,
         };
-        match self.create_file(path, &write) {
-            Ok(handle) => self.memory.detour.write_handle = Some(handle),
-            Err(status) => return status,
-        }
+        self.memory.detour.write_handle = Some(self.create_file(path, &write)?);
         let read = CreateRequest {
             access: FileAccess::GENERIC_READ.union(FileAccess::SYNCHRONIZE),
             disposition: CreateDisposition::Open,
             ..write
         };
-        match self.create_file(path, &read) {
-            Ok(handle) => {
-                self.memory.detour.read_handle = Some(handle);
-                NtStatus::SUCCESS
-            }
-            Err(status) => status,
-        }
+        self.memory.detour.read_handle = Some(self.create_file(path, &read)?);
+        Ok(())
     }
 
     fn close_detour_log(&mut self) {

@@ -4,7 +4,6 @@
 //! of the receive buffer.
 
 use openxbdm_core::line::CommandLine;
-use openxbdm_core::status::Hresult;
 
 use super::CaptureValue;
 use super::Continuation;
@@ -12,6 +11,7 @@ use crate::backend::Backend;
 use crate::continuation::Continuation as AnyContinuation;
 use crate::invocation::Invocation;
 use crate::network::Network;
+use crate::reply::CommandResult;
 use crate::state::ServerState;
 use crate::text::ResponseText;
 
@@ -149,15 +149,15 @@ impl Reply {
 
 /// Run a `pixcmd` line a title passes through monitor control code 0x45
 /// (stock calls the handler 0x91f57fe0 directly): `buffer` holds the line
-/// up to its NUL and the bytes after it. `r` returns `Hresult::BINARY`
-/// with no continuation; the caller transfers the snapshot itself.
+/// up to its NUL and the bytes after it. `r` returns `Reply::Binary` with
+/// no continuation; the caller transfers the snapshot itself.
 pub fn run_title_command(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     network: &mut dyn Network,
     buffer: &[u8],
     text: &mut ResponseText,
-) -> Hresult {
+) -> CommandResult {
     let end = buffer
         .iter()
         .position(|&byte| byte == 0)
@@ -174,7 +174,7 @@ pub fn run_title_command(
     pix_command(&mut invocation)
 }
 
-pub(super) fn pix_command(invocation: &mut Invocation<'_>) -> Hresult {
+pub(super) fn pix_command(invocation: &mut Invocation<'_>) -> CommandResult {
     let end = invocation
         .buffer
         .iter()
@@ -271,7 +271,7 @@ pub(super) fn pix_command(invocation: &mut Invocation<'_>) -> Hresult {
         Reply::OldD3d => invocation.text.set_bytes(b"OldD3D"),
         Reply::Text => {}
     }
-    Hresult::OK
+    Ok(crate::reply::Reply::Ok)
 }
 
 /// A frame range `a..=b` counted back from the current frame; `b`
@@ -508,13 +508,13 @@ fn gpu_capture(invocation: &mut Invocation<'_>, arguments: &Arguments<'_>) -> Re
 
 /// `r`: sample the counters into the trace ring and send the queued
 /// bytes.
-fn trace(invocation: &mut Invocation<'_>) -> Hresult {
+fn trace(invocation: &mut Invocation<'_>) -> CommandResult {
     let queued = invocation.backend.pix_trace_snapshot();
     invocation.set_text(format_args!("OK {}", queued as i32));
     if let Some(session) = invocation.session.as_deref_mut() {
         session.continuation = AnyContinuation::Performance(Continuation::Trace);
     }
-    Hresult::BINARY
+    Ok(crate::reply::Reply::Binary)
 }
 
 #[cfg(test)]

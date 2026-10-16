@@ -6,7 +6,9 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::Win32Error;
 use openxbdm_server::Platform;
 use openxbdm_server::Server;
 use openxbdm_server::commands;
@@ -27,19 +29,18 @@ use openxbdm_server::commands::console::KitFeatures;
 use openxbdm_server::commands::console::MemoryStatistics;
 use openxbdm_server::commands::console::NETWORK_ADDRESS_SIZE;
 use openxbdm_server::commands::console::NetworkAddress;
+use openxbdm_server::commands::console::NetworkRaError;
 use openxbdm_server::commands::console::NetworkRaRecord;
 use openxbdm_server::commands::console::NetworkRaRequest;
 use openxbdm_server::commands::console::Published;
 use openxbdm_server::commands::console::REGISTRATION_RESPONSE_CAPACITY;
 use openxbdm_server::commands::console::RegistrationResult;
 use openxbdm_server::commands::console::SETTINGS_BLOCK_SIZE;
-use openxbdm_server::commands::console::STATUS_PROCEDURE_NOT_FOUND;
 use openxbdm_server::commands::console::SYSTEM_SETTINGS_SIZE;
 use openxbdm_server::commands::console::SystemInformation;
 use openxbdm_server::commands::console::SystemSettings;
 use openxbdm_server::commands::console::TraceMask;
 use openxbdm_server::commands::console::Version;
-use openxbdm_server::commands::console::XamStatus;
 use openxbdm_server::text::LineText;
 
 use super::Console;
@@ -133,10 +134,6 @@ struct NetworkRaDescriptor {
     size: u32,
 }
 
-fn is_failure(status: u32) -> bool {
-    (status as i32) < 0
-}
-
 fn smc_i2c_message(address: usize) -> [u8; 16] {
     let mut message = [0u8; 16];
     message[0] = SMC_I2C_COMMAND;
@@ -145,14 +142,19 @@ fn smc_i2c_message(address: usize) -> [u8; 16] {
     message
 }
 
-fn send_network_ra(descriptor: &mut NetworkRaDescriptor) -> XamStatus {
-    XamStatus(kernel::XMsgStartIORequest(
+fn send_network_ra(descriptor: &mut NetworkRaDescriptor) -> Result<(), NetworkRaError> {
+    let result = Hresult(kernel::XMsgStartIORequest(
         NETWORK_SERVICE,
         NETWORK_RA_MESSAGE,
         0,
         (descriptor as *mut NetworkRaDescriptor).cast(),
         size_of::<NetworkRaDescriptor>() as u32,
-    ))
+    ));
+    if result.is_failure() {
+        Err(NetworkRaError(result))
+    } else {
+        Ok(())
+    }
 }
 
 impl Console {
@@ -167,8 +169,14 @@ impl Console {
     fn feature_switch(&mut self) -> Option<u32> {
         let module = kernel::module_handle(c"xam.xex").ok()?;
         let mut address = 0u32;
-        let status = kernel::XexGetProcedureAddress(module, FEATURE_SWITCH_ORDINAL, &mut address);
-        (!is_failure(status)).then_some(address)
+        NtStatus(kernel::XexGetProcedureAddress(
+            module.raw(),
+            FEATURE_SWITCH_ORDINAL,
+            &mut address,
+        ))
+        .result()
+        .ok()?;
+        Some(address)
     }
 
     fn network_address(query: extern "C" fn(u32, *mut u8) -> u32) -> NetworkAddress {
@@ -199,7 +207,7 @@ fn memory_statistics() -> Option<MemoryStatistics> {
         0,
         0,
     );
-    if is_failure(status) || (words[0] as usize) < MEMORY_STATISTICS_SIZE {
+    if NtStatus(status).result().is_err() || (words[0] as usize) < MEMORY_STATISTICS_SIZE {
         return None;
     }
     Some(MemoryStatistics {
@@ -218,34 +226,27 @@ impl commands::console::Backend for Console {
         &mut self,
         setting: ConfigSetting,
         output: &mut [u8],
-    ) -> Result<usize, NtStatus> {
+    ) -> Result<usize, KernelError> {
         let mut length = 0u16;
-        let status = kernel::ExGetXConfigSetting(
+        NtStatus(kernel::ExGetXConfigSetting(
             u32::from(setting.category),
             u32::from(setting.index),
             output.as_mut_ptr(),
             output.len() as u32,
             &mut length,
-        );
-        if is_failure(status) {
-            Err(NtStatus(status))
-        } else {
-            Ok(usize::from(length))
-        }
+        ))
+        .result()?;
+        Ok(usize::from(length))
     }
 
-    fn xconfig_set(&mut self, setting: ConfigSetting, value: &[u8]) -> Result<(), NtStatus> {
-        let status = kernel::ExSetXConfigSetting(
+    fn xconfig_set(&mut self, setting: ConfigSetting, value: &[u8]) -> Result<(), KernelError> {
+        NtStatus(kernel::ExSetXConfigSetting(
             u32::from(setting.category),
             u32::from(setting.index),
             value.as_ptr(),
             value.len() as u32,
-        );
-        if is_failure(status) {
-            Err(NtStatus(status))
-        } else {
-            Ok(())
-        }
+        ))
+        .result()
     }
 
     fn xconfig_modify(
@@ -253,9 +254,9 @@ impl commands::console::Backend for Console {
         setting: ConfigSetting,
         and_mask: u32,
         or_mask: u32,
-    ) -> Result<(), NtStatus> {
+    ) -> Result<(), KernelError> {
         let Some(function) = self.config_modify_export() else {
-            return Err(STATUS_PROCEDURE_NOT_FOUND);
+            return Err(KernelError::OrdinalNotFound);
         };
         // SAFETY: export 700 takes (category, index, and mask, or mask).
         let status = unsafe {
@@ -267,11 +268,7 @@ impl commands::console::Backend for Console {
                 or_mask,
             )
         };
-        if is_failure(status) {
-            Err(NtStatus(status))
-        } else {
-            Ok(())
-        }
+        NtStatus(status).result()
     }
 
     /// Stock 0x91f4e378: four 8-byte SMC reads, two attempts each.
@@ -344,12 +341,9 @@ impl commands::console::Backend for Console {
         }
     }
 
-    fn console_id(&mut self) -> Result<ConsoleId, NtStatus> {
+    fn console_id(&mut self) -> Result<ConsoleId, KernelError> {
         let mut text = [0u8; CONSOLE_ID_LENGTH + 1];
-        let status = XeKeysGetConsoleID(core::ptr::null_mut(), text.as_mut_ptr());
-        if is_failure(status) {
-            return Err(NtStatus(status));
-        }
+        NtStatus(XeKeysGetConsoleID(core::ptr::null_mut(), text.as_mut_ptr())).result()?;
         let mut id = [0u8; CONSOLE_ID_LENGTH];
         id.copy_from_slice(&text[..CONSOLE_ID_LENGTH]);
         Ok(ConsoleId(id))
@@ -367,7 +361,7 @@ impl commands::console::Backend for Console {
         XamSetInactivityTimeFromConfig(1);
     }
 
-    fn network_ra_request(&mut self, request: NetworkRaRequest<'_>) -> XamStatus {
+    fn network_ra_request(&mut self, request: NetworkRaRequest<'_>) -> Result<(), NetworkRaError> {
         let (operation, record) = match request {
             NetworkRaRequest::Reset => {
                 let mut descriptor = NetworkRaDescriptor {
@@ -390,12 +384,12 @@ impl commands::console::Backend for Console {
             record: &mut message as *mut NetworkRaMessage as usize as u32,
             size: size_of::<NetworkRaMessage>() as u32,
         };
-        let status = send_network_ra(&mut descriptor);
+        let result = send_network_ra(&mut descriptor);
         *record = NetworkRaRecord {
             flags: message.flags,
             custom_boot_address: message.custom_boot_address,
         };
-        status
+        result
     }
 
     fn feature_switch_present(&mut self) -> bool {
@@ -409,13 +403,14 @@ impl commands::console::Backend for Console {
         }
     }
 
-    fn load_network_client(&mut self) -> NtStatus {
+    fn load_network_client(&mut self) -> Result<(), KernelError> {
         NtStatus(kernel::XexLoadImage(
             c"\\SystemRoot\\connectx.xex".as_ptr().cast(),
             8,
             0,
             core::ptr::null_mut(),
         ))
+        .result()
     }
 
     fn tick_milliseconds(&mut self) -> u32 {
@@ -582,7 +577,7 @@ impl commands::console::Backend for Console {
                 },
                 _ => HttpFailure::Request {
                     state: HTTP_FAILURE_STATE.load(Ordering::Relaxed),
-                    error: HTTP_FAILURE_ERROR.load(Ordering::Relaxed),
+                    error: Win32Error::new(HTTP_FAILURE_ERROR.load(Ordering::Relaxed)),
                 },
             };
             return HttpProgress::Failed(failure);
@@ -742,7 +737,7 @@ fn store_word(output: u32, value: u32) -> u32 {
 
 /// Export 17: copy the debug name into `buffer` of `*size` bytes.
 extern "C" fn export_get_debug_name(buffer: u32, size: u32) -> u32 {
-    get_debug_name(buffer, size).0
+    get_debug_name(buffer, size)
 }
 export!(17, export_get_debug_name);
 
@@ -831,11 +826,12 @@ extern "C" fn export_get_system_info(block: u32) -> u32 {
 }
 export!(161, export_get_system_info);
 
+/// Exports 175 and 176: a failed setting call returns its status with the
+/// NT facility bit.
 fn xconfig_result(status: u32) -> u32 {
-    if is_failure(status) {
-        status | 0x1000_0000
-    } else {
-        Hresult::OK.0
+    match NtStatus(status).result() {
+        Ok(()) => Hresult::OK.0,
+        Err(error) => Hresult::from(error).0,
     }
 }
 
@@ -928,7 +924,10 @@ extern "C" fn export_get_registration_response(transaction: u32, buffer: u32, si
     if size != 0 {
         write_word(size, response.length);
     }
-    response.result.0
+    match response.result {
+        Ok(()) => Hresult::OK.0,
+        Err(error) => Hresult::from(error).0,
+    }
 }
 export!(194, export_get_registration_response);
 
@@ -1004,19 +1003,22 @@ pub(crate) fn service_get_system_settings(argument: u32) -> u32 {
 
 /// Control code 0x33 (stock export 17): `{+0 buffer, +4 size pointer}`.
 pub(crate) fn service_get_debug_name(argument: u32) -> u32 {
-    get_debug_name(read_word(argument), read_word(argument + 4)).0
+    get_debug_name(read_word(argument), read_word(argument + 4))
 }
 
 /// Stock export 17: copy the debug name into `buffer` of `*size` bytes.
-pub(crate) fn get_debug_name(buffer: u32, size: u32) -> Hresult {
+fn get_debug_name(buffer: u32, size: u32) -> u32 {
     if buffer == 0 || size == 0 {
-        return Hresult::INVALID_ARGUMENT;
+        return Hresult::INVALID_ARGUMENT.0;
     }
     // SAFETY: the caller's buffer holds `*size` bytes.
     let output = unsafe {
         core::slice::from_raw_parts_mut(buffer as usize as *mut u8, read_word(size) as usize)
     };
-    commands::console::copy_debug_name(&debug_name(), output)
+    match commands::console::copy_debug_name(&debug_name(), output) {
+        Ok(()) => Hresult::OK.0,
+        Err(error) => Hresult::from(error).0,
+    }
 }
 
 import_thunk!(

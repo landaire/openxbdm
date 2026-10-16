@@ -9,7 +9,10 @@ use core::sync::atomic::AtomicU8;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
+use openxbdm_core::status::Hresult;
 use openxbdm_server::commands::performance::CounterSample;
+use openxbdm_server::commands::performance::counters::CounterQuery;
+use openxbdm_server::commands::performance::counters::Evaluation;
 
 use super::super::counters;
 use super::super::pmc;
@@ -162,7 +165,7 @@ const SLOTS: usize = 0x12;
 const PERCENT: f32 = 100.0;
 /// 100 percent maps to 0xffff.
 const HALFWORD_SCALE: f32 = 655.35;
-const COUNTER_QUERY: u32 = 0x20;
+const COUNTER_QUERY: CounterQuery = CounterQuery(0x20);
 const TIME_RECORD_BASE: u32 = 0x0221_0000;
 /// `XBDM` record: 0x84 bytes.
 const XBDM_TAG: u32 = 0x5842_444d;
@@ -235,8 +238,14 @@ fn query_counter(name: &[u8]) -> Option<CounterSample> {
         counter.release();
         result
     });
-    kernel::NtClose(handle);
-    (result? == openxbdm_core::status::Hresult::OK).then_some(sample)
+    handle.close();
+    let sampled = match result? {
+        Ok(Evaluation::Sampled) => true,
+        // A query routine's success counts only as exactly OK.
+        Ok(Evaluation::Routine(result)) => result == Hresult::OK,
+        Err(_) => false,
+    };
+    sampled.then_some(sample)
 }
 
 /// Sample the processor time counters, the processor statistics, and the

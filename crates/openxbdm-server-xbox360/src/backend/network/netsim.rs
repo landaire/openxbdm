@@ -10,10 +10,11 @@ use core::ptr::null_mut;
 use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::Ordering;
 
-use openxbdm_core::status::Hresult;
+use openxbdm_server::commands::network::WsaError;
 use openxbdm_server::commands::network::netsim;
 use openxbdm_server::commands::network::netsim::Direction;
 use openxbdm_server::commands::network::netsim::KeyStatus;
+use openxbdm_server::commands::network::netsim::NetsimError;
 use openxbdm_server::commands::network::netsim::Program;
 use openxbdm_server::commands::network::netsim::QueueConfig;
 use openxbdm_server::commands::network::netsim::QueueIndex;
@@ -23,8 +24,6 @@ use openxbdm_server::commands::network::netsim::QueueStats;
 use openxbdm_server::commands::network::netsim::RedirectConfig;
 use openxbdm_server::commands::network::netsim::RedirectIndex;
 use openxbdm_server::commands::network::netsim::RedirectSnapshot;
-use openxbdm_server::commands::network::netsim::WSAEALREADY;
-use openxbdm_server::commands::network::netsim::status;
 
 use self::engine::Instance;
 use super::FrameHook;
@@ -97,16 +96,13 @@ mod memory {
     }
 }
 
-/// An intercept result as a library result: positive errors become
-/// `HRESULT_FROM_WIN32`. Only the simulator's own registration turns
-/// `WSAEALREADY` into 0x82da0010.
-fn registration_error(error: i32, own_registration: bool) -> Hresult {
-    if own_registration && error as u32 == WSAEALREADY {
-        status::INTERCEPT_BUSY
-    } else if error > 0 {
-        Hresult(0x8007_0000 | (error as u32 & 0xffff))
+/// An intercept registration failure. Only the simulator's own
+/// registration turns `WSAEALREADY` into its busy error.
+fn registration_error(error: WsaError, own_registration: bool) -> NetsimError {
+    if own_registration && error == WsaError::ALREADY {
+        NetsimError::InterceptBusy
     } else {
-        Hresult(error as u32)
+        NetsimError::Intercept(error)
     }
 }
 
@@ -114,11 +110,11 @@ fn registration_error(error: i32, own_registration: bool) -> Hresult {
 /// unsynchronized with its creation and destruction, as stock does.
 static INSTANCE: AtomicPtr<Instance> = AtomicPtr::new(null_mut());
 
-fn instance() -> Result<&'static Instance, Hresult> {
+fn instance() -> Result<&'static Instance, NetsimError> {
     // SAFETY: the instance stays allocated until `destroy_simulator`.
     NonNull::new(INSTANCE.load(Ordering::Acquire))
         .map(|instance| unsafe { &*instance.as_ptr() })
-        .ok_or(status::NO_INSTANCE)
+        .ok_or(NetsimError::NoInstance)
 }
 
 /// Whether the instance exists.
@@ -160,13 +156,16 @@ pub(crate) fn redirect_count() -> u32 {
 }
 
 /// Counters of a queue (0x91f8d558).
-pub(crate) fn queue_stats(direction: Direction, index: QueueIndex) -> Result<QueueStats, Hresult> {
-    instance()?.queue_stats(direction, index.0)
+pub(crate) fn queue_stats(
+    direction: Direction,
+    index: QueueIndex,
+) -> Result<QueueStats, NetsimError> {
+    instance()?.queue_stats(direction, index)
 }
 
 /// Type and stored settings of a queue (0x91f8d620).
-pub(crate) fn queue(direction: Direction, index: QueueIndex) -> Result<QueueSnapshot, Hresult> {
-    instance()?.queue(direction, index.0)
+pub(crate) fn queue(direction: Direction, index: QueueIndex) -> Result<QueueSnapshot, NetsimError> {
+    instance()?.queue(direction, index)
 }
 
 impl netsim::Backend for Console {
@@ -176,9 +175,9 @@ impl netsim::Backend for Console {
 
     /// 0x91f365e8. A running capture moves from its own intercept into the
     /// instance; a failed registration leaves it detached, as stock does.
-    fn create_simulator(&mut self) -> Result<(), Hresult> {
+    fn create_simulator(&mut self) -> Result<(), NetsimError> {
         if instance().is_ok() {
-            return Err(status::INSTANCE_EXISTS);
+            return Err(NetsimError::InstanceExists);
         }
         let pointer = Instance::create()?;
         // SAFETY: just created and owned here.
@@ -189,7 +188,7 @@ impl netsim::Backend for Console {
         if let Some(hook) = self.network.netcap.hook() {
             instance.chain(Some(hook), false);
             let error = NetDll_XnpEthernetInterceptSetCallbacks(XNCALLER_SYSAPP, 0, 0, 0, 0);
-            if error != 0 {
+            if let Some(error) = WsaError::new(error) {
                 Instance::destroy(pointer.as_ptr());
                 return Err(registration_error(error, false));
             }
@@ -201,7 +200,7 @@ impl netsim::Backend for Console {
             instance.context(),
             INTERCEPT_FLAGS,
         );
-        if error != 0 {
+        if let Some(error) = WsaError::new(error) {
             Instance::destroy(pointer.as_ptr());
             return Err(registration_error(error, true));
         }
@@ -210,9 +209,9 @@ impl netsim::Backend for Console {
     }
 
     /// 0x91f36750.
-    fn destroy_simulator(&mut self) -> Result<(), Hresult> {
+    fn destroy_simulator(&mut self) -> Result<(), NetsimError> {
         let pointer = NonNull::new(INSTANCE.swap(null_mut(), Ordering::AcqRel))
-            .ok_or(status::INSTANCE_CHANGED)?;
+            .ok_or(NetsimError::InstanceChanged)?;
         NetDll_XnpEthernetInterceptSetCallbacks(XNCALLER_SYSAPP, 0, 0, 0, INTERCEPT_FLAGS);
         if let Some(hook) = self.network.netcap.hook() {
             NetDll_XnpEthernetInterceptSetCallbacks(
@@ -242,11 +241,8 @@ impl netsim::Backend for Console {
         kind: QueueKind,
         update: &QueueConfig,
         program: Option<&Program>,
-    ) -> Result<QueueIndex, Hresult> {
-        let position = position.map(|QueueIndex(index)| index);
-        instance()?
-            .insert_queue(direction, position, kind, update, program)
-            .map(QueueIndex)
+    ) -> Result<QueueIndex, NetsimError> {
+        instance()?.insert_queue(direction, position, kind, update, program)
     }
 
     fn modify_queue(
@@ -254,27 +250,31 @@ impl netsim::Backend for Console {
         direction: Direction,
         index: QueueIndex,
         update: &QueueConfig,
-    ) -> Result<(), Hresult> {
-        instance()?.modify_queue(direction, index.0, update)
+    ) -> Result<(), NetsimError> {
+        instance()?.modify_queue(direction, index, update)
     }
 
     fn remove_queues(
         &mut self,
         direction: Direction,
         position: Option<QueueIndex>,
-    ) -> Result<u32, Hresult> {
-        instance()?.remove_queues(direction, position.map(|QueueIndex(index)| index))
+    ) -> Result<u32, NetsimError> {
+        instance()?.remove_queues(direction, position)
     }
 
     fn queue_stats(
         &mut self,
         direction: Direction,
         index: QueueIndex,
-    ) -> Result<QueueStats, Hresult> {
+    ) -> Result<QueueStats, NetsimError> {
         queue_stats(direction, index)
     }
 
-    fn queue(&mut self, direction: Direction, index: QueueIndex) -> Result<QueueSnapshot, Hresult> {
+    fn queue(
+        &mut self,
+        direction: Direction,
+        index: QueueIndex,
+    ) -> Result<QueueSnapshot, NetsimError> {
         queue(direction, index)
     }
 
@@ -283,19 +283,16 @@ impl netsim::Backend for Console {
         position: Option<RedirectIndex>,
         redirect: &RedirectConfig,
         program: Option<&Program>,
-    ) -> Result<RedirectIndex, Hresult> {
-        let position = position.map(|RedirectIndex(index)| index);
-        instance()?
-            .insert_redirect(position, redirect, program)
-            .map(RedirectIndex)
+    ) -> Result<RedirectIndex, NetsimError> {
+        instance()?.insert_redirect(position, redirect, program)
     }
 
-    fn remove_redirects(&mut self, position: Option<RedirectIndex>) -> Result<u32, Hresult> {
-        instance()?.remove_redirects(position.map(|RedirectIndex(index)| index))
+    fn remove_redirects(&mut self, position: Option<RedirectIndex>) -> Result<u32, NetsimError> {
+        instance()?.remove_redirects(position)
     }
 
     fn redirect(&mut self, index: RedirectIndex) -> Option<RedirectSnapshot> {
-        instance().ok()?.redirect(index.0)
+        instance().ok()?.redirect(index)
     }
 
     fn key_status(&mut self) -> KeyStatus {

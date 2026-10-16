@@ -7,16 +7,17 @@ use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 use core::ptr::null_mut;
 
-use openxbdm_core::status::Hresult;
 use openxbdm_server::commands::network::netsim::Direction;
+use openxbdm_server::commands::network::netsim::NetsimError;
 use openxbdm_server::commands::network::netsim::Program;
 use openxbdm_server::commands::network::netsim::QueueConfig;
+use openxbdm_server::commands::network::netsim::QueueIndex;
 use openxbdm_server::commands::network::netsim::QueueKind;
 use openxbdm_server::commands::network::netsim::QueueSnapshot;
 use openxbdm_server::commands::network::netsim::QueueStats;
 use openxbdm_server::commands::network::netsim::RedirectConfig;
+use openxbdm_server::commands::network::netsim::RedirectIndex;
 use openxbdm_server::commands::network::netsim::RedirectSnapshot;
-use openxbdm_server::commands::network::netsim::status;
 
 use super::KeCancelTimer;
 use super::KeInitializeDpc;
@@ -81,9 +82,9 @@ fn now() -> u64 {
 struct StoredProgram(NonNull<Program>);
 
 impl StoredProgram {
-    fn new(program: &Program) -> Result<Self, Hresult> {
+    fn new(program: &Program) -> Result<Self, NetsimError> {
         let block = memory::allocate(core::mem::size_of::<Program>())
-            .ok_or(status::OUT_OF_MEMORY)?
+            .ok_or(NetsimError::OutOfMemory)?
             .cast::<Program>();
         // SAFETY: the block holds a `Program`; pool blocks are 8-aligned.
         unsafe {
@@ -92,7 +93,7 @@ impl StoredProgram {
         }
     }
 
-    fn store(program: Option<&Program>) -> Result<Option<Self>, Hresult> {
+    fn store(program: Option<&Program>) -> Result<Option<Self>, NetsimError> {
         program.map(Self::new).transpose()
     }
 
@@ -484,9 +485,9 @@ unsafe impl Sync for Instance {}
 
 impl Instance {
     /// Allocate and initialize (0x91f8ee60, 0x91f8ed88, 0x91f8c758).
-    pub(super) fn create() -> Result<NonNull<Instance>, Hresult> {
+    pub(super) fn create() -> Result<NonNull<Instance>, NetsimError> {
         let instance = memory::allocate(core::mem::size_of::<Instance>())
-            .ok_or(status::OUT_OF_MEMORY)?
+            .ok_or(NetsimError::OutOfMemory)?
             .cast::<Instance>();
         // SAFETY: the block is large enough and pool blocks are 8-aligned.
         unsafe {
@@ -525,7 +526,7 @@ impl Instance {
             Some(address) => this.lock().inner().transmit_unmodified = address,
             None => {
                 Instance::destroy(instance);
-                return Err(Hresult::error(0xe));
+                return Err(NetsimError::RoutineMissing);
             }
         }
         // SAFETY: allocation succeeded.
@@ -600,16 +601,16 @@ impl Instance {
     pub(super) fn insert_queue(
         &self,
         direction: Direction,
-        position: Option<u32>,
+        position: Option<QueueIndex>,
         kind: QueueKind,
         update: &QueueConfig,
         program: Option<&Program>,
-    ) -> Result<u32, Hresult> {
+    ) -> Result<QueueIndex, NetsimError> {
         let mut config = QueueConfig::default();
         config.merge(kind, update)?;
         let program = StoredProgram::store(program)?;
         let queue = memory::allocate(core::mem::size_of::<Queue>())
-            .ok_or(status::OUT_OF_MEMORY)?
+            .ok_or(NetsimError::OutOfMemory)?
             .cast::<Queue>();
         let mut pipeline = Pipeline::new(kind);
         pipeline.configure(update, now());
@@ -628,10 +629,10 @@ impl Instance {
             .lock()
             .inner()
             .queues(direction)
-            .insert(position, queue);
-        inserted.ok_or_else(|| {
+            .insert(position.map(|QueueIndex(index)| index), queue);
+        inserted.map(QueueIndex).ok_or_else(|| {
             free_queue(queue);
-            status::INVALID
+            NetsimError::Invalid
         })
     }
 
@@ -639,15 +640,15 @@ impl Instance {
     pub(super) fn modify_queue(
         &self,
         direction: Direction,
-        index: u32,
+        index: QueueIndex,
         update: &QueueConfig,
-    ) -> Result<(), Hresult> {
+    ) -> Result<(), NetsimError> {
         let mut guard = self.lock();
         let queue = guard
             .inner()
             .queues(direction)
-            .get(index)
-            .ok_or(status::INVALID)?;
+            .get(index.0)
+            .ok_or(NetsimError::Invalid)?;
         // SAFETY: members are live queues; the lock is held.
         let queue = unsafe { &mut *queue };
         queue.config.merge(queue.kind, update)?;
@@ -659,8 +660,8 @@ impl Instance {
     pub(super) fn remove_queues(
         &self,
         direction: Direction,
-        position: Option<u32>,
-    ) -> Result<u32, Hresult> {
+        position: Option<QueueIndex>,
+    ) -> Result<u32, NetsimError> {
         let mut guard = self.lock();
         let queues = guard.inner().queues(direction);
         match position {
@@ -671,36 +672,40 @@ impl Instance {
                 }
                 Ok(count)
             }
-            Some(index) if index < queues.count => {
+            Some(QueueIndex(index)) if index < queues.count => {
                 free_queue(queues.remove(index));
                 Ok(1)
             }
-            Some(_) => Err(status::INVALID),
+            Some(_) => Err(NetsimError::Invalid),
         }
     }
 
     pub(super) fn queue_stats(
         &self,
         direction: Direction,
-        index: u32,
-    ) -> Result<QueueStats, Hresult> {
+        index: QueueIndex,
+    ) -> Result<QueueStats, NetsimError> {
         let mut guard = self.lock();
         let queue = guard
             .inner()
             .queues(direction)
-            .get(index)
-            .ok_or(status::INVALID)?;
+            .get(index.0)
+            .ok_or(NetsimError::Invalid)?;
         // SAFETY: members are live queues.
         Ok(unsafe { (*queue).stats })
     }
 
-    pub(super) fn queue(&self, direction: Direction, index: u32) -> Result<QueueSnapshot, Hresult> {
+    pub(super) fn queue(
+        &self,
+        direction: Direction,
+        index: QueueIndex,
+    ) -> Result<QueueSnapshot, NetsimError> {
         let mut guard = self.lock();
         let queue = guard
             .inner()
             .queues(direction)
-            .get(index)
-            .ok_or(status::INVALID)?;
+            .get(index.0)
+            .ok_or(NetsimError::Invalid)?;
         // SAFETY: members are live queues.
         let queue = unsafe { &*queue };
         Ok(QueueSnapshot {
@@ -713,15 +718,15 @@ impl Instance {
     /// 0x91f8d7c0 from the allocation (0x91f8cd50) on.
     pub(super) fn insert_redirect(
         &self,
-        position: Option<u32>,
+        position: Option<RedirectIndex>,
         config: &RedirectConfig,
         program: Option<&Program>,
-    ) -> Result<u32, Hresult> {
+    ) -> Result<RedirectIndex, NetsimError> {
         let program = StoredProgram::store(program)?;
         let size = core::mem::size_of::<Redirect>()
             + usize::from(config.sessions) * core::mem::size_of::<Session>();
         let redirect = memory::allocate(size)
-            .ok_or(status::OUT_OF_MEMORY)?
+            .ok_or(NetsimError::OutOfMemory)?
             .cast::<Redirect>();
         // SAFETY: the block holds the header and the session slots.
         unsafe {
@@ -747,21 +752,28 @@ impl Instance {
                 });
             }
         }
-        let inserted = self.lock().inner().redirects.insert(position, redirect);
-        inserted.ok_or_else(|| {
+        let inserted = self
+            .lock()
+            .inner()
+            .redirects
+            .insert(position.map(|RedirectIndex(index)| index), redirect);
+        inserted.map(RedirectIndex).ok_or_else(|| {
             free_redirect(redirect);
-            status::INVALID
+            NetsimError::Invalid
         })
     }
 
     /// 0x91f8d960.
-    pub(super) fn remove_redirects(&self, position: Option<u32>) -> Result<u32, Hresult> {
+    pub(super) fn remove_redirects(
+        &self,
+        position: Option<RedirectIndex>,
+    ) -> Result<u32, NetsimError> {
         let mut guard = self.lock();
         let inner = guard.inner();
         let (first, count) = match position {
             None => (0, inner.redirects.count),
-            Some(index) if index < inner.redirects.count => (index, 1),
-            Some(_) => return Err(status::INVALID),
+            Some(RedirectIndex(index)) if index < inner.redirects.count => (index, 1),
+            Some(_) => return Err(NetsimError::Invalid),
         };
         for _ in 0..count {
             let redirect = inner.redirects.remove(first);
@@ -771,9 +783,9 @@ impl Instance {
         Ok(count)
     }
 
-    pub(super) fn redirect(&self, index: u32) -> Option<RedirectSnapshot> {
+    pub(super) fn redirect(&self, index: RedirectIndex) -> Option<RedirectSnapshot> {
         let mut guard = self.lock();
-        let redirect = guard.inner().redirects.get(index)?;
+        let redirect = guard.inner().redirects.get(index.0)?;
         // SAFETY: members are live redirects.
         let redirect = unsafe { &*redirect };
         Some(RedirectSnapshot {

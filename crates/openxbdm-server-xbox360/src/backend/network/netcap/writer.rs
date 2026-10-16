@@ -7,8 +7,11 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::KernelError;
+use openxbdm_core::status::NtStatus;
 use openxbdm_server::commands::network::netcap::BufferSizes;
 use openxbdm_server::commands::network::netcap::capture_file;
+use openxbdm_server::commands::network::netcap::capture_file::CaptureFileError;
 use openxbdm_server::commands::network::netcap::capture_file::CaptureIo;
 use openxbdm_server::commands::network::netcap::capture_file::Recorder;
 
@@ -18,8 +21,6 @@ use crate::kernel::IoStatusBlock;
 use crate::kernel::ObjectAttributes;
 use crate::kernel::SpinLocked;
 
-/// Result bit marking a kernel status carried as a result.
-const NT_STATUS_BIT: u32 = 0x1000_0000;
 const GENERIC_READ_WRITE: u32 = 0xc000_0000;
 const FILE_SHARE_READ: u32 = 1;
 /// The capture file must not exist yet (mode bit 1).
@@ -38,15 +39,29 @@ const SYSTEM_PROCESS_TYPE: u32 = 1;
 const EXECUTIVE: u32 = 3;
 const KERNEL_MODE: u32 = 0;
 const WAIT_KERNEL_MODE: u32 = 1;
-/// Writer thread exit status when it is asked to stop.
-const WRITER_STOPPED: u32 = 0x8007_04c7;
+/// Writer thread exit status when it is asked to stop
+/// (`HRESULT_FROM_WIN32(ERROR_CANCELLED)`).
+const WRITER_STOPPED: Hresult = Hresult(0x8007_04c7);
 
-fn nt_failure(status: u32) -> Hresult {
-    Hresult(status | NT_STATUS_BIT)
+/// Why the writer thread exited.
+enum WriterExit {
+    /// Waiting for the wake event failed.
+    Wait(KernelError),
+    /// `stop_thread` asked it to stop.
+    Stopped,
+    /// Writing the buffer failed.
+    Write(CaptureFileError),
 }
 
-fn failed(status: u32) -> bool {
-    (status as i32) < 0
+impl WriterExit {
+    /// The thread exit status.
+    fn code(self) -> u32 {
+        match self {
+            Self::Wait(error) => NtStatus::from(error).0,
+            Self::Stopped => WRITER_STOPPED.0,
+            Self::Write(error) => Hresult::from(error).0,
+        }
+    }
 }
 
 /// Positional access to the open capture file.
@@ -61,18 +76,16 @@ impl FileIo {
         offset: u64,
         buffer: *mut u8,
         length: u32,
-    ) -> Result<(), Hresult> {
+    ) -> Result<(), CaptureFileError> {
         let mut io = IoStatusBlock::default();
         let status = if write {
             kernel::NtWriteFile(self.0, 0, 0, 0, &mut io, buffer, length, &offset)
         } else {
             kernel::NtReadFile(self.0, 0, 0, 0, &mut io, buffer, length, &offset)
         };
-        if failed(status) {
-            return Err(nt_failure(status));
-        }
+        NtStatus(status).result()?;
         if io.information != length {
-            Err(capture_file::BAD_LENGTH)
+            Err(CaptureFileError::BadLength)
         } else {
             Ok(())
         }
@@ -80,22 +93,20 @@ impl FileIo {
 }
 
 impl CaptureIo for FileIo {
-    fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> Result<(), Hresult> {
+    fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> Result<(), CaptureFileError> {
         self.transfer(false, offset, buffer.as_mut_ptr(), buffer.len() as u32)
     }
 
-    fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), Hresult> {
+    fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), CaptureFileError> {
         self.transfer(true, offset, data.as_ptr().cast_mut(), data.len() as u32)
     }
 
-    fn truncate(&mut self, length: u64) -> Result<(), Hresult> {
+    fn truncate(&mut self, length: u64) -> Result<(), CaptureFileError> {
         for class in [FILE_END_OF_FILE_INFORMATION, FILE_ALLOCATION_INFORMATION] {
             let mut io = IoStatusBlock::default();
             let status =
                 kernel::NtSetInformationFile(self.0, &mut io, (&raw const length).cast(), 8, class);
-            if failed(status) {
-                return Err(nt_failure(status));
-            }
+            NtStatus(status).result()?;
         }
         Ok(())
     }
@@ -172,7 +183,7 @@ impl Writer {
         header: &[u8; capture_file::HEADER_SIZE],
         pool: u32,
         tag: u32,
-    ) -> Result<(), Hresult> {
+    ) -> Result<(), CaptureFileError> {
         let name = AnsiString::new(path);
         let attributes = ObjectAttributes {
             root_directory: if path.first() == Some(&b'\\') {
@@ -196,9 +207,7 @@ impl Writer {
             FILE_CREATE,
             FILE_SYNCHRONOUS_IO_NONALERT,
         );
-        if failed(status) {
-            return Err(nt_failure(status));
-        }
+        NtStatus(status).result()?;
         let result = self.prepare(handle, sizes, header, pool, tag);
         if result.is_err() {
             self.release();
@@ -213,7 +222,7 @@ impl Writer {
         header: &[u8; capture_file::HEADER_SIZE],
         pool: u32,
         tag: u32,
-    ) -> Result<(), Hresult> {
+    ) -> Result<(), CaptureFileError> {
         // SAFETY: no other user exists during `open`.
         let config = unsafe { &mut *self.config.get() };
         config.handle = handle;
@@ -229,7 +238,7 @@ impl Writer {
         });
         let buffer = kernel::ExAllocatePoolTypeWithTag(sizes.buffer, tag, pool);
         if buffer == 0 {
-            return Err(Hresult::OUT_OF_MEMORY);
+            return Err(CaptureFileError::OutOfMemory);
         }
         config.buffer = buffer as usize as *mut u8;
         config.size = sizes.buffer;
@@ -254,16 +263,14 @@ impl Writer {
             self as *const Self as usize as u32,
             flags,
         );
-        if failed(status) {
-            return Err(nt_failure(status));
-        }
+        NtStatus(status).result()?;
         self.thread.store(object, Ordering::Release);
         Ok(())
     }
 
     /// Copy `data` into the buffer (0x91f6a730). Runs at raised IRQL from
     /// the frame callbacks, so a full buffer cannot be waited for.
-    pub(super) fn put(&self, data: &[u8], completes_record: bool) -> Result<(), Hresult> {
+    pub(super) fn put(&self, data: &[u8], completes_record: bool) -> Result<(), CaptureFileError> {
         let config = self.config();
         let outcome = self.progress.with(|progress| {
             progress.record_end?;
@@ -285,7 +292,7 @@ impl Writer {
             Some((complete, progress.fill >= config.chunk))
         });
         let Some((complete, wake)) = outcome else {
-            return Err(capture_file::WRITE_FAULT);
+            return Err(CaptureFileError::WriteFault);
         };
         if wake {
             kernel::KeSetEvent(self.event(), 1, 0);
@@ -294,12 +301,12 @@ impl Writer {
             return Ok(());
         }
         self.progress.with(|progress| progress.record_end = None);
-        Err(capture_file::WRITE_FAULT)
+        Err(CaptureFileError::WriteFault)
     }
 
     /// Write out the whole buffer in pieces of at most
     /// [`capture_file::WRITE_LIMIT`] bytes (0x91f6a4e8, forced).
-    fn drain(&self) -> Result<(), Hresult> {
+    fn drain(&self) -> Result<(), CaptureFileError> {
         let config = self.config();
         loop {
             let (fill, offset, committed) = self.progress.with(|progress| {
@@ -335,7 +342,7 @@ impl Writer {
     }
 
     /// Writer thread loop (0x91f6b2a0).
-    fn run(&self) -> u32 {
+    fn run(&self) -> WriterExit {
         loop {
             let status = kernel::KeWaitForSingleObject(
                 self.event(),
@@ -344,19 +351,19 @@ impl Writer {
                 0,
                 core::ptr::null(),
             );
-            if failed(status) {
-                return status;
+            if let Err(error) = NtStatus(status).result() {
+                return WriterExit::Wait(error);
             }
             let (running, fill) = self
                 .progress
                 .with(|progress| (self.thread.load(Ordering::Acquire) != 0, progress.fill));
             if !running {
-                return WRITER_STOPPED;
+                return WriterExit::Stopped;
             }
             if fill != 0
                 && let Err(error) = self.drain()
             {
-                return error.0;
+                return WriterExit::Write(error);
             }
         }
     }
@@ -383,7 +390,7 @@ impl Writer {
     /// Stop the thread, write the buffer, and finish the file (0x91f69d18).
     /// With records, the frame table starts after the last complete record
     /// written before a record was cut short (0x91f6b080).
-    pub(super) fn finish(&self, recorder: &mut Recorder) -> Result<(), Hresult> {
+    pub(super) fn finish(&self, recorder: &mut Recorder) -> Result<(), CaptureFileError> {
         self.stop_thread();
         self.drain()?;
         let end = self.progress.with(|progress| match progress.record_end {
@@ -414,7 +421,7 @@ extern "C" fn writer_thread(context: u32) -> u32 {
     // SAFETY: `open` passes the writer, which outlives the thread:
     // `stop_thread` waits for it to exit before the writer is freed.
     let writer = unsafe { &*(context as usize as *const Writer) };
-    let status = writer.run();
+    let status = writer.run().code();
     kernel::ExTerminateThread(status);
     status
 }

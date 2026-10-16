@@ -12,10 +12,17 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::KernelError;
+use openxbdm_core::status::NtStatus;
+use openxbdm_server::commands::performance::CounterEntry;
 use openxbdm_server::commands::performance::CounterSample;
 use openxbdm_server::commands::performance::counters;
+use openxbdm_server::commands::performance::counters::CounterError;
 use openxbdm_server::commands::performance::counters::CounterObject;
+use openxbdm_server::commands::performance::counters::CounterQuery;
 use openxbdm_server::commands::performance::counters::CounterRegistration;
+use openxbdm_server::commands::performance::counters::Evaluation;
+use openxbdm_server::reply::CommandError;
 
 use crate::exports::bridged;
 use crate::exports::export;
@@ -44,7 +51,6 @@ const BUCKETS: usize = counters::MAX_PERIOD as usize;
 /// Registration flag: the source is a query routine.
 const HAS_HANDLER: u32 = 0x10_0000;
 const STATUS_NO_MORE_ENTRIES: u32 = 0x8000_001a;
-const STATUS_BUFFER_TOO_SMALL: u32 = 0xc000_0023;
 /// Directory query buffer of the monitor.
 const DIRECTORY_BUFFER: usize = 0x10c;
 /// Kernel export ordinals of the pool routines the object type uses.
@@ -59,11 +65,52 @@ pub(crate) const MONITOR_STATISTICS_LENGTH: u32 = 0x30;
 /// Processor blocks the thread counters cover.
 const PROCESSORS: usize = 6;
 
-const SUCCESS: Hresult = Hresult::OK;
-const OUT_OF_MEMORY: Hresult = Hresult(0x8007_000e);
-const INVALID_ARGUMENT: Hresult = Hresult(0x8007_0057);
-const OBJECT_NOT_FOUND: Hresult = Hresult::error(0x0e);
-const NO_DIRECTORY: Hresult = Hresult::error(0x02);
+/// A failed counter registration (stock export 33).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegisterError {
+    /// The process has no counter directory.
+    NoDirectory,
+    /// The sampling period exceeds [`counters::MAX_PERIOD`].
+    PeriodTooLong,
+    Kernel(KernelError),
+}
+
+impl From<RegisterError> for Hresult {
+    fn from(error: RegisterError) -> Self {
+        match error {
+            RegisterError::NoDirectory => Hresult::OUT_OF_MEMORY,
+            RegisterError::PeriodTooLong => CounterError::TypeInvalid.into(),
+            RegisterError::Kernel(error) => {
+                CommandError::from_kernel(error, CommandError::Fail).into()
+            }
+        }
+    }
+}
+
+/// A failed memory statistics query (stock export 75).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatisticsError {
+    /// The block's length word is not [`MONITOR_STATISTICS_LENGTH`].
+    BadLength,
+    Kernel(KernelError),
+}
+
+impl From<StatisticsError> for Hresult {
+    fn from(error: StatisticsError) -> Self {
+        match error {
+            StatisticsError::BadLength => Hresult::INVALID_ARGUMENT,
+            StatisticsError::Kernel(error) => error.into(),
+        }
+    }
+}
+
+/// The result word of the counter exports.
+fn export_result(result: Result<(), impl Into<Hresult>>) -> u32 {
+    match result {
+        Ok(()) => Hresult::OK.0,
+        Err(error) => Into::<Hresult>::into(error).0,
+    }
+}
 
 /// Registration words of the built-in counters.
 const FRAMES: u32 = 0x1_0011;
@@ -168,12 +215,22 @@ pub(super) fn directory() -> Option<u32> {
     Some(handle)
 }
 
-/// Open counter `name` (stock export 26, 0x91f2aa20).
-pub(super) fn open(name: &[u8]) -> Result<u32, Hresult> {
-    open_in(directory().ok_or(NO_DIRECTORY)?, name)
+/// An open handle to a counter object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CounterHandle(u32);
+
+impl CounterHandle {
+    pub(super) fn close(self) {
+        kernel::NtClose(self.0);
+    }
 }
 
-fn open_in(directory: u32, name: &[u8]) -> Result<u32, Hresult> {
+/// Open counter `name` (stock export 26, 0x91f2aa20).
+pub(super) fn open(name: &[u8]) -> Result<CounterHandle, CounterError> {
+    open_in(directory().ok_or(CounterError::NoDirectory)?, name)
+}
+
+fn open_in(directory: u32, name: &[u8]) -> Result<CounterHandle, CounterError> {
     let name = AnsiString::new(name);
     let attributes = ObjectAttributes {
         root_directory: directory,
@@ -187,50 +244,52 @@ fn open_in(directory: u32, name: &[u8]) -> Result<u32, Hresult> {
         0,
         &mut handle,
     )) {
-        return Err(OBJECT_NOT_FOUND);
+        return Err(CounterError::NotFound);
     }
-    Ok(handle)
+    Ok(CounterHandle(handle))
 }
 
 /// Referenced counter object of an open handle.
-pub(super) fn reference(handle: u32) -> Result<KernelCounter, u32> {
+pub(super) fn reference(handle: CounterHandle) -> Result<KernelCounter, KernelError> {
     let mut object = 0u32;
-    match kernel::ObReferenceObjectByHandle(handle, counter_type(), &mut object) {
-        status if failed(status) => Err(status),
-        _ => Ok(KernelCounter::new(object)),
-    }
+    NtStatus(kernel::ObReferenceObjectByHandle(
+        handle.0,
+        counter_type(),
+        &mut object,
+    ))
+    .result()?;
+    Ok(KernelCounter::new(object))
 }
 
 /// Evaluate a referenced counter (stock export 27, 0x91f2aab0).
-pub(super) fn query(counter: &mut KernelCounter, query: u32, out: &mut CounterSample) -> Hresult {
+pub(super) fn query(
+    counter: &mut KernelCounter,
+    query: CounterQuery,
+    out: &mut CounterSample,
+) -> Result<Evaluation, CounterError> {
     counters::query(counter, query, out)
 }
 
-/// One directory entry after `context` (0 restarts): the name length
-/// copied into `name` and the counter type (stock export 53, 0x91f2adf0).
-pub(super) fn next(context: &mut u32, name: &mut [u8]) -> Result<(usize, u16), Hresult> {
-    let directory = directory().ok_or(Hresult::END_OF_DATA)?;
+/// One directory entry after `context` (0 restarts), its name copied into
+/// `name` (stock export 53, 0x91f2adf0).
+pub(super) fn next(context: &mut u32, name: &mut [u8]) -> Result<CounterEntry, CounterError> {
+    let directory = directory().ok_or(CounterError::End)?;
     let mut buffer = [0u32; DIRECTORY_BUFFER / 4];
     let restart = u32::from(*context == 0);
-    let status = kernel::NtQueryDirectoryObject(
+    NtStatus(kernel::NtQueryDirectoryObject(
         directory,
         buffer.as_mut_ptr().cast(),
         DIRECTORY_BUFFER as u32,
         restart,
         context,
         core::ptr::null_mut(),
-    );
-    match status {
-        STATUS_NO_MORE_ENTRIES => return Err(Hresult::END_OF_DATA),
-        STATUS_BUFFER_TOO_SMALL => return Err(Hresult::error(0x105)),
-        status if failed(status) => {
-            return Err(Hresult::from_nt_status(
-                openxbdm_core::status::NtStatus(status),
-                Hresult::FAIL,
-            ));
-        }
-        _ => {}
-    }
+    ))
+    .result()
+    .map_err(|error| match error {
+        KernelError::NoMoreEntries => CounterError::End,
+        KernelError::BufferTooSmall => CounterError::NameTooLong,
+        error => CounterError::Kernel(error),
+    })?;
     // Stock copies the full entry name; the buffer holds at most 0x104
     // name bytes, which can run past the caller's name field.
     let length = ((buffer[0] >> 16) as usize).min(name.len() - 1);
@@ -238,14 +297,17 @@ pub(super) fn next(context: &mut u32, name: &mut [u8]) -> Result<(usize, u16), H
     let source = unsafe { core::slice::from_raw_parts(buffer[1] as usize as *const u8, length) };
     name[..length].copy_from_slice(source);
     name[length] = 0;
-    let handle = open(&name[..length]).map_err(|_| Hresult::UNEXPECTED)?;
+    let handle = open(&name[..length]).map_err(|_| CounterError::Unexpected)?;
     let entry = reference(handle).map(|counter| {
         let counter_type = counter.read_u32(8) as u16;
         counter.release();
-        (length, counter_type)
+        CounterEntry {
+            name_len: length,
+            counter_type,
+        }
     });
-    kernel::NtClose(handle);
-    entry.map_err(|_| Hresult::UNEXPECTED)
+    handle.close();
+    entry.map_err(|_| CounterError::Unexpected)
 }
 
 /// A counter object in kernel memory, and the IRQL to return to while the
@@ -307,10 +369,10 @@ impl CounterObject for KernelCounter {
         unsafe { core::ptr::read_volatile((self.source() + offset as usize) as *const u64) }
     }
 
-    fn call_reader(&mut self, value: &mut u64, rate: Option<&mut u64>) -> Hresult {
+    fn call_reader(&mut self, value: &mut u64, rate: Option<&mut u64>) -> Result<(), CounterError> {
         let rate = rate.map_or(0, |rate| rate as *mut u64 as usize as u32);
         // SAFETY: kind 1 counters register a reader taking (value, rate).
-        Hresult(unsafe {
+        let result = Hresult(unsafe {
             kernel::call_export(
                 self.source() as u32,
                 value as *mut u64 as usize as u32,
@@ -318,10 +380,15 @@ impl CounterObject for KernelCounter {
                 0,
                 0,
             )
-        })
+        });
+        counters::routine_result(result).map(|_| ())
     }
 
-    fn call_handler(&mut self, query: u32, out: &mut CounterSample) -> Hresult {
+    fn call_handler(
+        &mut self,
+        query: CounterQuery,
+        out: &mut CounterSample,
+    ) -> Result<Evaluation, CounterError> {
         let mut sample = [0u32; 6];
         sample[0] = (out.value >> 32) as u32;
         sample[1] = out.value as u32;
@@ -333,7 +400,7 @@ impl CounterObject for KernelCounter {
         let result = Hresult(unsafe {
             kernel::call_export(
                 self.source() as u32,
-                query,
+                query.0,
                 self.object,
                 sample.as_mut_ptr() as usize as u32,
                 0,
@@ -342,7 +409,7 @@ impl CounterObject for KernelCounter {
         out.value = (u64::from(sample[0]) << 32) | u64::from(sample[1]);
         out.rate = (u64::from(sample[2]) << 32) | u64::from(sample[3]);
         out.sample_type = sample[4];
-        result
+        counters::routine_result(result)
     }
 
     fn exclude_sampler(&mut self) {
@@ -406,25 +473,26 @@ fn frame_number() -> u32 {
 
 /// Reader of `Frames` (stock 0x91f2a510).
 extern "C" fn read_frames(value: *mut u32, _rate: *mut u32) -> u32 {
-    match TITLE_INTERFACE[FRAME_COUNT].load(Ordering::Acquire) {
-        0 => counters::DATA_NOT_AVAILABLE.0,
+    let result = match TITLE_INTERFACE[FRAME_COUNT].load(Ordering::Acquire) {
+        0 => Err(CounterError::DataNotAvailable),
         pointer => {
             write(value as usize as u32, 0);
             write(value as usize as u32 + 4, read(pointer));
-            SUCCESS.0
+            Ok(())
         }
-    }
+    };
+    export_result(result)
 }
 
 /// Reader of `Frame Ticks` (stock 0x91f2a550).
 extern "C" fn read_frame_ticks(value: *mut u32, _rate: *mut u32) -> u32 {
     let pointer = TITLE_INTERFACE[FRAME_TICKS_COUNT].load(Ordering::Acquire);
     if TITLE_INTERFACE[0].load(Ordering::Acquire) <= 0x1c || pointer == 0 {
-        return counters::DATA_NOT_AVAILABLE.0;
+        return export_result(Err(CounterError::DataNotAvailable));
     }
     write(value as usize as u32, 0);
     write(value as usize as u32 + 4, read(pointer));
-    SUCCESS.0
+    Hresult::OK.0
 }
 
 /// Sources of the built-in counters (stock 0x91fae680): eight page
@@ -555,13 +623,11 @@ pub(super) extern "C" fn set_timer(
 
 /// Register counter `name` (stock export 33): `word` is the registration
 /// word, `source` the data or routine it reads.
-fn register(name: &[u8], word: u32, source: u32) -> Hresult {
-    let Some(directory) = directory() else {
-        return OUT_OF_MEMORY;
-    };
+fn register(name: &[u8], word: u32, source: u32) -> Result<(), RegisterError> {
+    let directory = directory().ok_or(RegisterError::NoDirectory)?;
     let period = CounterRegistration(word).period();
     if period > counters::MAX_PERIOD {
-        return counters::TYPE_INVALID;
+        return Err(RegisterError::PeriodTooLong);
     }
     let name = AnsiString::new(name);
     let attributes = ObjectAttributes {
@@ -570,22 +636,20 @@ fn register(name: &[u8], word: u32, source: u32) -> Hresult {
         attributes: OBJ_PERMANENT | kernel::OBJ_CASE_INSENSITIVE,
     };
     let mut object = 0u32;
-    let status = ObCreateObject(
+    NtStatus(ObCreateObject(
         counter_type(),
         &attributes,
         counters::OBJECT_SIZE as u32,
         &mut object,
-    );
-    if failed(status) {
-        return Hresult::from_nt_status(openxbdm_core::status::NtStatus(status), Hresult::FAIL);
-    }
+    ))
+    .result()
+    .map_err(RegisterError::Kernel)?;
     // SAFETY: the object body holds OBJECT_SIZE bytes.
     unsafe { core::ptr::write_bytes(object as usize as *mut u8, 0, counters::OBJECT_SIZE) };
     let mut handle = 0u32;
-    let status = ObInsertObject(object, &attributes, 0, &mut handle);
-    if failed(status) {
-        return Hresult::from_nt_status(openxbdm_core::status::NtStatus(status), Hresult::FAIL);
-    }
+    NtStatus(ObInsertObject(object, &attributes, 0, &mut handle))
+        .result()
+        .map_err(RegisterError::Kernel)?;
     let mut counter = KernelCounter::new(object);
     counter.write_u32(0xc, source);
     counters::initialize(&mut counter, CounterRegistration(word));
@@ -595,7 +659,7 @@ fn register(name: &[u8], word: u32, source: u32) -> Hresult {
         kernel::KfLowerIrql(irql);
     }
     kernel::NtClose(handle);
-    SUCCESS
+    Ok(())
 }
 
 /// Stock export 33: `(name, word, source) -> HRESULT`.
@@ -603,23 +667,23 @@ extern "C" fn register_counter(name: *const u8, word: u32, source: u32) -> u32 {
     if name.is_null() {
         // Stock tests the directory before the name.
         return match directory() {
-            Some(_) => INVALID_ARGUMENT.0,
-            None => OUT_OF_MEMORY.0,
+            Some(_) => Hresult::INVALID_ARGUMENT.0,
+            None => Hresult::from(RegisterError::NoDirectory).0,
         };
     }
     // SAFETY: the caller passes a NUL-terminated name.
     let name = unsafe { CStr::from_ptr(name.cast()) };
-    register(name.to_bytes(), word, source).0
+    export_result(register(name.to_bytes(), word, source))
 }
 export!(33, register_counter);
 
 /// Stock export 26: `(name, handle out) -> HRESULT`.
 extern "C" fn open_counter(name: *const u8, handle: *mut u32) -> u32 {
     let Some(directory) = directory() else {
-        return NO_DIRECTORY.0;
+        return export_result(Err(CounterError::NoDirectory));
     };
     if name.is_null() {
-        return NO_DIRECTORY.0;
+        return export_result(Err(CounterError::NoDirectory));
     }
     // SAFETY: the caller passes a NUL-terminated name.
     let name = AnsiString::new(unsafe { CStr::from_ptr(name.cast()) }.to_bytes());
@@ -629,10 +693,11 @@ extern "C" fn open_counter(name: *const u8, handle: *mut u32) -> u32 {
         attributes: kernel::OBJ_CASE_INSENSITIVE,
     };
     // The kernel stores the handle through the caller's pointer.
-    match kernel::ObOpenObjectByName(&attributes, counter_type(), 0, handle) {
-        status if failed(status) => OBJECT_NOT_FOUND.0,
-        _ => SUCCESS.0,
-    }
+    let result = match kernel::ObOpenObjectByName(&attributes, counter_type(), 0, handle) {
+        status if failed(status) => Err(CounterError::NotFound),
+        _ => Ok(()),
+    };
+    export_result(result)
 }
 export!(26, open_counter);
 
@@ -641,14 +706,11 @@ export!(26, open_counter);
 /// not produce.
 extern "C" fn query_counter(handle: u32, query_type: u32, sample: *mut u32) -> u32 {
     if sample.is_null() {
-        return INVALID_ARGUMENT.0;
+        return Hresult::INVALID_ARGUMENT.0;
     }
-    let mut counter = match reference(handle) {
+    let mut counter = match reference(CounterHandle(handle)) {
         Ok(counter) => counter,
-        Err(status) => {
-            return Hresult::from_nt_status(openxbdm_core::status::NtStatus(status), Hresult::FAIL)
-                .0;
-        }
+        Err(error) => return export_result(Err(CounterError::Kernel(error))),
     };
     let address = sample as usize as u32;
     let mut out = CounterSample {
@@ -656,14 +718,17 @@ extern "C" fn query_counter(handle: u32, query_type: u32, sample: *mut u32) -> u
         rate: (u64::from(read(address + 8)) << 32) | u64::from(read(address + 0xc)),
         sample_type: read(address + 0x10),
     };
-    let result = query(&mut counter, query_type, &mut out);
+    let result = query(&mut counter, CounterQuery(query_type), &mut out);
     counter.release();
     write(address, (out.value >> 32) as u32);
     write(address + 4, out.value as u32);
     write(address + 8, (out.rate >> 32) as u32);
     write(address + 0xc, out.rate as u32);
     write(address + 0x10, out.sample_type);
-    result.0
+    match result {
+        Ok(evaluation) => Hresult::from(evaluation).0,
+        Err(error) => Hresult::from(error).0,
+    }
 }
 export!(27, query_counter);
 
@@ -675,10 +740,10 @@ const ENTRY_NAME: usize = 0x100;
 extern "C" fn walk_counters(context: *mut u32, entry: *mut u8) -> u32 {
     let directory = directory();
     if context.is_null() || entry.is_null() {
-        return INVALID_ARGUMENT.0;
+        return Hresult::INVALID_ARGUMENT.0;
     }
     if directory.is_none() {
-        return Hresult::END_OF_DATA.0;
+        return export_result(Err(CounterError::End));
     }
     // SAFETY: the caller passes a context dword and an entry of
     // ENTRY_NAME + 4 bytes.
@@ -688,24 +753,21 @@ extern "C" fn walk_counters(context: *mut u32, entry: *mut u8) -> u32 {
             core::slice::from_raw_parts_mut(entry, ENTRY_NAME),
         )
     };
-    match next(context, name) {
-        Ok((_, counter_type)) => {
-            write(
-                entry as usize as u32 + ENTRY_NAME as u32,
-                u32::from(counter_type),
-            );
-            SUCCESS.0
-        }
-        Err(result) => result.0,
-    }
+    let result = next(context, name).map(|counter| {
+        write(
+            entry as usize as u32 + ENTRY_NAME as u32,
+            u32::from(counter.counter_type),
+        );
+    });
+    export_result(result)
 }
 export!(53, walk_counters);
 
 /// Fill the monitor's memory statistics block (stock export 75,
 /// 0x91f331c8): `out[0]` is the length word and must be 0x30.
-pub(crate) fn memory_statistics(out: &mut [u32; 12]) -> Hresult {
+pub(crate) fn memory_statistics(out: &mut [u32; 12]) -> Result<(), StatisticsError> {
     if out[0] != MONITOR_STATISTICS_LENGTH {
-        return INVALID_ARGUMENT;
+        return Err(StatisticsError::BadLength);
     }
     let mut reply = [0u32; MEMORY_STATISTICS_REPLY_LENGTH as usize / 4];
     reply[0] = MEMORY_STATISTICS_REPLY_LENGTH;
@@ -724,9 +786,7 @@ pub(crate) fn memory_statistics(out: &mut [u32; 12]) -> Hresult {
         status = MmQueryStatistics(statistics.as_mut_ptr());
         &statistics
     };
-    if failed(status) {
-        return Hresult(status | 0x1000_0000);
-    }
+    NtStatus(status).result().map_err(StatisticsError::Kernel)?;
     out[1] = s[1];
     out[2] = s[0xe].wrapping_add(s[3]);
     out[3] = s[0x13].wrapping_add(s[8]);
@@ -741,7 +801,7 @@ pub(crate) fn memory_statistics(out: &mut [u32; 12]) -> Hresult {
     out[9] = s[0x18].wrapping_add(s[0xd]);
     out[10] = s[0x11].wrapping_add(s[6]).wrapping_add(s[2]);
     out[11] = 0;
-    SUCCESS
+    Ok(())
 }
 
 /// Update the idle/DPC/ISR sources from the processor blocks.
@@ -961,7 +1021,7 @@ fn retire_counters(directory: u32) -> usize {
             ObMakeTemporaryObject(counter.object);
             counter.release();
         }
-        kernel::NtClose(handle);
+        handle.close();
     }
 }
 

@@ -15,9 +15,11 @@ use openxbdm_client::commands::SetMem;
 use openxbdm_client::commands::VirtualRegion;
 use openxbdm_client::commands::WalkMem;
 use openxbdm_client::commands::XbeInfo;
+use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
 use openxbdm_server::commands::memory::TrackingFlags;
 use openxbdm_server::commands::memory::detour::EntryId;
+use openxbdm_server::commands::memory::detour::ReturnValue;
 use openxbdm_server_host::backend::memory::MEMORY_BASE;
 use openxbdm_server_host::backend::memory::detour::CallOutcome;
 use openxbdm_server_host::backend::memory::detour::SimulatedCall;
@@ -447,9 +449,10 @@ fn advmem_toggles_the_flash_flag() {
     assert_eq!(server.host.lock().backend.memory.flash[6..8], [1, 0]);
     assert_eq!(session.command("advmem"), "400- improper command");
 
-    server.host.lock().backend.memory.flash_write_failure = Some(NtStatus(0xc000_0185));
+    server.host.lock().backend.memory.flash_write_failure =
+        Some(KernelError::from_status(NtStatus(0xc000_0185)));
     assert_eq!(session.command("advmem on"), "400- unexpected error");
-    server.host.lock().backend.memory.flash_read_failure = Some(NtStatus(0xc000_0034));
+    server.host.lock().backend.memory.flash_read_failure = Some(KernelError::ObjectNameNotFound);
     assert_eq!(session.command("advmem"), "400- unexpected error");
 }
 
@@ -824,7 +827,7 @@ fn detour_discarded_call_completes_its_overlapped_request() {
     let call = SimulatedCall {
         frame: MEMORY_BASE + 0x200,
         registers: [3, u64::from(overlapped), 5, 6, 7, 8, 9, 10],
-        original_result: 0x99,
+        original_result: ReturnValue(0x99),
         ..SimulatedCall::default()
     };
     let outcome = server.host.lock().backend.detour_call(EntryId(0), call);
@@ -832,7 +835,7 @@ fn detour_discarded_call_completes_its_overlapped_request() {
         outcome,
         CallOutcome {
             called: false,
-            returned: 0x3e5
+            returned: ReturnValue::IO_PENDING
         }
     );
     {
@@ -919,7 +922,7 @@ fn detour_call_through_to_the_original_counts_discards() {
         "200- hresult=0x2da0000"
     );
     let call = SimulatedCall {
-        original_result: 9,
+        original_result: ReturnValue(9),
         ..SimulatedCall::default()
     };
     let first = server.host.lock().backend.detour_call(EntryId(0), call);
@@ -928,14 +931,14 @@ fn detour_call_through_to_the_original_counts_discards() {
         first,
         CallOutcome {
             called: true,
-            returned: 9
+            returned: ReturnValue(9)
         }
     );
     assert_eq!(
         second,
         CallOutcome {
             called: false,
-            returned: 7
+            returned: ReturnValue(7)
         }
     );
     // Sleep before the call and after it, twice.

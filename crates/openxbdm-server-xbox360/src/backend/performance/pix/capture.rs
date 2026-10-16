@@ -222,12 +222,9 @@ pub(super) fn module_records() {
     }
     timing::write_record(0x66, &[]);
     let mut walk = 0u32;
-    let mut module = [0u32; 0x124 / 4];
+    let mut module = [0u32; crate::backend::memory::MODULE_RECORD_SHORT_SIZE / 4];
     let mut directory = [0u32; 0x118 / 4];
-    let walk_address = core::ptr::from_mut(&mut walk) as usize as u32;
-    while crate::backend::memory::walk_modules(walk_address, module.as_mut_ptr() as usize as u32)
-        == 0x02da_0000
-    {
+    while crate::backend::memory::next_module(&mut walk, &mut module).is_ok() {
         crate::backend::memory::get_module_debug_directory(
             module[0x104 / 4],
             directory.as_mut_ptr() as usize as u32,

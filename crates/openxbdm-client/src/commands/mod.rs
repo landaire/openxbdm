@@ -56,6 +56,7 @@ pub use debug::Go;
 pub use debug::Halt;
 pub use debug::IsBreak;
 pub use debug::IsStopped;
+pub use debug::NtStatus;
 pub use debug::Resume;
 pub use debug::SetInitialBreakpoint;
 pub use debug::Stop;

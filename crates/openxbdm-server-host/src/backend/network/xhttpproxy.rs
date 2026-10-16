@@ -1,7 +1,5 @@
 //! Simulated proxy list.
 
-use openxbdm_core::status::ErrorCode;
-use openxbdm_core::status::Hresult;
 use openxbdm_server::commands::network::decode_hex;
 use openxbdm_server::commands::network::xhttpproxy;
 use openxbdm_server::commands::network::xhttpproxy::Certificate;
@@ -9,6 +7,7 @@ use openxbdm_server::commands::network::xhttpproxy::Inserted;
 use openxbdm_server::commands::network::xhttpproxy::NAME_CAPACITY;
 use openxbdm_server::commands::network::xhttpproxy::NewProxy;
 use openxbdm_server::commands::network::xhttpproxy::ProxyEntry;
+use openxbdm_server::commands::network::xhttpproxy::ProxyError;
 use openxbdm_server::commands::network::xhttpproxy::ProxyFlags;
 use openxbdm_server::commands::network::xhttpproxy::ProxyId;
 use openxbdm_server::commands::network::xhttpproxy::ProxyOutcome;
@@ -81,10 +80,9 @@ impl xhttpproxy::Backend for MockBackend {
             Certificate::Hex { size, .. } | Certificate::Upload { size } => size,
         };
         if std::mem::take(&mut mock.fail_allocation) || certificate_size > POOL_LIMIT {
-            let error = Hresult::from_error_code(ErrorCode::OUT_OF_MEMORY);
             return ProxyOutcome {
                 cleared,
-                inserted: Some(Err(error)),
+                inserted: Some(Err(ProxyError::OutOfMemory)),
             };
         }
         mock.next_id += 1;
@@ -106,7 +104,7 @@ impl xhttpproxy::Backend for MockBackend {
                         entry.certificate = certificate;
                         Ok(Inserted::Applied)
                     }
-                    _ => Err(Hresult::from_error_code(ErrorCode::UNKNOWN_COMMAND)),
+                    _ => Err(ProxyError::BadCertificate),
                 }
             }
             Certificate::Upload { size } => {

@@ -1,9 +1,10 @@
 //! `netsim` over TCP.
 
-use openxbdm_core::status::Hresult;
 use openxbdm_server::commands::network::LinkFlags;
 use openxbdm_server::commands::network::SystemVersion;
+use openxbdm_server::commands::network::WsaError;
 use openxbdm_server::commands::network::netsim::ConfigMask;
+use openxbdm_server::commands::network::netsim::NetsimError;
 use openxbdm_server::commands::network::netsim::QueueConfig;
 use openxbdm_server::commands::network::netsim::QueueKind;
 use openxbdm_server::commands::network::netsim::QueueStats;
@@ -217,15 +218,16 @@ fn insertq_rejections() {
 fn instance_creation_failures() {
     let server = TestServer::start();
     let mut session = session(&server);
+    // ERROR_ACCESS_DENIED from the intercept registration.
     with_mock(&server, |mock| {
-        mock.create_error = Some(Hresult(0x8007_0005))
+        mock.create_error = WsaError::new(5).map(NetsimError::Intercept)
     });
     assert_eq!(
         session.command(&format!("netsim insertq in cfg={UNSHAPED}")),
         "400- err=0x80070005"
     );
     with_mock(&server, |mock| {
-        mock.create_error = Some(Hresult(0x82da_0010))
+        mock.create_error = Some(NetsimError::InterceptBusy)
     });
     assert_eq!(
         session.command(&format!("netsim insertipv4redir cfg={REDIRECT}")),

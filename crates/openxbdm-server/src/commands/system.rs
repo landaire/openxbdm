@@ -7,12 +7,15 @@ use core::fmt::Write as _;
 use openxbdm_core::line::CommandLine;
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
-use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::KernelError;
+use openxbdm_core::status::Win32Error;
 
 use crate::access::Access;
 use crate::backend::Backend as AnyBackend;
 use crate::commands;
+use crate::commands::console::ConfigFlags;
 use crate::commands::console::ConfigSetting;
+use crate::commands::console::RetailFlags;
 use crate::commands::console::TraceMask;
 use crate::commands::console::trace;
 use crate::commands::console::trace_text;
@@ -33,6 +36,9 @@ use crate::notify::Event;
 use crate::notify::ExecutionState;
 use crate::registry::CommandEntry;
 use crate::registry::DispatchFlags;
+use crate::reply::CommandError;
+use crate::reply::CommandResult;
+use crate::reply::Reply;
 use crate::server::Server;
 use crate::state::ServerState;
 
@@ -47,7 +53,7 @@ const fn entry(
     name: &'static str,
     any_of: Access,
     flags: DispatchFlags,
-    handler: fn(&mut Invocation<'_>) -> Hresult,
+    handler: fn(&mut Invocation<'_>) -> CommandResult,
 ) -> CommandEntry {
     CommandEntry::new(name, any_of, Access::NONE, flags, handler)
 }
@@ -249,9 +255,17 @@ pub struct FlashOptions {
     pub stock_image: bool,
 }
 
-/// A Win32 error code.
+/// Programming the flash failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Win32Error(pub core::num::NonZeroU32);
+pub struct FlashFailed(pub Win32Error);
+
+/// The `flash` result: the Win32 facility applied to the low word of any
+/// code, as the reply text prints it.
+impl From<FlashFailed> for Hresult {
+    fn from(FlashFailed(error): FlashFailed) -> Self {
+        Hresult(0x8007_0000 | (error.code() & 0xffff))
+    }
+}
 
 /// An open settings file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,7 +298,7 @@ pub enum CreateSettingsError {
     /// The write buffer could not be allocated.
     NoBuffer,
     /// The file could not be created.
-    Create(NtStatus),
+    Create(KernelError),
 }
 
 /// Platform services this domain needs.
@@ -297,7 +311,7 @@ pub trait Backend {
     /// the title process, which stock hands to the server thread.
     fn title_process_caller(&mut self) -> bool;
     /// Low dword of the size of a settings file opened for reading.
-    fn settings_file_size(&mut self, file: SettingsFile) -> Result<u32, NtStatus>;
+    fn settings_file_size(&mut self, file: SettingsFile) -> Result<u32, KernelError>;
     /// Start a copy of the settings text; `None` when its buffer cannot be
     /// allocated. Bytes go through [`Backend::write_settings`].
     fn begin_settings_copy(&mut self, copy: SettingsCopy) -> Option<SettingsFile>;
@@ -337,7 +351,10 @@ pub trait Backend {
     fn flash_abort(&mut self);
 }
 
-pub(crate) fn resume(continuation: &mut Continuation, cx: &mut ContinuationContext<'_>) -> Hresult {
+pub(crate) fn resume(
+    continuation: &mut Continuation,
+    cx: &mut ContinuationContext<'_>,
+) -> CommandResult {
     match continuation {
         Continuation::Flash(upload) => resume_flash(upload, cx),
     }
@@ -480,7 +497,8 @@ fn write_settings_file(
     let file = match backend.create_settings() {
         Ok(file) => file,
         Err(CreateSettingsError::NoBuffer) => return,
-        Err(CreateSettingsError::Create(NtStatus(status))) => {
+        Err(CreateSettingsError::Create(error)) => {
+            let status = error.status().0;
             let text = format_args!("XBDM: WriteIniFileImpl - Failed Create: 0x{status:08x}\n");
             trace(state, backend, TraceMask::SETTINGS, text);
             return;
@@ -867,7 +885,8 @@ fn trace_settings_file(state: &ServerState, backend: &mut dyn AnyBackend, file: 
             let text = format_args!("XBDM: Handle: 0x{handle:08x}, File Size: {}\n", size as i32);
             trace(state, backend, TraceMask::SETTINGS, text);
         }
-        Err(NtStatus(status)) => {
+        Err(error) => {
+            let status = error.status().0;
             let text = format_args!("XBDM: NtQueryInformationFile Failed: 0x{status:08x}\n");
             trace(state, backend, TraceMask::SETTINGS, text);
         }
@@ -980,9 +999,9 @@ fn reboot_from_settings(invocation: &mut Invocation<'_>, kind: RebootKind) {
 /// `reboot [stop] [wait] [smcreset]`: reply, then restart. The server
 /// writes the settings file, sends `execution rebooting`, and closes every
 /// connection and notification channel before the restart.
-fn reboot(invocation: &mut Invocation<'_>) -> Hresult {
+fn reboot(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(session) = invocation.session.as_deref_mut() else {
-        return Hresult::NO_REPLY;
+        return Ok(Reply::Sent);
     };
     let kind = if invocation.line.has("smcreset") {
         RebootKind::SmcReset
@@ -1001,15 +1020,15 @@ fn reboot(invocation: &mut Invocation<'_>) -> Hresult {
         }
     }
     invocation.state.settings_dirty = true;
-    Hresult::NO_REPLY
+    Ok(Reply::Sent)
 }
 
 /// `recovery`: request a recovery boot and restart. From the settings file
 /// the line only records the request.
-fn recovery(invocation: &mut Invocation<'_>) -> Hresult {
+fn recovery(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.session.is_none() {
         invocation.state.system.recovery_boot = true;
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     invocation.state.system.recovery_requested = true;
     launch(invocation, BootFlags::COLD, None)
@@ -1063,9 +1082,9 @@ fn record_hard_reboot(system: &mut State, flags: BootFlags) {
 
 /// `systime`: the system clock as FILETIME halves, once `setsystime` has
 /// run.
-fn system_time(invocation: &mut Invocation<'_>) -> Hresult {
+fn system_time(invocation: &mut Invocation<'_>) -> CommandResult {
     if !invocation.state.system.clock_set {
-        return Hresult::from_error_code(ErrorCode::CLOCK_NOT_SET);
+        return Err(ErrorCode::ClockNotSet.into());
     }
     let time = invocation.backend.system_time();
     invocation.set_text(format_args!(
@@ -1073,29 +1092,29 @@ fn system_time(invocation: &mut Invocation<'_>) -> Hresult {
         (time >> 32) as u32,
         time as u32
     ));
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `setsystime clockhi=<dword> clocklo=<dword> [tz=<dword>]`: set the
 /// clock; with `tz`, fill in a default time zone when none is configured.
-fn set_system_time(invocation: &mut Invocation<'_>) -> Hresult {
+fn set_system_time(invocation: &mut Invocation<'_>) -> CommandResult {
     let dword = |name: &str| invocation.line.dword(name);
     let (Some(high), Some(low)) = (dword("clockhi"), dword("clocklo")) else {
-        return Hresult::from_error_code(ErrorCode::CLOCK_NOT_SET);
+        return Err(ErrorCode::ClockNotSet.into());
     };
     let has_zone = dword("tz").is_some();
     let backend = &mut *invocation.backend;
     backend.set_system_time(u64::from(high) << 32 | u64::from(low));
     invocation.state.system.clock_set = true;
     if !has_zone {
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     let mut standard_name = [0u8; 4];
     if backend
         .xconfig_get(ConfigSetting::new(3, 2), &mut standard_name)
         .is_err()
     {
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     if standard_name[0] == 0 {
         const DEFAULT_ZONE: [(u16, [u8; 4]); 7] = [
@@ -1112,7 +1131,7 @@ fn set_system_time(invocation: &mut Invocation<'_>) -> Hresult {
                 .xconfig_set(ConfigSetting::new(3, index), &value)
                 .is_err()
             {
-                return Hresult::from_error_code(ErrorCode::CLOCK_NOT_SET);
+                return Err(ErrorCode::ClockNotSet.into());
             }
         }
     }
@@ -1120,34 +1139,35 @@ fn set_system_time(invocation: &mut Invocation<'_>) -> Hresult {
     let mut enabled = [0u8; 4];
     let _ = backend.xconfig_get(ConfigSetting::new(3, 9), &mut enabled);
     if enabled != [0; 4] {
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     match backend.xconfig_set(ConfigSetting::new(3, 9), &1u32.to_be_bytes()) {
-        Ok(()) => Hresult::OK,
-        Err(_) => Hresult::from_error_code(ErrorCode::CLOCK_NOT_SET),
+        Ok(()) => Ok(Reply::Ok),
+        Err(_) => Err(ErrorCode::ClockNotSet.into()),
     }
 }
 
 /// `setdiscboot enable=<0|1>`: select the boot device bits of
 /// configuration setting (3, 0xc) through the kernel modify export.
-fn set_disc_boot(invocation: &mut Invocation<'_>) -> Hresult {
+fn set_disc_boot(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(enable) = util::required_dword(invocation, "enable") else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
-    let or_mask = match enable {
-        0 => 0x80,
-        1 => 0x2000,
-        _ => return Hresult::FAIL,
+    let selected = match enable {
+        0 => RetailFlags::DISC_BOOT_DISABLED,
+        1 => RetailFlags::DISC_BOOT_ENABLED,
+        _ => return Err(CommandError::Fail),
     };
-    match invocation.backend.xconfig_modify(
-        ConfigSetting::new(3, 0xc),
-        !or_mask & 0xfffd_d77f,
-        or_mask,
-    ) {
-        Ok(()) => Hresult::OK,
-        Err(NtStatus(status)) => {
+    let (selected, field) = (selected.bits(), RetailFlags::BOOT_DEVICE.bits());
+    match invocation
+        .backend
+        .xconfig_modify(RetailFlags::SETTING, !selected & !field, selected)
+    {
+        Ok(()) => Ok(Reply::Ok),
+        Err(error) => {
+            let status = error.status().0;
             invocation.set_text(format_args!("Modify failed: 0x{status:08x}"));
-            Hresult::FAIL
+            Err(CommandError::Fail)
         }
     }
 }
@@ -1157,7 +1177,7 @@ const RESET_CHORD_SIZE: usize = 5;
 
 /// `setreset [chord=<string>]`: store the reset button chord (up to four
 /// characters), or report the stored one.
-fn set_reset(invocation: &mut Invocation<'_>) -> Hresult {
+fn set_reset(invocation: &mut Invocation<'_>) -> CommandResult {
     let setting = ConfigSetting::new(2, 5);
     let mut chord = [0u8; RESET_CHORD_SIZE];
     let result = match invocation.line.param("chord") {
@@ -1176,7 +1196,7 @@ fn set_reset(invocation: &mut Invocation<'_>) -> Hresult {
             .map(Some),
     };
     match result {
-        Ok(None) => Hresult::OK,
+        Ok(None) => Ok(Reply::Ok),
         Ok(Some(length)) => {
             let stored = &chord[..length.min(RESET_CHORD_SIZE)];
             let end = stored
@@ -1184,11 +1204,11 @@ fn set_reset(invocation: &mut Invocation<'_>) -> Hresult {
                 .position(|&byte| byte == 0)
                 .unwrap_or(stored.len());
             invocation.text.set_bytes(&stored[..end]);
-            Hresult::OK
+            Ok(Reply::Ok)
         }
         Err(_) => {
             invocation.set_text(format_args!("Could not change reset key"));
-            Hresult::FAIL
+            Err(CommandError::Fail)
         }
     }
 }
@@ -1430,9 +1450,9 @@ fn set_title(
     drive: Option<&[u8]>,
     command_line: Option<&[u8]>,
     persist: bool,
-) -> Hresult {
+) -> CommandResult {
     if !title_exists(state, backend, image, TitleCheck::PreBoot) {
-        return Hresult::from_error_code(ErrorCode::FILE_NOT_FOUND);
+        return Err(ErrorCode::FileNotFound.into());
     }
     let system = &mut state.system;
     system.title.set(image, drive, command_line);
@@ -1440,7 +1460,7 @@ fn set_title(
         system.persistent_title = system.title;
     }
     save_settings(state, backend);
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// Flags of export 81.
@@ -1461,7 +1481,7 @@ impl TitleFlags {
 /// Export 81 (stock 0x91f47140), and export 42 with no flags: set the
 /// launch title from the drive paths `dir` and `name`. With
 /// [`TitleFlags::CLEAR_PERSISTENT`] and no `name`, only the persistent
-/// title is cleared.
+/// title is cleared. The exports return the result as an HRESULT.
 pub fn set_title_from_paths(
     state: &mut ServerState,
     backend: &mut dyn AnyBackend,
@@ -1469,20 +1489,20 @@ pub fn set_title_from_paths(
     name: Option<&[u8]>,
     command_line: Option<&[u8]>,
     flags: TitleFlags,
-) -> Hresult {
+) -> CommandResult {
     if flags.contains(TitleFlags::CLEAR_PERSISTENT) {
         state.system.persistent_title = LaunchTitle::default();
         if name.is_none() {
             save_settings(state, backend);
-            return Hresult::OK;
+            return Ok(Reply::Ok);
         }
     }
     let Some(name) = name else {
-        return Hresult::INVALID_ARGUMENT;
+        return Err(CommandError::InvalidArgument);
     };
     let mut paths = TitlePaths::EMPTY;
     if !image_and_drive(state, backend, name, dir, &mut paths) {
-        return Hresult::from_error_code(ErrorCode::FILE_NOT_FOUND);
+        return Err(ErrorCode::FileNotFound.into());
     }
     set_title(
         state,
@@ -1499,7 +1519,7 @@ pub fn set_title_from_paths(
 /// honored and `name`/`dir` are object paths taken as given; from a
 /// connection they are drive paths, as for export 81. The settings file
 /// is written again after the title is set.
-fn title(invocation: &mut Invocation<'_>) -> Hresult {
+fn title(invocation: &mut Invocation<'_>) -> CommandResult {
     let line = invocation.line;
     let loading = invocation.session.is_none();
     if loading && let Some(flags) = line.dword("flags") {
@@ -1510,14 +1530,14 @@ fn title(invocation: &mut Invocation<'_>) -> Hresult {
         // Stock writes the settings file twice here.
         save_settings(invocation.state, invocation.backend);
         save_settings(invocation.state, invocation.backend);
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     let mut dir_buffer = [0u8; TITLE_PARAMETER_BUFFER];
     let dir = string_param(line, "dir", &mut dir_buffer);
     let mut name_buffer = [0u8; TITLE_PARAMETER_BUFFER];
     let Some(name) = string_param(line, "name", &mut name_buffer) else {
         invocation.set_text(format_args!("missing name"));
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     let persist = line.has("persist");
     let command_line = line.param("cmdline").map(|value| value.raw());
@@ -1559,7 +1579,7 @@ pub struct LaunchRequest<'a> {
 
 /// How a launch continues after [`begin_launch`].
 enum LaunchOutcome {
-    Done(Hresult),
+    Done(CommandResult),
     /// Restart the console with these flags.
     HardReboot(BootFlags),
 }
@@ -1576,7 +1596,7 @@ fn begin_launch(
     if let Some(request) = &request
         && !title_exists(state, backend, request.image, TitleCheck::PreBoot)
     {
-        return LaunchOutcome::Done(Hresult::from_error_code(ErrorCode::FILE_NOT_FOUND));
+        return LaunchOutcome::Done(Err(ErrorCode::FileNotFound.into()));
     }
     let execution = backend.execution_state();
     let system = &mut state.system;
@@ -1596,7 +1616,7 @@ fn begin_launch(
     }
     if effective.0 & HARD_REBOOT_FLAGS == 0 {
         if execution == ExecutionState::RebootTitle {
-            return LaunchOutcome::Done(Hresult::OK);
+            return LaunchOutcome::Done(Ok(Reply::Ok));
         }
         if backend.title_launch_registered()
             && !commands::debugger::threads_block_relaunch(state, backend)
@@ -1609,7 +1629,7 @@ fn begin_launch(
             );
             state.system.boot_flags = effective;
             backend.launch_title();
-            return LaunchOutcome::Done(Hresult::OK);
+            return LaunchOutcome::Done(Ok(Reply::Ok));
         }
     }
     LaunchOutcome::HardReboot(effective)
@@ -1620,7 +1640,7 @@ fn launch(
     invocation: &mut Invocation<'_>,
     flags: BootFlags,
     request: Option<LaunchRequest<'_>>,
-) -> Hresult {
+) -> CommandResult {
     match begin_launch(
         invocation.state,
         invocation.backend,
@@ -1631,7 +1651,7 @@ fn launch(
         LaunchOutcome::Done(result) => result,
         LaunchOutcome::HardReboot(effective) => {
             hard_reboot(invocation, effective);
-            Hresult::NO_REPLY
+            Ok(Reply::Sent)
         }
     }
 }
@@ -1639,21 +1659,21 @@ fn launch(
 /// Exports 28 and 125 (stock 0x91f278a8 with no connection): launch a
 /// title, relaunching in place when possible; otherwise prepare the
 /// restart as control code 0x02 does and restart, which on a console
-/// does not return.
+/// does not return. The exports return the result as an HRESULT.
 pub fn launch_without_connection(
     server: &mut Server,
     backend: &mut dyn AnyBackend,
     network: &mut dyn Network,
     flags: BootFlags,
     request: Option<LaunchRequest<'_>>,
-) -> Hresult {
+) -> CommandResult {
     match begin_launch(&mut server.state, backend, network, flags, request) {
         LaunchOutcome::Done(result) => result,
         LaunchOutcome::HardReboot(effective) => {
             record_hard_reboot(&mut server.state.system, effective);
             prepare_reboot(server, backend, network);
             backend.reboot(RebootKind::Normal);
-            Hresult::NO_REPLY
+            Ok(Reply::Sent)
         }
     }
 }
@@ -1669,10 +1689,10 @@ pub fn launch_from_paths(
     image: Option<&[u8]>,
     drive: Option<&[u8]>,
     command_line: Option<&[u8]>,
-) -> Hresult {
+) -> CommandResult {
     let Some(image) = image else {
         if drive.is_some() || command_line.is_some() {
-            return Hresult::INVALID_ARGUMENT;
+            return Err(CommandError::InvalidArgument);
         }
         return launch_without_connection(server, backend, network, flags, None);
     };
@@ -1687,18 +1707,15 @@ pub fn launch_from_paths(
     let mut paths = TitlePaths::EMPTY;
     let Some(image) = translate_title_path(&mut server.state, backend, image, &mut paths.image)
     else {
-        return Hresult::from_error_code(ErrorCode::FILE_NOT_FOUND);
+        return Err(ErrorCode::FileNotFound.into());
     };
-    let drive = match translate_optional_path(
+    let drive = translate_optional_path(
         &mut server.state,
         backend,
         drive,
         &mut paths.drive,
-        ErrorCode::PATH_NOT_FOUND,
-    ) {
-        Ok(drive) => drive,
-        Err(error) => return error,
-    };
+        ErrorCode::PathNotFound,
+    )?;
     let request = LaunchRequest {
         image: image.as_bytes(),
         drive,
@@ -1715,19 +1732,19 @@ fn translate_optional_path<'p>(
     path: Option<&[u8]>,
     translated: &'p mut TitlePath,
     error: ErrorCode,
-) -> Result<Option<&'p [u8]>, Hresult> {
+) -> Result<Option<&'p [u8]>, CommandError> {
     let Some(path) = path else {
         return Ok(None);
     };
     match translate_title_path(state, backend, path, translated) {
         Some(translated) => Ok(Some(translated.as_bytes())),
-        None => Err(Hresult::from_error_code(error)),
+        None => Err(error.into()),
     }
 }
 
 /// `magicboot [warm] [cold] [wait] [stop] [title=<s>] [directory=<s>]
 /// [cmdline=<s>]`: launch a title, relaunching in place when possible.
-fn magic_boot(invocation: &mut Invocation<'_>) -> Hresult {
+fn magic_boot(invocation: &mut Invocation<'_>) -> CommandResult {
     let line = invocation.line;
     let mut flags = 0;
     for (name, bit) in [
@@ -1742,26 +1759,20 @@ fn magic_boot(invocation: &mut Invocation<'_>) -> Hresult {
     }
     let mut paths = TitlePaths::EMPTY;
     let mut buffer = [0u8; TITLE_PARAMETER_BUFFER];
-    let image = match translate_optional_path(
+    let image = translate_optional_path(
         invocation.state,
         invocation.backend,
         string_param(line, "title", &mut buffer),
         &mut paths.image,
-        ErrorCode::FILE_NOT_FOUND,
-    ) {
-        Ok(image) => image,
-        Err(error) => return error,
-    };
-    let drive = match translate_optional_path(
+        ErrorCode::FileNotFound,
+    )?;
+    let drive = translate_optional_path(
         invocation.state,
         invocation.backend,
         string_param(line, "directory", &mut buffer),
         &mut paths.drive,
-        ErrorCode::PATH_NOT_FOUND,
-    ) {
-        Ok(drive) => drive,
-        Err(error) => return error,
-    };
+        ErrorCode::PathNotFound,
+    )?;
     let mut command_line_buffer = [0u8; TITLE_PARAMETER_BUFFER];
     let command_line = string_param(line, "cmdline", &mut command_line_buffer);
     let request = image.map(|image| LaunchRequest {
@@ -1774,7 +1785,7 @@ fn magic_boot(invocation: &mut Invocation<'_>) -> Hresult {
 
 /// `deftitle none` | `deftitle launcher` | `deftitle dir=<s> name=<s>`:
 /// replace or delete the default title file `\SystemRoot\dashboard.xbx`.
-fn default_title(invocation: &mut Invocation<'_>) -> Hresult {
+fn default_title(invocation: &mut Invocation<'_>) -> CommandResult {
     let line = invocation.line;
     let backend = &mut *invocation.backend;
     let synchronous = CreateOptions::SYNCHRONOUS_IO_NONALERT;
@@ -1799,14 +1810,14 @@ fn default_title(invocation: &mut Invocation<'_>) -> Hresult {
             synchronous,
         );
         let Ok(handle) = backend.create_file(DEFAULT_TITLE_PATH, &delete) else {
-            return Hresult::OK;
+            return Ok(Reply::Ok);
         };
         let deleted = backend.set_delete_disposition(handle, true);
         backend.close_file(handle);
         return if deleted.is_ok() {
-            Hresult::OK
+            Ok(Reply::Ok)
         } else {
-            Hresult::UNEXPECTED
+            Err(CommandError::Unexpected)
         };
     }
 
@@ -1821,13 +1832,13 @@ fn default_title(invocation: &mut Invocation<'_>) -> Hresult {
         let mut dir_buffer = [0u8; DEFAULT_TITLE_DIRECTORY_BUFFER];
         let Some(dir) = string_param(line, "dir", &mut dir_buffer) else {
             invocation.set_text(format_args!("missing dir"));
-            return Hresult::FAIL;
+            return Err(CommandError::Fail);
         };
         let mut translated = TitlePath::EMPTY;
         let Some(directory) =
             translate_title_path(invocation.state, invocation.backend, dir, &mut translated)
         else {
-            return Hresult::from_error_code(ErrorCode::FILE_NOT_FOUND);
+            return Err(ErrorCode::FileNotFound.into());
         };
         let mut length = directory.len;
         content[..length].copy_from_slice(directory.as_bytes());
@@ -1837,7 +1848,7 @@ fn default_title(invocation: &mut Invocation<'_>) -> Hresult {
         }
         let Some(name) = line.param("name") else {
             invocation.set_text(format_args!("missing name"));
-            return Hresult::FAIL;
+            return Err(CommandError::Fail);
         };
         let end = DEFAULT_TITLE_SIZE.max(length);
         name.copy_into(&mut content[length..end]);
@@ -1856,11 +1867,11 @@ fn default_title(invocation: &mut Invocation<'_>) -> Hresult {
     );
     match backend.create_file(&content[..path_end], &check) {
         Ok(handle) => backend.close_file(handle),
-        Err(status) => {
-            return Hresult::from_nt_status(
-                status,
-                Hresult::from_error_code(ErrorCode::ACCESS_DENIED),
-            );
+        Err(error) => {
+            return Err(CommandError::from_kernel(
+                error,
+                ErrorCode::AccessDenied.into(),
+            ));
         }
     }
     content[file_start - 1] = b';';
@@ -1875,17 +1886,17 @@ fn default_title(invocation: &mut Invocation<'_>) -> Hresult {
         options: synchronous,
     };
     let Ok(handle) = backend.create_file(DEFAULT_TITLE_PATH, &create) else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     let result = match backend.write_file(
         handle,
         None,
         FileData::Bytes(&content[..DEFAULT_TITLE_SIZE]),
     ) {
-        Ok(()) => Hresult::OK,
+        Ok(()) => Ok(Reply::Ok),
         Err(_) => match backend.set_delete_disposition(handle, true) {
-            Ok(()) => Hresult::OK,
-            Err(_) => Hresult::UNEXPECTED,
+            Ok(()) => Ok(Reply::Ok),
+            Err(_) => Err(CommandError::Unexpected),
         },
     };
     backend.close_file(handle);
@@ -1918,16 +1929,16 @@ const FLASH_HARDWARE_MASK: u32 = 0xff00_0003;
 
 /// `flash size_<hw>=<dword> [ignoreversionchecking=<dword>] [stockimage]`:
 /// receive a system flash image for this hardware and program it.
-fn flash(invocation: &mut Invocation<'_>) -> Hresult {
+fn flash(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.session.is_none() {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     let line = invocation.line;
     let selector = invocation.backend.hardware_flags() & FLASH_HARDWARE_MASK;
     let Some(&(_, parameter)) = FLASH_HARDWARE.iter().find(|(value, _)| *value == selector) else {
         // Stock formats a null suffix, which the CRT prints as `(null)`.
         invocation.set_text(format_args!("unsupported hardware type, requires (null)"));
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     let suffix = &parameter.as_bytes()[FLASH_SIZE_PREFIX.len()..];
     let Some(size) = line.dword(parameter) else {
@@ -1936,7 +1947,7 @@ fn flash(invocation: &mut Invocation<'_>) -> Hresult {
             .text
             .push_bytes(b"unsupported hardware type, requires ");
         let _ = invocation.text.push_bytes(suffix);
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     // Stock reads this with the required-parameter getter; its `missing`
     // text is always replaced below.
@@ -1950,7 +1961,7 @@ fn flash(invocation: &mut Invocation<'_>) -> Hresult {
     let rounded = size.wrapping_add(FLASH_BLOCK - 1) & !(FLASH_BLOCK - 1);
     if !invocation.backend.flash_begin(rounded) {
         invocation.set_text(format_args!("Not enough memory"));
-        return Hresult::error(0);
+        return Err(ErrorCode::Undefined.into());
     }
     invocation.text.clear();
     let _ = invocation.text.push_bytes(b"send=");
@@ -1963,13 +1974,13 @@ fn flash(invocation: &mut Invocation<'_>) -> Hresult {
                 options,
             }));
     }
-    Hresult::SEND_BINARY
+    Ok(Reply::SendBinary)
 }
 
-fn resume_flash(upload: &mut FlashUpload, cx: &mut ContinuationContext<'_>) -> Hresult {
+fn resume_flash(upload: &mut FlashUpload, cx: &mut ContinuationContext<'_>) -> CommandResult {
     if cx.received.is_empty() {
         cx.backend.flash_abort();
-        return Hresult::UNEXPECTED;
+        return Err(CommandError::Unexpected);
     }
     cx.backend.flash_write(upload.received, cx.received);
     let count = cx.received.len() as u32;
@@ -1981,17 +1992,18 @@ fn resume_flash(upload: &mut FlashUpload, cx: &mut ContinuationContext<'_>) -> H
         .saturating_sub(count);
     cx.session.receive_remaining = Some(remaining);
     if remaining != 0 {
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     match cx.backend.flash_commit(upload.received, upload.options) {
         Ok(()) => {
             let _ = cx.line.write_str("Done, new image flashed");
-            Hresult::OK
+            Ok(Reply::Ok)
         }
-        Err(Win32Error(error)) => {
-            let result = Hresult(0x8007_0000 | (error.get() & 0xffff));
-            let _ = write!(cx.line, "Flash failed with HRESULT 0x{:x}", result.0);
-            result
+        Err(error) => {
+            let error = FlashFailed(error);
+            let result = Hresult::from(error).0;
+            let _ = write!(cx.line, "Flash failed with HRESULT 0x{result:x}");
+            Err(CommandError::Flash(error))
         }
     }
 }

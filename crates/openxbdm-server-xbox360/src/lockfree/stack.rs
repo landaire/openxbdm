@@ -16,6 +16,7 @@ use super::ALLOCATOR_SIZE;
 use super::Allocator;
 use super::CREATE_FAILED;
 use super::Creation;
+use super::Failure;
 use super::OPTIONS_SIZE;
 use super::Object;
 use super::REMOVE_TIMEOUT;
@@ -23,7 +24,6 @@ use super::SUCCESS;
 use super::SemaphoreKind;
 use super::Shape;
 use super::Side;
-use super::Status;
 use super::UNLIMITED;
 use super::Wait;
 use super::close_handle;
@@ -31,6 +31,7 @@ use super::copy;
 use super::counts;
 use super::create_semaphore;
 use super::exchange;
+use super::export_result;
 use super::insert_result;
 use super::load;
 use super::lwsync;
@@ -42,7 +43,6 @@ use super::remove_result;
 use super::remove_waiting;
 use super::store;
 use super::walk;
-use super::win32_result;
 use super::zero;
 use crate::exports::export;
 
@@ -155,16 +155,13 @@ fn take(stack: Object) -> Option<u32> {
     pop(stack.base + TOP, 0).map(|node| finish(stack, node))
 }
 
-fn push_value(stack: Object, value: u32, wait: &Wait) -> Status {
-    let node = match stack.acquire_node(wait) {
-        Ok(node) => node,
-        Err(status) => return status,
-    };
+fn push_value(stack: Object, value: u32, wait: &Wait) -> Result<(), Failure> {
+    let node = stack.acquire_node(wait)?;
     store(node as usize + VALUE, value);
     push(stack.base + TOP, node, 0);
     stack.signal_item();
     stack.count_added();
-    Status::SUCCESS
+    Ok(())
 }
 
 /// Stock rechecks the signature and stores -1 when it changed meanwhile.
@@ -189,7 +186,7 @@ extern "C" fn create_export(descriptor: u32, output: u32) -> u32 {
     store(output as usize, 0);
     let creation = match Creation::read(descriptor) {
         Ok(creation) => creation,
-        Err(result) => return result.0,
+        Err(error) => return Hresult::from(error).0,
     };
     let options = creation.keeps_options();
     let Some(stack) = create(&creation, if options { OPTIONS_SIZE } else { 0 }) else {
@@ -254,11 +251,11 @@ extern "C" fn pop_export(stack: u32, output: u32) -> u32 {
                     remove_waiting(stack, semaphore, &wait, || pop(stack.base + TOP, 0))
                         .map(|node| finish(stack, node))
                 }
-                None => take(stack).ok_or(Status::TIMEOUT),
+                None => take(stack).ok_or(Failure::Timeout),
             };
             match taken {
                 Ok(value) => value,
-                Err(status) => return remove_result(status),
+                Err(failure) => return remove_result(failure),
             }
         }
         None => match take(stack) {
@@ -298,8 +295,8 @@ extern "C" fn enumerate(stack: u32, context: u32, callback: u32) -> u32 {
         .flatten()
     {
         Some(stack) => walk(load(stack.base + TOP), VALUE, context, callback),
-        _ => Status::INVALID_PARAMETER.0,
+        _ => Err(Failure::InvalidParameter),
     };
-    win32_result(result).0
+    export_result(result)
 }
 export!(317, enumerate);

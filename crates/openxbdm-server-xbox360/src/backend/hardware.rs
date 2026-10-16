@@ -14,6 +14,7 @@ use core::sync::atomic::Ordering;
 
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
 use openxbdm_server::ConnectionIndex;
 use openxbdm_server::Server;
@@ -26,7 +27,6 @@ use openxbdm_server::commands::filesystem::FileAttributes;
 use openxbdm_server::commands::filesystem::FileHandle;
 use openxbdm_server::commands::filesystem::ObjectPath;
 use openxbdm_server::commands::filesystem::ShareAccess;
-use openxbdm_server::commands::filesystem::nt;
 use openxbdm_server::commands::hardware::AvatarError;
 use openxbdm_server::commands::hardware::AvatarHook;
 use openxbdm_server::commands::hardware::ExportMissing;
@@ -38,6 +38,13 @@ use openxbdm_server::commands::hardware::PgoModule;
 use openxbdm_server::commands::hardware::PlayToCommand;
 use openxbdm_server::commands::hardware::PlayToState;
 use openxbdm_server::commands::hardware::StackAddresses;
+use openxbdm_server::commands::hardware::SystemApp;
+use openxbdm_server::commands::hardware::SystemMessage;
+use openxbdm_server::commands::hardware::UsbController;
+use openxbdm_server::commands::hardware::UsbPort;
+use openxbdm_server::commands::hardware::XamError;
+use openxbdm_server::commands::hardware::XamHeapId;
+use openxbdm_server::commands::hardware::XamHeapInfoClass;
 use openxbdm_server::commands::hardware::automation;
 use openxbdm_server::commands::hardware::automation::Automation;
 use openxbdm_server::commands::hardware::automation::AutomationError;
@@ -98,12 +105,11 @@ const KERNEL_USB_PORT_POWER: u32 = 825;
 /// Monitor service: devkit memory statistics.
 const MONITOR_MEMORY_STATISTICS: u32 = 8;
 /// Media service application and PlayTo message.
-const MEDIA_APP: u32 = 0xf0;
-const MEDIA_PLAY_TO: u32 = 0x900002;
+const MEDIA_APP: SystemApp = SystemApp(0xf0);
+const MEDIA_PLAY_TO: SystemMessage = SystemMessage(0x900002);
 /// Caller identifier passed to the network address queries.
 const NETWORK_CALLER: u32 = 3;
 const XNADDR_SIZE: usize = 0x24;
-const STATUS_DEVICE_NOT_CONNECTED: u32 = 0xc000_009d;
 const ERROR_DEVICE_NOT_CONNECTED: u32 = 0x48f;
 const POOL_TAG_CONTROLLER: u32 = 0x646d_6175;
 const POOL_TAG_UPLOAD: u32 = 0x444d_4155;
@@ -340,7 +346,7 @@ pub(crate) fn service_automation_get_state(request: u32) -> u32 {
     match AUTOMATION.with(|automation| automation.poll(user, &mut Input)) {
         None => 0,
         Some(Poll::NotConnected) => {
-            write_word(status, STATUS_DEVICE_NOT_CONNECTED);
+            write_word(status, NtStatus::from(KernelError::DeviceNotConnected).0);
             1
         }
         Some(Poll::State {
@@ -718,7 +724,7 @@ fn odd_initialize() {
         CreateDisposition::Open as u32,
         CreateOptions::SYNCHRONOUS_IO_NONALERT.0,
     );
-    if (opened as i32) < 0 {
+    if NtStatus(opened).result().is_err() {
         return;
     }
     // Stock reads the output even when the request fails (uninitialized
@@ -819,12 +825,14 @@ extern "C" fn odd_writer(handle: u32) -> u32 {
     0
 }
 
-fn failed(status: u32) -> bool {
-    status & 0xc000_0000 == 0xc000_0000
+/// The failure of a status with both severity bits set, the only statuses
+/// the optical disc log treats as failures.
+fn failure(status: NtStatus) -> Option<KernelError> {
+    (status.0 & 0xc000_0000 == 0xc000_0000).then(|| KernelError::from_status(status))
 }
 
 /// Start the optical disc log (stock export 147 0x91f3dad0).
-fn odd_log_start(path: Result<&[u8], NtStatus>) -> Result<(), OddLogStartError> {
+fn odd_log_start(path: Result<&[u8], KernelError>) -> Result<(), OddLogStartError> {
     let log = &ODD_LOG;
     if log
         .busy
@@ -859,7 +867,7 @@ fn odd_log_start(path: Result<&[u8], NtStatus>) -> Result<(), OddLogStartError> 
                 status: 0,
                 information: 0,
             };
-            let status = kernel::NtWriteFile(
+            let status = NtStatus(kernel::NtWriteFile(
                 handle,
                 0,
                 0,
@@ -868,12 +876,12 @@ fn odd_log_start(path: Result<&[u8], NtStatus>) -> Result<(), OddLogStartError> 
                 ODD_LOG_HEADER.as_ptr(),
                 ODD_LOG_HEADER.len() as u32,
                 core::ptr::null(),
-            );
-            if failed(status) {
+            ));
+            if failure(status).is_some() {
                 kernel::NtClose(handle);
             } else {
                 let mut thread = 0u32;
-                let created = kernel::ExCreateThread(
+                let created = NtStatus(kernel::ExCreateThread(
                     &mut thread,
                     ODD_WRITER_STACK,
                     core::ptr::null_mut(),
@@ -881,15 +889,15 @@ fn odd_log_start(path: Result<&[u8], NtStatus>) -> Result<(), OddLogStartError> 
                     odd_writer as *const () as usize as u32,
                     handle,
                     ODD_WRITER_FLAGS,
-                );
-                if failed(created) {
+                ));
+                if let Some(error) = failure(created) {
                     // Stock leaves the finished event clear here, so its
                     // next stop waits forever; no writer runs, so mark it
                     // finished.
                     kernel::NtClose(handle);
                     log.finished.set();
                     log.busy.store(0, Ordering::Release);
-                    return Err(OddLogStartError::Failed(NtStatus(created)));
+                    return Err(OddLogStartError::Failed(error));
                 }
                 // A stop that ran before this store left the previous
                 // object behind.
@@ -901,15 +909,15 @@ fn odd_log_start(path: Result<&[u8], NtStatus>) -> Result<(), OddLogStartError> 
             }
             status
         }
-        Err(status) => status.0,
+        Err(error) => error.status(),
     };
     // Stock's writer reports the open or header status and exits, setting
     // the finished event; only statuses with both severity bits set fail
     // the start. The stop flag stays clear, so a later stop succeeds.
     log.finished.set();
-    if failed(status) {
+    if let Some(error) = failure(status) {
         log.busy.store(0, Ordering::Release);
-        return Err(OddLogStartError::Failed(NtStatus(status)));
+        return Err(OddLogStartError::Failed(error));
     }
     Ok(())
 }
@@ -945,8 +953,9 @@ fn query_input_focus(user: u32) -> Result<u32, ExportMissing> {
     Ok(unsafe { kernel::call_export(function, user, 0, 0, 0) })
 }
 
-fn automation_hresult(result: Result<(), AutomationError>) -> u32 {
-    result.map_or_else(|error| error.hresult().0, |()| Hresult::OK.0)
+/// The return word of an export.
+fn export_result<E: Into<Hresult>>(result: Result<(), E>) -> u32 {
+    result.map_or_else(|error| error.into().0, |()| Hresult::OK.0)
 }
 
 // Shared by the exports and the command backend.
@@ -975,7 +984,7 @@ fn query_queue(user: u32) -> Result<QueueStatus, AutomationError> {
 extern "C" fn export_query_input_focus(user: u32, focus: *mut u32) -> u32 {
     let (value, result) = match query_input_focus(user) {
         Ok(value) => (value, Hresult::OK),
-        Err(ExportMissing) => (0, Hresult::from_error_code(ErrorCode::UNKNOWN_COMMAND)),
+        Err(ExportMissing) => (0, Hresult::from_error_code(ErrorCode::UnknownCommand)),
     };
     // SAFETY: the caller passes a writable dword.
     unsafe { focus.write_volatile(value) };
@@ -984,22 +993,22 @@ extern "C" fn export_query_input_focus(user: u32, focus: *mut u32) -> u32 {
 
 /// Export 167 (stock 0x91f24c08): `autoinput bind`.
 extern "C" fn export_automation_bind(user: u32, queue_length: u32) -> u32 {
-    automation_hresult(automation::bind(&mut XboxControllers, user, queue_length))
+    export_result(automation::bind(&mut XboxControllers, user, queue_length))
 }
 
 /// Export 168 (stock 0x91f24d60): `autoinput unbind`.
 extern "C" fn export_automation_unbind(user: u32) -> u32 {
-    automation_hresult(automation::unbind(&mut XboxControllers, user))
+    export_result(automation::unbind(&mut XboxControllers, user))
 }
 
 /// Export 169 (stock 0x91f244c8): `autoinput connect`.
 extern "C" fn export_automation_connect(user: u32) -> u32 {
-    automation_hresult(connect(user))
+    export_result(connect(user))
 }
 
 /// Export 170 (stock 0x91f24580): `autoinput disconnect`.
 extern "C" fn export_automation_disconnect(user: u32) -> u32 {
-    automation_hresult(disconnect(user))
+    export_result(disconnect(user))
 }
 
 /// Export 171 (stock 0x91f24e20): `autoinput setpacket` with a gamepad
@@ -1009,12 +1018,12 @@ extern "C" fn export_automation_set_packet(
     packet: *const [u8; Gamepad::WIRE_SIZE],
 ) -> u32 {
     if user >= automation::USERS {
-        return AutomationError::BadParameter.hresult().0;
+        return Hresult::from(AutomationError::BadParameter).0;
     }
     // SAFETY: the caller passes a gamepad state.
     let packet = unsafe { packet.read_unaligned() };
     let packet = Gamepad::from_console(&packet);
-    automation_hresult(automation::set_packet(&mut XboxControllers, user, packet))
+    export_result(automation::set_packet(&mut XboxControllers, user, packet))
 }
 
 /// Export 172 (stock 0x91f24f90): queue `count` gamepad states in console
@@ -1033,7 +1042,7 @@ extern "C" fn export_automation_queue(
         || queued.is_null()
         || (times.is_null() && counts.is_null())
     {
-        return AutomationError::BadParameter.hresult().0;
+        return Hresult::from(AutomationError::BadParameter).0;
     }
     let layout = UploadLayout {
         count,
@@ -1063,13 +1072,13 @@ extern "C" fn export_automation_queue(
             unsafe { queued.write_volatile(accepted) };
             Hresult::OK.0
         }
-        Err(error) => error.hresult().0,
+        Err(error) => Hresult::from(error).0,
     }
 }
 
 /// Export 173 (stock 0x91f24630): `autoinput clearqueue`.
 extern "C" fn export_automation_clear_queue(user: u32) -> u32 {
-    automation_hresult(clear_queue(user))
+    export_result(clear_queue(user))
 }
 
 /// Export 174 (stock 0x91f246c8): `autoinput queryqueue`; every present
@@ -1082,7 +1091,7 @@ extern "C" fn export_automation_query_queue(
     remaining_count: *mut u32,
 ) -> u32 {
     if user >= automation::USERS {
-        return AutomationError::BadParameter.hresult().0;
+        return Hresult::from(AutomationError::BadParameter).0;
     }
     let outputs = [queue_length, queued, remaining_ms, remaining_count];
     let store = |values: [u32; 4]| {
@@ -1104,7 +1113,7 @@ extern "C" fn export_automation_query_queue(
             ]);
             Hresult::OK.0
         }
-        Err(error) => error.hresult().0,
+        Err(error) => Hresult::from(error).0,
     }
 }
 
@@ -1143,13 +1152,13 @@ extern "C" fn export_odd_log_start(path: *const core::ffi::c_char) -> u32 {
         dispatcher::call_on_server(translate_on_server, &raw mut translation as usize as u32)
             .and(translation.path.as_ref())
             .map(ObjectPath::as_bytes)
-            .ok_or(nt::NO_SUCH_FILE);
-    odd_log_start(translated).map_or_else(|error| error.hresult().0, |()| Hresult::OK.0)
+            .ok_or(KernelError::NoSuchFile);
+    export_result(odd_log_start(translated))
 }
 
 /// Export 148 (stock 0x91f3d140): stop the optical disc log.
 extern "C" fn export_odd_log_stop() -> u32 {
-    odd_log_stop().map_or(OddLogNotRunning::HRESULT.0, |()| Hresult::OK.0)
+    export_result(odd_log_stop())
 }
 
 export!(147, export_odd_log_start);
@@ -1243,9 +1252,7 @@ impl commands::hardware::Backend for Console {
         let result = unsafe {
             kernel::call_export(lookup, hook.index(), output_address(&mut function), 0, 0)
         };
-        if (result as i32) < 0 {
-            return Err(AvatarError::Lookup(Hresult(result)));
-        }
+        XamError::check(Hresult(result)).map_err(AvatarError::Lookup)?;
         if function == 0 {
             return Err(AvatarError::NoFunction);
         }
@@ -1257,24 +1264,21 @@ impl commands::hardware::Backend for Console {
         };
         // SAFETY: the hooks take at most two dword arguments.
         let result = unsafe { kernel::call_export(function, first, second, 0, 0) };
-        if (result as i32) < 0 {
-            Err(AvatarError::Hook(Hresult(result)))
-        } else {
-            Ok(())
-        }
+        XamError::check(Hresult(result)).map_err(AvatarError::Hook)
     }
 
-    fn set_wireless_radio(&mut self, enabled: bool) -> NtStatus {
-        NtStatus(XInputdSetRFPowerMode(u32::from(enabled)))
+    fn set_wireless_radio(&mut self, enabled: bool) -> Result<(), KernelError> {
+        NtStatus(XInputdSetRFPowerMode(u32::from(enabled))).result()
     }
 
-    fn devkit_memory_statistics(&mut self, block: &mut [u8; 0x90]) -> NtStatus {
+    fn devkit_memory_statistics(&mut self, block: &mut [u8; 0x90]) -> Result<(), KernelError> {
         NtStatus(kernel::ExDebugMonitorService(
             MONITOR_MEMORY_STATISTICS,
             output_address(&mut block[..]),
             0,
             0,
         ))
+        .result()
     }
 
     fn xam_heap_count_available(&mut self) -> bool {
@@ -1285,50 +1289,76 @@ impl commands::hardware::Backend for Console {
         HEAP_INFO.xam(XAM_HEAP_INFO).is_some()
     }
 
-    fn xam_heap_count(&mut self, block: &mut [u8; 12]) -> Hresult {
+    fn xam_heap_count(&mut self, block: &mut [u8; 12]) -> Result<(), XamError> {
         let Some(function) = HEAP_COUNT.xam(XAM_HEAP_COUNT) else {
-            return Hresult::FAIL;
+            return Err(XamError::Fail);
         };
         // SAFETY: the export fills the sized block.
-        Hresult(unsafe { kernel::call_export(function, output_address(&mut block[..]), 0, 0, 0) })
+        let result =
+            unsafe { kernel::call_export(function, output_address(&mut block[..]), 0, 0, 0) };
+        XamError::check(Hresult(result))
     }
 
-    fn xam_heap_name(&mut self, id: u32, name: &mut [u8; 0x20]) -> Hresult {
+    fn xam_heap_name(&mut self, id: XamHeapId, name: &mut [u8; 0x20]) -> Result<(), XamError> {
         let Some(function) = HEAP_INFO.xam(XAM_HEAP_INFO) else {
-            return Hresult::FAIL;
+            return Err(XamError::Fail);
         };
         let mut length = name.len() as u32;
         let request = [output_address(&mut name[..]), output_address(&mut length)];
-        // SAFETY: class 1 takes `{buffer, &length}`.
-        Hresult(unsafe { kernel::call_export(function, id, 1, address_of(&request[..]), 0) })
-    }
-
-    fn xam_heap_info(&mut self, id: u32, class: u32, block: &mut [u8]) -> Hresult {
-        let Some(function) = HEAP_INFO.xam(XAM_HEAP_INFO) else {
-            return Hresult::FAIL;
+        // SAFETY: the name class takes `{buffer, &length}`.
+        let result = unsafe {
+            kernel::call_export(
+                function,
+                id.0,
+                XamHeapInfoClass::Name.code(),
+                address_of(&request[..]),
+                0,
+            )
         };
-        // SAFETY: classes 2 and 3 fill the sized block.
-        Hresult(unsafe { kernel::call_export(function, id, class, output_address(block), 0) })
+        XamError::check(Hresult(result))
     }
 
-    fn system_message(&mut self, app: u32, message: u32, buffer: &mut [u8]) -> Hresult {
-        Hresult(kernel::XMsgStartIORequest(
-            app,
-            message,
+    fn xam_heap_info(
+        &mut self,
+        id: XamHeapId,
+        class: XamHeapInfoClass,
+        block: &mut [u8],
+    ) -> Result<(), XamError> {
+        let Some(function) = HEAP_INFO.xam(XAM_HEAP_INFO) else {
+            return Err(XamError::Fail);
+        };
+        // SAFETY: the limits and usage classes fill the sized block.
+        let result =
+            unsafe { kernel::call_export(function, id.0, class.code(), output_address(block), 0) };
+        XamError::check(Hresult(result))
+    }
+
+    fn system_message(
+        &mut self,
+        app: SystemApp,
+        message: SystemMessage,
+        buffer: &mut [u8],
+    ) -> Result<(), XamError> {
+        XamError::check(Hresult(kernel::XMsgStartIORequest(
+            app.0,
+            message.0,
             0,
             buffer.as_mut_ptr(),
             buffer.len() as u32,
-        ))
+        )))
     }
 
-    fn play_to(&mut self, command: PlayToCommand) -> Result<PlayToState, Hresult> {
+    fn play_to(&mut self, command: PlayToCommand) -> Result<PlayToState, XamError> {
         let mut output = [0u32; 2];
         let mut input = [command.code(), output_address(&mut output[..]), 8];
-        let result =
-            kernel::XMsgStartIORequest(MEDIA_APP, MEDIA_PLAY_TO, 0, input.as_mut_ptr().cast(), 12);
-        if (result as i32) < 0 {
-            return Err(Hresult(result));
-        }
+        let result = kernel::XMsgStartIORequest(
+            MEDIA_APP.0,
+            MEDIA_PLAY_TO.0,
+            0,
+            input.as_mut_ptr().cast(),
+            12,
+        );
+        XamError::check(Hresult(result))?;
         Ok(PlayToState {
             xmp_heap: output[0],
             play_to: output[1],
@@ -1346,7 +1376,7 @@ impl commands::hardware::Backend for Console {
         }
     }
 
-    fn odd_log_start(&mut self, path: Result<&[u8], NtStatus>) -> Result<(), OddLogStartError> {
+    fn odd_log_start(&mut self, path: Result<&[u8], KernelError>) -> Result<(), OddLogStartError> {
         odd_log_start(path)
     }
 
@@ -1371,7 +1401,7 @@ impl commands::hardware::Backend for Console {
         pgo::control_snapshot(phase, reset, module)
     }
 
-    fn pgo_set_allocation_scale(&mut self, module: u32, scale: u32) -> Result<(), PgoError> {
+    fn pgo_set_allocation_scale(&mut self, module: PgoModule, scale: u32) -> Result<(), PgoError> {
         pgo::control_allocation_scale(module, scale)
     }
 
@@ -1387,12 +1417,20 @@ impl commands::hardware::Backend for Console {
         USB_PORT_POWER.kernel(KERNEL_USB_PORT_POWER).is_some()
     }
 
-    fn set_usb_port_power(&mut self, controller: u32, port: u32, enable: bool) -> NtStatus {
-        let Some(function) = USB_PORT_POWER.kernel(KERNEL_USB_PORT_POWER) else {
-            return NtStatus(0xc000_0138);
-        };
+    fn set_usb_port_power(
+        &mut self,
+        controller: UsbController,
+        port: UsbPort,
+        enable: bool,
+    ) -> Result<(), KernelError> {
+        let function = USB_PORT_POWER
+            .kernel(KERNEL_USB_PORT_POWER)
+            .ok_or(KernelError::OrdinalNotFound)?;
         // SAFETY: the export takes three dword arguments.
-        NtStatus(unsafe { kernel::call_export(function, controller, port, u32::from(enable), 0) })
+        NtStatus(unsafe {
+            kernel::call_export(function, controller.0, port.0, u32::from(enable), 0)
+        })
+        .result()
     }
 }
 

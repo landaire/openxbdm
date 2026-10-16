@@ -1,7 +1,8 @@
 //! Simulated virtual memory, loaded modules, flash, and allocation
 //! tracking.
 
-use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::KernelError;
+use openxbdm_core::status::Win32Error;
 use openxbdm_server::commands::filesystem;
 use openxbdm_server::commands::filesystem::Backend as _;
 use openxbdm_server::commands::memory;
@@ -107,8 +108,8 @@ pub struct Mock {
     pub executable_path: Vec<u8>,
     /// Raw flash device content.
     pub flash: Vec<u8>,
-    pub flash_read_failure: Option<NtStatus>,
-    pub flash_write_failure: Option<NtStatus>,
+    pub flash_read_failure: Option<KernelError>,
+    pub flash_write_failure: Option<KernelError>,
     /// Module names the kernel accepts for import tracing.
     pub traceable_modules: Vec<String>,
     /// Import tracing requests the kernel accepted, in order.
@@ -443,17 +444,17 @@ impl memory::Backend for MockBackend {
         count
     }
 
-    fn read_flash(&mut self, offset: u32, output: &mut [u8]) -> Result<(), NtStatus> {
-        if let Some(status) = self.memory.flash_read_failure {
-            return Err(status);
+    fn read_flash(&mut self, offset: u32, output: &mut [u8]) -> Result<(), KernelError> {
+        if let Some(error) = self.memory.flash_read_failure {
+            return Err(error);
         }
         output.copy_from_slice(&self.memory.flash[offset as usize..][..output.len()]);
         Ok(())
     }
 
-    fn write_flash(&mut self, offset: u32, data: &[u8]) -> Result<(), NtStatus> {
-        if let Some(status) = self.memory.flash_write_failure {
-            return Err(status);
+    fn write_flash(&mut self, offset: u32, data: &[u8]) -> Result<(), KernelError> {
+        if let Some(error) = self.memory.flash_write_failure {
+            return Err(error);
         }
         self.memory.flash[offset as usize..][..data.len()].copy_from_slice(data);
         Ok(())
@@ -479,34 +480,32 @@ impl memory::Backend for MockBackend {
         self.memory.tracking_flags = flags;
     }
 
-    fn write_tracking_records(&mut self, file: filesystem::FileHandle) -> NtStatus {
+    fn write_tracking_records(&mut self, file: filesystem::FileHandle) -> Result<(), KernelError> {
         let records = self.memory.tracking_records.clone();
         for record in &records {
-            if let Err(status) = self.write_file(file, None, filesystem::FileData::Bytes(record)) {
-                return status;
-            }
+            self.write_file(file, None, filesystem::FileData::Bytes(record))?;
         }
-        NtStatus::SUCCESS
+        Ok(())
     }
 
     /// The kernel table entries the simulated console produces.
-    fn dos_error_from_nt_status(&mut self, status: NtStatus) -> u32 {
-        match status.0 {
-            0 => 0,
-            0xc000_0022 => 5,
-            0xc000_0033 => 123,
-            0xc000_000f | 0xc000_0034 => 2,
-            0xc000_003a => 3,
-            0xc000_007f => 112,
+    fn dos_error_from_nt_status(&mut self, error: KernelError) -> Option<Win32Error> {
+        let code = match error {
+            KernelError::AccessDenied => 5,
+            KernelError::ObjectNameInvalid => 123,
+            KernelError::NoSuchFile | KernelError::ObjectNameNotFound => 2,
+            KernelError::ObjectPathNotFound => 3,
+            KernelError::DiskFull => 112,
             _ => 317,
-        }
+        };
+        Win32Error::new(code)
     }
 
     fn detour(&mut self, operation: &mut dyn FnMut(&engine::Engine, &dyn engine::Platform)) {
         self.detour_operation(operation);
     }
 
-    fn start_detour_log(&mut self, log: Option<&[u8]>) -> NtStatus {
+    fn start_detour_log(&mut self, log: Option<&[u8]>) -> Result<(), KernelError> {
         self.start_detour_writer(log)
     }
 

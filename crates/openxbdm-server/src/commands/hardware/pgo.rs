@@ -4,6 +4,7 @@
 //! applies the results to the instrumented modules; see
 //! `docs/re-notes/pgo.md`.
 
+use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 
 use crate::backend::Backend as AnyBackend;
@@ -24,14 +25,16 @@ pub const PATH_UNITS: usize = 0x104;
 /// Capacity in bytes of a profile file name.
 pub const FILE_NAME_BYTES: usize = 0x104;
 
-/// `0x02da0000`.
-pub const SUCCESS: Hresult = Hresult::OK;
-/// `0x82da000c`: `pogo.ini` cannot be located for the module path.
-pub const BAD_MODULE_PATH: Hresult = Hresult::error(0xc);
-/// `0x82da0017`: the module is not registered.
-pub const NO_SUCH_MODULE: Hresult = Hresult::error(0x17);
-/// `0x82da0019`: the count block exists; the setting is fixed.
-pub const BLOCK_ALLOCATED: Hresult = Hresult::error(0x19);
+/// `pogo.ini` cannot be located for the module path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BadModulePath;
+
+/// Result of export 107: `0x82da000c`.
+impl From<BadModulePath> for Hresult {
+    fn from(BadModulePath: BadModulePath) -> Self {
+        Hresult::from_error_code(ErrorCode::FilenameInvalid)
+    }
+}
 
 /// Layout family of a count block. The runtime compares the version word
 /// with the extended value only; every other value is standard.
@@ -1163,10 +1166,10 @@ pub fn load_ini(
     backend: &mut dyn AnyBackend,
     module_path: &[u8],
     apply: &mut dyn FnMut(&ServerState, &mut dyn AnyBackend, IniDirective<'_>),
-) -> Hresult {
+) -> Result<(), BadModulePath> {
     let module_path = &module_path[..c_len(module_path)];
     if module_path.len() >= INI_MODULE_PATH_LIMIT {
-        return BAD_MODULE_PATH;
+        return Err(BadModulePath);
     }
     let mut drive_path = [0u8; INI_PATH_CAPACITY];
     let drive_length =
@@ -1176,10 +1179,10 @@ pub fn load_ini(
             .object_path_to_drive_path(backend, module_path, &mut drive_path);
     let drive_path = &drive_path[..drive_length];
     let Some(separator) = drive_path.iter().rposition(|&byte| byte == b'\\') else {
-        return BAD_MODULE_PATH;
+        return Err(BadModulePath);
     };
     if separator + 1 >= INI_DIRECTORY_LIMIT {
-        return BAD_MODULE_PATH;
+        return Err(BadModulePath);
     }
     let mut ini_path = [0u8; INI_PATH_CAPACITY];
     ini_path[..=separator].copy_from_slice(&drive_path[..=separator]);
@@ -1198,7 +1201,7 @@ pub fn load_ini(
         Err(_) => filesystem::open_translated(state, backend, b"xe:\\pogo.ini", &request).ok(),
     };
     let Some(handle) = handle else {
-        return SUCCESS;
+        return Ok(());
     };
     if let Some(buffer) = backend.allocate_pool(INI_BUFFER_SIZE as u32) {
         let mut in_section = false;
@@ -1261,7 +1264,7 @@ pub fn load_ini(
         backend.free_pool(buffer);
     }
     backend.close_file(handle);
-    SUCCESS
+    Ok(())
 }
 
 #[cfg(test)]

@@ -9,6 +9,7 @@ use std::time::Instant;
 use openxbdm_server::commands::network::SystemVersion;
 use openxbdm_server::commands::network::WsaError;
 use openxbdm_server::commands::network::ipproxy::RegisterStatus;
+use openxbdm_server::commands::network::ipproxy::SocketFailed;
 use openxbdm_server::commands::network::ipproxy::tunnel;
 use openxbdm_server_host::backend::network::ipproxy::Routine;
 
@@ -179,7 +180,8 @@ fn socket_errors_are_reported() {
     let server = TestServer::start();
     let mut session = session(&server);
     let host = host_socket();
-    server.host.lock().backend.network.ipproxy.socket_failure = Some(WsaError(10050));
+    server.host.lock().backend.network.ipproxy.socket_failure =
+        Some(SocketFailed(WsaError::new(10050)));
     assert_eq!(session.command(&start_line(&host)), "400- err=10050");
     assert!(!started(&server));
     assert!(!server.host.lock().backend.network.ipproxy.proxy_bypass);
@@ -190,7 +192,7 @@ fn socket_error_zero_reports_started() {
     let server = TestServer::start();
     let mut session = session(&server);
     let host = host_socket();
-    server.host.lock().backend.network.ipproxy.socket_failure = Some(WsaError(0));
+    server.host.lock().backend.network.ipproxy.socket_failure = Some(SocketFailed(None));
     assert_eq!(
         session.command(&start_line(&host)),
         "200- started ver=1 addr=0x00000000 port=0x0000"
@@ -205,7 +207,7 @@ fn register_failures_are_reported() {
     let server = TestServer::start();
     let mut session = session(&server);
     let host = host_socket();
-    server.host.lock().backend.network.ipproxy.register_failure = Some(RegisterStatus(0x8000_4005));
+    server.host.lock().backend.network.ipproxy.register_failure = RegisterStatus::new(0x8000_4005);
     assert_eq!(session.command(&start_line(&host)), "400- err=-2147467259");
     {
         let backend = &server.host.lock().backend;
@@ -215,7 +217,7 @@ fn register_failures_are_reported() {
     }
 
     start(&server, &mut session, &host);
-    server.host.lock().backend.network.ipproxy.register_failure = Some(RegisterStatus(5));
+    server.host.lock().backend.network.ipproxy.register_failure = RegisterStatus::new(5);
     assert_eq!(session.command("ipproxy stop"), "400- err=5");
     assert!(started(&server));
     assert!(server.host.lock().backend.network.ipproxy.hook_installed);

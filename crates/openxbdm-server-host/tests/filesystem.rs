@@ -690,12 +690,12 @@ fn sendvfile_reports_one_result_per_file() {
 
 #[test]
 fn end_of_file_beyond_the_volume_is_disk_full() {
+    use openxbdm_core::status::KernelError;
     use openxbdm_server::commands::filesystem::Backend as _;
     use openxbdm_server::commands::filesystem::CreateOptions;
     use openxbdm_server::commands::filesystem::CreateRequest;
     use openxbdm_server::commands::filesystem::FileAccess;
     use openxbdm_server::commands::filesystem::ShareAccess;
-    use openxbdm_server::commands::filesystem::nt;
 
     let server = TestServer::start();
     let mut host = server.host.lock();
@@ -712,7 +712,7 @@ fn end_of_file_beyond_the_volume_is_disk_full() {
         .unwrap();
     assert_eq!(
         host.backend.set_end_of_file(handle, u64::MAX),
-        Err(nt::DISK_FULL)
+        Err(KernelError::DiskFull)
     );
     assert_eq!(
         host.backend.write_file(
@@ -720,7 +720,7 @@ fn end_of_file_beyond_the_volume_is_disk_full() {
             Some(u64::MAX),
             openxbdm_server::commands::filesystem::FileData::Bytes(b"x")
         ),
-        Err(nt::DISK_FULL)
+        Err(KernelError::DiskFull)
     );
     host.backend.close_file(handle);
 }
@@ -1041,10 +1041,7 @@ fn map_title_drive(server: &TestServer, name: &[u8], target: Option<(u32, &[u8])
     let openxbdm_server_host::Host {
         server, backend, ..
     } = &mut *guard;
-    assert_eq!(
-        openxbdm_server::commands::filesystem::map_title_drive(&mut server.state, backend, request),
-        0
-    );
+    openxbdm_server::commands::filesystem::map_title_drive(&mut server.state, backend, request);
 }
 
 #[test]

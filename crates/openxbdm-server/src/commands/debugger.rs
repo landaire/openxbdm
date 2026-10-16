@@ -11,12 +11,15 @@ use core::fmt::Write as _;
 
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::Win32Error;
 
 pub use self::breakpoints::BREAKPOINT_BLOCKS;
 pub use self::breakpoints::Breakpoints;
 pub use self::breakpoints::DataBreakpoint;
 pub use self::breakpoints::DataKind;
+pub use self::breakpoints::SetError;
 pub use self::breakpoints::TRAP_INSTRUCTION;
 use self::context::CONTEXT_SIZE;
 pub use self::context::Context;
@@ -34,12 +37,14 @@ pub use self::direct::ThreadNameRequest;
 pub use self::direct::dispatch_direct;
 pub use self::events::StopReason;
 pub use self::events::process_events;
+pub use self::kd::ExtensionError;
 pub use self::kd::KDNET_RECORD_OFFSET;
 pub use self::kd::KDNET_RECORD_SIZE;
 pub use self::kd::load_extension;
 pub use self::kd::release_extension;
 use crate::access::Access;
 use crate::backend::Backend as AnyBackend;
+use crate::commands::services::ThreadHandle;
 use crate::commands::system::SettingsFile;
 use crate::commands::system::end_line;
 use crate::commands::system::write_bytes;
@@ -53,6 +58,9 @@ use crate::notify::Event;
 use crate::notify::ExecutionState;
 use crate::registry::CommandEntry;
 use crate::registry::DispatchFlags;
+use crate::reply::CommandError;
+use crate::reply::CommandResult;
+use crate::reply::Reply;
 use crate::state::ServerState;
 use crate::text::LineText;
 use crate::text::Text;
@@ -62,7 +70,7 @@ use crate::transfer_blocks::TransferBlocks;
 const fn entry(
     name: &'static str,
     flags: DispatchFlags,
-    handler: fn(&mut Invocation<'_>) -> Hresult,
+    handler: fn(&mut Invocation<'_>) -> CommandResult,
 ) -> CommandEntry {
     CommandEntry::new(name, Access::CONTROL, Access::NONE, flags, handler)
 }
@@ -163,11 +171,25 @@ pub struct ThreadName {
     pub length: u32,
 }
 
-/// Exception record of a thread that entered the monitor.
+/// Flags of an exception record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExceptionFlags(pub u32);
+
+impl ExceptionFlags {
+    pub const NONE: Self = Self(0);
+    /// The exception cannot be continued.
+    pub const NONCONTINUABLE: Self = Self(0x1);
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+/// Exception record of a thread that entered the monitor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExceptionRecord {
-    pub code: u32,
-    pub flags: u32,
+    pub code: NtStatus,
+    pub flags: ExceptionFlags,
     pub address: u32,
     pub parameter_count: u32,
     /// The first parameters.
@@ -177,14 +199,26 @@ pub struct ExceptionRecord {
     pub record_address: u32,
 }
 
+impl Default for ExceptionRecord {
+    fn default() -> Self {
+        Self {
+            code: NtStatus::SUCCESS,
+            flags: ExceptionFlags::NONE,
+            address: 0,
+            parameter_count: 0,
+            parameters: [0; 4],
+            record_address: 0,
+        }
+    }
+}
+
 impl ExceptionRecord {
-    pub const BREAKPOINT: u32 = 0x8000_0003;
-    pub const SINGLE_STEP: u32 = 0x8000_0004;
-    pub const ACCESS_VIOLATION: u32 = 0xc000_0005;
-    pub const NT_ASSERT: u32 = 0xc000_0420;
-    pub const THREAD_NAME: u32 = 0x406d_1388;
-    /// Record flag: the exception cannot be continued.
-    pub const NONCONTINUABLE: u32 = 0x1;
+    pub const BREAKPOINT: NtStatus = NtStatus(0x8000_0003);
+    pub const SINGLE_STEP: NtStatus = NtStatus(0x8000_0004);
+    pub const ACCESS_VIOLATION: NtStatus = NtStatus(0xc000_0005);
+    pub const STACK_OVERFLOW: NtStatus = NtStatus(0xc000_00fd);
+    pub const NT_ASSERT: NtStatus = NtStatus(0xc000_0420);
+    pub const THREAD_NAME: NtStatus = NtStatus(0x406d_1388);
 
     /// Trap code of a breakpoint exception (low half of the first
     /// parameter).
@@ -381,12 +415,42 @@ pub struct Disposition {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NoSuchThread;
 
-/// Failure of a thread context write.
+impl From<NoSuchThread> for CommandError {
+    fn from(NoSuchThread: NoSuchThread) -> Self {
+        ErrorCode::NoSuchThread.into()
+    }
+}
+
+/// An operation on a thread stopped at a debug event failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SetContextError {
+pub enum StoppedThreadError {
     NoSuchThread,
     /// The thread is not inside the monitor at a debug event.
     NotStopped,
+}
+
+impl From<NoSuchThread> for StoppedThreadError {
+    fn from(NoSuchThread: NoSuchThread) -> Self {
+        Self::NoSuchThread
+    }
+}
+
+impl From<StoppedThreadError> for CommandError {
+    fn from(error: StoppedThreadError) -> Self {
+        match error {
+            StoppedThreadError::NoSuchThread => ErrorCode::NoSuchThread.into(),
+            StoppedThreadError::NotStopped => ErrorCode::NotStopped.into(),
+        }
+    }
+}
+
+/// Exit status of a thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExitStatus(pub u32);
+
+impl ExitStatus {
+    /// The status of a thread that has not exited.
+    pub const STILL_ACTIVE: Self = Self(0x103);
 }
 
 /// Handle of a loaded debugger extension module.
@@ -429,12 +493,12 @@ pub trait Backend {
         &mut self,
         thread: ThreadId,
         context: &Context,
-    ) -> Result<(), SetContextError>;
+    ) -> Result<(), StoppedThreadError>;
     /// Copy the NUL-terminated name at `address` as the name of `thread`.
     fn set_thread_name(&mut self, thread: ThreadId, address: u32);
     /// Exit status of the thread behind a handle of the monitor process:
-    /// `Ok(0x103)` while it runs. `Err` carries the Win32 error.
-    fn thread_exit_status(&mut self, handle: u32) -> Result<u32, u32>;
+    /// [`ExitStatus::STILL_ACTIVE`] while it runs.
+    fn thread_exit_status(&mut self, handle: ThreadHandle) -> Result<ExitStatus, KernelError>;
     /// Replace the instruction word at `address` through a writable
     /// mapping, synchronizing the instruction cache. Returns the previous
     /// word, or `None` when the address cannot be mapped.
@@ -475,9 +539,9 @@ pub trait Backend {
     /// Kernel build number.
     fn kernel_build(&mut self) -> u16;
     /// Load a debugger extension image.
-    fn load_extension(&mut self, path: &[u8]) -> Result<ExtensionHandle, NtStatus>;
+    fn load_extension(&mut self, path: &[u8]) -> Result<ExtensionHandle, KernelError>;
     /// Unload a debugger extension image, calling its unload export.
-    fn unload_extension(&mut self, handle: ExtensionHandle) -> Result<(), NtStatus>;
+    fn unload_extension(&mut self, handle: ExtensionHandle) -> Result<(), KernelError>;
 }
 
 /// A notification queued by a direct exception, with what the platform
@@ -554,7 +618,7 @@ pub struct State {
 struct HeldReply {
     thread: ThreadId,
     socket: SocketId,
-    result: Hresult,
+    result: CommandResult,
     text: LineText,
 }
 
@@ -700,16 +764,19 @@ pub enum Continuation {
 /// Thread identifiers `threads` can report.
 pub const THREAD_LIST_CAPACITY: usize = 0x100;
 
-pub(crate) fn resume(continuation: &mut Continuation, cx: &mut ContinuationContext<'_>) -> Hresult {
+pub(crate) fn resume(
+    continuation: &mut Continuation,
+    cx: &mut ContinuationContext<'_>,
+) -> CommandResult {
     match continuation {
         Continuation::Threads { list, remaining } => thread_lines(*list, remaining, cx),
         Continuation::ThreadInfo { info, sent } => {
             if *sent {
-                return Hresult::END_OF_DATA;
+                return Err(CommandError::EndOfData);
             }
             *sent = true;
             thread_info_line(info, cx.line);
-            Hresult::OK
+            Ok(Reply::Ok)
         }
         Continuation::Context { snapshot, position } => context_lines(*snapshot, position, cx),
     }
@@ -728,9 +795,9 @@ fn start_transfer(invocation: &mut Invocation<'_>, continuation: Continuation) -
 
 /// `getpid`: a nonzero identifier generated once per boot from the time
 /// base and the system time.
-fn get_process_id(invocation: &mut Invocation<'_>) -> Hresult {
+fn get_process_id(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.backend.execution_state() == ExecutionState::Pending {
-        return Hresult::from_error_code(ErrorCode::NO_SUCH_THREAD);
+        return Err(NoSuchThread.into());
     }
     let process_id = match invocation.state.debugger.process_id {
         Some(process_id) => process_id,
@@ -745,7 +812,7 @@ fn get_process_id(invocation: &mut Invocation<'_>) -> Hresult {
         },
     };
     invocation.set_text(format_args!("pid=0x{process_id:08x}"));
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// Keys of `break` that request more than `now`.
@@ -763,12 +830,12 @@ static BREAK_FLAGS: [&str; 7] = [
 /// data breakpoint `read=|write=|readwrite=|execute=` with `size=`. `now`
 /// stops the command thread at a trap; the reply follows once a debugger
 /// continues it.
-fn set_breakpoint(invocation: &mut Invocation<'_>) -> Hresult {
+fn set_breakpoint(invocation: &mut Invocation<'_>) -> CommandResult {
     let line = invocation.line;
     let now = line.has("now");
     let stopped = if now { break_now(invocation) } else { None };
     let result = if now && !BREAK_FLAGS.iter().any(|key| line.has(key)) {
-        Hresult::OK
+        Ok(Reply::Ok)
     } else {
         breakpoint_flags(invocation)
     };
@@ -785,7 +852,7 @@ fn set_breakpoint(invocation: &mut Invocation<'_>) -> Hresult {
         text,
     });
     send_held_reply(invocation.state, invocation.backend, invocation.network);
-    Hresult::NO_REPLY
+    Ok(Reply::Sent)
 }
 
 /// Trap on the command thread and process the trap as a debug event.
@@ -802,29 +869,30 @@ fn break_now(invocation: &mut Invocation<'_>) -> Option<ThreadId> {
     Some(thread)
 }
 
-fn breakpoint_flags(invocation: &mut Invocation<'_>) -> Hresult {
+fn breakpoint_flags(invocation: &mut Invocation<'_>) -> CommandResult {
     let line = invocation.line;
     if line.has("start") {
-        let result = break_at_title_start(invocation.state, invocation.backend);
-        if result != Hresult::OK {
+        if let Err(error) = break_at_title_start(invocation.state, invocation.backend) {
             invocation.set_text(format_args!("execution not pending"));
+            return Err(error.into());
         }
-        return result;
+        return Ok(Reply::Ok);
     }
     if line.has("clearall") {
         let debugger = &mut invocation.state.debugger;
         debugger.breakpoints.clear_all(invocation.backend);
         debugger.data_breakpoint = None;
         invocation.backend.set_data_breakpoint_register(0);
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     let clear = line.has("clear");
     if let Some(address) = util::required_dword(invocation, "addr") {
-        return if clear {
-            clear_software_breakpoint(invocation.state, invocation.backend, address)
+        if clear {
+            clear_software_breakpoint(invocation.state, invocation.backend, address)?;
         } else {
-            set_software_breakpoint(invocation.state, invocation.backend, address)
-        };
+            set_software_breakpoint(invocation.state, invocation.backend, address)?;
+        }
+        return Ok(Reply::Ok);
     }
     let dword = |key: &str| line.dword(key);
     let (address, kind) = if let Some(address) = dword("read") {
@@ -836,14 +904,14 @@ fn breakpoint_flags(invocation: &mut Invocation<'_>) -> Hresult {
     } else if let Some(address) = dword("execute") {
         (address, None)
     } else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let size = if clear {
         0
     } else {
         match util::required_dword(invocation, "size") {
             Some(size) => size,
-            None => return util::MISSING,
+            None => return Err(util::MISSING),
         }
     };
     invocation.text.clear();
@@ -852,20 +920,40 @@ fn breakpoint_flags(invocation: &mut Invocation<'_>) -> Hresult {
     } else {
         DataTarget::Set(kind)
     };
-    set_data_breakpoint(invocation.state, invocation.backend, address, size, target)
+    set_data_breakpoint(invocation.state, invocation.backend, address, size, target)?;
+    Ok(Reply::Ok)
+}
+
+/// No title launch is pending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotPending;
+
+impl From<NotPending> for CommandError {
+    fn from(NotPending: NotPending) -> Self {
+        Self::Fail
+    }
 }
 
 /// Break when the title's first thread starts (stock export 39,
 /// 0x91f26728): only while a title launch is pending.
-pub fn break_at_title_start(state: &mut ServerState, backend: &mut dyn AnyBackend) -> Hresult {
+pub fn break_at_title_start(
+    state: &mut ServerState,
+    backend: &mut dyn AnyBackend,
+) -> Result<(), NotPending> {
     if matches!(
         backend.execution_state(),
         ExecutionState::Pending | ExecutionState::PendingTitle
     ) {
         state.debugger.break_at_title_entry = true;
-        Hresult::OK
+        Ok(())
     } else {
-        Hresult::FAIL
+        Err(NotPending)
+    }
+}
+
+impl From<SetError> for CommandError {
+    fn from(_: SetError) -> Self {
+        Self::Fail
     }
 }
 
@@ -875,10 +963,17 @@ pub fn set_software_breakpoint(
     state: &mut ServerState,
     backend: &mut dyn AnyBackend,
     address: u32,
-) -> Hresult {
-    match state.debugger.breakpoints.set(address, backend) {
-        Ok(()) => Hresult::OK,
-        Err(_) => Hresult::FAIL,
+) -> Result<(), SetError> {
+    state.debugger.breakpoints.set(address, backend)
+}
+
+/// No software breakpoint is set at the address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoSuchBreakpoint;
+
+impl From<NoSuchBreakpoint> for CommandError {
+    fn from(NoSuchBreakpoint: NoSuchBreakpoint) -> Self {
+        Self::Fail
     }
 }
 
@@ -887,11 +982,11 @@ pub fn clear_software_breakpoint(
     state: &mut ServerState,
     backend: &mut dyn AnyBackend,
     address: u32,
-) -> Hresult {
+) -> Result<(), NoSuchBreakpoint> {
     if state.debugger.breakpoints.clear(address, backend) {
-        Hresult::OK
+        Ok(())
     } else {
-        Hresult::FAIL
+        Err(NoSuchBreakpoint)
     }
 }
 
@@ -916,6 +1011,28 @@ impl DataTarget {
     }
 }
 
+/// A data breakpoint request was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataBreakpointError {
+    /// The range crosses an 8-byte boundary.
+    Unaligned,
+    /// Another data breakpoint is set.
+    InUse,
+    /// The kind is not supported (execute).
+    UnsupportedKind,
+}
+
+impl From<DataBreakpointError> for CommandError {
+    fn from(error: DataBreakpointError) -> Self {
+        match error {
+            DataBreakpointError::Unaligned | DataBreakpointError::UnsupportedKind => {
+                Self::InvalidArgument
+            }
+            DataBreakpointError::InUse => Self::OutOfMemory,
+        }
+    }
+}
+
 /// Set or clear the data breakpoint (stock export 38, 0x91f27370). The
 /// monitor keeps the address 0 as "no breakpoint", so a breakpoint at 0 is
 /// replaced by the next set and a clear of 0 always reprograms.
@@ -925,7 +1042,7 @@ pub fn set_data_breakpoint(
     address: u32,
     size: u32,
     target: DataTarget,
-) -> Hresult {
+) -> Result<(), DataBreakpointError> {
     let debugger = &mut state.debugger;
     let kind = match target {
         DataTarget::Clear => {
@@ -937,12 +1054,12 @@ pub fn set_data_breakpoint(
                 debugger.data_breakpoint = None;
                 backend.set_data_breakpoint_register(0);
             }
-            return Hresult::OK;
+            return Ok(());
         }
         DataTarget::Set(kind) => kind,
     };
     if (address & 7).wrapping_add(size) > 8 {
-        return Hresult::INVALID_ARGUMENT;
+        return Err(DataBreakpointError::Unaligned);
     }
     if let Some(current) = debugger
         .data_breakpoint
@@ -951,12 +1068,12 @@ pub fn set_data_breakpoint(
         if Some(current.kind) == kind && current.address == address && current.size == size {
             // The monitor reprograms the registers with 0 here.
             backend.set_data_breakpoint_register(0);
-            return Hresult::OK;
+            return Ok(());
         }
-        return Hresult::OUT_OF_MEMORY;
+        return Err(DataBreakpointError::InUse);
     }
     let Some(kind) = kind else {
-        return Hresult::INVALID_ARGUMENT;
+        return Err(DataBreakpointError::UnsupportedKind);
     };
     let breakpoint = DataBreakpoint {
         address,
@@ -965,7 +1082,7 @@ pub fn set_data_breakpoint(
     };
     debugger.data_breakpoint = Some(breakpoint);
     backend.set_data_breakpoint_register(breakpoint.register());
-    Hresult::OK
+    Ok(())
 }
 
 /// Breakpoint kind at `address` (stock export 56, 0x91f257f8): 4 for a
@@ -983,13 +1100,43 @@ pub fn breakpoint_kind(state: &ServerState, address: u32) -> u32 {
 }
 
 /// `isbreak addr=`.
-fn is_breakpoint(invocation: &mut Invocation<'_>) -> Hresult {
+fn is_breakpoint(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(address) = util::required_dword(invocation, "addr") else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let kind = breakpoint_kind(invocation.state, address);
     invocation.set_text(format_args!("type={kind}"));
-    Hresult::OK
+    Ok(Reply::Ok)
+}
+
+/// Why an execution state change was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionError {
+    /// `426-`: a stop while stopped or while a title launch is pending.
+    AlreadyStopped,
+    /// A start while running.
+    NotStopped,
+    /// `400-`: a start while rebooting.
+    Rebooting,
+    /// The state machine has no transition from the current state.
+    AccessDenied,
+}
+
+impl From<ExecutionError> for Hresult {
+    fn from(error: ExecutionError) -> Self {
+        match error {
+            ExecutionError::AlreadyStopped => Hresult::error(0x1a),
+            ExecutionError::NotStopped => Hresult::from_error_code(ErrorCode::NotStopped),
+            ExecutionError::Rebooting => Hresult::from_error_code(ErrorCode::Undefined),
+            ExecutionError::AccessDenied => Hresult::from_error_code(ErrorCode::AccessDenied),
+        }
+    }
+}
+
+impl From<ExecutionError> for CommandError {
+    fn from(error: ExecutionError) -> Self {
+        Self::Execution(error)
+    }
 }
 
 /// Change the execution state for a command (callers of the monitor's
@@ -1000,19 +1147,19 @@ pub(crate) fn change_execution(
     backend: &mut dyn AnyBackend,
     network: &mut dyn Network,
     target: ExecutionState,
-) -> Hresult {
+) -> Result<(), ExecutionError> {
     match (target, backend.execution_state()) {
         (
             ExecutionState::Stopped,
             ExecutionState::Stopped | ExecutionState::Pending | ExecutionState::PendingTitle,
-        ) => Hresult::error(0x1a),
+        ) => Err(ExecutionError::AlreadyStopped),
         (
             ExecutionState::Started,
             ExecutionState::Started | ExecutionState::RebootTitle | ExecutionState::Pending,
-        ) => Hresult::from_error_code(ErrorCode::NOT_STOPPED),
-        (ExecutionState::Started, ExecutionState::Rebooting) => Hresult::error(0),
-        _ if transition(state, backend, network, target, true) => Hresult::OK,
-        _ => Hresult::from_error_code(ErrorCode::ACCESS_DENIED),
+        ) => Err(ExecutionError::NotStopped),
+        (ExecutionState::Started, ExecutionState::Rebooting) => Err(ExecutionError::Rebooting),
+        _ if transition(state, backend, network, target, true) => Ok(()),
+        _ => Err(ExecutionError::AccessDenied),
     }
 }
 
@@ -1081,13 +1228,12 @@ fn transition(
     true
 }
 
-/// Stop the title (stock 0x91f25be0): `Hresult::OK` when it was stopped by
-/// this call, 0x82da001a when already stopped, else 0x82da000e.
+/// Stop the title (stock 0x91f25be0); fails unless this call stopped it.
 pub fn stop_execution(
     state: &mut ServerState,
     backend: &mut dyn AnyBackend,
     network: &mut dyn Network,
-) -> Hresult {
+) -> Result<(), ExecutionError> {
     change_execution(state, backend, network, ExecutionState::Stopped)
 }
 
@@ -1096,7 +1242,7 @@ pub fn go_execution(
     state: &mut ServerState,
     backend: &mut dyn AnyBackend,
     network: &mut dyn Network,
-) -> Hresult {
+) -> Result<(), ExecutionError> {
     let target = if backend.execution_state() == ExecutionState::Pending {
         ExecutionState::RebootTitle
     } else {
@@ -1106,26 +1252,28 @@ pub fn go_execution(
 }
 
 /// `stop`.
-fn stop(invocation: &mut Invocation<'_>) -> Hresult {
+fn stop(invocation: &mut Invocation<'_>) -> CommandResult {
     let result = stop_execution(invocation.state, invocation.backend, invocation.network);
-    if result == Hresult::error(0x1a) {
+    if result == Err(ExecutionError::AlreadyStopped) {
         invocation.set_text(format_args!("already stopped"));
     }
-    result
+    result?;
+    Ok(Reply::Ok)
 }
 
 /// `go`.
-fn go(invocation: &mut Invocation<'_>) -> Hresult {
+fn go(invocation: &mut Invocation<'_>) -> CommandResult {
     let result = go_execution(invocation.state, invocation.backend, invocation.network);
-    if result == Hresult::from_error_code(ErrorCode::NOT_STOPPED) {
+    if result == Err(ExecutionError::NotStopped) {
         invocation.set_text(format_args!("not stopped"));
     }
-    result
+    result?;
+    Ok(Reply::Ok)
 }
 
 /// `halt [thread=]`: the monitor's halt routine always fails.
-fn halt(_invocation: &mut Invocation<'_>) -> Hresult {
-    Hresult::error(0)
+fn halt(_invocation: &mut Invocation<'_>) -> CommandResult {
+    Err(ErrorCode::Undefined.into())
 }
 
 fn required_thread(invocation: &mut Invocation<'_>) -> Option<ThreadId> {
@@ -1140,14 +1288,14 @@ pub fn continue_stopped_thread(
     network: &mut dyn Network,
     thread: ThreadId,
     pass_exception: bool,
-) -> Hresult {
+) -> Result<(), StoppedThreadError> {
     events::continue_thread(state, backend, network, thread, pass_exception)
 }
 
 /// `continue thread= [exception]`.
-fn continue_thread(invocation: &mut Invocation<'_>) -> Hresult {
+fn continue_thread(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(thread) = required_thread(invocation) else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let pass_exception = invocation.line.has("exception");
     continue_stopped_thread(
@@ -1156,29 +1304,26 @@ fn continue_thread(invocation: &mut Invocation<'_>) -> Hresult {
         invocation.network,
         thread,
         pass_exception,
-    )
+    )?;
+    Ok(Reply::Ok)
 }
 
 /// `suspend thread=`.
-fn suspend_thread(invocation: &mut Invocation<'_>) -> Hresult {
+fn suspend_thread(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(thread) = required_thread(invocation) else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
-    match invocation.backend.suspend_thread(thread) {
-        Ok(()) => Hresult::OK,
-        Err(NoSuchThread) => Hresult::from_error_code(ErrorCode::NO_SUCH_THREAD),
-    }
+    invocation.backend.suspend_thread(thread)?;
+    Ok(Reply::Ok)
 }
 
 /// `resume thread=`.
-fn resume_thread(invocation: &mut Invocation<'_>) -> Hresult {
+fn resume_thread(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(thread) = required_thread(invocation) else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
-    match invocation.backend.resume_thread(thread) {
-        Ok(()) => Hresult::OK,
-        Err(NoSuchThread) => Hresult::from_error_code(ErrorCode::NO_SUCH_THREAD),
-    }
+    invocation.backend.resume_thread(thread)?;
+    Ok(Reply::Ok)
 }
 
 /// What a thread is stopped at (stock export 22, 0x91f26058).
@@ -1186,36 +1331,33 @@ pub fn stop_reason(
     state: &ServerState,
     backend: &mut dyn AnyBackend,
     thread: ThreadId,
-) -> Result<StopReason, Hresult> {
+) -> Result<StopReason, StoppedThreadError> {
     events::stop_reason(state, backend, thread)
 }
 
 /// `isstopped thread=`: the event the thread is stopped at.
-fn is_stopped(invocation: &mut Invocation<'_>) -> Hresult {
+fn is_stopped(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(thread) = required_thread(invocation) else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
-    let reason = match stop_reason(invocation.state, invocation.backend, thread) {
-        Ok(reason) => reason,
-        Err(result) => return result,
-    };
+    let reason = stop_reason(invocation.state, invocation.backend, thread)?;
     invocation.text.clear();
     events::stop_description(invocation.backend, &reason, invocation.text);
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `threads`: identifiers of the debuggable threads as signed decimal
 /// lines, in reverse enumeration order.
-fn threads(invocation: &mut Invocation<'_>) -> Hresult {
+fn threads(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(socket) = invocation.session.as_ref().map(|session| session.socket()) else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     let Some(list) = invocation.state.transfer_blocks.acquire(
         invocation.backend,
         socket,
         THREAD_LIST_CAPACITY as u32 * 4,
     ) else {
-        return Hresult::OUT_OF_MEMORY;
+        return Err(CommandError::OutOfMemory);
     };
     let mut ids = [ThreadId(0); THREAD_LIST_CAPACITY];
     let count = if invocation.backend.execution_state() == ExecutionState::Pending {
@@ -1228,7 +1370,7 @@ fn threads(invocation: &mut Invocation<'_>) -> Hresult {
                     .state
                     .transfer_blocks
                     .release(invocation.backend, list);
-                return Hresult::UNEXPECTED;
+                return Err(CommandError::Unexpected);
             }
         }
     };
@@ -1249,17 +1391,17 @@ fn threads(invocation: &mut Invocation<'_>) -> Hresult {
         },
     );
     invocation.set_text(format_args!("thread list follows"));
-    Hresult::MULTILINE
+    Ok(Reply::Multiline)
 }
 
 fn thread_lines(
     list: TransferBlock,
     remaining: &mut u16,
     cx: &mut ContinuationContext<'_>,
-) -> Hresult {
+) -> CommandResult {
     if *remaining == 0 {
         cx.state.transfer_blocks.release(cx.backend, list);
-        return Hresult::END_OF_DATA;
+        return Err(CommandError::EndOfData);
     }
     let ids = cx
         .state
@@ -1278,7 +1420,7 @@ fn thread_lines(
         let _ = write!(out, "{}\r\n", id as i32);
     }
     cx.binary_len = out.len;
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 struct BinaryWriter<'a> {
@@ -1303,20 +1445,17 @@ impl core::fmt::Write for BinaryWriter<'_> {
 const THREAD_SLACK: u32 = 0x540;
 
 /// `threadinfo thread=`.
-fn thread_info(invocation: &mut Invocation<'_>) -> Hresult {
+fn thread_info(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.session.is_none() {
-        return Hresult::error(0);
+        return Err(ErrorCode::Undefined.into());
     }
     let Some(thread) = required_thread(invocation) else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
-    let info = match invocation.backend.thread_info(thread) {
-        Ok(info) => info,
-        Err(NoSuchThread) => return Hresult::from_error_code(ErrorCode::NO_SUCH_THREAD),
-    };
+    let info = invocation.backend.thread_info(thread)?;
     start_transfer(invocation, Continuation::ThreadInfo { info, sent: false });
     invocation.set_text(format_args!("thread info follows"));
-    Hresult::MULTILINE
+    Ok(Reply::Multiline)
 }
 
 fn thread_info_line(info: &ThreadInfo, line: &mut LineText) {
@@ -1344,12 +1483,12 @@ fn thread_info_line(info: &ThreadInfo, line: &mut LineText) {
 }
 
 /// `getcontext thread= [control] [int] [fp] [vr] [full]`.
-fn get_context(invocation: &mut Invocation<'_>) -> Hresult {
+fn get_context(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.session.is_none() {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     let Some(thread) = required_thread(invocation) else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let line = invocation.line;
     let mut flags = ContextFlags::NONE;
@@ -1366,15 +1505,9 @@ fn get_context(invocation: &mut Invocation<'_>) -> Hresult {
     }
     let mut context = Context::EMPTY;
     context.flags = flags;
-    if invocation
-        .backend
-        .thread_context(thread, &mut context)
-        .is_err()
-    {
-        return Hresult::from_error_code(ErrorCode::NO_SUCH_THREAD);
-    }
+    invocation.backend.thread_context(thread, &mut context)?;
     let Some(socket) = invocation.session.as_ref().map(|session| session.socket()) else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     let Some(snapshot) =
         invocation
@@ -1382,7 +1515,7 @@ fn get_context(invocation: &mut Invocation<'_>) -> Hresult {
             .transfer_blocks
             .acquire(invocation.backend, socket, SNAPSHOT_POOL_SIZE)
     else {
-        return Hresult::OUT_OF_MEMORY;
+        return Err(CommandError::OutOfMemory);
     };
     if let Some(bytes) = snapshot_bytes(
         &mut invocation.state.transfer_blocks,
@@ -1398,7 +1531,7 @@ fn get_context(invocation: &mut Invocation<'_>) -> Hresult {
             position: 0,
         },
     );
-    Hresult::MULTILINE
+    Ok(Reply::Multiline)
 }
 
 /// Pool bytes of a `getcontext` copy (stock 0x91f482b0 allocates 0xa50).
@@ -1421,13 +1554,13 @@ fn context_lines(
     snapshot: TransferBlock,
     position: &mut usize,
     cx: &mut ContinuationContext<'_>,
-) -> Hresult {
+) -> CommandResult {
     let context = snapshot_bytes(&mut cx.state.transfer_blocks, cx.backend, snapshot)
         .map(|bytes| Context::decode(bytes))
         .unwrap_or_default();
     if ContextLine::first_from(*position, context.flags).is_none() {
         cx.state.transfer_blocks.release(cx.backend, snapshot);
-        return Hresult::END_OF_DATA;
+        return Err(CommandError::EndOfData);
     }
     let mut out = BinaryWriter {
         buffer: cx.binary,
@@ -1447,30 +1580,21 @@ fn context_lines(
         *position = index + 1;
     }
     cx.binary_len = out.len;
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `setcontext thread= <Reg>=<value>...`.
-fn set_context(invocation: &mut Invocation<'_>) -> Hresult {
+fn set_context(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(thread) = required_thread(invocation) else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let mut context = Context::EMPTY;
     context.flags = ContextFlags::FULL;
-    if invocation
-        .backend
-        .thread_context(thread, &mut context)
-        .is_err()
-    {
-        return Hresult::from_error_code(ErrorCode::NO_SUCH_THREAD);
-    }
+    invocation.backend.thread_context(thread, &mut context)?;
     context::apply_parameters(&invocation.line, &mut context);
     context.flags = ContextFlags::FULL;
-    match invocation.backend.set_thread_context(thread, &context) {
-        Ok(()) => Hresult::OK,
-        Err(SetContextError::NoSuchThread) => Hresult::from_error_code(ErrorCode::NO_SUCH_THREAD),
-        Err(SetContextError::NotStopped) => Hresult::from_error_code(ErrorCode::NOT_STOPPED),
-    }
+    invocation.backend.set_thread_context(thread, &context)?;
+    Ok(Reply::Ok)
 }
 
 const STOP_ON_FLAGS: [(&str, StopOn); 6] = [
@@ -1504,37 +1628,42 @@ pub fn change_stop_on(state: &mut ServerState, mask: StopOn, enable: bool) {
 }
 
 /// `stopon`.
-fn stop_on(invocation: &mut Invocation<'_>) -> Hresult {
+fn stop_on(invocation: &mut Invocation<'_>) -> CommandResult {
     let mask = stop_on_mask(invocation, "stop on all");
     change_stop_on(invocation.state, StopOn(mask), true);
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `nostopon`.
-fn no_stop_on(invocation: &mut Invocation<'_>) -> Hresult {
+fn no_stop_on(invocation: &mut Invocation<'_>) -> CommandResult {
     let mask = stop_on_mask(invocation, "stop on none");
     change_stop_on(invocation.state, StopOn(mask), false);
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `crashdump`: reply first, then write a dump of the calling thread.
-fn crash_dump(invocation: &mut Invocation<'_>) -> Hresult {
+fn crash_dump(invocation: &mut Invocation<'_>) -> CommandResult {
     let _ = invocation.send_line(b"200- OK");
     invocation.backend.crash_dump();
-    Hresult::NO_REPLY
+    Ok(Reply::Sent)
 }
 
 /// `threadstat handle=`.
-fn thread_status(invocation: &mut Invocation<'_>) -> Hresult {
+fn thread_status(invocation: &mut Invocation<'_>) -> CommandResult {
     let line = invocation.line;
     let Some(handle) = kd::flag_number(&line, invocation.buffer, "handle") else {
-        return Hresult::from_error_code(ErrorCode::BAD_PARAMETER);
+        return Err(ErrorCode::BadParameter.into());
     };
-    match invocation.backend.thread_exit_status(handle) {
-        Ok(code) => invocation.set_text(format_args!("Exit Code 0x{code:x}")),
-        Err(error) => invocation.set_text(format_args!("Error 0x{error:x}")),
+    match invocation.backend.thread_exit_status(ThreadHandle(handle)) {
+        Ok(ExitStatus(code)) => invocation.set_text(format_args!("Exit Code 0x{code:x}")),
+        Err(error) => {
+            // The kernel's translation; 0 (ERROR_SUCCESS) prints as is.
+            let code = crate::commands::filesystem::Backend::dos_error(invocation.backend, error)
+                .map_or(0, Win32Error::code);
+            invocation.set_text(format_args!("Error 0x{code:x}"));
+        }
     }
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// Parse `a.b.c.d`: up to three decimal digits per octet, `.` after the
@@ -1570,7 +1699,7 @@ fn debugger_target_exists(state: &ServerState, address: u32, port: u32) -> bool 
 
 /// `debugger connect|disconnect|init [addr=] [port=] [name=] [user=]
 /// [override]`.
-fn debugger_identity(invocation: &mut Invocation<'_>) -> Hresult {
+fn debugger_identity(invocation: &mut Invocation<'_>) -> CommandResult {
     let line = invocation.line;
     let address = match line.param("addr") {
         Some(value) => {
@@ -1598,7 +1727,7 @@ fn debugger_identity(invocation: &mut Invocation<'_>) -> Hresult {
             && debugger_target_exists(state, record.address, record.port)
             && !override_existing
         {
-            return Hresult::from_error_code(ErrorCode::FILE_ALREADY_EXISTS);
+            return Err(ErrorCode::FileAlreadyExists.into());
         }
         let changed = apply_identity(state, &line, address, port, true);
         let record = &mut state.debugger.debugger;
@@ -1607,7 +1736,7 @@ fn debugger_identity(invocation: &mut Invocation<'_>) -> Hresult {
         if changed {
             state.settings_dirty = true;
         }
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     if line.has("disconnect") {
         let record = &state.debugger.debugger;
@@ -1615,21 +1744,21 @@ fn debugger_identity(invocation: &mut Invocation<'_>) -> Hresult {
             && !(port == Some(record.port) && address == record.address)
             && !override_existing
         {
-            return Hresult::from_error_code(ErrorCode::ACCESS_DENIED);
+            return Err(ErrorCode::AccessDenied.into());
         }
         state.debugger.debugger = DebuggerRecord::EMPTY;
         state.debugger.kernel_debugger = Some(true);
         state.settings_dirty = true;
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     if line.has("init") {
         if apply_identity(state, &line, address, port, false) {
             state.settings_dirty = true;
         }
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     invocation.set_text(format_args!("no command"));
-    Hresult::FAIL
+    Err(CommandError::Fail)
 }
 
 /// Store the given identity fields; returns whether the settings changed.
@@ -1661,18 +1790,18 @@ fn apply_identity(
     changed
 }
 
-/// `isdebugger`.
-fn is_debugger(invocation: &mut Invocation<'_>) -> Hresult {
+/// `isdebugger`: an attached debugger reports as status 410.
+fn is_debugger(invocation: &mut Invocation<'_>) -> CommandResult {
     let state = &*invocation.state;
     let record = &state.debugger.debugger;
     if !record.attached {
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     if record.address != 0 && !debugger_target_exists(state, record.address, record.port) {
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     if record.name.is_empty() && record.user.is_empty() {
-        return Hresult::from_error_code(ErrorCode::FILE_ALREADY_EXISTS);
+        return Err(ErrorCode::FileAlreadyExists.into());
     }
     let text = &mut *invocation.text;
     text.clear();
@@ -1685,7 +1814,7 @@ fn is_debugger(invocation: &mut Invocation<'_>) -> Hresult {
         let _ = text.push_bytes(b"user=");
         let _ = text.push_bytes(record.user.as_bytes());
     }
-    Hresult::from_error_code(ErrorCode::FILE_ALREADY_EXISTS)
+    Err(ErrorCode::FileAlreadyExists.into())
 }
 
 /// Settings line of the attached debugger (stock 0x91f3ce50), written

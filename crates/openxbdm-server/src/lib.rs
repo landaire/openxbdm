@@ -18,6 +18,7 @@ pub mod network;
 pub mod notify;
 pub mod processors;
 pub mod registry;
+pub mod reply;
 pub mod server;
 pub mod state;
 pub mod text;

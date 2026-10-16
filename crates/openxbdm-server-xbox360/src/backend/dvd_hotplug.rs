@@ -11,6 +11,7 @@ use core::sync::atomic::AtomicI32;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
+use openxbdm_core::status::NtStatus;
 use openxbdm_server::Server;
 use openxbdm_server::commands::console::TraceMask;
 use openxbdm_server::commands::filesystem::Backend as _;
@@ -748,8 +749,8 @@ pub(crate) fn install(trace_mask: TraceMask) {
     let verbose = trace_mask.contains(TraceMask::CDROM);
     let name = AnsiString::new(b"\\Device\\Cdrom0");
     let mut object = 0u32;
-    let status = kernel::ObReferenceObjectByName(&name, 0, 0, 0, &mut object);
-    if ((status as i32) < 0 || object == 0) && verbose {
+    let found = NtStatus(kernel::ObReferenceObjectByName(&name, 0, 0, 0, &mut object)).result();
+    if (found.is_err() || object == 0) && verbose {
         kernel::debug_print(c"[xbdm] Failed to find object: CdRom0.\n");
     }
     if patch(Device::new(object)).is_err() && verbose {

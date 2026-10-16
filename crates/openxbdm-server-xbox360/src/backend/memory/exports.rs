@@ -6,10 +6,16 @@ use core::ffi::CStr;
 use core::ffi::c_char;
 use core::sync::atomic::Ordering;
 
+use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::KernelError;
+use openxbdm_core::status::NtStatus;
 use openxbdm_server::commands::console;
 use openxbdm_server::commands::memory;
 use openxbdm_server::commands::memory::Backend as _;
+use openxbdm_server::reply;
+use openxbdm_server::reply::CommandResult;
+use openxbdm_server::reply::Reply;
 
 use super::ENTRY_BASE;
 use super::ENTRY_FLAG_REPORTED;
@@ -26,8 +32,8 @@ use super::RtlImageDirectoryEntryToData;
 use super::RtlImageXexHeaderField;
 use super::SECTION_HEADER_SIZE;
 use super::TRACKING;
-use super::TRACKING_OFF;
 use super::TRACKING_TYPE_COUNT;
+use super::TrackingError;
 use super::Untracked;
 use super::all_entries;
 use super::code_view_of;
@@ -41,6 +47,7 @@ use super::read_u32;
 use super::section_info;
 use super::section_table;
 use super::track_allocation;
+use super::tracking_hresult;
 use super::tracking_type_name_bytes;
 use super::untrack_allocation;
 use super::write_debug_byte;
@@ -51,7 +58,6 @@ use crate::kernel;
 /// Result of an export whose server part could not run (on the server
 /// thread or above passive level).
 const SERVER_UNAVAILABLE: Hresult = Hresult::FAIL;
-const MEMORY_NOT_MAPPED: Hresult = Hresult::error(4);
 const BAD_PARAMETER: Hresult = Hresult::error(0x17);
 const NO_SUCH_MODULE: Hresult = Hresult::error(3);
 const NO_SUCH_FIELD: Hresult = Hresult::error(0x25);
@@ -63,7 +69,7 @@ const TOO_MANY_NAMES: u32 = 0x8007_03fb;
 /// Module snapshot record of export 142 (DMN_MODLOAD_EX).
 const MODULE_RECORD_SIZE: u32 = 0x12c;
 /// Export 51's record: the export 142 record without its size dword.
-const MODULE_RECORD_SHORT_SIZE: usize = 0x124;
+pub(crate) const MODULE_RECORD_SHORT_SIZE: usize = 0x124;
 const MODULE_SNAPSHOT_TAG: u32 = u32::from_be_bytes(*b"dmwm");
 const MODULE_SNAPSHOT_CAPACITY: u32 = 10;
 /// Section snapshot record of export 52 (DMN_SECTIONLOAD).
@@ -136,7 +142,7 @@ fn transfer<'a>(argument: u32) -> &'a Transfer {
 /// copy before the next byte. Without a count pointer, stock reports
 /// 0x82da0004 whenever its down counter did not end at zero, which
 /// includes every complete copy.
-fn copy_bytes(request: &Transfer, mut step: impl FnMut(u32, u32) -> bool) -> u32 {
+fn copy_bytes(request: &Transfer, mut step: impl FnMut(u32, u32) -> bool) -> CommandResult {
     let mut remaining = request.length;
     let mut valid = true;
     let mut page = request.address.wrapping_add(0x1000);
@@ -164,9 +170,9 @@ fn copy_bytes(request: &Transfer, mut step: impl FnMut(u32, u32) -> bool) -> u32
         write_u32(request.count, count);
     }
     if remaining != 0 && request.count == 0 {
-        MEMORY_NOT_MAPPED.0
+        Err(ErrorCode::MemoryNotMapped.into())
     } else {
-        Hresult::OK.0
+        Ok(Reply::Ok)
     }
 }
 
@@ -186,7 +192,7 @@ extern "C" fn get_memory(address: u32, length: u32, buffer: u32, count: u32) -> 
     dispatcher::call_on_server(
         |server, _console, _network, argument| {
             let request = transfer(argument);
-            copy_bytes(request, |current, index| {
+            reply::hresult(copy_bytes(request, |current, index| {
                 match server
                     .state
                     .debugger
@@ -199,7 +205,8 @@ extern "C" fn get_memory(address: u32, length: u32, buffer: u32, count: u32) -> 
                     }
                     None => false,
                 }
-            })
+            }))
+            .0
         },
         &request as *const Transfer as usize as u32,
     )
@@ -223,10 +230,11 @@ extern "C" fn set_memory(address: u32, length: u32, buffer: u32, count: u32) -> 
     dispatcher::call_on_server(
         |server, _console, _network, argument| {
             let request = transfer(argument);
-            copy_bytes(request, |current, index| {
+            reply::hresult(copy_bytes(request, |current, index| {
                 let byte = read_u8(request.buffer + index);
                 server.state.debugger.shadow_write(current, byte) || write_debug_byte(current, byte)
-            })
+            }))
+            .0
         },
         &request as *const Transfer as usize as u32,
     )
@@ -345,26 +353,51 @@ fn module_snapshot() -> Option<u32> {
     }
 }
 
-/// Stock export 142 (0x91f338c0): `(walk, record) -> HRESULT`; the next
-/// module of a snapshot taken on the first call. `record` starts with its
-/// size, at most 0x12c bytes are copied, and the size is replaced by the
-/// copied length. 0x82da0104 after the last module.
-pub(crate) extern "C" fn walk_loaded_modules(walk: u32, record: u32) -> u32 {
+/// Why a module walk returned no record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModuleWalkError {
+    /// A null walk or record pointer.
+    InvalidArgument,
+    /// The snapshot could not be allocated.
+    OutOfMemory,
+    /// Every module was returned.
+    End,
+}
+
+impl From<ModuleWalkError> for Hresult {
+    fn from(error: ModuleWalkError) -> Self {
+        match error {
+            ModuleWalkError::InvalidArgument => Hresult::INVALID_ARGUMENT,
+            ModuleWalkError::OutOfMemory => Hresult::OUT_OF_MEMORY,
+            ModuleWalkError::End => Hresult::END_OF_DATA,
+        }
+    }
+}
+
+/// The export word of a module walk.
+fn walk_word(result: Result<(), ModuleWalkError>) -> u32 {
+    match result {
+        Ok(()) => Hresult::OK.0,
+        Err(error) => Hresult::from(error).0,
+    }
+}
+
+/// The next module of a snapshot taken on the first call. `record` starts
+/// with its size, at most 0x12c bytes are copied, and the size is replaced
+/// by the copied length.
+fn next_loaded_module(walk: u32, record: u32) -> Result<(), ModuleWalkError> {
     if walk == 0 || record == 0 {
-        return Hresult::INVALID_ARGUMENT.0;
+        return Err(ModuleWalkError::InvalidArgument);
     }
     let mut snapshot = read_u32(walk);
     if snapshot == 0 {
-        match module_snapshot() {
-            Some(created) => snapshot = created,
-            None => return Hresult::OUT_OF_MEMORY.0,
-        }
+        snapshot = module_snapshot().ok_or(ModuleWalkError::OutOfMemory)?;
         write_u32(walk, snapshot);
     }
     let count = read_u32(snapshot);
     let index = read_u32(snapshot + 4);
     if index == count {
-        return Hresult::END_OF_DATA.0;
+        return Err(ModuleWalkError::End);
     }
     let size = read_u32(record).min(MODULE_RECORD_SIZE);
     write_u32(snapshot + 4, index + 1);
@@ -378,27 +411,48 @@ pub(crate) extern "C" fn walk_loaded_modules(walk: u32, record: u32) -> u32 {
         )
     };
     write_u32(record, size);
-    Hresult::OK.0
+    Ok(())
+}
+
+/// Stock export 142 (0x91f338c0): `(walk, record) -> HRESULT`;
+/// [`next_loaded_module`].
+extern "C" fn walk_loaded_modules(walk: u32, record: u32) -> u32 {
+    walk_word(next_loaded_module(walk, record))
 }
 export!(142, walk_loaded_modules);
 
-/// Stock export 51 (0x91f33af8): `(walk, record) -> HRESULT`; export 142
-/// with a 0x124-byte record that has no size dword.
-pub(crate) extern "C" fn walk_modules(walk: u32, record: u32) -> u32 {
+/// [`next_loaded_module`] with a 0x124-byte record that has no size dword.
+fn next_short_module(walk: u32, record: u32) -> Result<(), ModuleWalkError> {
     let mut full = [0u32; MODULE_RECORD_SIZE as usize / 4];
     full[0] = MODULE_RECORD_SIZE;
-    let result = walk_loaded_modules(walk, full.as_mut_ptr() as usize as u32);
-    if (result as i32) >= 0 {
-        // SAFETY: the caller's record holds 0x124 bytes.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                full.as_ptr().cast::<u8>().add(4),
-                record as usize as *mut u8,
-                MODULE_RECORD_SHORT_SIZE,
-            )
-        };
-    }
-    result
+    next_loaded_module(walk, full.as_mut_ptr() as usize as u32)?;
+    // SAFETY: the caller's record holds 0x124 bytes.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            full.as_ptr().cast::<u8>().add(4),
+            record as usize as *mut u8,
+            MODULE_RECORD_SHORT_SIZE,
+        )
+    };
+    Ok(())
+}
+
+/// The next module of the walk `walk` (0 before the first call), as export
+/// 51 returns it.
+pub(crate) fn next_module(
+    walk: &mut u32,
+    record: &mut [u32; MODULE_RECORD_SHORT_SIZE / 4],
+) -> Result<(), ModuleWalkError> {
+    next_short_module(
+        core::ptr::from_mut(walk) as usize as u32,
+        record.as_mut_ptr() as usize as u32,
+    )
+}
+
+/// Stock export 51 (0x91f33af8): `(walk, record) -> HRESULT`;
+/// [`next_short_module`].
+extern "C" fn walk_modules(walk: u32, record: u32) -> u32 {
+    walk_word(next_short_module(walk, record))
 }
 export!(51, walk_modules);
 
@@ -432,7 +486,7 @@ extern "C" fn walk_module_sections(walk: u32, name: u32, record: u32) -> u32 {
         let name = caller_string(name);
         let mut capacity = SECTION_SNAPSHOT_CAPACITY;
         loop {
-            let mut result = NO_SUCH_MODULE;
+            let mut found = false;
             if snapshot != 0 {
                 capacity = read_u16(snapshot);
                 kernel::ExFreePool(snapshot);
@@ -451,7 +505,7 @@ extern "C" fn walk_module_sections(walk: u32, name: u32, record: u32) -> u32 {
                     if let Some(header) = nt_header(entry) {
                         let sections = section_table(header);
                         let count = read_le16(header + 6);
-                        result = Hresult::OK;
+                        found = true;
                         write_u16(snapshot, count);
                         if count <= capacity {
                             for index in 0..count {
@@ -468,9 +522,9 @@ extern "C" fn walk_module_sections(walk: u32, name: u32, record: u32) -> u32 {
                     }
                 }
             }
-            if result.is_failure() {
+            if !found {
                 kernel::ExFreePool(snapshot);
-                return result.0;
+                return NO_SUCH_MODULE.0;
             }
             if read_u16(snapshot) <= capacity {
                 break;
@@ -504,13 +558,18 @@ export!(52, walk_module_sections);
 extern "C" fn query_memory_statistics(statistics: u32) -> u32 {
     // SAFETY: the importer passes a 0x30-byte statistics block.
     let block = unsafe { &mut *(statistics as usize as *mut [u32; 12]) };
-    crate::backend::performance::memory_statistics(block).0
+    match crate::backend::performance::memory_statistics(block) {
+        Ok(()) => Hresult::OK.0,
+        Err(error) => Hresult::from(error).0,
+    }
 }
 export!(75, query_memory_statistics);
 
 /// The kernel's memory statistics through the debug monitor service, or
 /// `MmQueryStatistics` when the service fails or replies short.
-fn kernel_memory_statistics(output: &mut [u32; MEMORY_STATISTICS_LENGTH as usize / 4]) -> u32 {
+fn kernel_memory_statistics(
+    output: &mut [u32; MEMORY_STATISTICS_LENGTH as usize / 4],
+) -> Result<(), KernelError> {
     let mut reply = [0u32; MEMORY_STATISTICS_REPLY_LENGTH as usize / 4];
     reply[0] = MEMORY_STATISTICS_REPLY_LENGTH;
     reply[1] = MEMORY_STATISTICS_LENGTH;
@@ -523,10 +582,10 @@ fn kernel_memory_statistics(output: &mut [u32; MEMORY_STATISTICS_LENGTH as usize
     if (status as i32) >= 0 && reply[0] >= MEMORY_STATISTICS_REPLY_LENGTH {
         let length = output.len();
         output.copy_from_slice(&reply[1..1 + length]);
-        return status;
+        return NtStatus(status).result();
     }
     output[0] = MEMORY_STATISTICS_LENGTH;
-    kernel::MmQueryStatistics(output.as_mut_ptr())
+    NtStatus(kernel::MmQueryStatistics(output.as_mut_ptr())).result()
 }
 
 /// Stock export 165 (0x91f33318): `(statistics) -> HRESULT`; page counts
@@ -536,9 +595,8 @@ extern "C" fn query_memory_usage(statistics: u32) -> u32 {
         return Hresult::INVALID_ARGUMENT.0;
     }
     let mut s = [0u32; MEMORY_STATISTICS_LENGTH as usize / 4];
-    let status = kernel_memory_statistics(&mut s);
-    if (status as i32) < 0 {
-        return status | 0x1000_0000;
+    if let Err(error) = kernel_memory_statistics(&mut s) {
+        return Hresult::from(error).0;
     }
     let total = s[6..14]
         .iter()
@@ -581,7 +639,7 @@ export!(77, get_tracking_type_name);
 /// allocation type name and store its index through `type` (u16).
 extern "C" fn register_tracking_type(name: u32, kind: u32) -> u32 {
     if TRACKING.flags.load(Ordering::Relaxed) & memory::TrackingFlags::TYPE_MASK == 0 {
-        return TRACKING_OFF;
+        return tracking_hresult(Err(TrackingError::Off)).0;
     }
     if TRACKING_TYPE_COUNT.load(Ordering::Acquire) > 0xffff {
         return TOO_MANY_NAMES;
@@ -615,7 +673,7 @@ extern "C" fn track_registered_allocation(address: u32, size: u32, kind: u32) ->
     if usize::from(kind) < memory::TRACKING_TYPE_NAMES.len() {
         return Hresult::INVALID_ARGUMENT.0;
     }
-    track_allocation(address, size, kind)
+    tracking_hresult(track_allocation(address, size, kind)).0
 }
 export!(79, track_registered_allocation);
 
@@ -626,7 +684,7 @@ extern "C" fn untrack_registered_allocation(address: u32, size: u32, kind: u32) 
         return Hresult::INVALID_ARGUMENT.0;
     }
     match untrack_allocation(address, size, kind) {
-        Untracked::Skipped(result) | Untracked::Lookup(result) => result,
+        Untracked::Skipped(result) | Untracked::Lookup(result) => tracking_hresult(result).0,
     }
 }
 export!(80, untrack_registered_allocation);
@@ -694,7 +752,7 @@ extern "C" fn get_xex_header_field(
     if field == 0 {
         return NO_SUCH_FIELD.0;
     }
-    let mut result = Hresult::OK;
+    let mut truncated = false;
     match key & 0xff {
         0 => {}
         1 => write_u32(size, 4),
@@ -704,7 +762,7 @@ extern "C" fn get_xex_header_field(
     let length = read_u32(size);
     if length != 0 && buffer != 0 {
         let count = if length > buffer_size {
-            result = BUFFER_TOO_SMALL;
+            truncated = true;
             buffer_size
         } else {
             length
@@ -722,13 +780,17 @@ extern "C" fn get_xex_header_field(
         write_u32(size, 4);
         if buffer != 0 {
             if buffer_size < 4 {
-                result = BUFFER_TOO_SMALL;
+                truncated = true;
             } else {
                 write_u32(buffer, field);
             }
         }
     }
-    result.0
+    if truncated {
+        BUFFER_TOO_SMALL.0
+    } else {
+        Hresult::OK.0
+    }
 }
 export!(143, get_xex_header_field);
 

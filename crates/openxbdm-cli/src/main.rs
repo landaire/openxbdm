@@ -74,6 +74,8 @@ use openxbdm_client::commands::pix::CaptureSession;
 use openxbdm_client::commands::pix::Notification;
 #[cfg(feature = "capture")]
 use openxbdm_client::commands::pix::PixCmd;
+#[cfg(feature = "capture")]
+use openxbdm_client::commands::pix::PixError;
 use openxbdm_client::error::Error;
 use openxbdm_client::transport::CaptureLog;
 use openxbdm_client::transport::RecordingTransport;
@@ -2541,15 +2543,24 @@ async fn run_capture(
         .into_notification_channel(notify_request)
         .await?;
 
-    let (notify_tx, mut notify_rx) = mpsc::unbounded_channel::<Notification>();
+    let (notify_tx, mut notify_rx) =
+        mpsc::unbounded_channel::<Result<Notification, openxbdm_client::ParseError>>();
     let notify_task = tokio::spawn(async move {
         while let Ok(line) = notify_channel.next_notification().await {
-            if let Some(n) = Notification::parse(&line) {
-                if notify_tx.send(n).is_err() {
-                    break;
+            match Notification::parse(&line) {
+                Ok(Some(n)) => {
+                    if notify_tx.send(Ok(n)).is_err() {
+                        break;
+                    }
                 }
-            } else {
-                tracing::debug!(target: "openxbdm_client::pix", line = %line, "non-pix notify line");
+                Ok(None) => {
+                    tracing::debug!(target: "openxbdm_client::pix", line = %line, "non-pix notify line");
+                }
+                Err(e) => {
+                    if notify_tx.send(Err(e)).is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -2586,58 +2597,45 @@ async fn run_capture(
     );
 
     // The handler ACKs {BeginCaptureFileCreation} immediately but
-    // actual readiness is signalled asynchronously. Block until we
-    // see PIX!{CaptureFileCreationEnded} <hresult>. The hresult is
-    // on the notification line as a trailing hex; a 0 means success.
-    // Give up after 30s and surface a clearer error than the eventual
-    // "0 segments".
+    // actual readiness is signalled asynchronously by
+    // PIX!{CaptureFileCreationEnded} <hresult>. Give up after 30s and
+    // surface a clearer error than the eventual "0 segments".
     const FILE_READY_TIMEOUT: Duration = Duration::from_secs(30);
-    match tokio::time::timeout(FILE_READY_TIMEOUT, async {
+    let result = tokio::time::timeout(FILE_READY_TIMEOUT, async {
         loop {
             match notify_rx.recv().await {
-                Some(Notification::CaptureFileCreationEnded { index }) => {
-                    // The `index` field here is the hresult from the
-                    // notification line; a 0 means S_OK.
-                    return Ok::<_, rootcause::Report<Error>>(index);
+                Some(Ok(Notification::CaptureFileCreationEnded { result })) => {
+                    return Ok::<_, rootcause::Report<Error>>(result);
                 }
-                Some(other) => {
+                Some(Ok(other)) => {
                     tracing::debug!(
                         target: "openxbdm_client::pix",
                         ?other,
                         "notify while waiting for CaptureFileCreationEnded",
                     );
                 }
+                Some(Err(e)) => return Err(rootcause::Report::new(Error::from(e))),
                 None => {
                     return Err(rootcause::Report::new(Error::from(
-                        openxbdm_client::error::ArgumentError::EmptyFilename,
-                    ))
-                    .attach("notify channel closed before CaptureFileCreationEnded"));
+                        PixError::NotificationChannelClosed,
+                    )));
                 }
             }
         }
     })
     .await
-    {
-        Ok(Ok(0)) => eprintln!("{} capture file ready", ok_tag("ready")),
-        Ok(Ok(hr)) => {
-            return Err(rootcause::Report::new(Error::from(
-                openxbdm_client::error::ArgumentError::EmptyFilename,
-            ))
-            .attach(format!(
-                "capture file creation failed on console, hresult {hr:#010x}"
-            )));
-        }
-        Ok(Err(e)) => return Err(e),
-        Err(_) => {
-            return Err(rootcause::Report::new(Error::from(
-                openxbdm_client::error::ArgumentError::EmptyFilename,
-            ))
-            .attach(format!(
-                "no CaptureFileCreationEnded within {}s; is a title actually rendering D3D frames?",
-                FILE_READY_TIMEOUT.as_secs()
-            )));
-        }
+    .map_err(|_| {
+        rootcause::Report::new(Error::from(PixError::CaptureFileCreationTimedOut {
+            timeout: FILE_READY_TIMEOUT,
+        }))
+        .attach("is a title actually rendering D3D frames?")
+    })??;
+    if result.is_failure() {
+        return Err(rootcause::Report::new(Error::from(
+            PixError::CaptureFileCreationFailed { result },
+        )));
     }
+    eprintln!("{} capture file ready", ok_tag("ready"));
 
     session.begin_capture().await?;
     eprintln!(
@@ -2671,7 +2669,7 @@ async fn run_capture(
     let _ = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             match notify_rx.recv().await {
-                Some(Notification::CaptureEnded) => break,
+                Some(Ok(Notification::CaptureEnded)) => break,
                 Some(_) => continue,
                 None => break,
             }
@@ -3413,15 +3411,17 @@ async fn run_pix_notify(
                 }
                 let ts = start.elapsed().as_millis();
                 let tag = match Notification::parse(trimmed) {
-                    Some(Notification::CaptureFileCreationEnded { .. }) => "cap-seg",
-                    Some(Notification::CaptureEnded) => "cap-end",
-                    Some(Notification::MovieData(_)) => "movie",
-                    Some(Notification::Resource(_)) => "rsrc",
-                    Some(Notification::VideoOp { error: true, .. }) => "verr",
-                    Some(Notification::VideoOp { error: false, .. }) => "vop",
-                    Some(Notification::Status(_)) => "stat",
-                    Some(Notification::Other(_)) => "pix?",
-                    None => "line",
+                    Ok(Some(Notification::CaptureFileCreationEnded { .. })) => "cap-seg",
+                    Ok(Some(Notification::CaptureEnded)) => "cap-end",
+                    Ok(Some(Notification::MovieData(_))) => "movie",
+                    Ok(Some(Notification::Resource(_))) => "rsrc",
+                    Ok(Some(Notification::VideoOp { error: true, .. })) => "verr",
+                    Ok(Some(Notification::VideoOp { error: false, .. })) => "vop",
+                    Ok(Some(Notification::Status(_))) => "stat",
+                    Ok(Some(Notification::Other(_))) => "pix?",
+                    Ok(None) => "line",
+                    // Shown verbatim: the monitor displays every line.
+                    Err(_) => "malformed",
                 };
                 let rendered = format!("{ts:>6}ms [{tag}] {trimmed}");
                 eprintln!("{rendered}");

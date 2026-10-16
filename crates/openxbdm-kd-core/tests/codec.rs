@@ -4,10 +4,10 @@ use std::fmt::Write;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 
-use openxbdm_kd_core::NtStatus;
 use openxbdm_kd_core::file_io;
 use openxbdm_kd_core::file_io::FileIoReply;
 use openxbdm_kd_core::file_io::FileIoRequest;
+use openxbdm_kd_core::file_io::HostFileError;
 use openxbdm_kd_core::file_io::HostFileHandle;
 use openxbdm_kd_core::file_io::HostFileSystem;
 use openxbdm_kd_core::file_io::MAX_READ_LEN;
@@ -190,7 +190,7 @@ const FILE_SIZE: u64 = 258_048;
 const HANDLE: HostFileHandle = HostFileHandle(NonZeroU64::MIN);
 
 impl HostFileSystem for OneFile {
-    fn open(&mut self, request: &OpenRequest<'_>) -> Result<OpenedFile, NtStatus> {
+    fn open(&mut self, request: &OpenRequest<'_>) -> Result<OpenedFile, HostFileError> {
         if request
             .path
             .to_string()
@@ -201,7 +201,7 @@ impl HostFileSystem for OneFile {
                 size: FILE_SIZE,
             })
         } else {
-            Err(NtStatus::OBJECT_NAME_NOT_FOUND)
+            Err(HostFileError::NotMapped)
         }
     }
 
@@ -210,9 +210,9 @@ impl HostFileSystem for OneFile {
         handle: HostFileHandle,
         offset: u64,
         buffer: &mut [u8],
-    ) -> Result<usize, NtStatus> {
+    ) -> Result<usize, HostFileError> {
         if handle != HANDLE {
-            return Err(NtStatus::INVALID_HANDLE);
+            return Err(HostFileError::UnknownHandle);
         }
         let count = (FILE_SIZE.saturating_sub(offset) as usize).min(buffer.len());
         for (index, byte) in buffer[..count].iter_mut().enumerate() {
@@ -221,11 +221,11 @@ impl HostFileSystem for OneFile {
         Ok(count)
     }
 
-    fn close(&mut self, handle: HostFileHandle) -> Result<(), NtStatus> {
+    fn close(&mut self, handle: HostFileHandle) -> Result<(), HostFileError> {
         if handle == HANDLE {
             Ok(())
         } else {
-            Err(NtStatus::INVALID_HANDLE)
+            Err(HostFileError::UnknownHandle)
         }
     }
 }

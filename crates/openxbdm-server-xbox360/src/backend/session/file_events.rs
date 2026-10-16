@@ -8,6 +8,7 @@ use core::sync::atomic::Ordering;
 
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::NtStatus;
 use openxbdm_server::commands::session::EventPath;
 use openxbdm_server::commands::session::FILE_EVENT_TEXT_LIMIT;
 use openxbdm_server::commands::session::FLAG_BUFFERED;
@@ -33,6 +34,7 @@ use super::THREAD_ID;
 use super::c_string;
 use super::current_thread;
 use super::current_title_id;
+use super::notifications::notification_result;
 use super::notifications::send_notification_text;
 use super::read_u32;
 use super::read_u64;
@@ -88,7 +90,7 @@ static FILE_EVENTS: SpinLocked<FileEvents> = SpinLocked::new(FileEvents {
 /// stock does.
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
-const BAD_PARAMETER: Hresult = Hresult::from_error_code(ErrorCode::BAD_PARAMETER);
+const BAD_PARAMETER: Hresult = Hresult::from_error_code(ErrorCode::BadParameter);
 
 fn enabled() -> bool {
     ENABLED.load(Ordering::Acquire)
@@ -117,8 +119,9 @@ fn assign_id(output: u32) -> FileEventId {
     })
 }
 
+/// Send `text`; the export result word.
 fn send(text: &FileEventText) -> u32 {
-    send_notification_text(text.as_bytes()).0
+    notification_result(send_notification_text(text.as_bytes()))
 }
 
 fn event_time() -> u64 {
@@ -156,7 +159,7 @@ fn string<'a>(address: u32) -> &'a [u8] {
 
 fn announce_switch(enable: bool) -> u32 {
     let text = format_file_event_switch(enable, switch(enable));
-    send_notification_text(text.as_bytes()).0
+    notification_result(send_notification_text(text.as_bytes()))
 }
 
 /// Export 152 (stock 0x91f2f428): enable the notifications and announce
@@ -212,7 +215,7 @@ extern "C" fn pseudo_end(handle: u32, result: u32, id: u32) -> u32 {
         FileEventId(id),
         event_time(),
         Some(handle),
-        result,
+        Hresult(result),
     ))
 }
 
@@ -263,7 +266,7 @@ extern "C" fn pseudo_end_result(result: u32, id: u32) -> u32 {
         FileEventId(id),
         event_time(),
         None,
-        result,
+        Hresult(result),
     ))
 }
 
@@ -416,7 +419,7 @@ pub(crate) fn service_file_event_end(record: u32) -> u32 {
         FileEventId(id),
         time_base,
         read_u32(record + EVENT_HANDLE),
-        read_u32(record + EVENT_STATUS),
+        NtStatus(read_u32(record + EVENT_STATUS)),
     );
     send(&text);
     0

@@ -18,6 +18,9 @@
 //! through [`CounterObject`] byte offsets to keep that behavior.
 
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::KernelError;
+
+use crate::reply::CommandError;
 
 /// Size of a counter object.
 pub const OBJECT_SIZE: usize = 0xc8;
@@ -42,13 +45,111 @@ const HAS_HANDLER: u32 = 0x10_0000;
 const CLASS_MASK: u32 = 0x30;
 const CLASS_RATE: u32 = 0x10;
 const CLASS_RATIO: u32 = 0x20;
-/// Query bits that request history evaluation.
-const HISTORY_QUERY_MASK: u32 = 0xfc0;
 
-/// Result of a counter type mismatch.
-pub const TYPE_INVALID: Hresult = Hresult::error(0x11);
-/// Result when no sample is available.
-pub const DATA_NOT_AVAILABLE: Hresult = Hresult::error(0x12);
+/// The `querypc type=` word: counter class bits, history selectors, and a
+/// sample count in the low nibble.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CounterQuery(pub u32);
+
+impl CounterQuery {
+    /// Selector bits that request history evaluation.
+    const HISTORY: u32 = 0xfc0;
+
+    const fn class(self) -> u32 {
+        self.0 & CLASS_MASK
+    }
+
+    /// Samples to evaluate; 0 selects the default.
+    const fn count(self) -> i32 {
+        (self.0 & 0xf) as i32
+    }
+
+    const fn history(self) -> bool {
+        self.0 & Self::HISTORY != 0
+    }
+
+    const fn contains(self, bits: u32) -> bool {
+        self.0 & bits != 0
+    }
+}
+
+/// A successful counter evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Evaluation {
+    Sampled,
+    /// Success result of the counter's query routine.
+    Routine(Hresult),
+}
+
+/// A failed counter enumeration, open, or query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CounterError {
+    /// The query does not match the counter type.
+    TypeInvalid,
+    /// No sample is available.
+    DataNotAvailable,
+    /// Failure result of the counter's reader or query routine.
+    Routine(Hresult),
+    /// The process has no counter directory.
+    NoDirectory,
+    /// The counter cannot be opened.
+    NotFound,
+    /// The counter object cannot be referenced.
+    Kernel(KernelError),
+    /// The end of the counter directory.
+    End,
+    /// A directory entry does not fit the enumeration buffer.
+    NameTooLong,
+    /// An enumerated counter cannot be opened.
+    Unexpected,
+}
+
+impl From<Evaluation> for Hresult {
+    fn from(evaluation: Evaluation) -> Self {
+        match evaluation {
+            Evaluation::Sampled => Hresult::OK,
+            Evaluation::Routine(result) => result,
+        }
+    }
+}
+
+impl From<CounterError> for CommandError {
+    fn from(error: CounterError) -> Self {
+        match error {
+            CounterError::Kernel(error) => CommandError::from_kernel(error, CommandError::Fail),
+            CounterError::End => CommandError::EndOfData,
+            CounterError::Unexpected => CommandError::Unexpected,
+            error => CommandError::Counter(error),
+        }
+    }
+}
+
+impl From<CounterError> for Hresult {
+    #[inline(never)]
+    fn from(error: CounterError) -> Self {
+        match error {
+            CounterError::TypeInvalid => Hresult::error(0x11),
+            CounterError::DataNotAvailable => Hresult::error(0x12),
+            CounterError::Routine(result) => result,
+            CounterError::NoDirectory => Hresult::error(0x02),
+            CounterError::NotFound => Hresult::error(0x0e),
+            CounterError::NameTooLong => Hresult::error(0x105),
+            CounterError::Kernel(_) | CounterError::End | CounterError::Unexpected => {
+                CommandError::from(error).into()
+            }
+        }
+    }
+}
+
+/// The typed form of the result word of a counter's reader or query
+/// routine.
+pub const fn routine_result(result: Hresult) -> Result<Evaluation, CounterError> {
+    if result.is_failure() {
+        Err(CounterError::Routine(result))
+    } else {
+        Ok(Evaluation::Routine(result))
+    }
+}
 
 /// Registration word of a counter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -99,9 +200,13 @@ pub trait CounterObject {
     fn source_u32(&self, offset: u32) -> u32;
     fn source_u64(&self, offset: u32) -> u64;
     /// Call the reader routine of a kind 1 counter.
-    fn call_reader(&mut self, value: &mut u64, rate: Option<&mut u64>) -> Hresult;
+    fn call_reader(&mut self, value: &mut u64, rate: Option<&mut u64>) -> Result<(), CounterError>;
     /// Call the query routine of a counter registered with a handler.
-    fn call_handler(&mut self, query: u32, out: &mut CounterSample) -> Hresult;
+    fn call_handler(
+        &mut self,
+        query: CounterQuery,
+        out: &mut CounterSample,
+    ) -> Result<Evaluation, CounterError>;
     /// Keep the sampler away from the object until `allow_sampler`; stock
     /// raises the IRQL around the history and copied-sample reads only.
     fn exclude_sampler(&mut self);
@@ -139,7 +244,7 @@ pub fn initialize(object: &mut impl CounterObject, registration: CounterRegistra
 fn read_source(object: &mut impl CounterObject, value: &mut u64, rate: Option<&mut u64>) -> bool {
     match registration(object).kind() {
         0 => false,
-        1 => !object.call_reader(value, rate).is_failure(),
+        1 => object.call_reader(value, rate).is_ok(),
         2 | 3 => {
             *value = u64::from(object.source_u32(0));
             if let Some(rate) = rate {
@@ -194,7 +299,11 @@ pub fn sample(object: &mut impl CounterObject, tick_count: u32, frame_number: u3
 
 /// Evaluate `querypc type=<query>` into `out`. Fields the evaluation does
 /// not produce keep their previous content.
-pub fn query(object: &mut impl CounterObject, query: u32, out: &mut CounterSample) -> Hresult {
+pub fn query(
+    object: &mut impl CounterObject,
+    query: CounterQuery,
+    out: &mut CounterSample,
+) -> Result<Evaluation, CounterError> {
     let word = registration(object).0;
     let class = word & CLASS_MASK;
     if word & COPIES_SAMPLE != 0 {
@@ -203,21 +312,21 @@ pub fn query(object: &mut impl CounterObject, query: u32, out: &mut CounterSampl
         out.rate = object.source_u64(8);
         out.sample_type = object.source_u32(0x10);
         object.allow_sampler();
-        return Hresult::OK;
+        return Ok(Evaluation::Sampled);
     }
     if word & HAS_HANDLER != 0 {
         return object.call_handler(query, out);
     }
-    if (word ^ query) & CLASS_MASK != 0 {
-        return TYPE_INVALID;
+    if word & CLASS_MASK != query.class() {
+        return Err(CounterError::TypeInvalid);
     }
-    let mut count = (query & 0xf) as i32;
-    if query & HISTORY_QUERY_MASK == 0 && class != CLASS_RATIO {
+    let mut count = query.count();
+    if !query.history() && class != CLASS_RATIO {
         if !read_source(object, &mut out.value, None) {
-            return DATA_NOT_AVAILABLE;
+            return Err(CounterError::DataNotAvailable);
         }
         out.sample_type = class;
-        return Hresult::OK;
+        return Ok(Evaluation::Sampled);
     }
     if class == 0 {
         if count == 0 {
@@ -240,10 +349,14 @@ pub fn query(object: &mut impl CounterObject, query: u32, out: &mut CounterSampl
 }
 
 /// Sum of the last `count` values (class 0 history query).
-fn history_sum(object: &impl CounterObject, count: i32, out: &mut CounterSample) -> Hresult {
+fn history_sum(
+    object: &impl CounterObject,
+    count: i32,
+    out: &mut CounterSample,
+) -> Result<Evaluation, CounterError> {
     let mut index = history_index(object);
     if index < 0 {
-        return DATA_NOT_AVAILABLE;
+        return Err(CounterError::DataNotAvailable);
     }
     for _ in 0..count {
         if index < 0 {
@@ -253,36 +366,36 @@ fn history_sum(object: &impl CounterObject, count: i32, out: &mut CounterSample)
         index -= 1;
     }
     out.sample_type = u32::from(registration(object).counter_type());
-    Hresult::OK
+    Ok(Evaluation::Sampled)
 }
 
 /// Value and rate change over the last `count` samples (rate and ratio
 /// history queries).
 fn history_difference(
     object: &impl CounterObject,
-    query: u32,
+    query: CounterQuery,
     count: i32,
     out: &mut CounterSample,
-) -> Hresult {
+) -> Result<Evaluation, CounterError> {
     let class = registration(object).0 & CLASS_MASK;
     let index = history_index(object);
     if index < 0 {
-        return DATA_NOT_AVAILABLE;
+        return Err(CounterError::DataNotAvailable);
     }
     let mut back = index - count;
     if back < 0 {
         back += HISTORY_LENGTH;
     }
     out.value = value_at(object, index).wrapping_sub(value_at(object, back));
-    if query & 0x130 == 0x110 {
+    if query.0 & 0x130 == 0x110 {
         out.sample_type = 0x110;
         out.rate = u64::from(frame_at(object, index).wrapping_sub(frame_at(object, back)));
     } else {
         out.rate = u64::from(rate_at(object, index).wrapping_sub(rate_at(object, back)));
         out.sample_type = if class == CLASS_RATE {
-            if query & 0x200 != 0 {
+            if query.contains(0x200) {
                 0x210
-            } else if query & 0x40 != 0 {
+            } else if query.contains(0x40) {
                 out.value = out.value.wrapping_mul(1000);
                 0x50
             } else {
@@ -296,9 +409,9 @@ fn history_difference(
     }
     out.sample_type |= count as u32;
     if out.rate == 0 {
-        DATA_NOT_AVAILABLE
+        Err(CounterError::DataNotAvailable)
     } else {
-        Hresult::OK
+        Ok(Evaluation::Sampled)
     }
 }
 
@@ -351,10 +464,18 @@ mod tests {
         fn source_u64(&self, _offset: u32) -> u64 {
             unreachable!()
         }
-        fn call_reader(&mut self, _value: &mut u64, _rate: Option<&mut u64>) -> Hresult {
+        fn call_reader(
+            &mut self,
+            _value: &mut u64,
+            _rate: Option<&mut u64>,
+        ) -> Result<(), CounterError> {
             unreachable!()
         }
-        fn call_handler(&mut self, _query: u32, _out: &mut CounterSample) -> Hresult {
+        fn call_handler(
+            &mut self,
+            _query: CounterQuery,
+            _out: &mut CounterSample,
+        ) -> Result<Evaluation, CounterError> {
             unreachable!()
         }
         fn exclude_sampler(&mut self) {}
@@ -369,7 +490,10 @@ mod tests {
             rate: 0x1234,
             sample_type: 7,
         };
-        assert_eq!(query(&mut object, 1, &mut out), Hresult::OK);
+        assert_eq!(
+            query(&mut object, CounterQuery(1), &mut out),
+            Ok(Evaluation::Sampled)
+        );
         assert_eq!(
             out,
             CounterSample {
@@ -384,12 +508,18 @@ mod tests {
     fn history_queries_see_only_the_current_slot() {
         let mut object = Image::new(0x0002_0011, [5, 9]);
         let mut out = CounterSample::default();
-        assert_eq!(query(&mut object, 0x51, &mut out), DATA_NOT_AVAILABLE);
+        assert_eq!(
+            query(&mut object, CounterQuery(0x51), &mut out),
+            Err(CounterError::DataNotAvailable)
+        );
         sample(&mut object, 1000, 3);
         object.source = [8, 9];
         sample(&mut object, 1100, 4);
         // Both samples land in slot 0; the other slots stay zero.
-        assert_eq!(query(&mut object, 0x51, &mut out), Hresult::OK);
+        assert_eq!(
+            query(&mut object, CounterQuery(0x51), &mut out),
+            Ok(Evaluation::Sampled)
+        );
         assert_eq!(
             out,
             CounterSample {
@@ -398,7 +528,10 @@ mod tests {
                 sample_type: 0x51
             }
         );
-        assert_eq!(query(&mut object, 0x313, &mut out), Hresult::OK);
+        assert_eq!(
+            query(&mut object, CounterQuery(0x313), &mut out),
+            Ok(Evaluation::Sampled)
+        );
         assert_eq!(
             out,
             CounterSample {
@@ -407,7 +540,10 @@ mod tests {
                 sample_type: 0x113
             }
         );
-        assert_eq!(query(&mut object, 0x90, &mut out), Hresult::OK);
+        assert_eq!(
+            query(&mut object, CounterQuery(0x90), &mut out),
+            Ok(Evaluation::Sampled)
+        );
         assert_eq!(
             out,
             CounterSample {
@@ -416,7 +552,10 @@ mod tests {
                 sample_type: 0x9a
             }
         );
-        assert_eq!(query(&mut object, 0x20, &mut out), TYPE_INVALID);
+        assert_eq!(
+            query(&mut object, CounterQuery(0x20), &mut out),
+            Err(CounterError::TypeInvalid)
+        );
     }
 
     #[test]
@@ -424,7 +563,10 @@ mod tests {
         let mut object = Image::new(0x0002_0021, [40, 100]);
         let mut out = CounterSample::default();
         sample(&mut object, 0, 0);
-        assert_eq!(query(&mut object, 0x21, &mut out), Hresult::OK);
+        assert_eq!(
+            query(&mut object, CounterQuery(0x21), &mut out),
+            Ok(Evaluation::Sampled)
+        );
         assert_eq!(
             out,
             CounterSample {
@@ -434,7 +576,10 @@ mod tests {
             }
         );
         // Eleven samples back is the current slot again.
-        assert_eq!(query(&mut object, 0x2b, &mut out), DATA_NOT_AVAILABLE);
+        assert_eq!(
+            query(&mut object, CounterQuery(0x2b), &mut out),
+            Err(CounterError::DataNotAvailable)
+        );
     }
 
     #[test]
@@ -442,7 +587,10 @@ mod tests {
         let mut object = Image::new(0x0002_0001, [6, 0]);
         let mut out = CounterSample::default();
         sample(&mut object, 0, 0);
-        assert_eq!(query(&mut object, 0x43, &mut out), Hresult::OK);
+        assert_eq!(
+            query(&mut object, CounterQuery(0x43), &mut out),
+            Ok(Evaluation::Sampled)
+        );
         assert_eq!(
             out,
             CounterSample {

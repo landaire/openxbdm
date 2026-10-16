@@ -11,6 +11,7 @@ mod compile;
 mod grammar;
 pub mod variant;
 
+pub use self::compile::CompileError;
 pub use self::compile::Compiled;
 pub use self::compile::compile_text;
 

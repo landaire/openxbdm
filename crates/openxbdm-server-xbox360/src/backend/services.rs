@@ -5,11 +5,13 @@
 
 use core::ffi::CStr;
 
+use openxbdm_core::status::Hresult;
 use openxbdm_core::status::NtStatus;
 use openxbdm_server::commands;
 use openxbdm_server::commands::services::CivProgress;
 use openxbdm_server::commands::services::CivResult;
 use openxbdm_server::commands::services::DetectionBit;
+use openxbdm_server::commands::services::DetectionMask;
 use openxbdm_server::commands::services::DetectionRoutine;
 use openxbdm_server::commands::services::DetectionRoutineMissing;
 use openxbdm_server::commands::services::DetectionUpdate;
@@ -40,7 +42,7 @@ const FAILED_BLOCKS_RECORD_SIZE: u32 = 0x18;
 
 /// The calling thread's last-error value.
 fn last_error() -> LastError {
-    LastError(kernel::last_error())
+    LastError::from_win32(kernel::last_error())
 }
 
 /// Why a XAM export could not be called.
@@ -63,18 +65,16 @@ fn xam_export(ordinal: u32) -> Result<u32, Unresolved> {
     })
 }
 
-/// Call a XAM export reporting a value: its return, the last error when
-/// xam.xex is absent, and the last error or 0 for `ERROR_PROC_NOT_FOUND`
-/// when the export is absent.
+/// Call a XAM export reporting a value: its return, or the last error
+/// when xam.xex or the export is absent.
 fn call_reporting(ordinal: u32, a0: u32, a1: u32, a2: u32) -> CivResult {
     match xam_export(ordinal) {
         // SAFETY: the export takes at most three dword arguments.
-        Ok(function) => CivResult(unsafe { kernel::call_export(function, a0, a1, a2, 0) }),
-        Err(Unresolved::Module) => CivResult(last_error().0),
-        Err(Unresolved::Export) => match last_error() {
-            LastError::PROC_NOT_FOUND => CivResult(0),
-            error => CivResult(error.0),
-        },
+        Ok(function) => CivResult::Returned(Hresult(unsafe {
+            kernel::call_export(function, a0, a1, a2, 0)
+        })),
+        Err(Unresolved::Module) => CivResult::NoModule(last_error()),
+        Err(Unresolved::Export) => CivResult::NoExport(last_error()),
     }
 }
 
@@ -95,24 +95,25 @@ extern "C" fn failure_thread(context: u32) -> u32 {
 }
 
 /// Resolve the detection exports in stock order.
-fn detection_exports() -> Result<([u32; 4], u32), DetectionRoutineMissing> {
+fn detection_exports() -> Result<([u32; 4], NtStatus), DetectionRoutineMissing> {
     // The monitor holds the kernel handle from startup; the kernel is
     // always loaded.
     let kernel_module =
-        kernel::module_handle(KERNEL_MODULE).map_err(|status| DetectionRoutineMissing {
+        kernel::module_handle(KERNEL_MODULE).map_err(|error| DetectionRoutineMissing {
             routine: DetectionRoutine::SetDetected,
-            status: NtStatus(status),
+            error,
         })?;
     let mut addresses = [0u32; 4];
-    let mut last_status = 0;
+    let mut last_status = NtStatus::SUCCESS;
     for (address, routine) in addresses.iter_mut().zip(DetectionRoutine::ORDER) {
-        let status = kernel::XexGetProcedureAddress(kernel_module, routine.ordinal(), address);
-        if (status as i32) < 0 {
-            return Err(DetectionRoutineMissing {
-                routine,
-                status: NtStatus(status),
-            });
-        }
+        let status = NtStatus(kernel::XexGetProcedureAddress(
+            kernel_module.raw(),
+            routine.ordinal(),
+            address,
+        ));
+        status
+            .result()
+            .map_err(|error| DetectionRoutineMissing { routine, error })?;
         last_status = status;
     }
     Ok((addresses, last_status))
@@ -133,7 +134,7 @@ impl commands::services::Backend for Console {
         );
         // Thread creation does not set the last error; stock reports
         // whatever the thread held before.
-        if (status as i32) < 0 || handle == 0 {
+        if !NtStatus(status).is_success() || handle == 0 {
             Err(last_error())
         } else {
             Ok(ThreadHandle(handle))
@@ -154,13 +155,15 @@ impl commands::services::Backend for Console {
         let ([set, get, initialize, save], last_status) = detection_exports()?;
         // SAFETY: the detection exports take at most one dword argument.
         unsafe {
-            let old_mask = kernel::call_export(get, 0, 0, 0, 0);
+            let old_mask = DetectionMask(kernel::call_export(get, 0, 0, 0, 0));
             kernel::call_export(initialize, 0, 0, 0, 0);
             kernel::call_export(save, 0, 0, 0, 0);
-            let result = bit.map_or(last_status, |bit| kernel::call_export(set, bit.0, 0, 0, 0));
-            let new_mask = kernel::call_export(get, 0, 0, 0, 0);
+            let status = bit.map_or(last_status, |bit| {
+                NtStatus(kernel::call_export(set, bit.0, 0, 0, 0))
+            });
+            let new_mask = DetectionMask(kernel::call_export(get, 0, 0, 0, 0));
             Ok(DetectionUpdate {
-                result,
+                status,
                 old_mask,
                 new_mask,
             })
@@ -192,15 +195,15 @@ impl commands::services::Backend for Console {
                     kernel::call_export(function, record.as_mut_ptr() as usize as u32, 0, 0, 0)
                 };
                 if result != 0 {
-                    return Err(CivResult(result));
+                    return Err(CivResult::Returned(Hresult(result)));
                 }
             }
-            Err(Unresolved::Module) => return Err(CivResult(last_error().0)),
+            Err(Unresolved::Module) => return Err(CivResult::NoModule(last_error())),
             Err(Unresolved::Export) => match last_error() {
-                LastError::PROC_NOT_FOUND => {
+                LastError::ProcNotFound => {
                     record = [0, 0, 0, 0, 0, 1];
                 }
-                error => return Err(CivResult(error.0)),
+                error => return Err(CivResult::NoExport(error)),
             },
         }
         Ok(CivProgress {

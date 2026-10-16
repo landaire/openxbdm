@@ -10,19 +10,18 @@ use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
-use openxbdm_core::status::Hresult;
+use openxbdm_core::status::KernelError;
+use openxbdm_core::status::NtStatus;
 use openxbdm_server::SocketId;
-use openxbdm_server::commands::performance::studio::ABORTED;
-use openxbdm_server::commands::performance::studio::COMPLETED;
 use openxbdm_server::commands::performance::studio::CallerBuffer;
 use openxbdm_server::commands::performance::studio::Direction;
 use openxbdm_server::commands::performance::studio::Incoming;
-use openxbdm_server::commands::performance::studio::NOT_CONNECTED;
 use openxbdm_server::commands::performance::studio::Outgoing;
-use openxbdm_server::commands::performance::studio::PENDING;
 use openxbdm_server::commands::performance::studio::Slot;
 use openxbdm_server::commands::performance::studio::Stream;
+use openxbdm_server::commands::performance::studio::StudioError;
 use openxbdm_server::commands::performance::studio::Transport;
+use openxbdm_server::commands::performance::studio::routine_result;
 
 use crate::kernel;
 use crate::kernel::CriticalSection;
@@ -62,10 +61,6 @@ const SOCKADDR_SIZE: i32 = 16;
 const WSAEWOULDBLOCK: i32 = 10035;
 
 const STATUS_PENDING: u32 = 0x103;
-const STATUS_NOT_IMPLEMENTED: u32 = 0xc000_0002;
-const STATUS_NO_SUCH_DEVICE: u32 = 0xc000_000e;
-const STATUS_NO_MEMORY: u32 = 0xc000_0017;
-const NOT_IMPLEMENTED: Hresult = Hresult(0x8000_4001);
 const INFINITE: u32 = u32::MAX;
 const WAIT_ANY: u32 = 1;
 const USER_MODE: u32 = 1;
@@ -112,16 +107,15 @@ fn raw_handle(handle: Option<Handle>) -> u32 {
 /// `SetEvent` (stock 0x91f738b8).
 fn set_event(handle: Option<Handle>) {
     let status = kernel::NtSetEvent(raw_handle(handle), core::ptr::null_mut());
-    if failed(status) {
-        kernel::set_last_error(status);
+    if let Err(error) = NtStatus(status).result() {
+        kernel::set_last_error(error);
     }
 }
 
 /// `CloseHandle` (stock 0x91f738f8).
 fn close_handle(handle: Handle) {
-    let status = kernel::NtClose(handle.0);
-    if failed(status) {
-        kernel::set_last_error(status);
+    if let Err(error) = NtStatus(kernel::NtClose(handle.0)).result() {
+        kernel::set_last_error(error);
     }
 }
 
@@ -151,7 +145,7 @@ impl SpinLock {
 /// Session state guarded by [`SECTION`].
 struct Session {
     /// Failure of a null-cable transport creation; disables the subsystem.
-    result: Hresult,
+    failure: Option<StudioError>,
     worker: Option<Handle>,
     stop_event: Option<Handle>,
     listener: Option<SocketId>,
@@ -186,7 +180,7 @@ static TEST_MODE: AtomicBool = AtomicBool::new(false);
 static SECTION: CriticalSection = CriticalSection::new();
 static SECTION_READY: AtomicBool = AtomicBool::new(false);
 static SESSION: SessionCell = SessionCell(UnsafeCell::new(Session {
-    result: COMPLETED,
+    failure: None,
     worker: None,
     stop_event: None,
     listener: None,
@@ -197,15 +191,16 @@ static SESSION: SessionCell = SessionCell(UnsafeCell::new(Session {
 static NULL_CABLE_REQUEST: AtomicU32 = AtomicU32::new(0);
 static STUDIO_SERVICE: AtomicU32 = AtomicU32::new(0);
 
-fn resolve(module: &core::ffi::CStr, ordinal: u32) -> Result<u32, u32> {
+fn resolve(module: &core::ffi::CStr, ordinal: u32) -> Result<u32, KernelError> {
     let handle = kernel::module_handle(module)?;
     let mut address = 0u32;
-    let status = kernel::XexGetProcedureAddress(handle, ordinal, &mut address);
-    if failed(status) {
-        Err(status)
-    } else {
-        Ok(address)
-    }
+    NtStatus(kernel::XexGetProcedureAddress(
+        handle.raw(),
+        ordinal,
+        &mut address,
+    ))
+    .result()?;
+    Ok(address)
 }
 
 fn call(function: &AtomicU32, a0: u32, a1: u32) -> u32 {
@@ -222,8 +217,11 @@ pub(crate) fn initialize() {
     let exports = resolve(c"xboxkrnl.exe", NULL_CABLE_ORDINAL)
         .and_then(|request| Ok((request, resolve(c"xam.xex", STUDIO_SERVICE_ORDINAL)?)));
     match exports {
-        Err(status) => {
-            super::pmc::print(c"XStudio: Failed initialization %d\n", &[u64::from(status)]);
+        Err(error) => {
+            super::pmc::print(
+                c"XStudio: Failed initialization %d\n",
+                &[u64::from(NtStatus::from(error).0)],
+            );
         }
         Ok((request, service)) => {
             NULL_CABLE_REQUEST.store(request, Ordering::Release);
@@ -304,9 +302,9 @@ pub(crate) fn service_set_test_mode(argument: u32) -> u32 {
 
 /// `xstudio DedicateSocket` (stock 0x91f65b18): open a listener on an
 /// ephemeral port for the next session and return the port.
-pub(super) fn dedicate() -> Result<u16, Hresult> {
+pub(super) fn dedicate() -> Result<u16, StudioError> {
     if !INITIALIZED.load(Ordering::Relaxed) {
-        return Err(Hresult::FAIL);
+        return Err(StudioError::Fail);
     }
     SECTION.enter();
     let outcome = open_listener();
@@ -315,28 +313,28 @@ pub(super) fn dedicate() -> Result<u16, Hresult> {
 }
 
 /// Runs with [`SECTION`] held.
-fn open_listener() -> Result<u16, Hresult> {
-    let (result, running, attached) =
-        with_session(|session| (session.result, session.worker.is_some(), session.attached));
-    if running && !result.is_failure() {
+fn open_listener() -> Result<u16, StudioError> {
+    let (failure, running, attached) =
+        with_session(|session| (session.failure, session.worker.is_some(), session.attached));
+    if running && failure.is_none() {
         if !DEDICATED.load(Ordering::Relaxed) || attached {
-            return Err(Hresult::FAIL);
+            return Err(StudioError::Fail);
         }
         SECTION.leave();
         stop_session();
         SECTION.enter();
     }
-    if result.is_failure() {
-        return Err(result);
+    if let Some(failure) = failure {
+        return Err(failure);
     }
     let socket = net::NetDll_socket(XNCALLER_XBDM, net::AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if socket == INVALID_SOCKET {
-        return Err(Hresult::FAIL);
+        return Err(StudioError::Fail);
     }
     let socket = SocketId(socket);
     let Some(port) = configure_listener(socket) else {
         close_socket(socket);
-        return Err(Hresult::FAIL);
+        return Err(StudioError::Fail);
     };
     with_session(|session| session.listener = Some(socket));
     DEDICATED.store(true, Ordering::Relaxed);
@@ -368,7 +366,7 @@ fn configure_listener(socket: SocketId) -> Option<u16> {
 fn start_session() {
     SECTION.enter();
     // Stock has no initialized check here; it only matters while unloading.
-    let ready = with_session(|session| session.worker.is_none() && !session.result.is_failure())
+    let ready = with_session(|session| session.worker.is_none() && session.failure.is_none())
         && !TEST_MODE.load(Ordering::Relaxed)
         && INITIALIZED.load(Ordering::Relaxed);
     if ready {
@@ -462,9 +460,9 @@ extern "C" fn worker(_context: u32) -> u32 {
         },
         None => match create_null_cable_transport() {
             Ok(object) => Some(object),
-            Err(result) => {
+            Err(failure) => {
                 SECTION.enter();
-                with_session(|session| session.result = result);
+                with_session(|session| session.failure = Some(failure));
                 SECTION.leave();
                 None
             }
@@ -499,11 +497,14 @@ extern "C" fn worker(_context: u32) -> u32 {
 
 /// Wait for a connection on `listener` or for `stop_event` (stock
 /// 0x91f655e8).
-fn accept_connection(listener: SocketId, stop_event: Option<Handle>) -> Result<SocketId, Hresult> {
+fn accept_connection(
+    listener: SocketId,
+    stop_event: Option<Handle>,
+) -> Result<SocketId, StudioError> {
     let Some(ready) = Handle::new(kernel::CreateEventA(0, 1, 0, core::ptr::null())) else {
-        return Err(Hresult::OUT_OF_MEMORY);
+        return Err(StudioError::OutOfMemory);
     };
-    let mut outcome = Err(Hresult::FAIL);
+    let mut outcome = Err(StudioError::Fail);
     if net::NetDll_WSAEventSelect(XNCALLER_XBDM, listener.0, ready.0, FD_ACCEPT) == 0 {
         let handles = [raw_handle(stop_event), ready.0];
         outcome = loop {
@@ -515,10 +516,10 @@ fn accept_connection(listener: SocketId, stop_event: Option<Handle>) -> Result<S
                 0,
                 core::ptr::null(),
             );
-            if failed(wait) {
-                kernel::set_last_error(wait);
+            if let Err(error) = NtStatus(wait).result() {
+                kernel::set_last_error(error);
             } else if wait == 0 {
-                break Err(ABORTED);
+                break Err(StudioError::Aborted);
             } else if wait == 1 {
                 let socket = net::NetDll_accept(
                     XNCALLER_XBDM,
@@ -550,7 +551,7 @@ struct NullCableTransport {
     request: u32,
 }
 
-fn create_null_cable_transport() -> Result<u32, Hresult> {
+fn create_null_cable_transport() -> Result<u32, StudioError> {
     let object = kernel::ExAllocatePoolTypeWithTag(
         size_of::<NullCableTransport>() as u32,
         NULL_CABLE_POOL_TAG,
@@ -558,27 +559,26 @@ fn create_null_cable_transport() -> Result<u32, Hresult> {
     );
     // Stock passes the null pointer to ExFreePool here.
     if object == 0 {
-        return Err(Hresult::OUT_OF_MEMORY);
+        return Err(StudioError::OutOfMemory);
     }
     let request = kernel::module_handle(c"xboxkrnl.exe")
-        .map_err(|_| Hresult::FAIL)
+        .map_err(|_| StudioError::Fail)
         .and_then(|module| {
             let mut address = 0u32;
-            if failed(kernel::XexGetProcedureAddress(
-                module,
+            NtStatus(kernel::XexGetProcedureAddress(
+                module.raw(),
                 NULL_CABLE_ORDINAL,
                 &mut address,
-            )) {
-                Err(NOT_IMPLEMENTED)
-            } else {
-                Ok(address)
-            }
+            ))
+            .result()
+            .map(|()| address)
+            .map_err(|_| StudioError::NotImplemented)
         });
     let request = match request {
         Ok(request) => request,
-        Err(result) => {
+        Err(failure) => {
             kernel::ExFreePool(object);
-            return Err(result);
+            return Err(failure);
         }
     };
     let routines = [
@@ -601,14 +601,20 @@ fn null_cable_request(this: u32) -> u32 {
     unsafe { (*(this as usize as *const NullCableTransport)).request }
 }
 
-/// Map a null-cable request status (stock 0x91f83290).
-fn null_cable_result_code(status: u32) -> u32 {
-    match status {
-        0 => 0,
-        STATUS_NO_SUCH_DEVICE => NOT_CONNECTED.0,
-        STATUS_NO_MEMORY => Hresult::OUT_OF_MEMORY.0,
-        STATUS_NOT_IMPLEMENTED => NOT_IMPLEMENTED.0,
-        _ => Hresult::FAIL.0,
+/// Map a null-cable request status (stock 0x91f83290); any other nonzero
+/// status, informational ones included, fails.
+fn null_cable_status(status: u32) -> Result<(), StudioError> {
+    let status = NtStatus(status);
+    if status == NtStatus::SUCCESS {
+        Ok(())
+    } else if status == KernelError::NoSuchDevice.status() {
+        Err(StudioError::NotConnected)
+    } else if status == KernelError::NoMemory.status() {
+        Err(StudioError::OutOfMemory)
+    } else if status == KernelError::NotImplemented.status() {
+        Err(StudioError::NotImplemented)
+    } else {
+        Err(StudioError::Fail)
     }
 }
 
@@ -633,7 +639,7 @@ fn null_cable_transfer(this: u32, code: u32, buffer: u32, length: u32, request: 
             0,
         )
     };
-    null_cable_result_code(status)
+    routine_result(null_cable_status(status)).0
 }
 
 extern "C" fn null_cable_kind(_this: u32) -> u32 {
@@ -668,13 +674,18 @@ extern "C" fn null_cable_result(_this: u32, request: u32, transferred: u32, wait
             break status;
         }
         if wait == 0 {
-            return PENDING.0;
+            return routine_result(Err(StudioError::Pending)).0;
         }
         kernel::WaitForSingleObject(event, INFINITE);
     };
     core::sync::atomic::fence(Ordering::Acquire);
     write_u32(transferred, read_u32(request));
-    if status != 0 { Hresult::FAIL.0 } else { 0 }
+    routine_result(if status != 0 {
+        Err(StudioError::Fail)
+    } else {
+        Ok(())
+    })
+    .0
 }
 
 extern "C" fn null_cable_cancel(this: u32) -> u32 {
@@ -689,11 +700,15 @@ extern "C" fn null_cable_cancel(this: u32) -> u32 {
             0,
         )
     };
-    match status {
-        0 => 0,
-        STATUS_NOT_IMPLEMENTED => NOT_IMPLEMENTED.0,
-        _ => Hresult::FAIL.0,
-    }
+    let status = NtStatus(status);
+    let result = if status == NtStatus::SUCCESS {
+        Ok(())
+    } else if status == KernelError::NotImplemented.status() {
+        Err(StudioError::NotImplemented)
+    } else {
+        Err(StudioError::Fail)
+    };
+    routine_result(result).0
 }
 
 bridged!(null_cable_kind_entry, null_cable_kind);
@@ -770,14 +785,14 @@ impl Stream for SocketStream {
     }
 }
 
-fn create_socket_transport(socket: SocketId) -> Result<u32, Hresult> {
+fn create_socket_transport(socket: SocketId) -> Result<u32, StudioError> {
     let object = kernel::ExAllocatePoolTypeWithTag(
         size_of::<SocketTransport>() as u32,
         SOCKET_POOL_TAG,
         POOL_TYPE,
     );
     if object == 0 {
-        return Err(Hresult::OUT_OF_MEMORY);
+        return Err(StudioError::OutOfMemory);
     }
     let routines = [
         routine(socket_kind_entry),
@@ -804,7 +819,7 @@ fn create_socket_transport(socket: SocketId) -> Result<u32, Hresult> {
         == net::SOCKET_ERROR
     {
         kernel::ExFreePool(object);
-        return Err(Hresult::FAIL);
+        return Err(StudioError::Fail);
     }
     Ok(object)
 }
@@ -874,26 +889,22 @@ impl SocketTransport {
 fn socket_queue(this: u32, direction: Direction, buffer: u32, length: u32, request: u32) -> u32 {
     // SAFETY: the studio service passes the transport it was given.
     let object = unsafe { enter(this) };
-    let result = match object.engine.reserve() {
-        Err(result) => result.0,
-        Ok(slot) => {
-            object.bind_event(read_u32(request + REQUEST_EVENT));
-            write_u32(request, object.handle(slot));
-            let mut stream = object.stream();
-            object.engine.submit(
-                slot,
-                direction,
-                CallerBuffer {
-                    address: buffer,
-                    length,
-                },
-                &mut stream,
-            );
-            0
-        }
-    };
+    let result = object.engine.reserve().map(|slot| {
+        object.bind_event(read_u32(request + REQUEST_EVENT));
+        write_u32(request, object.handle(slot));
+        let mut stream = object.stream();
+        object.engine.submit(
+            slot,
+            direction,
+            CallerBuffer {
+                address: buffer,
+                length,
+            },
+            &mut stream,
+        );
+    });
     leave(this);
-    result
+    routine_result(result).0
 }
 
 extern "C" fn socket_kind(_this: u32) -> u32 {
@@ -924,7 +935,7 @@ extern "C" fn socket_result(this: u32, request: u32, transferred: u32, wait: u32
     let object = unsafe { enter(this) };
     let Some(slot) = object.slot(handle) else {
         leave(this);
-        return Hresult::INVALID_ARGUMENT.0;
+        return routine_result(Err(StudioError::InvalidArgument)).0;
     };
     object.pump();
     if wait != 0 {
@@ -936,7 +947,7 @@ extern "C" fn socket_result(this: u32, request: u32, transferred: u32, wait: u32
             }
             if !object.engine.is_connected() {
                 leave(this);
-                return NOT_CONNECTED.0;
+                return routine_result(Err(StudioError::NotConnected)).0;
             }
             let event = object.event;
             leave(this);
@@ -948,7 +959,7 @@ extern "C" fn socket_result(this: u32, request: u32, transferred: u32, wait: u32
     // SAFETY: the section is held.
     let object = unsafe { &mut *(this as usize as *mut SocketTransport) };
     let result = match object.engine.complete(slot) {
-        None => PENDING,
+        None => Err(StudioError::Pending),
         Some((status, count)) => {
             write_u32(transferred, count);
             write_u32(request, 0);
@@ -956,7 +967,7 @@ extern "C" fn socket_result(this: u32, request: u32, transferred: u32, wait: u32
         }
     };
     leave(this);
-    result.0
+    routine_result(result).0
 }
 
 extern "C" fn socket_cancel(this: u32) -> u32 {

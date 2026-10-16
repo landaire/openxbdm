@@ -6,18 +6,26 @@ use std::io::Write;
 
 use common::RawSession;
 use common::TestServer;
+use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
-use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::KernelError;
 use openxbdm_server::commands::console::ConfigSetting;
 use openxbdm_server::commands::hardware::AvatarError;
 use openxbdm_server::commands::hardware::AvatarHook;
 use openxbdm_server::commands::hardware::InputOwner;
 use openxbdm_server::commands::hardware::PlayToCommand;
 use openxbdm_server::commands::hardware::PlayToState;
+use openxbdm_server::commands::hardware::SystemApp;
+use openxbdm_server::commands::hardware::SystemMessage;
+use openxbdm_server::commands::hardware::UsbController;
+use openxbdm_server::commands::hardware::UsbPort;
+use openxbdm_server::commands::hardware::XamError;
 use openxbdm_server::commands::hardware::automation::DebuggerMessage;
 use openxbdm_server::commands::hardware::automation::Gamepad;
 use openxbdm_server::commands::hardware::automation::Poll;
 use openxbdm_server_host::backend::hardware::PgoRecord;
+use openxbdm_server_host::backend::hardware::SentMessage;
+use openxbdm_server_host::backend::hardware::UsbPortRequest;
 
 fn session(server: &TestServer) -> RawSession {
     let mut session = server.raw();
@@ -341,12 +349,12 @@ fn avatar_runs_test_hooks() {
         let mut host = server.host.lock();
         let failures = &mut host.backend.hardware.avatar_failures;
         failures.insert(0, AvatarError::NoFunction);
-        failures.insert(8, AvatarError::Lookup(Hresult::INVALID_ARGUMENT));
+        failures.insert(8, AvatarError::Lookup(XamError::InvalidArgument));
         failures.insert(
             7,
-            AvatarError::Hook(Hresult::from_error_code(
-                openxbdm_core::status::ErrorCode::NOT_STOPPED,
-            )),
+            AvatarError::Hook(
+                XamError::check(Hresult::from_error_code(ErrorCode::NotStopped)).unwrap_err(),
+            ),
         );
     }
     assert_eq!(
@@ -409,7 +417,7 @@ fn bkgdmodetest_and_builtinmu_edit_configuration_bits() {
         .console
         .xconfig
         .failures
-        .insert(ConfigSetting::new(2, 6), NtStatus(0xc000_0001));
+        .insert(ConfigSetting::new(2, 6), KernelError::Unsuccessful);
     assert_eq!(session.command("builtinmu enable"), "400- unexpected error");
     server
         .host
@@ -418,7 +426,7 @@ fn bkgdmodetest_and_builtinmu_edit_configuration_bits() {
         .console
         .xconfig
         .failures
-        .insert(ConfigSetting::new(3, 0xd), NtStatus(0xc000_0022));
+        .insert(ConfigSetting::new(3, 0xd), KernelError::AccessDenied);
     assert_eq!(session.command("bkgdmodetest enable"), "414- access denied");
 }
 
@@ -455,7 +463,7 @@ fn configuration_flag_commands_always_succeed() {
         .console
         .xconfig
         .failures
-        .insert(ConfigSetting::new(3, 0xd), NtStatus(0xc000_0001));
+        .insert(ConfigSetting::new(3, 0xd), KernelError::Unsuccessful);
     assert_eq!(session.command("bootanim enabled=off"), "200- OK");
 }
 
@@ -481,7 +489,7 @@ fn enablewirelesscontrollers_switches_the_radio_and_flag() {
         "200- OK"
     );
     assert_eq!(config(&server, 3, 0xd), 0);
-    server.host.lock().backend.hardware.radio_status = NtStatus(0xc000_0001);
+    server.host.lock().backend.hardware.radio_result = Err(KernelError::Unsuccessful);
     assert_eq!(
         session.command("enablewirelesscontrollers enabled=off"),
         "414- access denied"
@@ -559,8 +567,8 @@ fn mixcmd_reports_memory_statistics() {
     {
         let mut host = server.host.lock();
         let hardware = &mut host.backend.hardware;
-        hardware.memory_statistics_status = NtStatus(0xc000_0001);
-        hardware.xam_heap_count_result = Hresult::FAIL;
+        hardware.memory_statistics_result = Err(KernelError::Unsuccessful);
+        hardware.xam_heap_count_result = Err(XamError::Fail);
     }
     assert_eq!(session.command("mixcmd querystats"), "400- ");
     assert_eq!(session.command("mixcmd countxamheaps"), "400- ");
@@ -599,11 +607,16 @@ fn mockcurrencyvalue_messages_the_marketplace() {
     );
     let mut expected = vec![0, 0, 0, 1, 0, 0, 0x12, 0x34];
     expected.extend([0; 12]);
+    let sent = |buffer| SentMessage {
+        app: SystemApp::MARKETPLACE,
+        message: SystemMessage::MOCK_CURRENCY,
+        buffer,
+    };
     assert_eq!(
         server.host.lock().backend.hardware.system_messages,
-        [(0xfe, 0x23100, expected), (0xfe, 0x23100, vec![0; 20])]
+        [sent(expected), sent(vec![0; 20])]
     );
-    server.host.lock().backend.hardware.system_message_result = Hresult(0);
+    server.host.lock().backend.hardware.system_message_result = Ok(());
     assert_eq!(
         session.command("mockcurrencyvalue enabled=off"),
         "414- access denied"
@@ -644,7 +657,7 @@ fn oddlog_file_failure_leaves_the_writer_stoppable() {
         "413- file cannot be created"
     );
     assert_eq!(session.command("oddlog stop"), "200- stopped logging");
-    server.host.lock().backend.hardware.odd_log.file_status = NtStatus(0xc000_003a);
+    server.host.lock().backend.hardware.odd_log.file_result = Err(KernelError::ObjectPathNotFound);
     assert_eq!(session.command("oddlog"), "430- path not found");
     assert_eq!(session.command("oddlog stop"), "200- stopped logging");
 }
@@ -682,7 +695,7 @@ fn playto_queries_the_media_service() {
             PlayToCommand::Enable
         ]
     );
-    server.host.lock().backend.hardware.play_to = Err(Hresult::FAIL);
+    server.host.lock().backend.hardware.play_to = Err(XamError::Fail);
     assert_eq!(
         session.command("playto show"),
         "423- Invalid parameter: playto show"
@@ -782,14 +795,19 @@ fn usbportctrl_switches_port_power() {
         session.command("usbportctrl controller=0 port=1 disable enable"),
         "200- OK"
     );
-    server.host.lock().backend.hardware.usb_port_status = NtStatus(0xc000_0001);
+    server.host.lock().backend.hardware.usb_port_result = Err(KernelError::Unsuccessful);
     assert_eq!(
         session.command("usbportctrl controller=1 port=2 disable"),
         "400- "
     );
+    let request = |controller, port, enable| UsbPortRequest {
+        controller: UsbController(controller),
+        port: UsbPort(port),
+        enable,
+    };
     assert_eq!(
         server.host.lock().backend.hardware.usb_port_requests,
-        [(0, 1, true), (1, 2, false)]
+        [request(0, 1, true), request(1, 2, false)]
     );
     server.host.lock().backend.hardware.usb_port_available = false;
     assert_eq!(session.command("usbportctrl"), "414- access denied");

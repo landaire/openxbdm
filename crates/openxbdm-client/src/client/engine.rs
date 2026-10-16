@@ -57,7 +57,7 @@ use crate::error::Error;
 use crate::error::FramingError;
 use crate::error::TransportError;
 use crate::protocol::Classified;
-use crate::protocol::ErrorCode;
+use crate::protocol::RemoteStatus;
 use crate::protocol::SuccessCode;
 use crate::protocol::response::Response;
 use crate::protocol::response::parse_response_head;
@@ -91,7 +91,7 @@ pub enum ClientEvent {
     /// `Failed` so callers don't have to scrutinize the error variant
     /// to know whether the session survived.
     RemoteError {
-        code: ErrorCode,
+        code: RemoteStatus,
         /// Text after the status code (typically `"unknown command"`,
         /// `"file not found"`, etc.).
         message: String,
@@ -465,18 +465,13 @@ impl ClientEngine {
                 };
                 match head.code.try_classify() {
                     Classified::Error(code) => {
-                        // 4xx is a per-command failure, not a session
-                        // teardown: drop back to Idle so the caller can
-                        // submit again.
-                        self.events.push_back(ClientEvent::RemoteError {
-                            code,
-                            message: head.rest,
-                        });
-                        self.state = State::Idle;
-                        true
+                        self.remote_error(RemoteStatus::Listed(code), head.rest)
+                    }
+                    Classified::UnlistedError(code) => {
+                        self.remote_error(RemoteStatus::Unlisted(code), head.rest)
                     }
                     Classified::Unknown(code) => {
-                        self.fail(Error::UnknownStatusCode { raw: code.raw() });
+                        self.fail(Error::UnknownStatusCode { code });
                         true
                     }
                     Classified::Success(SuccessCode::MultilineFollows) => {
@@ -617,6 +612,15 @@ impl ClientEngine {
         }
     }
 
+    /// A 4xx is a per-command failure, not a session teardown: back to
+    /// `Idle` so the caller can submit again.
+    fn remote_error(&mut self, code: RemoteStatus, message: String) -> bool {
+        self.events
+            .push_back(ClientEvent::RemoteError { code, message });
+        self.state = State::Idle;
+        true
+    }
+
     fn fail(&mut self, e: Error) {
         self.state = State::Failed;
         self.events.push_back(ClientEvent::Failed(Box::new(e)));
@@ -626,6 +630,8 @@ impl ClientEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::ErrorCode;
+    use crate::protocol::StatusCode;
 
     fn drive(engine: &mut ClientEngine) -> Vec<ClientEvent> {
         let mut out = Vec::new();
@@ -760,7 +766,7 @@ mod tests {
         assert_eq!(evs.len(), 1);
         match &evs[0] {
             ClientEvent::RemoteError { code, message } => {
-                assert_eq!(code.raw(), 407);
+                assert_eq!(*code, ErrorCode::UnknownCommand);
                 assert_eq!(message, "unknown command");
             }
             other => panic!("got {other:?}"),
@@ -774,6 +780,26 @@ mod tests {
             e.poll(),
             Some(ClientEvent::Response(Response::Line { .. }))
         ));
+    }
+
+    #[test]
+    fn unlisted_error_status_is_a_remote_error() {
+        let mut e = ClientEngine::new();
+        e.recv(b"201- connected\r\n");
+        let _ = drive(&mut e);
+        e.submit("cmd", None).unwrap();
+        let _ = drain_send(&mut e);
+        e.recv(b"425- \r\n");
+        let evs = drive(&mut e);
+        match &evs[..] {
+            [ClientEvent::RemoteError { code, message }] => {
+                assert_eq!(*code, RemoteStatus::Unlisted(StatusCode::new(425).unwrap()));
+                assert_eq!(code.raw(), 425);
+                assert_eq!(message, "");
+            }
+            other => panic!("got {other:?}"),
+        }
+        assert!(!e.is_terminal());
     }
 
     #[test]
@@ -917,7 +943,7 @@ mod tests {
         let evs = drive(&mut e);
         match &evs[0] {
             ClientEvent::RemoteError { code, message } => {
-                assert_eq!(code.raw(), 402);
+                assert_eq!(*code, ErrorCode::FileNotFound);
                 assert_eq!(message, "file not found");
             }
             other => panic!("got {other:?}"),

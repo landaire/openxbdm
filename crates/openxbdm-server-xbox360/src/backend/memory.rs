@@ -6,7 +6,9 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::Win32Error;
 use openxbdm_server::commands::filesystem;
 use openxbdm_server::commands::filesystem::Backend as _;
 use openxbdm_server::commands::memory;
@@ -31,8 +33,10 @@ use crate::kernel::import_variable;
 mod detour;
 mod exports;
 
+pub(crate) use exports::MODULE_RECORD_SHORT_SIZE;
+pub(crate) use exports::ModuleWalkError;
 pub(crate) use exports::get_module_debug_directory;
-pub(crate) use exports::walk_modules;
+pub(crate) use exports::next_module;
 
 import_thunk!(pub RtlImageNtHeader(base: u32) -> u32, lib = LIB_KERNEL, ordinal = 0x1a9);
 import_thunk!(
@@ -108,8 +112,51 @@ fn assert_allocation_pointer(line: u32) {
     );
 }
 
-/// HRESULT of tracking calls while no type is tracked.
-const TRACKING_OFF: u32 = 0x8007_0426;
+/// A tracking hook call that did not fail.
+#[derive(Clone, Copy)]
+enum Tracked {
+    /// The record was added or removed.
+    Done,
+    /// The type is not tracked.
+    TypeNotTracked,
+}
+
+/// A failed tracking hook call.
+#[derive(Clone, Copy)]
+enum TrackingError {
+    /// No type is tracked.
+    Off,
+    /// The type index is past the known types.
+    UnknownType,
+    /// The record could not be allocated.
+    OutOfMemory,
+    /// No record has the address.
+    NotFound,
+    /// The record has another type.
+    TypeMismatch,
+    /// The record has another size.
+    SizeMismatch,
+}
+
+type TrackingResult = Result<Tracked, TrackingError>;
+
+/// The HRESULT a tracking hook returns to the kernel or the title.
+fn tracking_hresult(result: TrackingResult) -> Hresult {
+    match result {
+        // S_OK.
+        Ok(Tracked::Done) => Hresult(0),
+        // S_FALSE.
+        Ok(Tracked::TypeNotTracked) => Hresult(1),
+        // HRESULT_FROM_WIN32(ERROR_SERVICE_NOT_ACTIVE).
+        Err(TrackingError::Off) => Hresult(0x8007_0426),
+        Err(TrackingError::UnknownType | TrackingError::TypeMismatch) => Hresult::INVALID_ARGUMENT,
+        Err(TrackingError::OutOfMemory) => Hresult::OUT_OF_MEMORY,
+        // HRESULT_FROM_WIN32(ERROR_NOT_FOUND).
+        Err(TrackingError::NotFound) => Hresult(0x8007_0490),
+        // HRESULT_FROM_WIN32(ERROR_BAD_LENGTH).
+        Err(TrackingError::SizeMismatch) => Hresult(0x8007_0018),
+    }
+}
 
 fn read_u32(address: u32) -> u32 {
     // SAFETY: callers pass addresses of kernel structures that stay mapped
@@ -381,7 +428,7 @@ fn read_unaligned_u32(address: u32) -> u32 {
 /// allocation. `arguments` points at the address, size, and type dwords.
 /// The stock return value is residual.
 pub(crate) fn service_memtrack_record_alloc(arguments: u32) -> u32 {
-    track_allocation(
+    let _ = track_allocation(
         read_u32(arguments),
         read_u32(arguments + 4),
         u16::from(read_u32(arguments + 8) as u8),
@@ -389,21 +436,20 @@ pub(crate) fn service_memtrack_record_alloc(arguments: u32) -> u32 {
     0
 }
 
-/// 0x91f23598: 0x80070426 while tracking is off, E_INVALIDARG for an
-/// unknown type, 1 for a type not tracked, E_OUTOFMEMORY, or 0.
-fn track_allocation(address: u32, size: u32, kind: u16) -> u32 {
+/// 0x91f23598.
+fn track_allocation(address: u32, size: u32, kind: u16) -> TrackingResult {
     if address == 0 {
         assert_allocation_pointer(TRACK_ASSERT_LINE);
     }
     let flags = TRACKING.flags.load(Ordering::Relaxed);
     if flags & TrackingFlags::TYPE_MASK == 0 {
-        return TRACKING_OFF;
+        return Err(TrackingError::Off);
     }
     if u32::from(kind) >= tracking_type_count() {
-        return Hresult::INVALID_ARGUMENT.0;
+        return Err(TrackingError::UnknownType);
     }
     if !tracking_type_enabled(kind, flags) {
-        return 1;
+        return Ok(Tracked::TypeNotTracked);
     }
     let length = record_length();
     let record = kernel::ExAllocatePoolWithTag(length, TRACKING_POOL_TAG);
@@ -411,7 +457,7 @@ fn track_allocation(address: u32, size: u32, kind: u16) -> u32 {
         tracking_diagnostic(format_args!(
             "unable to allocate buffer for allocation tracking"
         ));
-        return Hresult::OUT_OF_MEMORY.0;
+        return Err(TrackingError::OutOfMemory);
     }
     write_unaligned_u32(record + RECORD_ADDRESS, address);
     write_unaligned_u32(record + RECORD_SIZE, size);
@@ -434,7 +480,7 @@ fn track_allocation(address: u32, size: u32, kind: u16) -> u32 {
     TRACKING.head.store(record, Ordering::Relaxed);
     TRACKING.count.fetch_add(1, Ordering::Relaxed);
     kernel::KfReleaseSpinLock(lock, irql);
-    0
+    Ok(Tracked::Done)
 }
 
 /// Debug monitor control code 9 (stock 0x91f3b754 -> 0x91f236d8): stop
@@ -447,7 +493,7 @@ pub(crate) fn service_memtrack_record_free(arguments: u32) -> u32 {
         read_u32(arguments + 4),
         u16::from(read_u32(arguments + 8) as u8),
     ) {
-        Untracked::Lookup(result) => result,
+        Untracked::Lookup(result) => tracking_hresult(result).0,
         Untracked::Skipped(_) => 0,
     }
 }
@@ -455,9 +501,9 @@ pub(crate) fn service_memtrack_record_free(arguments: u32) -> u32 {
 /// Outcome of 0x91f236d8.
 enum Untracked {
     /// Tracking is off, the type is unknown, or it is not tracked.
-    Skipped(u32),
+    Skipped(TrackingResult),
     /// The record lookup ran.
-    Lookup(u32),
+    Lookup(TrackingResult),
 }
 
 fn untrack_allocation(address: u32, size: u32, kind: u16) -> Untracked {
@@ -466,13 +512,13 @@ fn untrack_allocation(address: u32, size: u32, kind: u16) -> Untracked {
     }
     let flags = TRACKING.flags.load(Ordering::Relaxed);
     if flags & TrackingFlags::TYPE_MASK == 0 {
-        return Untracked::Skipped(TRACKING_OFF);
+        return Untracked::Skipped(Err(TrackingError::Off));
     }
     if u32::from(kind) >= tracking_type_count() {
-        return Untracked::Skipped(Hresult::INVALID_ARGUMENT.0);
+        return Untracked::Skipped(Err(TrackingError::UnknownType));
     }
     if !tracking_type_enabled(kind, flags) {
-        return Untracked::Skipped(1);
+        return Untracked::Skipped(Ok(Tracked::TypeNotTracked));
     }
     let lock = TRACKING.lock.as_ptr();
     let irql = kernel::KfAcquireSpinLock(lock);
@@ -490,7 +536,7 @@ fn untrack_allocation(address: u32, size: u32, kind: u16) -> Untracked {
             address,
             size as i32
         ));
-        0x8007_0490
+        Err(TrackingError::NotFound)
     } else {
         // SAFETY: the record is live under the lock.
         let recorded_kind =
@@ -502,7 +548,7 @@ fn untrack_allocation(address: u32, size: u32, kind: u16) -> Untracked {
                 tracking_type_name(recorded_kind),
                 tracking_type_name(kind)
             ));
-            0x8007_0057
+            Err(TrackingError::TypeMismatch)
         } else if size == 0 || size == read_unaligned_u32(record + RECORD_SIZE) {
             let next = read_unaligned_u32(record);
             match previous {
@@ -511,14 +557,14 @@ fn untrack_allocation(address: u32, size: u32, kind: u16) -> Untracked {
             }
             TRACKING.count.fetch_sub(1, Ordering::Relaxed);
             release = true;
-            0
+            Ok(Tracked::Done)
         } else {
             tracking_diagnostic(format_args!(
                 "invalid size freeing {} @ {:08X}",
                 tracking_type_name(kind),
                 address
             ));
-            0x8007_0018
+            Err(TrackingError::SizeMismatch)
         }
     };
     kernel::KfReleaseSpinLock(lock, irql);
@@ -830,11 +876,11 @@ impl memory::Backend for Console {
         length
     }
 
-    fn read_flash(&mut self, offset: u32, output: &mut [u8]) -> Result<(), NtStatus> {
+    fn read_flash(&mut self, offset: u32, output: &mut [u8]) -> Result<(), KernelError> {
         super::system::flash::device_read(offset, output.as_mut_ptr(), output.len() as u32)
     }
 
-    fn write_flash(&mut self, offset: u32, data: &[u8]) -> Result<(), NtStatus> {
+    fn write_flash(&mut self, offset: u32, data: &[u8]) -> Result<(), KernelError> {
         super::system::flash::device_write(offset, data.as_ptr(), data.len() as u32)
     }
 
@@ -868,7 +914,7 @@ impl memory::Backend for Console {
         TRACKING.flags.store(flags.0, Ordering::Relaxed);
     }
 
-    fn write_tracking_records(&mut self, file: filesystem::FileHandle) -> NtStatus {
+    fn write_tracking_records(&mut self, file: filesystem::FileHandle) -> Result<(), KernelError> {
         let length = record_length() as usize;
         let mut record = TRACKING.head.load(Ordering::Relaxed);
         while record != 0 {
@@ -876,16 +922,14 @@ impl memory::Backend for Console {
             // stopped during the save.
             let bytes =
                 unsafe { core::slice::from_raw_parts(record as usize as *const u8, length) };
-            if let Err(status) = self.write_file(file, None, filesystem::FileData::Bytes(bytes)) {
-                return status;
-            }
+            self.write_file(file, None, filesystem::FileData::Bytes(bytes))?;
             record = read_unaligned_u32(record);
         }
-        NtStatus::SUCCESS
+        Ok(())
     }
 
-    fn dos_error_from_nt_status(&mut self, status: NtStatus) -> u32 {
-        kernel::RtlNtStatusToDosError(status.0)
+    fn dos_error_from_nt_status(&mut self, error: KernelError) -> Option<Win32Error> {
+        Win32Error::new(kernel::RtlNtStatusToDosError(NtStatus::from(error).0))
     }
 
     fn detour(
@@ -895,7 +939,7 @@ impl memory::Backend for Console {
         detour::with_engine(operation);
     }
 
-    fn start_detour_log(&mut self, log: Option<&[u8]>) -> NtStatus {
+    fn start_detour_log(&mut self, log: Option<&[u8]>) -> Result<(), KernelError> {
         detour::start(log)
     }
 

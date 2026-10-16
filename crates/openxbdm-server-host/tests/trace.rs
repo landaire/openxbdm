@@ -118,11 +118,16 @@ fn upload_completion_status_line() {
 #[test]
 fn title_processor_hand_off_traces_the_line_twice() {
     let server = TestServer::start();
-    server.host.lock().backend.register_processor(
-        b"ttl",
-        Some(Box::new(|_, _| Hresult::OK)),
-        ProcessorFlags::TITLE,
-    );
+    server
+        .host
+        .lock()
+        .backend
+        .register_processor(
+            b"ttl",
+            Some(Box::new(|_, _| Hresult::OK)),
+            ProcessorFlags::TITLE,
+        )
+        .unwrap();
     let mut session = session(&server);
     assert_eq!(session.command("verbose level=1"), "200- OK");
     assert_eq!(session.command("ttl!a"), "200- OK");

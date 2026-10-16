@@ -4,7 +4,8 @@ use core::fmt::Write as _;
 
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
-use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::KernelError;
+use openxbdm_core::status::Win32Error;
 
 use crate::access::Access;
 use crate::backend::Backend as AnyBackend;
@@ -20,6 +21,9 @@ use crate::continuation::ContinuationContext;
 use crate::invocation::Invocation;
 use crate::registry::CommandEntry;
 use crate::registry::DispatchFlags;
+use crate::reply::CommandError;
+use crate::reply::CommandResult;
+use crate::reply::Reply;
 use crate::state::ServerState;
 use crate::text::LineText;
 
@@ -34,32 +38,32 @@ pub const NETWORK_ADDRESS_SIZE: usize = 0x24;
 /// Characters of a console identifier string.
 pub const CONSOLE_ID_LENGTH: usize = 12;
 
-/// Status the kernel returns when an export is absent.
-pub const STATUS_PROCEDURE_NOT_FOUND: NtStatus = NtStatus(0xc000_0138);
+/// Console failures whose reply status is outside the result table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleError {
+    /// `442-` with empty text: a network address query is pending.
+    AddressPending,
+}
 
-/// `442-` with empty text.
-const NOT_AVAILABLE: Hresult = Hresult::error(0x2a);
-const BAD_PARAMETER: Hresult = Hresult::from_error_code(ErrorCode::BAD_PARAMETER);
-const ACCESS_DENIED: Hresult = Hresult::from_error_code(ErrorCode::ACCESS_DENIED);
-const UNKNOWN_COMMAND: Hresult = Hresult::from_error_code(ErrorCode::UNKNOWN_COMMAND);
-const FILENAME_INVALID: Hresult = Hresult::from_error_code(ErrorCode::FILENAME_INVALID);
+impl From<ConsoleError> for Hresult {
+    fn from(error: ConsoleError) -> Self {
+        match error {
+            ConsoleError::AddressPending => Hresult::error(0x2a),
+        }
+    }
+}
+
+impl From<ConsoleError> for CommandError {
+    fn from(error: ConsoleError) -> Self {
+        Self::Console(error)
+    }
+}
 
 /// Configuration settings written by this domain.
 const SETTING_AUTO_SHUTOFF: ConfigSetting = ConfigSetting::new(7, 2);
 const SETTING_DISCOVERABLE: ConfigSetting = ConfigSetting::new(7, 0xf);
 const SETTING_KIOSK_ID: ConfigSetting = ConfigSetting::new(0xb, 3);
-const SETTING_RETAIL_FLAGS: ConfigSetting = ConfigSetting::new(3, 0xc);
 const SETTING_NETWORK_SHARE: ConfigSetting = ConfigSetting::new(3, 0x10);
-/// Index of the category-3 user flags dword.
-const USER_FLAGS_INDEX: u16 = 0xd;
-/// Index of the category-3 retail flags dword.
-const RETAIL_FLAGS_INDEX: u16 = 0xc;
-
-const USER_FLAG_LIVE_SIGNIN_REQUIRED: u32 = 0x08;
-const USER_FLAG_KIOSK: u32 = 0x40;
-const USER_FLAG_DATA_CENTER: u32 = 0x400;
-const RETAIL_FLAG_WELCOME_HIDE: u32 = 0x0400_0000;
-const RETAIL_FLAG_WELCOME_DEFAULT: u32 = 0x0800_0000;
 
 /// Value buffer of the on/off string parameters.
 const SWITCH_BUFFER: usize = 10;
@@ -102,7 +106,7 @@ const fn entry(
     name: &'static str,
     any_of: Access,
     flags: DispatchFlags,
-    handler: fn(&mut Invocation<'_>) -> Hresult,
+    handler: fn(&mut Invocation<'_>) -> CommandResult,
 ) -> CommandEntry {
     CommandEntry::new(name, any_of, Access::NONE, flags, handler)
 }
@@ -266,19 +270,26 @@ impl DebugName {
     }
 }
 
-/// The name does not fit the caller's buffer (stock export 17).
-pub const BUFFER_TOO_SMALL: Hresult = Hresult::error(0x105);
+/// The output does not hold the whole value (stock exports 17 and 194).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferTooSmall;
+
+impl From<BufferTooSmall> for Hresult {
+    fn from(_: BufferTooSmall) -> Self {
+        Hresult::error(0x105)
+    }
+}
 
 /// Stock export 17 (control code 0x33): copy the debug name and a
-/// terminator into `output`, cut to fit; a cut name fails with
-/// [`BUFFER_TOO_SMALL`]. Stock underflows the size of an empty buffer and
-/// copies the whole name past it; here nothing is written.
-pub fn copy_debug_name(name: &DebugName, output: &mut [u8]) -> Hresult {
+/// terminator into `output`, cut to fit; a cut name fails. Stock
+/// underflows the size of an empty buffer and copies the whole name past
+/// it; here nothing is written.
+pub fn copy_debug_name(name: &DebugName, output: &mut [u8]) -> Result<(), BufferTooSmall> {
     let Some(room) = output.len().checked_sub(1) else {
         return if name.as_bytes().is_empty() {
-            Hresult::OK
+            Ok(())
         } else {
-            BUFFER_TOO_SMALL
+            Err(BufferTooSmall)
         };
     };
     let name = name.as_bytes();
@@ -286,9 +297,9 @@ pub fn copy_debug_name(name: &DebugName, output: &mut [u8]) -> Hresult {
     output[..length].copy_from_slice(&name[..length]);
     output[length] = 0;
     if length == name.len() {
-        Hresult::OK
+        Ok(())
     } else {
-        BUFFER_TOO_SMALL
+        Err(BufferTooSmall)
     }
 }
 
@@ -646,29 +657,29 @@ impl RegistrationResult {
     /// response of a registered console into `output`, the caller's buffer
     /// (`None` without a size pointer).
     pub fn export_response(&self, output: Option<&mut [u8]>) -> RegistrationResponse {
-        let none = |result| RegistrationResponse {
-            result,
+        let none = |error| RegistrationResponse {
+            result: Err(error),
             transaction: 0,
             length: 0,
         };
         match self.state {
             RegistrationState::Pending | RegistrationState::InProgress => {
-                none(Hresult::error(0x150))
+                none(RegistrationError::NotRegistered)
             }
-            RegistrationState::Cleared => none(Hresult::error(0x2)),
-            RegistrationState::Failed => none(Hresult::error(0x100)),
-            RegistrationState::Rejected => none(Hresult::error(0x10a)),
-            RegistrationState::ResponseTooLarge => none(Hresult::error(0xf)),
+            RegistrationState::Cleared => none(RegistrationError::Cleared),
+            RegistrationState::Failed => none(RegistrationError::Failed),
+            RegistrationState::Rejected => none(RegistrationError::Rejected),
+            RegistrationState::ResponseTooLarge => none(RegistrationError::ResponseTooLarge),
             RegistrationState::Registered => {
                 let response = &self.response[..usize::from(self.response_len)];
                 let result = match output {
                     Some(output) if output.len() >= response.len() => {
                         output[..response.len()].copy_from_slice(response);
-                        Hresult::OK
+                        Ok(())
                     }
-                    Some(_) => BUFFER_TOO_SMALL,
+                    Some(_) => Err(RegistrationError::BufferTooSmall),
                     // Without a size pointer nothing is copied, yet stock reports success.
-                    None => Hresult::OK,
+                    None => Ok(()),
                 };
                 RegistrationResponse {
                     result,
@@ -680,10 +691,36 @@ impl RegistrationResult {
     }
 }
 
+/// Why export 194 reports no response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationError {
+    /// Waiting to register or a request is in progress.
+    NotRegistered,
+    Cleared,
+    Failed,
+    Rejected,
+    ResponseTooLarge,
+    /// The caller's buffer does not hold the response.
+    BufferTooSmall,
+}
+
+impl From<RegistrationError> for Hresult {
+    fn from(error: RegistrationError) -> Self {
+        match error {
+            RegistrationError::NotRegistered => Hresult::error(0x150),
+            RegistrationError::Cleared => Hresult::error(0x2),
+            RegistrationError::Failed => Hresult::error(0x100),
+            RegistrationError::Rejected => Hresult::error(0x10a),
+            RegistrationError::ResponseTooLarge => Hresult::error(0xf),
+            RegistrationError::BufferTooSmall => BufferTooSmall.into(),
+        }
+    }
+}
+
 /// What export 194 stores and returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegistrationResponse {
-    pub result: Hresult,
+    pub result: Result<(), RegistrationError>,
     pub transaction: u64,
     pub length: u32,
 }
@@ -766,6 +803,92 @@ impl ConfigSetting {
     }
 }
 
+/// A category-3 configuration dword edited as a bit set.
+pub trait ConfigFlags: Copy {
+    const SETTING: ConfigSetting;
+
+    fn bits(self) -> u32;
+}
+
+/// Bits of the user flags dword, setting (3, 0xd).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UserFlags(u32);
+
+impl UserFlags {
+    pub const MOTION_DETECTION_DISABLED: Self = Self(0x01);
+    pub const BACKGROUND_MODE_TEST: Self = Self(0x02);
+    pub const BOOT_ANIMATION_DISABLED: Self = Self(0x04);
+    pub const LIVE_SIGNIN_REQUIRED: Self = Self(0x08);
+    pub const KINECT_HEALTH_MESSAGE_DISABLED: Self = Self(0x20);
+    pub const KIOSK: Self = Self(0x40);
+    pub const DATA_CENTER: Self = Self(0x400);
+    pub const WIRELESS_CONTROLLERS_DISABLED: Self = Self(0x800);
+
+    pub const fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+impl ConfigFlags for UserFlags {
+    const SETTING: ConfigSetting = ConfigSetting::new(3, 0xd);
+
+    fn bits(self) -> u32 {
+        self.0
+    }
+}
+
+/// Bits of the retail flags dword, setting (3, 0xc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RetailFlags(u32);
+
+impl RetailFlags {
+    pub const OOBE_DISABLED: Self = Self(0x40);
+    /// Boot device selection of `setdiscboot enable=0`; the meaning of the
+    /// single bit is not known.
+    pub const DISC_BOOT_DISABLED: Self = Self(0x80);
+    /// Boot device selection of `setdiscboot enable=1`; the meaning of the
+    /// single bit is not known.
+    pub const DISC_BOOT_ENABLED: Self = Self(0x2000);
+    /// Every bit `setdiscboot` clears before setting its selection.
+    pub const BOOT_DEVICE: Self = Self(0x0002_2880);
+    pub const IPTV_ENABLED: Self = Self(0x1000);
+    pub const OOBE_CHECKPOINT_DISABLED: Self = Self(0x8000);
+    pub const IPTV_DVR: Self = Self(0x0008_0000);
+    /// Set when uninstalling IPTV is not allowed.
+    pub const IPTV_UNINSTALL_BLOCKED: Self = Self(0x0200_0000);
+    pub const WELCOME_HIDE: Self = Self(0x0400_0000);
+    pub const WELCOME_DEFAULT: Self = Self(0x0800_0000);
+    pub const NUI_OOBE_DISABLED: Self = Self(0x2000_0000);
+
+    pub const fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+impl ConfigFlags for RetailFlags {
+    const SETTING: ConfigSetting = ConfigSetting::new(3, 0xc);
+
+    fn bits(self) -> u32 {
+        self.0
+    }
+}
+
 /// Fields of the kernel memory statistics (debug monitor service 8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryStatistics {
@@ -801,15 +924,10 @@ impl ConsoleMemory {
     }
 }
 
-/// Result code of a system message request; negative values are failures.
+/// A failed system network service request: the result the system
+/// software returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct XamStatus(pub u32);
-
-impl XamStatus {
-    pub const fn is_failure(self) -> bool {
-        (self.0 as i32) < 0
-    }
-}
+pub struct NetworkRaError(pub Hresult);
 
 /// Data-center network configuration record exchanged with the system
 /// network service.
@@ -923,44 +1041,45 @@ pub enum HttpStartStage {
     Send,
 }
 
-/// A failed request start and the last error code.
+/// A failed request start and the last error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HttpStartFailure {
     pub stage: HttpStartStage,
-    pub error: u32,
+    pub error: Option<Win32Error>,
 }
 
-/// How an in-progress request failed. Errors are last error codes.
+/// How an in-progress request failed. Errors are last errors; `None` is
+/// `ERROR_SUCCESS`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpFailure {
     Work {
-        error: u32,
+        error: Option<Win32Error>,
     },
     Receive {
-        error: u32,
+        error: Option<Win32Error>,
     },
     StatusQuery {
-        error: u32,
+        error: Option<Win32Error>,
     },
     /// The server answered with a status other than 200.
     Status {
         code: u32,
     },
     ContentLength {
-        error: u32,
+        error: Option<Win32Error>,
     },
     /// The announced body exceeds [`REGISTRATION_RESPONSE_CAPACITY`].
     TooLarge {
         length: u32,
     },
     Read {
-        error: u32,
+        error: Option<Win32Error>,
     },
     /// The request failed in stock state `state` (1 sending, 3 receiving
     /// headers, 5 reading).
     Request {
         state: u32,
-        error: u32,
+        error: Option<Win32Error>,
     },
     /// The connection ended with `expected` body bytes outstanding.
     Truncated {
@@ -982,18 +1101,21 @@ pub enum HttpProgress {
 pub trait Backend {
     fn kit_features(&mut self) -> KitFeatures;
     /// Read a configuration setting into `output`; returns the stored length.
-    fn xconfig_get(&mut self, setting: ConfigSetting, output: &mut [u8])
-    -> Result<usize, NtStatus>;
-    fn xconfig_set(&mut self, setting: ConfigSetting, value: &[u8]) -> Result<(), NtStatus>;
+    fn xconfig_get(
+        &mut self,
+        setting: ConfigSetting,
+        output: &mut [u8],
+    ) -> Result<usize, KernelError>;
+    fn xconfig_set(&mut self, setting: ConfigSetting, value: &[u8]) -> Result<(), KernelError>;
     /// Kernel export 700: replace a 4-byte setting with
-    /// `(old & and_mask) | or_mask`. [`STATUS_PROCEDURE_NOT_FOUND`] when
+    /// `(old & and_mask) | or_mask`. [`KernelError::OrdinalNotFound`] when
     /// the export is absent.
     fn xconfig_modify(
         &mut self,
         setting: ConfigSetting,
         and_mask: u32,
         or_mask: u32,
-    ) -> Result<(), NtStatus>;
+    ) -> Result<(), KernelError>;
     /// Read the SMC I2C settings block; `None` when the read fails.
     fn read_settings_block(&mut self) -> Option<[u8; SETTINGS_BLOCK_SIZE]>;
     /// Write the SMC I2C settings block; false when the write fails.
@@ -1001,17 +1123,17 @@ pub trait Backend {
     /// Kernel memory statistics; `None` when the query fails.
     fn memory_statistics(&mut self) -> Option<MemoryStatistics>;
     fn system_information(&mut self) -> SystemInformation;
-    fn console_id(&mut self) -> Result<ConsoleId, NtStatus>;
+    fn console_id(&mut self) -> Result<ConsoleId, KernelError>;
     fn debug_network_address(&mut self) -> NetworkAddress;
     fn title_network_address(&mut self) -> NetworkAddress;
     /// Apply the inactivity auto-shutoff configuration.
     fn apply_inactivity_time(&mut self);
-    fn network_ra_request(&mut self, request: NetworkRaRequest<'_>) -> XamStatus;
+    fn network_ra_request(&mut self, request: NetworkRaRequest<'_>) -> Result<(), NetworkRaError>;
     /// Whether the system UI library exports its feature switch (ordinal 515).
     fn feature_switch_present(&mut self) -> bool;
     fn set_feature(&mut self, enable: u32, feature: u32);
-    /// Load the network file system client; the status of the image load.
-    fn load_network_client(&mut self) -> NtStatus;
+    /// Load the network file system client image.
+    fn load_network_client(&mut self) -> Result<(), KernelError>;
     /// Millisecond tick count.
     fn tick_milliseconds(&mut self) -> u32;
     /// Version of the system software (XAM).
@@ -1036,19 +1158,26 @@ pub trait Backend {
     fn trace_mask(&mut self) -> TraceMask;
 }
 
-/// Stock 0x91f4d350: set or clear `mask` in the 4-byte setting (3, `index`)
+/// Stock 0x91f4d350: set or clear `flags` in their configuration dword
 /// through kernel export 700, or read, modify and write the setting when
 /// that export is absent. Failures map with fallback 0x8000ffff.
-pub fn modify_config_flag(
+pub fn modify_config_flag<F: ConfigFlags>(
     backend: &mut dyn AnyBackend,
-    index: u16,
+    flags: F,
+    set: bool,
+) -> Result<(), CommandError> {
+    modify_config_bits(backend, F::SETTING, flags.bits(), set)
+}
+
+fn modify_config_bits(
+    backend: &mut dyn AnyBackend,
+    setting: ConfigSetting,
     mask: u32,
     set: bool,
-) -> Hresult {
-    let setting = ConfigSetting::new(3, index);
+) -> Result<(), CommandError> {
     let or_mask = if set { mask } else { 0 };
-    let status = match backend.xconfig_modify(setting, !mask, or_mask) {
-        Err(STATUS_PROCEDURE_NOT_FOUND) => {
+    let result = match backend.xconfig_modify(setting, !mask, or_mask) {
+        Err(KernelError::OrdinalNotFound) => {
             let mut value = [0u8; 4];
             match backend.xconfig_get(setting, &mut value) {
                 Ok(_) => {
@@ -1056,15 +1185,12 @@ pub fn modify_config_flag(
                     let new = if set { old | mask } else { old & !mask };
                     backend.xconfig_set(setting, &new.to_be_bytes())
                 }
-                Err(status) => Err(status),
+                Err(error) => Err(error),
             }
         }
         other => other,
     };
-    Hresult::from_nt_status(
-        status.err().unwrap_or(NtStatus::SUCCESS),
-        Hresult::UNEXPECTED,
-    )
+    result.map_err(|error| CommandError::from_kernel(error, CommandError::Unexpected))
 }
 
 /// Stock 0x91f50088 (export 214), shared with `consolemem` and
@@ -1213,7 +1339,7 @@ pub(crate) fn refresh_network_share(state: &mut ServerState, backend: &mut dyn A
     }
     if length == 0 || length > NETWORK_SHARE_NAME_LIMIT || setting[0] == 0 {
         state.filesystem.drives.set_network_share(None);
-    } else if backend.load_network_client().is_success() {
+    } else if backend.load_network_client().is_ok() {
         state
             .filesystem
             .drives
@@ -1221,7 +1347,10 @@ pub(crate) fn refresh_network_share(state: &mut ServerState, backend: &mut dyn A
     }
 }
 
-pub(crate) fn resume(continuation: &mut Continuation, cx: &mut ContinuationContext<'_>) -> Hresult {
+pub(crate) fn resume(
+    continuation: &mut Continuation,
+    cx: &mut ContinuationContext<'_>,
+) -> CommandResult {
     match continuation {
         Continuation::SystemInfo {
             next,
@@ -1249,26 +1378,26 @@ fn equals_any(value: &[u8], words: &[&str]) -> bool {
 }
 
 /// `altaddr`: the title IPv4 address; fails while the address is pending.
-fn alternate_address(invocation: &mut Invocation<'_>) -> Hresult {
+fn alternate_address(invocation: &mut Invocation<'_>) -> CommandResult {
     let address = invocation.backend.title_network_address();
     if address.status <= 1 {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     let [a, b, c, d, ..] = address.record;
     invocation.set_text(format_args!(
         "addr=0x{:08x}",
         u32::from_be_bytes([a, b, c, d])
     ));
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `autoshutoff timeout=<hours>`: 0, 1 or 6 hours; stored in minutes with
 /// bit 15 set.
-fn auto_shutoff(invocation: &mut Invocation<'_>) -> Hresult {
+fn auto_shutoff(invocation: &mut Invocation<'_>) -> CommandResult {
     let value = invocation.line.param("timeout");
     let hours = value.map_or(0, |value| value.dword_prefix());
     let result = match value.and_then(|value| value.dword()) {
-        None => Hresult::error(0),
+        None => Err(ErrorCode::Undefined.into()),
         Some(0 | 1 | 6) => {
             let minutes = ((hours * 60) as u16) | 0x8000;
             if invocation
@@ -1277,39 +1406,40 @@ fn auto_shutoff(invocation: &mut Invocation<'_>) -> Hresult {
                 .is_ok()
             {
                 invocation.backend.apply_inactivity_time();
-                Hresult::OK
+                Ok(Reply::Ok)
             } else {
-                Hresult::error(0)
+                Err(ErrorCode::Undefined.into())
             }
         }
-        Some(_) => BAD_PARAMETER,
+        Some(_) => Err(ErrorCode::BadParameter.into()),
     };
     let mut message = LineText::new();
     let _ = writeln!(
         message,
         "[xbdm] AutoShutoff, timeout={hours} hr:0x{:08X}",
-        result.0
+        crate::reply::hresult(result).0
     );
     invocation.backend.debug_print(message.as_bytes());
     result
 }
 
-fn network_ra_failure(invocation: &mut Invocation<'_>, status: XamStatus) -> Hresult {
+fn network_ra_failure(invocation: &mut Invocation<'_>, error: NetworkRaError) -> CommandResult {
+    let NetworkRaError(result) = error;
     invocation.set_text(format_args!(
         "\x1e{VE_FAILURE} (err 0x{:08X})\x1e",
-        status.0
+        result.0
     ));
-    Hresult::UNEXPECTED
+    Err(CommandError::Unexpected)
 }
 
 /// Stock 0x91f46560: query and print the configuration.
-fn show_network_ra(invocation: &mut Invocation<'_>, record: &mut NetworkRaRecord) -> Hresult {
+fn show_network_ra(invocation: &mut Invocation<'_>, record: &mut NetworkRaRecord) -> CommandResult {
     record.flags = 0;
-    let status = invocation
+    if let Err(error) = invocation
         .backend
-        .network_ra_request(NetworkRaRequest::Get(record));
-    if status.is_failure() {
-        return network_ra_failure(invocation, status);
+        .network_ra_request(NetworkRaRequest::Get(record))
+    {
+        return network_ra_failure(invocation, error);
     }
     let relax = if record.flags & NetworkRaRecord::RELAX_HEARTBEAT != 0 {
         "on"
@@ -1320,20 +1450,20 @@ fn show_network_ra(invocation: &mut Invocation<'_>, record: &mut NetworkRaRecord
         "\x1e{VE_HEADER}\x1erelaxheartbeat={relax} customubootaddr=0x{:08X}\x1e",
         record.custom_boot_address
     ));
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `confignetra [show] [relaxheartbeat=on|off] [customubootaddr=<dword>]`.
-fn configure_network_ra(invocation: &mut Invocation<'_>) -> Hresult {
+fn configure_network_ra(invocation: &mut Invocation<'_>) -> CommandResult {
     let mut record = NetworkRaRecord::default();
     if invocation.line.has("show") {
         return show_network_ra(invocation, &mut record);
     }
-    let status = invocation
+    if let Err(error) = invocation
         .backend
-        .network_ra_request(NetworkRaRequest::Get(&mut record));
-    if status.is_failure() {
-        return network_ra_failure(invocation, status);
+        .network_ra_request(NetworkRaRequest::Get(&mut record))
+    {
+        return network_ra_failure(invocation, error);
     }
     let mut changes = 0;
     if invocation.line.has("relaxheartbeat") {
@@ -1358,19 +1488,19 @@ fn configure_network_ra(invocation: &mut Invocation<'_>) -> Hresult {
     }
     if changes == 0 {
         invocation.set_text(format_args!("\x1e{VE_USAGE}\x1e"));
-        return UNKNOWN_COMMAND;
+        return Err(ErrorCode::UnknownCommand.into());
     }
-    let status = invocation
+    if let Err(error) = invocation
         .backend
-        .network_ra_request(NetworkRaRequest::Set(&mut record));
-    if status.is_failure() {
-        return network_ra_failure(invocation, status);
+        .network_ra_request(NetworkRaRequest::Set(&mut record))
+    {
+        return network_ra_failure(invocation, error);
     }
     show_network_ra(invocation, &mut record)
 }
 
 /// `consolefeatures`: each feature name is appended with a leading space.
-fn console_features(invocation: &mut Invocation<'_>) -> Hresult {
+fn console_features(invocation: &mut Invocation<'_>) -> CommandResult {
     let features = invocation.backend.kit_features();
     invocation.text.clear();
     for (present, name) in [
@@ -1382,38 +1512,33 @@ fn console_features(invocation: &mut Invocation<'_>) -> Hresult {
             let _ = invocation.text.push_bytes(name.as_bytes());
         }
     }
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
-fn console_memory_command(invocation: &mut Invocation<'_>) -> Hresult {
+fn console_memory_command(invocation: &mut Invocation<'_>) -> CommandResult {
     let memory = console_memory(invocation.backend);
     invocation.set_text(format_args!("consolemem=0x{:x}", memory.value()));
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `consoletype`: stock reports only these two kit types.
-fn console_type(invocation: &mut Invocation<'_>) -> Hresult {
+fn console_type(invocation: &mut Invocation<'_>) -> CommandResult {
     let kind: &[u8] = if invocation.backend.is_test_kit() {
         b"testkit"
     } else {
         b"devkit"
     };
     invocation.text.set_bytes(kind);
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `datacentermode [enabled=on|true]`: any other value, or none, disables.
-fn data_center_mode(invocation: &mut Invocation<'_>) -> Hresult {
+fn data_center_mode(invocation: &mut Invocation<'_>) -> CommandResult {
     let mut buffer = [0u8; SWITCH_BUFFER];
     let enable = string_param(invocation, "enabled", &mut buffer)
         .is_some_and(|value| equals_any(value, &["on", "true"]));
-    let _ = modify_config_flag(
-        invocation.backend,
-        USER_FLAGS_INDEX,
-        USER_FLAG_DATA_CENTER,
-        enable,
-    );
-    Hresult::OK
+    let _ = modify_config_flag(invocation.backend, UserFlags::DATA_CENTER, enable);
+    Ok(Reply::Ok)
 }
 
 /// Stock 0x91f4e6b0: store the name in the SMC I2C settings block when it
@@ -1446,58 +1571,58 @@ fn persist_debug_name(backend: &mut dyn AnyBackend, name: &[u8]) {
 
 /// `dbgname [name=<string>]`: report or set the debug name. Setting it
 /// requires the config privilege and also rewrites the settings file.
-fn debug_name(invocation: &mut Invocation<'_>) -> Hresult {
+fn debug_name(invocation: &mut Invocation<'_>) -> CommandResult {
     let mut buffer = [0u8; DEBUG_NAME_CAPACITY];
     let Some(value) = string_param(invocation, "name", &mut buffer) else {
         let name = invocation.state.console.debug_name;
         invocation.text.set_bytes(name.as_bytes());
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     };
     if !invocation.access().intersects(Access::CONFIG) {
-        return ACCESS_DENIED;
+        return Err(ErrorCode::AccessDenied.into());
     }
     let name = DebugName::new(value);
     invocation.state.console.debug_name = name;
     invocation.backend.publish(Published::DebugName(&name));
     persist_debug_name(invocation.backend, name.as_bytes());
     crate::commands::system::save_settings(invocation.state, invocation.backend);
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `debugmemsize`: bits 8..20 of debug monitor memory statistic 0x70.
-fn debug_memory_size(invocation: &mut Invocation<'_>) -> Hresult {
+fn debug_memory_size(invocation: &mut Invocation<'_>) -> CommandResult {
     // A failed query reports 0, as stock does.
     let size = invocation
         .backend
         .memory_statistics()
         .map_or(0, |statistics| statistics.debug_memory_size());
     invocation.set_text(format_args!("debugmemsize=0x{size:x}"));
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `debugmode`: gated by a stock global (0x91fab9a8) that nothing sets, so
 /// the command is always unknown.
-fn debug_mode(_invocation: &mut Invocation<'_>) -> Hresult {
-    UNKNOWN_COMMAND
+fn debug_mode(_invocation: &mut Invocation<'_>) -> CommandResult {
+    Err(ErrorCode::UnknownCommand.into())
 }
 
 /// `discoverable enabled=on|true|off|false`; the write result is ignored.
-fn discoverable(invocation: &mut Invocation<'_>) -> Hresult {
+fn discoverable(invocation: &mut Invocation<'_>) -> CommandResult {
     let mut buffer = [0u8; SWITCH_BUFFER];
     let value = match string_param(invocation, "enabled", &mut buffer) {
         Some(value) if equals_any(value, &["on", "true"]) => 1u8,
         Some(value) if equals_any(value, &["off", "false"]) => 0,
-        _ => return BAD_PARAMETER,
+        _ => return Err(ErrorCode::BadParameter.into()),
     };
     let _ = invocation
         .backend
         .xconfig_set(SETTING_DISCOVERABLE, &[value]);
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `dumpmode [smart|enabled|disabled]`: the first present flag is stored
 /// through export 118. Replies with the current mode.
-fn dump_mode(invocation: &mut Invocation<'_>) -> Hresult {
+fn dump_mode(invocation: &mut Invocation<'_>) -> CommandResult {
     if let Some(mode) = DumpMode::ALL
         .into_iter()
         .find(|mode| invocation.line.has(mode.name()))
@@ -1508,7 +1633,7 @@ fn dump_mode(invocation: &mut Invocation<'_>) -> Hresult {
     invocation
         .text
         .set_bytes(invocation.state.console.dump_mode.name().as_bytes());
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// Stock export 118, also behind `dumpmode`: a test kit stores `enabled`
@@ -1537,7 +1662,7 @@ fn dump_selector(invocation: &Invocation<'_>, name: &str, field: DumpField) -> O
 
 /// `dumpsettings [rpt=] [dst=] [fmt=] [path=]`: unrecognized values are
 /// ignored; replies with the current settings.
-fn dump_settings(invocation: &mut Invocation<'_>) -> Hresult {
+fn dump_settings(invocation: &mut Invocation<'_>) -> CommandResult {
     let mut settings = invocation.state.console.dump_settings;
     let mut changed = false;
     for (name, field) in [
@@ -1567,12 +1692,12 @@ fn dump_settings(invocation: &mut Invocation<'_>) -> Hresult {
     settings.write_summary(&mut |bytes| {
         let _ = text.push_bytes(bytes);
     });
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `eventdefer [set [break] [debugstring] ...]`: `set` replaces the mask
 /// with the named events. Replies with a leading space before each name.
-fn event_defer(invocation: &mut Invocation<'_>) -> Hresult {
+fn event_defer(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.line.has("set") {
         let mut mask = 0;
         for (bit, name) in EventDeferMask::NAMES.iter().enumerate() {
@@ -1591,7 +1716,7 @@ fn event_defer(invocation: &mut Invocation<'_>) -> Hresult {
         let _ = invocation.text.push_bytes(b" ");
         let _ = invocation.text.push_bytes(name.as_bytes());
     }
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// Server state other threads read through the monitor exports and
@@ -1655,41 +1780,41 @@ pub fn apply_exported_setting(
 
 /// `feature enable=<dword> feature=<dword>`: forwarded to the system UI
 /// library; without that export the command does nothing.
-fn feature(invocation: &mut Invocation<'_>) -> Hresult {
+fn feature(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.session.is_none() {
-        return BAD_PARAMETER;
+        return Err(ErrorCode::BadParameter.into());
     }
     if !invocation.backend.feature_switch_present() {
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     let Some(enable) = invocation.line.dword("enable") else {
         invocation.text.set_bytes(b"'enable' not specified");
-        return BAD_PARAMETER;
+        return Err(ErrorCode::BadParameter.into());
     };
     let Some(feature) = invocation.line.dword("feature") else {
         invocation.text.set_bytes(b"'feature' not specified");
-        return BAD_PARAMETER;
+        return Err(ErrorCode::BadParameter.into());
     };
     invocation.backend.set_feature(enable, feature);
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `getconsoleid`: a failed read returns the status with bit 28 set.
-fn console_id(invocation: &mut Invocation<'_>) -> Hresult {
+fn console_id(invocation: &mut Invocation<'_>) -> CommandResult {
     match invocation.backend.console_id() {
         Ok(ConsoleId(id)) => {
             let length = c_string(&id).len();
             invocation.text.clear();
             let _ = invocation.text.push_bytes(b"consoleid=");
             let _ = invocation.text.push_bytes(&id[..length]);
-            Hresult::OK
+            Ok(Reply::Ok)
         }
-        Err(status) => Hresult(status.0 | 0x1000_0000),
+        Err(error) => Err(CommandError::Kernel(error)),
     }
 }
 
 /// `getnetaddrs`: debug name and both address records in hex.
-fn network_addresses(invocation: &mut Invocation<'_>) -> Hresult {
+fn network_addresses(invocation: &mut Invocation<'_>) -> CommandResult {
     let debug = invocation.backend.debug_network_address();
     let title = invocation.backend.title_network_address();
     if debug.status == 0 || title.status == 0 {
@@ -1697,7 +1822,7 @@ fn network_addresses(invocation: &mut Invocation<'_>) -> Hresult {
             "debugstatus=0x{:08x} titlestatus=0x{:08x}",
             debug.status, title.status
         ));
-        return NOT_AVAILABLE;
+        return Err(ConsoleError::AddressPending.into());
     }
     let name = invocation.state.console.debug_name;
     invocation.text.clear();
@@ -1707,13 +1832,13 @@ fn network_addresses(invocation: &mut Invocation<'_>) -> Hresult {
     let _ = invocation.text.push_hex_upper(&debug.record);
     let _ = invocation.text.push_bytes(b" title=");
     let _ = invocation.text.push_hex_upper(&title.record);
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `httpreg clear` | `httpreg server=<s> object=</path> [port=<dword>]`.
 /// Every call clears the previous registration and rewrites the settings
 /// file.
-fn http_registration(invocation: &mut Invocation<'_>) -> Hresult {
+fn http_registration(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.state.console.http_registration.state == RegistrationState::InProgress {
         invocation.backend.http_close();
     }
@@ -1721,7 +1846,7 @@ fn http_registration(invocation: &mut Invocation<'_>) -> Hresult {
     *registration = HttpRegistration::EMPTY;
     let result = if invocation.line.has("clear") {
         registration.state = RegistrationState::Cleared;
-        Hresult::OK
+        Ok(Reply::Ok)
     } else {
         let mut buffer = [0u8; REGISTRATION_TEXT_CAPACITY + 1];
         let server = invocation
@@ -1741,14 +1866,14 @@ fn http_registration(invocation: &mut Invocation<'_>) -> Hresult {
         }
         if object.is_none() {
             registration.state = RegistrationState::Failed;
-            BAD_PARAMETER
+            Err(ErrorCode::BadParameter.into())
         } else if registration.object().first() != Some(&b'/') {
             registration.state = RegistrationState::Failed;
-            FILENAME_INVALID
+            Err(ErrorCode::FilenameInvalid.into())
         } else {
             registration.port = invocation.line.dword("port").map_or(0, |port| port as u16);
             registration.state = RegistrationState::Pending;
-            Hresult::OK
+            Ok(Reply::Ok)
         }
     };
     invocation.backend.publish(Published::Registration(
@@ -1831,8 +1956,16 @@ fn registration_path(
     path.len
 }
 
+/// A last error as the registration texts print it; `ERROR_SUCCESS` is 0.
+fn last_error_code(error: Option<Win32Error>) -> u32 {
+    error.map_or(0, Win32Error::code)
+}
+
 /// Stock 0x91f300e0: build the request and start it.
-fn start_registration(state: &mut ServerState, backend: &mut dyn AnyBackend) -> Result<(), u32> {
+fn start_registration(
+    state: &mut ServerState,
+    backend: &mut dyn AnyBackend,
+) -> Result<(), HttpStartFailure> {
     let mut transaction = [0u8; 8];
     backend.random_bytes(&mut transaction);
     state.console.http_registration.transaction = u64::from_be_bytes(transaction);
@@ -1857,10 +1990,13 @@ fn start_registration(state: &mut ServerState, backend: &mut dyn AnyBackend) -> 
         };
         print(
             backend,
-            format_args!("XBDM: Failed {stage} (err = {})!\n", failure.error),
+            format_args!(
+                "XBDM: Failed {stage} (err = {})!\n",
+                last_error_code(failure.error)
+            ),
         );
         state.console.http_registration.transaction = 0;
-        return Err(failure.error);
+        return Err(failure);
     }
     let mut message = MessageText::new();
     let _ = message.write_str("XBDM: Attempting to register at [http://");
@@ -1900,15 +2036,24 @@ fn advance_registration(state: &mut ServerState, backend: &mut dyn AnyBackend) -
     match failure {
         HttpFailure::Work { error } => print(
             backend,
-            format_args!("XBDM: Failed doing XHttp work (err = {error})!\n"),
+            format_args!(
+                "XBDM: Failed doing XHttp work (err = {})!\n",
+                last_error_code(error)
+            ),
         ),
         HttpFailure::Receive { error } => print(
             backend,
-            format_args!("XBDM: Failed starting to receive HTTP response (err = {error})!\n"),
+            format_args!(
+                "XBDM: Failed starting to receive HTTP response (err = {})!\n",
+                last_error_code(error)
+            ),
         ),
         HttpFailure::StatusQuery { error } => print(
             backend,
-            format_args!("XBDM: Failed retrieving HTTP status code (err = {error})!\n"),
+            format_args!(
+                "XBDM: Failed retrieving HTTP status code (err = {})!\n",
+                last_error_code(error)
+            ),
         ),
         HttpFailure::Status { code } => print(
             backend,
@@ -1916,7 +2061,10 @@ fn advance_registration(state: &mut ServerState, backend: &mut dyn AnyBackend) -
         ),
         HttpFailure::ContentLength { error } => print(
             backend,
-            format_args!("XBDM: Failed retrieving content length (err = {error})!\n"),
+            format_args!(
+                "XBDM: Failed retrieving content length (err = {})!\n",
+                last_error_code(error)
+            ),
         ),
         HttpFailure::TooLarge { length } => print(
             backend,
@@ -1926,11 +2074,17 @@ fn advance_registration(state: &mut ServerState, backend: &mut dyn AnyBackend) -
         ),
         HttpFailure::Read { error } => print(
             backend,
-            format_args!("XBDM: Failed reading XHttp data (err = {error})!\n"),
+            format_args!(
+                "XBDM: Failed reading XHttp data (err = {})!\n",
+                last_error_code(error)
+            ),
         ),
         HttpFailure::Request { state, error } => print(
             backend,
-            format_args!("XBDM: HTTP registration failed (state {state}, err = {error})!\n"),
+            format_args!(
+                "XBDM: HTTP registration failed (state {state}, err = {})!\n",
+                last_error_code(error)
+            ),
         ),
         HttpFailure::Truncated { received, expected } => print(
             backend,
@@ -2007,10 +2161,13 @@ fn run_registration(state: &mut ServerState, backend: &mut dyn AnyBackend) -> u3
     }
     match start_registration(state, backend) {
         Ok(()) => advance_registration(state, backend),
-        Err(error) => {
+        Err(failure) => {
             print(
                 backend,
-                format_args!("XBDM: Failed starting up HTTP registration task (err = {error})!\n"),
+                format_args!(
+                    "XBDM: Failed starting up HTTP registration task (err = {})!\n",
+                    last_error_code(failure.error)
+                ),
             );
             state.console.http_registration.state = RegistrationState::Failed;
             REGISTRATION_PERIOD_MS
@@ -2019,70 +2176,59 @@ fn run_registration(state: &mut ServerState, backend: &mut dyn AnyBackend) -> u3
 }
 
 /// `kiosk enabled=off|false` | `kiosk enabled=on|true id=<dword>`.
-fn kiosk(invocation: &mut Invocation<'_>) -> Hresult {
+fn kiosk(invocation: &mut Invocation<'_>) -> CommandResult {
     let mut buffer = [0u8; KIOSK_SWITCH_BUFFER];
     let Some(value) = string_param(invocation, "enabled", &mut buffer) else {
-        return BAD_PARAMETER;
+        return Err(ErrorCode::BadParameter.into());
     };
     let (enable, id) = if equals_any(value, &["off", "false"]) {
         (false, 0)
     } else if equals_any(value, &["on", "true"]) {
         match invocation.line.dword("id") {
             Some(id) => (true, id),
-            None => return BAD_PARAMETER,
+            None => return Err(ErrorCode::BadParameter.into()),
         }
     } else {
-        return BAD_PARAMETER;
+        return Err(ErrorCode::BadParameter.into());
     };
-    if modify_config_flag(
-        invocation.backend,
-        USER_FLAGS_INDEX,
-        USER_FLAG_KIOSK,
-        enable,
-    )
-    .is_failure()
+    if modify_config_flag(invocation.backend, UserFlags::KIOSK, enable).is_err()
         || invocation
             .backend
             .xconfig_set(SETTING_KIOSK_ID, &id.to_be_bytes())
             .is_err()
     {
-        return ACCESS_DENIED;
+        return Err(ErrorCode::AccessDenied.into());
     }
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `livesigninrequired [enabled=on]`: any other value, or none, clears it.
-fn live_signin_required(invocation: &mut Invocation<'_>) -> Hresult {
+fn live_signin_required(invocation: &mut Invocation<'_>) -> CommandResult {
     let mut buffer = [0u8; SWITCH_BUFFER];
     let enable = string_param(invocation, "enabled", &mut buffer)
         .is_some_and(|value| value.eq_ignore_ascii_case(b"on"));
-    let _ = modify_config_flag(
-        invocation.backend,
-        USER_FLAGS_INDEX,
-        USER_FLAG_LIVE_SIGNIN_REQUIRED,
-        enable,
-    );
-    Hresult::OK
+    let _ = modify_config_flag(invocation.backend, UserFlags::LIVE_SIGNIN_REQUIRED, enable);
+    Ok(Reply::Ok)
 }
 
 /// `resetnetra`: the result of the request is ignored.
-fn reset_network_ra(invocation: &mut Invocation<'_>) -> Hresult {
+fn reset_network_ra(invocation: &mut Invocation<'_>) -> CommandResult {
     let _ = invocation
         .backend
         .network_ra_request(NetworkRaRequest::Reset);
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `setconfig category=<dword> index=<dword> value=<dword>`.
-fn set_config(invocation: &mut Invocation<'_>) -> Hresult {
+fn set_config(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(category) = util::required_dword(invocation, "category") else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let Some(index) = util::required_dword(invocation, "index") else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let Some(value) = util::required_dword(invocation, "value") else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let setting = ConfigSetting::new(category as u16, index as u16);
     if invocation
@@ -2091,37 +2237,37 @@ fn set_config(invocation: &mut Invocation<'_>) -> Hresult {
         .is_err()
     {
         invocation.text.set_bytes(b"setvalue failed");
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `setretail and=<dword> or=<dword>`: masked update of setting (3, 0xc)
 /// through kernel export 700 only.
-fn set_retail(invocation: &mut Invocation<'_>) -> Hresult {
+fn set_retail(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(and_mask) = util::required_dword(invocation, "and") else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let Some(or_mask) = util::required_dword(invocation, "or") else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
-    if let Err(status) = invocation
+    if let Err(error) = invocation
         .backend
-        .xconfig_modify(SETTING_RETAIL_FLAGS, and_mask, or_mask)
+        .xconfig_modify(RetailFlags::SETTING, and_mask, or_mask)
     {
-        invocation.set_text(format_args!("Modify failed: 0x{:08x}", status.0));
-        return Hresult::FAIL;
+        invocation.set_text(format_args!("Modify failed: 0x{:08x}", error.status().0));
+        return Err(CommandError::Fail);
     }
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `setserver none` | `setserver name=<string>`: store the network share
 /// server and remap the share drive.
-fn set_server(invocation: &mut Invocation<'_>) -> Hresult {
+fn set_server(invocation: &mut Invocation<'_>) -> CommandResult {
     let mut setting = [0u8; NETWORK_SHARE_SIZE];
     if !invocation.line.has("none") && string_param(invocation, "name", &mut setting).is_none() {
         invocation.text.set_bytes(b"missing server name");
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     if invocation
         .backend
@@ -2129,19 +2275,19 @@ fn set_server(invocation: &mut Invocation<'_>) -> Hresult {
         .is_err()
     {
         invocation.text.set_bytes(b"save setting failed");
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     refresh_network_share(invocation.state, invocation.backend);
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `systeminfo`: four lines. Stock sends uninitialized stack text on the
 /// 202 line; an empty text gives the default `multiline response follows`.
-fn system_info(invocation: &mut Invocation<'_>) -> Hresult {
+fn system_info(invocation: &mut Invocation<'_>) -> CommandResult {
     let info = invocation.backend.system_information();
     let test_kit = invocation.backend.is_test_kit();
     let Some(session) = invocation.session.as_deref_mut() else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     session.receive_remaining = None;
     session.continuation = AnyContinuation::Console(Continuation::SystemInfo {
@@ -2150,7 +2296,7 @@ fn system_info(invocation: &mut Invocation<'_>) -> Hresult {
         test_kit,
     });
     invocation.text.clear();
-    Hresult::MULTILINE
+    Ok(Reply::Multiline)
 }
 
 fn platform_name(flags: u32) -> &'static str {
@@ -2184,7 +2330,7 @@ fn system_info_line(
     info: &SystemInformation,
     test_kit: bool,
     line: &mut LineText,
-) -> Hresult {
+) -> CommandResult {
     line.clear();
     let flags = info.hardware_flags;
     let _ = match *next {
@@ -2234,14 +2380,14 @@ fn system_info_line(
                 xdk[3]
             )
         }
-        SystemInfoLine::End => return Hresult::END_OF_DATA,
+        SystemInfoLine::End => return Err(CommandError::EndOfData),
     };
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `verbose level=<dword>`: the parsed prefix is stored even when the value
 /// is rejected.
-fn verbose(invocation: &mut Invocation<'_>) -> Hresult {
+fn verbose(invocation: &mut Invocation<'_>) -> CommandResult {
     if let Some(value) = invocation.line.param("level") {
         invocation.state.console.trace_mask = TraceMask(value.dword_prefix());
         invocation
@@ -2249,33 +2395,33 @@ fn verbose(invocation: &mut Invocation<'_>) -> Hresult {
             .publish(Published::TraceMask(invocation.state.console.trace_mask));
     }
     if util::required_dword(invocation, "level").is_none() {
-        return util::MISSING;
+        return Err(util::MISSING);
     }
     crate::commands::system::save_settings(invocation.state, invocation.backend);
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// Shared by `welcomedefault` and `welcomehide`: `off` or `false` sets the
 /// bit, anything else clears it.
-fn welcome_flag(invocation: &mut Invocation<'_>, mask: u32) -> Hresult {
+fn welcome_flag(invocation: &mut Invocation<'_>, flag: RetailFlags) -> CommandResult {
     let mut buffer = [0u8; SWITCH_BUFFER];
     let disabled = string_param(invocation, "enabled", &mut buffer)
         .is_some_and(|value| equals_any(value, &["off", "false"]));
-    let _ = modify_config_flag(invocation.backend, RETAIL_FLAGS_INDEX, mask, disabled);
-    Hresult::OK
+    let _ = modify_config_flag(invocation.backend, flag, disabled);
+    Ok(Reply::Ok)
 }
 
-fn welcome_default(invocation: &mut Invocation<'_>) -> Hresult {
-    welcome_flag(invocation, RETAIL_FLAG_WELCOME_DEFAULT)
+fn welcome_default(invocation: &mut Invocation<'_>) -> CommandResult {
+    welcome_flag(invocation, RetailFlags::WELCOME_DEFAULT)
 }
 
-fn welcome_hide(invocation: &mut Invocation<'_>) -> Hresult {
-    welcome_flag(invocation, RETAIL_FLAG_WELCOME_HIDE)
+fn welcome_hide(invocation: &mut Invocation<'_>) -> CommandResult {
+    welcome_flag(invocation, RetailFlags::WELCOME_HIDE)
 }
 
-fn monitor_version(invocation: &mut Invocation<'_>) -> Hresult {
+fn monitor_version(invocation: &mut Invocation<'_>) -> CommandResult {
     invocation.text.set_bytes(MONITOR_VERSION.as_bytes());
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `verbose level=%d` when the trace mask is nonzero.
@@ -2375,13 +2521,16 @@ mod tests {
     fn debug_name_copy_cuts_to_the_buffer() {
         let name = DebugName::new(b"kit");
         let mut buffer = [0xffu8; 5];
-        assert_eq!(copy_debug_name(&name, &mut buffer), Hresult::OK);
+        assert_eq!(copy_debug_name(&name, &mut buffer), Ok(()));
         assert_eq!(buffer, *b"kit\0\xff");
-        assert_eq!(copy_debug_name(&name, &mut buffer[..4]), Hresult::OK);
-        assert_eq!(copy_debug_name(&name, &mut buffer[..3]), BUFFER_TOO_SMALL);
+        assert_eq!(copy_debug_name(&name, &mut buffer[..4]), Ok(()));
+        assert_eq!(
+            copy_debug_name(&name, &mut buffer[..3]),
+            Err(BufferTooSmall)
+        );
         assert_eq!(buffer[..3], *b"ki\0");
-        assert_eq!(copy_debug_name(&name, &mut []), BUFFER_TOO_SMALL);
-        assert_eq!(copy_debug_name(&DebugName::EMPTY, &mut []), Hresult::OK);
+        assert_eq!(copy_debug_name(&name, &mut []), Err(BufferTooSmall));
+        assert_eq!(copy_debug_name(&DebugName::EMPTY, &mut []), Ok(()));
     }
 
     #[test]
@@ -2400,24 +2549,41 @@ mod tests {
     #[test]
     fn registration_response_follows_the_state() {
         let mut registration = RegistrationResult::EMPTY;
-        let failed = |code| RegistrationResponse {
-            result: Hresult::error(code),
+        let failed = |error| RegistrationResponse {
+            result: Err(error),
             transaction: 0,
             length: 0,
         };
-        for (state, code) in [
-            (RegistrationState::Pending, 0x150),
-            (RegistrationState::InProgress, 0x150),
-            (RegistrationState::Cleared, 0x2),
-            (RegistrationState::Failed, 0x100),
-            (RegistrationState::Rejected, 0x10a),
-            (RegistrationState::ResponseTooLarge, 0xf),
+        for (state, error, code) in [
+            (
+                RegistrationState::Pending,
+                RegistrationError::NotRegistered,
+                0x150,
+            ),
+            (
+                RegistrationState::InProgress,
+                RegistrationError::NotRegistered,
+                0x150,
+            ),
+            (RegistrationState::Cleared, RegistrationError::Cleared, 0x2),
+            (RegistrationState::Failed, RegistrationError::Failed, 0x100),
+            (
+                RegistrationState::Rejected,
+                RegistrationError::Rejected,
+                0x10a,
+            ),
+            (
+                RegistrationState::ResponseTooLarge,
+                RegistrationError::ResponseTooLarge,
+                0xf,
+            ),
         ] {
             registration.state = state;
             assert_eq!(
                 registration.export_response(Some(&mut [0; 8])),
-                failed(code)
+                failed(error)
             );
+            assert_eq!(Hresult::from(error), Hresult::error(code));
         }
         registration.state = RegistrationState::Registered;
         registration.transaction = 0x0123_4567_89ab_cdef;
@@ -2431,13 +2597,17 @@ mod tests {
         let mut buffer = [0xffu8; 4];
         assert_eq!(
             registration.export_response(Some(&mut buffer)),
-            registered(Hresult::OK)
+            registered(Ok(()))
         );
         assert_eq!(buffer, *b"abc\xff");
         assert_eq!(
             registration.export_response(Some(&mut buffer[..2])),
-            registered(BUFFER_TOO_SMALL)
+            registered(Err(RegistrationError::BufferTooSmall))
         );
-        assert_eq!(registration.export_response(None), registered(Hresult::OK));
+        assert_eq!(
+            Hresult::from(RegistrationError::BufferTooSmall),
+            Hresult::error(0x105)
+        );
+        assert_eq!(registration.export_response(None), registered(Ok(())));
     }
 }

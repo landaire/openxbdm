@@ -13,7 +13,6 @@ pub(crate) mod xtrace;
 
 pub(crate) use counters::memory_statistics;
 
-use openxbdm_core::status::Hresult;
 use openxbdm_server::commands::filesystem::DriveTable;
 use openxbdm_server::commands::performance;
 use openxbdm_server::commands::performance::COUNTER_NAME_CAPACITY;
@@ -27,7 +26,16 @@ use openxbdm_server::commands::performance::EDID_BLOCK_SIZE;
 use openxbdm_server::commands::performance::EdidRead;
 use openxbdm_server::commands::performance::PixDogma;
 use openxbdm_server::commands::performance::TILE_SIZE;
+use openxbdm_server::commands::performance::capture::BufferRequest;
+use openxbdm_server::commands::performance::capture::CaptureError;
 use openxbdm_server::commands::performance::capture::CaptureFlags;
+use openxbdm_server::commands::performance::capture::Started;
+use openxbdm_server::commands::performance::counters::CounterError;
+use openxbdm_server::commands::performance::counters::CounterQuery;
+use openxbdm_server::commands::performance::counters::Evaluation;
+use openxbdm_server::commands::performance::profiler::ProfilerError;
+use openxbdm_server::commands::performance::profiler::ProfilerFlags;
+use openxbdm_server::commands::performance::studio::StudioError;
 
 use super::Console;
 use crate::kernel;
@@ -236,29 +244,25 @@ impl performance::Backend for Console {
         &mut self,
         context: &mut u32,
         name: &mut [u8; COUNTER_NAME_CAPACITY],
-    ) -> Result<CounterEntry, Hresult> {
-        counters::next(context, name).map(|(name_len, counter_type)| CounterEntry {
-            name_len,
-            counter_type,
-        })
+    ) -> Result<CounterEntry, CounterError> {
+        counters::next(context, name)
     }
 
-    fn query_counter(&mut self, name: &[u8], query: u32, out: &mut CounterSample) -> Hresult {
-        let handle = match counters::open(name) {
-            Ok(handle) => handle,
-            Err(result) => return result,
-        };
-        let result = match counters::reference(handle) {
-            Ok(mut counter) => {
+    fn query_counter(
+        &mut self,
+        name: &[u8],
+        query: CounterQuery,
+        out: &mut CounterSample,
+    ) -> Result<Evaluation, CounterError> {
+        let handle = counters::open(name)?;
+        let result = counters::reference(handle)
+            .map_err(CounterError::Kernel)
+            .and_then(|mut counter| {
                 let result = counters::query(&mut counter, query, out);
                 counter.release();
                 result
-            }
-            Err(status) => {
-                Hresult::from_nt_status(openxbdm_core::status::NtStatus(status), Hresult::FAIL)
-            }
-        };
-        kernel::NtClose(handle);
+            });
+        handle.close();
         result
     }
 
@@ -376,12 +380,17 @@ impl performance::Backend for Console {
         }
     }
 
-    fn dedicate_studio_socket(&mut self) -> Result<u16, Hresult> {
+    fn dedicate_studio_socket(&mut self) -> Result<u16, StudioError> {
         studio::dedicate()
     }
 
-    fn capture_start(&mut self, name: &[u8], path: &[u8], buffer_size: u32) -> Hresult {
-        capture::start(name, path, buffer_size)
+    fn capture_start(
+        &mut self,
+        name: &[u8],
+        path: &[u8],
+        buffer: BufferRequest,
+    ) -> Result<Started, CaptureError> {
+        capture::start(name, path, buffer)
     }
 
     fn fast_cap_present(&mut self) -> bool {
@@ -392,7 +401,7 @@ impl performance::Backend for Console {
         capture::call_cap_present()
     }
 
-    fn capture_stop(&mut self, drives: &DriveTable) -> Hresult {
+    fn capture_stop(&mut self, drives: &DriveTable) -> Result<(), CaptureError> {
         capture::stop(self, drives)
     }
 
@@ -400,11 +409,11 @@ impl performance::Backend for Console {
         capture::set_flags(flags);
     }
 
-    fn capture_status(&mut self) -> Hresult {
+    fn capture_status(&mut self) -> Result<(), CaptureError> {
         capture::status()
     }
 
-    fn capture_abort(&mut self) -> Hresult {
+    fn capture_abort(&mut self) -> Result<(), CaptureError> {
         capture::abort()
     }
 
@@ -413,8 +422,8 @@ impl performance::Backend for Console {
         drives: &DriveTable,
         name: &[u8],
         interval: u32,
-        flags: u32,
-    ) -> Hresult {
+        flags: ProfilerFlags,
+    ) -> Result<(), ProfilerError> {
         let path = drives.translate(self, name);
         let mut executable = [0u8; module_snapshot::PATH_LIMIT + 2];
         let length = drives.object_path_to_drive_path(
@@ -430,11 +439,11 @@ impl performance::Backend for Console {
         )
     }
 
-    fn cpu_profiler_stop(&mut self) -> Hresult {
+    fn cpu_profiler_stop(&mut self) -> Result<(), ProfilerError> {
         profiler::stop()
     }
 
-    fn cpu_profiler_info(&mut self) -> Result<CpuProfilerInfo, Hresult> {
+    fn cpu_profiler_info(&mut self) -> Result<CpuProfilerInfo, ProfilerError> {
         profiler::info()
     }
 

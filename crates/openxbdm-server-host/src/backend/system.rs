@@ -2,7 +2,8 @@
 
 use std::time::Duration;
 
-use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::KernelError;
+use openxbdm_core::status::Win32Error;
 use openxbdm_server::commands::system;
 use openxbdm_server::commands::system::CreateSettingsError;
 use openxbdm_server::commands::system::FlashOptions;
@@ -10,7 +11,6 @@ use openxbdm_server::commands::system::RebootKind;
 use openxbdm_server::commands::system::SettingsCopy;
 use openxbdm_server::commands::system::SettingsFile;
 use openxbdm_server::commands::system::SettingsSource;
-use openxbdm_server::commands::system::Win32Error;
 
 use super::MockBackend;
 
@@ -24,8 +24,6 @@ const HARDWARE_TEST_KIT: u32 = 0x0200_0000;
 const FLASH_MEMORY: u32 = 0x0400_0000;
 /// Buffer through which a settings copy reaches the caller's file.
 const COPY_FILE_BUFFER: usize = 0x1000;
-/// Status of a query on a handle that is not an open settings file.
-const STATUS_INVALID_HANDLE: NtStatus = NtStatus(0xc000_0008);
 
 /// A programmed flash image.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,10 +145,10 @@ impl system::Backend for MockBackend {
         self.system.title_process_caller
     }
 
-    fn settings_file_size(&mut self, file: SettingsFile) -> Result<u32, NtStatus> {
+    fn settings_file_size(&mut self, file: SettingsFile) -> Result<u32, KernelError> {
         match self.system.open.get(file.0 as usize) {
             Some(Some(OpenFile::Read { data, .. })) => Ok(data.len() as u32),
-            _ => Err(STATUS_INVALID_HANDLE),
+            _ => Err(KernelError::InvalidHandle),
         }
     }
 

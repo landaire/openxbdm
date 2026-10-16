@@ -8,6 +8,7 @@ use openxbdm_server::commands::network::WsaError;
 use openxbdm_server::commands::network::ipproxy;
 use openxbdm_server::commands::network::ipproxy::RegisterStatus;
 use openxbdm_server::commands::network::ipproxy::RoutineMissing;
+use openxbdm_server::commands::network::ipproxy::SocketFailed;
 use openxbdm_server::commands::network::ipproxy::ThreadFailed;
 use openxbdm_server::commands::network::ipproxy::tunnel;
 use openxbdm_server::commands::network::ipproxy::tunnel::Inbound;
@@ -268,10 +269,9 @@ impl Data {
             return Ok(());
         };
         // SAFETY: the register routine takes (caller, record, flags).
-        match unsafe { kernel::call_export(register, XNCALLER_SYSAPP, record, REGISTER_FLAGS, 0) } {
-            0 => Ok(()),
-            status => Err(RegisterStatus(status)),
-        }
+        let status =
+            unsafe { kernel::call_export(register, XNCALLER_SYSAPP, record, REGISTER_FLAGS, 0) };
+        RegisterStatus::new(status).map_or(Ok(()), Err)
     }
 
     fn close_socket(&mut self) {
@@ -282,8 +282,10 @@ impl Data {
     }
 }
 
-fn last_error() -> WsaError {
-    WsaError(net::NetDll_WSAGetLastError(XNCALLER_XBDM))
+/// The socket failure with the thread's last Winsock error, which may be
+/// unset.
+fn socket_failed() -> SocketFailed {
+    SocketFailed(WsaError::new(net::NetDll_WSAGetLastError(XNCALLER_XBDM)))
 }
 
 impl ipproxy::Backend for Console {
@@ -306,7 +308,7 @@ impl ipproxy::Backend for Console {
         SHARED.inject.store(0, Ordering::Relaxed);
     }
 
-    fn open_proxy_socket(&mut self, host: Endpoint) -> Result<(), WsaError> {
+    fn open_proxy_socket(&mut self, host: Endpoint) -> Result<(), SocketFailed> {
         SHARED
             .host_address
             .store(u32::from_be_bytes(host.address.octets()), Ordering::Relaxed);
@@ -323,7 +325,7 @@ impl ipproxy::Backend for Console {
             net::IPPROTO_UDP,
         );
         if socket == net::INVALID_SOCKET {
-            return Err(last_error());
+            return Err(socket_failed());
         }
         let data = &mut self.network.ipproxy;
         data.socket = Some(socket);
@@ -339,7 +341,7 @@ impl ipproxy::Backend for Console {
             SOCKADDR_LENGTH as i32,
         ) != 0
         {
-            let error = last_error();
+            let error = socket_failed();
             data.close_socket();
             return Err(error);
         }
@@ -358,7 +360,7 @@ impl ipproxy::Backend for Console {
             Ordering::Relaxed,
         );
         if named != 0 {
-            let error = last_error();
+            let error = socket_failed();
             data.close_socket();
             return Err(error);
         }

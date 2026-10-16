@@ -4,26 +4,18 @@ pub mod capture_file;
 
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::Win32Error;
 
+use self::capture_file::CaptureFileError;
+use super::NetworkError;
 use super::WsaError;
 use crate::invocation::Invocation;
+use crate::reply::CommandError;
+use crate::reply::CommandResult;
+use crate::reply::Reply;
 
-/// `start` while a capture runs.
-const ALREADY_CAPTURING: Hresult = Hresult::error(0x08);
-/// `stop` without a capture: status 435 with no default text.
-const NOT_CAPTURING: Hresult = Hresult::error(0x23);
-/// `stop` after frames were lost to a full write buffer.
-const FRAMES_LOST: Hresult = Hresult::error(0x26);
-/// Intercept callbacks owned by another client.
-const INTERCEPT_BUSY: Hresult = Hresult::error(0x10);
-/// Intercept result for callbacks that are already installed.
-const WSAEALREADY: WsaError = WsaError(0x2735);
-/// Result bit marking a kernel status carried as a result.
-const NT_STATUS_BIT: u32 = 0x1000_0000;
-/// Mask of the facility bits the `start` status keeps.
-const FACILITY_MASK: u32 = 0x1fff_0000;
-const FACILITY_XBDM: u32 = 0x02da_0000;
 /// Size of the `file=` buffer, terminator included.
 const FILE_PARAMETER_SIZE: usize = 0x104;
 /// Size of the translated path buffer; the translator stops at this many
@@ -113,7 +105,7 @@ pub struct CaptureRequest<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CaptureClose {
     /// Result of writing the frame table and closing the file (0x91f69d18).
-    pub result: Result<(), Hresult>,
+    pub result: Result<(), CaptureFileError>,
     /// Frames in the file.
     pub frames: u32,
 }
@@ -121,9 +113,8 @@ pub struct CaptureClose {
 /// Platform services `netcap` needs.
 pub trait Backend {
     /// Create the capture context and the capture file (0x91f67f90,
-    /// 0x91f69c10). Failures are raw results; kernel failures carry
-    /// [`NT_STATUS_BIT`].
-    fn open_capture(&mut self, request: &CaptureRequest<'_>) -> Result<(), Hresult>;
+    /// 0x91f69c10).
+    fn open_capture(&mut self, request: &CaptureRequest<'_>) -> Result<(), CaptureFileError>;
     /// `XNetSetOpt(2, 0x1390, enable)`; true on success.
     fn set_promiscuous(&mut self, enable: bool) -> bool;
     /// Clear the frame callback error, then feed frames to the open capture
@@ -134,7 +125,7 @@ pub trait Backend {
     /// Remove the callbacks `attach_capture` installed.
     fn detach_capture(&mut self);
     /// First failure a frame callback recorded (0x91f9f698).
-    fn capture_error(&self) -> Option<Hresult>;
+    fn capture_error(&self) -> Option<CaptureFileError>;
     /// Finish and close the capture file, then free the context.
     fn close_capture(&mut self) -> CaptureClose;
 }
@@ -158,20 +149,19 @@ impl State {
 
 /// `netcap start file=<name> [maxframedata=] [buffersize=] [flags=]` or
 /// `netcap stop`.
-pub(super) fn netcap(invocation: &mut Invocation<'_>) -> Hresult {
+pub(super) fn netcap(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.line.has("start") {
         start(invocation)
     } else if invocation.line.has("stop") {
-        let (result, text) = stop(
+        let text = stop(
             &mut invocation.state.network.netcap,
             &mut *invocation.backend,
-        );
-        if let Some(text) = text {
-            invocation.set_text(format_args!("{text}"));
-        }
-        result
+        )?;
+        invocation.set_text(format_args!("{text}"));
+        text.status()?;
+        Ok(Reply::Ok)
     } else {
-        Hresult::from_error_code(ErrorCode::BAD_PARAMETER)
+        Err(ErrorCode::BadParameter.into())
     }
 }
 
@@ -186,7 +176,7 @@ pub(super) fn title_exited(state: &mut State, backend: &mut dyn crate::backend::
     }
 }
 
-fn start(invocation: &mut Invocation<'_>) -> Hresult {
+fn start(invocation: &mut Invocation<'_>) -> CommandResult {
     let line = invocation.line;
     // Absent and unparsable values read as 0, which selects the defaults.
     let dword = |name| line.dword(name).unwrap_or(0);
@@ -194,12 +184,12 @@ fn start(invocation: &mut Invocation<'_>) -> Hresult {
     let buffer = dword("buffersize");
     let flags = CaptureFlags(dword("flags"));
     let Some(file) = line.param("file") else {
-        return Hresult::from_error_code(ErrorCode::FILENAME_INVALID);
+        return Err(ErrorCode::FilenameInvalid.into());
     };
     let mut name = [0u8; FILE_PARAMETER_SIZE];
     let name = file.copy_into(&mut name);
 
-    let result = match start_capture(
+    match start_capture(
         invocation.state,
         invocation.backend,
         name,
@@ -209,41 +199,50 @@ fn start(invocation: &mut Invocation<'_>) -> Hresult {
     ) {
         Ok(()) => {
             invocation.set_text(format_args!("started"));
-            return Hresult::OK;
+            Ok(Reply::Ok)
         }
-        Err(error) => error,
-    };
-    invocation.set_text(format_args!("err=0x{:08x}", result.0));
-    if result.is_failure() && result.0 & FACILITY_MASK != FACILITY_XBDM {
-        Hresult::error(0)
-    } else {
-        result
+        Err(error) => {
+            invocation.set_text(format_args!("err=0x{:08x}", Hresult::from(error).0));
+            Err(NetworkError::CaptureStart(error).into())
+        }
     }
 }
 
-/// Open the capture and attach the callbacks (0x91f34f80); failures that
-/// carry a kernel status are mapped through the status table.
+/// Why a capture did not start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartError {
+    /// A capture runs.
+    AlreadyCapturing,
+    /// The Ethernet intercept callbacks are owned by another client.
+    InterceptBusy,
+    /// Installing the intercept callbacks failed.
+    Intercept(WsaError),
+    /// Creating the capture context or file failed.
+    Open(CaptureFileError),
+}
+
+impl From<StartError> for Hresult {
+    fn from(error: StartError) -> Self {
+        match error {
+            StartError::AlreadyCapturing => Hresult::error(0x08),
+            StartError::InterceptBusy => Hresult::error(0x10),
+            StartError::Intercept(error) => intercept_result(error),
+            StartError::Open(error) => capture_result(error),
+        }
+    }
+}
+
+/// Open the capture and attach the callbacks (0x91f34f80).
 pub fn start_capture(
     state: &mut crate::state::ServerState,
     backend: &mut dyn crate::backend::Backend,
     name: &[u8],
     data_limit: u32,
     buffer: u32,
-    flags: CaptureFlags,
-) -> Result<(), Hresult> {
-    open_and_attach(state, backend, name, data_limit, buffer, flags).map_err(map_nt_result)
-}
-
-fn open_and_attach(
-    state: &mut crate::state::ServerState,
-    backend: &mut dyn crate::backend::Backend,
-    name: &[u8],
-    data_limit: u32,
-    buffer: u32,
     mut flags: CaptureFlags,
-) -> Result<(), Hresult> {
+) -> Result<(), StartError> {
     if state.network.netcap.capture.is_some() {
-        return Err(ALREADY_CAPTURING);
+        return Err(StartError::AlreadyCapturing);
     }
     let translated = state.filesystem.drives.translate(&mut *backend, name);
     let path = match &translated {
@@ -262,54 +261,98 @@ fn open_and_attach(
         ),
         flags,
     };
-    backend.open_capture(&request)?;
+    backend.open_capture(&request).map_err(StartError::Open)?;
     if flags.contains(CaptureFlags::PROMISCUOUS) && !backend.set_promiscuous(true) {
         flags = flags.without(CaptureFlags::PROMISCUOUS);
     }
-    if let Err(WsaError(error)) = backend.attach_capture(flags) {
+    if let Err(error) = backend.attach_capture(flags) {
         // Stock leaves promiscuous mode on here.
         let _ = backend.close_capture();
-        return Err(if WsaError(error) == WSAEALREADY {
-            INTERCEPT_BUSY
-        } else if error <= 0 {
-            Hresult(error as u32)
+        return Err(if error == WsaError::ALREADY {
+            StartError::InterceptBusy
         } else {
-            Hresult(0x8007_0000 | (error as u32 & 0xffff))
+            StartError::Intercept(error)
         });
     }
     state.network.netcap.capture = Some(flags);
     Ok(())
 }
 
-/// Reply of a stopped capture (0x91f351e0 text).
-enum StopText {
-    Stopped { frames: u32 },
-    Failed { error: Hresult, frames: u32 },
+/// The result a failed capture reports: kernel failures map through the
+/// status table (0x91f41f18), falling back to the NT-facility result.
+fn capture_result(error: CaptureFileError) -> Hresult {
+    match error {
+        CaptureFileError::Kernel(error) => {
+            CommandError::from_kernel(error, CommandError::Kernel(error)).into()
+        }
+        error => error.into(),
+    }
 }
 
-impl core::fmt::Display for StopText {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+/// An intercept failure as a result. Stock maps every failed start result
+/// that carries the NT facility bit through the status table, so a
+/// negative intercept value with that bit reads as a kernel status.
+fn intercept_result(error: WsaError) -> Hresult {
+    let result = Hresult::from(Win32Error::from(error));
+    if result.is_failure() && result.0 & 0x1000_0000 != 0 {
+        let status = KernelError::from_status(NtStatus(result.0 & !0x1000_0000));
+        capture_result(CaptureFileError::Kernel(status))
+    } else {
+        result
+    }
+}
+
+/// Reply of a stopped capture (0x91f351e0 text).
+enum StopText {
+    Stopped {
+        frames: u32,
+    },
+    Failed {
+        error: CaptureFileError,
+        frames: u32,
+    },
+    /// Frames were lost to a full write buffer; the status reports it.
+    FramesLost {
+        frames: u32,
+    },
+}
+
+impl StopText {
+    /// Status of the stop.
+    fn status(&self) -> Result<(), NetworkError> {
         match self {
-            Self::Stopped { frames } => write!(formatter, "stopped frames={frames}"),
-            Self::Failed { error, frames } => {
-                write!(formatter, "stopped err=0x{:08x} frames={frames}", error.0)
-            }
+            Self::FramesLost { .. } => Err(NetworkError::FramesLost),
+            Self::Stopped { .. } | Self::Failed { .. } => Ok(()),
         }
     }
 }
 
-/// Stop the capture (0x91f351e0). The first failure wins: a frame callback
-/// error, then the close result.
-pub fn stop_capture(state: &mut State, backend: &mut dyn crate::backend::Backend) -> Hresult {
-    stop(state, backend).0
+impl core::fmt::Display for StopText {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let (error, frames) = match *self {
+            Self::Stopped { frames } => return write!(formatter, "stopped frames={frames}"),
+            Self::Failed { error, frames } => (capture_result(error), frames),
+            Self::FramesLost { frames } => (NetworkError::FramesLost.into(), frames),
+        };
+        write!(formatter, "stopped err=0x{:08x} frames={frames}", error.0)
+    }
 }
 
+/// Stop the capture (0x91f351e0).
+pub fn stop_capture(
+    state: &mut State,
+    backend: &mut dyn crate::backend::Backend,
+) -> Result<(), NetworkError> {
+    stop(state, backend)?.status()
+}
+
+/// The first failure wins: a frame callback error, then the close result.
 fn stop(
     state: &mut State,
     backend: &mut dyn crate::backend::Backend,
-) -> (Hresult, Option<StopText>) {
+) -> Result<StopText, NetworkError> {
     let Some(flags) = state.capture.take() else {
-        return (NOT_CAPTURING, None);
+        return Err(NetworkError::NotCapturing);
     };
     let callback_error = backend.capture_error();
     if flags.contains(CaptureFlags::PROMISCUOUS) {
@@ -318,35 +361,11 @@ fn stop(
     backend.detach_capture();
     let close = backend.close_capture();
     let frames = close.frames;
-    match callback_error.or(close.result.err()) {
-        Some(capture_file::WRITE_FAULT) => (
-            FRAMES_LOST,
-            Some(StopText::Failed {
-                error: FRAMES_LOST,
-                frames,
-            }),
-        ),
-        Some(error) => {
-            let error = map_nt_result(error);
-            let text = if error.is_failure() {
-                StopText::Failed { error, frames }
-            } else {
-                StopText::Stopped { frames }
-            };
-            (Hresult::OK, Some(text))
-        }
-        None => (Hresult::OK, Some(StopText::Stopped { frames })),
-    }
-}
-
-/// Failures carrying a kernel status map through the status table
-/// (0x91f41f18), falling back to the result itself.
-fn map_nt_result(result: Hresult) -> Hresult {
-    if result.is_failure() && result.0 & NT_STATUS_BIT != 0 {
-        Hresult::from_nt_status(NtStatus(result.0 & !NT_STATUS_BIT), result)
-    } else {
-        result
-    }
+    Ok(match callback_error.or(close.result.err()) {
+        Some(CaptureFileError::WriteFault) => StopText::FramesLost { frames },
+        Some(error) => StopText::Failed { error, frames },
+        None => StopText::Stopped { frames },
+    })
 }
 
 #[cfg(test)]
@@ -411,10 +430,17 @@ mod tests {
     #[test]
     fn kernel_failures_map_through_the_status_table() {
         assert_eq!(
-            map_nt_result(Hresult(0xd000_0035)),
-            Hresult::from_error_code(ErrorCode::FILE_ALREADY_EXISTS)
+            capture_result(CaptureFileError::Kernel(KernelError::ObjectNameCollision)),
+            Hresult::from_error_code(ErrorCode::FileAlreadyExists)
         );
-        assert_eq!(map_nt_result(Hresult(0xd000_0010)), Hresult(0xd000_0010));
-        assert_eq!(map_nt_result(Hresult(0x8007_006f)), Hresult(0x8007_006f));
+        let unlisted = KernelError::from_status(NtStatus(0xc000_0010));
+        assert_eq!(
+            capture_result(CaptureFileError::Kernel(unlisted)),
+            Hresult(0xd000_0010)
+        );
+        assert_eq!(
+            capture_result(CaptureFileError::DataLimitReached),
+            Hresult(0x8007_006f)
+        );
     }
 }

@@ -11,15 +11,53 @@ use core::sync::atomic::Ordering;
 use openxbdm_core::status::Hresult;
 
 use super::CpuProfilerInfo;
+use crate::reply::CommandError;
 
-pub const ALREADY_RUNNING: Hresult = Hresult::error(0x19);
-pub const NOT_RUNNING: Hresult = Hresult::error(0x18);
-/// `info` after a title ended while profiling.
-pub const SUSPENDED: Hresult = Hresult::error(0x27);
-/// The sampling engine reports success with this code.
-pub const STARTED: Hresult = Hresult::OK;
-/// The engine could not start its file writer thread (stock 0x91f90258).
-pub const PROLOGUE_FAILED: Hresult = Hresult::error(0);
+/// A failed profiler operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfilerError {
+    AlreadyRunning,
+    NotRunning,
+    /// `info` after a title ended while profiling.
+    Suspended,
+    /// The engine could not start its file writer thread (stock 0x91f90258).
+    PrologueFailed,
+    /// The kernel module cannot be found.
+    NoKernel,
+    /// The kernel lacks a profile interrupt export.
+    NoProfileExport,
+    /// The kernel refused to enable the profile interrupt.
+    ProfileInterruptRefused,
+    /// The sample buffers cannot be allocated.
+    NoBuffers,
+    /// The performance counters cannot be acquired or started.
+    NoCounters,
+    /// Another owner holds the performance counters.
+    NotCounterOwner,
+}
+
+impl From<ProfilerError> for Hresult {
+    fn from(error: ProfilerError) -> Self {
+        Hresult::error(match error {
+            ProfilerError::AlreadyRunning => 0x19,
+            ProfilerError::NotRunning => 0x18,
+            ProfilerError::Suspended => 0x27,
+            ProfilerError::PrologueFailed => 0,
+            ProfilerError::NoKernel => 0x03,
+            ProfilerError::NoProfileExport => 0x07,
+            ProfilerError::ProfileInterruptRefused => 0x17,
+            ProfilerError::NoBuffers => 0x1c,
+            ProfilerError::NoCounters => 0x2c,
+            ProfilerError::NotCounterOwner => 0x2d,
+        })
+    }
+}
+
+impl From<ProfilerError> for CommandError {
+    fn from(error: ProfilerError) -> Self {
+        CommandError::Profiler(error)
+    }
+}
 
 /// `lopctrl` flags word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,7 +145,7 @@ pub fn buffer_layout(flags: ProfilerFlags) -> Result<BufferLayout, NoProcessors>
 pub trait Engine {
     /// Size the buffers, write the header, and hook the sampling interrupt
     /// (0x91f90768).
-    fn initialize(&mut self, flags: ProfilerFlags) -> Hresult;
+    fn initialize(&mut self, flags: ProfilerFlags) -> Result<(), ProfilerError>;
     /// Undo a failed initialization (0x91f90220).
     fn abandon(&mut self);
     /// Create the directories above `path` (0x91f64448).
@@ -115,9 +153,9 @@ pub trait Engine {
     /// Open the capture file and start sampling every `interval` timer
     /// ticks (0x91f90258). `path` is `None` when the name has no object
     /// name; stock would hang waiting for its writer thread.
-    fn start(&mut self, path: Option<&[u8]>, interval: u32) -> Hresult;
+    fn start(&mut self, path: Option<&[u8]>, interval: u32) -> Result<(), ProfilerError>;
     /// Stop sampling, flush, and close the file (0x91f90310).
-    fn stop(&mut self) -> Hresult;
+    fn stop(&mut self) -> Result<(), ProfilerError>;
     /// Elapsed seconds and the interrupt counters (0x91f90370).
     fn info(&mut self) -> CpuProfilerInfo;
 }
@@ -159,35 +197,33 @@ impl Control {
         path: Option<&[u8]>,
         interval: u32,
         flags: ProfilerFlags,
-    ) -> Hresult {
+    ) -> Result<(), ProfilerError> {
         if self.running.swap(true, Ordering::AcqRel) {
-            return ALREADY_RUNNING;
+            return Err(ProfilerError::AlreadyRunning);
         }
-        if !self.initialized.swap(true, Ordering::AcqRel) {
-            let result = engine.initialize(flags);
-            if result != STARTED {
-                engine.abandon();
-                self.initialized.store(false, Ordering::Release);
-                self.running.store(false, Ordering::Release);
-                return result;
-            }
+        if !self.initialized.swap(true, Ordering::AcqRel)
+            && let Err(error) = engine.initialize(flags)
+        {
+            engine.abandon();
+            self.initialized.store(false, Ordering::Release);
+            self.running.store(false, Ordering::Release);
+            return Err(error);
         }
         if let Some(path) = path {
             engine.create_directories(path);
         }
-        let result = engine.start(path, interval);
-        if result.is_failure() {
+        if let Err(error) = engine.start(path, interval) {
             self.running.store(false, Ordering::Release);
-            return result;
+            return Err(error);
         }
         self.suspended.store(false, Ordering::Release);
-        STARTED
+        Ok(())
     }
 
     /// Stop profiling and write the file (stock 0x91f33010).
-    pub fn stop(&self, engine: &mut dyn Engine) -> Hresult {
+    pub fn stop(&self, engine: &mut dyn Engine) -> Result<(), ProfilerError> {
         if !self.running() {
-            return NOT_RUNNING;
+            return Err(ProfilerError::NotRunning);
         }
         let result = engine.stop();
         self.running.store(false, Ordering::Release);
@@ -196,12 +232,12 @@ impl Control {
     }
 
     /// Stock 0x91f32e30.
-    pub fn info(&self, engine: &mut dyn Engine) -> Result<CpuProfilerInfo, Hresult> {
+    pub fn info(&self, engine: &mut dyn Engine) -> Result<CpuProfilerInfo, ProfilerError> {
         if self.suspended.load(Ordering::Acquire) {
-            return Err(SUSPENDED);
+            return Err(ProfilerError::Suspended);
         }
         if !self.running() {
-            return Err(NOT_RUNNING);
+            return Err(ProfilerError::NotRunning);
         }
         Ok(engine.info())
     }
@@ -223,13 +259,13 @@ mod tests {
         initializations: u32,
         abandoned: u32,
         stops: u32,
-        initialize_result: Option<Hresult>,
+        initialize_error: Option<ProfilerError>,
     }
 
     impl Engine for Recorder {
-        fn initialize(&mut self, _flags: ProfilerFlags) -> Hresult {
+        fn initialize(&mut self, _flags: ProfilerFlags) -> Result<(), ProfilerError> {
             self.initializations += 1;
-            self.initialize_result.unwrap_or(STARTED)
+            self.initialize_error.map_or(Ok(()), Err)
         }
 
         fn abandon(&mut self) {
@@ -238,13 +274,13 @@ mod tests {
 
         fn create_directories(&mut self, _path: &[u8]) {}
 
-        fn start(&mut self, _path: Option<&[u8]>, _interval: u32) -> Hresult {
-            Hresult(1)
+        fn start(&mut self, _path: Option<&[u8]>, _interval: u32) -> Result<(), ProfilerError> {
+            Ok(())
         }
 
-        fn stop(&mut self) -> Hresult {
+        fn stop(&mut self) -> Result<(), ProfilerError> {
             self.stops += 1;
-            Hresult::OK
+            Ok(())
         }
 
         fn info(&mut self) -> CpuProfilerInfo {
@@ -262,15 +298,15 @@ mod tests {
         let mut engine = Recorder::default();
         assert_eq!(
             control.start(&mut engine, Some(b"\\Device\\a"), 0, ProfilerFlags(1)),
-            STARTED
+            Ok(())
         );
         control.title_terminated(&mut engine);
         assert_eq!(engine.stops, 1);
-        assert_eq!(control.info(&mut engine), Err(SUSPENDED));
-        assert_eq!(control.stop(&mut engine), NOT_RUNNING);
+        assert_eq!(control.info(&mut engine), Err(ProfilerError::Suspended));
+        assert_eq!(control.stop(&mut engine), Err(ProfilerError::NotRunning));
         assert_eq!(
             control.start(&mut engine, Some(b"\\Device\\a"), 0, ProfilerFlags(1)),
-            STARTED
+            Ok(())
         );
         assert_eq!(engine.initializations, 2);
         assert_eq!(
@@ -283,18 +319,18 @@ mod tests {
     fn failed_initialization_is_abandoned_and_retried() {
         let control = Control::new();
         let mut engine = Recorder {
-            initialize_result: Some(Hresult::error(0x1c)),
+            initialize_error: Some(ProfilerError::NoBuffers),
             ..Recorder::default()
         };
         assert_eq!(
             control.start(&mut engine, None, 0, ProfilerFlags(0)),
-            Hresult::error(0x1c)
+            Err(ProfilerError::NoBuffers)
         );
         assert_eq!((engine.initializations, engine.abandoned), (1, 1));
-        engine.initialize_result = None;
+        engine.initialize_error = None;
         assert_eq!(
             control.start(&mut engine, None, 0, ProfilerFlags(1)),
-            STARTED
+            Ok(())
         );
         assert_eq!(engine.initializations, 2);
     }

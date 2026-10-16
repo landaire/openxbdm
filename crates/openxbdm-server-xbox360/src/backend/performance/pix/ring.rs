@@ -7,6 +7,8 @@
 
 use core::cell::UnsafeCell;
 
+use openxbdm_core::status::Hresult;
+
 use crate::backend::dispatcher;
 use crate::kernel;
 use crate::kernel::KeAcquireSpinLockAtRaisedIrql;
@@ -1048,13 +1050,13 @@ crate::exports::bridged!(title_transfer_entry, title_transfer);
 extern "C" fn title_transfer(context: u32) -> u32 {
     with(|ring| {
         if ring.buffer.is_none() {
-            return 0x82da_0104;
+            return Hresult::END_OF_DATA.0;
         }
         ring.read = ring.snapshot;
         if ring.snapshot == ring.snapshot_end {
             ring.notified = false;
             ring.write_drop_record();
-            return 0x82da_0104;
+            return Hresult::END_OF_DATA.0;
         }
         super::write_u32(context + 8, ring.snapshot);
         if ring.snapshot_end > ring.snapshot {
@@ -1075,7 +1077,7 @@ extern "C" fn title_transfer(context: u32) -> u32 {
             );
             ring.snapshot = ring.base();
         }
-        0x02da_0000
+        Hresult::OK.0
     })
 }
 

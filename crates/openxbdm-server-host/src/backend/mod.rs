@@ -28,6 +28,7 @@ use openxbdm_server::processors::ProcessorHandle;
 use openxbdm_server::processors::ProcessorProgress;
 use openxbdm_server::processors::ProcessorThread;
 use openxbdm_server::processors::Processors;
+use openxbdm_server::processors::RegisterError;
 use openxbdm_server::server::TRANSFER_CAPACITY;
 use openxbdm_server::text::ResponseText;
 
@@ -107,7 +108,7 @@ impl MockBackend {
         name: &[u8],
         handler: Option<ExternalProcessor>,
         flags: ProcessorFlags,
-    ) -> Hresult {
+    ) -> Result<(), RegisterError> {
         let handle = handler.map(|handler| {
             self.processor_handlers.push(handler);
             ProcessorHandle(self.processor_handlers.len() as u32 - 1)

@@ -4,8 +4,7 @@ use std::collections::HashMap;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use openxbdm_core::status::Hresult;
-use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::KernelError;
 use openxbdm_server::commands::filesystem;
 use openxbdm_server::commands::filesystem::FileData;
 use openxbdm_server::commands::filesystem::FileHandle;
@@ -13,12 +12,14 @@ use openxbdm_server::commands::session;
 use openxbdm_server::commands::session::DEBUG_CAPTURE_SIZE;
 use openxbdm_server::commands::session::FastPipeBackend;
 use openxbdm_server::commands::session::FileEventId;
+use openxbdm_server::commands::session::LogEngineError;
 use openxbdm_server::commands::session::ProcessorNumber;
 use openxbdm_server::commands::session::RpcBackend;
 use openxbdm_server::commands::session::RpcCall;
 use openxbdm_server::commands::session::RpcContext;
 use openxbdm_server::commands::session::RpcCreateError;
 use openxbdm_server::commands::session::RpcThread;
+use openxbdm_server::commands::session::TellLogAreas;
 use openxbdm_server::commands::session::TellLogBackend;
 use openxbdm_server::commands::session::TellLogConfig;
 use openxbdm_server::commands::session::TellLogCounters;
@@ -68,7 +69,7 @@ impl RpcDrains {
 #[derive(Debug)]
 pub struct MockTellLog {
     pub file: FileHandle,
-    pub area: u32,
+    pub area: TellLogAreas,
     ring: RecordRing,
     block: bool,
     storage: Vec<u8>,
@@ -418,7 +419,7 @@ impl session::Backend for MockBackend {
         self.session.processor = processor.0;
     }
 
-    fn flush_file(&mut self, _handle: FileHandle) -> Result<(), NtStatus> {
+    fn flush_file(&mut self, _handle: FileHandle) -> Result<(), KernelError> {
         Ok(())
     }
 
@@ -438,11 +439,11 @@ impl session::Backend for MockBackend {
 }
 
 impl TellLogBackend for MockBackend {
-    fn tell_log_area(&mut self) -> Option<u32> {
+    fn tell_log_area(&mut self) -> Option<TellLogAreas> {
         self.session.tell_log.as_ref().map(|log| log.area)
     }
 
-    fn set_tell_log_area(&mut self, area: u32) {
+    fn set_tell_log_area(&mut self, area: TellLogAreas) {
         if let Some(log) = self.session.tell_log.as_mut() {
             log.area = area;
         }
@@ -451,15 +452,15 @@ impl TellLogBackend for MockBackend {
     fn tell_log_start(
         &mut self,
         file: FileHandle,
-        area: u32,
+        area: TellLogAreas,
         config: TellLogConfig,
-    ) -> Result<Hresult, Hresult> {
+    ) -> Result<(), LogEngineError> {
         let size = config
             .entry_size
             .checked_mul(config.entries)
             .and_then(|size| size.checked_add(ENGINE_HEADER));
         let Some(size) = size.filter(|&size| size <= POOL_LIMIT) else {
-            return Err(Hresult::OUT_OF_MEMORY);
+            return Err(LogEngineError::OutOfMemory);
         };
         self.session.tell_log = Some(MockTellLog {
             file,
@@ -471,7 +472,7 @@ impl TellLogBackend for MockBackend {
             stopped: false,
             counters: TellLogCounters::default(),
         });
-        Ok(Hresult(0))
+        Ok(())
     }
 
     fn tell_log_close(&mut self) -> Option<TellLogCounters> {

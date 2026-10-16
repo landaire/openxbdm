@@ -14,12 +14,13 @@ use std::time::Instant;
 use common::RawSession;
 use common::TestServer;
 use common::run;
-use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::Hresult;
+use openxbdm_core::status::KernelError;
 use openxbdm_server::commands::console::ConfigSetting;
 use openxbdm_server::commands::console::DumpMode;
+use openxbdm_server::commands::console::NetworkRaError;
 use openxbdm_server::commands::console::NetworkRaRecord;
 use openxbdm_server::commands::console::RegistrationState;
-use openxbdm_server::commands::console::XamStatus;
 use openxbdm_server::commands::filesystem::DriveTarget;
 use openxbdm_server::commands::system::RebootKind;
 use openxbdm_server_host::Host;
@@ -105,7 +106,8 @@ fn console_memory_classes() {
 
 #[test]
 fn console_id_failure_sets_bit_28() {
-    let server = server_with(|host| host.backend.console.console_id = Err(NtStatus(0xc000_0001)));
+    let server =
+        server_with(|host| host.backend.console.console_id = Err(KernelError::Unsuccessful));
     assert_eq!(session(&server).command("getconsoleid"), "400- ");
 }
 
@@ -236,7 +238,7 @@ fn user_flag_settings() {
         .console
         .xconfig
         .failures
-        .insert(ConfigSetting::new(0xb, 3), NtStatus(0xc000_0001));
+        .insert(ConfigSetting::new(0xb, 3), KernelError::Unsuccessful);
     assert_eq!(session.command("kiosk enabled=off"), "414- access denied");
 }
 
@@ -309,7 +311,7 @@ fn retail_flags_and_raw_settings() {
         .console
         .xconfig
         .failures
-        .insert(ConfigSetting::new(5, 3), NtStatus(0xc000_0001));
+        .insert(ConfigSetting::new(5, 3), KernelError::Unsuccessful);
     assert_eq!(
         session.command("setconfig category=5 index=3 value=0"),
         "400- setvalue failed"
@@ -399,7 +401,8 @@ fn data_center_network_configuration() {
     assert_eq!(session.command("resetnetra"), "200- OK");
     assert_eq!(server.host.lock().backend.console.network_ra.resets, 1);
 
-    server.host.lock().backend.console.network_ra.failure = Some(XamStatus(0x8007_048f));
+    server.host.lock().backend.console.network_ra.failure =
+        Some(NetworkRaError(Hresult(0x8007_048f)));
     assert_eq!(
         session.command("confignetra show"),
         "400- \x1econfignetra: failed to getting VE device config! Are you not running in DC mode? (err 0x8007048F)\x1e"
@@ -818,7 +821,7 @@ fn network_share_server() {
         .console
         .xconfig
         .failures
-        .insert(ConfigSetting::new(3, 0x10), NtStatus(0xc000_0001));
+        .insert(ConfigSetting::new(3, 0x10), KernelError::Unsuccessful);
     assert_eq!(
         session.command("setserver name=x"),
         "400- save setting failed"

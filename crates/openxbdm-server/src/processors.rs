@@ -54,6 +54,24 @@ impl Processor {
     }
 }
 
+/// Why a processor could not be registered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterError {
+    /// Every registry slot is taken.
+    RegistryFull,
+    /// The name is longer than [`PROCESSOR_NAME_CAPACITY`].
+    NameTooLong,
+}
+
+impl From<RegisterError> for Hresult {
+    fn from(error: RegisterError) -> Self {
+        match error {
+            RegisterError::RegistryFull => Hresult::OUT_OF_MEMORY,
+            RegisterError::NameTooLong => Hresult::INVALID_ARGUMENT,
+        }
+    }
+}
+
 /// Processor registry.
 #[derive(Debug, Default)]
 pub struct Processors {
@@ -74,20 +92,20 @@ impl Processors {
         name: &[u8],
         handle: Option<ProcessorHandle>,
         flags: ProcessorFlags,
-    ) -> Hresult {
+    ) -> Result<(), RegisterError> {
         let Some(handle) = handle else {
             for slot in &mut self.slots {
                 if matches!(slot, Some(p) if p.name().eq_ignore_ascii_case(name)) {
                     *slot = None;
                 }
             }
-            return Hresult::OK;
+            return Ok(());
         };
         let Some(index) = self.slots.iter().position(Option::is_none) else {
-            return Hresult::OUT_OF_MEMORY;
+            return Err(RegisterError::RegistryFull);
         };
         if name.len() > PROCESSOR_NAME_CAPACITY {
-            return Hresult::INVALID_ARGUMENT;
+            return Err(RegisterError::NameTooLong);
         }
         let mut stored = [0u8; PROCESSOR_NAME_CAPACITY];
         stored[..name.len()].copy_from_slice(name);
@@ -97,7 +115,7 @@ impl Processors {
             handle,
             flags,
         });
-        Hresult::OK
+        Ok(())
     }
 
     /// Find a processor by name, ignoring ASCII case.

@@ -259,9 +259,9 @@ fn linkstate_errors() {
         session.command("linkstate setflags and=1x or=2"),
         "423- bad parameter"
     );
-    server.host.lock().backend.network.link_error = Some(WsaError(10022));
+    server.host.lock().backend.network.link_error = Some(WsaError::INVALID_ARGUMENT);
     assert_eq!(session.command("linkstate restore"), "407- err=10022");
-    server.host.lock().backend.network.link_error = Some(WsaError(10050));
+    server.host.lock().backend.network.link_error = WsaError::new(10050);
     assert_eq!(session.command("linkstate disconnect"), "400- err=10050");
 }
 

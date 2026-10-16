@@ -2,21 +2,21 @@
 
 pub mod tunnel;
 
-use openxbdm_core::status::ErrorCode;
-use openxbdm_core::status::Hresult;
+use core::num::NonZeroU32;
 
+use openxbdm_core::status::ErrorCode;
+
+use super::NetworkError;
 use super::SystemVersion;
 use super::WsaError;
 use crate::invocation::Invocation;
 use crate::network::Endpoint;
 use crate::network::Ipv4Address;
+use crate::reply::CommandResult;
+use crate::reply::Reply;
 
 /// First system version with the packet intercept exports.
 const IPPROXY_VERSION: SystemVersion = SystemVersion(0x201c_7d00);
-/// `stop` without a running proxy: status 426 with no default text.
-const NOT_STARTED: Hresult = Hresult::error(0x1a);
-/// Error reported when the receive thread cannot be created (WSAENOBUFS).
-const THREAD_FAILED: i32 = 10055;
 /// Protocol version reported by `start`.
 const VERSION: u32 = 1;
 
@@ -37,7 +37,27 @@ pub struct RoutineMissing;
 
 /// Nonzero result of the register routine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RegisterStatus(pub u32);
+pub struct RegisterStatus(NonZeroU32);
+
+impl RegisterStatus {
+    /// `None` for success.
+    pub const fn new(status: u32) -> Option<Self> {
+        match NonZeroU32::new(status) {
+            Some(status) => Some(Self(status)),
+            None => None,
+        }
+    }
+
+    /// The result as `err=` reports it.
+    pub const fn code(self) -> i32 {
+        self.0.get() as i32
+    }
+}
+
+/// The proxy socket could not be opened. The thread's last Winsock error
+/// may be unset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocketFailed(pub Option<WsaError>);
 
 /// The receive thread could not be created.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +75,7 @@ pub trait Backend {
     /// Record `host` and reset the tunnel clocks, then open a UDP socket
     /// connected to `host`. The local endpoint is recorded from the socket
     /// port and the debug XNADDR address. On failure the socket is closed.
-    fn open_proxy_socket(&mut self, host: Endpoint) -> Result<(), WsaError>;
+    fn open_proxy_socket(&mut self, host: Endpoint) -> Result<(), SocketFailed>;
     fn close_proxy_socket(&mut self);
     /// Local endpoint recorded by the last [`Backend::open_proxy_socket`].
     fn proxy_local_endpoint(&mut self) -> Endpoint;
@@ -74,96 +94,103 @@ pub trait Backend {
 }
 
 /// `ipproxy start ver=<dword> addr=<dword> port=<dword>` or `ipproxy stop`.
-pub(super) fn ipproxy(invocation: &mut Invocation<'_>) -> Hresult {
+pub(super) fn ipproxy(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.line.has("start") {
         start(invocation)
     } else if invocation.line.has("stop") {
         stop(invocation)
     } else {
-        Hresult::from_error_code(ErrorCode::BAD_PARAMETER)
+        Err(ErrorCode::BadParameter.into())
     }
 }
 
-fn start(invocation: &mut Invocation<'_>) -> Hresult {
+fn start(invocation: &mut Invocation<'_>) -> CommandResult {
     let line = invocation.line;
     // Absent and unparsable values read as 0, which is rejected.
     let value = |name| line.dword(name).filter(|&value| value != 0);
     let (Some(_version), Some(address), Some(port)) = (value("ver"), value("addr"), value("port"))
     else {
-        return Hresult::from_error_code(ErrorCode::BAD_PARAMETER);
+        return Err(ErrorCode::BadParameter.into());
     };
     let Ok(port) = u16::try_from(port) else {
-        return Hresult::from_error_code(ErrorCode::BAD_PARAMETER);
+        return Err(ErrorCode::BadParameter.into());
     };
     let backend = &mut *invocation.backend;
     if backend.proxy_started() {
-        return Hresult::from_error_code(ErrorCode::FILE_ALREADY_EXISTS);
+        return Err(ErrorCode::FileAlreadyExists.into());
     }
     if backend.system_version() < IPPROXY_VERSION {
-        return Hresult::from_error_code(ErrorCode::UNKNOWN_COMMAND);
+        return Err(ErrorCode::UnknownCommand.into());
     }
     if backend.resolve_proxy_routines().is_err() {
-        return Hresult::from_error_code(ErrorCode::ACCESS_DENIED);
+        return Err(ErrorCode::AccessDenied.into());
     }
     let host = Endpoint {
         address: Ipv4Address(address.to_be_bytes()),
         port,
     };
-    match open_tunnel(backend, host) {
-        Err(error) if error != 0 => {
-            backend.release_proxy_routines();
-            invocation.set_text(format_args!("err={error}"));
-            Hresult::from_error_code(ErrorCode::UNDEFINED)
-        }
+    let error = match open_tunnel(backend, host) {
+        Err(TunnelError::Socket(SocketFailed(Some(error)))) => error.code(),
+        Err(TunnelError::Register(status)) => status.code(),
+        Err(TunnelError::Thread) => WsaError::NO_BUFFERS.code(),
         // Stock tests the error code, not the failed step: a socket
         // failure with last error 0 reports success and stays started.
-        _ => {
+        Ok(()) | Err(TunnelError::Socket(SocketFailed(None))) => {
             let local = backend.proxy_local_endpoint();
             invocation.set_text(format_args!(
                 "started ver={VERSION} addr=0x{:08x} port=0x{:04x}",
                 u32::from_be_bytes(local.address.octets()),
                 local.port
             ));
-            Hresult::OK
+            return Ok(Reply::Ok);
         }
-    }
+    };
+    backend.release_proxy_routines();
+    invocation.set_text(format_args!("err={error}"));
+    Err(ErrorCode::Undefined.into())
+}
+
+/// The step of [`open_tunnel`] that failed.
+enum TunnelError {
+    Socket(SocketFailed),
+    Register(RegisterStatus),
+    Thread,
 }
 
 /// Open the socket, install the hook, and start the receive thread,
-/// undoing the earlier steps when one fails. The error is the code `start`
-/// reports.
-fn open_tunnel(backend: &mut (impl Backend + ?Sized), host: Endpoint) -> Result<(), i32> {
+/// undoing the earlier steps when one fails.
+fn open_tunnel(backend: &mut (impl Backend + ?Sized), host: Endpoint) -> Result<(), TunnelError> {
     backend
         .open_proxy_socket(host)
-        .map_err(|WsaError(error)| error)?;
+        .map_err(TunnelError::Socket)?;
     backend.set_proxy_bypass(true);
-    if let Err(RegisterStatus(status)) = backend.install_proxy_hook() {
+    if let Err(status) = backend.install_proxy_hook() {
         backend.set_proxy_bypass(false);
         backend.close_proxy_socket();
-        return Err(status as i32);
+        return Err(TunnelError::Register(status));
     }
     if backend.start_proxy_thread().is_err() {
         backend.set_proxy_bypass(false);
         // Stock ignores the result of unregistering here.
         let _ = backend.remove_proxy_hook();
         backend.close_proxy_socket();
-        return Err(THREAD_FAILED);
+        return Err(TunnelError::Thread);
     }
     Ok(())
 }
 
-fn stop(invocation: &mut Invocation<'_>) -> Hresult {
+fn stop(invocation: &mut Invocation<'_>) -> CommandResult {
     let backend = &mut *invocation.backend;
     if !backend.proxy_started() {
-        return NOT_STARTED;
+        return Err(NetworkError::ProxyNotStarted.into());
     }
-    if let Err(RegisterStatus(status)) = backend.remove_proxy_hook() {
-        invocation.set_text(format_args!("err={}", status as i32));
-        return Hresult::from_error_code(ErrorCode::UNDEFINED);
+    if let Err(status) = backend.remove_proxy_hook() {
+        invocation.set_text(format_args!("err={}", status.code()));
+        return Err(ErrorCode::Undefined.into());
     }
     backend.stop_proxy_thread();
     backend.release_proxy_routines();
     backend.set_proxy_bypass(false);
     invocation.set_text(format_args!("stopped"));
-    Hresult::OK
+    Ok(Reply::Ok)
 }

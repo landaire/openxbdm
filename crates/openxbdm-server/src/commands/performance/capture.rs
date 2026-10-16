@@ -10,7 +10,8 @@
 //! order the chunks of its records from first to last.
 
 use openxbdm_core::status::Hresult;
-use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::KernelError;
+use openxbdm_core::status::Win32Error;
 
 use super::pmc::COUNTERS;
 use super::pmc::Route;
@@ -18,29 +19,142 @@ use super::pmc::Setup;
 use crate::backend::Backend;
 use crate::commands::filesystem::DriveTable;
 use crate::commands::filesystem::ObjectPath;
+use crate::reply;
+use crate::reply::CommandError;
+use crate::reply::Reply;
 
-/// Start while a capture runs, from a title (export 73): the capture keeps
-/// running.
-pub const CONTINUED: Hresult = Hresult::success(0x06);
-pub const ALREADY_RUNNING: Hresult = Hresult::error(0x19);
-/// No capture buffers exist, or the capture is stopped.
-pub const NO_CAPTURE: Hresult = Hresult::error(0x18);
-pub const NO_BUFFER_MEMORY: Hresult = Hresult::error(0x1c);
-pub const TITLE_CAPTURE_FAILED: Hresult = Hresult::error(0x1d);
-pub const NOT_INSTRUMENTED: Hresult = Hresult::error(0x23);
-pub const CALL_CAP_UNAVAILABLE: Hresult = Hresult::error(0x24);
-/// A processor ran out of buffer space.
-pub const BUFFER_FULL: Hresult = Hresult::error(0x26);
-pub const TITLE_TERMINATED: Hresult = Hresult::error(0x27);
-/// The capture ran longer than the 29-bit record timestamps cover.
-pub const TOO_LONG: Hresult = Hresult::error(0x29);
-pub const COUNTERS_UNAVAILABLE: Hresult = Hresult::error(0x2c);
-pub const COUNTERS_LOST: Hresult = Hresult::error(0x2d);
-/// Another start or stop holds the engine.
-pub const BUSY: Hresult = Hresult(0x8007_00aa);
+/// A capture that started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Started {
+    Recording,
+    /// Start while a capture runs, from a title (export 73): the capture
+    /// keeps running.
+    Continued,
+    /// The title runs the capture; its success word is the handler result.
+    Title(Reply),
+}
 
-/// Kernel status of an unavailable call-cap service.
-const CALL_CAP_SERVICE_UNAVAILABLE: u32 = 0xc000_0040;
+/// Success results of the capture interface other than OK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureReply {
+    Continued,
+    FastCapEnabled,
+    CallCapEnabled,
+}
+
+/// A failed capture operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureError {
+    /// The capture file cannot be created.
+    FileFailed,
+    FastCapDisabled,
+    CallCapDisabled,
+    /// No capture buffers exist, or the capture is stopped.
+    NoCapture,
+    AlreadyRunning,
+    NoBufferMemory,
+    TitleCaptureFailed,
+    NotInstrumented,
+    CallCapUnavailable,
+    /// A processor ran out of buffer space.
+    BufferFull,
+    TitleTerminated,
+    /// The capture ran longer than the 29-bit record timestamps cover.
+    TooLong,
+    CountersUnavailable,
+    CountersLost,
+    /// Another start or stop holds the engine.
+    Busy,
+    /// The kernel call-cap service failed.
+    Kernel(KernelError),
+    /// The capture file writer failed.
+    Write(Win32Error),
+    /// Failure result of a title that runs the capture.
+    Title(Hresult),
+}
+
+impl From<Started> for Reply {
+    fn from(started: Started) -> Self {
+        match started {
+            Started::Recording => Reply::Ok,
+            Started::Continued => Reply::Capture(CaptureReply::Continued),
+            Started::Title(reply) => reply,
+        }
+    }
+}
+
+impl From<CaptureReply> for Hresult {
+    fn from(reply: CaptureReply) -> Self {
+        match reply {
+            CaptureReply::Continued => Hresult::success(0x06),
+            CaptureReply::FastCapEnabled => Hresult::success(0x07),
+            CaptureReply::CallCapEnabled => Hresult::success(0x08),
+        }
+    }
+}
+
+impl From<CaptureError> for Hresult {
+    #[inline(never)]
+    fn from(error: CaptureError) -> Self {
+        match error {
+            CaptureError::FileFailed => Hresult::error(0x0d),
+            CaptureError::FastCapDisabled => Hresult::error(0x1b),
+            CaptureError::CallCapDisabled => Hresult::error(0x21),
+            CaptureError::NoCapture => Hresult::error(0x18),
+            CaptureError::AlreadyRunning => Hresult::error(0x19),
+            CaptureError::NoBufferMemory => Hresult::error(0x1c),
+            CaptureError::TitleCaptureFailed => Hresult::error(0x1d),
+            CaptureError::NotInstrumented => Hresult::error(0x23),
+            CaptureError::CallCapUnavailable => Hresult::error(0x24),
+            CaptureError::BufferFull => Hresult::error(0x26),
+            CaptureError::TitleTerminated => Hresult::error(0x27),
+            CaptureError::TooLong => Hresult::error(0x29),
+            CaptureError::CountersUnavailable => Hresult::error(0x2c),
+            CaptureError::CountersLost => Hresult::error(0x2d),
+            CaptureError::Busy => Hresult(0x8007_00aa),
+            CaptureError::Kernel(error) => error.into(),
+            CaptureError::Write(error) => error.into(),
+            CaptureError::Title(result) => result,
+        }
+    }
+}
+
+impl From<CaptureError> for CommandError {
+    fn from(error: CaptureError) -> Self {
+        CommandError::Capture(error)
+    }
+}
+
+/// The typed form of the result word a title answers a capture request
+/// with: a success word is the handler result, 0 sends no status line.
+pub fn title_result(result: Hresult) -> Result<Started, CaptureError> {
+    if result == Hresult::NO_REPLY {
+        return Ok(Started::Title(Reply::Sent));
+    }
+    match reply::from_processor(result) {
+        Ok(reply) => Ok(Started::Title(reply)),
+        Err(_) => Err(CaptureError::Title(result)),
+    }
+}
+
+/// `capctrl fastcapenabled` and export 84.
+pub const fn fast_cap_state(present: bool) -> Result<CaptureReply, CaptureError> {
+    if present {
+        Ok(CaptureReply::FastCapEnabled)
+    } else {
+        Err(CaptureError::FastCapDisabled)
+    }
+}
+
+/// `capctrl callcapenabled`.
+pub const fn call_cap_state(present: bool) -> Result<CaptureReply, CaptureError> {
+    if present {
+        Ok(CaptureReply::CallCapEnabled)
+    } else {
+        Err(CaptureError::CallCapDisabled)
+    }
+}
+
 /// Ceiling of a requested buffer size.
 const BUFFER_SIZE_LIMIT: u32 = 0x1000_0000;
 const PAGE_SIZE: u32 = 0x1000;
@@ -68,7 +182,7 @@ impl CaptureFlags {
     const PROCESSOR_MASK: u32 = 0x3f;
     const COUNTERS: u32 = 0x1_0000;
     /// Stored by a stop that saw a full buffer.
-    pub const FULL_MARK: u32 = 0x8000_0000;
+    pub const FULL_MARK: Self = Self(0x8000_0000);
 
     /// Value of `capctrl flags=` and export 90.
     pub const fn from_request(value: u32) -> Self {
@@ -95,6 +209,10 @@ impl CaptureFlags {
         }
     }
 
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
     /// Counter sampled into each record.
     pub const fn counter_source(self) -> CounterSource {
         match (self.0 >> 6) & 0x1f {
@@ -104,6 +222,13 @@ impl CaptureFlags {
             0x13 => CounterSource::Memory(MemoryCounter::Combined),
             selector => CounterSource::Unsupported(selector as u8),
         }
+    }
+}
+
+/// The flags after initialization.
+impl Default for CaptureFlags {
+    fn default() -> Self {
+        Self::IDLE
     }
 }
 
@@ -187,6 +312,29 @@ pub enum ControlRecord {
 /// First word of a record.
 pub const fn record_header(kind: RecordKind, timebase: u32) -> u32 {
     (kind as u32) << 29 | timebase & 0x1fff_ffff
+}
+
+/// The `buffersize` word of `capctrl start` and export 73: a byte count,
+/// or with bit 31 set a capture the title runs, sized in MiB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferRequest(pub u32);
+
+impl BufferRequest {
+    const TITLE: u32 = 0x8000_0000;
+
+    /// The requested size without the title bit.
+    pub const fn size(self) -> u32 {
+        self.0 & !Self::TITLE
+    }
+
+    /// MiB of a capture handed to the title.
+    pub const fn title_megabytes(self) -> Option<u8> {
+        if self.0 & Self::TITLE != 0 {
+            Some((self.size() >> 20) as u8)
+        } else {
+            None
+        }
+    }
 }
 
 /// Buffer size of `buffersize`: whole pages, at most 256 MiB; `None`
@@ -306,15 +454,6 @@ pub const fn chunk_size(buffer_size: u32, processors: u32) -> u32 {
     }
 }
 
-/// HRESULT of a Win32 error from the capture file writer.
-pub const fn dos_result(error: u32) -> Hresult {
-    if (error as i32) > 0 {
-        Hresult(0x8007_0000 | error & 0xffff)
-    } else {
-        Hresult(error)
-    }
-}
-
 /// Server state the capture file writer needs.
 pub trait Paths {
     /// Object name of drive path `name` (stock 0x91f2e888).
@@ -348,22 +487,27 @@ pub trait Engine {
     /// A loaded module carries `kind` (0x91f28ae0).
     fn instrumented(&mut self, kind: Instrumentation) -> bool;
     /// Kernel call-cap support (debug monitor service 2).
-    fn set_kernel_call_cap(&mut self, enable: bool) -> NtStatus;
+    fn set_kernel_call_cap(&mut self, enable: bool) -> Result<(), KernelError>;
     /// The title-terminated mark (0x91fae7e8).
     fn set_title_terminated(&mut self, terminated: bool);
     /// Hand the capture to the title through its control words (buffer
     /// size bit 31).
-    fn request_title_capture(&mut self, megabytes: u8) -> Hresult;
+    fn request_title_capture(&mut self, megabytes: u8) -> Result<Started, CaptureError>;
     /// Allocate the buffers and start recording (0x91f29210); `exclusive`
     /// rejects a running capture.
-    fn begin(&mut self, name: &[u8], buffer_size: u32, exclusive: bool) -> Hresult;
+    fn begin(
+        &mut self,
+        name: &[u8],
+        buffer_size: u32,
+        exclusive: bool,
+    ) -> Result<Started, CaptureError>;
     /// Stop recording (0x91f29830).
-    fn end(&mut self) -> Hresult;
+    fn end(&mut self) -> Result<(), CaptureError>;
     fn flags(&mut self) -> CaptureFlags;
     /// Reset the flags to idle and keep `previous` (0x91fae800).
-    fn retire_flags(&mut self, previous: u32);
+    fn retire_flags(&mut self, previous: CaptureFlags);
     /// Stop the counters of `flags` (0x91f27db8).
-    fn finish_counters(&mut self, flags: CaptureFlags) -> Hresult;
+    fn finish_counters(&mut self, flags: CaptureFlags) -> Result<(), CaptureError>;
     /// Release the performance counters and mark them ready (0x91f96084).
     fn release_counters(&mut self);
     fn counters_ready(&mut self) -> bool;
@@ -371,99 +515,99 @@ pub trait Engine {
     fn try_lock(&mut self) -> bool;
     fn unlock(&mut self);
     /// Write the capture file and free the buffers (0x91f28540).
-    fn write(&mut self, paths: &mut dyn Paths) -> NtStatus;
-    fn dos_error(&mut self, status: NtStatus) -> u32;
+    fn write(&mut self, paths: &mut dyn Paths) -> Result<(), KernelError>;
+    /// The Win32 error of a failed write (`RtlNtStatusToDosError`).
+    fn dos_error(&mut self, error: KernelError) -> Option<Win32Error>;
     /// Disable every processor and forget the buffers (title terminate).
     fn discard(&mut self);
 }
 
 /// Start after the file was validated (0x91f299c8, operation 1).
-pub fn start(engine: &mut dyn Engine, name: &[u8], buffer_size: u32, exclusive: bool) -> Hresult {
+pub fn start(
+    engine: &mut dyn Engine,
+    name: &[u8],
+    buffer: BufferRequest,
+    exclusive: bool,
+) -> Result<Started, CaptureError> {
     let fast_cap = engine.instrumented(Instrumentation::FastCap);
     let call_cap = engine.instrumented(Instrumentation::CallCap);
     engine.set_title_terminated(false);
     if !fast_cap && !call_cap {
-        return NOT_INSTRUMENTED;
+        return Err(CaptureError::NotInstrumented);
     }
-    let size = buffer_size & 0x7fff_ffff;
-    if buffer_size & 0x8000_0000 != 0 {
-        return engine.request_title_capture((size >> 20) as u8);
+    if let Some(megabytes) = buffer.title_megabytes() {
+        return engine.request_title_capture(megabytes);
     }
     if !fast_cap {
-        let status = engine.set_kernel_call_cap(true);
-        if !status.is_success() {
-            return if status.0 == CALL_CAP_SERVICE_UNAVAILABLE {
-                CALL_CAP_UNAVAILABLE
-            } else {
-                Hresult(status.0 | super::NT_FAILURE_MARKER)
-            };
-        }
+        engine
+            .set_kernel_call_cap(true)
+            .map_err(|error| match error {
+                KernelError::SectionTooBig => CaptureError::CallCapUnavailable,
+                error => CaptureError::Kernel(error),
+            })?;
     }
-    engine.begin(name, size, exclusive)
+    engine.begin(name, buffer.size(), exclusive)
 }
 
 /// Stop recording, release the counters, and retire the flags; returns
 /// the result the caller continues with. Only a stop that writes the file
 /// takes the counter result and marks a full buffer in the kept flags.
-fn stop_recording(engine: &mut dyn Engine, writing: bool) -> Hresult {
+fn stop_recording(engine: &mut dyn Engine, writing: bool) -> Result<(), CaptureError> {
     let stopped = engine.end();
     if !engine.instrumented(Instrumentation::FastCap)
         && engine.instrumented(Instrumentation::CallCap)
     {
-        engine.set_kernel_call_cap(false);
+        let _ = engine.set_kernel_call_cap(false);
     }
     let flags = engine.flags();
     let mut result = stopped;
     if flags.counters() {
         let finished = engine.finish_counters(flags);
-        if writing && !stopped.is_failure() {
+        if writing && stopped.is_ok() {
             result = if engine.counters_ready() {
                 finished
             } else {
-                COUNTERS_UNAVAILABLE
+                Err(CaptureError::CountersUnavailable)
             };
         }
         engine.release_counters();
     }
     let flags = engine.flags();
-    let full = writing && result == BUFFER_FULL;
+    let full = writing && result == Err(CaptureError::BufferFull);
     engine.retire_flags(if full {
-        flags.0 | CaptureFlags::FULL_MARK
+        flags.union(CaptureFlags::FULL_MARK)
     } else {
-        flags.0
+        flags
     });
     result
 }
 
-/// Stop and write the capture file (export 74).
-pub fn stop(engine: &mut dyn Engine, paths: &mut dyn Paths) -> Hresult {
-    let mut result = stop_recording(engine, true);
-    if result != BUFFER_FULL && result.is_failure() {
-        return result;
+/// Stop and write the capture file (export 74). A full buffer is still
+/// written and then reported.
+pub fn stop(engine: &mut dyn Engine, paths: &mut dyn Paths) -> Result<(), CaptureError> {
+    let recorded = stop_recording(engine, true);
+    if let Err(error) = recorded
+        && error != CaptureError::BufferFull
+    {
+        return Err(error);
     }
     if !engine.try_lock() {
-        return BUSY;
+        return Err(CaptureError::Busy);
     }
-    let status = engine.write(paths);
-    let error = engine.dos_error(status);
-    if result != BUFFER_FULL {
-        result = dos_result(error);
-    }
+    let written = engine.write(paths).map_err(|error| engine.dos_error(error));
     engine.unlock();
-    if result.is_failure() {
-        result
-    } else {
-        Hresult::OK
+    recorded?;
+    match written {
+        Err(Some(error)) => Err(CaptureError::Write(error)),
+        Ok(()) | Err(None) => Ok(()),
     }
 }
 
 /// Stop without writing the capture (export 162).
-pub fn abort(engine: &mut dyn Engine) -> Hresult {
-    let result = stop_recording(engine, false);
-    if result == BUFFER_FULL || !result.is_failure() {
-        Hresult::OK
-    } else {
-        result
+pub fn abort(engine: &mut dyn Engine) -> Result<(), CaptureError> {
+    match stop_recording(engine, false) {
+        Err(CaptureError::BufferFull) => Ok(()),
+        result => result,
     }
 }
 
@@ -472,11 +616,11 @@ pub fn title_terminated(engine: &mut dyn Engine) {
     engine.set_title_terminated(true);
     let flags = engine.flags();
     if flags.counters() {
-        engine.finish_counters(flags);
+        let _ = engine.finish_counters(flags);
         engine.release_counters();
     }
     let flags = engine.flags();
-    engine.retire_flags(flags.0);
+    engine.retire_flags(flags);
     engine.discard();
 }
 
@@ -552,29 +696,23 @@ mod tests {
         assert_eq!(chunk_size(0x10_0000, 3), 0x8000);
     }
 
-    #[test]
-    fn writer_errors_become_win32_results() {
-        assert_eq!(dos_result(0), Hresult(0));
-        assert_eq!(dos_result(2), Hresult(0x8007_0002));
-        assert_eq!(dos_result(0x1_0005), Hresult(0x8007_0005));
-    }
-
     #[derive(Default)]
     struct Recorder {
         fast_cap: bool,
         call_cap: bool,
         kernel_call_cap: Vec<bool>,
-        kernel_status: u32,
+        kernel_error: Option<KernelError>,
         title_terminated: Option<bool>,
         begun: Vec<(Vec<u8>, u32, bool)>,
-        end: Option<Hresult>,
-        flags: u32,
-        previous: Option<u32>,
-        finish: Option<Hresult>,
+        /// `None` reports no capture.
+        end: Option<Result<(), CaptureError>>,
+        flags: CaptureFlags,
+        previous: Option<CaptureFlags>,
+        finish: Option<CaptureError>,
         ready: bool,
         released: bool,
         locked: bool,
-        write: u32,
+        write: Option<KernelError>,
         discarded: bool,
     }
 
@@ -585,32 +723,37 @@ mod tests {
                 Instrumentation::CallCap => self.call_cap,
             }
         }
-        fn set_kernel_call_cap(&mut self, enable: bool) -> NtStatus {
+        fn set_kernel_call_cap(&mut self, enable: bool) -> Result<(), KernelError> {
             self.kernel_call_cap.push(enable);
-            NtStatus(self.kernel_status)
+            self.kernel_error.map_or(Ok(()), Err)
         }
         fn set_title_terminated(&mut self, terminated: bool) {
             self.title_terminated = Some(terminated);
         }
-        fn request_title_capture(&mut self, megabytes: u8) -> Hresult {
-            Hresult(u32::from(megabytes))
+        fn request_title_capture(&mut self, megabytes: u8) -> Result<Started, CaptureError> {
+            title_result(Hresult(u32::from(megabytes)))
         }
-        fn begin(&mut self, name: &[u8], buffer_size: u32, exclusive: bool) -> Hresult {
+        fn begin(
+            &mut self,
+            name: &[u8],
+            buffer_size: u32,
+            exclusive: bool,
+        ) -> Result<Started, CaptureError> {
             self.begun.push((name.to_vec(), buffer_size, exclusive));
-            Hresult::OK
+            Ok(Started::Recording)
         }
-        fn end(&mut self) -> Hresult {
-            self.end.unwrap_or(NO_CAPTURE)
+        fn end(&mut self) -> Result<(), CaptureError> {
+            self.end.unwrap_or(Err(CaptureError::NoCapture))
         }
         fn flags(&mut self) -> CaptureFlags {
-            CaptureFlags(self.flags)
+            self.flags
         }
-        fn retire_flags(&mut self, previous: u32) {
-            self.flags = CaptureFlags::IDLE.0;
+        fn retire_flags(&mut self, previous: CaptureFlags) {
+            self.flags = CaptureFlags::IDLE;
             self.previous = Some(previous);
         }
-        fn finish_counters(&mut self, _flags: CaptureFlags) -> Hresult {
-            self.finish.unwrap_or(Hresult::OK)
+        fn finish_counters(&mut self, _flags: CaptureFlags) -> Result<(), CaptureError> {
+            self.finish.map_or(Ok(()), Err)
         }
         fn release_counters(&mut self) {
             self.released = true;
@@ -625,14 +768,13 @@ mod tests {
         fn unlock(&mut self) {
             self.locked = false;
         }
-        fn write(&mut self, _paths: &mut dyn Paths) -> NtStatus {
-            NtStatus(self.write)
+        fn write(&mut self, _paths: &mut dyn Paths) -> Result<(), KernelError> {
+            self.write.map_or(Ok(()), Err)
         }
-        fn dos_error(&mut self, status: NtStatus) -> u32 {
-            match status.0 {
-                0 => 0,
-                0xc000_000f => 2,
-                other => other,
+        fn dos_error(&mut self, error: KernelError) -> Option<Win32Error> {
+            match error {
+                KernelError::NoSuchFile => Win32Error::new(2),
+                other => Win32Error::new(other.status().0),
             }
         }
         fn discard(&mut self) {
@@ -654,20 +796,34 @@ mod tests {
     #[test]
     fn start_requires_instrumentation_and_enables_call_cap_alone() {
         let mut engine = Recorder::default();
-        assert_eq!(start(&mut engine, b"e:\\a", 0, true), NOT_INSTRUMENTED);
+        assert_eq!(
+            start(&mut engine, b"e:\\a", BufferRequest(0), true),
+            Err(CaptureError::NotInstrumented)
+        );
         assert_eq!(engine.title_terminated, Some(false));
 
         engine.call_cap = true;
-        engine.kernel_status = 0xc000_0040;
-        assert_eq!(start(&mut engine, b"e:\\a", 0, true), CALL_CAP_UNAVAILABLE);
-        engine.kernel_status = 0xc000_0017;
-        assert_eq!(start(&mut engine, b"e:\\a", 0, true), Hresult(0xd000_0017));
-        engine.kernel_status = 0;
-        assert_eq!(start(&mut engine, b"e:\\a", 0x1000, false), Hresult::OK);
+        engine.kernel_error = Some(KernelError::SectionTooBig);
+        assert_eq!(
+            start(&mut engine, b"e:\\a", BufferRequest(0), true),
+            Err(CaptureError::CallCapUnavailable)
+        );
+        engine.kernel_error = Some(KernelError::NoMemory);
+        let failed = start(&mut engine, b"e:\\a", BufferRequest(0), true);
+        assert_eq!(failed, Err(CaptureError::Kernel(KernelError::NoMemory)));
+        assert_eq!(failed.map_err(Hresult::from), Err(Hresult(0xd000_0017)));
+        engine.kernel_error = None;
+        assert_eq!(
+            start(&mut engine, b"e:\\a", BufferRequest(0x1000), false),
+            Ok(Started::Recording)
+        );
         assert_eq!(engine.kernel_call_cap, [true, true, true]);
 
         engine.fast_cap = true;
-        assert_eq!(start(&mut engine, b"e:\\b", 0x2000, true), Hresult::OK);
+        assert_eq!(
+            start(&mut engine, b"e:\\b", BufferRequest(0x2000), true),
+            Ok(Started::Recording)
+        );
         assert_eq!(engine.kernel_call_cap.len(), 3);
         assert_eq!(
             engine.begun,
@@ -685,8 +841,8 @@ mod tests {
             ..Recorder::default()
         };
         assert_eq!(
-            start(&mut engine, b"e:\\a", 0x8350_0000, true),
-            Hresult(0x35)
+            start(&mut engine, b"e:\\a", BufferRequest(0x8350_0000), true),
+            Ok(Started::Title(Reply::Processor(Hresult(0x35))))
         );
         assert!(engine.kernel_call_cap.is_empty() && engine.begun.is_empty());
     }
@@ -695,38 +851,42 @@ mod tests {
     fn stop_writes_the_file_and_maps_the_writer_status() {
         let mut engine = Recorder {
             fast_cap: true,
-            end: Some(Hresult::OK),
-            flags: 0x2_0001,
-            write: 0xc000_000f,
+            end: Some(Ok(())),
+            flags: CaptureFlags(0x2_0001),
+            write: Some(KernelError::NoSuchFile),
             ..Recorder::default()
         };
-        assert_eq!(stop(&mut engine, &mut NoPaths), Hresult(0x8007_0002));
-        assert_eq!(engine.previous, Some(0x2_0001));
-        assert_eq!(engine.flags, CaptureFlags::IDLE.0);
+        let stopped = stop(&mut engine, &mut NoPaths);
+        assert_eq!(stopped.map_err(Hresult::from), Err(Hresult(0x8007_0002)));
+        assert_eq!(engine.previous, Some(CaptureFlags(0x2_0001)));
+        assert_eq!(engine.flags, CaptureFlags::IDLE);
         assert!(!engine.locked);
 
-        engine.end = Some(BUFFER_FULL);
-        engine.flags = 3;
-        assert_eq!(stop(&mut engine, &mut NoPaths), BUFFER_FULL);
-        assert_eq!(engine.previous, Some(0x8000_0003));
+        engine.end = Some(Err(CaptureError::BufferFull));
+        engine.flags = CaptureFlags(3);
+        assert_eq!(
+            stop(&mut engine, &mut NoPaths),
+            Err(CaptureError::BufferFull)
+        );
+        assert_eq!(engine.previous, Some(CaptureFlags(0x8000_0003)));
 
-        engine.end = Some(Hresult::OK);
-        engine.write = 0;
+        engine.end = Some(Ok(()));
+        engine.write = None;
         engine.locked = true;
-        assert_eq!(stop(&mut engine, &mut NoPaths), BUSY);
+        assert_eq!(stop(&mut engine, &mut NoPaths), Err(CaptureError::Busy));
     }
 
     #[test]
     fn stop_failures_skip_the_file_and_only_call_cap_disables_the_service() {
         let mut engine = Recorder {
             call_cap: true,
-            end: Some(TOO_LONG),
+            end: Some(Err(CaptureError::TooLong)),
             ..Recorder::default()
         };
-        assert_eq!(stop(&mut engine, &mut NoPaths), TOO_LONG);
+        assert_eq!(stop(&mut engine, &mut NoPaths), Err(CaptureError::TooLong));
         assert_eq!(engine.kernel_call_cap, [false]);
         engine.fast_cap = true;
-        assert_eq!(abort(&mut engine), TOO_LONG);
+        assert_eq!(abort(&mut engine), Err(CaptureError::TooLong));
         assert_eq!(engine.kernel_call_cap, [false]);
     }
 
@@ -734,47 +894,53 @@ mod tests {
     fn counter_mode_results() {
         let mut engine = Recorder {
             fast_cap: true,
-            end: Some(Hresult::OK),
-            flags: 0x1_0001,
-            finish: Some(COUNTERS_LOST),
+            end: Some(Ok(())),
+            flags: CaptureFlags(0x1_0001),
+            finish: Some(CaptureError::CountersLost),
             ready: true,
             ..Recorder::default()
         };
-        assert_eq!(stop(&mut engine, &mut NoPaths), COUNTERS_LOST);
+        assert_eq!(
+            stop(&mut engine, &mut NoPaths),
+            Err(CaptureError::CountersLost)
+        );
         assert!(engine.released);
 
         engine.ready = false;
-        engine.flags = 0x1_0001;
-        engine.finish = Some(Hresult::OK);
-        assert_eq!(stop(&mut engine, &mut NoPaths), COUNTERS_UNAVAILABLE);
+        engine.flags = CaptureFlags(0x1_0001);
+        engine.finish = None;
+        assert_eq!(
+            stop(&mut engine, &mut NoPaths),
+            Err(CaptureError::CountersUnavailable)
+        );
 
         engine.ready = false;
-        engine.flags = 0x1_0001;
-        engine.finish = Some(COUNTERS_LOST);
-        assert_eq!(abort(&mut engine), Hresult::OK);
+        engine.flags = CaptureFlags(0x1_0001);
+        engine.finish = Some(CaptureError::CountersLost);
+        assert_eq!(abort(&mut engine), Ok(()));
         assert!(engine.ready);
     }
 
     #[test]
     fn abort_reports_stop_failures_except_a_full_buffer() {
         let mut engine = Recorder::default();
-        assert_eq!(abort(&mut engine), NO_CAPTURE);
-        engine.end = Some(BUFFER_FULL);
-        engine.flags = 1;
-        assert_eq!(abort(&mut engine), Hresult::OK);
-        assert_eq!(engine.previous, Some(1));
+        assert_eq!(abort(&mut engine), Err(CaptureError::NoCapture));
+        engine.end = Some(Err(CaptureError::BufferFull));
+        engine.flags = CaptureFlags(1);
+        assert_eq!(abort(&mut engine), Ok(()));
+        assert_eq!(engine.previous, Some(CaptureFlags(1)));
     }
 
     #[test]
     fn title_termination_retires_the_capture() {
         let mut engine = Recorder {
-            flags: 0x1_0002,
+            flags: CaptureFlags(0x1_0002),
             ..Recorder::default()
         };
         title_terminated(&mut engine);
         assert_eq!(engine.title_terminated, Some(true));
         assert!(engine.released && engine.discarded);
-        assert_eq!(engine.previous, Some(0x1_0002));
-        assert_eq!(engine.flags, CaptureFlags::IDLE.0);
+        assert_eq!(engine.previous, Some(CaptureFlags(0x1_0002)));
+        assert_eq!(engine.flags, CaptureFlags::IDLE);
     }
 }

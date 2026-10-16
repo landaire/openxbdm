@@ -6,22 +6,24 @@
 use core::ffi::CStr;
 use core::ffi::c_char;
 
+use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_server::Server;
 use openxbdm_server::commands::network::LinkFlags;
+use openxbdm_server::commands::network::NetworkError;
 use openxbdm_server::commands::network::link_error;
 use openxbdm_server::commands::network::netcap;
 use openxbdm_server::commands::network::netcap::CaptureFlags;
 use openxbdm_server::commands::network::netsim;
 use openxbdm_server::commands::network::netsim::CONFIG_CAPACITY;
 use openxbdm_server::commands::network::netsim::Direction;
+use openxbdm_server::commands::network::netsim::NetsimError;
 use openxbdm_server::commands::network::netsim::QueueIndex;
 use openxbdm_server::commands::network::netsim::RedirectConfig;
 use openxbdm_server::commands::network::netsim::RedirectIndex;
 use openxbdm_server::commands::network::netsim::Source;
 use openxbdm_server::commands::network::netsim::api;
 use openxbdm_server::commands::network::netsim::classifier;
-use openxbdm_server::commands::network::netsim::status;
 
 use crate::backend::Console;
 use crate::backend::dispatcher;
@@ -41,7 +43,13 @@ const ALL: u32 = u32::MAX;
 /// report a generic failure.
 fn on_server<T>(request: &mut T, service: dispatcher::ServerService) -> Hresult {
     dispatcher::call_on_server(service, request as *mut T as usize as u32)
-        .map_or(status::GENERIC, Hresult)
+        .map_or(Hresult::from_error_code(ErrorCode::Undefined), Hresult)
+}
+
+/// A helper failure as the exports report it, through the facility rule
+/// of the command status.
+fn reported(error: NetsimError) -> u32 {
+    Hresult::from(NetworkError::Netsim(error)).0
 }
 
 /// # Safety
@@ -78,14 +86,14 @@ fn read_bytes<const N: usize>(address: u32) -> Option<[u8; N]> {
 
 /// Caller queue settings (0x91f8bc38): the size dword is checked before the
 /// rest of the structure is read.
-fn read_settings(address: u32) -> Result<netsim::QueueConfig, Hresult> {
+fn read_settings(address: u32) -> Result<netsim::QueueConfig, NetsimError> {
     if let Some(size) = read_bytes::<4>(address)
         && !api::declares_size(&size, api::SETTINGS_SIZE)
     {
-        return Err(status::INVALID);
+        return Err(NetsimError::Invalid);
     }
     api::decode_settings(read_bytes::<{ api::SETTINGS_SIZE }>(address).as_ref())
-        .map_err(Hresult::from)
+        .map_err(NetsimError::from)
 }
 
 fn write_bytes<const N: usize>(address: u32, bytes: &[u8; N]) {
@@ -132,7 +140,10 @@ extern "C" fn capture_start(name: u32, data_limit: u32, buffer: u32, flags: u32)
                 start.buffer,
                 start.flags,
             );
-            result.err().unwrap_or(Hresult::OK).0
+            match result {
+                Ok(()) => Hresult::OK.0,
+                Err(error) => Hresult::from(error).0,
+            }
         },
     )
     .0
@@ -144,7 +155,10 @@ extern "C" fn capture_stop() -> u32 {
     on_server(
         &mut (),
         |server: &mut Server, console: &mut Console, _: &mut XamNetwork, _| {
-            netcap::stop_capture(&mut server.state.network.netcap, console).0
+            match netcap::stop_capture(&mut server.state.network.netcap, console) {
+                Ok(()) => Hresult::OK.0,
+                Err(error) => Hresult::from(error).0,
+            }
         },
     )
     .0
@@ -163,7 +177,7 @@ extern "C" fn set_link_disconnected(disconnect: u32) -> u32 {
     let _ = super::link_status();
     match super::set_link_flags(flags) {
         Ok(()) => Hresult::OK.0,
-        Err(error) => link_error(error).0,
+        Err(error) => Hresult::from(link_error(error)).0,
     }
 }
 export!(215, set_link_disconnected);
@@ -208,7 +222,7 @@ fn remove_queues(request: &mut RemoveQueues) -> Hresult {
                 }
                 Err(error) => {
                     request.removed = Some(0);
-                    netsim::reported(error).0
+                    reported(error)
                 }
             }
         },
@@ -249,7 +263,7 @@ export!(218, remove_all_queues);
 extern "C" fn modify_queue(inbound: u32, index: u32, settings: u32) -> u32 {
     let config = match read_settings(settings) {
         Ok(config) => config,
-        Err(error) => return error.0,
+        Err(error) => return Hresult::from(error).0,
     };
     let mut request = QueueRequest {
         direction: direction(inbound),
@@ -259,7 +273,7 @@ extern "C" fn modify_queue(inbound: u32, index: u32, settings: u32) -> u32 {
     };
     request.length = match api::queue_blob(0, &config, None, &mut request.blob) {
         Ok(length) => length,
-        Err(error) => return error.0,
+        Err(error) => return Hresult::from(error).0,
     };
     on_server(
         &mut request,
@@ -277,7 +291,7 @@ extern "C" fn modify_queue(inbound: u32, index: u32, settings: u32) -> u32 {
                 true,
             ) {
                 Ok(()) => Hresult::OK.0,
-                Err(error) => netsim::reported(error).0,
+                Err(error) => reported(error),
             }
         },
     )
@@ -313,8 +327,8 @@ impl<T> InsertRequest<T> {
     fn build(
         &mut self,
         text: u32,
-        build: impl FnOnce(Option<Source<'_>>, &mut [u8; CONFIG_CAPACITY]) -> Result<usize, Hresult>,
-    ) -> Result<(), Hresult> {
+        build: impl FnOnce(Option<Source<'_>>, &mut [u8; CONFIG_CAPACITY]) -> Result<usize, NetsimError>,
+    ) -> Result<(), NetsimError> {
         let compiled = match c_string(text) {
             Some(text) => classifier::compile_text(text)?,
             None => None,
@@ -324,9 +338,9 @@ impl<T> InsertRequest<T> {
     }
 
     /// Record the helper's outcome: the index or -1, and the mapped result.
-    fn record(&mut self, result: Result<u32, Hresult>) -> u32 {
+    fn record(&mut self, result: Result<u32, NetsimError>) -> u32 {
         self.inserted = Some(*result.as_ref().unwrap_or(&ALL));
-        result.map_or_else(|error| netsim::reported(error).0, |_| Hresult::OK.0)
+        result.map_or_else(reported, |_| Hresult::OK.0)
     }
 
     fn finish(self, result: Hresult, inserted: u32) -> u32 {
@@ -350,13 +364,13 @@ extern "C" fn insert_queue(
 ) -> u32 {
     let config = match read_settings(settings) {
         Ok(config) => config,
-        Err(error) => return error.0,
+        Err(error) => return Hresult::from(error).0,
     };
     let mut request = InsertRequest::new(direction(inbound), index);
     if let Err(error) = request.build(text, |program, blob| {
         api::queue_blob(kind, &config, program, blob)
     }) {
-        return error.0;
+        return Hresult::from(error).0;
     }
     let result = on_server(
         &mut request,
@@ -398,7 +412,7 @@ extern "C" fn insert_redirect(
     let address = |pointer| read_bytes::<4>(pointer).unwrap_or([0; 4]);
     // The session count is checked before it is narrowed to 16 bits.
     let Ok(sessions) = u16::try_from(sessions) else {
-        return status::INVALID.0;
+        return Hresult::from(NetsimError::Invalid).0;
     };
     let config = RedirectConfig {
         match_address: address(match_address),
@@ -408,13 +422,13 @@ extern "C" fn insert_redirect(
         sessions,
     };
     if let Err(error) = config.validate() {
-        return Hresult::from(error).0;
+        return Hresult::from(NetsimError::from(error)).0;
     }
     let mut request = InsertRequest::new((), index);
     if let Err(error) = request.build(text, |program, blob| {
         api::redirect_blob(&config, program, blob)
     }) {
-        return error.0;
+        return Hresult::from(error).0;
     }
     let result = on_server(
         &mut request,
@@ -442,11 +456,11 @@ export!(224, insert_redirect);
 extern "C" fn queue_stats(inbound: u32, index: u32, stats: u32) -> u32 {
     let result = if super::netsim::simulator_exists() {
         match read_bytes::<4>(stats) {
-            Some(size) if !api::declares_size(&size, api::STATS_SIZE) => Err(status::INVALID),
+            Some(size) if !api::declares_size(&size, api::STATS_SIZE) => Err(NetsimError::Invalid),
             _ => super::netsim::queue_stats(direction(inbound), QueueIndex(index)),
         }
     } else {
-        Err(status::NO_INSTANCE)
+        Err(NetsimError::NoInstance)
     };
     match result {
         Ok(counters) => {
@@ -455,7 +469,7 @@ extern "C" fn queue_stats(inbound: u32, index: u32, stats: u32) -> u32 {
             }
             Hresult::OK.0
         }
-        Err(error) => netsim::reported(error).0,
+        Err(error) => reported(error),
     }
 }
 export!(221, queue_stats);
@@ -463,12 +477,12 @@ export!(221, queue_stats);
 /// Type and stored settings of a queue (0x91f36eb8 calling 0x91f8d620).
 extern "C" fn queue_settings(inbound: u32, index: u32, kind: u32, settings: u32) -> u32 {
     if !super::netsim::simulator_exists() {
-        return status::NO_INSTANCE.0;
+        return Hresult::from(NetsimError::NoInstance).0;
     }
     if let Some(size) = read_bytes::<4>(settings)
         && !api::declares_size(&size, api::SETTINGS_SIZE)
     {
-        return status::INVALID.0;
+        return Hresult::from(NetsimError::Invalid).0;
     }
     match super::netsim::queue(direction(inbound), QueueIndex(index)) {
         Ok(snapshot) => {
@@ -478,7 +492,7 @@ extern "C" fn queue_settings(inbound: u32, index: u32, kind: u32, settings: u32)
             }
             Hresult::OK.0
         }
-        Err(error) => error.0,
+        Err(error) => Hresult::from(error).0,
     }
 }
 export!(222, queue_settings);
@@ -517,7 +531,7 @@ extern "C" fn remove_redirects(index: u32, removed: u32) -> u32 {
                 }
                 Err(error) => {
                     request.removed = Some(0);
-                    netsim::reported(error).0
+                    reported(error)
                 }
             }
         },

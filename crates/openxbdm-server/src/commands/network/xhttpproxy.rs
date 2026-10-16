@@ -11,11 +11,15 @@ use openxbdm_core::status::Hresult;
 
 use crate::backend::Backend as AnyBackend;
 use crate::commands::network::Continuation;
+use crate::commands::network::NetworkError;
 use crate::commands::system;
 use crate::commands::system::SettingsFile;
 use crate::continuation::Continuation as AnyContinuation;
 use crate::continuation::ContinuationContext;
 use crate::invocation::Invocation;
+use crate::reply::CommandError;
+use crate::reply::CommandResult;
+use crate::reply::Reply;
 use crate::state::ServerState;
 use crate::text::HEX_UPPER;
 
@@ -23,8 +27,6 @@ use crate::text::HEX_UPPER;
 pub const NAME_CAPACITY: usize = 0x100;
 /// Certificate bytes per hex chunk of a settings line.
 const SETTINGS_CHUNK: u32 = 0x1ff;
-/// Result of a certificate upload cut short by the connection.
-const UPLOAD_ABORTED: Hresult = Hresult(0x82da_0101);
 
 /// Flag bits of a proxy entry, as stored by the monitor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,13 +88,30 @@ pub enum Inserted {
     Pending(ProxyId),
 }
 
+/// Why a new entry was not inserted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyError {
+    /// The certificate hex is malformed or longer than `certsize`.
+    BadCertificate,
+    OutOfMemory,
+}
+
+impl From<ProxyError> for CommandError {
+    fn from(error: ProxyError) -> Self {
+        match error {
+            ProxyError::BadCertificate => ErrorCode::UnknownCommand.into(),
+            ProxyError::OutOfMemory => ErrorCode::OutOfMemory.into(),
+        }
+    }
+}
+
 /// Result of [`Backend::proxy_update`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProxyOutcome {
     /// Flags of the entry that was deactivated, if any.
     pub cleared: Option<ProxyFlags>,
     /// `None` when no entry was requested.
-    pub inserted: Option<Result<Inserted, Hresult>>,
+    pub inserted: Option<Result<Inserted, ProxyError>>,
 }
 
 /// One entry as the settings writer reads it.
@@ -113,8 +132,8 @@ pub trait Backend {
     /// Deactivate the active entry whose system bit equals `sys` (dropping
     /// its active reference, freeing it when unreferenced), then insert
     /// `new` at the head as active with one reference. Certificate hex is
-    /// decoded with [`super::decode_hex`]; a bad certificate unlinks and frees the
-    /// new entry and yields 0x82da0007; no memory yields 0x82da001c.
+    /// decoded with [`super::decode_hex`]; a bad certificate unlinks and
+    /// frees the new entry.
     fn proxy_update(&mut self, sys: bool, new: Option<&NewProxy<'_>>) -> ProxyOutcome;
     /// Copy uploaded certificate bytes at `offset`.
     fn proxy_write_certificate(&mut self, id: ProxyId, offset: u32, bytes: &[u8]);
@@ -140,7 +159,7 @@ pub trait Backend {
 
 /// `xhttpproxy [name=<str> [port=<dword>] [certsize=<dword>] [cert=<hex>]]
 /// [sys | sysonly] [force] [temp]`: replace the proxy of a scope.
-pub(super) fn xhttpproxy(invocation: &mut Invocation<'_>) -> Hresult {
+pub(super) fn xhttpproxy(invocation: &mut Invocation<'_>) -> CommandResult {
     let line = invocation.line;
     let mut name_buffer = [0u8; NAME_CAPACITY];
     let (name, certificate_size) = match line.param("name") {
@@ -154,7 +173,7 @@ pub(super) fn xhttpproxy(invocation: &mut Invocation<'_>) -> Hresult {
                 (1..=0xffff).contains(&port)
             };
             if !valid {
-                return Hresult::from_error_code(ErrorCode::BAD_PARAMETER);
+                return Err(ErrorCode::BadParameter.into());
             }
             let certificate_size = line.dword("certsize").unwrap_or(0);
             // An empty name stores no name, as a missing one does.
@@ -208,11 +227,11 @@ pub(super) fn xhttpproxy(invocation: &mut Invocation<'_>) -> Hresult {
         .cleared
         .is_some_and(|cleared| !cleared.contains(ProxyFlags::TEMP));
     let (result, applied) = match outcome.inserted {
-        None => (Hresult::OK, ""),
-        Some(Err(error)) => (error, ""),
+        None => (Ok(Reply::Ok), ""),
+        Some(Err(error)) => (Err(error.into()), ""),
         Some(Ok(Inserted::Applied)) => {
             settings_changed |= !temp;
-            (Hresult::OK, " applied")
+            (Ok(Reply::Ok), " applied")
         }
         Some(Ok(Inserted::Pending(id))) => match invocation.session.as_deref_mut() {
             Some(session) => {
@@ -222,13 +241,13 @@ pub(super) fn xhttpproxy(invocation: &mut Invocation<'_>) -> Hresult {
                     received: 0,
                     size: certificate_size,
                 });
-                (Hresult::SEND_BINARY, " applying")
+                (Ok(Reply::SendBinary), " applying")
             }
             // Stock stores the upload state through the missing context;
             // without a connection the entry cannot receive its certificate.
             None => {
                 invocation.backend.proxy_upload_aborted(id);
-                (Hresult::FAIL, "")
+                (Err(CommandError::Fail), "")
             }
         },
     };
@@ -240,10 +259,12 @@ pub(super) fn xhttpproxy(invocation: &mut Invocation<'_>) -> Hresult {
     } else {
         ""
     };
-    if result.is_failure() {
-        invocation.set_text(format_args!("err=0x{:08x} {cleared}{applied}", result.0));
-    } else {
-        invocation.set_text(format_args!("{cleared}{applied}"));
+    match result {
+        Err(error) => invocation.set_text(format_args!(
+            "err=0x{:08x} {cleared}{applied}",
+            Hresult::from(error).0
+        )),
+        Ok(_) => invocation.set_text(format_args!("{cleared}{applied}")),
     }
     result
 }
@@ -254,11 +275,11 @@ pub(super) fn receive_certificate(
     received: &mut u32,
     size: u32,
     cx: &mut ContinuationContext<'_>,
-) -> Hresult {
+) -> CommandResult {
     if cx.received.is_empty() {
         cx.backend.proxy_upload_aborted(id);
         cx.session.receive_remaining = Some(0);
-        return UPLOAD_ABORTED;
+        return Err(NetworkError::UploadAborted.into());
     }
     let count = (cx.received.len() as u32).min(size - *received);
     cx.backend
@@ -267,7 +288,7 @@ pub(super) fn receive_certificate(
     let remaining = size - *received;
     cx.session.receive_remaining = Some(remaining);
     if remaining != 0 {
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     if cx
         .backend
@@ -276,7 +297,7 @@ pub(super) fn receive_certificate(
     {
         cx.state.settings_dirty = true;
     }
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// Settings lines of active, persistent, complete entries (stock

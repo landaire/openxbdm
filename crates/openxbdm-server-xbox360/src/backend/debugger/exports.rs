@@ -8,15 +8,16 @@ use core::sync::atomic::Ordering;
 
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::NtStatus;
 use openxbdm_server::commands::debugger;
 use openxbdm_server::commands::debugger::ContextFlags;
 use openxbdm_server::commands::debugger::DataTarget;
 use openxbdm_server::commands::debugger::ExtensionHandle;
 use openxbdm_server::commands::debugger::NoSuchThread;
-use openxbdm_server::commands::debugger::SetContextError;
 use openxbdm_server::commands::debugger::StopOn;
 use openxbdm_server::commands::debugger::ThreadId;
 use openxbdm_server::notify::ExecutionState;
+use openxbdm_server::reply::CommandError;
 use openxbdm_server::state::ServerState;
 
 use super::super::dispatcher;
@@ -33,9 +34,8 @@ import_thunk!(
     ordinal = 0x12a
 );
 
-const NO_SUCH_THREAD: Hresult = Hresult::from_error_code(ErrorCode::NO_SUCH_THREAD);
-const NOT_STOPPED: Hresult = Hresult::from_error_code(ErrorCode::NOT_STOPPED);
-const BAD_PARAMETER: Hresult = Hresult::from_error_code(ErrorCode::BAD_PARAMETER);
+/// Export 178's result for a missing or overlong name.
+const BAD_PARAMETER: Hresult = Hresult::from_error_code(ErrorCode::BadParameter);
 /// More threads exist than the caller's list holds.
 const BUFFER_TOO_SMALL: Hresult = Hresult::error(0x105);
 /// Longest extension name export 178 accepts.
@@ -61,6 +61,19 @@ fn write_u32(address: u32, value: u32) {
 fn write_u8(address: u32, value: u8) {
     // SAFETY: the caller passes a writable location.
     unsafe { core::ptr::write_volatile(address as usize as *mut u8, value) }
+}
+
+/// The result word of a failed export.
+fn error_word(error: impl Into<CommandError>) -> u32 {
+    Hresult::from(error.into()).0
+}
+
+/// The result word of an export without outputs.
+fn result_word(result: Result<(), impl Into<CommandError>>) -> u32 {
+    match result {
+        Ok(()) => Hresult::OK.0,
+        Err(error) => error_word(error),
+    }
 }
 
 /// Arguments of an export, passed to the server thread on the caller's
@@ -119,14 +132,13 @@ extern "C" fn continue_thread(thread: u32, exception: u32) -> u32 {
     on_server(
         |server, console, network, argument| {
             let request = request(argument);
-            debugger::continue_stopped_thread(
+            result_word(debugger::continue_stopped_thread(
                 &mut server.state,
                 console,
                 network,
                 ThreadId(request.first),
                 request.second != 0,
-            )
-            .0
+            ))
         },
         thread,
         exception,
@@ -146,14 +158,11 @@ extern "C" fn get_thread_context(thread: u32, context: u32) -> u32 {
         flags,
         ..debugger::Context::default()
     };
-    match super::read_thread_context(ThreadId(thread), &mut read) {
-        Ok(()) => {
-            write_u32(context, read.flags.0);
-            super::context_to_memory(context, &read);
-            Hresult::OK.0
-        }
-        Err(NoSuchThread) => NO_SUCH_THREAD.0,
-    }
+    let result = super::read_thread_context(ThreadId(thread), &mut read).map(|()| {
+        write_u32(context, read.flags.0);
+        super::context_to_memory(context, &read);
+    });
+    result_word(result)
 }
 export!(13, get_thread_context);
 
@@ -183,7 +192,9 @@ export!(15, get_thread_list);
 /// Stock export 19 (0x91f25b50): `go`.
 extern "C" fn go() -> u32 {
     on_server(
-        |server, console, network, _| debugger::go_execution(&mut server.state, console, network).0,
+        |server, console, network, _| {
+            result_word(debugger::go_execution(&mut server.state, console, network))
+        },
         0,
         0,
         0,
@@ -212,7 +223,7 @@ extern "C" fn is_thread_stopped(thread: u32, record: u32) -> u32 {
                     (request.words, request.count) = reason.encode();
                     Hresult::OK.0
                 }
-                Err(result) => result.0,
+                Err(error) => error_word(error),
             }
         },
         &mut stop,
@@ -226,8 +237,11 @@ export!(22, is_thread_stopped);
 extern "C" fn remove_breakpoint(address: u32) -> u32 {
     on_server(
         |server, console, _, argument| {
-            debugger::clear_software_breakpoint(&mut server.state, console, request(argument).first)
-                .0
+            result_word(debugger::clear_software_breakpoint(
+                &mut server.state,
+                console,
+                request(argument).first,
+            ))
         },
         address,
         0,
@@ -238,10 +252,7 @@ export!(34, remove_breakpoint);
 
 /// Stock export 35 (0x91f26838): `(thread) -> HRESULT`.
 extern "C" fn resume_thread(thread: u32) -> u32 {
-    match super::resume(ThreadId(thread)) {
-        Ok(()) => Hresult::OK.0,
-        Err(NoSuchThread) => NO_SUCH_THREAD.0,
-    }
+    result_word(super::resume(ThreadId(thread)))
 }
 export!(35, resume_thread);
 
@@ -249,7 +260,11 @@ export!(35, resume_thread);
 extern "C" fn set_breakpoint(address: u32) -> u32 {
     on_server(
         |server, console, _, argument| {
-            debugger::set_software_breakpoint(&mut server.state, console, request(argument).first).0
+            result_word(debugger::set_software_breakpoint(
+                &mut server.state,
+                console,
+                request(argument).first,
+            ))
         },
         address,
         0,
@@ -265,14 +280,13 @@ extern "C" fn set_data_breakpoint(address: u32, kind: u32, size: u32) -> u32 {
         |server, console, _, argument| {
             let request = request(argument);
             let target = DataTarget::from_type(request.second);
-            debugger::set_data_breakpoint(
+            result_word(debugger::set_data_breakpoint(
                 &mut server.state,
                 console,
                 request.first,
                 request.third,
                 target,
-            )
-            .0
+            ))
         },
         address,
         kind,
@@ -284,7 +298,9 @@ export!(38, set_data_breakpoint);
 /// Stock export 39 (0x91f26728): `break start`.
 extern "C" fn break_at_title_start() -> u32 {
     on_server(
-        |server, console, _, _| debugger::break_at_title_start(&mut server.state, console).0,
+        |server, console, _, _| {
+            result_word(debugger::break_at_title_start(&mut server.state, console))
+        },
         0,
         0,
         0,
@@ -300,11 +316,7 @@ extern "C" fn set_thread_context(thread: u32, context: u32) -> u32 {
     }
     let flags = ContextFlags(read_u32(context)).intersection(ContextFlags::FULL);
     let source = super::context_from_memory(context, flags);
-    match super::write_thread_context(ThreadId(thread), &source) {
-        Ok(()) => Hresult::OK.0,
-        Err(SetContextError::NoSuchThread) => NO_SUCH_THREAD.0,
-        Err(SetContextError::NotStopped) => NOT_STOPPED.0,
-    }
+    result_word(super::write_thread_context(ThreadId(thread), &source))
 }
 export!(41, set_thread_context);
 
@@ -312,7 +324,11 @@ export!(41, set_thread_context);
 extern "C" fn stop() -> u32 {
     on_server(
         |server, console, network, _| {
-            debugger::stop_execution(&mut server.state, console, network).0
+            result_word(debugger::stop_execution(
+                &mut server.state,
+                console,
+                network,
+            ))
         },
         0,
         0,
@@ -365,10 +381,7 @@ export!(46, stop_on);
 
 /// Stock export 48 (0x91f267e8): `(thread) -> HRESULT`.
 extern "C" fn suspend_thread(thread: u32) -> u32 {
-    match super::suspend(ThreadId(thread)) {
-        Ok(()) => Hresult::OK.0,
-        Err(NoSuchThread) => NO_SUCH_THREAD.0,
-    }
+    result_word(super::suspend(ThreadId(thread)))
 }
 export!(48, suspend_thread);
 
@@ -381,14 +394,14 @@ extern "C" fn thread_debug_data(thread: u32, address: u32) -> u32 {
         return Hresult::INVALID_ARGUMENT.0;
     }
     if thread != u32::MAX && super::ThreadRef::lookup(ThreadId(thread)).is_err() {
-        return NO_SUCH_THREAD.0;
+        return error_word(NoSuchThread);
     }
     match super::current_record() {
         Some(record) => {
             write_u32(address, super::debug_data_of(record));
             Hresult::OK.0
         }
-        None => NO_SUCH_THREAD.0,
+        None => error_word(NoSuchThread),
     }
 }
 export!(49, thread_debug_data);
@@ -477,7 +490,7 @@ extern "C" fn thread_info(thread: u32, info: u32) -> u32 {
         return Hresult::INVALID_ARGUMENT.0;
     }
     let Ok(details) = super::thread_information(ThreadId(thread)) else {
-        return NO_SUCH_THREAD.0;
+        return error_word(NoSuchThread);
     };
     for offset in 4..size {
         write_u8(info + offset, 0);
@@ -542,7 +555,7 @@ extern "C" fn load_extension(name: u32, handle: u32) -> u32 {
                     request.count = 1;
                     Hresult::OK.0
                 }
-                Err(result) => result.0,
+                Err(error) => error_word(error),
             }
         },
         &mut load,
@@ -558,12 +571,11 @@ export!(178, load_extension);
 extern "C" fn release_extension(handle: u32) -> u32 {
     on_server(
         |server, console, _, argument| {
-            debugger::release_extension(
+            result_word(debugger::release_extension(
                 &mut server.state,
                 console,
                 ExtensionHandle(request(argument).first),
-            )
-            .0
+            ))
         },
         handle,
         0,
@@ -594,8 +606,8 @@ extern "C" fn create_thread(
         parameter,
         creation,
     );
-    if (status as i32) < 0 {
-        kernel::set_last_error(status);
+    if let Err(error) = NtStatus(status).result() {
+        kernel::set_last_error(error);
         return 0;
     }
     handle

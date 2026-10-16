@@ -664,7 +664,7 @@ fn client_commands() {
             .unwrap_err();
         assert!(
             matches!(error.current_context(), Error::Remote { code, message }
-                if *code == ErrorCode::KEY_EXCHANGE_REQUIRED && message == "key exchange required"),
+                if *code == ErrorCode::KeyExchangeRequired && message == "key exchange required"),
             "{error:?}"
         );
         let key = user
@@ -733,12 +733,14 @@ fn exports_share_lock_state_and_users_with_commands() {
                 privileges: Access::READ,
             },
         )
+        .map_err(Hresult::from)
     });
-    assert_eq!(unlocked, Hresult(0x82da_0014));
+    assert_eq!(unlocked, Err(Hresult(0x82da_0014)));
     assert_eq!(
         export(&server, |state, backend| security::walk_users(
             state, backend, &mut 0
-        )),
+        )
+        .map_err(Hresult::from)),
         Err(Hresult(0x82da_0104))
     );
 
@@ -770,7 +772,7 @@ fn exports_share_lock_state_and_users_with_commands() {
             },
         )
     });
-    assert_eq!(added, Hresult::OK);
+    assert_eq!(added, Ok(()));
     assert_eq!(
         settings(&server),
         [
@@ -789,8 +791,9 @@ fn exports_share_lock_state_and_users_with_commands() {
                 privileges: access,
             },
         )
+        .map_err(Hresult::from)
     });
-    assert_eq!(again, Hresult(0x82da_000a));
+    assert_eq!(again, Err(Hresult(0x82da_000a)));
 
     // The access word is stored as given, including bits no command names.
     let raw = Access::from_bits(0x8000_0001);
@@ -798,7 +801,7 @@ fn exports_share_lock_state_and_users_with_commands() {
         export(&server, |_, backend| security::set_user_access(
             backend, b"eve", raw
         )),
-        Hresult::OK
+        Ok(())
     );
     assert_eq!(
         export(&server, |_, backend| security::user_access(backend, b"eve")),
@@ -808,13 +811,15 @@ fn exports_share_lock_state_and_users_with_commands() {
     assert_eq!(
         export(&server, |_, backend| security::set_user_access(
             backend, b"nobody", raw
-        )),
-        Hresult(0x82da_0002)
+        )
+        .map_err(Hresult::from)),
+        Err(Hresult(0x82da_0002))
     );
     assert_eq!(
         export(&server, |_, backend| security::user_access(
             backend, b"nobody"
-        )),
+        )
+        .map_err(Hresult::from)),
         Err(Hresult(0x82da_0002))
     );
 
@@ -823,7 +828,7 @@ fn exports_share_lock_state_and_users_with_commands() {
     let mut position = 0;
     let end = loop {
         match export(&server, |state, backend| {
-            security::walk_users(state, backend, &mut position)
+            security::walk_users(state, backend, &mut position).map_err(Hresult::from)
         }) {
             Ok((name, access)) => walked.push((
                 String::from_utf8(name.as_bytes().to_vec()).unwrap(),
@@ -841,14 +846,15 @@ fn exports_share_lock_state_and_users_with_commands() {
     assert_eq!(
         export(&server, |state, backend| security::remove_user(
             state, backend, b"nobody"
-        )),
-        Hresult(0x82da_0002)
+        )
+        .map_err(Hresult::from)),
+        Err(Hresult(0x82da_0002))
     );
     assert_eq!(
         export(&server, |state, backend| security::remove_user(
             state, backend, b"BOB"
         )),
-        Hresult::OK
+        Ok(())
     );
     assert_eq!(admin.command("getuserpriv name=bob"), "402- file not found");
     assert_eq!(

@@ -12,6 +12,7 @@ use openxbdm_server::commands::security::Password;
 use openxbdm_server::commands::security::User;
 use openxbdm_server::commands::security::UserCreationFailed;
 use openxbdm_server::commands::security::UserName;
+use openxbdm_server::reply::CommandError;
 
 use super::Console;
 use super::dispatcher;
@@ -315,16 +316,24 @@ fn save_settings(server: &mut Server, console: &mut Console) {
     server.save_settings_if_dirty(console);
 }
 
+/// The export's return word: `S_OK`, or the failure's result value.
+fn export_result(result: Result<(), CommandError>) -> u32 {
+    match result {
+        Ok(()) => Hresult::OK.0,
+        Err(error) => Hresult::from(error).0,
+    }
+}
+
 extern "C" fn set_user_access(user: u32, access: u32) -> u32 {
     on_server(
         |_, console, _, argument| {
             let request = request(argument);
-            security::set_user_access(
+            let result = security::set_user_access(
                 console,
                 name(request.first),
                 Access::from_bits(request.second),
-            )
-            .0
+            );
+            export_result(result)
         },
         user,
         access,
@@ -336,13 +345,9 @@ extern "C" fn get_user_access(user: u32, access: u32) -> u32 {
     on_server(
         |_, console, _, argument| {
             let request = request(argument);
-            match security::user_access(console, name(request.first)) {
-                Ok(found) => {
-                    write_u32(request.second, found.bits());
-                    Hresult::OK.0
-                }
-                Err(result) => result.0,
-            }
+            let result = security::user_access(console, name(request.first))
+                .map(|found| write_u32(request.second, found.bits()));
+            export_result(result)
         },
         user,
         access,
@@ -360,8 +365,8 @@ extern "C" fn walk_users(walk: u32, record: u32) -> u32 {
             let request = request(argument);
             // SAFETY: the caller passes a writable walk position.
             let position = unsafe { &mut *(request.first as usize as *mut u32) };
-            match security::walk_users(&server.state, console, position) {
-                Ok((user, access)) => {
+            let result =
+                security::walk_users(&server.state, console, position).map(|(user, access)| {
                     let record = request.second;
                     // SAFETY: the caller passes a `DM_USER` record.
                     unsafe {
@@ -377,10 +382,8 @@ extern "C" fn walk_users(walk: u32, record: u32) -> u32 {
                         );
                     }
                     write_u32(record + USER_RECORD_ACCESS, access.bits());
-                    Hresult::OK.0
-                }
-                Err(result) => result.0,
-            }
+                });
+            export_result(result)
         },
         walk,
         record,
@@ -398,7 +401,7 @@ extern "C" fn add_user(user: u32, access: u32) -> u32 {
             };
             let result = security::add_user(&mut server.state, console, name(request.first), user);
             save_settings(server, console);
-            result.0
+            export_result(result)
         },
         user,
         access,
@@ -442,7 +445,7 @@ extern "C" fn remove_user(user: u32) -> u32 {
             let result =
                 security::remove_user(&mut server.state, console, name(request(argument).first));
             save_settings(server, console);
-            result.0
+            export_result(result)
         },
         user,
         0,

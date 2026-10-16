@@ -886,7 +886,7 @@ mod ffi {
         pub(crate) data_address: u32,
         pub(crate) length: u32,
         pub(crate) access: u32,
-        pub(crate) code: u32,
+        pub(crate) code: Option<openxbdm_client::commands::NtStatus>,
         pub(crate) access_violation: bool,
         pub(crate) first_chance: bool,
         pub(crate) noncontinuable: bool,
@@ -902,7 +902,7 @@ mod ffi {
                 data_address: 0,
                 length: 0,
                 access: 0,
-                code: 0,
+                code: None,
                 access_violation: false,
                 first_chance: false,
                 noncontinuable: false,
@@ -979,7 +979,7 @@ mod ffi {
                     let base = Self {
                         thread: exception.thread.0,
                         address: exception.address,
-                        code: exception.code,
+                        code: Some(exception.code),
                         first_chance: exception.first_chance,
                         noncontinuable: exception.noncontinuable,
                         ..Self::with_kind(9)
@@ -1035,9 +1035,9 @@ mod ffi {
         pub fn access(&self) -> u32 {
             self.access
         }
-        /// Kind 9: the exception code.
+        /// Kind 9: the exception code; 0 for other kinds.
         pub fn exception_code(&self) -> u32 {
-            self.code
+            self.code.map_or(0, |code| code.0)
         }
         /// Kind 9: the exception is an access violation (0xc0000005).
         pub fn is_access_violation(&self) -> bool {
@@ -1298,7 +1298,7 @@ mod ffi {
         pub(crate) name_address: u32,
         pub(crate) name_length: u32,
         pub(crate) processor: u32,
-        pub(crate) last_error: u32,
+        pub(crate) last_error: Option<openxbdm_client::commands::Win32Error>,
     }
 
     impl From<openxbdm_client::commands::ThreadDetail> for OpenxbdmThreadDetail {
@@ -1358,8 +1358,10 @@ mod ffi {
         pub fn processor(&self) -> u32 {
             self.processor
         }
+        /// The thread's last Win32 error; 0 for `ERROR_SUCCESS`.
         pub fn last_error(&self) -> u32 {
             self.last_error
+                .map_or(0, openxbdm_client::commands::Win32Error::code)
         }
     }
 

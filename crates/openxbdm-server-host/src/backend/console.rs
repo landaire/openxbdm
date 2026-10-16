@@ -12,7 +12,8 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
-use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::KernelError;
+use openxbdm_core::status::Win32Error;
 use openxbdm_server::commands::console;
 use openxbdm_server::commands::console::ConfigSetting;
 use openxbdm_server::commands::console::ConsoleId;
@@ -24,17 +25,16 @@ use openxbdm_server::commands::console::KitFeatures;
 use openxbdm_server::commands::console::MemoryStatistics;
 use openxbdm_server::commands::console::NETWORK_ADDRESS_SIZE;
 use openxbdm_server::commands::console::NetworkAddress;
+use openxbdm_server::commands::console::NetworkRaError;
 use openxbdm_server::commands::console::NetworkRaRecord;
 use openxbdm_server::commands::console::NetworkRaRequest;
 use openxbdm_server::commands::console::Published;
 use openxbdm_server::commands::console::REGISTRATION_RESPONSE_CAPACITY;
 use openxbdm_server::commands::console::REGISTRATION_USER_AGENT;
 use openxbdm_server::commands::console::SETTINGS_BLOCK_SIZE;
-use openxbdm_server::commands::console::STATUS_PROCEDURE_NOT_FOUND;
 use openxbdm_server::commands::console::SystemInformation;
 use openxbdm_server::commands::console::SystemSettings;
 use openxbdm_server::commands::console::Version;
-use openxbdm_server::commands::console::XamStatus;
 
 use super::MockBackend;
 
@@ -44,8 +44,8 @@ pub struct XConfig {
     /// Stored values. A setting never written reads as zero bytes of the
     /// requested length, as the fixed-layout settings of a new console do.
     pub settings: BTreeMap<ConfigSetting, Vec<u8>>,
-    /// Status returned by every read, write, or modify of a setting.
-    pub failures: BTreeMap<ConfigSetting, NtStatus>,
+    /// Failure of every read, write, or modify of a setting.
+    pub failures: BTreeMap<ConfigSetting, KernelError>,
     /// Whether the kernel provides the modify export (ordinal 700).
     pub modify_export: bool,
 }
@@ -79,9 +79,9 @@ impl XConfig {
         u32::from_be_bytes(bytes)
     }
 
-    fn check(&self, setting: ConfigSetting) -> Result<(), NtStatus> {
+    fn check(&self, setting: ConfigSetting) -> Result<(), KernelError> {
         match self.failures.get(&setting) {
-            Some(&status) => Err(status),
+            Some(&error) => Err(error),
             None => Ok(()),
         }
     }
@@ -91,8 +91,8 @@ impl XConfig {
 #[derive(Debug, Default)]
 pub struct NetworkRaService {
     pub record: NetworkRaRecord,
-    /// Status of every request while set.
-    pub failure: Option<XamStatus>,
+    /// Failure of every request while set.
+    pub failure: Option<NetworkRaError>,
     pub resets: u32,
 }
 
@@ -107,7 +107,7 @@ pub struct Mock {
     pub i2c_failure: bool,
     pub memory_statistics: Option<MemoryStatistics>,
     pub system_information: SystemInformation,
-    pub console_id: Result<ConsoleId, NtStatus>,
+    pub console_id: Result<ConsoleId, KernelError>,
     pub debug_address: NetworkAddress,
     pub title_address: NetworkAddress,
     /// Times the inactivity configuration was applied.
@@ -115,8 +115,8 @@ pub struct Mock {
     pub network_ra: NetworkRaService,
     /// Calls of the system UI feature switch; `None` when the export is absent.
     pub feature_calls: Option<Vec<(u32, u32)>>,
-    /// Status of loading the network file system client.
-    pub network_client_status: NtStatus,
+    /// Failure of loading the network file system client; `None` loads it.
+    pub network_client_failure: Option<KernelError>,
     /// System software version reported to the registration task.
     pub system_version: u32,
     /// Origin of the millisecond tick.
@@ -173,7 +173,7 @@ pub struct HttpClient {
 }
 
 /// Header lookup error of the console HTTP stack (header not found).
-const HTTP_HEADER_NOT_FOUND: u32 = 12150;
+const HTTP_HEADER_NOT_FOUND: Win32Error = Win32Error::new(12150).unwrap();
 /// Kernel address of the simulated server thread object.
 pub const SERVER_THREAD: u32 = 0x8007_4a00;
 /// Port of a request without one.
@@ -181,8 +181,10 @@ const HTTP_DEFAULT_PORT: u16 = 80;
 /// Limit on each socket wait of a request.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn os_error(error: &io::Error) -> u32 {
-    error.raw_os_error().map_or(0, |code| code as u32)
+fn os_error(error: &io::Error) -> Option<Win32Error> {
+    error
+        .raw_os_error()
+        .and_then(|code| Win32Error::new(code as u32))
 }
 
 impl HttpClient {
@@ -218,7 +220,12 @@ impl HttpClient {
             }
             let mut chunk = [0u8; 512];
             match stream.read(&mut chunk) {
-                Ok(0) => return Err(HttpFailure::Request { state: 3, error: 0 }),
+                Ok(0) => {
+                    return Err(HttpFailure::Request {
+                        state: 3,
+                        error: None,
+                    });
+                }
                 Ok(count) => received.extend_from_slice(&chunk[..count]),
                 Err(error) => return Err(request_error(3, &error)),
             }
@@ -230,7 +237,7 @@ impl HttpClient {
             .and_then(|status| status.split(' ').nth(1))
             .and_then(|code| code.parse::<u32>().ok());
         let code = code.ok_or(HttpFailure::StatusQuery {
-            error: HTTP_HEADER_NOT_FOUND,
+            error: Some(HTTP_HEADER_NOT_FOUND),
         })?;
         if code != 200 {
             return Err(HttpFailure::Status { code });
@@ -242,7 +249,7 @@ impl HttpClient {
                 .then(|| value.trim().parse::<u32>().ok())?
         });
         let length = length.ok_or(HttpFailure::ContentLength {
-            error: HTTP_HEADER_NOT_FOUND,
+            error: Some(HTTP_HEADER_NOT_FOUND),
         })?;
         if length as usize > REGISTRATION_RESPONSE_CAPACITY {
             return Err(HttpFailure::TooLarge { length });
@@ -313,7 +320,7 @@ impl Default for Mock {
             inactivity_updates: 0,
             network_ra: NetworkRaService::default(),
             feature_calls: Some(Vec::new()),
-            network_client_status: NtStatus::SUCCESS,
+            network_client_failure: None,
             system_version: 0x2045_5400,
             boot: Instant::now(),
             http: HttpClient::default(),
@@ -334,7 +341,7 @@ impl console::Backend for MockBackend {
         &mut self,
         setting: ConfigSetting,
         output: &mut [u8],
-    ) -> Result<usize, NtStatus> {
+    ) -> Result<usize, KernelError> {
         let xconfig = &self.console.xconfig;
         xconfig.check(setting)?;
         output.fill(0);
@@ -348,7 +355,7 @@ impl console::Backend for MockBackend {
         }
     }
 
-    fn xconfig_set(&mut self, setting: ConfigSetting, value: &[u8]) -> Result<(), NtStatus> {
+    fn xconfig_set(&mut self, setting: ConfigSetting, value: &[u8]) -> Result<(), KernelError> {
         self.console.xconfig.check(setting)?;
         self.console
             .xconfig
@@ -362,10 +369,10 @@ impl console::Backend for MockBackend {
         setting: ConfigSetting,
         and_mask: u32,
         or_mask: u32,
-    ) -> Result<(), NtStatus> {
+    ) -> Result<(), KernelError> {
         let xconfig = &mut self.console.xconfig;
         if !xconfig.modify_export {
-            return Err(STATUS_PROCEDURE_NOT_FOUND);
+            return Err(KernelError::OrdinalNotFound);
         }
         xconfig.check(setting)?;
         let value = (xconfig.dword(setting.category, setting.index) & and_mask) | or_mask;
@@ -395,7 +402,7 @@ impl console::Backend for MockBackend {
         self.console.system_information
     }
 
-    fn console_id(&mut self) -> Result<ConsoleId, NtStatus> {
+    fn console_id(&mut self) -> Result<ConsoleId, KernelError> {
         self.console.console_id
     }
 
@@ -411,17 +418,17 @@ impl console::Backend for MockBackend {
         self.console.inactivity_updates += 1;
     }
 
-    fn network_ra_request(&mut self, request: NetworkRaRequest<'_>) -> XamStatus {
+    fn network_ra_request(&mut self, request: NetworkRaRequest<'_>) -> Result<(), NetworkRaError> {
         let service = &mut self.console.network_ra;
-        if let Some(status) = service.failure {
-            return status;
+        if let Some(error) = service.failure {
+            return Err(error);
         }
         match request {
             NetworkRaRequest::Get(record) => *record = service.record,
             NetworkRaRequest::Set(record) => service.record = *record,
             NetworkRaRequest::Reset => service.resets += 1,
         }
-        XamStatus(0)
+        Ok(())
     }
 
     fn feature_switch_present(&mut self) -> bool {
@@ -434,8 +441,8 @@ impl console::Backend for MockBackend {
         }
     }
 
-    fn load_network_client(&mut self) -> NtStatus {
-        self.console.network_client_status
+    fn load_network_client(&mut self) -> Result<(), KernelError> {
+        self.console.network_client_failure.map_or(Ok(()), Err)
     }
 
     fn tick_milliseconds(&mut self) -> u32 {
@@ -459,11 +466,13 @@ impl console::Backend for MockBackend {
 
     fn http_poll(&mut self, body: &mut [u8; REGISTRATION_RESPONSE_CAPACITY]) -> HttpProgress {
         let Some(receiver) = &self.console.http.pending else {
-            return HttpProgress::Failed(HttpFailure::Work { error: 0 });
+            return HttpProgress::Failed(HttpFailure::Work { error: None });
         };
         match receiver.try_recv() {
             Err(TryRecvError::Empty) => HttpProgress::Pending,
-            Err(TryRecvError::Disconnected) => HttpProgress::Failed(HttpFailure::Work { error: 0 }),
+            Err(TryRecvError::Disconnected) => {
+                HttpProgress::Failed(HttpFailure::Work { error: None })
+            }
             Ok(Err(failure)) => HttpProgress::Failed(failure),
             Ok(Ok(content)) => {
                 body.fill(0);

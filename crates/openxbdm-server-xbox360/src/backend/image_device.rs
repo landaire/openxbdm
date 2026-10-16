@@ -10,6 +10,7 @@ use core::ptr::null_mut;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
+use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
 
 use crate::exports::export_raw;
@@ -53,7 +54,6 @@ const STATUS_INVALID_PARAMETER: NtStatus = NtStatus(0xc000_000d);
 const STATUS_INVALID_DEVICE_REQUEST: NtStatus = NtStatus(0xc000_0010);
 const STATUS_END_OF_FILE: NtStatus = NtStatus(0xc000_0011);
 const STATUS_BUFFER_TOO_SMALL: NtStatus = NtStatus(0xc000_0023);
-const STATUS_MAPPED_ALIGNMENT: NtStatus = NtStatus(0xc000_0220);
 
 const GENERIC_READ: u32 = 0x8000_0000;
 const FILE_SHARE_READ: u32 = 1;
@@ -411,10 +411,11 @@ extern "C" fn mount_thread(request: *mut MountRequest) -> u32 {
             Ok(created) => {
                 device = Some(created);
                 MOUNTED.fetch_add(1, Ordering::Relaxed);
-                NtStatus::SUCCESS.0
+                NtStatus::SUCCESS
             }
-            Err(status) => status.0,
+            Err(error) => NtStatus::from(error),
         }
+        .0
     } else {
         file = 0;
         opened
@@ -471,15 +472,18 @@ fn create_device(
     file: u32,
     name: *const AnsiString,
     length: u64,
-) -> Result<*mut DeviceObject, NtStatus> {
+) -> Result<*mut DeviceObject, KernelError> {
     if length as u32 & SECTOR_MASK != 0 {
-        return Err(STATUS_MAPPED_ALIGNMENT);
+        return Err(KernelError::MappedAlignment);
     }
     let mut io_event = 0u32;
-    let created = kernel::NtCreateEvent(&mut io_event, null(), u32::from(SYNCHRONIZATION), 0);
-    if !succeeded(created) {
-        return Err(NtStatus(created));
-    }
+    NtStatus(kernel::NtCreateEvent(
+        &mut io_event,
+        null(),
+        u32::from(SYNCHRONIZATION),
+        0,
+    ))
+    .result()?;
     let mut device: *mut DeviceObject = null_mut();
     let status = IoCreateDevice(
         DRIVER.0.get(),
@@ -489,9 +493,9 @@ fn create_device(
         0,
         &mut device,
     );
-    if !succeeded(status) {
+    if let Err(error) = NtStatus(status).result() {
         kernel::NtClose(io_event);
-        return Err(NtStatus(status));
+        return Err(error);
     }
     // SAFETY: the kernel created the device with an extension of the
     // requested size; nothing else uses it yet.
@@ -523,10 +527,10 @@ fn create_device(
             device as usize as u32,
             WORKER_THREAD_FLAGS | process_flags,
         );
-        if !succeeded(status) {
+        if let Err(error) = NtStatus(status).result() {
             (*extension).thread = None;
             delete_device(device);
-            return Err(NtStatus(status));
+            return Err(error);
         }
         KeSetPriorityThread((*extension).thread, WORKER_PRIORITY);
         (*device).flags &= !DEVICE_INITIALIZING;

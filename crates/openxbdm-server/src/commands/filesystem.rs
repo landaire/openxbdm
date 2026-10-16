@@ -4,7 +4,8 @@ use core::fmt::Write as _;
 
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
-use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::KernelError;
+use openxbdm_core::status::Win32Error;
 
 use crate::access::Access;
 use crate::commands::console;
@@ -17,32 +18,10 @@ use crate::invocation::Invocation;
 use crate::notify::ExecutionState;
 use crate::registry::CommandEntry;
 use crate::registry::DispatchFlags;
+use crate::reply::CommandError;
+use crate::reply::CommandResult;
+use crate::reply::Reply;
 use crate::state::ServerState;
-
-/// Kernel status codes this domain produces or distinguishes.
-pub mod nt {
-    use openxbdm_core::status::NtStatus;
-
-    pub const BUFFER_OVERFLOW: NtStatus = NtStatus(0x8000_0005);
-    pub const NO_MORE_FILES: NtStatus = NtStatus(0x8000_0006);
-    pub const INVALID_PARAMETER: NtStatus = NtStatus(0xc000_000d);
-    /// Result of a path that does not translate to an object name.
-    pub const NO_SUCH_FILE: NtStatus = NtStatus(0xc000_000f);
-    pub const NO_MEDIA_IN_DEVICE: NtStatus = NtStatus(0xc000_0013);
-    pub const NO_MEMORY: NtStatus = NtStatus(0xc000_0017);
-    pub const ACCESS_DENIED: NtStatus = NtStatus(0xc000_0022);
-    pub const OBJECT_NAME_INVALID: NtStatus = NtStatus(0xc000_0033);
-    pub const OBJECT_NAME_NOT_FOUND: NtStatus = NtStatus(0xc000_0034);
-    pub const OBJECT_NAME_COLLISION: NtStatus = NtStatus(0xc000_0035);
-    pub const OBJECT_PATH_NOT_FOUND: NtStatus = NtStatus(0xc000_003a);
-    pub const CRC_ERROR: NtStatus = NtStatus(0xc000_003f);
-    pub const DISK_FULL: NtStatus = NtStatus(0xc000_007f);
-    pub const FILE_IS_A_DIRECTORY: NtStatus = NtStatus(0xc000_00ba);
-    pub const NOT_SAME_DEVICE: NtStatus = NtStatus(0xc000_00d4);
-    pub const DIRECTORY_NOT_EMPTY: NtStatus = NtStatus(0xc000_0101);
-    pub const NOT_A_DIRECTORY: NtStatus = NtStatus(0xc000_0103);
-    pub const CANNOT_DELETE: NtStatus = NtStatus(0xc000_0121);
-}
 
 /// Most file name parameters are copied into 0x141-byte buffers.
 const NAME_BUFFER: usize = 0x141;
@@ -136,6 +115,8 @@ pub struct FileAccess(pub u32);
 
 impl FileAccess {
     pub const LIST_DIRECTORY: Self = Self(0x1);
+    pub const READ_DATA: Self = Self(0x1);
+    pub const WRITE_DATA: Self = Self(0x2);
     pub const WRITE_ATTRIBUTES: Self = Self(0x100);
     pub const DELETE: Self = Self(0x1_0000);
     pub const SYNCHRONIZE: Self = Self(0x10_0000);
@@ -180,6 +161,7 @@ pub struct CreateOptions(pub u32);
 impl CreateOptions {
     pub const NONE: Self = Self(0);
     pub const DIRECTORY_FILE: Self = Self(0x1);
+    pub const NO_INTERMEDIATE_BUFFERING: Self = Self(0x8);
     pub const SYNCHRONOUS_IO_ALERT: Self = Self(0x10);
     pub const SYNCHRONOUS_IO_NONALERT: Self = Self(0x20);
     pub const NON_DIRECTORY_FILE: Self = Self(0x40);
@@ -308,8 +290,11 @@ pub struct DvdTrace {
 
 /// Platform services this domain needs. Paths are kernel object names.
 pub trait Backend {
-    fn create_file(&mut self, path: &[u8], request: &CreateRequest)
-    -> Result<FileHandle, NtStatus>;
+    fn create_file(
+        &mut self,
+        path: &[u8],
+        request: &CreateRequest,
+    ) -> Result<FileHandle, KernelError>;
     /// Open `name` relative to an object directory.
     fn open_relative(
         &mut self,
@@ -318,7 +303,7 @@ pub trait Backend {
         access: FileAccess,
         share: ShareAccess,
         options: CreateOptions,
-    ) -> Result<FileHandle, NtStatus>;
+    ) -> Result<FileHandle, KernelError>;
     fn close_file(&mut self, handle: FileHandle);
     /// Count the close of a file a command may have changed (0x91f9feec,
     /// read by export 85).
@@ -330,47 +315,54 @@ pub trait Backend {
         handle: FileHandle,
         offset: Option<u64>,
         target: PoolRange,
-    ) -> Result<u32, NtStatus>;
+    ) -> Result<u32, KernelError>;
     /// Write at `offset`, or at the current position when `None`.
     fn write_file(
         &mut self,
         handle: FileHandle,
         offset: Option<u64>,
         data: FileData<'_>,
-    ) -> Result<(), NtStatus>;
-    fn set_delete_disposition(&mut self, handle: FileHandle, delete: bool) -> Result<(), NtStatus>;
-    fn set_end_of_file(&mut self, handle: FileHandle, size: u64) -> Result<(), NtStatus>;
-    fn set_file_position(&mut self, handle: FileHandle, position: u64) -> Result<(), NtStatus>;
+    ) -> Result<(), KernelError>;
+    fn set_delete_disposition(
+        &mut self,
+        handle: FileHandle,
+        delete: bool,
+    ) -> Result<(), KernelError>;
+    fn set_end_of_file(&mut self, handle: FileHandle, size: u64) -> Result<(), KernelError>;
+    fn set_file_position(&mut self, handle: FileHandle, position: u64) -> Result<(), KernelError>;
     fn set_basic_information(
         &mut self,
         handle: FileHandle,
         information: &BasicInformation,
-    ) -> Result<(), NtStatus>;
+    ) -> Result<(), KernelError>;
     fn rename_file(
         &mut self,
         handle: FileHandle,
         target: &[u8],
         replace: bool,
-    ) -> Result<(), NtStatus>;
-    fn query_file_information(&mut self, handle: FileHandle) -> Result<FileInformation, NtStatus>;
-    fn query_full_attributes(&mut self, path: &[u8]) -> Result<FileInformation, NtStatus>;
+    ) -> Result<(), KernelError>;
+    fn query_file_information(
+        &mut self,
+        handle: FileHandle,
+    ) -> Result<FileInformation, KernelError>;
+    fn query_full_attributes(&mut self, path: &[u8]) -> Result<FileInformation, KernelError>;
     /// Next entry of a directory; the name goes into `name`. A name longer
-    /// than `name` fails with [`nt::BUFFER_OVERFLOW`].
+    /// than `name` fails with [`KernelError::BufferOverflow`].
     fn query_directory(
         &mut self,
         handle: FileHandle,
         restart: bool,
         name: &mut [u8],
-    ) -> Result<DirectoryEntry, NtStatus>;
-    fn query_volume_size(&mut self, handle: FileHandle) -> Result<VolumeSize, NtStatus>;
+    ) -> Result<DirectoryEntry, KernelError>;
+    fn query_volume_size(&mut self, handle: FileHandle) -> Result<VolumeSize, KernelError>;
     /// Resolve the symbolic link object `link` into `target`; returns the
     /// target length.
     fn translate_symbolic_link(
         &mut self,
         link: &[u8],
         target: &mut [u8],
-    ) -> Result<usize, NtStatus>;
-    fn open_object_directory(&mut self, path: &[u8]) -> Result<ObjectDirectory, NtStatus>;
+    ) -> Result<usize, KernelError>;
+    fn open_object_directory(&mut self, path: &[u8]) -> Result<ObjectDirectory, KernelError>;
     /// Next object name of a directory; `context` carries the position.
     fn query_object_directory(
         &mut self,
@@ -378,9 +370,9 @@ pub trait Backend {
         restart: bool,
         context: &mut u32,
         name: &mut [u8],
-    ) -> Result<usize, NtStatus>;
+    ) -> Result<usize, KernelError>;
     fn close_object_directory(&mut self, directory: ObjectDirectory);
-    fn reference_device(&mut self, name: &[u8]) -> Result<DeviceObject, NtStatus>;
+    fn reference_device(&mut self, name: &[u8]) -> Result<DeviceObject, KernelError>;
     fn dereference_device(&mut self, device: DeviceObject);
     /// Synchronous transfer of `buffer.length` bytes at byte `offset`.
     fn transfer_device(
@@ -389,7 +381,7 @@ pub trait Backend {
         direction: TransferDirection,
         offset: u64,
         buffer: PoolRange,
-    ) -> Result<(), NtStatus>;
+    ) -> Result<(), KernelError>;
     fn allocate_pool(&mut self, size: u32) -> Option<PoolBuffer>;
     fn free_pool(&mut self, buffer: PoolBuffer);
     fn pool(&mut self, buffer: PoolBuffer) -> &mut [u8];
@@ -400,11 +392,12 @@ pub trait Backend {
     /// Open (nonzero) or close (zero) the optical drive tray.
     fn open_close_tray(&mut self, value: u32);
     /// Format a block device as XTAF.
-    fn format_partition(&mut self, device: &[u8], cluster_size: u32) -> Result<(), NtStatus>;
+    fn format_partition(&mut self, device: &[u8], cluster_size: u32) -> Result<(), KernelError>;
     /// The kernel update sequence number used in system update file names.
     fn update_sequence(&mut self) -> u16;
-    /// The Win32 error code of a kernel status.
-    fn dos_error(&mut self, status: NtStatus) -> u32;
+    /// The Win32 error code of a failed kernel call; `None` for
+    /// `ERROR_SUCCESS`.
+    fn dos_error(&mut self, error: KernelError) -> Option<Win32Error>;
     /// Allocate a fresh optical drive trace buffer and enable tracing.
     /// Allocation failure leaves tracing off.
     fn start_dvd_trace(&mut self);
@@ -988,9 +981,9 @@ pub fn map_title_drive(
     state: &mut ServerState,
     backend: &mut dyn crate::backend::Backend,
     request: u32,
-) -> u32 {
+) {
     let Some(bytes) = backend.target_bytes(request, DRIVE_NAME_SIZE + 4) else {
-        return 0;
+        return;
     };
     let name_len = bytes[..DRIVE_NAME_SIZE]
         .iter()
@@ -1005,17 +998,16 @@ pub fn map_title_drive(
     ]);
     if name == b"F" || name == b"SMB" {
         crate::commands::console::refresh_network_share(state, backend);
-        return 0;
+        return;
     }
     let target = match address {
         0 => None,
         _ => match mapped_length(backend, address) {
             Some(length) => Some(DriveTarget::Mapped { address, length }),
-            None => return 0,
+            None => return,
         },
     };
     state.filesystem.drives.map(name, target, true);
-    0
 }
 
 /// Length of the title string at `address`. Strings longer than any object
@@ -1043,18 +1035,18 @@ fn is_device_path(name: &[u8]) -> bool {
 }
 
 /// Open a drive path (0x91f2eb68); a path that does not translate fails
-/// with [`nt::NO_SUCH_FILE`].
+/// with [`KernelError::NoSuchFile`].
 pub fn open_translated(
     state: &ServerState,
     backend: &mut dyn crate::backend::Backend,
     name: &[u8],
     request: &CreateRequest,
-) -> Result<FileHandle, NtStatus> {
+) -> Result<FileHandle, KernelError> {
     let path = state
         .filesystem
         .drives
         .translate(backend, name)
-        .ok_or(nt::NO_SUCH_FILE)?;
+        .ok_or(KernelError::NoSuchFile)?;
     backend.create_file(path.as_bytes(), request)
 }
 
@@ -1064,7 +1056,7 @@ pub fn open_path(
     backend: &mut dyn crate::backend::Backend,
     name: &[u8],
     request: &CreateRequest,
-) -> Result<FileHandle, NtStatus> {
+) -> Result<FileHandle, KernelError> {
     if is_device_path(name) {
         backend.create_file(name, request)
     } else {
@@ -1228,7 +1220,10 @@ pub enum Continuation {
     Checksum(Checksum),
 }
 
-pub(crate) fn resume(continuation: &mut Continuation, cx: &mut ContinuationContext<'_>) -> Hresult {
+pub(crate) fn resume(
+    continuation: &mut Continuation,
+    cx: &mut ContinuationContext<'_>,
+) -> CommandResult {
     match continuation {
         Continuation::DirectoryList {
             handle,
@@ -1249,9 +1244,9 @@ pub(crate) fn resume(continuation: &mut Continuation, cx: &mut ContinuationConte
                 write_attributes(&mut output, &information);
                 let length = output.len;
                 let _ = cx.line.push_bytes(&text[..length]);
-                Hresult::OK
+                Ok(Reply::Ok)
             }
-            None => Hresult::END_OF_DATA,
+            None => Err(CommandError::EndOfData),
         },
         Continuation::Upload(upload) => upload.resume(cx),
         Continuation::MultiUpload(upload) => upload.resume(cx),
@@ -1308,26 +1303,22 @@ fn begin(
     true
 }
 
-const fn map(status: NtStatus, fallback: Hresult) -> Hresult {
-    Hresult::from_nt_status(status, fallback)
-}
-
-const ACCESS_DENIED: Hresult = Hresult::from_error_code(ErrorCode::ACCESS_DENIED);
-const CANNOT_CREATE: Hresult = Hresult::from_error_code(ErrorCode::FILE_CANNOT_BE_CREATED);
+const ACCESS_DENIED: CommandError = CommandError::Status(ErrorCode::AccessDenied);
+const CANNOT_CREATE: CommandError = CommandError::Status(ErrorCode::FileCannotBeCreated);
 const SYNCHRONOUS: CreateOptions = CreateOptions::SYNCHRONOUS_IO_NONALERT;
 const DIRECTORY: CreateOptions = CreateOptions::DIRECTORY_FILE.union(SYNCHRONOUS);
 
 /// `delete name=<path> [dir]`.
-fn delete(invocation: &mut Invocation<'_>) -> Hresult {
+fn delete(invocation: &mut Invocation<'_>) -> CommandResult {
     let mut buffer = [0u8; NAME_BUFFER];
     let Some(name) = name_param(invocation, &mut buffer) else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let directory = invocation.line.has("dir");
     let at = |index: usize| name.get(index).copied().unwrap_or(0);
     let base = usize::from(matches!(at(0), b'x' | b'X'));
     if at(base + 1) == b':' && at(base + 2) == b'\\' && at(base + 3) == 0 {
-        return ACCESS_DENIED;
+        return Err(ACCESS_DENIED);
     }
     let options = if directory {
         DIRECTORY
@@ -1340,37 +1331,37 @@ fn delete(invocation: &mut Invocation<'_>) -> Hresult {
         options,
     );
     match open_path(invocation.state, invocation.backend, name, &request) {
-        Err(nt::FILE_IS_A_DIRECTORY) => {
+        Err(KernelError::FileIsADirectory) => {
             invocation.set_text(format_args!("is a directory"));
-            ACCESS_DENIED
+            Err(ACCESS_DENIED)
         }
-        Err(nt::NOT_A_DIRECTORY) => {
+        Err(KernelError::NotADirectory) => {
             invocation.set_text(format_args!("not a directory"));
-            ACCESS_DENIED
+            Err(ACCESS_DENIED)
         }
-        Err(status) => map(status, ACCESS_DENIED),
+        Err(error) => Err(CommandError::from_kernel(error, ACCESS_DENIED)),
         Ok(handle) => {
             let result = invocation.backend.set_delete_disposition(handle, true);
             close_changed(invocation.backend, handle);
             match result {
-                Ok(()) => Hresult::OK,
-                Err(status) => map(status, ACCESS_DENIED),
+                Ok(()) => Ok(Reply::Ok),
+                Err(error) => Err(CommandError::from_kernel(error, ACCESS_DENIED)),
             }
         }
     }
 }
 
 /// `dirlist name=<path>`: one line per directory entry.
-fn dirlist(invocation: &mut Invocation<'_>) -> Hresult {
+fn dirlist(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.session.is_none() {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     let mut buffer = [0u8; NAME_BUFFER];
     let Some(name) = name_param(invocation, &mut buffer) else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let Some(line) = invocation.backend.allocate_pool(LINE_BUFFER) else {
-        return Hresult::OUT_OF_MEMORY;
+        return Err(CommandError::OutOfMemory);
     };
     let request = CreateRequest::open(
         FileAccess::LIST_DIRECTORY.union(FileAccess::SYNCHRONIZE),
@@ -1378,9 +1369,9 @@ fn dirlist(invocation: &mut Invocation<'_>) -> Hresult {
         DIRECTORY,
     );
     match open_path(invocation.state, invocation.backend, name, &request) {
-        Err(status) => {
+        Err(error) => {
             invocation.backend.free_pool(line);
-            map(status, ACCESS_DENIED)
+            Err(CommandError::from_kernel(error, ACCESS_DENIED))
         }
         Ok(handle) => {
             begin(
@@ -1392,7 +1383,7 @@ fn dirlist(invocation: &mut Invocation<'_>) -> Hresult {
                 },
                 None,
             );
-            Hresult::MULTILINE
+            Ok(Reply::Multiline)
         }
     }
 }
@@ -1404,14 +1395,14 @@ fn directory_list_line(
     count: &mut u32,
     line: PoolBuffer,
     cx: &mut ContinuationContext<'_>,
-) -> Hresult {
+) -> CommandResult {
     let mut name = [0u8; DIRECTORY_NAME_CAPACITY];
     let entry = match cx.backend.query_directory(handle, *count == 0, &mut name) {
         Ok(entry) => entry,
         Err(_) => {
             cx.backend.close_file(handle);
             cx.backend.free_pool(line);
-            return Hresult::END_OF_DATA;
+            return Err(CommandError::EndOfData);
         }
     };
     *count += 1;
@@ -1427,7 +1418,7 @@ fn directory_list_line(
     write_attributes(&mut output, &entry.information);
     let length = output.len;
     send_pool_line(&pool[..length], cx.binary, &mut cx.binary_len);
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// Queue a line built in a pool line buffer as raw 202 output.
@@ -1439,16 +1430,16 @@ fn send_pool_line(text: &[u8], binary: &mut [u8], binary_len: &mut usize) {
 }
 
 /// `drivefreespace name=<path>`.
-fn drive_free_space(invocation: &mut Invocation<'_>) -> Hresult {
+fn drive_free_space(invocation: &mut Invocation<'_>) -> CommandResult {
     let mut buffer = [0u8; NAME_BUFFER];
     let Some(name) = name_param(invocation, &mut buffer) else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     if invocation.session.is_none() {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     let Some(line) = invocation.backend.allocate_pool(LINE_BUFFER) else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     let request = CreateRequest::open(
         FileAccess::LIST_DIRECTORY.union(FileAccess::SYNCHRONIZE),
@@ -1457,7 +1448,7 @@ fn drive_free_space(invocation: &mut Invocation<'_>) -> Hresult {
     );
     // The image keeps the line buffer allocated when the open fails.
     match open_translated(invocation.state, invocation.backend, name, &request) {
-        Err(status) => map(status, ACCESS_DENIED),
+        Err(error) => Err(CommandError::from_kernel(error, ACCESS_DENIED)),
         Ok(handle) => {
             begin(
                 invocation,
@@ -1468,7 +1459,7 @@ fn drive_free_space(invocation: &mut Invocation<'_>) -> Hresult {
                 },
                 None,
             );
-            Hresult::MULTILINE
+            Ok(Reply::Multiline)
         }
     }
 }
@@ -1479,18 +1470,18 @@ fn drive_free_space_line(
     first: &mut bool,
     line: PoolBuffer,
     cx: &mut ContinuationContext<'_>,
-) -> Hresult {
+) -> CommandResult {
     if !core::mem::take(first) {
         cx.backend.close_file(handle);
         cx.backend.free_pool(line);
-        return Hresult::END_OF_DATA;
+        return Err(CommandError::EndOfData);
     }
     let size = match cx.backend.query_volume_size(handle) {
         Ok(size) => size,
         Err(_) => {
             cx.backend.close_file(handle);
             cx.backend.free_pool(line);
-            return Hresult::FAIL;
+            return Err(CommandError::Fail);
         }
     };
     let unit = u64::from(size.sectors_per_unit.wrapping_mul(size.bytes_per_sector));
@@ -1506,7 +1497,7 @@ fn drive_free_space_line(
     output.push_hex(b" totalfreebyteshi=0x", (free >> 32) as u32, 8);
     let length = output.len;
     send_pool_line(&pool[..length], cx.binary, &mut cx.binary_len);
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `drivelist` progress: drive letters from `\??`, then the drive table.
@@ -1522,12 +1513,12 @@ pub enum DriveList {
 }
 
 /// `drivelist`.
-fn drive_list(invocation: &mut Invocation<'_>) -> Hresult {
+fn drive_list(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.session.is_none() {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     match invocation.backend.open_object_directory(DOS_DEVICES) {
-        Err(status) => map(status, Hresult::FAIL),
+        Err(error) => Err(CommandError::from_kernel(error, CommandError::Fail)),
         Ok(directory) => {
             begin(
                 invocation,
@@ -1537,7 +1528,7 @@ fn drive_list(invocation: &mut Invocation<'_>) -> Hresult {
                 }),
                 None,
             );
-            Hresult::MULTILINE
+            Ok(Reply::Multiline)
         }
     }
 }
@@ -1557,7 +1548,7 @@ fn prefix_equal(a: &[u8], b: &[u8], count: usize) -> bool {
     true
 }
 
-fn drive_list_line(list: &mut DriveList, cx: &mut ContinuationContext<'_>) -> Hresult {
+fn drive_list_line(list: &mut DriveList, cx: &mut ContinuationContext<'_>) -> CommandResult {
     if let DriveList::Objects { directory, context } = list {
         let directory = *directory;
         loop {
@@ -1603,12 +1594,12 @@ fn drive_list_line(list: &mut DriveList, cx: &mut ContinuationContext<'_>) -> Hr
         }
     }
     let DriveList::Table { index } = list else {
-        return Hresult::END_OF_DATA;
+        return Err(CommandError::EndOfData);
     };
     loop {
         let row = *index;
         let Some(Some(drive)) = cx.state.filesystem.drives.entries.get(row).copied() else {
-            return Hresult::END_OF_DATA;
+            return Err(CommandError::EndOfData);
         };
         *index += 1;
         if !drive.enabled {
@@ -1634,21 +1625,21 @@ fn drive_list_line(list: &mut DriveList, cx: &mut ContinuationContext<'_>) -> Hr
     }
 }
 
-fn drive_name_line(cx: &mut ContinuationContext<'_>, name: &[u8]) -> Hresult {
+fn drive_name_line(cx: &mut ContinuationContext<'_>, name: &[u8]) -> CommandResult {
     let _ = cx.line.push_bytes(b"drivename=\"");
     let _ = cx.line.push_bytes(name);
     let _ = cx.line.push_bytes(b"\"");
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `fileeof name=<path> size=<dword> [mustcreate|cancreate]`.
-fn file_eof(invocation: &mut Invocation<'_>) -> Hresult {
+fn file_eof(invocation: &mut Invocation<'_>) -> CommandResult {
     let mut buffer = [0u8; NAME_BUFFER];
     let Some(name) = name_param(invocation, &mut buffer) else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let Some(size) = util::required_dword(invocation, "size") else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let disposition = if invocation.line.has("mustcreate") {
         CreateDisposition::Create
@@ -1669,13 +1660,13 @@ fn file_eof(invocation: &mut Invocation<'_>) -> Hresult {
     };
     let handle = match open_path(invocation.state, invocation.backend, name, &request) {
         Ok(handle) => handle,
-        Err(status) => return map(status, ACCESS_DENIED),
+        Err(error) => return Err(CommandError::from_kernel(error, ACCESS_DENIED)),
     };
     let result = invocation.backend.set_end_of_file(handle, u64::from(size));
     close_changed(invocation.backend, handle);
     match result {
-        Ok(()) => Hresult::OK,
-        Err(status) => map(status, ACCESS_DENIED),
+        Ok(()) => Ok(Reply::Ok),
+        Err(error) => Err(CommandError::from_kernel(error, ACCESS_DENIED)),
     }
 }
 
@@ -1693,20 +1684,20 @@ pub struct GetFile {
 }
 
 /// `getfile name=<path> [offset=<dword> size=<dword>]`.
-fn get_file(invocation: &mut Invocation<'_>) -> Hresult {
+fn get_file(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.session.is_none() {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     let mut buffer = [0u8; NAME_BUFFER];
     let Some(name) = name_param(invocation, &mut buffer) else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let offset_value = invocation.line.param("offset");
     let offset = offset_value.map_or(0, |value| value.dword_prefix());
     let mut size = 0;
     if offset_value.and_then(|value| value.dword()).is_some() {
         let Some(value) = util::required_dword(invocation, "size") else {
-            return util::MISSING;
+            return Err(util::MISSING);
         };
         size = value;
     }
@@ -1717,20 +1708,20 @@ fn get_file(invocation: &mut Invocation<'_>) -> Hresult {
     );
     let handle = match open_path(invocation.state, invocation.backend, name, &request) {
         Ok(handle) => handle,
-        Err(status) => return map(status, ACCESS_DENIED),
+        Err(error) => return Err(CommandError::from_kernel(error, ACCESS_DENIED)),
     };
     let backend = &mut *invocation.backend;
     let information = match backend.query_file_information(handle) {
         Ok(information) => information,
         Err(_) => {
             backend.close_file(handle);
-            return Hresult::UNEXPECTED;
+            return Err(CommandError::Unexpected);
         }
     };
     if information.end_of_file >> 32 != 0 {
         backend.close_file(handle);
         invocation.set_text(format_args!("file is too big"));
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     let end = information.end_of_file as u32;
     let mut length = if offset > end {
@@ -1738,9 +1729,9 @@ fn get_file(invocation: &mut Invocation<'_>) -> Hresult {
     } else if offset == 0 {
         end
     } else {
-        if let Err(status) = backend.set_file_position(handle, u64::from(offset)) {
+        if let Err(error) = backend.set_file_position(handle, u64::from(offset)) {
             backend.close_file(handle);
-            return map(status, ACCESS_DENIED);
+            return Err(CommandError::from_kernel(error, ACCESS_DENIED));
         }
         end - offset
     };
@@ -1749,7 +1740,7 @@ fn get_file(invocation: &mut Invocation<'_>) -> Hresult {
     }
     let Some(pool) = backend.allocate_pool(GETFILE_CHUNK) else {
         backend.close_file(handle);
-        return Hresult::OUT_OF_MEMORY;
+        return Err(CommandError::OutOfMemory);
     };
     if offset != 0 || size != 0 {
         invocation.set_text(format_args!("partial send"));
@@ -1764,22 +1755,22 @@ fn get_file(invocation: &mut Invocation<'_>) -> Hresult {
         chunk_length: 0,
     };
     begin(invocation, Continuation::GetFile(transfer), None);
-    Hresult::BINARY
+    Ok(Reply::Binary)
 }
 
 /// A failed read sends zeros for its chunk.
-fn get_file_data(transfer: &mut GetFile, cx: &mut ContinuationContext<'_>) -> Hresult {
+fn get_file_data(transfer: &mut GetFile, cx: &mut ContinuationContext<'_>) -> CommandResult {
     if !cx.aborted && !transfer.header_sent {
         transfer.header_sent = true;
         cx.binary[..4].copy_from_slice(&transfer.length.to_le_bytes());
         cx.binary_len = 4;
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     let refill = transfer.chunk_sent == transfer.chunk_length;
     if cx.aborted || refill && transfer.remaining == 0 {
         cx.backend.close_file(transfer.handle);
         cx.backend.free_pool(transfer.buffer);
-        return Hresult::END_OF_DATA;
+        return Err(CommandError::EndOfData);
     }
     if refill {
         let count = transfer.remaining.min(GETFILE_CHUNK);
@@ -1813,23 +1804,23 @@ fn send_pool_piece(
     offset: u32,
     total: u32,
     sent: &mut u32,
-) -> Hresult {
+) -> CommandResult {
     let count = ((total - *sent) as usize).min(cx.binary.len());
     let start = (offset + *sent) as usize;
     cx.binary[..count].copy_from_slice(&cx.backend.pool(buffer)[start..start + count]);
     *sent += count as u32;
     cx.binary_len = count;
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `getfileattributes name=<path>`.
-fn get_file_attributes(invocation: &mut Invocation<'_>) -> Hresult {
+fn get_file_attributes(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.session.is_none() {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     let mut buffer = [0u8; NAME_BUFFER];
     let Some(name) = name_param(invocation, &mut buffer) else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let result = if is_device_path(name) {
         invocation.backend.query_full_attributes(name)
@@ -1840,19 +1831,19 @@ fn get_file_attributes(invocation: &mut Invocation<'_>) -> Hresult {
             .drives
             .translate(invocation.backend, name)
         else {
-            return Hresult::error(0);
+            return Err(ErrorCode::Undefined.into());
         };
         invocation.backend.query_full_attributes(path.as_bytes())
     };
     match result {
-        Err(status) => map(status, ACCESS_DENIED),
+        Err(error) => Err(CommandError::from_kernel(error, ACCESS_DENIED)),
         Ok(information) => {
             begin(
                 invocation,
                 Continuation::FileAttributes(Some(information)),
                 None,
             );
-            Hresult::MULTILINE
+            Ok(Reply::Multiline)
         }
     }
 }
@@ -1875,18 +1866,18 @@ enum VirtualAttributesPhase {
 
 /// `getvfattr count=<dword>`, then `count` names, each a big-endian
 /// length and the name bytes; replies with 0x1c-byte records.
-fn get_vfattr(invocation: &mut Invocation<'_>) -> Hresult {
+fn get_vfattr(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(count) = util::required_dword(invocation, "count") else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     if invocation.session.is_none() {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     let size = count
         .wrapping_mul(VFATTR_RECORD)
         .wrapping_add(VFATTR_RECEIVE_AREA);
     let Some(buffer) = invocation.backend.allocate_pool(size) else {
-        return Hresult::OUT_OF_MEMORY;
+        return Err(CommandError::OutOfMemory);
     };
     let transfer = VirtualAttributes {
         buffer: Some(buffer),
@@ -1899,7 +1890,7 @@ fn get_vfattr(invocation: &mut Invocation<'_>) -> Hresult {
         Continuation::VirtualAttributes(transfer),
         Some(4),
     );
-    Hresult::SEND_BINARY
+    Ok(Reply::SendBinary)
 }
 
 impl VirtualAttributes {
@@ -1909,15 +1900,15 @@ impl VirtualAttributes {
         }
     }
 
-    fn resume(&mut self, cx: &mut ContinuationContext<'_>) -> Hresult {
+    fn resume(&mut self, cx: &mut ContinuationContext<'_>) -> CommandResult {
         if let VirtualAttributesPhase::Send { sent } = &mut self.phase {
             let Some(buffer) = self.buffer else {
-                return Hresult::END_OF_DATA;
+                return Err(CommandError::EndOfData);
             };
             let total = self.count.wrapping_mul(VFATTR_RECORD);
             if cx.aborted || *sent >= total {
                 self.release(cx.backend);
-                return Hresult::END_OF_DATA;
+                return Err(CommandError::EndOfData);
             }
             return send_pool_piece(cx, buffer, VFATTR_RECEIVE_AREA, total, sent);
         }
@@ -1925,16 +1916,16 @@ impl VirtualAttributes {
         let mut remaining = cx.session.receive_remaining.unwrap_or(0);
         if cx.received.is_empty() && remaining != 0 {
             self.release(cx.backend);
-            return Hresult::FAIL;
+            return Err(CommandError::Fail);
         }
         let Some(buffer) = self.buffer else {
-            return Hresult::OK;
+            return Ok(Reply::Ok);
         };
         if self.count == 0 {
             // The image frees the block on the first piece and keeps
             // receiving without ever completing.
             self.release(cx.backend);
-            return Hresult::END_OF_DATA;
+            return Err(CommandError::EndOfData);
         }
         for piece in cx.received.chunks(VFATTR_RECEIVE_AREA as usize) {
             cx.backend.pool(buffer)[..piece.len()].copy_from_slice(piece);
@@ -1942,7 +1933,7 @@ impl VirtualAttributes {
         remaining -= cx.received.len() as u32;
         cx.session.receive_remaining = Some(remaining);
         if remaining != 0 {
-            return Hresult::OK;
+            return Ok(Reply::Ok);
         }
         match self.phase {
             VirtualAttributesPhase::Length => {
@@ -1953,7 +1944,7 @@ impl VirtualAttributes {
                 if length == 0 {
                     self.release(cx.backend);
                 }
-                Hresult::OK
+                Ok(Reply::Ok)
             }
             VirtualAttributesPhase::Name => {
                 let mut name = [0u8; VFATTR_RECEIVE_AREA as usize];
@@ -1969,7 +1960,7 @@ impl VirtualAttributes {
                 } else {
                     match cx.state.filesystem.drives.translate(cx.backend, name) {
                         Some(path) => cx.backend.query_full_attributes(path.as_bytes()),
-                        None => Err(nt::NO_SUCH_FILE),
+                        None => Err(KernelError::NoSuchFile),
                     }
                 };
                 let record: [u32; 7] = match result {
@@ -1993,47 +1984,47 @@ impl VirtualAttributes {
                 self.index += 1;
                 if self.index == self.count {
                     self.phase = VirtualAttributesPhase::Send { sent: 0 };
-                    return Hresult::BINARY;
+                    return Ok(Reply::Binary);
                 }
                 cx.session.receive_remaining = Some(4);
                 self.phase = VirtualAttributesPhase::Length;
-                Hresult::OK
+                Ok(Reply::Ok)
             }
-            VirtualAttributesPhase::Send { .. } => Hresult::OK,
+            VirtualAttributesPhase::Send { .. } => Ok(Reply::Ok),
         }
     }
 }
 
 /// `hdd enable|disable`: clear or set bit 0 of configuration setting
 /// (2, 6).
-fn hdd(invocation: &mut Invocation<'_>) -> Hresult {
+fn hdd(invocation: &mut Invocation<'_>) -> CommandResult {
     let value = if invocation.line.has("enable") {
         0
     } else if invocation.line.has("disable") {
         1
     } else {
         invocation.set_text(format_args!("missing arguments"));
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     let mut bytes = [0u8; 4];
-    if let Err(status) = invocation.backend.xconfig_get(HDD_SETTING, &mut bytes) {
-        return map(status, Hresult::UNEXPECTED);
+    if let Err(error) = invocation.backend.xconfig_get(HDD_SETTING, &mut bytes) {
+        return Err(CommandError::from_kernel(error, CommandError::Unexpected));
     }
     let flags = u32::from_be_bytes(bytes) & !1 | value;
     match invocation
         .backend
         .xconfig_set(HDD_SETTING, &flags.to_be_bytes())
     {
-        Ok(()) => Hresult::OK,
-        Err(status) => map(status, Hresult::UNEXPECTED),
+        Ok(()) => Ok(Reply::Ok),
+        Err(error) => Err(CommandError::from_kernel(error, CommandError::Unexpected)),
     }
 }
 
 /// `mkdir name=<path>`.
-fn make_directory(invocation: &mut Invocation<'_>) -> Hresult {
+fn make_directory(invocation: &mut Invocation<'_>) -> CommandResult {
     let mut buffer = [0u8; NAME_BUFFER];
     let Some(name) = name_param(invocation, &mut buffer) else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let request = CreateRequest {
         access: FileAccess::LIST_DIRECTORY.union(FileAccess::SYNCHRONIZE),
@@ -2046,30 +2037,30 @@ fn make_directory(invocation: &mut Invocation<'_>) -> Hresult {
     match open_path(invocation.state, invocation.backend, name, &request) {
         Ok(handle) => {
             close_changed(invocation.backend, handle);
-            Hresult::OK
+            Ok(Reply::Ok)
         }
-        Err(status) => map(status, CANNOT_CREATE),
+        Err(error) => Err(CommandError::from_kernel(error, CANNOT_CREATE)),
     }
 }
 
 /// `prevflash [prevflashver=<dword>]`.
-fn previous_flash(invocation: &mut Invocation<'_>) -> Hresult {
+fn previous_flash(invocation: &mut Invocation<'_>) -> CommandResult {
     let version = optional_dword(invocation, "PREVFLASHVER", 0);
     match invocation
         .backend
         .xconfig_set(PREVIOUS_FLASH_SETTING, &version.to_be_bytes())
     {
-        Ok(()) => Hresult::OK,
-        Err(status) => map(status, Hresult::UNEXPECTED),
+        Ok(()) => Ok(Reply::Ok),
+        Err(error) => Err(CommandError::from_kernel(error, CommandError::Unexpected)),
     }
 }
 
 /// `rename name=<path> newname=<path>`.
-fn rename(invocation: &mut Invocation<'_>) -> Hresult {
+fn rename(invocation: &mut Invocation<'_>) -> CommandResult {
     let mut new_buffer = [0u8; NAME_BUFFER];
     let Some(new_name) = string_param(invocation, "newname", &mut new_buffer) else {
         invocation.set_text(format_args!("missing new name"));
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     let Some(target) = invocation
         .state
@@ -2078,11 +2069,11 @@ fn rename(invocation: &mut Invocation<'_>) -> Hresult {
         .translate(invocation.backend, new_name)
     else {
         invocation.set_text(format_args!("new name does not exist"));
-        return Hresult::from_error_code(ErrorCode::FILE_NOT_FOUND);
+        return Err(ErrorCode::FileNotFound.into());
     };
     let mut buffer = [0u8; NAME_BUFFER];
     let Some(name) = name_param(invocation, &mut buffer) else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let request = CreateRequest::open(
         FileAccess::GENERIC_WRITE.union(FileAccess::SYNCHRONIZE),
@@ -2090,25 +2081,25 @@ fn rename(invocation: &mut Invocation<'_>) -> Hresult {
         SYNCHRONOUS,
     );
     let Ok(handle) = open_translated(invocation.state, invocation.backend, name, &request) else {
-        return ACCESS_DENIED;
+        return Err(ACCESS_DENIED);
     };
     let result = invocation
         .backend
         .rename_file(handle, target.as_bytes(), false);
     close_changed(invocation.backend, handle);
     match result {
-        Ok(()) => Hresult::OK,
-        Err(nt::NOT_SAME_DEVICE) => Hresult::from_error_code(ErrorCode::FILE_MUST_BE_COPIED),
-        Err(status) => map(status, CANNOT_CREATE),
+        Ok(()) => Ok(Reply::Ok),
+        Err(KernelError::NotSameDevice) => Err(ErrorCode::FileMustBeCopied.into()),
+        Err(error) => Err(CommandError::from_kernel(error, CANNOT_CREATE)),
     }
 }
 
 /// `setfileattributes name=<path> [readonly=] [hidden=] [createhi= createlo=]
 /// [changehi= changelo=]`.
-fn set_file_attributes(invocation: &mut Invocation<'_>) -> Hresult {
+fn set_file_attributes(invocation: &mut Invocation<'_>) -> CommandResult {
     let mut buffer = [0u8; NAME_BUFFER];
     let Some(name) = name_param(invocation, &mut buffer) else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let request = CreateRequest::open(
         FileAccess::SYNCHRONIZE,
@@ -2117,7 +2108,7 @@ fn set_file_attributes(invocation: &mut Invocation<'_>) -> Hresult {
     );
     let handle = match open_translated(invocation.state, invocation.backend, name, &request) {
         Ok(handle) => handle,
-        Err(status) => return map(status, ACCESS_DENIED),
+        Err(error) => return Err(CommandError::from_kernel(error, ACCESS_DENIED)),
     };
     let mut mask = 0;
     let mut value = 0;
@@ -2159,8 +2150,8 @@ fn set_file_attributes(invocation: &mut Invocation<'_>) -> Hresult {
         });
     close_changed(invocation.backend, handle);
     match result {
-        Ok(()) => Hresult::OK,
-        Err(status) => map(status, Hresult::FAIL),
+        Ok(()) => Ok(Reply::Ok),
+        Err(error) => Err(CommandError::from_kernel(error, CommandError::Fail)),
     }
 }
 
@@ -2174,7 +2165,7 @@ pub struct Writer {
     half: u32,
     offset: u64,
     written: u32,
-    failure: Option<NtStatus>,
+    failure: Option<KernelError>,
     /// Failed writes mark the file for deletion, except in write-at mode.
     delete_on_failure: bool,
 }
@@ -2229,13 +2220,13 @@ impl Writer {
                     self.offset += u64::from(self.staged);
                     self.written = self.written.wrapping_add(self.staged);
                 }
-                Err(status) => {
+                Err(error) => {
                     if self.delete_on_failure {
                         let _ = backend.set_delete_disposition(handle, true);
                     }
                     close_changed(backend, handle);
                     self.handle = None;
-                    self.failure = Some(status);
+                    self.failure = Some(error);
                 }
             }
         }
@@ -2263,18 +2254,18 @@ pub struct Upload {
 }
 
 impl Upload {
-    fn resume(&mut self, cx: &mut ContinuationContext<'_>) -> Hresult {
+    fn resume(&mut self, cx: &mut ContinuationContext<'_>) -> CommandResult {
         let mut remaining = cx.session.receive_remaining.unwrap_or(0);
         if cx.received.is_empty() && remaining != 0 {
             cx.session.receive_remaining = Some(0);
             self.writer.abandon(cx.backend);
             cx.backend.free_pool(self.writer.buffer);
-            return Hresult::UNEXPECTED;
+            return Err(CommandError::Unexpected);
         }
         self.writer.receive(cx.backend, cx.received, &mut remaining);
         cx.session.receive_remaining = Some(remaining);
         if remaining != 0 {
-            return Hresult::OK;
+            return Ok(Reply::Ok);
         }
         if let Some(handle) = self.writer.handle.take() {
             close_changed(cx.backend, handle);
@@ -2283,44 +2274,43 @@ impl Upload {
         if self.write_at {
             let _ = write!(cx.line, "{} bytes written", self.writer.written);
         }
-        if self.writer.failure.is_some() {
-            Hresult::UNEXPECTED
-        } else {
-            Hresult::OK
+        match self.writer.failure {
+            Some(_) => Err(CommandError::Unexpected),
+            None => Ok(Reply::Ok),
         }
     }
 }
 
 /// `sendfile name=<path> length=<dword>`: create or replace a file.
-fn send_file(invocation: &mut Invocation<'_>) -> Hresult {
+fn send_file(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.session.is_none() {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     let mut buffer = [0u8; NAME_BUFFER];
     let Some(name) = name_param(invocation, &mut buffer) else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let Some(length) = util::required_dword(invocation, "length") else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     start_upload(invocation, name, None, length)
 }
 
 /// `writefile name=<path> offset=<dword> length=<dword>`: write into an
 /// existing file.
-fn write_file(invocation: &mut Invocation<'_>) -> Hresult {
+fn write_file(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.session.is_none() {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     let mut buffer = [0u8; NAME_BUFFER];
     let Some(name) = name_param(invocation, &mut buffer) else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let Some(offset) = util::required_dword(invocation, "offset") else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let Some(length) = util::required_dword(invocation, "length") else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     start_upload(invocation, name, Some(offset), length)
 }
@@ -2333,7 +2323,7 @@ fn start_upload(
     name: &[u8],
     write_at: Option<u32>,
     length: u32,
-) -> Hresult {
+) -> CommandResult {
     let (access, disposition, fallback) = match write_at {
         Some(_) => (
             FileAccess::GENERIC_READ
@@ -2360,22 +2350,26 @@ fn start_upload(
     };
     let handle = match open_path(invocation.state, invocation.backend, name, &request) {
         Ok(handle) => handle,
-        Err(status) => return map(status, fallback),
+        Err(error) => return Err(CommandError::from_kernel(error, fallback)),
     };
     let backend = &mut *invocation.backend;
     let prepared = match write_at {
         Some(offset) => backend.set_file_position(handle, u64::from(offset)),
         None => backend.set_end_of_file(handle, u64::from(length)),
     }
-    .and_then(|()| backend.allocate_pool(2 * UPLOAD_HALF).ok_or(nt::NO_MEMORY));
+    .and_then(|()| {
+        backend
+            .allocate_pool(2 * UPLOAD_HALF)
+            .ok_or(KernelError::NoMemory)
+    });
     let pool = match prepared {
         Ok(pool) => pool,
-        Err(status) => {
+        Err(error) => {
             if write_at.is_none() {
                 let _ = backend.set_delete_disposition(handle, true);
             }
             close_changed(backend, handle);
-            return map(status, fallback);
+            return Err(CommandError::from_kernel(error, fallback));
         }
     };
     // A created file is written from its start.
@@ -2385,7 +2379,7 @@ fn start_upload(
         write_at: write_at.is_some(),
     };
     begin(invocation, Continuation::Upload(upload), Some(length));
-    Hresult::SEND_BINARY
+    Ok(Reply::SendBinary)
 }
 
 /// `sendvfile` progress.
@@ -2422,18 +2416,18 @@ enum MultiUploadPhase {
 
 /// `sendvfile count=<dword>`, then per file a 0x20-byte big-endian
 /// header, the name, and the data; replies with one HRESULT per file.
-fn send_vfile(invocation: &mut Invocation<'_>) -> Hresult {
+fn send_vfile(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(count) = util::required_dword(invocation, "count") else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     if invocation.session.is_none() {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     let Some(buffer) = invocation
         .backend
         .allocate_pool(count.wrapping_add(0x2000).wrapping_mul(4))
     else {
-        return Hresult::OUT_OF_MEMORY;
+        return Err(CommandError::OutOfMemory);
     };
     let results = VFILE_RESULTS as usize;
     invocation.backend.pool(buffer)[results..results + count as usize * 4].fill(0);
@@ -2450,7 +2444,7 @@ fn send_vfile(invocation: &mut Invocation<'_>) -> Hresult {
         Continuation::MultiUpload(upload),
         Some(VFILE_HEADER),
     );
-    Hresult::SEND_BINARY
+    Ok(Reply::SendBinary)
 }
 
 impl MultiUpload {
@@ -2467,11 +2461,13 @@ impl MultiUpload {
         }
     }
 
-    fn set_result(&mut self, backend: &mut dyn crate::backend::Backend, result: Hresult) {
+    /// Store the current file's failure in the result table of the reply.
+    fn set_result(&mut self, backend: &mut dyn crate::backend::Backend, error: CommandError) {
         let Some(buffer) = self.buffer else {
             return;
         };
         let start = (VFILE_RESULTS + (self.total - self.files_left) * 4) as usize;
+        let result = Hresult::from(error);
         backend.pool(buffer)[start..start + 4].copy_from_slice(&result.0.to_be_bytes());
     }
 
@@ -2501,22 +2497,22 @@ impl MultiUpload {
                 };
                 let _ = backend.set_basic_information(handle, &basic);
             }
-            Err(status) => self.set_result(backend, map(status, CANNOT_CREATE)),
+            Err(error) => self.set_result(backend, CommandError::from_kernel(error, CANNOT_CREATE)),
         }
         close_changed(backend, handle);
     }
 
     /// Advance to the next file header, or to the reply after the last.
-    fn next_file(&mut self, remaining: &mut u32) -> Hresult {
+    fn next_file(&mut self, remaining: &mut u32) -> CommandResult {
         self.files_left -= 1;
         self.staged = 0;
         if self.files_left == 0 {
             self.phase = MultiUploadPhase::Send { sent: 0 };
-            return Hresult::BINARY;
+            return Ok(Reply::Binary);
         }
         self.phase = MultiUploadPhase::Header;
         *remaining = VFILE_HEADER;
-        Hresult::OK
+        Ok(Reply::Ok)
     }
 
     fn open(
@@ -2524,7 +2520,7 @@ impl MultiUpload {
         cx: &mut ContinuationContext<'_>,
         buffer: PoolBuffer,
         remaining: &mut u32,
-    ) -> Hresult {
+    ) -> CommandResult {
         let mut name = [0u8; NAME_BUFFER];
         let staged = (self.staged as usize).min(UPLOAD_HALF as usize);
         let pool = cx.backend.pool(buffer);
@@ -2550,17 +2546,17 @@ impl MultiUpload {
                 .set_end_of_file(handle, self.header.size)
             {
                 Ok(()) => Ok(handle),
-                Err(status) => {
+                Err(error) => {
                     let _ = cx.backend.set_delete_disposition(handle, true);
                     close_changed(cx.backend, handle);
-                    Err(status)
+                    Err(error)
                 }
             });
         self.staged = 0;
         *remaining = self.header.size as u32;
         match opened {
-            Err(status) => {
-                self.set_result(cx.backend, map(status, CANNOT_CREATE));
+            Err(error) => {
+                self.set_result(cx.backend, CommandError::from_kernel(error, CANNOT_CREATE));
                 self.phase = MultiUploadPhase::Discard;
                 if *remaining == 0 {
                     return self.next_file(remaining);
@@ -2572,19 +2568,19 @@ impl MultiUpload {
             }
             Ok(handle) => self.phase = MultiUploadPhase::Data(Writer::new(handle, buffer, 0, true)),
         }
-        Hresult::OK
+        Ok(Reply::Ok)
     }
 
-    fn resume(&mut self, cx: &mut ContinuationContext<'_>) -> Hresult {
+    fn resume(&mut self, cx: &mut ContinuationContext<'_>) -> CommandResult {
         if let MultiUploadPhase::Send { sent } = &mut self.phase {
             let Some(buffer) = self.buffer else {
-                return Hresult::END_OF_DATA;
+                return Err(CommandError::EndOfData);
             };
             let total = self.total * 4;
             if cx.aborted || *sent >= total {
                 cx.backend.free_pool(buffer);
                 self.buffer = None;
-                return Hresult::END_OF_DATA;
+                return Err(CommandError::EndOfData);
             }
             return send_pool_piece(cx, buffer, VFILE_RESULTS, total, sent);
         }
@@ -2594,16 +2590,16 @@ impl MultiUpload {
             // The image keeps the block allocated when the connection
             // drops.
             self.abandon(cx.backend);
-            return Hresult::FAIL;
+            return Err(CommandError::Fail);
         }
         let Some(buffer) = self.buffer else {
-            return Hresult::OK;
+            return Ok(Reply::Ok);
         };
         if self.total == 0 {
             // The image frees the block on the first piece and keeps
             // receiving without ever completing.
             self.release(cx.backend);
-            return Hresult::END_OF_DATA;
+            return Err(CommandError::EndOfData);
         }
         let received = cx.received;
         let result = match &mut self.phase {
@@ -2611,7 +2607,7 @@ impl MultiUpload {
                 self.stage(cx.backend, buffer, received);
                 remaining -= received.len() as u32;
                 if remaining != 0 {
-                    Hresult::OK
+                    Ok(Reply::Ok)
                 } else {
                     let mut header = [0u8; VFILE_HEADER as usize];
                     header.copy_from_slice(&cx.backend.pool(buffer)[..VFILE_HEADER as usize]);
@@ -2641,7 +2637,7 @@ impl MultiUpload {
                         self.open(cx, buffer, &mut remaining)
                     } else {
                         self.phase = MultiUploadPhase::Name;
-                        Hresult::OK
+                        Ok(Reply::Ok)
                     }
                 }
             }
@@ -2649,7 +2645,7 @@ impl MultiUpload {
                 self.stage(cx.backend, buffer, received);
                 remaining -= received.len() as u32;
                 if remaining != 0 {
-                    Hresult::OK
+                    Ok(Reply::Ok)
                 } else {
                     self.open(cx, buffer, &mut remaining)
                 }
@@ -2657,23 +2653,24 @@ impl MultiUpload {
             MultiUploadPhase::Discard => {
                 remaining -= received.len() as u32;
                 if remaining != 0 {
-                    Hresult::OK
+                    Ok(Reply::Ok)
                 } else {
                     self.next_file(&mut remaining)
                 }
             }
             MultiUploadPhase::Data(writer) => {
                 writer.receive(cx.backend, received, &mut remaining);
-                if let Some(status) = writer.failure {
-                    self.set_result(cx.backend, map(status, Hresult::UNEXPECTED));
+                if let Some(error) = writer.failure {
+                    let error = CommandError::from_kernel(error, CommandError::Unexpected);
+                    self.set_result(cx.backend, error);
                     self.phase = MultiUploadPhase::Discard;
                     if remaining != 0 {
-                        Hresult::OK
+                        Ok(Reply::Ok)
                     } else {
                         self.next_file(&mut remaining)
                     }
                 } else if remaining != 0 {
-                    Hresult::OK
+                    Ok(Reply::Ok)
                 } else {
                     let handle = writer.handle.take();
                     if let Some(handle) = handle {
@@ -2682,7 +2679,7 @@ impl MultiUpload {
                     self.next_file(&mut remaining)
                 }
             }
-            MultiUploadPhase::Send { .. } => Hresult::OK,
+            MultiUploadPhase::Send { .. } => Ok(Reply::Ok),
         };
         cx.session.receive_remaining = Some(remaining);
         result
@@ -2698,10 +2695,10 @@ pub struct BlockRead {
 }
 
 impl BlockRead {
-    fn resume(&mut self, cx: &mut ContinuationContext<'_>) -> Hresult {
+    fn resume(&mut self, cx: &mut ContinuationContext<'_>) -> CommandResult {
         if cx.aborted || self.sent >= self.length {
             cx.backend.free_pool(self.buffer);
-            return Hresult::END_OF_DATA;
+            return Err(CommandError::EndOfData);
         }
         send_pool_piece(cx, self.buffer, 0, self.length, &mut self.sent)
     }
@@ -2731,14 +2728,14 @@ fn read_blocks(
     block: u32,
     length: u32,
     sector: u32,
-) -> Hresult {
+) -> CommandResult {
     let backend = &mut *invocation.backend;
     let Ok(object) = backend.reference_device(device) else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     let Some(buffer) = backend.allocate_pool(length) else {
         backend.dereference_device(object);
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     let range = PoolRange {
         buffer,
@@ -2750,7 +2747,7 @@ fn read_blocks(
     backend.dereference_device(object);
     if result.is_err() {
         backend.free_pool(buffer);
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     begin(
         invocation,
@@ -2761,38 +2758,38 @@ fn read_blocks(
         }),
         None,
     );
-    Hresult::BINARY
+    Ok(Reply::Binary)
 }
 
 /// `dvdblk block=<dword> count=<dword>`: read 2048-byte optical sectors.
-fn dvd_block(invocation: &mut Invocation<'_>) -> Hresult {
+fn dvd_block(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.session.is_none() {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     let Some(block) = util::required_dword(invocation, "block") else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let Some(length) = block_length(invocation, DVD_MAX_BLOCKS, DVD_SECTOR) else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     read_blocks(invocation, b"\\Device\\Cdrom0", block, length, DVD_SECTOR)
 }
 
 /// `gethddblk name=<device> block=<dword> count=<dword>`: read 512-byte
 /// sectors of a named device.
-fn get_hdd_block(invocation: &mut Invocation<'_>) -> Hresult {
+fn get_hdd_block(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.session.is_none() {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     let mut buffer = [0u8; 0x100];
     let Some(name) = string_param(invocation, "name", &mut buffer) else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     let Some(block) = util::required_dword(invocation, "block") else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let Some(length) = block_length(invocation, HDD_MAX_BLOCKS, HDD_SECTOR) else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     read_blocks(invocation, name, block, length, HDD_SECTOR)
 }
@@ -2807,13 +2804,13 @@ pub struct BlockWrite {
 }
 
 impl BlockWrite {
-    fn resume(&mut self, cx: &mut ContinuationContext<'_>) -> Hresult {
+    fn resume(&mut self, cx: &mut ContinuationContext<'_>) -> CommandResult {
         let remaining = cx.session.receive_remaining.unwrap_or(0);
         if cx.received.is_empty() {
             cx.backend.free_pool(self.buffer);
             cx.backend.dereference_device(self.device);
             cx.session.receive_remaining = Some(0);
-            return Hresult::FAIL;
+            return Err(CommandError::Fail);
         }
         let start = (self.length - remaining) as usize;
         let count = cx.received.len();
@@ -2821,7 +2818,7 @@ impl BlockWrite {
         let remaining = remaining - count as u32;
         cx.session.receive_remaining = Some(remaining);
         if remaining != 0 {
-            return Hresult::OK;
+            return Ok(Reply::Ok);
         }
         let range = PoolRange {
             buffer: self.buffer,
@@ -2834,37 +2831,36 @@ impl BlockWrite {
                 .transfer_device(self.device, TransferDirection::Write, offset, range);
         cx.backend.dereference_device(self.device);
         cx.backend.free_pool(self.buffer);
-        if result.is_ok() {
-            Hresult::OK
-        } else {
-            Hresult::UNEXPECTED
+        match result {
+            Ok(()) => Ok(Reply::Ok),
+            Err(_) => Err(CommandError::Unexpected),
         }
     }
 }
 
 /// `sethddblk name=<device> block=<dword> count=<dword>`, then the sector
 /// data.
-fn set_hdd_block(invocation: &mut Invocation<'_>) -> Hresult {
+fn set_hdd_block(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.session.is_none() {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     let mut buffer = [0u8; 0x100];
     let Some(name) = string_param(invocation, "name", &mut buffer) else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     let Some(block) = util::required_dword(invocation, "block") else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let Some(length) = block_length(invocation, HDD_MAX_BLOCKS, HDD_SECTOR) else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     let backend = &mut *invocation.backend;
     let Ok(device) = backend.reference_device(name) else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     let Some(pool) = backend.allocate_pool(length) else {
         backend.dereference_device(device);
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     begin(
         invocation,
@@ -2876,14 +2872,14 @@ fn set_hdd_block(invocation: &mut Invocation<'_>) -> Hresult {
         }),
         Some(length),
     );
-    Hresult::SEND_BINARY
+    Ok(Reply::SendBinary)
 }
 
 /// `dvdeject [eject=<dword>]`.
-fn dvd_eject(invocation: &mut Invocation<'_>) -> Hresult {
+fn dvd_eject(invocation: &mut Invocation<'_>) -> CommandResult {
     let value = optional_dword(invocation, "eject", 1);
     invocation.backend.open_close_tray(value);
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `dvdperf report`: one line per valid trace record.
@@ -2895,27 +2891,27 @@ pub struct DvdReport {
 }
 
 /// `dvdperf start` | `dvdperf stop [report]`.
-fn dvd_performance(invocation: &mut Invocation<'_>) -> Hresult {
+fn dvd_performance(invocation: &mut Invocation<'_>) -> CommandResult {
     if !invocation.line.has("stop") {
         if !invocation.line.has("start") {
-            return Hresult::FAIL;
+            return Err(CommandError::Fail);
         }
         invocation.backend.start_dvd_trace();
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     if invocation.session.is_none() {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     let trace = invocation.backend.stop_dvd_trace();
     if !invocation.line.has("report") {
         if let Some(trace) = trace {
             invocation.backend.free_pool(trace.buffer);
         }
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     let Some(trace) = trace else {
         invocation.set_text(format_args!("nothing to report"));
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     let pool = invocation.backend.pool(trace.buffer);
     let mut base = [0u8; 8];
@@ -2926,11 +2922,11 @@ fn dvd_performance(invocation: &mut Invocation<'_>) -> Hresult {
         base: u64::from_be_bytes(base),
     };
     begin(invocation, Continuation::DvdReport(report), None);
-    Hresult::MULTILINE
+    Ok(Reply::Multiline)
 }
 
 impl DvdReport {
-    fn resume(&mut self, cx: &mut ContinuationContext<'_>) -> Hresult {
+    fn resume(&mut self, cx: &mut ContinuationContext<'_>) -> CommandResult {
         while self.cursor + DVD_TRACE_RECORD <= self.trace.length {
             let start = self.cursor as usize;
             let mut record = [0u8; DVD_TRACE_RECORD as usize];
@@ -2954,16 +2950,16 @@ impl DvdReport {
                 (word >> 1) & 0xff_ffff,
                 word >> 25,
             );
-            return Hresult::OK;
+            return Ok(Reply::Ok);
         }
         cx.backend.free_pool(self.trace.buffer);
-        Hresult::END_OF_DATA
+        Err(CommandError::EndOfData)
     }
 }
 
 /// `fmtfat partition=<1..5> [force=<dword>]`: format a hard disk
 /// partition as XTAF.
-fn format_fat(invocation: &mut Invocation<'_>) -> Hresult {
+fn format_fat(invocation: &mut Invocation<'_>) -> CommandResult {
     let force_value = invocation.line.param("force");
     if force_value.and_then(|value| value.dword()).is_none() {
         invocation.set_text(format_args!("missing force"));
@@ -2971,13 +2967,13 @@ fn format_fat(invocation: &mut Invocation<'_>) -> Hresult {
     let force = force_value.map_or(0, |value| value.dword_prefix());
     if force == 0 && invocation.backend.execution_state() != ExecutionState::Pending {
         invocation.set_text(format_args!("not stopped"));
-        return Hresult::from_error_code(ErrorCode::NOT_STOPPED);
+        return Err(ErrorCode::NotStopped.into());
     }
     let Some(partition) = util::required_dword(invocation, "partition") else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     if !(1..=5).contains(&partition) {
-        return Hresult::from_error_code(ErrorCode::FILE_NOT_FOUND);
+        return Err(ErrorCode::FileNotFound.into());
     }
     let mut device = *b"\\Device\\Harddisk0\\Partition0";
     device[device.len() - 1] = b'0' + partition as u8;
@@ -2985,10 +2981,10 @@ fn format_fat(invocation: &mut Invocation<'_>) -> Hresult {
         .backend
         .format_partition(&device, FORMAT_CLUSTER_SIZE)
     {
-        Ok(()) => Hresult::OK,
+        Ok(()) => Ok(Reply::Ok),
         Err(_) => {
             invocation.set_text(format_args!("unable to format"));
-            ACCESS_DENIED
+            Err(ACCESS_DENIED)
         }
     }
 }
@@ -3003,19 +2999,19 @@ pub struct Checksum {
 
 /// `getsum ADDR=<dword> LENGTH=<dword> BLOCKSIZE=<dword>`: one CRC per
 /// block of target memory, 0 for blocks touching an unreadable page.
-fn get_sum(invocation: &mut Invocation<'_>) -> Hresult {
+fn get_sum(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(address) = util::required_dword(invocation, "ADDR") else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let Some(length) = util::required_dword(invocation, "LENGTH") else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let Some(block_size) = util::required_dword(invocation, "BLOCKSIZE") else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     if block_size == 0 {
         invocation.set_text(format_args!("Zero BLOCKSIZE not allowed."));
-        return Hresult::from_error_code(ErrorCode::BAD_PARAMETER);
+        return Err(ErrorCode::BadParameter.into());
     }
     let remaining = (length / block_size).wrapping_mul(4);
     if !begin(
@@ -3027,15 +3023,15 @@ fn get_sum(invocation: &mut Invocation<'_>) -> Hresult {
         }),
         None,
     ) {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
-    Hresult::BINARY
+    Ok(Reply::Binary)
 }
 
 impl Checksum {
-    fn resume(&mut self, cx: &mut ContinuationContext<'_>) -> Hresult {
+    fn resume(&mut self, cx: &mut ContinuationContext<'_>) -> CommandResult {
         if cx.aborted || self.remaining == 0 {
-            return Hresult::END_OF_DATA;
+            return Err(CommandError::EndOfData);
         }
         let count = self.remaining.min(GETSUM_CHUNK);
         for slot in cx.binary[..count as usize].as_chunks_mut::<4>().0 {
@@ -3045,7 +3041,7 @@ impl Checksum {
         }
         self.remaining -= count;
         cx.binary_len = count as usize;
-        Hresult::OK
+        Ok(Reply::Ok)
     }
 }
 
@@ -3114,13 +3110,29 @@ pub fn update_crc(mut crc: u32, data: &[u8]) -> u32 {
     crc
 }
 
-/// The HRESULT of a kernel status through its Win32 error code.
-fn dos_hresult(backend: &mut dyn crate::backend::Backend, status: NtStatus) -> Hresult {
-    let error = backend.dos_error(status);
-    if error as i32 > 0 {
-        Hresult(0x8007_0000 | (error & 0xffff))
-    } else {
-        Hresult(error)
+/// The result of a failed kernel call through its Win32 error code.
+/// `ERROR_SUCCESS` is result 0 ([`Reply::Sent`]).
+fn dos_result(backend: &mut dyn crate::backend::Backend, error: KernelError) -> CommandResult {
+    match backend.dos_error(error) {
+        Some(code) => Err(CommandError::Win32(code)),
+        None => Ok(Reply::Sent),
+    }
+}
+
+/// `ERROR_INVALID_NAME`: the target path has no room for the temporary
+/// file name.
+const INVALID_NAME: CommandError = CommandError::Win32(Win32Error::new(0x7b).unwrap());
+
+/// Why `sysfileupd` failed before its upload started.
+enum UpdateError {
+    Command(CommandError),
+    /// Reported through its Win32 error code.
+    Kernel(KernelError),
+}
+
+impl From<CommandError> for UpdateError {
+    fn from(error: CommandError) -> Self {
+        Self::Command(error)
     }
 }
 
@@ -3155,40 +3167,44 @@ fn create_parent_directories(backend: &mut dyn crate::backend::Backend, path: &[
     }
 }
 
-fn hresult_text(invocation_text: &mut crate::text::ResponseText, result: Hresult) {
+fn hresult_text(invocation_text: &mut crate::text::ResponseText, result: CommandResult) {
     invocation_text.clear();
-    let _ = write!(invocation_text, "HRESULT 0x{:x}", result.0);
+    let _ = write!(
+        invocation_text,
+        "HRESULT 0x{:x}",
+        crate::reply::hresult(result).0
+    );
 }
 
 /// `sysfileupd name=<object path>` with `query=<nonzero>`, `localsrc=`, or
 /// an upload of `size` bytes checked against `crc`.
-fn system_file_update(invocation: &mut Invocation<'_>) -> Hresult {
+fn system_file_update(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.session.is_none() {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     let Some(buffer) = invocation.backend.allocate_pool(SYSFILE_BLOCK) else {
-        hresult_text(invocation.text, Hresult::OUT_OF_MEMORY);
-        return Hresult::OUT_OF_MEMORY;
+        hresult_text(invocation.text, Err(CommandError::OutOfMemory));
+        return Err(CommandError::OutOfMemory);
     };
-    let result = system_file_update_start(invocation, buffer);
-    if !matches!(result, Ok(Hresult::SEND_BINARY)) {
+    let started = system_file_update_start(invocation, buffer);
+    if !matches!(started, Ok(Reply::SendBinary)) {
         invocation.backend.free_pool(buffer);
     }
-    match result {
-        Ok(result) => result,
-        Err(result) => {
-            hresult_text(invocation.text, result);
-            result
-        }
-    }
+    let result = match started {
+        Ok(reply) => return Ok(reply),
+        Err(UpdateError::Command(error)) => Err(error),
+        Err(UpdateError::Kernel(error)) => dos_result(invocation.backend, error),
+    };
+    hresult_text(invocation.text, result);
+    result
 }
 
 fn system_file_update_start(
     invocation: &mut Invocation<'_>,
     buffer: PoolBuffer,
-) -> Result<Hresult, Hresult> {
+) -> Result<Reply, UpdateError> {
     let mut name = [0u8; SYSFILE_NAME_BUFFER];
-    let name = string_param(invocation, "name", &mut name).ok_or(Hresult::INVALID_ARGUMENT)?;
+    let name = string_param(invocation, "name", &mut name).ok_or(CommandError::InvalidArgument)?;
     if invocation
         .line
         .dword("query")
@@ -3205,38 +3221,42 @@ fn system_file_update_start(
             backend.close_file(handle);
             information
         });
-        let status = queried.err().unwrap_or(NtStatus::SUCCESS);
-        let result = dos_hresult(backend, status);
-        if result.is_failure() {
-            return Err(result);
-        }
-        let information = queried.unwrap_or_default();
+        let information = match queried {
+            Ok(information) => information,
+            Err(error) => match backend.dos_error(error) {
+                Some(code) => return Err(CommandError::Win32(code).into()),
+                // A failure without a Win32 error reports zero size and time.
+                None => FileInformation::default(),
+            },
+        };
         invocation.set_text(format_args!(
             "0x{:x} 0x{:x}",
             information.end_of_file, information.last_write_time.0
         ));
-        return Ok(Hresult::OK);
+        return Ok(Reply::Ok);
     }
-    let time_high = util::required_dword(invocation, "ftimehi").ok_or(Hresult::INVALID_ARGUMENT)?;
-    let time_low = util::required_dword(invocation, "ftimelo").ok_or(Hresult::INVALID_ARGUMENT)?;
+    let time_high =
+        util::required_dword(invocation, "ftimehi").ok_or(CommandError::InvalidArgument)?;
+    let time_low =
+        util::required_dword(invocation, "ftimelo").ok_or(CommandError::InvalidArgument)?;
     let time = FileTime::from_parts(time_high, time_low);
     let mut source = [0u8; SYSFILE_NAME_BUFFER];
     if let Some(source) = string_param(invocation, "localsrc", &mut source) {
         // The copy result does not reach the reply.
         copy_local_file(invocation.backend, source, name, time);
-        return Ok(Hresult::OK);
+        return Ok(Reply::Ok);
     }
-    let size = util::required_dword(invocation, "size").ok_or(Hresult::INVALID_ARGUMENT)?;
-    let expected = util::required_dword(invocation, "crc").ok_or(Hresult::INVALID_ARGUMENT)?;
+    let size = util::required_dword(invocation, "size").ok_or(CommandError::InvalidArgument)?;
+    let expected = util::required_dword(invocation, "crc").ok_or(CommandError::InvalidArgument)?;
     invocation.text.clear();
 
     let mut temporary = [0u8; SYSFILE_NAME_BUFFER];
     let separator = name
         .iter()
         .rposition(|&byte| byte == b'\\')
-        .ok_or(Hresult(0x8007_007b))?;
+        .ok_or(INVALID_NAME)?;
     if SYSFILE_NAME_BUFFER - 1 - separator < 0xe {
-        return Err(Hresult(0x8007_007b));
+        return Err(INVALID_NAME.into());
     }
     temporary[..separator].copy_from_slice(&name[..separator]);
     let sequence = invocation.backend.update_sequence();
@@ -3260,11 +3280,11 @@ fn system_file_update_start(
     };
     let handle = backend
         .create_file(temporary, &request)
-        .map_err(|status| dos_hresult(backend, status))?;
-    if let Err(status) = backend.set_end_of_file(handle, u64::from(size)) {
+        .map_err(UpdateError::Kernel)?;
+    if let Err(error) = backend.set_end_of_file(handle, u64::from(size)) {
         let _ = backend.set_delete_disposition(handle, true);
         backend.close_file(handle);
-        return Err(dos_hresult(backend, status));
+        return Err(UpdateError::Kernel(error));
     }
     let name_start = SYSFILE_DATA as usize;
     backend.pool(buffer)[name_start..name_start + name.len()].copy_from_slice(name);
@@ -3282,7 +3302,7 @@ fn system_file_update_start(
         Continuation::SystemFileUpdate(update),
         Some(size),
     );
-    Ok(Hresult::SEND_BINARY)
+    Ok(Reply::SendBinary)
 }
 
 /// Copy `source` to `target` in 64 KiB pieces and set all four times to
@@ -3348,7 +3368,7 @@ fn copy_local_file(
             attributes: information.attributes,
         };
         let _ = backend.set_basic_information(output, &basic);
-        Ok::<(), NtStatus>(())
+        Ok::<(), KernelError>(())
     })();
     if let (Err(_), Some(output)) = (result, target_handle) {
         let _ = backend.set_delete_disposition(output, true);
@@ -3363,14 +3383,14 @@ fn copy_local_file(
 }
 
 impl SystemFileUpdate {
-    fn fail(&mut self, cx: &mut ContinuationContext<'_>, status: NtStatus) -> Hresult {
+    fn fail(&mut self, cx: &mut ContinuationContext<'_>, error: KernelError) -> CommandResult {
         if let Some(handle) = self.handle.take() {
             let _ = cx.backend.set_delete_disposition(handle, true);
             cx.backend.close_file(handle);
         }
-        let result = dos_hresult(cx.backend, status);
+        let result = dos_result(cx.backend, error);
         cx.line.clear();
-        let _ = write!(cx.line, "HRESULT 0x{:x}", result.0);
+        let _ = write!(cx.line, "HRESULT 0x{:x}", crate::reply::hresult(result).0);
         result
     }
 
@@ -3379,7 +3399,7 @@ impl SystemFileUpdate {
         &mut self,
         cx: &mut ContinuationContext<'_>,
         handle: FileHandle,
-    ) -> Result<(), NtStatus> {
+    ) -> Result<(), KernelError> {
         let mut name = [0u8; SYSFILE_NAME_BUFFER];
         let start = SYSFILE_DATA as usize;
         name[..self.name_length]
@@ -3409,7 +3429,7 @@ impl SystemFileUpdate {
         cx.backend.set_basic_information(handle, &basic)
     }
 
-    fn resume(&mut self, cx: &mut ContinuationContext<'_>) -> Hresult {
+    fn resume(&mut self, cx: &mut ContinuationContext<'_>) -> CommandResult {
         let remaining = cx.session.receive_remaining.unwrap_or(0);
         if cx.received.is_empty() && remaining != 0 {
             cx.backend.free_pool(self.buffer);
@@ -3419,12 +3439,13 @@ impl SystemFileUpdate {
                 let _ = cx.backend.set_delete_disposition(handle, true);
             }
             cx.session.receive_remaining = Some(0);
-            let _ = write!(cx.line, "HRESULT 0x{:x}", Hresult::UNEXPECTED.0);
-            return Hresult::UNEXPECTED;
+            let error = CommandError::Unexpected;
+            let _ = write!(cx.line, "HRESULT 0x{:x}", Hresult::from(error).0);
+            return Err(error);
         }
         let mut data = cx.received;
         let mut remaining = remaining;
-        let mut result = Hresult::OK;
+        let mut result = Ok(Reply::Ok);
         loop {
             let count = ((SYSFILE_DATA - self.staged) as usize).min(data.len());
             let start = self.staged as usize;
@@ -3446,7 +3467,7 @@ impl SystemFileUpdate {
         result
     }
 
-    fn flush(&mut self, cx: &mut ContinuationContext<'_>, remaining: u32) -> Hresult {
+    fn flush(&mut self, cx: &mut ContinuationContext<'_>, remaining: u32) -> CommandResult {
         let staged = self.staged;
         self.staged = 0;
         let pool = cx.backend.pool(self.buffer);
@@ -3459,26 +3480,26 @@ impl SystemFileUpdate {
         // After a failure the image keeps writing through a null handle.
         let written = match self.handle {
             Some(handle) => cx.backend.write_file(handle, None, FileData::Pool(range)),
-            None => Err(NtStatus(0xc000_0008)),
+            None => Err(KernelError::InvalidHandle),
         };
-        if let Err(status) = written {
-            return self.fail(cx, status);
+        if let Err(error) = written {
+            return self.fail(cx, error);
         }
         if remaining != 0 {
-            return Hresult::OK;
+            return Ok(Reply::Ok);
         }
         if self.crc != self.expected {
-            return self.fail(cx, nt::CRC_ERROR);
+            return self.fail(cx, KernelError::CrcError);
         }
         let Some(handle) = self.handle else {
-            return Hresult::OK;
+            return Ok(Reply::Ok);
         };
-        if let Err(status) = self.finalize(cx, handle) {
-            return self.fail(cx, status);
+        if let Err(error) = self.finalize(cx, handle) {
+            return self.fail(cx, error);
         }
         self.handle = None;
         cx.backend.close_file(handle);
-        Hresult::OK
+        Ok(Reply::Ok)
     }
 }
 

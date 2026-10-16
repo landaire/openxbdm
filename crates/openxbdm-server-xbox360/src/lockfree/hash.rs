@@ -18,12 +18,12 @@ use super::ALLOCATOR_SIZE;
 use super::Allocator;
 use super::CREATE_FAILED;
 use super::Creation;
+use super::Failure;
 use super::Object;
 use super::SUCCESS;
 use super::SemaphoreKind;
 use super::Shape;
 use super::Side;
-use super::Status;
 use super::UNLIMITED;
 use super::Wait;
 use super::call;
@@ -33,6 +33,7 @@ use super::copy;
 use super::counts;
 use super::create_semaphore;
 use super::exchange;
+use super::export_result;
 use super::fetch_add;
 use super::fetch_sub;
 use super::insert_result;
@@ -57,7 +58,6 @@ use super::read_field;
 use super::remove_result;
 use super::store;
 use super::walk;
-use super::win32_result;
 use super::zero;
 use crate::exports::export;
 
@@ -232,12 +232,12 @@ fn create(buckets: u32, creation: &Creation) -> Option<Object> {
 }
 
 /// Remove from each bucket in turn without waiting; the error carries the
-/// status of the last bucket, success when there is none.
-fn sweep(table: Object, item: &mut Item, wait: &Wait) -> Result<(), Status> {
-    let mut status = Status::SUCCESS;
+/// failure of the last bucket, `None` when there is none.
+fn sweep(table: Object, item: &mut Item, wait: &Wait) -> Result<(), Option<Failure>> {
+    let mut last = None;
     let mut index = 0;
     while (index as i32) < bucket_count(table) as i32 {
-        status = if valid(table) {
+        let result = if valid(table) {
             remove(
                 table,
                 bucket_at(table, index),
@@ -248,14 +248,15 @@ fn sweep(table: Object, item: &mut Item, wait: &Wait) -> Result<(), Status> {
                 Handoff::Items,
             )
         } else {
-            Status::INVALID_PARAMETER
+            Err(Failure::InvalidParameter)
         };
-        if status == Status::SUCCESS {
-            return Ok(());
+        match result {
+            Ok(()) => return Ok(()),
+            Err(failure) => last = Some(failure),
         }
         index += 1;
     }
-    Err(status)
+    Err(last)
 }
 
 /// Whether the signature is still in place; stock checks it again inside
@@ -265,14 +266,14 @@ fn valid(table: Object) -> bool {
 }
 
 /// Remove an item by key, or any item with [`Search::First`].
-fn remove_item(table: Object, item: &mut Item, wait: &Wait, search: Search) -> Status {
+fn remove_item(table: Object, item: &mut Item, wait: &Wait, search: Search) -> Result<(), Failure> {
     if !valid(table) {
-        return Status::INVALID_PARAMETER;
+        return Err(Failure::InvalidParameter);
     }
     if search != Search::First {
         let bucket = bucket(table, item.key);
         if !valid(table) {
-            return Status::INVALID_PARAMETER;
+            return Err(Failure::InvalidParameter);
         }
         return remove(
             table,
@@ -285,25 +286,29 @@ fn remove_item(table: Object, item: &mut Item, wait: &Wait, search: Search) -> S
         );
     }
     let last = match sweep(table, item, wait) {
-        Ok(()) => return Status::SUCCESS,
+        Ok(()) => return Ok(()),
         Err(last) => last,
     };
     let Some(semaphore) = table.item_semaphore() else {
-        return last;
+        // A table without buckets reports success, as stock.
+        return match last {
+            Some(failure) => Err(failure),
+            None => Ok(()),
+        };
     };
     let waiters = table.field(SHAPE.waiters);
     fetch_add(waiters, 1);
     if sweep(table, item, wait).is_ok() {
         fetch_sub(waiters, 1);
-        return Status::SUCCESS;
+        return Ok(());
     }
     // Stock reports success after the wait without removing an item and
     // leaves the remover counted as waiting.
-    let status = wait.block(semaphore);
-    if status != Status::SUCCESS {
+    let result = wait.block(semaphore);
+    if result.is_err() {
         fetch_sub(waiters, 1);
     }
-    status
+    result
 }
 
 extern "C" fn insert_export(table: u32, key: u32, value: u32) -> u32 {
@@ -340,11 +345,11 @@ extern "C" fn create_export(descriptor: u32, compare: u32, buckets: u32, output:
     }
     let creation = match Creation::read(descriptor) {
         Ok(creation) => creation,
-        Err(result) => return result.0,
+        Err(error) => return Hresult::from(error).0,
     };
     let options = match sorted_options(&creation, compare) {
         Ok(options) => options,
-        Err(result) => return result.0,
+        Err(error) => return Hresult::from(error).0,
     };
     let buckets = if options.custom_hash {
         buckets
@@ -413,9 +418,8 @@ fn take(table: u32, key: u32, search: Search, output: u32) -> u32 {
         value: 0,
         key: Key(key),
     };
-    let status = remove_item(table, &mut item, &wait, search);
-    if status != Status::SUCCESS {
-        return remove_result(status);
+    if let Err(failure) = remove_item(table, &mut item, &wait, search) {
+        return remove_result(failure);
     }
     if output != 0 {
         store(output as usize, item.value);
@@ -437,16 +441,16 @@ export!(337, remove_key);
 /// returns nonzero; positive results become HRESULTs.
 extern "C" fn enumerate(table: u32, context: u32, callback: u32) -> u32 {
     let Some(table) = Object::validate(table, &SHAPE) else {
-        return win32_result(Status::INVALID_PARAMETER.0).0;
+        return export_result(Err(Failure::InvalidParameter));
     };
     let mut index = 0;
     while (index as i32) < bucket_count(table) as i32 {
         if callback == 0 || load(table.field(SHAPE.tag)) != LFHT {
-            return win32_result(Status::INVALID_PARAMETER.0).0;
+            return export_result(Err(Failure::InvalidParameter));
         }
         let result = walk(first(bucket_at(table, index)), VALUE, context, callback);
-        if result != 0 {
-            return win32_result(result).0;
+        if result.is_err() {
+            return export_result(result);
         }
         index += 1;
     }

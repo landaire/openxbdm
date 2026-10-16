@@ -1,9 +1,9 @@
 //! Simulated `netsim` library: queue and redirect lists of the instance.
 
-use openxbdm_core::status::Hresult;
 use openxbdm_server::commands::network::netsim;
 use openxbdm_server::commands::network::netsim::Direction;
 use openxbdm_server::commands::network::netsim::KeyStatus;
+use openxbdm_server::commands::network::netsim::NetsimError;
 use openxbdm_server::commands::network::netsim::Program;
 use openxbdm_server::commands::network::netsim::QueueConfig;
 use openxbdm_server::commands::network::netsim::QueueIndex;
@@ -13,7 +13,6 @@ use openxbdm_server::commands::network::netsim::QueueStats;
 use openxbdm_server::commands::network::netsim::RedirectConfig;
 use openxbdm_server::commands::network::netsim::RedirectIndex;
 use openxbdm_server::commands::network::netsim::RedirectSnapshot;
-use openxbdm_server::commands::network::netsim::status;
 
 use crate::backend::MockBackend;
 use crate::backend::network::netcap::Attachment;
@@ -51,7 +50,7 @@ pub struct Mock {
     pub instance: Option<Instance>,
     /// Result of the next instance creation, standing in for intercept
     /// registration failures.
-    pub create_error: Option<Hresult>,
+    pub create_error: Option<NetsimError>,
     /// Instances created so far.
     pub created: u32,
     /// Instances destroyed so far.
@@ -67,14 +66,14 @@ impl Mock {
         self.instance.is_some()
     }
 
-    fn instance(&mut self) -> Result<&mut Instance, Hresult> {
-        self.instance.as_mut().ok_or(status::NO_INSTANCE)
+    fn instance(&mut self) -> Result<&mut Instance, NetsimError> {
+        self.instance.as_mut().ok_or(NetsimError::NoInstance)
     }
 }
 
 /// Insert before `position` or append; a position at or past the end is
 /// rejected.
-fn insert_at<T>(list: &mut Vec<T>, position: Option<u32>, item: T) -> Result<u32, Hresult> {
+fn insert_at<T>(list: &mut Vec<T>, position: Option<u32>, item: T) -> Result<u32, NetsimError> {
     match position {
         None => {
             list.push(item);
@@ -84,11 +83,11 @@ fn insert_at<T>(list: &mut Vec<T>, position: Option<u32>, item: T) -> Result<u32
             list.insert(index as usize, item);
             Ok(index)
         }
-        Some(_) => Err(status::INVALID),
+        Some(_) => Err(NetsimError::Invalid),
     }
 }
 
-fn remove_at<T>(list: &mut Vec<T>, position: Option<u32>) -> Result<u32, Hresult> {
+fn remove_at<T>(list: &mut Vec<T>, position: Option<u32>) -> Result<u32, NetsimError> {
     match position {
         None => {
             let count = list.len() as u32;
@@ -99,7 +98,7 @@ fn remove_at<T>(list: &mut Vec<T>, position: Option<u32>) -> Result<u32, Hresult
             list.remove(index as usize);
             Ok(1)
         }
-        Some(_) => Err(status::INVALID),
+        Some(_) => Err(NetsimError::Invalid),
     }
 }
 
@@ -110,10 +109,10 @@ impl netsim::Backend for MockBackend {
 
     /// A running capture moves from its own intercept into the instance;
     /// a failed registration leaves it unrouted (0x91f365e8).
-    fn create_simulator(&mut self) -> Result<(), Hresult> {
+    fn create_simulator(&mut self) -> Result<(), NetsimError> {
         let mock = &mut self.network.netsim;
         if mock.instance.is_some() {
-            return Err(status::INSTANCE_EXISTS);
+            return Err(NetsimError::InstanceExists);
         }
         let attachment = &mut self.network.netcap.attachment;
         if let Some(error) = mock.create_error.take() {
@@ -131,9 +130,9 @@ impl netsim::Backend for MockBackend {
     }
 
     /// A chained capture returns to its own intercept (0x91f36750).
-    fn destroy_simulator(&mut self) -> Result<(), Hresult> {
+    fn destroy_simulator(&mut self) -> Result<(), NetsimError> {
         let mock = &mut self.network.netsim;
-        mock.instance.take().ok_or(status::INSTANCE_CHANGED)?;
+        mock.instance.take().ok_or(NetsimError::InstanceChanged)?;
         mock.destroyed += 1;
         let attachment = &mut self.network.netcap.attachment;
         if attachment.is_some() {
@@ -163,7 +162,7 @@ impl netsim::Backend for MockBackend {
         kind: QueueKind,
         update: &QueueConfig,
         program: Option<&Program>,
-    ) -> Result<QueueIndex, Hresult> {
+    ) -> Result<QueueIndex, NetsimError> {
         let instance = self.network.netsim.instance()?;
         let mut config = QueueConfig::default();
         config.merge(kind, update)?;
@@ -186,12 +185,12 @@ impl netsim::Backend for MockBackend {
         direction: Direction,
         index: QueueIndex,
         update: &QueueConfig,
-    ) -> Result<(), Hresult> {
+    ) -> Result<(), NetsimError> {
         let instance = self.network.netsim.instance()?;
         let queue = instance
             .queues(direction)
             .get_mut(index.0 as usize)
-            .ok_or(status::INVALID)?;
+            .ok_or(NetsimError::Invalid)?;
         queue.config.merge(queue.kind, update)?;
         Ok(())
     }
@@ -200,7 +199,7 @@ impl netsim::Backend for MockBackend {
         &mut self,
         direction: Direction,
         position: Option<QueueIndex>,
-    ) -> Result<u32, Hresult> {
+    ) -> Result<u32, NetsimError> {
         let instance = self.network.netsim.instance()?;
         remove_at(
             instance.queues(direction),
@@ -212,16 +211,20 @@ impl netsim::Backend for MockBackend {
         &mut self,
         direction: Direction,
         index: QueueIndex,
-    ) -> Result<QueueStats, Hresult> {
+    ) -> Result<QueueStats, NetsimError> {
         let instance = self.network.netsim.instance()?;
         instance
             .queues(direction)
             .get(index.0 as usize)
             .map(|queue| queue.stats)
-            .ok_or(status::INVALID)
+            .ok_or(NetsimError::Invalid)
     }
 
-    fn queue(&mut self, direction: Direction, index: QueueIndex) -> Result<QueueSnapshot, Hresult> {
+    fn queue(
+        &mut self,
+        direction: Direction,
+        index: QueueIndex,
+    ) -> Result<QueueSnapshot, NetsimError> {
         let instance = self.network.netsim.instance()?;
         instance
             .queues(direction)
@@ -231,7 +234,7 @@ impl netsim::Backend for MockBackend {
                 config: queue.config,
                 program: queue.program,
             })
-            .ok_or(status::INVALID)
+            .ok_or(NetsimError::Invalid)
     }
 
     fn insert_redirect(
@@ -239,7 +242,7 @@ impl netsim::Backend for MockBackend {
         position: Option<RedirectIndex>,
         redirect: &RedirectConfig,
         program: Option<&Program>,
-    ) -> Result<RedirectIndex, Hresult> {
+    ) -> Result<RedirectIndex, NetsimError> {
         let instance = self.network.netsim.instance()?;
         let redirect = RedirectSnapshot {
             config: *redirect,
@@ -253,7 +256,7 @@ impl netsim::Backend for MockBackend {
         .map(RedirectIndex)
     }
 
-    fn remove_redirects(&mut self, position: Option<RedirectIndex>) -> Result<u32, Hresult> {
+    fn remove_redirects(&mut self, position: Option<RedirectIndex>) -> Result<u32, NetsimError> {
         let instance = self.network.netsim.instance()?;
         remove_at(
             &mut instance.redirects,

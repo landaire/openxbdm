@@ -4,6 +4,10 @@
 //! those of the development kernel the module runs on; take each ordinal
 //! from the import record stock XBDM uses for the same purpose.
 
+use openxbdm_core::status::KernelError;
+use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::Win32Error;
+
 /// Declare an import. Console callees home r3-r10 into the caller frame at
 /// sp+0x10..sp+0x50. SysV frames do not reserve that area, so each import is
 /// called through a stub that allocates it. Stack-passed arguments are not
@@ -136,57 +140,58 @@ fn last_error_slot() -> Option<*mut u32> {
     }
 }
 
-/// The calling thread's Win32 last-error value; 0 during a DPC.
-pub fn last_error() -> u32 {
+/// The calling thread's Win32 last error; `None` for `ERROR_SUCCESS` and
+/// during a DPC.
+pub fn last_error() -> Option<Win32Error> {
     // SAFETY: the slot is a field of the current thread object.
-    last_error_slot().map_or(0, |slot| unsafe { core::ptr::read_volatile(slot) })
+    Win32Error::new(last_error_slot().map_or(0, |slot| unsafe { core::ptr::read_volatile(slot) }))
 }
 
-/// Record a failure status as the calling thread's last error.
-pub fn set_last_error(status: u32) {
-    let error = RtlNtStatusToDosError(status);
+/// Record a failed kernel call as the calling thread's last error.
+pub fn set_last_error(error: KernelError) {
+    let error = RtlNtStatusToDosError(NtStatus::from(error).0);
     if let Some(slot) = last_error_slot() {
         // SAFETY: the slot is a field of the current thread object.
         unsafe { core::ptr::write_volatile(slot, error) };
     }
 }
 
-/// Store a Win32 error as the calling thread's last error (stock
-/// 0x91f72b30).
-pub fn set_last_error_value(error: u32) {
+/// Store a Win32 error, `None` for `ERROR_SUCCESS`, as the calling thread's
+/// last error (stock 0x91f72b30).
+pub fn set_last_error_value(error: Option<Win32Error>) {
     if let Some(slot) = last_error_slot() {
         // SAFETY: the slot is a field of the current thread object.
-        unsafe { core::ptr::write_volatile(slot, error) };
+        unsafe { core::ptr::write_volatile(slot, error.map_or(0, Win32Error::code)) };
     }
 }
 
-/// Status for an export whose address is the module entry point.
-pub const STATUS_DRIVER_ENTRYPOINT_NOT_FOUND: u32 = 0xc000_0263;
+/// Loader handle of a loaded module: its data table entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModuleHandle(u32);
 
-/// Handle of a loaded module, or the failure status.
-pub fn module_handle(name: &core::ffi::CStr) -> Result<u32, u32> {
+impl ModuleHandle {
+    /// The handle as the loader exports take it.
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+/// Handle of a loaded module.
+pub fn module_handle(name: &core::ffi::CStr) -> Result<ModuleHandle, KernelError> {
     let mut handle = 0u32;
-    let status = XexGetModuleHandle(name.as_ptr().cast(), &mut handle);
-    if (status as i32) < 0 {
-        Err(status)
-    } else {
-        Ok(handle)
-    }
+    NtStatus(XexGetModuleHandle(name.as_ptr().cast(), &mut handle)).result()?;
+    Ok(ModuleHandle(handle))
 }
 
-/// Address of an export by ordinal, or the failure status. As stock
-/// 0x91f729d8, an address equal to the module's entry point (handle
-/// +0x18) counts as absent.
-pub fn resolve_export(module: u32, ordinal: u32) -> Result<u32, u32> {
+/// Address of an export by ordinal. As stock 0x91f729d8, an address equal
+/// to the module's entry point (handle +0x18) counts as absent.
+pub fn resolve_export(module: ModuleHandle, ordinal: u32) -> Result<u32, KernelError> {
     let mut address = 0u32;
-    let status = XexGetProcedureAddress(module, ordinal, &mut address);
-    if (status as i32) < 0 {
-        return Err(status);
-    }
+    NtStatus(XexGetProcedureAddress(module.0, ordinal, &mut address)).result()?;
     // SAFETY: a module handle points at the loader's data table entry.
-    let entry = unsafe { core::ptr::read_volatile((module as usize + 0x18) as *const u32) };
+    let entry = unsafe { core::ptr::read_volatile((module.0 as usize + 0x18) as *const u32) };
     if address == entry {
-        Err(STATUS_DRIVER_ENTRYPOINT_NOT_FOUND)
+        Err(KernelError::EntryPointNotFound)
     } else {
         Ok(address)
     }

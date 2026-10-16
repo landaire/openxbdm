@@ -2,7 +2,8 @@
 
 use std::collections::HashMap;
 
-use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::KernelError;
+use openxbdm_core::status::Win32Error;
 use openxbdm_server::Platform;
 use openxbdm_server::commands::filesystem;
 use openxbdm_server::commands::filesystem::BasicInformation;
@@ -24,7 +25,6 @@ use openxbdm_server::commands::filesystem::PoolRange;
 use openxbdm_server::commands::filesystem::ShareAccess;
 use openxbdm_server::commands::filesystem::TransferDirection;
 use openxbdm_server::commands::filesystem::VolumeSize;
-use openxbdm_server::commands::filesystem::nt;
 
 use super::MockBackend;
 use super::POOL_LIMIT;
@@ -42,9 +42,6 @@ pub const CDROM: &str = "\\Device\\Cdrom0";
 /// The whole hard disk as a raw device.
 pub const HARDDISK: &str = "\\Device\\Harddisk0\\Partition0";
 
-const STATUS_INVALID_HANDLE: NtStatus = NtStatus(0xc000_0008);
-const STATUS_END_OF_FILE: NtStatus = NtStatus(0xc000_0011);
-const STATUS_UNRECOGNIZED_VOLUME: NtStatus = NtStatus(0xc000_014f);
 /// FATX names are at most 42 characters.
 const MAX_NAME: usize = 42;
 const CLUSTER: u64 = 0x4000;
@@ -255,7 +252,7 @@ fn strip_component<'a>(path: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
 impl Mock {
     /// Resolve an object name to a volume and a volume path; `None` path
     /// means the root.
-    fn resolve(&self, path: &[u8]) -> Result<(usize, Option<Vec<u8>>), NtStatus> {
+    fn resolve(&self, path: &[u8]) -> Result<(usize, Option<Vec<u8>>), KernelError> {
         if let Some(rest) = strip_component(path, b"\\??") {
             let rest = rest.strip_prefix(b"\\").unwrap_or(rest);
             for (name, target) in &self.links {
@@ -265,7 +262,7 @@ impl Mock {
                     return self.resolve(&resolved);
                 }
             }
-            return Err(nt::OBJECT_PATH_NOT_FOUND);
+            return Err(KernelError::ObjectPathNotFound);
         }
         for (index, volume) in self.volumes.iter().enumerate() {
             if let Some(rest) = strip_component(path, &volume.device) {
@@ -278,24 +275,26 @@ impl Mock {
             .iter()
             .any(|device| strip_component(path, &device.name).is_some())
         {
-            return Err(STATUS_UNRECOGNIZED_VOLUME);
+            return Err(KernelError::UnrecognizedVolume);
         }
         let components = path
             .split(|&byte| byte == b'\\')
             .filter(|part| !part.is_empty())
             .count();
         Err(if components > 2 {
-            nt::OBJECT_PATH_NOT_FOUND
+            KernelError::ObjectPathNotFound
         } else {
-            nt::OBJECT_NAME_NOT_FOUND
+            KernelError::ObjectNameNotFound
         })
     }
 
-    fn file(&self, handle: FileHandle) -> Result<&OpenFile, NtStatus> {
-        self.handles.get(&handle.0).ok_or(STATUS_INVALID_HANDLE)
+    fn file(&self, handle: FileHandle) -> Result<&OpenFile, KernelError> {
+        self.handles
+            .get(&handle.0)
+            .ok_or(KernelError::InvalidHandle)
     }
 
-    fn entry_of(&self, handle: FileHandle) -> Result<(usize, Option<usize>), NtStatus> {
+    fn entry_of(&self, handle: FileHandle) -> Result<(usize, Option<usize>), KernelError> {
         let file = self.file(handle)?;
         let volume = &self.volumes[file.volume];
         match &file.path {
@@ -303,7 +302,7 @@ impl Mock {
             Some(path) => volume
                 .find(path)
                 .map(|index| (file.volume, Some(index)))
-                .ok_or(STATUS_INVALID_HANDLE),
+                .ok_or(KernelError::InvalidHandle),
         }
     }
 
@@ -398,15 +397,20 @@ impl Mock {
 
     /// Whether replacing `old_size` bytes of a file with `new_size` bytes
     /// fits the volume, counted in clusters as the free space is reported.
-    fn check_capacity(&self, volume: usize, new_size: u64, old_size: u64) -> Result<(), NtStatus> {
+    fn check_capacity(
+        &self,
+        volume: usize,
+        new_size: u64,
+        old_size: u64,
+    ) -> Result<(), KernelError> {
         let volume = &self.volumes[volume];
         let units = volume
             .used_units()
             .checked_sub(old_size.div_ceil(CLUSTER))
             .and_then(|units| units.checked_add(new_size.div_ceil(CLUSTER)))
-            .ok_or(nt::DISK_FULL)?;
+            .ok_or(KernelError::DiskFull)?;
         if units > volume.total_units {
-            Err(nt::DISK_FULL)
+            Err(KernelError::DiskFull)
         } else {
             Ok(())
         }
@@ -434,16 +438,16 @@ impl filesystem::Backend for MockBackend {
         &mut self,
         path: &[u8],
         request: &CreateRequest,
-    ) -> Result<FileHandle, NtStatus> {
+    ) -> Result<FileHandle, KernelError> {
         let now = FileTime(self.system_time());
         let (volume, path) = self.filesystem.resolve(path)?;
         let state = &mut self.filesystem;
         let Some(path) = path else {
             if request.options.contains(CreateOptions::NON_DIRECTORY_FILE) {
-                return Err(nt::FILE_IS_A_DIRECTORY);
+                return Err(KernelError::FileIsADirectory);
             }
             if request.disposition == CreateDisposition::Create {
-                return Err(nt::OBJECT_NAME_COLLISION);
+                return Err(KernelError::ObjectNameCollision);
             }
             let file = OpenFile {
                 volume,
@@ -463,27 +467,27 @@ impl filesystem::Backend for MockBackend {
         } else {
             match disk.find(parent_path) {
                 Some(index) if disk.entries[index].directory => disk.entries[index].path.clone(),
-                _ => return Err(nt::OBJECT_PATH_NOT_FOUND),
+                _ => return Err(KernelError::ObjectPathNotFound),
             }
         };
         if !valid_name(leaf(&path)) {
-            return Err(nt::OBJECT_NAME_INVALID);
+            return Err(KernelError::ObjectNameInvalid);
         }
         let writes = request.access.contains(FileAccess::GENERIC_WRITE);
         let path = match disk.find(&path) {
             Some(index) => {
                 let entry = &mut disk.entries[index];
                 if request.disposition == CreateDisposition::Create {
-                    return Err(nt::OBJECT_NAME_COLLISION);
+                    return Err(KernelError::ObjectNameCollision);
                 }
                 if request.options.contains(CreateOptions::DIRECTORY_FILE) && !entry.directory {
-                    return Err(nt::NOT_A_DIRECTORY);
+                    return Err(KernelError::NotADirectory);
                 }
                 if request.options.contains(CreateOptions::NON_DIRECTORY_FILE) && entry.directory {
-                    return Err(nt::FILE_IS_A_DIRECTORY);
+                    return Err(KernelError::FileIsADirectory);
                 }
                 if writes && entry.attributes.contains(FileAttributes::READONLY) {
-                    return Err(nt::ACCESS_DENIED);
+                    return Err(KernelError::AccessDenied);
                 }
                 if matches!(
                     request.disposition,
@@ -492,7 +496,7 @@ impl filesystem::Backend for MockBackend {
                         | CreateDisposition::Supersede
                 ) {
                     if entry.directory {
-                        return Err(nt::FILE_IS_A_DIRECTORY);
+                        return Err(KernelError::FileIsADirectory);
                     }
                     entry.data.clear();
                     entry.last_write_time = now;
@@ -504,7 +508,7 @@ impl filesystem::Backend for MockBackend {
                     request.disposition,
                     CreateDisposition::Open | CreateDisposition::Overwrite
                 ) {
-                    return Err(nt::OBJECT_NAME_NOT_FOUND);
+                    return Err(KernelError::ObjectNameNotFound);
                 }
                 let directory = request.options.contains(CreateOptions::DIRECTORY_FILE);
                 let mut attributes = request.attributes.0 & !FileAttributes::NORMAL.0;
@@ -514,7 +518,7 @@ impl filesystem::Backend for MockBackend {
                 if let Some(size) = request.allocation_size {
                     let free = disk.total_units.saturating_sub(disk.used_units()) * CLUSTER;
                     if size > free {
-                        return Err(nt::DISK_FULL);
+                        return Err(KernelError::DiskFull);
                     }
                 }
                 let mut stored = stored_parent;
@@ -550,9 +554,9 @@ impl filesystem::Backend for MockBackend {
         access: FileAccess,
         share: ShareAccess,
         options: CreateOptions,
-    ) -> Result<FileHandle, NtStatus> {
+    ) -> Result<FileHandle, KernelError> {
         if root.0 != 1 {
-            return Err(STATUS_INVALID_HANDLE);
+            return Err(KernelError::InvalidHandle);
         }
         let mut path = b"\\??\\".to_vec();
         path.extend_from_slice(name);
@@ -580,17 +584,17 @@ impl filesystem::Backend for MockBackend {
         handle: FileHandle,
         offset: Option<u64>,
         target: PoolRange,
-    ) -> Result<u32, NtStatus> {
+    ) -> Result<u32, KernelError> {
         let (volume, index) = self.filesystem.entry_of(handle)?;
-        let index = index.ok_or(nt::INVALID_PARAMETER)?;
+        let index = index.ok_or(KernelError::InvalidParameter)?;
         let file = self.filesystem.file(handle)?;
         if !file.access.contains(FileAccess::GENERIC_READ) {
-            return Err(nt::ACCESS_DENIED);
+            return Err(KernelError::AccessDenied);
         }
         let position = offset.unwrap_or(file.position);
         let data = &self.filesystem.volumes[volume].entries[index].data;
         if position >= data.len() as u64 {
-            return Err(STATUS_END_OF_FILE);
+            return Err(KernelError::EndOfFile);
         }
         let start = position as usize;
         let count = (target.length as usize).min(data.len() - start);
@@ -612,13 +616,13 @@ impl filesystem::Backend for MockBackend {
         handle: FileHandle,
         offset: Option<u64>,
         data: FileData<'_>,
-    ) -> Result<(), NtStatus> {
+    ) -> Result<(), KernelError> {
         let now = FileTime(self.system_time());
         let (volume, index) = self.filesystem.entry_of(handle)?;
-        let index = index.ok_or(nt::INVALID_PARAMETER)?;
+        let index = index.ok_or(KernelError::InvalidParameter)?;
         let file = self.filesystem.file(handle)?;
         if !file.access.contains(FileAccess::GENERIC_WRITE) {
-            return Err(nt::ACCESS_DENIED);
+            return Err(KernelError::AccessDenied);
         }
         let position = offset.unwrap_or(file.position);
         let bytes = match data {
@@ -628,9 +632,9 @@ impl filesystem::Backend for MockBackend {
         let old = self.filesystem.volumes[volume].entries[index].data.len() as u64;
         let end = position
             .checked_add(bytes.len() as u64)
-            .ok_or(nt::DISK_FULL)?;
+            .ok_or(KernelError::DiskFull)?;
         if self.filesystem.write_limit.is_some_and(|limit| end > limit) {
-            return Err(nt::DISK_FULL);
+            return Err(KernelError::DiskFull);
         }
         self.filesystem.check_capacity(volume, end.max(old), old)?;
         let entry = &mut self.filesystem.volumes[volume].entries[index];
@@ -645,16 +649,20 @@ impl filesystem::Backend for MockBackend {
         Ok(())
     }
 
-    fn set_delete_disposition(&mut self, handle: FileHandle, delete: bool) -> Result<(), NtStatus> {
+    fn set_delete_disposition(
+        &mut self,
+        handle: FileHandle,
+        delete: bool,
+    ) -> Result<(), KernelError> {
         let (volume, index) = self.filesystem.entry_of(handle)?;
         let Some(index) = index else {
-            return Err(nt::CANNOT_DELETE);
+            return Err(KernelError::CannotDelete);
         };
         let disk = &self.filesystem.volumes[volume];
         let entry = &disk.entries[index];
         if delete {
             if entry.attributes.contains(FileAttributes::READONLY) {
-                return Err(nt::CANNOT_DELETE);
+                return Err(KernelError::CannotDelete);
             }
             if entry.directory
                 && disk
@@ -662,7 +670,7 @@ impl filesystem::Backend for MockBackend {
                     .iter()
                     .any(|other| parent(&other.path).eq_ignore_ascii_case(&entry.path))
             {
-                return Err(nt::DIRECTORY_NOT_EMPTY);
+                return Err(KernelError::DirectoryNotEmpty);
             }
         }
         if let Some(file) = self.filesystem.handles.get_mut(&handle.0) {
@@ -671,11 +679,11 @@ impl filesystem::Backend for MockBackend {
         Ok(())
     }
 
-    fn set_end_of_file(&mut self, handle: FileHandle, size: u64) -> Result<(), NtStatus> {
+    fn set_end_of_file(&mut self, handle: FileHandle, size: u64) -> Result<(), KernelError> {
         let (volume, index) = self.filesystem.entry_of(handle)?;
-        let index = index.ok_or(nt::INVALID_PARAMETER)?;
+        let index = index.ok_or(KernelError::InvalidParameter)?;
         if self.filesystem.volumes[volume].entries[index].directory {
-            return Err(nt::INVALID_PARAMETER);
+            return Err(KernelError::InvalidParameter);
         }
         let old = self.filesystem.volumes[volume].entries[index].data.len() as u64;
         self.filesystem.check_capacity(volume, size, old)?;
@@ -685,12 +693,12 @@ impl filesystem::Backend for MockBackend {
         Ok(())
     }
 
-    fn set_file_position(&mut self, handle: FileHandle, position: u64) -> Result<(), NtStatus> {
+    fn set_file_position(&mut self, handle: FileHandle, position: u64) -> Result<(), KernelError> {
         let file = self
             .filesystem
             .handles
             .get_mut(&handle.0)
-            .ok_or(STATUS_INVALID_HANDLE)?;
+            .ok_or(KernelError::InvalidHandle)?;
         file.position = position;
         Ok(())
     }
@@ -699,9 +707,9 @@ impl filesystem::Backend for MockBackend {
         &mut self,
         handle: FileHandle,
         information: &BasicInformation,
-    ) -> Result<(), NtStatus> {
+    ) -> Result<(), KernelError> {
         let (volume, index) = self.filesystem.entry_of(handle)?;
-        let index = index.ok_or(nt::ACCESS_DENIED)?;
+        let index = index.ok_or(KernelError::AccessDenied)?;
         let entry = &mut self.filesystem.volumes[volume].entries[index];
         for (target, value) in [
             (&mut entry.creation_time, information.creation_time),
@@ -728,14 +736,14 @@ impl filesystem::Backend for MockBackend {
         handle: FileHandle,
         target: &[u8],
         replace: bool,
-    ) -> Result<(), NtStatus> {
+    ) -> Result<(), KernelError> {
         let (volume, index) = self.filesystem.entry_of(handle)?;
-        let index = index.ok_or(nt::ACCESS_DENIED)?;
+        let index = index.ok_or(KernelError::AccessDenied)?;
         let (target_volume, target) = self.filesystem.resolve(target)?;
         if target_volume != volume {
-            return Err(nt::NOT_SAME_DEVICE);
+            return Err(KernelError::NotSameDevice);
         }
-        let target = target.ok_or(nt::ACCESS_DENIED)?;
+        let target = target.ok_or(KernelError::AccessDenied)?;
         let disk = &mut self.filesystem.volumes[volume];
         let parent_path = parent(&target);
         if !parent_path.is_empty()
@@ -743,10 +751,10 @@ impl filesystem::Backend for MockBackend {
                 .find(parent_path)
                 .is_some_and(|parent| disk.entries[parent].directory)
         {
-            return Err(nt::OBJECT_PATH_NOT_FOUND);
+            return Err(KernelError::ObjectPathNotFound);
         }
         if !valid_name(leaf(&target)) {
-            return Err(nt::OBJECT_NAME_INVALID);
+            return Err(KernelError::ObjectNameInvalid);
         }
         let old = disk.entries[index].path.clone();
         // A directory cannot move below itself.
@@ -754,12 +762,12 @@ impl filesystem::Backend for MockBackend {
             && starts_with_ignore_case(&target, &old)
             && target[old.len()] == b'\\'
         {
-            return Err(nt::INVALID_PARAMETER);
+            return Err(KernelError::InvalidParameter);
         }
         let mut index = index;
         if let Some(existing) = disk.find(&target).filter(|&existing| existing != index) {
             if !replace || disk.entries[existing].directory {
-                return Err(nt::OBJECT_NAME_COLLISION);
+                return Err(KernelError::ObjectNameCollision);
             }
             disk.entries.remove(existing);
             if existing < index {
@@ -783,14 +791,17 @@ impl filesystem::Backend for MockBackend {
         Ok(())
     }
 
-    fn query_file_information(&mut self, handle: FileHandle) -> Result<FileInformation, NtStatus> {
+    fn query_file_information(
+        &mut self,
+        handle: FileHandle,
+    ) -> Result<FileInformation, KernelError> {
         let (volume, index) = self.filesystem.entry_of(handle)?;
         Ok(index.map_or_else(root_information, |index| {
             self.filesystem.volumes[volume].entries[index].information()
         }))
     }
 
-    fn query_full_attributes(&mut self, path: &[u8]) -> Result<FileInformation, NtStatus> {
+    fn query_full_attributes(&mut self, path: &[u8]) -> Result<FileInformation, KernelError> {
         let (volume, path) = self.filesystem.resolve(path)?;
         let Some(path) = path else {
             return Ok(root_information());
@@ -799,9 +810,9 @@ impl filesystem::Backend for MockBackend {
         match disk.find(&path) {
             Some(index) => Ok(disk.entries[index].information()),
             None if parent(&path).is_empty() || disk.find(parent(&path)).is_some() => {
-                Err(nt::OBJECT_NAME_NOT_FOUND)
+                Err(KernelError::ObjectNameNotFound)
             }
-            None => Err(nt::OBJECT_PATH_NOT_FOUND),
+            None => Err(KernelError::ObjectPathNotFound),
         }
     }
 
@@ -810,11 +821,11 @@ impl filesystem::Backend for MockBackend {
         handle: FileHandle,
         restart: bool,
         name: &mut [u8],
-    ) -> Result<DirectoryEntry, NtStatus> {
+    ) -> Result<DirectoryEntry, KernelError> {
         let (volume, index) = self.filesystem.entry_of(handle)?;
         let directory = match index {
             Some(index) if !self.filesystem.volumes[volume].entries[index].directory => {
-                return Err(nt::INVALID_PARAMETER);
+                return Err(KernelError::InvalidParameter);
             }
             Some(index) => self.filesystem.volumes[volume].entries[index].path.clone(),
             None => Vec::new(),
@@ -823,7 +834,7 @@ impl filesystem::Backend for MockBackend {
             .filesystem
             .handles
             .get_mut(&handle.0)
-            .ok_or(STATUS_INVALID_HANDLE)?;
+            .ok_or(KernelError::InvalidHandle)?;
         if restart {
             file.cursor = 0;
         }
@@ -832,10 +843,10 @@ impl filesystem::Backend for MockBackend {
             .iter()
             .filter(|entry| parent(&entry.path).eq_ignore_ascii_case(&directory))
             .nth(file.cursor)
-            .ok_or(nt::NO_MORE_FILES)?;
+            .ok_or(KernelError::NoMoreFiles)?;
         let leaf = leaf(&entry.path);
         if leaf.len() > name.len() {
-            return Err(nt::BUFFER_OVERFLOW);
+            return Err(KernelError::BufferOverflow);
         }
         file.cursor += 1;
         name[..leaf.len()].copy_from_slice(leaf);
@@ -845,7 +856,7 @@ impl filesystem::Backend for MockBackend {
         })
     }
 
-    fn query_volume_size(&mut self, handle: FileHandle) -> Result<VolumeSize, NtStatus> {
+    fn query_volume_size(&mut self, handle: FileHandle) -> Result<VolumeSize, KernelError> {
         let volume = &self.filesystem.volumes[self.filesystem.file(handle)?.volume];
         Ok(VolumeSize {
             total_units: volume.total_units,
@@ -859,26 +870,26 @@ impl filesystem::Backend for MockBackend {
         &mut self,
         link: &[u8],
         target: &mut [u8],
-    ) -> Result<usize, NtStatus> {
+    ) -> Result<usize, KernelError> {
         let name = link
             .strip_prefix(b"\\??\\")
-            .ok_or(nt::OBJECT_NAME_NOT_FOUND)?;
+            .ok_or(KernelError::ObjectNameNotFound)?;
         let (_, resolved) = self
             .filesystem
             .links
             .iter()
             .find(|(link, _)| link.eq_ignore_ascii_case(name))
-            .ok_or(nt::OBJECT_NAME_NOT_FOUND)?;
+            .ok_or(KernelError::ObjectNameNotFound)?;
         let count = resolved.len().min(target.len());
         target[..count].copy_from_slice(&resolved[..count]);
         Ok(count)
     }
 
-    fn open_object_directory(&mut self, path: &[u8]) -> Result<ObjectDirectory, NtStatus> {
+    fn open_object_directory(&mut self, path: &[u8]) -> Result<ObjectDirectory, KernelError> {
         if path == b"\\??" {
             Ok(ObjectDirectory(1))
         } else {
-            Err(nt::OBJECT_NAME_NOT_FOUND)
+            Err(KernelError::ObjectNameNotFound)
         }
     }
 
@@ -888,9 +899,9 @@ impl filesystem::Backend for MockBackend {
         restart: bool,
         context: &mut u32,
         name: &mut [u8],
-    ) -> Result<usize, NtStatus> {
+    ) -> Result<usize, KernelError> {
         if directory.0 != 1 {
-            return Err(STATUS_INVALID_HANDLE);
+            return Err(KernelError::InvalidHandle);
         }
         if restart {
             *context = 0;
@@ -899,9 +910,9 @@ impl filesystem::Backend for MockBackend {
             .filesystem
             .links
             .get(*context as usize)
-            .ok_or(nt::NO_MORE_FILES)?;
+            .ok_or(KernelError::NoMoreFiles)?;
         if link.len() > name.len() {
-            return Err(nt::BUFFER_OVERFLOW);
+            return Err(KernelError::BufferOverflow);
         }
         name[..link.len()].copy_from_slice(link);
         *context += 1;
@@ -910,13 +921,13 @@ impl filesystem::Backend for MockBackend {
 
     fn close_object_directory(&mut self, _directory: ObjectDirectory) {}
 
-    fn reference_device(&mut self, name: &[u8]) -> Result<DeviceObject, NtStatus> {
+    fn reference_device(&mut self, name: &[u8]) -> Result<DeviceObject, KernelError> {
         self.filesystem
             .devices
             .iter()
             .position(|device| device.name.eq_ignore_ascii_case(name))
             .map(|index| DeviceObject(index as u32))
-            .ok_or(nt::OBJECT_NAME_NOT_FOUND)
+            .ok_or(KernelError::ObjectNameNotFound)
     }
 
     fn dereference_device(&mut self, _device: DeviceObject) {}
@@ -927,11 +938,11 @@ impl filesystem::Backend for MockBackend {
         direction: TransferDirection,
         offset: u64,
         buffer: PoolRange,
-    ) -> Result<(), NtStatus> {
+    ) -> Result<(), KernelError> {
         let size = self.filesystem.devices[device.0 as usize].bytes.len() as u64;
         let end = offset + u64::from(buffer.length);
         if end > size {
-            return Err(nt::INVALID_PARAMETER);
+            return Err(KernelError::InvalidParameter);
         }
         let range = offset as usize..end as usize;
         match direction {
@@ -989,13 +1000,13 @@ impl filesystem::Backend for MockBackend {
         self.filesystem.tray.push(value);
     }
 
-    fn format_partition(&mut self, device: &[u8], _cluster_size: u32) -> Result<(), NtStatus> {
+    fn format_partition(&mut self, device: &[u8], _cluster_size: u32) -> Result<(), KernelError> {
         let volume = self
             .filesystem
             .volumes
             .iter_mut()
             .find(|volume| volume.device.eq_ignore_ascii_case(device))
-            .ok_or(nt::OBJECT_NAME_NOT_FOUND)?;
+            .ok_or(KernelError::ObjectNameNotFound)?;
         volume.entries.clear();
         self.filesystem.formatted.push(device.to_vec());
         Ok(())
@@ -1005,19 +1016,19 @@ impl filesystem::Backend for MockBackend {
         self.filesystem.update_sequence
     }
 
-    fn dos_error(&mut self, status: NtStatus) -> u32 {
-        match status {
-            NtStatus::SUCCESS => 0,
-            nt::OBJECT_NAME_NOT_FOUND => 2,
-            nt::OBJECT_PATH_NOT_FOUND => 3,
-            nt::ACCESS_DENIED => 5,
-            STATUS_INVALID_HANDLE => 6,
-            nt::CRC_ERROR => 23,
-            nt::DISK_FULL => 112,
-            nt::OBJECT_NAME_INVALID => 123,
-            nt::OBJECT_NAME_COLLISION => 183,
+    fn dos_error(&mut self, error: KernelError) -> Option<Win32Error> {
+        let code = match error {
+            KernelError::ObjectNameNotFound => 2,
+            KernelError::ObjectPathNotFound => 3,
+            KernelError::AccessDenied => 5,
+            KernelError::InvalidHandle => 6,
+            KernelError::CrcError => 23,
+            KernelError::DiskFull => 112,
+            KernelError::ObjectNameInvalid => 123,
+            KernelError::ObjectNameCollision => 183,
             _ => 317,
-        }
+        };
+        Win32Error::new(code)
     }
 
     fn start_dvd_trace(&mut self) {

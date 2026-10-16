@@ -1,4 +1,4 @@
-use crate::protocol::ErrorCode;
+use crate::protocol::RemoteStatus;
 use crate::protocol::StatusCode;
 use crate::protocol::SuccessCode;
 
@@ -44,7 +44,7 @@ pub enum Error {
     Pe(#[from] crate::commands::dangerous::pe::PeError),
 
     #[error("remote reported error {code} ({message:?})")]
-    Remote { code: ErrorCode, message: String },
+    Remote { code: RemoteStatus, message: String },
 
     #[error("{operation} failed on the console with result {:#010x}", .hresult.0)]
     ConsoleOperationFailed {
@@ -52,8 +52,8 @@ pub enum Error {
         hresult: crate::commands::Hresult,
     },
 
-    #[error("unknown status code {raw}")]
-    UnknownStatusCode { raw: u16 },
+    #[error("unknown status code {code}")]
+    UnknownStatusCode { code: StatusCode },
 
     #[error("module {name:?} was not reported by XBDM")]
     ModuleNotFound { name: String },

@@ -7,7 +7,9 @@ use std::io::Write;
 use common::RawSession;
 use common::TestServer;
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::Win32Error;
 use openxbdm_server::commands::console::ConfigSetting;
 use openxbdm_server::commands::services::CivProgress;
 use openxbdm_server::commands::services::CivResult;
@@ -102,21 +104,21 @@ fn iptv_failures_map_kernel_status() {
     let server = TestServer::start();
     let mut session = session(&server);
     let failures = [
-        (0xc000_0022, "414- access denied"),
-        (0xc000_000d, "400- unexpected error"),
+        (KernelError::AccessDenied, "414- access denied"),
+        (KernelError::InvalidParameter, "400- unexpected error"),
     ];
-    for (status, reply) in failures {
+    for (error, reply) in failures {
         let mut host = server.host.lock();
         host.backend
             .console
             .xconfig
             .failures
-            .insert(ConfigSetting::new(3, 0xc), NtStatus(status));
+            .insert(ConfigSetting::new(3, 0xc), error);
         host.backend
             .console
             .xconfig
             .failures
-            .insert(ConfigSetting::new(9, 4), NtStatus(status));
+            .insert(ConfigSetting::new(9, 4), error);
         drop(host);
         assert_eq!(session.command("iptv enable"), reply);
         assert_eq!(session.command("iptvbootstrapurl x"), reply);
@@ -204,7 +206,8 @@ fn civfail_reports_the_thread_handle() {
         ]
     );
 
-    server.host.lock().backend.services.thread_failure = Some(LastError(0x8));
+    server.host.lock().backend.services.thread_failure =
+        Some(LastError::Other(Win32Error::new(0x8).unwrap()));
     assert_eq!(
         session.command("civfail reboot=1"),
         "200- CreateThread failed 0x8"
@@ -301,7 +304,7 @@ fn civsetbits_reports_an_unresolved_export() {
         .services
         .missing_detection_routine = Some(DetectionRoutineMissing {
         routine: DetectionRoutine::GetDetected,
-        status: NtStatus(0xc000_0139),
+        error: KernelError::from_status(NtStatus(0xc000_0139)),
     });
     let mut session = session(&server);
     assert_eq!(
@@ -344,7 +347,7 @@ fn civstart_clamps_the_thread_id() {
         session.command("civstart threadid=-1"),
         "200- XSecurityCreateProcess 0x0"
     );
-    server.host.lock().backend.services.create_result = CivResult(0x8007_0005);
+    server.host.lock().backend.services.create_result = CivResult::Returned(Hresult(0x8007_0005));
     assert_eq!(
         session.command("civstart"),
         "200- XSecurityCreateProcess 0x80070005"
@@ -390,7 +393,7 @@ fn civstatus_formats_the_progress_record() {
         session.command("civstatus"),
         "200- Blocks Checked 100, Failed Reads -1, Failed Hashes 0, Total Blocks 100, Completed."
     );
-    server.host.lock().backend.services.progress = Err(CivResult(0x8000_4005));
+    server.host.lock().backend.services.progress = Err(CivResult::Returned(Hresult(0x8000_4005)));
     assert_eq!(
         session.command("civstatus"),
         "200- XSecurityFailedBlocks returned 0x80004005"
@@ -410,11 +413,13 @@ fn own_thread_commands_run_on_title_connections() {
     let server = TestServer::start();
     {
         let mut host = server.host.lock();
-        host.backend.register_processor(
-            b"ttl",
-            Some(Box::new(|_, _| Hresult::OK)),
-            ProcessorFlags::TITLE,
-        );
+        host.backend
+            .register_processor(
+                b"ttl",
+                Some(Box::new(|_, _| Hresult::OK)),
+                ProcessorFlags::TITLE,
+            )
+            .unwrap();
     }
     let mut session = session(&server);
     assert_eq!(session.command("ttl!x"), "200- OK");
@@ -450,7 +455,7 @@ fn civverify_replaces_non_positive_budgets() {
             "{command}"
         );
     }
-    server.host.lock().backend.services.verify_result = CivResult(0x103);
+    server.host.lock().backend.services.verify_result = CivResult::Returned(Hresult(0x103));
     assert_eq!(
         session.command("civverify milliseconds=0x20q"),
         "200- XSecurityVerify 0x103"

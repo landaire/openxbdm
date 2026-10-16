@@ -11,6 +11,10 @@
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 
+use crate::reply::CommandError;
+
+use super::HardwareError;
+
 /// Number of user slots.
 pub const USERS: u32 = 4;
 
@@ -136,14 +140,21 @@ pub enum AutomationError {
     Refused,
 }
 
-impl AutomationError {
-    pub const fn hresult(self) -> Hresult {
-        match self {
-            Self::BadParameter => Hresult::from_error_code(ErrorCode::BAD_PARAMETER),
-            Self::NotConnected => Hresult::error(0x2a),
-            Self::OutOfMemory => Hresult::from_error_code(ErrorCode::OUT_OF_MEMORY),
-            Self::Refused => Hresult::from_error_code(ErrorCode::UNKNOWN_COMMAND),
+impl From<AutomationError> for CommandError {
+    fn from(error: AutomationError) -> Self {
+        match error {
+            AutomationError::BadParameter => Self::Status(ErrorCode::BadParameter),
+            AutomationError::NotConnected => HardwareError::NotConnected.into(),
+            AutomationError::OutOfMemory => Self::Status(ErrorCode::OutOfMemory),
+            AutomationError::Refused => Self::Status(ErrorCode::UnknownCommand),
         }
+    }
+}
+
+/// Result of the automation exports 167 to 174.
+impl From<AutomationError> for Hresult {
+    fn from(error: AutomationError) -> Self {
+        CommandError::from(error).into()
     }
 }
 

@@ -11,12 +11,14 @@
 use core::fmt::Write as _;
 
 use openxbdm_core::status::ErrorCode;
-use openxbdm_core::status::Hresult;
-use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::KernelError;
 
 use crate::continuation::Continuation as AnyContinuation;
 use crate::continuation::ContinuationContext;
 use crate::invocation::Invocation;
+use crate::reply::CommandError;
+use crate::reply::CommandResult;
+use crate::reply::Reply;
 
 use super::Continuation as SessionContinuation;
 
@@ -58,7 +60,16 @@ pub enum RpcThread<'a> {
 pub enum RpcCreateError {
     OutOfMemory,
     /// The call thread could not be created.
-    Thread(NtStatus),
+    Thread(KernelError),
+}
+
+impl From<RpcCreateError> for CommandError {
+    fn from(error: RpcCreateError) -> Self {
+        match error {
+            RpcCreateError::OutOfMemory => ErrorCode::OutOfMemory.into(),
+            RpcCreateError::Thread(error) => Self::Kernel(error),
+        }
+    }
 }
 
 /// Platform services of `rpc`.
@@ -118,29 +129,29 @@ pub enum StreamPhase {
 
 /// `rpc version=4 (system|title) buf_size=<dword> [processor=<dword>]
 /// [thread=<name>]`.
-pub(super) fn rpc(invocation: &mut Invocation<'_>) -> Hresult {
+pub(super) fn rpc(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(version) = invocation.line.dword("version") else {
         invocation.set_text(format_args!(
             "error=Version is not specified, expecting major version {RPC_VERSION}"
         ));
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     };
     if version != RPC_VERSION {
         invocation.set_text(format_args!(
             "error=Version mismatch, expected {RPC_VERSION} but got {}",
             version as i32
         ));
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     let context = if invocation.line.has("system") {
         RpcContext::System
     } else if invocation.line.has("title") {
         RpcContext::Title
     } else {
-        return Hresult::from_error_code(ErrorCode::BAD_PARAMETER);
+        return Err(ErrorCode::BadParameter.into());
     };
     let Some(size) = invocation.line.dword("buf_size") else {
-        return Hresult::from_error_code(ErrorCode::BAD_PARAMETER);
+        return Err(ErrorCode::BadParameter.into());
     };
     // An absent or malformed value selects the default.
     let processor = invocation
@@ -157,17 +168,11 @@ pub(super) fn rpc(invocation: &mut Invocation<'_>) -> Hresult {
     } else {
         RpcThread::Named(name)
     };
-    let call = match invocation.backend.rpc_create(size, context, thread) {
-        Ok(call) => call,
-        Err(RpcCreateError::OutOfMemory) => {
-            return Hresult::from_error_code(ErrorCode::OUT_OF_MEMORY);
-        }
-        Err(RpcCreateError::Thread(status)) => return Hresult(status.0 | 0x1000_0000),
-    };
+    let call = invocation.backend.rpc_create(size, context, thread)?;
     let address = invocation.backend.rpc_buffer_address(call);
     let Some(session) = invocation.session.as_deref_mut() else {
         invocation.backend.rpc_abort(call);
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     session.receive_remaining = Some(size);
     session.continuation =
@@ -178,10 +183,13 @@ pub(super) fn rpc(invocation: &mut Invocation<'_>) -> Hresult {
         }));
     invocation.text.clear();
     let _ = write!(invocation.text, "buf_addr={address:08X}");
-    Hresult::SEND_BINARY
+    Ok(Reply::SendBinary)
 }
 
-pub(super) fn resume(transfer: &mut RpcTransfer, cx: &mut ContinuationContext<'_>) -> Hresult {
+pub(super) fn resume(
+    transfer: &mut RpcTransfer,
+    cx: &mut ContinuationContext<'_>,
+) -> CommandResult {
     match transfer {
         RpcTransfer::Upload {
             call,
@@ -197,13 +205,13 @@ fn upload(
     size: u32,
     received: &mut u32,
     cx: &mut ContinuationContext<'_>,
-) -> Hresult {
+) -> CommandResult {
     let remaining = cx.session.receive_remaining.unwrap_or(0);
     if cx.received.is_empty() && remaining != 0 {
         // The connection closed before the buffer arrived.
         cx.session.receive_remaining = Some(0);
         cx.backend.rpc_abort(call);
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     cx.backend.rpc_write(call, *received, cx.received);
     let count = cx.received.len() as u32;
@@ -211,7 +219,7 @@ fn upload(
     let remaining = remaining.saturating_sub(count);
     cx.session.receive_remaining = Some(remaining);
     if remaining != 0 {
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     cx.backend.rpc_start(call);
     let next = RpcTransfer::Stream {
@@ -220,7 +228,7 @@ fn upload(
         phase: StreamPhase::Waiting,
     };
     cx.session.continuation = AnyContinuation::Session(SessionContinuation::Rpc(next));
-    Hresult::BINARY
+    Ok(Reply::Binary)
 }
 
 fn stream(
@@ -228,10 +236,10 @@ fn stream(
     size: u32,
     phase: &mut StreamPhase,
     cx: &mut ContinuationContext<'_>,
-) -> Hresult {
+) -> CommandResult {
     if cx.aborted {
         cx.backend.rpc_release(call);
-        return Hresult::END_OF_DATA;
+        return Err(CommandError::EndOfData);
     }
     match *phase {
         StreamPhase::Waiting => {
@@ -250,7 +258,7 @@ fn stream(
             };
             cx.binary[..8].copy_from_slice(&marker);
             cx.binary_len = 8;
-            Hresult::OK
+            Ok(Reply::Ok)
         }
         StreamPhase::Buffer { offset } => {
             // The monitor waits before sending the buffer; the call has
@@ -269,11 +277,11 @@ fn stream(
                     offset: offset + count,
                 }
             };
-            Hresult::OK
+            Ok(Reply::Ok)
         }
         StreamPhase::Sent => {
             cx.backend.rpc_release(call);
-            Hresult::END_OF_DATA
+            Err(CommandError::EndOfData)
         }
     }
 }

@@ -71,7 +71,9 @@ fn passive() -> bool {
     kernel::current_irql() == 0
 }
 
-/// A service run on the server thread with the server's state.
+/// A service run on the server thread with the server's state. The result
+/// is the export's or control code's return word: services convert typed
+/// results to it as their last step.
 pub(crate) type ServerService = fn(&mut Server, &mut Console, &mut XamNetwork, u32) -> u32;
 
 const REQUEST_FREE: u32 = 0;

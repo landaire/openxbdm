@@ -9,6 +9,7 @@ use crate::protocol::ArgBuilder;
 use crate::protocol::Command;
 use crate::protocol::ErrorCode;
 use crate::protocol::ExpectedBody;
+use crate::protocol::RemoteStatus;
 use crate::protocol::Response;
 
 fn report_argument(err: ArgumentError) -> rootcause::Report<Error> {
@@ -104,7 +105,7 @@ pub enum DebuggerAttachment {
 }
 
 fn parse_attachment(message: &str) -> DebuggerAttachment {
-    if message == ErrorCode::FILE_ALREADY_EXISTS.message() {
+    if message == ErrorCode::FileAlreadyExists.message() {
         return DebuggerAttachment::Attached {
             name: None,
             user: None,
@@ -139,10 +140,10 @@ impl Command for IsDebugger {
 
     fn handle_remote(
         &self,
-        code: ErrorCode,
+        code: RemoteStatus,
         message: &str,
     ) -> Option<Result<Self::Output, rootcause::Report<Error>>> {
-        (code == ErrorCode::FILE_ALREADY_EXISTS).then(|| Ok(parse_attachment(message)))
+        (code == ErrorCode::FileAlreadyExists).then(|| Ok(parse_attachment(message)))
     }
 }
 
@@ -161,7 +162,7 @@ mod tests {
         .iter()
         .map(|message| {
             IsDebugger
-                .handle_remote(ErrorCode::FILE_ALREADY_EXISTS, message)
+                .handle_remote(ErrorCode::FileAlreadyExists.into(), message)
                 .unwrap()
                 .unwrap()
         })

@@ -9,6 +9,7 @@
 use core::num::NonZeroU32;
 
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::KernelError;
 
 /// Bytes before the first record: the 0x80-byte file header and the
 /// 0x74-byte media block.
@@ -28,14 +29,42 @@ pub const MAX_FRAME_LENGTH: u32 = 0x5ea;
 /// Largest single file write of the buffered writer.
 pub const WRITE_LIMIT: u32 = 0x1_0000;
 
-/// A frame is longer than [`MAX_FRAME_LENGTH`], or a file transfer was short.
-pub const BAD_LENGTH: Hresult = Hresult(0x8007_0018);
-/// The data limit is used up.
-pub const DATA_LIMIT_REACHED: Hresult = Hresult(0x8007_006f);
-/// The write buffer was full where the caller could not wait for it.
-pub const WRITE_FAULT: Hresult = Hresult(0x8007_001d);
-/// A record header in the file is inconsistent.
-pub const INVALID_DATA: Hresult = Hresult(0x8007_000d);
+/// Why a capture file operation failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureFileError {
+    /// A frame is longer than [`MAX_FRAME_LENGTH`], or a file transfer was
+    /// short.
+    BadLength,
+    /// The data limit is used up.
+    DataLimitReached,
+    /// The write buffer was full where the caller could not wait for it.
+    WriteFault,
+    /// A record header in the file is inconsistent.
+    InvalidData,
+    /// No memory for the context or the write buffer.
+    OutOfMemory,
+    /// A file operation failed.
+    Kernel(KernelError),
+}
+
+impl From<CaptureFileError> for Hresult {
+    fn from(error: CaptureFileError) -> Self {
+        match error {
+            CaptureFileError::BadLength => Hresult(0x8007_0018),
+            CaptureFileError::DataLimitReached => Hresult(0x8007_006f),
+            CaptureFileError::WriteFault => Hresult(0x8007_001d),
+            CaptureFileError::InvalidData => Hresult(0x8007_000d),
+            CaptureFileError::OutOfMemory => Hresult::OUT_OF_MEMORY,
+            CaptureFileError::Kernel(error) => error.into(),
+        }
+    }
+}
+
+impl From<KernelError> for CaptureFileError {
+    fn from(error: KernelError) -> Self {
+        Self::Kernel(error)
+    }
+}
 
 /// Local time of context creation, in `GetLocalTime` field order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -160,7 +189,8 @@ pub struct Recorder {
     frames: u32,
     /// The data limit was hit (flag 0x01000000).
     exhausted: bool,
-    /// A record failed with [`WRITE_FAULT`] (flag 0x00800000).
+    /// A record failed with [`CaptureFileError::WriteFault`] (flag
+    /// 0x00800000).
     write_fault: bool,
     closing: bool,
 }
@@ -182,12 +212,12 @@ impl Recorder {
     }
 
     /// Check a frame of `length` bytes before it is written.
-    pub fn admit(&mut self, length: u32) -> Result<Admission, Hresult> {
+    pub fn admit(&mut self, length: u32) -> Result<Admission, CaptureFileError> {
         if length > MAX_FRAME_LENGTH {
-            return Err(BAD_LENGTH);
+            return Err(CaptureFileError::BadLength);
         }
         if self.exhausted {
-            return Err(DATA_LIMIT_REACHED);
+            return Err(CaptureFileError::DataLimitReached);
         }
         if self.closing {
             return Ok(Admission::Discard);
@@ -202,7 +232,7 @@ impl Recorder {
             .wrapping_sub(self.used);
         if length > remaining {
             self.exhausted = true;
-            return Err(DATA_LIMIT_REACHED);
+            return Err(CaptureFileError::DataLimitReached);
         }
         Ok(Admission::Record)
     }
@@ -214,8 +244,8 @@ impl Recorder {
     }
 
     /// Writing a record failed with `error`.
-    pub fn failed(&mut self, error: Hresult) {
-        if error == WRITE_FAULT {
+    pub fn failed(&mut self, error: CaptureFileError) {
+        if error == CaptureFileError::WriteFault {
             self.write_fault = true;
         }
     }
@@ -228,9 +258,9 @@ impl Recorder {
     /// Finish the file (0x91f69d18 after the data is written): with records,
     /// rebuild the frame table from the records between the header and
     /// `end`; then cut the file after the table and store the table
-    /// location. A record lost to [`WRITE_FAULT`] makes a successful finish
-    /// report that error.
-    pub fn finish(&mut self, file: &mut impl CaptureIo, end: u64) -> Result<(), Hresult> {
+    /// location. A record lost to [`CaptureFileError::WriteFault`] makes a
+    /// successful finish report that error.
+    pub fn finish(&mut self, file: &mut impl CaptureIo, end: u64) -> Result<(), CaptureFileError> {
         let mut table = Table {
             offset: 0,
             bytes: 0,
@@ -244,7 +274,7 @@ impl Recorder {
         put(&mut location, 4, table.bytes);
         file.write_at(TABLE_LOCATION_OFFSET, &location)?;
         if self.write_fault {
-            Err(WRITE_FAULT)
+            Err(CaptureFileError::WriteFault)
         } else {
             Ok(())
         }
@@ -253,13 +283,14 @@ impl Recorder {
 
 /// Positional access to an open capture file.
 pub trait CaptureIo {
-    /// Read exactly `buffer.len()` bytes; a short read is [`BAD_LENGTH`].
-    fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> Result<(), Hresult>;
-    /// Write all of `data`; a short write is [`BAD_LENGTH`].
-    fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), Hresult>;
+    /// Read exactly `buffer.len()` bytes; a short read is
+    /// [`CaptureFileError::BadLength`].
+    fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> Result<(), CaptureFileError>;
+    /// Write all of `data`; a short write is [`CaptureFileError::BadLength`].
+    fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), CaptureFileError>;
     /// Set the end of file and the allocation size to `length`
     /// (0x91f6a310).
-    fn truncate(&mut self, length: u64) -> Result<(), Hresult>;
+    fn truncate(&mut self, length: u64) -> Result<(), CaptureFileError>;
 }
 
 struct Table {
@@ -273,7 +304,7 @@ fn write_frame_table(
     file: &mut impl CaptureIo,
     end: u64,
     table: &mut Table,
-) -> Result<u32, Hresult> {
+) -> Result<u32, CaptureFileError> {
     let mut position = HEADER_SIZE as u64;
     let mut count = 0u32;
     while position < end {
@@ -283,7 +314,7 @@ fn write_frame_table(
         let captured = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
         let available = end as i64 - (position + RECORD_HEADER_SIZE as u64) as i64;
         if i64::from(captured) > available || captured != original {
-            return Err(INVALID_DATA);
+            return Err(CaptureFileError::InvalidData);
         }
         let entry_offset = end + u64::from(count) * 4;
         file.write_at(entry_offset, &(position as u32).to_le_bytes())?;
@@ -309,14 +340,17 @@ mod tests {
     struct MemoryFile(Vec<u8>);
 
     impl CaptureIo for MemoryFile {
-        fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> Result<(), Hresult> {
+        fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> Result<(), CaptureFileError> {
             let start = offset as usize;
-            let bytes = self.0.get(start..start + buffer.len()).ok_or(BAD_LENGTH)?;
+            let bytes = self
+                .0
+                .get(start..start + buffer.len())
+                .ok_or(CaptureFileError::BadLength)?;
             buffer.copy_from_slice(bytes);
             Ok(())
         }
 
-        fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), Hresult> {
+        fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), CaptureFileError> {
             let end = offset as usize + data.len();
             if self.0.len() < end {
                 self.0.resize(end, 0);
@@ -325,7 +359,7 @@ mod tests {
             Ok(())
         }
 
-        fn truncate(&mut self, length: u64) -> Result<(), Hresult> {
+        fn truncate(&mut self, length: u64) -> Result<(), CaptureFileError> {
             self.0.resize(length as usize, 0);
             Ok(())
         }
@@ -399,12 +433,15 @@ mod tests {
     fn admission_limits() {
         let mut recorder = Recorder::new(DataLimit(None));
         assert_eq!(recorder.admit(MAX_FRAME_LENGTH), Ok(Admission::Record));
-        assert_eq!(recorder.admit(MAX_FRAME_LENGTH + 1), Err(BAD_LENGTH));
+        assert_eq!(
+            recorder.admit(MAX_FRAME_LENGTH + 1),
+            Err(CaptureFileError::BadLength)
+        );
 
         let mut recorder = Recorder::new(DataLimit(NonZeroU32::new(100)));
-        assert_eq!(recorder.admit(101), Err(DATA_LIMIT_REACHED));
+        assert_eq!(recorder.admit(101), Err(CaptureFileError::DataLimitReached));
         // Once exhausted, even small frames fail.
-        assert_eq!(recorder.admit(1), Err(DATA_LIMIT_REACHED));
+        assert_eq!(recorder.admit(1), Err(CaptureFileError::DataLimitReached));
 
         let mut recorder = Recorder::new(DataLimit(NonZeroU32::new(100)));
         assert_eq!(recorder.admit(90), Ok(Admission::Record));
@@ -415,7 +452,7 @@ mod tests {
         let mut recorder = Recorder::new(DataLimit(NonZeroU32::new(100)));
         assert_eq!(recorder.admit(60), Ok(Admission::Record));
         recorder.recorded(60);
-        assert_eq!(recorder.admit(23), Err(DATA_LIMIT_REACHED));
+        assert_eq!(recorder.admit(23), Err(CaptureFileError::DataLimitReached));
 
         let mut recorder = Recorder::new(DataLimit(None));
         recorder.begin_close();
@@ -469,20 +506,29 @@ aa aa aa 01 00 0a 00 00 00 00 00 00 00 02 00 00
         let (mut file, mut recorder) = capture(&[&[1, 2, 3]]);
         file.0[HEADER_SIZE + 8] = 4;
         let end = file.0.len() as u64;
-        assert_eq!(recorder.finish(&mut file, end), Err(INVALID_DATA));
+        assert_eq!(
+            recorder.finish(&mut file, end),
+            Err(CaptureFileError::InvalidData)
+        );
         assert_eq!(recorder.frames(), 1);
 
         let (mut file, mut recorder) = capture(&[&[1, 2, 3]]);
         let end = file.0.len() as u64 - 4;
-        assert_eq!(recorder.finish(&mut file, end), Err(INVALID_DATA));
+        assert_eq!(
+            recorder.finish(&mut file, end),
+            Err(CaptureFileError::InvalidData)
+        );
     }
 
     #[test]
     fn finish_reports_a_write_fault() {
         let (mut file, mut recorder) = capture(&[&[1]]);
-        recorder.failed(WRITE_FAULT);
+        recorder.failed(CaptureFileError::WriteFault);
         let end = file.0.len() as u64;
-        assert_eq!(recorder.finish(&mut file, end), Err(WRITE_FAULT));
+        assert_eq!(
+            recorder.finish(&mut file, end),
+            Err(CaptureFileError::WriteFault)
+        );
         assert_eq!(recorder.frames(), 1);
     }
 }

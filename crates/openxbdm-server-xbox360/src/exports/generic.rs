@@ -4,6 +4,7 @@
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::NtStatus;
+use openxbdm_server::reply::CommandError;
 
 use crate::exports::export;
 use crate::kernel;
@@ -41,11 +42,9 @@ export!(4, free_pool_if_present);
 export!(5, free_pool_if_present);
 
 extern "C" fn close_handle(handle: u32) -> u32 {
-    let status = kernel::NtClose(handle);
-    if (status as i32) < 0 {
-        Hresult::from_nt_status(NtStatus(status), Hresult::FAIL).0
-    } else {
-        Hresult::OK.0
+    match NtStatus(kernel::NtClose(handle)).result() {
+        Ok(()) => Hresult::OK.0,
+        Err(error) => Hresult::from(CommandError::from_kernel(error, CommandError::Fail)).0,
     }
 }
 export!(7, close_handle);
@@ -62,7 +61,7 @@ extern "C" fn not_implemented() -> u32 {
 export!(11, not_implemented);
 
 extern "C" fn monitor_failure() -> u32 {
-    Hresult::from_error_code(ErrorCode::UNDEFINED).0
+    Hresult::from(CommandError::from(ErrorCode::Undefined)).0
 }
 export!(20, monitor_failure);
 

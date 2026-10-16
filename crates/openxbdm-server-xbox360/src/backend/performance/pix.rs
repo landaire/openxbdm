@@ -20,9 +20,10 @@ pub(crate) use ring::stream_active;
 pub(crate) use ring::write_tagged_record;
 pub(crate) use ring::write_tagged_words;
 
-use openxbdm_core::status::Hresult;
 use openxbdm_server::Server;
 use openxbdm_server::commands::performance::pix;
+use openxbdm_server::reply;
+use openxbdm_server::reply::Reply;
 use openxbdm_server::text::ResponseText;
 
 use crate::backend::Console;
@@ -152,10 +153,10 @@ fn title_command(
         output[..count].copy_from_slice(&text.as_bytes()[..count]);
         output[count] = 0;
     }
-    if result == Hresult::BINARY {
+    if result == Ok(Reply::Binary) {
         ring::begin_title_transfer(context);
     }
-    result.0
+    reply::hresult(result).0
 }
 
 pub(crate) use capture::service_command_buffers;

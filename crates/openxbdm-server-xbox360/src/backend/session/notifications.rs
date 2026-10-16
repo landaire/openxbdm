@@ -724,7 +724,7 @@ extern "C" fn register_notification_processor(session: u32, name: u32, handler: 
     assert_passive(0xce4);
     let guard = LOCK.exclusive();
     let mut processors = (0..PROCESSOR_SLOTS).map(|slot| session + SESSION_PROCESSORS + 4 * slot);
-    let result = match block {
+    let result: Result<(), AddProcessorError> = match block {
         None => {
             let name = if name == 0 {
                 None
@@ -751,14 +751,14 @@ extern "C" fn register_notification_processor(session: u32, name: u32, handler: 
                     write_u32(slot, 0);
                 }
             }
-            Hresult::OK
+            Ok(())
         }
         Some(processor) => match processors.find(|&slot| read_u32(slot) == 0) {
-            None => Hresult::from_error_code(ErrorCode::MAX_CONNECTIONS_EXCEEDED),
+            None => Err(AddProcessorError::NoFreeSlot),
             Some(slot) => {
                 let name = c_string(name, PROCESSOR_NAME_LIMIT + 1);
                 if name.len() > PROCESSOR_NAME_LIMIT {
-                    Hresult::INVALID_ARGUMENT
+                    Err(AddProcessorError::NameTooLong)
                 } else {
                     // SAFETY: the block holds PROCESSOR_SIZE bytes.
                     unsafe {
@@ -769,7 +769,7 @@ extern "C" fn register_notification_processor(session: u32, name: u32, handler: 
                     write_u32(processor + PROCESSOR_HANDLER, handler);
                     write_u32(slot, processor);
                     block = None;
-                    Hresult::OK
+                    Ok(())
                 }
             }
         },
@@ -778,7 +778,25 @@ extern "C" fn register_notification_processor(session: u32, name: u32, handler: 
     if let Some(unused) = block {
         kernel::ExFreePool(unused);
     }
-    result.0
+    result.map_or_else(|error| Hresult::from(error).0, |()| Hresult::OK.0)
+}
+
+/// Why export 32 could not add a session processor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddProcessorError {
+    NoFreeSlot,
+    NameTooLong,
+}
+
+impl From<AddProcessorError> for Hresult {
+    fn from(error: AddProcessorError) -> Self {
+        match error {
+            AddProcessorError::NoFreeSlot => {
+                Hresult::from_error_code(ErrorCode::MaxConnectionsExceeded)
+            }
+            AddProcessorError::NameTooLong => Hresult::INVALID_ARGUMENT,
+        }
+    }
 }
 
 /// Export 36 (stock 0x91f3b070): send `text` to every notification
@@ -793,18 +811,28 @@ pub(super) extern "C" fn send_notification(text: u32) -> u32 {
     if text == 0 {
         return Hresult::INVALID_ARGUMENT.0;
     }
-    send_notification_text(c_string(text, usize::MAX)).0
+    notification_result(send_notification_text(c_string(text, usize::MAX)))
+}
+
+/// A notification text that names no kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MissingKind;
+
+/// The export result word of a notification send.
+pub(super) fn notification_result(result: Result<(), MissingKind>) -> u32 {
+    match result {
+        Ok(()) => Hresult::OK.0,
+        Err(MissingKind) => Hresult::INVALID_ARGUMENT.0,
+    }
 }
 
 /// [`send_notification`] for a text formatted by this module.
-pub(super) fn send_notification_text(text: &[u8]) -> Hresult {
-    if notification_kind_length(text).is_none() {
-        return Hresult::INVALID_ARGUMENT;
-    }
+pub(super) fn send_notification_text(text: &[u8]) -> Result<(), MissingKind> {
+    notification_kind_length(text).ok_or(MissingKind)?;
     if passive() {
         post_notification(text);
     }
-    Hresult::OK
+    Ok(())
 }
 
 /// Word stored by export 76 (stock 0x91fadd20); the monitor never reads it.

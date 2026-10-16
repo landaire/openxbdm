@@ -29,6 +29,7 @@ pub use protocol::Command;
 pub use protocol::ErrorCode;
 pub use protocol::ExpectedBody;
 pub use protocol::Qword;
+pub use protocol::RemoteStatus;
 pub use protocol::Response;
 pub use protocol::StatusCode;
 pub use protocol::SuccessCode;

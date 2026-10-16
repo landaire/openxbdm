@@ -4,7 +4,7 @@
 use openxbdm_core::line::CommandLine;
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
-use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::KernelError;
 
 use super::ExtensionHandle;
 use super::HARDWARE_KD_ENABLED;
@@ -14,6 +14,9 @@ use super::events;
 use crate::backend::Backend as AnyBackend;
 use crate::commands::console::ConfigSetting;
 use crate::invocation::Invocation;
+use crate::reply::CommandError;
+use crate::reply::CommandResult;
+use crate::reply::Reply;
 use crate::state::ServerState;
 use crate::text::Text;
 
@@ -21,9 +24,9 @@ use crate::text::Text;
 pub const KDNET_RECORD_OFFSET: u32 = 0x80;
 pub const KDNET_RECORD_SIZE: usize = 0x80;
 const KDNET_SIGNATURE: u16 = 0xca4a;
-/// Facility bit the monitor ORs into flash read and write results.
-const FLASH_RESULT_BIT: u32 = 0x1000_0000;
-const BAD_PARAMETER: Hresult = Hresult::from_error_code(ErrorCode::BAD_PARAMETER);
+/// Value of a successful flash access in the `kdnet` texts; a failure
+/// prints its status as an NT-facility result.
+const FLASH_SUCCESS: Hresult = Hresult(0x1000_0000);
 /// Console configuration value of the kd lite flag.
 const KD_LITE_SETTING: ConfigSetting = ConfigSetting::new(2, 6);
 const KD_LITE_BIT: u32 = 0x2;
@@ -42,23 +45,23 @@ pub struct Extension {
     pub references: u32,
 }
 
-fn improper(invocation: &mut Invocation<'_>) -> Hresult {
+fn improper(invocation: &mut Invocation<'_>) -> CommandResult {
     invocation.set_text(format_args!("improper command"));
-    Hresult::FAIL
+    Err(CommandError::Fail)
 }
 
 /// `kd enable|disable|except|exceptif`.
-pub(super) fn kernel_debugger(invocation: &mut Invocation<'_>) -> Hresult {
+pub(super) fn kernel_debugger(invocation: &mut Invocation<'_>) -> CommandResult {
     let line = invocation.line;
     if line.has("enable") {
         invocation.state.debugger.kernel_debugger = Some(true);
         invocation.set_text(format_args!("kd enabled"));
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     if line.has("disable") {
         invocation.state.debugger.kernel_debugger = Some(false);
         invocation.set_text(format_args!("kd disabled"));
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     let except = if line.has("except") {
         true
@@ -71,11 +74,11 @@ pub(super) fn kernel_debugger(invocation: &mut Invocation<'_>) -> Hresult {
         invocation.state.debugger.kernel_debugger = Some(true);
         events::release_all(invocation.state, invocation.backend, invocation.network);
     }
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `kdlite enable|disable`.
-pub(super) fn kernel_debugger_lite(invocation: &mut Invocation<'_>) -> Hresult {
+pub(super) fn kernel_debugger_lite(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.backend.hardware_flags() & HARDWARE_KD_LITE == 0 {
         return improper(invocation);
     }
@@ -112,7 +115,7 @@ pub(super) fn kernel_debugger_lite(invocation: &mut Invocation<'_>) -> Hresult {
         "kd lite {}",
         if enable { "enabled" } else { "disabled" }
     ));
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// The kdnet settings record.
@@ -154,65 +157,61 @@ impl KdnetRecord {
     }
 }
 
-fn flash_result(result: Result<(), NtStatus>) -> u32 {
+/// A flash access result as the `kdnet` texts print it.
+fn flash_code(result: Result<(), KernelError>) -> Hresult {
     match result {
-        Ok(()) => FLASH_RESULT_BIT,
-        Err(status) => status.0 | FLASH_RESULT_BIT,
+        Ok(()) => FLASH_SUCCESS,
+        Err(error) => Hresult::from(error),
     }
 }
 
-const fn is_failure(status: u32) -> bool {
-    (status as i32) < 0
-}
-
 /// `kdnet enable|disable|show|set [IP=] [Port=] [Mac=]`.
-pub(super) fn kernel_debugger_network(invocation: &mut Invocation<'_>) -> Hresult {
+pub(super) fn kernel_debugger_network(invocation: &mut Invocation<'_>) -> CommandResult {
     let build = invocation.backend.kernel_build();
     if build < 10914 || (11000..12902).contains(&build) {
         invocation
             .text
             .set_bytes(b"kdnet is not supported on this flash version.\x1e");
-        return Hresult::from_error_code(ErrorCode::UNKNOWN_COMMAND);
+        return Err(ErrorCode::UnknownCommand.into());
     }
     let mut record = KdnetRecord([0; KDNET_RECORD_SIZE]);
-    let load = flash_result(
-        invocation
-            .backend
-            .read_flash(KDNET_RECORD_OFFSET, &mut record.0),
-    );
+    let load = invocation
+        .backend
+        .read_flash(KDNET_RECORD_OFFSET, &mut record.0);
     let line = invocation.line;
     if line.has("enable") || line.has("disable") {
         let enable = line.has("enable");
-        if is_failure(load) {
+        if load.is_err() {
             invocation.set_text(format_args!(
-                "kdnet: unable to load current kdnet settings: 0x{load:08x}"
+                "kdnet: unable to load current kdnet settings: 0x{:08x}",
+                flash_code(load).0
             ));
-            return Hresult::OK;
+            return Ok(Reply::Ok);
         }
         if enable && !record.is_valid() {
             invocation.set_text(format_args!(
                 "kdnet: can't enable kdnet without setting the parameters."
             ));
-            return Hresult::from_error_code(ErrorCode::UNKNOWN_COMMAND);
+            return Err(ErrorCode::UnknownCommand.into());
         }
         record.set_word(KdnetRecord::ENABLE, u32::from(enable));
-        let save = flash_result(
-            invocation
-                .backend
-                .write_flash(KDNET_RECORD_OFFSET, &record.0),
-        );
+        let save = invocation
+            .backend
+            .write_flash(KDNET_RECORD_OFFSET, &record.0);
         invocation.set_text(format_args!(
-            "kdnet {}: 0x{save:08x}",
-            if enable { "enabled" } else { "disabled" }
+            "kdnet {}: 0x{:08x}",
+            if enable { "enabled" } else { "disabled" },
+            flash_code(save).0
         ));
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     if line.has("show") {
-        if is_failure(load) {
+        if load.is_err() {
             invocation.set_text(format_args!(
-                "kdnet: failed to load current settings: 0x{load:08X}"
+                "kdnet: failed to load current settings: 0x{:08X}",
+                flash_code(load).0
             ));
-            return Hresult::OK;
+            return Ok(Reply::Ok);
         }
         let r = &record.0;
         let t = KdnetRecord::TARGET_IP;
@@ -238,30 +237,56 @@ pub(super) fn kernel_debugger_network(invocation: &mut Invocation<'_>) -> Hresul
             record.port(),
             record.word(KdnetRecord::ENCRYPTED) as i32,
         ));
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     if line.has("set") {
-        let error = kdnet_set(invocation, &mut record);
-        return match error {
-            None => {
+        return match kdnet_set(invocation, &mut record) {
+            Ok(()) => {
                 invocation.set_text(format_args!("kdnet set succeeded."));
-                Hresult::OK
+                Ok(Reply::Ok)
             }
-            Some(error) => {
-                invocation.set_text(format_args!("kdnet set failed: error code 0x{error:08x}"));
-                if error == BAD_PARAMETER.0 {
-                    BAD_PARAMETER
-                } else {
-                    Hresult::FAIL
-                }
+            Err(error) => {
+                invocation.set_text(format_args!(
+                    "kdnet set failed: error code 0x{:08x}",
+                    error.code().0
+                ));
+                Err(match error {
+                    KdnetSetError::BadParameter => ErrorCode::BadParameter.into(),
+                    KdnetSetError::ConsoleAddress(_) | KdnetSetError::Save(_) => CommandError::Fail,
+                })
             }
         };
     }
-    BAD_PARAMETER
+    Err(ErrorCode::BadParameter.into())
 }
 
-/// Apply the `set` parameters and save; returns the error value.
-fn kdnet_set(invocation: &mut Invocation<'_>, record: &mut KdnetRecord) -> Option<u32> {
+/// Why `kdnet set` failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KdnetSetError {
+    /// A parameter is malformed, or the settings are incomplete.
+    BadParameter,
+    /// The console MAC address for a default target address is unreadable.
+    ConsoleAddress(KernelError),
+    /// The settings record could not be written.
+    Save(KernelError),
+}
+
+impl KdnetSetError {
+    /// The error code the failure text prints.
+    fn code(self) -> Hresult {
+        match self {
+            Self::BadParameter => Hresult::from_error_code(ErrorCode::BadParameter),
+            Self::ConsoleAddress(error) | Self::Save(error) => Hresult::from(error),
+        }
+    }
+}
+
+/// Apply the `set` parameters and save. The last failing step decides the
+/// error, as in the monitor.
+fn kdnet_set(
+    invocation: &mut Invocation<'_>,
+    record: &mut KdnetRecord,
+) -> Result<(), KdnetSetError> {
     let line = invocation.line;
     record.0[0..2].copy_from_slice(&KDNET_SIGNATURE.to_be_bytes());
     record.set_word(8, 0x10);
@@ -276,7 +301,7 @@ fn kdnet_set(invocation: &mut Invocation<'_>, record: &mut KdnetRecord) -> Optio
             Some(address) => {
                 record.0[KdnetRecord::HOST_IP..KdnetRecord::HOST_IP + 4].copy_from_slice(&address)
             }
-            None => error = Some(BAD_PARAMETER.0),
+            None => error = Some(KdnetSetError::BadParameter),
         }
     }
     if line.has("Port") {
@@ -284,7 +309,7 @@ fn kdnet_set(invocation: &mut Invocation<'_>, record: &mut KdnetRecord) -> Optio
         match line.dword("Port").filter(|&port| port <= 0xffff) {
             Some(port) => record.0[KdnetRecord::HOST_PORT..KdnetRecord::HOST_PORT + 2]
                 .copy_from_slice(&(port as u16).to_be_bytes()),
-            None => error = Some(BAD_PARAMETER.0),
+            None => error = Some(KdnetSetError::BadParameter),
         }
     }
     let mac = line.param("Mac");
@@ -301,10 +326,10 @@ fn kdnet_set(invocation: &mut Invocation<'_>, record: &mut KdnetRecord) -> Optio
                 &mut record.0[KdnetRecord::TARGET_MAC..KdnetRecord::TARGET_MAC + 6],
             ) {
                 if failed {
-                    error = Some(BAD_PARAMETER.0);
+                    error = Some(KdnetSetError::BadParameter);
                 }
             } else {
-                error = Some(BAD_PARAMETER.0);
+                error = Some(KdnetSetError::BadParameter);
             }
         }
         None => default_mac = record.mac().iter().all(|&byte| byte == 0),
@@ -320,21 +345,19 @@ fn kdnet_set(invocation: &mut Invocation<'_>, record: &mut KdnetRecord) -> Optio
                 record.0[KdnetRecord::TARGET_MAC..KdnetRecord::TARGET_MAC + 6]
                     .copy_from_slice(&console_mac);
             }
-            Err(status) => error = Some(status.0 | FLASH_RESULT_BIT),
+            Err(failure) => error = Some(KdnetSetError::ConsoleAddress(failure)),
         }
     }
     if !supplied || !record.is_valid() {
-        error = Some(BAD_PARAMETER.0);
+        error = Some(KdnetSetError::BadParameter);
     }
-    if error.is_some() {
-        return error;
+    if let Some(error) = error {
+        return Err(error);
     }
-    let save = flash_result(
-        invocation
-            .backend
-            .write_flash(KDNET_RECORD_OFFSET, &record.0),
-    );
-    is_failure(save).then_some(save)
+    invocation
+        .backend
+        .write_flash(KDNET_RECORD_OFFSET, &record.0)
+        .map_err(KdnetSetError::Save)
 }
 
 /// Six `-`-separated hex octets. Returns `None` for fewer than six parts,
@@ -398,17 +421,46 @@ fn inet_addr(text: &[u8]) -> Option<[u8; 4]> {
     (value != u32::MAX).then_some(value.to_be_bytes())
 }
 
+/// A debugger extension load or release failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionError {
+    /// `443-`: another extension is loaded.
+    OtherLoaded,
+    /// The handle is not the loaded extension's.
+    UnknownHandle,
+    /// The loader or the unload failed.
+    Kernel(KernelError),
+}
+
+impl From<ExtensionError> for Hresult {
+    fn from(error: ExtensionError) -> Self {
+        match error {
+            ExtensionError::OtherLoaded => Hresult::error(0x2b),
+            ExtensionError::UnknownHandle => Hresult::from_error_code(ErrorCode::BadParameter),
+            ExtensionError::Kernel(error) => {
+                CommandError::from_kernel(error, CommandError::Fail).into()
+            }
+        }
+    }
+}
+
+impl From<ExtensionError> for CommandError {
+    fn from(error: ExtensionError) -> Self {
+        Self::Extension(error)
+    }
+}
+
 /// Load the extension `name` from the DMEXT directory, or count another
 /// reference to the loaded one (stock export 178, 0x91f2e5e0). Only one
-/// extension can be loaded; another name fails with 0x82da002b.
+/// extension can be loaded.
 pub fn load_extension(
     state: &mut ServerState,
     backend: &mut dyn AnyBackend,
     name: &[u8],
-) -> Result<ExtensionHandle, Hresult> {
+) -> Result<ExtensionHandle, ExtensionError> {
     if let Some(extension) = state.debugger.extension.as_mut() {
         if !extension.name.as_bytes().eq_ignore_ascii_case(name) {
-            return Err(Hresult::error(0x2b));
+            return Err(ExtensionError::OtherLoaded);
         }
         extension.references += 1;
         return Ok(extension.handle);
@@ -418,7 +470,7 @@ pub fn load_extension(
     let _ = path.push_bytes(name);
     let handle = backend
         .load_extension(path.as_bytes())
-        .map_err(|status| Hresult::from_nt_status(status, Hresult::FAIL))?;
+        .map_err(ExtensionError::Kernel)?;
     let mut stored = Text::new();
     stored.set_bytes(name);
     state.debugger.extension = Some(Extension {
@@ -435,53 +487,49 @@ pub fn release_extension(
     state: &mut ServerState,
     backend: &mut dyn AnyBackend,
     handle: ExtensionHandle,
-) -> Hresult {
+) -> Result<(), ExtensionError> {
     let Some(extension) = state
         .debugger
         .extension
         .as_mut()
         .filter(|extension| extension.handle == handle)
     else {
-        return BAD_PARAMETER;
+        return Err(ExtensionError::UnknownHandle);
     };
     extension.references -= 1;
     if extension.references != 0 {
-        return Hresult::OK;
+        return Ok(());
     }
     state.debugger.extension = None;
-    match backend.unload_extension(handle) {
-        Ok(()) => Hresult::OK,
-        Err(status) => Hresult::from_nt_status(status, Hresult::FAIL),
-    }
+    backend
+        .unload_extension(handle)
+        .map_err(ExtensionError::Kernel)
 }
 
 /// `dbgextld name=` or `dbgextld unload module=`.
-pub(super) fn debugger_extension(invocation: &mut Invocation<'_>) -> Hresult {
+pub(super) fn debugger_extension(invocation: &mut Invocation<'_>) -> CommandResult {
     let line = invocation.line;
     if line.has("unload") {
         let Some(module) = line.dword("module") else {
             invocation.set_text(format_args!("missing module"));
-            return BAD_PARAMETER;
+            return Err(ErrorCode::BadParameter.into());
         };
-        return release_extension(
+        release_extension(
             invocation.state,
             invocation.backend,
             ExtensionHandle(module),
-        );
+        )?;
+        return Ok(Reply::Ok);
     }
     let Some(value) = line.param("name") else {
         invocation.set_text(format_args!("missing name"));
-        return BAD_PARAMETER;
+        return Err(ErrorCode::BadParameter.into());
     };
     let mut buffer = [0u8; EXTENSION_NAME_CAPACITY + 1];
     let name = value.copy_into(&mut buffer);
-    match load_extension(invocation.state, invocation.backend, name) {
-        Ok(handle) => {
-            invocation.set_text(format_args!("module=0x{:08x}", handle.0));
-            Hresult::OK
-        }
-        Err(result) => result,
-    }
+    let handle = load_extension(invocation.state, invocation.backend, name)?;
+    invocation.set_text(format_args!("module=0x{:08x}", handle.0));
+    Ok(Reply::Ok)
 }
 
 /// The number after a `name` token, as the monitor reads it: located like a

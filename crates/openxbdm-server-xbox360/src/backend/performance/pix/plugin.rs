@@ -9,12 +9,15 @@ use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
+use openxbdm_core::status::KernelError;
+use openxbdm_core::status::NtStatus;
 use openxbdm_server::commands::performance::PixDogma;
 use openxbdm_server::text::Text;
 
 use super::events;
 use super::files;
 use crate::backend::memory;
+use crate::backend::memory::ModuleWalkError;
 use crate::kernel;
 use crate::kernel::AnsiString;
 use crate::kernel::IoStatusBlock;
@@ -39,10 +42,9 @@ const INSTALL_CALLBACKS: usize = 4;
 const UNINSTALL: usize = 5;
 /// Pool tag `PIXd` of plugin allocations.
 const PLUGIN_TAG: u32 = 0x5049_5864;
-/// Module walk end and the flag of DLL records.
-const END_OF_LIST: u32 = 0x82da_0104;
+/// Flag of DLL module records.
 const MODULE_DLL: u32 = 4;
-const RECORD_SIZE: usize = 0x124;
+const RECORD_SIZE: usize = memory::MODULE_RECORD_SHORT_SIZE;
 const RECORD_FLAGS: usize = 0x114;
 /// XEX header field of the linked static libraries: 16-byte entries
 /// `{name[8], major, minor, build, qfe}` after a size word.
@@ -125,7 +127,7 @@ fn attach(starting: bool) {
         return;
     }
     let mut hook = 0u32;
-    submit_hook(handle, &mut hook);
+    let _ = submit_hook(handle, &mut hook);
     HOOK.store(hook, Ordering::Release);
     for (index, slot) in PROCEDURE.iter().enumerate() {
         let mut address = 0u32;
@@ -234,17 +236,21 @@ fn name_is(record: &[u8], name: &[u8]) -> bool {
 }
 
 /// Look up the submit hook of `image` for the running executable (stock
-/// 0x91f54f98); returns the lookup status.
-fn submit_hook(image: u32, hook: &mut u32) -> u32 {
+/// 0x91f54f98).
+fn submit_hook(image: u32, hook: &mut u32) -> Result<(), KernelError> {
     let mut returns = true;
     let mut walk = 0u32;
-    let mut record = [0u8; RECORD_SIZE];
-    let record_address = record.as_mut_ptr() as usize as u32;
-    let mut status = memory::walk_modules(
-        core::ptr::from_mut(&mut walk) as usize as u32,
-        record_address,
-    );
-    while status != END_OF_LIST {
+    let mut words = [0u32; RECORD_SIZE / 4];
+    // Stock keeps walking after failures other than the end of the list,
+    // with the record of the last module.
+    while !matches!(
+        memory::next_module(&mut walk, &mut words),
+        Err(ModuleWalkError::End)
+    ) {
+        let mut record = [0u8; RECORD_SIZE];
+        for (bytes, word) in record.as_chunks_mut::<4>().0.iter_mut().zip(&words) {
+            *bytes = word.to_ne_bytes();
+        }
         let flags = u32::from_be_bytes(
             record[RECORD_FLAGS..RECORD_FLAGS + 4]
                 .try_into()
@@ -291,10 +297,6 @@ fn submit_hook(image: u32, hook: &mut u32) -> u32 {
                 }
             }
         }
-        status = memory::walk_modules(
-            core::ptr::from_mut(&mut walk) as usize as u32,
-            record_address,
-        );
     }
     if walk != 0 {
         kernel::ExFreePool(walk);
@@ -306,7 +308,7 @@ fn submit_hook(image: u32, hook: &mut u32) -> u32 {
         kernel::debug_print(c"Catma: Use Submit hook NO returns\n");
         ORDINAL_SUBMIT
     };
-    kernel::XexGetProcedureAddress(image, ordinal, hook)
+    NtStatus(kernel::XexGetProcedureAddress(image, ordinal, hook)).result()
 }
 
 /// `pixcmd h` (stock 0x91f58b20): the plugin image, or `dogma.xex` loaded
@@ -328,9 +330,19 @@ pub(super) fn dogma() -> Option<PixDogma> {
         handle: image,
         ..PixDogma::default()
     };
-    let found = (submit_hook(image, &mut dogma.info) as i32) >= 0
-        && (kernel::XexGetProcedureAddress(image, 1, &mut dogma.procedure_1) as i32) >= 0
-        && (kernel::XexGetProcedureAddress(image, 3, &mut dogma.procedure_3) as i32) >= 0;
+    let found = submit_hook(image, &mut dogma.info).is_ok()
+        && NtStatus(kernel::XexGetProcedureAddress(
+            image,
+            1,
+            &mut dogma.procedure_1,
+        ))
+        .is_success()
+        && NtStatus(kernel::XexGetProcedureAddress(
+            image,
+            3,
+            &mut dogma.procedure_3,
+        ))
+        .is_success();
     if found || cached.is_some() {
         return Some(dogma);
     }

@@ -24,6 +24,8 @@ mod xbox360 {
     use core::sync::atomic::AtomicU32;
     use core::sync::atomic::Ordering;
 
+    use openxbdm_core::status::KernelError;
+    use openxbdm_core::status::NtStatus;
     use openxbdm_server::ConnectionIndex;
     use openxbdm_server::Server;
     use openxbdm_server::SocketId;
@@ -99,10 +101,14 @@ mod xbox360 {
             object_name: &name,
             attributes: kernel::OBJ_CASE_INSENSITIVE,
         };
-        match kernel::NtDeleteFile(&attributes) {
-            status if (status as i32) >= 0 => Removal::Removed,
-            0xC000_000F | 0xC000_0034 | 0xC000_003A => Removal::Absent,
-            _ => Removal::Failed,
+        match NtStatus(kernel::NtDeleteFile(&attributes)).result() {
+            Ok(()) => Removal::Removed,
+            Err(
+                KernelError::NoSuchFile
+                | KernelError::ObjectNameNotFound
+                | KernelError::ObjectPathNotFound,
+            ) => Removal::Absent,
+            Err(_) => Removal::Failed,
         }
     }
 
@@ -417,7 +423,7 @@ mod xbox360 {
         SHUTDOWN.store(false, Ordering::SeqCst);
         let mut handle = 0u32;
         let entry = entry as *const () as usize as u32;
-        let status = kernel::ExCreateThread(
+        let status = NtStatus(kernel::ExCreateThread(
             &mut handle,
             SERVER_STACK_SIZE,
             core::ptr::null_mut(),
@@ -425,8 +431,8 @@ mod xbox360 {
             entry,
             0,
             SERVER_THREAD_FLAGS,
-        );
-        if (status as i32) < 0 {
+        ));
+        if status.result().is_err() {
             kernel::debug_print(c"openxbdm: server thread creation failed\n");
             return Err(ThreadCreationFailed);
         }

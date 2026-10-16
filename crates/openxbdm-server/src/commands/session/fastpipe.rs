@@ -9,8 +9,8 @@
 //! +0x28 u32 attributes, and the NUL-terminated path at +0x2c, followed by
 //! the file data when it fits. `AA` data starts at +0xc.
 
+use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
-use openxbdm_core::status::NtStatus;
 
 use crate::backend::Backend as AnyBackend;
 use crate::commands::filesystem;
@@ -32,6 +32,9 @@ use crate::network::Network;
 use crate::network::SocketId;
 use crate::network::send_all;
 use crate::network::send_line;
+use crate::reply::CommandError;
+use crate::reply::CommandResult;
+use crate::reply::Reply;
 use crate::state::ServerState;
 use crate::text::Text;
 
@@ -54,11 +57,9 @@ const MAX_FILES: usize = 62;
 /// `AA` packets kept for files whose `CC` has not arrived.
 const MAX_ORPHANS: usize = 16;
 const PATH_OFFSET: usize = 0x2c;
-/// An `AA` offset that is not block aligned or beyond the file.
-const STATUS_INVALID_OFFSET: NtStatus = NtStatus(0xc000_0173);
-const CREATE_FALLBACK: Hresult = Hresult(0x82da_000d);
-/// `BB` result of a complete file.
-const PIPE_SUCCESS: Hresult = Hresult(0);
+const CREATE_FALLBACK: CommandError = CommandError::Status(ErrorCode::FileCannotBeCreated);
+/// `BB` result word of a complete file.
+const PIPE_SUCCESS: u32 = 0;
 /// Access the monitor opens files with: GENERIC_WRITE | DELETE | SYNCHRONIZE.
 const PIPE_FILE_ACCESS: FileAccess = FileAccess(0x4011_0000);
 
@@ -144,17 +145,17 @@ impl FastPipes {
 /// `fastpipe [group=<dword>]`: turn the connection into a pipe of `group`
 /// (a new group when absent or 0). Success sends only
 /// `209- result code <group>`.
-pub(super) fn fast_pipe(invocation: &mut Invocation<'_>) -> Hresult {
+pub(super) fn fast_pipe(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(socket) = invocation
         .session
         .as_deref()
         .map(|session| session.socket())
     else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     // The engine requires the 1 GB memory configuration.
     if !invocation.backend.kit_features().one_gigabyte_ram {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     // An absent or malformed value requests a new group.
     let group = invocation.line.dword("group").unwrap_or(0);
@@ -166,12 +167,12 @@ pub(super) fn fast_pipe(invocation: &mut Invocation<'_>) -> Hresult {
         group,
     ) {
         invocation.text.set_bytes(b"fastpipe limit exceeded");
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     if let Some(session) = invocation.session.as_deref_mut() {
         session.request(SessionRequest::ReleaseSocket);
     }
-    Hresult::NO_REPLY
+    Ok(Reply::Sent)
 }
 
 fn open_pipe(
@@ -331,12 +332,13 @@ fn create(
     path[..path_length].copy_from_slice(&packet[PATH_OFFSET..PATH_OFFSET + path_length]);
     let data_offset = PATH_OFFSET + path_length + 1;
 
-    let reply = |state: &mut ServerState, network: &mut dyn Network, result: Hresult| {
-        send_reply(state, network, slot, id, create_length, result);
-    };
+    let reply =
+        |state: &mut ServerState, network: &mut dyn Network, result: Result<(), CommandError>| {
+            send_reply(state, network, slot, id, create_length, result);
+        };
     let pipes = &mut state.session.fast_pipes;
     let Some(free) = pipes.files.iter().position(Option::is_none) else {
-        return reply(state, network, Hresult::OUT_OF_MEMORY);
+        return reply(state, network, Err(CommandError::OutOfMemory));
     };
     let request = CreateRequest {
         access: PIPE_FILE_ACCESS,
@@ -348,28 +350,28 @@ fn create(
     };
     let handle = match filesystem::open_path(state, backend, &path[..path_length], &request) {
         Ok(handle) => handle,
-        Err(status) => {
+        Err(error) => {
             return reply(
                 state,
                 network,
-                Hresult::from_nt_status(status, CREATE_FALLBACK),
+                Err(CommandError::from_kernel(error, CREATE_FALLBACK)),
             );
         }
     };
     if size > BLOCK_SIZE
-        && let Err(status) = backend.set_end_of_file(handle, full_size)
+        && let Err(error) = backend.set_end_of_file(handle, full_size)
     {
         let _ = backend.set_delete_disposition(handle, true);
         backend.close_file(handle);
         return reply(
             state,
             network,
-            Hresult::from_nt_status(status, CREATE_FALLBACK),
+            Err(CommandError::from_kernel(error, CREATE_FALLBACK)),
         );
     }
     if BLOCK_SIZE.wrapping_sub(header_size) >= size {
         // The data follows the path; times and attributes are not applied.
-        let mut result = PIPE_SUCCESS;
+        let mut result = Ok(());
         if size != 0 {
             let end = (data_offset + size as usize).min(PACKET_CAPACITY as usize);
             let range = PoolRange {
@@ -377,9 +379,9 @@ fn create(
                 offset: data_offset as u32,
                 length: (end - data_offset.min(end)) as u32,
             };
-            if let Err(status) = backend.write_file(handle, Some(0), FileData::Pool(range)) {
+            if let Err(error) = backend.write_file(handle, Some(0), FileData::Pool(range)) {
                 let _ = backend.set_delete_disposition(handle, true);
-                result = Hresult::from_nt_status(status, CREATE_FALLBACK);
+                result = Err(CommandError::from_kernel(error, CREATE_FALLBACK));
             }
         }
         backend.close_file(handle);
@@ -479,19 +481,22 @@ fn write_block(
         BLOCK_SIZE
     };
     let written = if offset >= file.size || offset & 0xffff != 0 {
-        Err(STATUS_INVALID_OFFSET)
+        // The monitor's STATUS_INVALID_OFFSET has no reply mapping.
+        Err(CommandError::Unexpected)
     } else {
         let range = PoolRange {
             buffer: block,
             offset: 0xc,
             length,
         };
-        backend.write_file(file.handle, Some(u64::from(offset)), FileData::Pool(range))
+        backend
+            .write_file(file.handle, Some(u64::from(offset)), FileData::Pool(range))
+            .map_err(|error| CommandError::from_kernel(error, CommandError::Unexpected))
     };
     let result = match written {
-        Err(status) => {
+        Err(error) => {
             let _ = backend.set_delete_disposition(file.handle, true);
-            Hresult::from_nt_status(status, Hresult::UNEXPECTED)
+            Err(error)
         }
         Ok(()) => {
             file.blocks_remaining -= 1;
@@ -515,7 +520,7 @@ fn write_block(
 }
 
 /// Apply the times and attributes of a complete file.
-fn finalize(backend: &mut dyn AnyBackend, file: &PipeFile) -> Hresult {
+fn finalize(backend: &mut dyn AnyBackend, file: &PipeFile) -> Result<(), CommandError> {
     match backend.query_file_information(file.handle) {
         Ok(_) => {
             let information = BasicInformation {
@@ -526,11 +531,11 @@ fn finalize(backend: &mut dyn AnyBackend, file: &PipeFile) -> Hresult {
                 attributes: file.attributes,
             };
             let _ = backend.set_basic_information(file.handle, &information);
-            PIPE_SUCCESS
+            Ok(())
         }
-        Err(status) => {
+        Err(error) => {
             let _ = backend.set_delete_disposition(file.handle, true);
-            Hresult::from_nt_status(status, Hresult::UNEXPECTED)
+            Err(CommandError::from_kernel(error, CommandError::Unexpected))
         }
     }
 }
@@ -543,7 +548,7 @@ fn send_reply(
     slot: u8,
     id: u16,
     create_length: u32,
-    result: Hresult,
+    result: Result<(), CommandError>,
 ) {
     let Some(Some(pipe)) = state.session.fast_pipes.slots.get(slot as usize) else {
         return;
@@ -552,7 +557,8 @@ fn send_reply(
     reply[..2].copy_from_slice(&MAGIC_REPLY.to_be_bytes());
     reply[2..4].copy_from_slice(&id.to_be_bytes());
     reply[4..8].copy_from_slice(&create_length.to_be_bytes());
-    reply[8..].copy_from_slice(&result.0.to_be_bytes());
+    let word = result.map_or_else(|error| Hresult::from(error).0, |()| PIPE_SUCCESS);
+    reply[8..].copy_from_slice(&word.to_be_bytes());
     let _ = send_all(network, pipe.socket, &reply);
 }
 

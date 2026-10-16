@@ -9,7 +9,7 @@
 
 use crate::error::Error;
 use crate::protocol::response::Response;
-use crate::protocol::status::ErrorCode;
+use crate::protocol::status::RemoteStatus;
 
 /// Declared response shape of a command. Used by the connection layer to
 /// decide how many binary bytes to collect or whether to expect a multi-line
@@ -55,7 +55,7 @@ pub trait Command {
     #[allow(unused_variables)]
     fn handle_remote(
         &self,
-        code: ErrorCode,
+        code: RemoteStatus,
         message: &str,
     ) -> Option<Result<Self::Output, rootcause::Report<Error>>> {
         None

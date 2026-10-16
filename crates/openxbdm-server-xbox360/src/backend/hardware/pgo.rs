@@ -12,6 +12,7 @@ use core::sync::atomic::Ordering;
 use core::sync::atomic::fence;
 
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::NtStatus;
 use openxbdm_server::Server;
 use openxbdm_server::commands::filesystem::CreateDisposition;
 use openxbdm_server::commands::filesystem::CreateOptions;
@@ -22,6 +23,7 @@ use openxbdm_server::commands::filesystem::ShareAccess;
 use openxbdm_server::commands::hardware::PgoError;
 use openxbdm_server::commands::hardware::PgoModule;
 use openxbdm_server::commands::hardware::pgo;
+use openxbdm_server::commands::hardware::pgo::BadModulePath;
 use openxbdm_server::commands::hardware::pgo::BlockFormat;
 use openxbdm_server::commands::hardware::pgo::CountBlockHeader;
 use openxbdm_server::commands::hardware::pgo::Fatal;
@@ -502,9 +504,8 @@ fn sleep_zero() {
 }
 
 fn close_handle(handle: u32) -> bool {
-    let status = kernel::NtClose(handle);
-    if (status as i32) < 0 {
-        kernel::set_last_error(status);
+    if let Err(error) = NtStatus(kernel::NtClose(handle)).result() {
+        kernel::set_last_error(error);
         return false;
     }
     true
@@ -669,8 +670,8 @@ fn end_sweep() {
     fence(Ordering::SeqCst);
     SWEEPING.store(false, Ordering::Release);
     let status = kernel::NtSetEvent(SWEEP_EVENT.load(Ordering::Acquire), core::ptr::null_mut());
-    if (status as i32) < 0 {
-        kernel::set_last_error(status);
+    if let Err(error) = NtStatus(status).result() {
+        kernel::set_last_error(error);
     }
 }
 
@@ -1659,8 +1660,8 @@ fn create_block(node: Node) {
     let mut size = header.reserved;
     let status =
         kernel::NtAllocateVirtualMemory(&mut base, &mut size, MEM_COMMIT, PAGE_READWRITE, 0);
-    if (status as i32) < 0 {
-        kernel::set_last_error(status);
+    if let Err(error) = NtStatus(status).result() {
+        kernel::set_last_error(error);
         base = 0;
     }
     write32(node.at(node::BLOCK), base);
@@ -1693,10 +1694,11 @@ fn create_block(node: Node) {
 }
 
 /// A `pogo.ini` request for the server thread.
-#[repr(C)]
 struct IniRequest {
-    path: u32,
-    node: u32,
+    path: *const core::ffi::c_char,
+    node: Node,
+    /// Unchanged when the server cannot take the request.
+    result: Result<(), BadModulePath>,
 }
 
 /// Export 107 (stock 0x91f3e038): apply `pogo.ini` to a record, then
@@ -1707,21 +1709,21 @@ extern "C" fn export_load_ini(path: *const core::ffi::c_char, node: u32) -> u32 
     // SAFETY: the caller passes a NUL-terminated module path.
     let bytes = unsafe { core::ffi::CStr::from_ptr(path) }.to_bytes();
     if bytes.len() >= 0x140 {
-        return pgo::BAD_MODULE_PATH.0;
+        return Hresult::from(BadModulePath).0;
     }
-    let request = IniRequest {
-        path: path as usize as u32,
-        node,
+    let mut request = IniRequest {
+        path,
+        node: Node(node),
+        result: Ok(()),
     };
-    let result = dispatcher::call_on_server(
-        service_load_ini,
-        &request as *const IniRequest as usize as u32,
-    )
-    .unwrap_or(pgo::SUCCESS.0);
-    if result == pgo::SUCCESS.0 {
-        debugger::report_pogo_module_start(path as usize as u32, node);
+    dispatcher::call_on_server(service_load_ini, &raw mut request as usize as u32);
+    match request.result {
+        Ok(()) => {
+            debugger::report_pogo_module_start(path as usize as u32, node);
+            Hresult::OK.0
+        }
+        Err(error) => Hresult::from(error).0,
     }
-    result
 }
 
 fn service_load_ini(
@@ -1732,19 +1734,19 @@ fn service_load_ini(
 ) -> u32 {
     // SAFETY: the poster waits with the request and its NUL-terminated
     // path in place.
-    let request = unsafe { &*(argument as usize as *const IniRequest) };
-    let node = Node(request.node);
+    let request = unsafe { &mut *(argument as usize as *mut IniRequest) };
+    let node = request.node;
     // SAFETY: as above.
-    let path =
-        unsafe { core::ffi::CStr::from_ptr(request.path as usize as *const core::ffi::c_char) }
-            .to_bytes();
+    let path = unsafe { core::ffi::CStr::from_ptr(request.path) }.to_bytes();
+    let module = PgoModule::Record(node.0);
+    // The results of the settings are not reported.
     let result = pgo::load_ini(
         &server.state,
         console,
         path,
         &mut |_, _, directive| match directive {
             IniDirective::AllocScale(scale) => {
-                set_allocation_scale(node.0, scale);
+                let _ = set_allocation_scale(module, scale);
             }
             IniDirective::OutputPath(directory) => {
                 let mut path = node.base_path();
@@ -1752,14 +1754,15 @@ fn service_load_ini(
                 node.set_base_path(&path);
             }
             IniDirective::DisableDataCollection => {
-                stop_modules(node.0);
+                let _ = stop_modules(module);
             }
             IniDirective::Option { option, value } => {
-                set_option(node.0, option, value);
+                let _ = set_option(module, option, value);
             }
         },
     );
-    result.0
+    request.result = result;
+    0
 }
 
 /// Set up a new record (0x91f70250).
@@ -1887,20 +1890,23 @@ extern "C" fn export_find_module(address: u32) -> u32 {
     find_module(address, None).map_or(0, |node| node.0)
 }
 
-fn select(module: u32) -> impl Iterator<Item = Node> {
-    modules().filter(move |node| module == 0 || node.0 == module)
+fn select(module: PgoModule) -> impl Iterator<Item = Node> {
+    modules().filter(move |node| match module {
+        PgoModule::All => true,
+        PgoModule::Record(address) => node.0 == address,
+    })
 }
 
-fn module_result(module: u32, matched: bool) -> Hresult {
-    if module != 0 && !matched {
-        pgo::NO_SUCH_MODULE
+fn module_result(module: PgoModule, matched: bool) -> Result<(), PgoError> {
+    if module != PgoModule::All && !matched {
+        Err(PgoError::NoSuchModule)
     } else {
-        pgo::SUCCESS
+        Ok(())
     }
 }
 
 /// Export 108 (stock 0x91f70630): request counting for one module or all.
-fn start_modules(module: u32) -> Hresult {
+fn start_modules(module: PgoModule) -> Result<(), PgoError> {
     let mut matched = false;
     for node in select(module) {
         matched = true;
@@ -1913,7 +1919,7 @@ fn start_modules(module: u32) -> Hresult {
 }
 
 /// Export 109 (stock 0x91f706d0).
-fn stop_modules(module: u32) -> Hresult {
+fn stop_modules(module: PgoModule) -> Result<(), PgoError> {
     let mut matched = false;
     for node in select(module) {
         matched = true;
@@ -1957,7 +1963,12 @@ fn snapshot(node: Node, phase: Option<&[u8]>, reset: bool, kind: SweepKind) {
 }
 
 /// Export 110 and `pogoctrl snapshot` (0x91f70880).
-fn snapshot_modules(phase: Option<&[u8]>, reset: bool, module: u32, kind: SweepKind) -> Hresult {
+fn snapshot_modules(
+    phase: Option<&[u8]>,
+    reset: bool,
+    module: PgoModule,
+    kind: SweepKind,
+) -> Result<(), PgoError> {
     let mut matched = false;
     for node in select(module) {
         matched = true;
@@ -1966,26 +1977,31 @@ fn snapshot_modules(phase: Option<&[u8]>, reset: bool, module: u32, kind: SweepK
     module_result(module, matched)
 }
 
+/// The record `module` selects; every module is not a record.
+fn record(module: PgoModule) -> Result<Node, PgoError> {
+    match module {
+        PgoModule::All => None,
+        PgoModule::Record(address) => find_node(address),
+    }
+    .ok_or(PgoError::NoSuchModule)
+}
+
 /// `AllocScale` (0x91f70978).
-fn set_allocation_scale(module: u32, scale: u32) -> Hresult {
-    let Some(node) = (module != 0).then(|| find_node(module)).flatten() else {
-        return pgo::NO_SUCH_MODULE;
-    };
+fn set_allocation_scale(module: PgoModule, scale: u32) -> Result<(), PgoError> {
+    let node = record(module)?;
     if node.block() != 0 {
-        return pgo::BLOCK_ALLOCATED;
+        return Err(PgoError::Busy);
     }
     write32(node.at(node::ALLOCATION_SCALE), scale);
-    pgo::SUCCESS
+    Ok(())
 }
 
 /// `pogo.ini` options (0x91f709e0); the validation and sweep options are
 /// global but still need a record without a count block.
-fn set_option(module: u32, option: PgoOption, value: u32) -> Hresult {
-    let Some(node) = (module != 0).then(|| find_node(module)).flatten() else {
-        return pgo::NO_SUCH_MODULE;
-    };
+fn set_option(module: PgoModule, option: PgoOption, value: u32) -> Result<(), PgoError> {
+    let node = record(module)?;
     if node.block() != 0 {
-        return pgo::BLOCK_ALLOCATED;
+        return Err(PgoError::Busy);
     }
     let set = value != 0;
     match option {
@@ -1998,7 +2014,7 @@ fn set_option(module: u32, option: PgoOption, value: u32) -> Hresult {
         PgoOption::EnableSweepOnOverflow => SWEEP_ON_OVERFLOW.store(set, Ordering::Relaxed),
         PgoOption::EnableSweepFullBuffer => SWEEP_FULL_BUFFER.store(set, Ordering::Relaxed),
     }
-    pgo::SUCCESS
+    Ok(())
 }
 
 fn profile_request(access: u32, disposition: CreateDisposition) -> CreateRequest {
@@ -2055,8 +2071,8 @@ fn write_file(handle: u32, buffer: u32, length: u32) -> bool {
         // SAFETY: the kernel completed the request and wrote the block.
         status = unsafe { core::ptr::read_volatile(&io_status.status) };
     }
-    if (status as i32) < 0 {
-        kernel::set_last_error(status);
+    if let Err(error) = NtStatus(status).result() {
+        kernel::set_last_error(error);
         return false;
     }
     true
@@ -2087,8 +2103,8 @@ fn write_profile(node: Node) {
     }
     let mut io_status = IoStatusBlock::default();
     let status = kernel::NtFlushBuffersFile(handle, &mut io_status);
-    if (status as i32) < 0 {
-        kernel::set_last_error(status);
+    if let Err(error) = NtStatus(status).result() {
+        kernel::set_last_error(error);
         warn(WriteWarning::Flush);
     }
     // The image reports a seek only when the new position is 0.
@@ -2100,8 +2116,8 @@ fn write_profile(node: Node) {
         8,
         FILE_POSITION_INFORMATION,
     );
-    if (status as i32) < 0 {
-        kernel::set_last_error(status);
+    if let Err(error) = NtStatus(status).result() {
+        kernel::set_last_error(error);
     }
     let complete = 1u8;
     if !write_file(handle, &complete as *const u8 as usize as u32, 1) {
@@ -2150,12 +2166,12 @@ pub(super) fn initialize() {
 
 /// Export 108.
 extern "C" fn export_start(module: u32) -> u32 {
-    start_modules(module).0
+    super::export_result(start_modules(PgoModule::from_value(module)))
 }
 
 /// Export 109.
 extern "C" fn export_stop(module: u32) -> u32 {
-    stop_modules(module).0
+    super::export_result(stop_modules(PgoModule::from_value(module)))
 }
 
 /// Export 110 (stock 0x91f70918): profile one module or all; `phase` may
@@ -2165,7 +2181,12 @@ extern "C" fn export_snapshot(phase: *const core::ffi::c_char, reset: u32, modul
         // SAFETY: the caller passes a NUL-terminated phase name.
         unsafe { core::ffi::CStr::from_ptr(phase) }.to_bytes_with_nul()
     });
-    snapshot_modules(phase, reset != 0, module, SweepKind::Export).0
+    super::export_result(snapshot_modules(
+        phase,
+        reset != 0,
+        PgoModule::from_value(module),
+        SweepKind::Export,
+    ))
 }
 
 /// Export 111 (stock 0x91f6cba8).
@@ -2230,29 +2251,14 @@ export!(113, export_set_module_info);
 export!(114, export_phase_snapshot);
 export!(115, export_ansi_phase_snapshot);
 
-fn control_result(result: Hresult) -> Result<(), PgoError> {
-    match result {
-        pgo::SUCCESS => Ok(()),
-        pgo::BLOCK_ALLOCATED => Err(PgoError::Busy),
-        _ => Err(PgoError::NoSuchModule),
-    }
-}
-
-fn module_address(module: PgoModule) -> u32 {
-    match module {
-        PgoModule::All => 0,
-        PgoModule::Record(address) => address,
-    }
-}
-
 /// `pogoctrl start`.
 pub(super) fn control_start(module: PgoModule) -> Result<(), PgoError> {
-    control_result(start_modules(module_address(module)))
+    start_modules(module)
 }
 
 /// `pogoctrl stop`.
 pub(super) fn control_stop(module: PgoModule) -> Result<(), PgoError> {
-    control_result(stop_modules(module_address(module)))
+    stop_modules(module)
 }
 
 /// `pogoctrl snapshot`: the phase is always set, empty when absent.
@@ -2261,15 +2267,10 @@ pub(super) fn control_snapshot(
     reset: bool,
     module: PgoModule,
 ) -> Result<(), PgoError> {
-    control_result(snapshot_modules(
-        Some(phase),
-        reset,
-        module_address(module),
-        SweepKind::Control,
-    ))
+    snapshot_modules(Some(phase), reset, module, SweepKind::Control)
 }
 
 /// `pogoctrl allocscale`.
-pub(super) fn control_allocation_scale(module: u32, scale: u32) -> Result<(), PgoError> {
-    control_result(set_allocation_scale(module, scale))
+pub(super) fn control_allocation_scale(module: PgoModule, scale: u32) -> Result<(), PgoError> {
+    set_allocation_scale(module, scale)
 }

@@ -2,8 +2,7 @@
 //! shared capture file encoder and a buffered writer into a file of the
 //! simulated file system.
 
-use openxbdm_core::status::Hresult;
-use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::KernelError;
 use openxbdm_server::commands::filesystem;
 use openxbdm_server::commands::filesystem::CreateDisposition;
 use openxbdm_server::commands::filesystem::CreateOptions;
@@ -13,7 +12,6 @@ use openxbdm_server::commands::filesystem::FileAttributes;
 use openxbdm_server::commands::filesystem::FileData;
 use openxbdm_server::commands::filesystem::FileHandle;
 use openxbdm_server::commands::filesystem::ShareAccess;
-use openxbdm_server::commands::filesystem::nt;
 use openxbdm_server::commands::network::WsaError;
 use openxbdm_server::commands::network::netcap;
 use openxbdm_server::commands::network::netcap::CaptureClose;
@@ -21,6 +19,7 @@ use openxbdm_server::commands::network::netcap::CaptureFlags;
 use openxbdm_server::commands::network::netcap::CaptureRequest;
 use openxbdm_server::commands::network::netcap::capture_file;
 use openxbdm_server::commands::network::netcap::capture_file::Admission;
+use openxbdm_server::commands::network::netcap::capture_file::CaptureFileError;
 use openxbdm_server::commands::network::netcap::capture_file::CaptureIo;
 use openxbdm_server::commands::network::netcap::capture_file::Clock;
 use openxbdm_server::commands::network::netcap::capture_file::LocalTime;
@@ -41,9 +40,6 @@ pub const LOCAL_TIME: LocalTime = LocalTime {
     second: 0,
     millisecond: 0,
 };
-/// Kernel status bit of results carrying an NTSTATUS.
-const NT_STATUS_BIT: u32 = 0x1000_0000;
-const STATUS_END_OF_FILE: NtStatus = NtStatus(0xc000_0011);
 /// Directory that resolves names without a leading backslash, which the
 /// console opens relative to root handle 0xfffffffd.
 const RELATIVE_ROOT: &[u8] = b"\\??\\";
@@ -90,9 +86,9 @@ impl Writer {
         backend: &mut MockBackend,
         data: &[u8],
         completes_record: bool,
-    ) -> Result<(), Hresult> {
+    ) -> Result<(), CaptureFileError> {
         if self.record_end.is_none() {
-            return Err(capture_file::WRITE_FAULT);
+            return Err(CaptureFileError::WriteFault);
         }
         let count = data.len().min(self.size as usize - self.buffer.len());
         self.buffer.extend_from_slice(&data[..count]);
@@ -112,11 +108,11 @@ impl Writer {
             return Ok(());
         }
         self.record_end = None;
-        Err(capture_file::WRITE_FAULT)
+        Err(CaptureFileError::WriteFault)
     }
 
     /// Write out the whole buffer (0x91f6a4e8).
-    fn drain(&mut self, backend: &mut MockBackend) -> Result<(), Hresult> {
+    fn drain(&mut self, backend: &mut MockBackend) -> Result<(), CaptureFileError> {
         while !self.buffer.is_empty() {
             let count = self.buffer.len().min(capture_file::WRITE_LIMIT as usize);
             let offset = self.position - self.buffer.len() as u64;
@@ -135,7 +131,7 @@ impl Writer {
         &mut self,
         backend: &mut MockBackend,
         recorder: &mut Recorder,
-    ) -> Result<(), Hresult> {
+    ) -> Result<(), CaptureFileError> {
         self.running = false;
         self.drain(backend)?;
         let end = match self.record_end {
@@ -167,12 +163,17 @@ pub struct Capture {
     /// Flags the callbacks apply.
     flags: CaptureFlags,
     /// First frame callback failure.
-    error: Option<Hresult>,
+    error: Option<CaptureFileError>,
 }
 
 impl Capture {
     /// Append one frame (0x91f699f8).
-    fn append(&mut self, backend: &mut MockBackend, frame: &[u8], now: u64) -> Result<(), Hresult> {
+    fn append(
+        &mut self,
+        backend: &mut MockBackend,
+        frame: &[u8],
+        now: u64,
+    ) -> Result<(), CaptureFileError> {
         let length = frame.len() as u32;
         if self.recorder.admit(length)? == Admission::Discard {
             return Ok(());
@@ -201,7 +202,7 @@ pub struct Mock {
     pub attachment: Option<Attachment>,
     pub capture: Option<Capture>,
     /// Result of the next capture creation.
-    pub open_error: Option<Hresult>,
+    pub open_error: Option<CaptureFileError>,
     /// Fail the next request to enable promiscuous mode.
     pub promiscuous_error: bool,
     /// Result of the next intercept installation.
@@ -210,7 +211,7 @@ pub struct Mock {
     /// when the network stack outpaces it.
     pub writer_stalled: bool,
     /// Result of finishing the next capture file.
-    pub finish_error: Option<Hresult>,
+    pub finish_error: Option<CaptureFileError>,
 }
 
 impl Default for Mock {
@@ -265,7 +266,10 @@ impl MockBackend {
     }
 
     /// Create the capture file and write its header (0x91f6b4e8).
-    fn create_capture(&mut self, request: &CaptureRequest<'_>) -> Result<Capture, Hresult> {
+    fn create_capture(
+        &mut self,
+        request: &CaptureRequest<'_>,
+    ) -> Result<Capture, CaptureFileError> {
         let mut name = Vec::new();
         if request.path.first() != Some(&b'\\') {
             name.extend_from_slice(RELATIVE_ROOT);
@@ -279,7 +283,7 @@ impl MockBackend {
             disposition: CreateDisposition::Create,
             options: CreateOptions::SYNCHRONOUS_IO_NONALERT,
         };
-        let handle = filesystem::Backend::create_file(self, &name, &create).map_err(nt_failure)?;
+        let handle = filesystem::Backend::create_file(self, &name, &create)?;
         let end = capture_file::HEADER_SIZE as u64;
         let writer = Writer {
             handle,
@@ -310,10 +314,6 @@ impl MockBackend {
     }
 }
 
-fn nt_failure(status: NtStatus) -> Hresult {
-    Hresult(status.0 | NT_STATUS_BIT)
-}
-
 /// Positional access to the capture file through the simulated file system.
 struct FileIo<'a> {
     backend: &'a mut MockBackend,
@@ -322,39 +322,40 @@ struct FileIo<'a> {
 }
 
 impl CaptureIo for FileIo<'_> {
-    fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> Result<(), Hresult> {
+    fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> Result<(), CaptureFileError> {
         let data = self
             .backend
             .filesystem
             .read(self.name)
-            .ok_or(nt_failure(nt::OBJECT_NAME_NOT_FOUND))?;
+            .ok_or(KernelError::ObjectNameNotFound)?;
         let Some(available) = data.get(offset as usize..).filter(|rest| !rest.is_empty()) else {
-            return Err(nt_failure(STATUS_END_OF_FILE));
+            return Err(KernelError::EndOfFile.into());
         };
         let bytes = available
             .get(..buffer.len())
-            .ok_or(capture_file::BAD_LENGTH)?;
+            .ok_or(CaptureFileError::BadLength)?;
         buffer.copy_from_slice(bytes);
         Ok(())
     }
 
-    fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), Hresult> {
+    fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), CaptureFileError> {
         filesystem::Backend::write_file(
             self.backend,
             self.handle,
             Some(offset),
             FileData::Bytes(data),
         )
-        .map_err(nt_failure)
+        .map_err(CaptureFileError::Kernel)
     }
 
-    fn truncate(&mut self, length: u64) -> Result<(), Hresult> {
-        filesystem::Backend::set_end_of_file(self.backend, self.handle, length).map_err(nt_failure)
+    fn truncate(&mut self, length: u64) -> Result<(), CaptureFileError> {
+        filesystem::Backend::set_end_of_file(self.backend, self.handle, length)
+            .map_err(CaptureFileError::Kernel)
     }
 }
 
 impl netcap::Backend for MockBackend {
-    fn open_capture(&mut self, request: &CaptureRequest<'_>) -> Result<(), Hresult> {
+    fn open_capture(&mut self, request: &CaptureRequest<'_>) -> Result<(), CaptureFileError> {
         if let Some(error) = self.network.netcap.open_error.take() {
             return Err(error);
         }
@@ -394,7 +395,7 @@ impl netcap::Backend for MockBackend {
         self.network.netcap.attachment = None;
     }
 
-    fn capture_error(&self) -> Option<Hresult> {
+    fn capture_error(&self) -> Option<CaptureFileError> {
         self.network
             .netcap
             .capture

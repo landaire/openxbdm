@@ -25,6 +25,8 @@ use openxbdm_client::commands::GetMem;
 use openxbdm_client::commands::GetNetAddrs;
 use openxbdm_client::commands::GetPid;
 use openxbdm_client::commands::GetSocketInfo;
+#[cfg(feature = "capture")]
+use openxbdm_client::commands::Hresult;
 use openxbdm_client::commands::IsStopped;
 use openxbdm_client::commands::ModuleSections;
 use openxbdm_client::commands::Modules;
@@ -318,7 +320,7 @@ fn threadinfo_parses_detail_block() {
     assert_eq!(detail.slack, 0x540);
     assert_eq!(detail.name_length, 0x0e);
     assert_eq!(detail.processor, 0x05);
-    assert_eq!(detail.last_error, 0);
+    assert_eq!(detail.last_error, None);
 }
 
 #[test]
@@ -521,8 +523,8 @@ fn error_response_is_typed() {
     let kind = err.current_context();
     insta::assert_debug_snapshot!(kind, @r###"
     Remote {
-        code: ErrorCode(
-            407,
+        code: Listed(
+            UnknownCommand,
         ),
         message: "unknown command",
     }
@@ -558,8 +560,15 @@ fn pix_full_handshake_walks_every_token_in_order() {
 #[test]
 fn pix_notification_parser_matches_xbmovie_shapes() {
     let segment = Notification::parse("PIX!{CaptureFileCreationEnded}7").unwrap();
-    assert_eq!(segment, Notification::CaptureFileCreationEnded { index: 7 });
+    assert_eq!(
+        segment,
+        Some(Notification::CaptureFileCreationEnded { result: Hresult(7) })
+    );
     let end = Notification::parse("PIX!{CaptureEnded}").unwrap();
-    assert_eq!(end, Notification::CaptureEnded);
-    assert!(Notification::parse("202- not a pix line").is_none());
+    assert_eq!(end, Some(Notification::CaptureEnded));
+    assert!(
+        Notification::parse("202- not a pix line")
+            .unwrap()
+            .is_none()
+    );
 }

@@ -2,16 +2,22 @@
 
 use openxbdm_core::line::Value;
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::Win32Error;
 
 use crate::access::Access;
 use crate::commands::console;
 use crate::commands::console::ConfigSetting;
+use crate::commands::console::RetailFlags;
 use crate::commands::util::required_dword;
 use crate::continuation::ContinuationContext;
 use crate::invocation::Invocation;
 use crate::registry::CommandEntry;
 use crate::registry::DispatchFlags;
+use crate::reply::CommandError;
+use crate::reply::CommandResult;
+use crate::reply::Reply;
 
 pub(crate) const COMMANDS: &[CommandEntry] = &[
     entry("civfail", DispatchFlags::NONE, civ_fail),
@@ -60,23 +66,63 @@ impl State {
 #[derive(Debug)]
 pub enum Continuation {}
 
-/// Handle of a thread created for `civfail`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Kernel handle of a thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ThreadHandle(pub u32);
 
-/// A thread last-error value (Win32 error code).
+/// A thread last-error value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LastError(pub u32);
-
-impl LastError {
-    /// The procedure is not exported by the module.
-    pub const PROC_NOT_FOUND: Self = Self(0x7f);
+pub enum LastError {
+    /// `ERROR_SUCCESS`: the thread holds no error.
+    Success,
+    /// `ERROR_PROC_NOT_FOUND`: the procedure is not exported by the module.
+    ProcNotFound,
+    Other(Win32Error),
 }
 
-/// Value a CIV service call reports: the service's return value, or a
-/// last-error value when the service cannot be resolved.
+impl LastError {
+    const PROC_NOT_FOUND: Win32Error = Win32Error::new(0x7f).unwrap();
+
+    pub fn from_win32(error: Option<Win32Error>) -> Self {
+        match error {
+            None => Self::Success,
+            Some(error) if error == Self::PROC_NOT_FOUND => Self::ProcNotFound,
+            Some(error) => Self::Other(error),
+        }
+    }
+
+    /// The Win32 code, as the reply text prints it.
+    pub fn code(self) -> u32 {
+        match self {
+            Self::Success => 0,
+            Self::ProcNotFound => Self::PROC_NOT_FOUND.code(),
+            Self::Other(error) => error.code(),
+        }
+    }
+}
+
+/// Value a CIV service call reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CivResult(pub u32);
+pub enum CivResult {
+    /// The XAM service's return value, reported unchanged.
+    Returned(Hresult),
+    /// xam.xex is not loaded.
+    NoModule(LastError),
+    /// The service is not exported.
+    NoExport(LastError),
+}
+
+impl CivResult {
+    /// The value the reply text prints: the return value or the last
+    /// error; an absent export with `ERROR_PROC_NOT_FOUND` reports 0.
+    pub fn value(self) -> u32 {
+        match self {
+            Self::Returned(value) => value.0,
+            Self::NoExport(LastError::ProcNotFound) => 0,
+            Self::NoModule(error) | Self::NoExport(error) => error.code(),
+        }
+    }
+}
 
 /// Bit index into the kernel's 64-bit security detection mask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,18 +169,21 @@ impl DetectionRoutine {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DetectionRoutineMissing {
     pub routine: DetectionRoutine,
-    pub status: NtStatus,
+    pub error: KernelError,
 }
 
-/// Outcome of a `civsetbits` update. Masks are the low 32 bits of the
-/// 64-bit detection mask.
+/// The low 32 bits of the kernel's 64-bit security detection mask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetectionMask(pub u32);
+
+/// Outcome of a `civsetbits` update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DetectionUpdate {
-    /// Status of the set request, or of the last export resolution when no
-    /// bit was requested.
-    pub result: u32,
-    pub old_mask: u32,
-    pub new_mask: u32,
+    /// Kernel status of the set request, or of the last export resolution
+    /// when no bit was requested; reported unchanged.
+    pub status: NtStatus,
+    pub old_mask: DetectionMask,
+    pub new_mask: DetectionMask,
 }
 
 /// Content verification counters reported by `civstatus`.
@@ -145,20 +194,6 @@ pub struct CivProgress {
     pub blocks_checked: u32,
     pub total_blocks: u32,
     pub completed: bool,
-}
-
-/// Console configuration flag word (category 3) the IPTV switches live in.
-pub const IPTV_FLAGS_SETTING: u16 = 0xc;
-
-/// Bits of the IPTV flag word.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IptvFlags(pub u32);
-
-impl IptvFlags {
-    pub const ENABLED: Self = Self(0x1000);
-    pub const DVR: Self = Self(0x0008_0000);
-    /// Set when uninstalling IPTV is not allowed.
-    pub const UNINSTALL_BLOCKED: Self = Self(0x0200_0000);
 }
 
 /// IPTV configuration strings (category 9). Values are stored as
@@ -233,7 +268,7 @@ pub trait Backend {
 pub(crate) fn resume(
     continuation: &mut Continuation,
     _cx: &mut ContinuationContext<'_>,
-) -> Hresult {
+) -> CommandResult {
     match *continuation {}
 }
 
@@ -254,29 +289,29 @@ fn stored_dword(invocation: &mut Invocation<'_>, name: &str) -> Option<u32> {
 }
 
 /// `civfail [reboot=<dword>]`. The thread handle is not closed.
-fn civ_fail(invocation: &mut Invocation<'_>) -> Hresult {
+fn civ_fail(invocation: &mut Invocation<'_>) -> CommandResult {
     // The stack variable starts at zero.
     let reboot = stored_dword(invocation, "reboot").unwrap_or(0) != 0;
     match invocation.backend.start_civ_failure_thread(reboot) {
         Ok(handle) => invocation.set_text(format_args!("Thread created: 0x{:08X}", handle.0)),
-        Err(error) => invocation.set_text(format_args!("CreateThread failed 0x{:x}", error.0)),
+        Err(error) => invocation.set_text(format_args!("CreateThread failed 0x{:x}", error.code())),
     }
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `civinject readerrors=<dword> hasherrors=<dword>`: absent counts are 0;
 /// the text names the last missing parameter.
-fn civ_inject(invocation: &mut Invocation<'_>) -> Hresult {
+fn civ_inject(invocation: &mut Invocation<'_>) -> CommandResult {
     let read_errors = required_dword(invocation, "readerrors").unwrap_or(0);
     let hash_errors = required_dword(invocation, "hasherrors").unwrap_or(0);
     invocation
         .backend
         .inject_civ_errors(hash_errors, read_errors);
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `civsetbits on=<dword>`: `on` is a detection bit index; zero sets none.
-fn civ_set_bits(invocation: &mut Invocation<'_>) -> Hresult {
+fn civ_set_bits(invocation: &mut Invocation<'_>) -> CommandResult {
     // Stock reads an uninitialized stack variable when `on` is absent; no
     // bit is set here.
     let bit = stored_dword(invocation, "on")
@@ -285,38 +320,42 @@ fn civ_set_bits(invocation: &mut Invocation<'_>) -> Hresult {
     let update = match invocation.backend.update_civ_detection(bit) {
         Ok(update) => update,
         Err(missing) => {
+            let status = NtStatus::from(missing.error);
             invocation.set_text(format_args!(
                 "Cannot load ordinal {} ({}): 0x{:x}\n",
                 missing.routine.ordinal(),
                 missing.routine.name(),
-                missing.status.0
+                status.0
             ));
             invocation.backend.debug_print(invocation.text.as_bytes());
             DetectionUpdate {
-                result: missing.status.0,
-                old_mask: 0xbaad_f00d,
-                new_mask: 0xdead_beef,
+                status,
+                old_mask: DetectionMask(0xbaad_f00d),
+                new_mask: DetectionMask(0xdead_beef),
             }
         }
     };
     invocation.set_text(format_args!(
         "Result 0x{:x}; old mask 0x{:x}, new mask 0x{:x}",
-        update.result, update.old_mask, update.new_mask
+        update.status.0, update.old_mask.0, update.new_mask.0
     ));
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `civstart threadid=<dword>`: the id is clamped to 5.
-fn civ_start(invocation: &mut Invocation<'_>) -> Hresult {
+fn civ_start(invocation: &mut Invocation<'_>) -> CommandResult {
     let thread_id = stored_dword(invocation, "threadid")
         .unwrap_or(0)
         .min(CIV_THREAD_ID_LIMIT);
     let result = invocation.backend.create_civ_process(thread_id);
-    invocation.set_text(format_args!("XSecurityCreateProcess 0x{:x}", result.0));
-    Hresult::OK
+    invocation.set_text(format_args!(
+        "XSecurityCreateProcess 0x{:x}",
+        result.value()
+    ));
+    Ok(Reply::Ok)
 }
 
-fn civ_status(invocation: &mut Invocation<'_>) -> Hresult {
+fn civ_status(invocation: &mut Invocation<'_>) -> CommandResult {
     match invocation.backend.civ_progress() {
         Ok(progress) => invocation.set_text(format_args!(
             "Blocks Checked {}, Failed Reads {}, Failed Hashes {}, Total Blocks {}, {}.",
@@ -332,21 +371,21 @@ fn civ_status(invocation: &mut Invocation<'_>) -> Hresult {
         )),
         Err(error) => invocation.set_text(format_args!(
             "XSecurityFailedBlocks returned 0x{:x}",
-            error.0
+            error.value()
         )),
     }
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
-fn civ_stop(invocation: &mut Invocation<'_>) -> Hresult {
+fn civ_stop(invocation: &mut Invocation<'_>) -> CommandResult {
     invocation.backend.close_civ_process();
     invocation.text.set_bytes(b"XSecurityCloseProcess");
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `civverify milliseconds=<dword>`: non-positive budgets other than -1
 /// become 0x100.
-fn civ_verify(invocation: &mut Invocation<'_>) -> Hresult {
+fn civ_verify(invocation: &mut Invocation<'_>) -> CommandResult {
     // Stock reads an uninitialized stack variable when the parameter is
     // absent; the default budget applies here.
     let requested = stored_dword(invocation, "milliseconds").unwrap_or(0) as i32;
@@ -356,38 +395,42 @@ fn civ_verify(invocation: &mut Invocation<'_>) -> Hresult {
         requested as u32
     };
     let result = invocation.backend.verify_civ(milliseconds);
-    invocation.set_text(format_args!("XSecurityVerify 0x{:x}", result.0));
-    Hresult::OK
+    invocation.set_text(format_args!("XSecurityVerify 0x{:x}", result.value()));
+    Ok(Reply::Ok)
 }
 
 /// `enable` (tested first) sets `on_enable`; `disable` sets the opposite.
-fn update_iptv_flag(invocation: &mut Invocation<'_>, mask: IptvFlags, on_enable: bool) -> Hresult {
+fn update_iptv_flag(
+    invocation: &mut Invocation<'_>,
+    flag: RetailFlags,
+    on_enable: bool,
+) -> CommandResult {
     let set = if invocation.line.has("enable") {
         on_enable
     } else if invocation.line.has("disable") {
         !on_enable
     } else {
         invocation.text.set_bytes(b"missing arguments");
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
-    console::modify_config_flag(invocation.backend, IPTV_FLAGS_SETTING, mask.0, set)
+    console::modify_config_flag(invocation.backend, flag, set).map(|()| Reply::Ok)
 }
 
-fn iptv(invocation: &mut Invocation<'_>) -> Hresult {
-    update_iptv_flag(invocation, IptvFlags::ENABLED, true)
+fn iptv(invocation: &mut Invocation<'_>) -> CommandResult {
+    update_iptv_flag(invocation, RetailFlags::IPTV_ENABLED, true)
 }
 
-fn iptv_allow_uninstall(invocation: &mut Invocation<'_>) -> Hresult {
-    update_iptv_flag(invocation, IptvFlags::UNINSTALL_BLOCKED, false)
+fn iptv_allow_uninstall(invocation: &mut Invocation<'_>) -> CommandResult {
+    update_iptv_flag(invocation, RetailFlags::IPTV_UNINSTALL_BLOCKED, false)
 }
 
-fn iptv_dvr(invocation: &mut Invocation<'_>) -> Hresult {
-    update_iptv_flag(invocation, IptvFlags::DVR, true)
+fn iptv_dvr(invocation: &mut Invocation<'_>) -> CommandResult {
+    update_iptv_flag(invocation, RetailFlags::IPTV_DVR, true)
 }
 
 /// The value at the setting's fixed line offset, without validation, each
 /// byte sign-extended to a big-endian UTF-16 unit.
-fn store_iptv_string(invocation: &mut Invocation<'_>, setting: IptvString) -> Hresult {
+fn store_iptv_string(invocation: &mut Invocation<'_>, setting: IptvString) -> CommandResult {
     let size = setting.size();
     let mut text = [0u8; IPTV_STRING_CAPACITY / 2];
     let text =
@@ -396,27 +439,25 @@ fn store_iptv_string(invocation: &mut Invocation<'_>, setting: IptvString) -> Hr
     for (unit, &byte) in stored.as_chunks_mut::<2>().0.iter_mut().zip(text) {
         *unit = (i16::from(byte as i8) as u16).to_be_bytes();
     }
-    match invocation
+    invocation
         .backend
         .xconfig_set(setting.setting(), &stored[..size])
-    {
-        Ok(()) => Hresult::OK,
-        Err(status) => Hresult::from_nt_status(status, Hresult::UNEXPECTED),
-    }
+        .map(|()| Reply::Ok)
+        .map_err(|error| CommandError::from_kernel(error, CommandError::Unexpected))
 }
 
-fn iptv_bootstrap_url(invocation: &mut Invocation<'_>) -> Hresult {
+fn iptv_bootstrap_url(invocation: &mut Invocation<'_>) -> CommandResult {
     store_iptv_string(invocation, IptvString::BootstrapUrl)
 }
 
-fn iptv_provider_name(invocation: &mut Invocation<'_>) -> Hresult {
+fn iptv_provider_name(invocation: &mut Invocation<'_>) -> CommandResult {
     store_iptv_string(invocation, IptvString::ProviderName)
 }
 
-fn iptv_provisioning_url(invocation: &mut Invocation<'_>) -> Hresult {
+fn iptv_provisioning_url(invocation: &mut Invocation<'_>) -> CommandResult {
     store_iptv_string(invocation, IptvString::ProvisioningUrl)
 }
 
-fn iptv_support_info(invocation: &mut Invocation<'_>) -> Hresult {
+fn iptv_support_info(invocation: &mut Invocation<'_>) -> CommandResult {
     store_iptv_string(invocation, IptvString::SupportInfo)
 }

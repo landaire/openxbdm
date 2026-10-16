@@ -24,6 +24,7 @@ use openxbdm_client::discovery::find_by_name;
 use openxbdm_core::status::Hresult;
 use openxbdm_server::ConnectionIndex;
 use openxbdm_server::commands::session::FileEventId;
+use openxbdm_server::commands::session::TellLogAreas;
 use openxbdm_server::commands::session::debug_capture_print;
 use openxbdm_server::processors::ProcessorFlags;
 use openxbdm_server_host::Host;
@@ -141,7 +142,8 @@ fn dedicate_moves_the_connection_between_contexts() {
             },
         );
         host.backend
-            .register_processor(b"ttl", Some(echo), ProcessorFlags::TITLE);
+            .register_processor(b"ttl", Some(echo), ProcessorFlags::TITLE)
+            .unwrap();
     }
     let mut session = session(&server);
     assert_eq!(session.command("dedicate"), "400- missing handler");
@@ -170,16 +172,20 @@ fn processor_answering_205_takes_the_connection() {
     let server = TestServer::start();
     {
         let mut host = server.host.lock();
-        host.backend.register_processor(
-            b"own",
-            Some(Box::new(|_, _| Hresult::DEDICATED)),
-            ProcessorFlags::TITLE,
-        );
-        host.backend.register_processor(
-            b"sys",
-            Some(Box::new(|_, _| Hresult::OK)),
-            ProcessorFlags::NONE,
-        );
+        host.backend
+            .register_processor(
+                b"own",
+                Some(Box::new(|_, _| Hresult::DEDICATED)),
+                ProcessorFlags::TITLE,
+            )
+            .unwrap();
+        host.backend
+            .register_processor(
+                b"sys",
+                Some(Box::new(|_, _| Hresult::OK)),
+                ProcessorFlags::NONE,
+            )
+            .unwrap();
     }
     let mut session = session(&server);
     assert_eq!(session.command("sys!x"), "200- OK");
@@ -196,26 +202,34 @@ fn status_lines_follow_the_line_builder() {
     let server = TestServer::start();
     {
         let mut host = server.host.lock();
-        host.backend.register_processor(
-            b"low",
-            Some(Box::new(|_, _| Hresult::success(0x64))),
-            ProcessorFlags::NONE,
-        );
-        host.backend.register_processor(
-            b"mid",
-            Some(Box::new(|_, _| Hresult::success(0xc8))),
-            ProcessorFlags::NONE,
-        );
-        host.backend.register_processor(
-            b"bad",
-            Some(Box::new(|_, _| Hresult::error(0x96))),
-            ProcessorFlags::NONE,
-        );
-        host.backend.register_processor(
-            b"big",
-            Some(Box::new(|_, _| Hresult(0x02da_0100))),
-            ProcessorFlags::NONE,
-        );
+        host.backend
+            .register_processor(
+                b"low",
+                Some(Box::new(|_, _| Hresult::success(0x64))),
+                ProcessorFlags::NONE,
+            )
+            .unwrap();
+        host.backend
+            .register_processor(
+                b"mid",
+                Some(Box::new(|_, _| Hresult::success(0xc8))),
+                ProcessorFlags::NONE,
+            )
+            .unwrap();
+        host.backend
+            .register_processor(
+                b"bad",
+                Some(Box::new(|_, _| Hresult::error(0x96))),
+                ProcessorFlags::NONE,
+            )
+            .unwrap();
+        host.backend
+            .register_processor(
+                b"big",
+                Some(Box::new(|_, _| Hresult(0x02da_0100))),
+                ProcessorFlags::NONE,
+            )
+            .unwrap();
     }
     let mut session = session(&server);
     assert_eq!(session.command("low!x"), "2:0- ");
@@ -229,16 +243,20 @@ fn transfer_without_continuation_keeps_the_original_text() {
     let server = TestServer::start();
     {
         let mut host = server.host.lock();
-        host.backend.register_processor(
-            b"multi",
-            Some(Box::new(|_, _| Hresult::MULTILINE)),
-            ProcessorFlags::NONE,
-        );
-        host.backend.register_processor(
-            b"send",
-            Some(Box::new(|_, _| Hresult::SEND_BINARY)),
-            ProcessorFlags::NONE,
-        );
+        host.backend
+            .register_processor(
+                b"multi",
+                Some(Box::new(|_, _| Hresult::MULTILINE)),
+                ProcessorFlags::NONE,
+            )
+            .unwrap();
+        host.backend
+            .register_processor(
+                b"send",
+                Some(Box::new(|_, _| Hresult::SEND_BINARY)),
+                ProcessorFlags::NONE,
+            )
+            .unwrap();
     }
     let mut session = session(&server);
     assert_eq!(
@@ -262,7 +280,8 @@ fn processor_calls_on_other_threads_reply_when_they_end() {
             },
         );
         host.backend
-            .register_processor(b"ttl", Some(echo), ProcessorFlags::TITLE);
+            .register_processor(b"ttl", Some(echo), ProcessorFlags::TITLE)
+            .unwrap();
     }
     let mut title = session(&server);
     title.send("ttl!echo");
@@ -292,12 +311,15 @@ fn title_termination_closes_title_connections_and_processors() {
         let mut host = server.host.lock();
         let ok = || Box::new(|_: &[u8], _: &mut openxbdm_server::text::ResponseText| Hresult::OK);
         host.backend
-            .register_processor(b"ttl", Some(ok()), ProcessorFlags::TITLE);
+            .register_processor(b"ttl", Some(ok()), ProcessorFlags::TITLE)
+            .unwrap();
         let dedicated = ProcessorFlags::TITLE.union(ProcessorFlags::DEDICATED_THREAD);
         host.backend
-            .register_processor(b"dttl", Some(ok()), dedicated);
+            .register_processor(b"dttl", Some(ok()), dedicated)
+            .unwrap();
         host.backend
-            .register_processor(b"dsys", Some(ok()), ProcessorFlags::DEDICATED_THREAD);
+            .register_processor(b"dsys", Some(ok()), ProcessorFlags::DEDICATED_THREAD)
+            .unwrap();
     }
     let mut shared = session(&server);
     assert_eq!(shared.command("ttl!x"), "200- OK");
@@ -671,15 +693,15 @@ fn dmtelllog_result_codes() {
     // A new area bit joins the open log, and a stop that leaves area bits
     // keeps it open; neither sends a reply.
     // The monitor takes one line per receive, so each line goes alone.
-    let area = |expected: u32| {
+    let area = |expected: TellLogAreas| {
         move |host: &Host| {
             host.backend.session.tell_log.as_ref().map(|log| log.area) == Some(expected)
         }
     };
     session.send("dmtelllog start file=other.log area=2");
-    server.wait_until(area(3));
+    server.wait_until(area(TellLogAreas(3)));
     session.send("dmtelllog stop area=1");
-    server.wait_until(area(2));
+    server.wait_until(area(TellLogAreas(2)));
     assert_eq!(session.command("dmtelllog stop"), "200- hresult=0x10000000");
     assert_eq!(
         session.command("dmtelllog start file=tell.log area=1 size=0x10000 entries=0x1000"),

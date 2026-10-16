@@ -31,8 +31,10 @@ impl StatusCode {
     pub fn try_classify(self) -> Classified {
         if let Some(s) = SuccessCode::from_raw(self.0) {
             Classified::Success(s)
+        } else if let Some(code) = ErrorCode::from_raw(self.0) {
+            Classified::Error(code)
         } else if self.is_error() {
-            Classified::Error(ErrorCode(self.0))
+            Classified::UnlistedError(self)
         } else {
             Classified::Unknown(self)
         }
@@ -55,6 +57,8 @@ impl core::fmt::Display for StatusCode {
 pub enum Classified {
     Success(SuccessCode),
     Error(ErrorCode),
+    /// A 4xx status outside the monitor's result table.
+    UnlistedError(StatusCode),
     Unknown(StatusCode),
 }
 
@@ -107,79 +111,103 @@ impl core::fmt::Display for SuccessCode {
     }
 }
 
-/// An error status (4xx). Default text comes from the monitor's result
-/// table; codes without table text have an empty message.
+/// An error status (4xx) of the monitor's result table. The numeric value
+/// of the enum matches the wire code.
+#[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ErrorCode(u16);
+pub enum ErrorCode {
+    Undefined = 400,
+    MaxConnectionsExceeded = 401,
+    FileNotFound = 402,
+    NoSuchModule = 403,
+    MemoryNotMapped = 404,
+    NoSuchThread = 405,
+    ClockNotSet = 406,
+    UnknownCommand = 407,
+    NotStopped = 408,
+    FileMustBeCopied = 409,
+    FileAlreadyExists = 410,
+    DirectoryNotEmpty = 411,
+    FilenameInvalid = 412,
+    FileCannotBeCreated = 413,
+    AccessDenied = 414,
+    NoRoomOnDevice = 415,
+    NotDebuggable = 416,
+    TypeInvalid = 417,
+    DataNotAvailable = 418,
+    BoxNotLocked = 420,
+    KeyExchangeRequired = 421,
+    DedicatedConnectionRequired = 422,
+    BadParameter = 423,
+    OutOfMemory = 428,
+    PathNotFound = 430,
+    LineTooLong = 446,
+}
 
 impl ErrorCode {
-    pub const UNDEFINED: Self = Self(400);
-    pub const MAX_CONNECTIONS_EXCEEDED: Self = Self(401);
-    pub const FILE_NOT_FOUND: Self = Self(402);
-    pub const NO_SUCH_MODULE: Self = Self(403);
-    pub const MEMORY_NOT_MAPPED: Self = Self(404);
-    pub const NO_SUCH_THREAD: Self = Self(405);
-    pub const CLOCK_NOT_SET: Self = Self(406);
-    pub const UNKNOWN_COMMAND: Self = Self(407);
-    pub const NOT_STOPPED: Self = Self(408);
-    pub const FILE_MUST_BE_COPIED: Self = Self(409);
-    pub const FILE_ALREADY_EXISTS: Self = Self(410);
-    pub const DIRECTORY_NOT_EMPTY: Self = Self(411);
-    pub const FILENAME_INVALID: Self = Self(412);
-    pub const FILE_CANNOT_BE_CREATED: Self = Self(413);
-    pub const ACCESS_DENIED: Self = Self(414);
-    pub const NO_ROOM_ON_DEVICE: Self = Self(415);
-    pub const NOT_DEBUGGABLE: Self = Self(416);
-    pub const TYPE_INVALID: Self = Self(417);
-    pub const DATA_NOT_AVAILABLE: Self = Self(418);
-    pub const BOX_NOT_LOCKED: Self = Self(420);
-    pub const KEY_EXCHANGE_REQUIRED: Self = Self(421);
-    pub const DEDICATED_CONNECTION_REQUIRED: Self = Self(422);
-    pub const BAD_PARAMETER: Self = Self(423);
-    pub const OUT_OF_MEMORY: Self = Self(428);
-    pub const PATH_NOT_FOUND: Self = Self(430);
-    pub const LINE_TOO_LONG: Self = Self(446);
-
-    /// Any 4xx code.
     pub const fn from_raw(raw: u16) -> Option<Self> {
-        if raw >= 400 && raw < 500 {
-            Some(Self(raw))
-        } else {
-            None
-        }
+        Some(match raw {
+            400 => Self::Undefined,
+            401 => Self::MaxConnectionsExceeded,
+            402 => Self::FileNotFound,
+            403 => Self::NoSuchModule,
+            404 => Self::MemoryNotMapped,
+            405 => Self::NoSuchThread,
+            406 => Self::ClockNotSet,
+            407 => Self::UnknownCommand,
+            408 => Self::NotStopped,
+            409 => Self::FileMustBeCopied,
+            410 => Self::FileAlreadyExists,
+            411 => Self::DirectoryNotEmpty,
+            412 => Self::FilenameInvalid,
+            413 => Self::FileCannotBeCreated,
+            414 => Self::AccessDenied,
+            415 => Self::NoRoomOnDevice,
+            416 => Self::NotDebuggable,
+            417 => Self::TypeInvalid,
+            418 => Self::DataNotAvailable,
+            420 => Self::BoxNotLocked,
+            421 => Self::KeyExchangeRequired,
+            422 => Self::DedicatedConnectionRequired,
+            423 => Self::BadParameter,
+            428 => Self::OutOfMemory,
+            430 => Self::PathNotFound,
+            446 => Self::LineTooLong,
+            _ => return None,
+        })
     }
 
     pub const fn raw(self) -> u16 {
-        self.0
+        self as u16
     }
 
     /// Default text the monitor sends for this code.
     pub const fn message(self) -> &'static str {
-        match self.0 {
-            402 => "file not found",
-            403 => "no such module",
-            404 => "memory not mapped",
-            405 => "no such thread",
-            407 => "unknown command",
-            408 => "not stopped",
-            409 => "file must be copied",
-            410 => "file already exists",
-            411 => "directory not empty",
-            412 => "filename is invalid",
-            413 => "file cannot be created",
-            414 => "access denied",
-            415 => "no room on device",
-            416 => "not debuggable",
-            417 => "type invalid",
-            418 => "data not available",
-            420 => "box is not locked",
-            421 => "key exchange required",
-            422 => "dedicated connection required",
-            423 => "bad parameter",
-            428 => "out of memory",
-            430 => "path not found",
-            446 => "line too long",
-            _ => "",
+        match self {
+            Self::Undefined | Self::MaxConnectionsExceeded | Self::ClockNotSet => "",
+            Self::FileNotFound => "file not found",
+            Self::NoSuchModule => "no such module",
+            Self::MemoryNotMapped => "memory not mapped",
+            Self::NoSuchThread => "no such thread",
+            Self::UnknownCommand => "unknown command",
+            Self::NotStopped => "not stopped",
+            Self::FileMustBeCopied => "file must be copied",
+            Self::FileAlreadyExists => "file already exists",
+            Self::DirectoryNotEmpty => "directory not empty",
+            Self::FilenameInvalid => "filename is invalid",
+            Self::FileCannotBeCreated => "file cannot be created",
+            Self::AccessDenied => "access denied",
+            Self::NoRoomOnDevice => "no room on device",
+            Self::NotDebuggable => "not debuggable",
+            Self::TypeInvalid => "type invalid",
+            Self::DataNotAvailable => "data not available",
+            Self::BoxNotLocked => "box is not locked",
+            Self::KeyExchangeRequired => "key exchange required",
+            Self::DedicatedConnectionRequired => "dedicated connection required",
+            Self::BadParameter => "bad parameter",
+            Self::OutOfMemory => "out of memory",
+            Self::PathNotFound => "path not found",
+            Self::LineTooLong => "line too long",
         }
     }
 }
@@ -193,7 +221,7 @@ impl core::fmt::Display for ErrorCode {
 /// Facility code of monitor results.
 const FACILITY_XBDM: u32 = 0x02da_0000;
 
-/// A kernel status code.
+/// A kernel status code as the kernel ABI and wire formats carry it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NtStatus(pub u32);
 
@@ -203,11 +231,160 @@ impl NtStatus {
     pub const fn is_success(self) -> bool {
         (self.0 as i32) >= 0
     }
+
+    /// `Ok` for a success or informational status, the failure otherwise.
+    pub const fn result(self) -> Result<(), KernelError> {
+        if self.is_success() {
+            Ok(())
+        } else {
+            Err(KernelError::from_status(self))
+        }
+    }
 }
 
-/// A handler result as the monitor represents it: facility 0x2da results
-/// carry the status code in the low word; other values are generic
-/// success or failure codes.
+/// Generates [`KernelError`] with one variant per listed status.
+macro_rules! kernel_errors {
+    ($($(#[$meta:meta])* $name:ident = $value:literal,)*) => {
+        /// A failed kernel call. A status without a variant keeps its value
+        /// for exact passthrough.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum KernelError {
+            $($(#[$meta])* $name,)*
+            Unlisted(UnlistedStatus),
+        }
+
+        impl KernelError {
+            /// The error for a failure status.
+            pub const fn from_status(status: NtStatus) -> Self {
+                match status.0 {
+                    $($value => Self::$name,)*
+                    _ => Self::Unlisted(UnlistedStatus(status)),
+                }
+            }
+
+            pub const fn status(self) -> NtStatus {
+                match self {
+                    $(Self::$name => NtStatus($value),)*
+                    Self::Unlisted(UnlistedStatus(status)) => status,
+                }
+            }
+        }
+    };
+}
+
+kernel_errors! {
+    BufferOverflow = 0x8000_0005,
+    NoMoreFiles = 0x8000_0006,
+    NoMoreEntries = 0x8000_001a,
+    Unsuccessful = 0xc000_0001,
+    NotImplemented = 0xc000_0002,
+    InvalidHandle = 0xc000_0008,
+    InvalidParameter = 0xc000_000d,
+    NoSuchDevice = 0xc000_000e,
+    NoSuchFile = 0xc000_000f,
+    EndOfFile = 0xc000_0011,
+    NoMediaInDevice = 0xc000_0013,
+    NoMemory = 0xc000_0017,
+    AccessDenied = 0xc000_0022,
+    BufferTooSmall = 0xc000_0023,
+    ObjectNameInvalid = 0xc000_0033,
+    ObjectNameNotFound = 0xc000_0034,
+    ObjectNameCollision = 0xc000_0035,
+    ObjectPathInvalid = 0xc000_0039,
+    ObjectPathNotFound = 0xc000_003a,
+    CrcError = 0xc000_003f,
+    SectionTooBig = 0xc000_0040,
+    DiskFull = 0xc000_007f,
+    InsufficientResources = 0xc000_009a,
+    DeviceNotConnected = 0xc000_009d,
+    FileIsADirectory = 0xc000_00ba,
+    NotSameDevice = 0xc000_00d4,
+    DirectoryNotEmpty = 0xc000_0101,
+    NotADirectory = 0xc000_0103,
+    CannotDelete = 0xc000_0121,
+    OrdinalNotFound = 0xc000_0138,
+    UnrecognizedVolume = 0xc000_014f,
+    MappedAlignment = 0xc000_0220,
+    EntryPointNotFound = 0xc000_0263,
+}
+
+/// A failure status without a [`KernelError`] variant. Only
+/// [`KernelError::from_status`] creates it, so equal errors have equal
+/// variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UnlistedStatus(NtStatus);
+
+impl From<NtStatus> for KernelError {
+    fn from(status: NtStatus) -> Self {
+        Self::from_status(status)
+    }
+}
+
+impl From<KernelError> for NtStatus {
+    fn from(error: KernelError) -> Self {
+        error.status()
+    }
+}
+
+impl core::fmt::Display for KernelError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "kernel status {:#010x}", self.status().0)
+    }
+}
+
+impl core::error::Error for KernelError {}
+
+/// A Win32 error code, as the kernel's status translation and last-error
+/// value report it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Win32Error(core::num::NonZeroU32);
+
+impl Win32Error {
+    /// `None` for `ERROR_SUCCESS`.
+    pub const fn new(code: u32) -> Option<Self> {
+        match core::num::NonZeroU32::new(code) {
+            Some(code) => Some(Self(code)),
+            None => None,
+        }
+    }
+
+    pub const fn code(self) -> u32 {
+        self.0.get()
+    }
+}
+
+impl core::fmt::Display for Win32Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "win32 error {}", self.code())
+    }
+}
+
+impl core::error::Error for Win32Error {}
+
+/// A kernel status as a result: the status with the NT facility bit set.
+impl From<KernelError> for Hresult {
+    fn from(error: KernelError) -> Self {
+        Self(error.status().0 | 0x1000_0000)
+    }
+}
+
+/// A Win32 error as a result: positive codes move to the Win32 facility,
+/// others pass unchanged.
+impl From<Win32Error> for Hresult {
+    fn from(error: Win32Error) -> Self {
+        let code = error.code();
+        if (code as i32) <= 0 {
+            Self(code)
+        } else {
+            Self(0x8007_0000 | (code & 0xffff))
+        }
+    }
+}
+
+/// A result value as the wire and the title ABI carry it: facility 0x2da
+/// results carry the status code in the low word; other values are
+/// generic success or failure codes. Code away from those boundaries uses
+/// typed results that convert into this one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Hresult(pub u32);
 
@@ -221,7 +398,7 @@ impl Hresult {
     pub const SEND_BINARY: Self = Self::success(4);
     pub const DEDICATED: Self = Self::success(5);
     pub const FAST_PIPE: Self = Self::success(9);
-    /// End of continuation data; never sent as a status.
+    /// End of a transfer or of a list.
     pub const END_OF_DATA: Self = Self::error(0x104);
     pub const FAIL: Self = Self(0x8000_4005);
     pub const UNEXPECTED: Self = Self(0x8000_ffff);
@@ -279,32 +456,12 @@ impl Hresult {
             0x8007_000e => "out of memory",
             0x8007_0057 => "bad parameter",
             value if value & 0xffff_0000 == 0x82da_0000 && value & 0xffff <= 0xff => {
-                ErrorCode((400 + (value & 0xffff)) as u16).message()
-            }
-            _ => "",
-        }
-    }
-
-    /// Map a kernel status to a monitor result, falling back to `fallback`.
-    pub const fn from_nt_status(status: NtStatus, fallback: Self) -> Self {
-        match status.0 {
-            0x0000_0000 => Self::OK,
-            0xc000_0008 => Self::INVALID_ARGUMENT,
-            0xc000_0022 => Self::from_error_code(ErrorCode::ACCESS_DENIED),
-            0xc000_0033 | 0xc000_0039 => Self::from_error_code(ErrorCode::FILENAME_INVALID),
-            0xc000_0034 | 0xc000_00ba => Self::from_error_code(ErrorCode::FILE_NOT_FOUND),
-            0xc000_0035 => Self::from_error_code(ErrorCode::FILE_ALREADY_EXISTS),
-            0xc000_003a => {
-                if fallback.0 == Self::from_error_code(ErrorCode::FILE_CANNOT_BE_CREATED).0 {
-                    Self::from_error_code(ErrorCode::PATH_NOT_FOUND)
-                } else {
-                    Self::from_error_code(ErrorCode::FILE_NOT_FOUND)
+                match ErrorCode::from_raw((400 + (value & 0xffff)) as u16) {
+                    Some(code) => code.message(),
+                    None => "",
                 }
             }
-            0xc000_007f => Self::from_error_code(ErrorCode::NO_ROOM_ON_DEVICE),
-            0xc000_009a => Self::OUT_OF_MEMORY,
-            0xc000_0101 => Self::from_error_code(ErrorCode::DIRECTORY_NOT_EMPTY),
-            _ => fallback,
+            _ => "",
         }
     }
 }
@@ -318,7 +475,7 @@ mod tests {
         assert_eq!(&Hresult::OK.status_digits(), b"200");
         assert_eq!(&Hresult::MULTILINE.status_digits(), b"202");
         assert_eq!(
-            &Hresult::from_error_code(ErrorCode::ACCESS_DENIED).status_digits(),
+            &Hresult::from_error_code(ErrorCode::AccessDenied).status_digits(),
             b"414"
         );
         assert_eq!(&Hresult::END_OF_DATA.status_digits(), b"400");
@@ -333,29 +490,16 @@ mod tests {
     #[test]
     fn default_messages_match_the_result_table() {
         assert_eq!(
-            Hresult::from_error_code(ErrorCode::FILE_MUST_BE_COPIED).default_message(),
+            Hresult::from_error_code(ErrorCode::FileMustBeCopied).default_message(),
             "file must be copied"
         );
         assert_eq!(
-            Hresult::from_error_code(ErrorCode::LINE_TOO_LONG).default_message(),
+            Hresult::from_error_code(ErrorCode::LineTooLong).default_message(),
             "line too long"
         );
         assert_eq!(Hresult::error(0x13).default_message(), "");
         assert_eq!(Hresult::INVALID_ARGUMENT.default_message(), "bad parameter");
         assert_eq!(Hresult::FAIL.default_message(), "");
         assert_eq!(Hresult::END_OF_DATA.default_message(), "");
-    }
-
-    #[test]
-    fn missing_path_maps_by_fallback() {
-        let create = Hresult::from_error_code(ErrorCode::FILE_CANNOT_BE_CREATED);
-        assert_eq!(
-            &Hresult::from_nt_status(NtStatus(0xc000_003a), create).status_digits(),
-            b"430"
-        );
-        assert_eq!(
-            &Hresult::from_nt_status(NtStatus(0xc000_003a), Hresult::FAIL).status_digits(),
-            b"402"
-        );
     }
 }

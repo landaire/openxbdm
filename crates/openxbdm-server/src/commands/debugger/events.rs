@@ -8,8 +8,7 @@
 
 use core::fmt::Write as _;
 
-use openxbdm_core::status::ErrorCode;
-use openxbdm_core::status::Hresult;
+use openxbdm_core::status::NtStatus;
 
 use super::Context;
 use super::ContextFlags;
@@ -18,15 +17,16 @@ use super::DirectNotice;
 use super::DirectNotification;
 use super::DirectPolicy;
 use super::Disposition;
+use super::ExceptionFlags;
 use super::ExceptionRecord;
 use super::HARDWARE_KERNEL_DEBUGGER;
 use super::MODULE_NAME_CAPACITY;
 use super::MSR_SINGLE_STEP;
 use super::ModuleEvent;
 use super::NOTICE_TEXT_CAPACITY;
-use super::NoSuchThread;
 use super::ProcessKind;
 use super::StopOn;
+use super::StoppedThreadError;
 use super::TRAP_INSTRUCTION;
 use super::ThreadId;
 use super::breakpoints::Slot;
@@ -509,7 +509,6 @@ fn stack_overflow(
     record_address: u32,
     can_stop: bool,
 ) {
-    const STACK_OVERFLOW: u32 = 0xc000_00fd;
     let hardware_kd = backend.hardware_flags() & HARDWARE_KERNEL_DEBUGGER != 0;
     if kernel_debugger_enabled(state, backend) && hardware_kd {
         backend.complete_event(thread, Disposition::default());
@@ -533,8 +532,8 @@ fn stack_overflow(
         return;
     }
     let record = ExceptionRecord {
-        code: STACK_OVERFLOW,
-        flags: ExceptionRecord::NONCONTINUABLE,
+        code: ExceptionRecord::STACK_OVERFLOW,
+        flags: ExceptionFlags::NONCONTINUABLE,
         address,
         record_address,
         ..ExceptionRecord::default()
@@ -547,7 +546,7 @@ fn stack_overflow(
     begin_stop(state, backend, network, entry);
     // The notification arguments carry no parameter array.
     let line = Event::Exception {
-        code: STACK_OVERFLOW,
+        code: ExceptionRecord::STACK_OVERFLOW.0,
         thread: thread.0,
         address,
         detail: ExceptionDetail::Parameters {
@@ -562,7 +561,7 @@ fn stack_overflow(
         if let Some(index) = state.debugger.events.pending_index(thread) {
             state.debugger.events.pending[index] = None;
         }
-        change_execution(state, backend, network, ExecutionState::Started);
+        let _ = change_execution(state, backend, network, ExecutionState::Started);
         backend.complete_event(
             thread,
             Disposition {
@@ -624,9 +623,9 @@ fn clear_single_step(backend: &mut dyn AnyBackend, thread: ThreadId) {
 /// instructions into breakpoints, or into divide errors for the compiler's
 /// overflow and divide-by-zero checks.
 pub(super) fn rewrite_trap(record: &mut ExceptionRecord) {
-    const INTEGER_DIVIDE_BY_ZERO: u32 = 0xc000_0094;
-    const INTEGER_OVERFLOW: u32 = 0xc000_0095;
-    const ILLEGAL_INSTRUCTION: u32 = 0xc000_008c;
+    const INTEGER_DIVIDE_BY_ZERO: NtStatus = NtStatus(0xc000_0094);
+    const INTEGER_OVERFLOW: NtStatus = NtStatus(0xc000_0095);
+    const ILLEGAL_INSTRUCTION: NtStatus = NtStatus(0xc000_008c);
     if !matches!(
         record.code,
         INTEGER_DIVIDE_BY_ZERO | INTEGER_OVERFLOW | ILLEGAL_INSTRUCTION
@@ -895,7 +894,7 @@ fn exception(
         if let Some(index) = state.debugger.events.pending_index(thread) {
             state.debugger.events.pending[index] = None;
         }
-        change_execution(state, backend, network, ExecutionState::Started);
+        let _ = change_execution(state, backend, network, ExecutionState::Started);
         finish(state, backend, network, pending, false);
     }
 }
@@ -987,7 +986,7 @@ fn begin_stop(
             return;
         }
     }
-    change_execution(state, backend, network, ExecutionState::Stopped);
+    let _ = change_execution(state, backend, network, ExecutionState::Stopped);
 }
 
 /// Bytes the instruction at `iar` accesses, for the data breakpoint
@@ -1131,7 +1130,7 @@ fn deliver_notice(
             size: module.size,
         },
         &Notice::Exception { first_chance } => Event::Exception {
-            code: record.code,
+            code: record.code.0,
             thread: id,
             address: record.address,
             detail: if record.code == ExceptionRecord::ACCESS_VIOLATION {
@@ -1146,7 +1145,7 @@ fn deliver_notice(
                 }
             },
             first_chance,
-            noncontinuable: record.flags & ExceptionRecord::NONCONTINUABLE != 0,
+            noncontinuable: record.flags.contains(ExceptionFlags::NONCONTINUABLE),
             stopped,
         },
     };
@@ -1365,33 +1364,30 @@ pub(super) fn continue_thread(
     network: &mut dyn Network,
     thread: ThreadId,
     pass_exception: bool,
-) -> Hresult {
-    let has_record = match backend.has_monitor_record(thread) {
-        Ok(has_record) => has_record,
-        Err(NoSuchThread) => return Hresult::from_error_code(ErrorCode::NO_SUCH_THREAD),
-    };
+) -> Result<(), StoppedThreadError> {
+    let has_record = backend.has_monitor_record(thread)?;
     let execution = backend.execution_state();
     if matches!(
         execution,
         ExecutionState::Pending | ExecutionState::RebootTitle | ExecutionState::PendingTitle
     ) {
-        return Hresult::from_error_code(ErrorCode::NO_SUCH_THREAD);
+        return Err(StoppedThreadError::NoSuchThread);
     }
     if !has_record {
-        return Hresult::OK;
+        return Ok(());
     }
     let Some(index) = state.debugger.events.pending_index(thread) else {
-        return Hresult::from_error_code(ErrorCode::NOT_STOPPED);
+        return Err(StoppedThreadError::NotStopped);
     };
     let Some(mut entry) = state.debugger.events.pending[index].take() else {
-        return Hresult::from_error_code(ErrorCode::NOT_STOPPED);
+        return Err(StoppedThreadError::NotStopped);
     };
     if execution == ExecutionState::Stopped {
         backend.monitor_suspend(thread);
     }
     entry.pass_exception = pass_exception;
     finish(state, backend, network, entry, true);
-    Hresult::OK
+    Ok(())
 }
 
 /// Release every stopped thread of `process` as if continued without
@@ -1572,7 +1568,7 @@ impl StopReason {
                 record,
                 first_chance,
             } => {
-                let mut flags = record.flags & ExceptionRecord::NONCONTINUABLE;
+                let mut flags = u32::from(record.flags.contains(ExceptionFlags::NONCONTINUABLE));
                 if first_chance {
                     flags |= 2;
                 }
@@ -1584,7 +1580,7 @@ impl StopReason {
                 let words = [
                     9,
                     thread.0,
-                    record.code,
+                    record.code.0,
                     record.address,
                     flags,
                     first,
@@ -1602,17 +1598,15 @@ pub(super) fn stop_reason(
     state: &ServerState,
     backend: &mut dyn AnyBackend,
     thread: ThreadId,
-) -> Result<StopReason, Hresult> {
-    let has_record = backend
-        .has_monitor_record(thread)
-        .map_err(|NoSuchThread| Hresult::from_error_code(ErrorCode::NO_SUCH_THREAD))?;
+) -> Result<StopReason, StoppedThreadError> {
+    let has_record = backend.has_monitor_record(thread)?;
     let entry = state
         .debugger
         .events
         .pending_index(thread)
         .and_then(|index| state.debugger.events.pending[index]);
     let Some(entry) = entry.filter(|_| has_record) else {
-        return Err(Hresult::from_error_code(ErrorCode::NOT_STOPPED));
+        return Err(StoppedThreadError::NotStopped);
     };
     let Some(record) = entry.record else {
         return Ok(StopReason::Unknown);
@@ -1650,7 +1644,7 @@ pub(super) fn stop_reason(
         },
         // The builder tests code 0x15 for ntassert; the dispatch raises
         // 0xc0000420, which reports as an exception.
-        0x15 => StopReason::NtAssert {
+        NtStatus(0x15) => StopReason::NtAssert {
             address: iar,
             thread,
         },
@@ -1721,13 +1715,13 @@ pub(super) fn stop_description(
             record,
             first_chance,
         } => {
-            let code = record.code;
+            let code = record.code.0;
             let _ = write!(
                 out,
                 "exception code=0x{code:08x} thread=0x{:08x} address=0x{:08x}",
                 thread.0, record.address
             );
-            if code == ExceptionRecord::ACCESS_VIOLATION {
+            if record.code == ExceptionRecord::ACCESS_VIOLATION {
                 let kind = if record.parameters[0] == 0 {
                     "read"
                 } else {
@@ -1745,7 +1739,7 @@ pub(super) fn stop_description(
             if first_chance {
                 let _ = out.write_str(" first");
             }
-            if record.flags & ExceptionRecord::NONCONTINUABLE != 0 {
+            if record.flags.contains(ExceptionFlags::NONCONTINUABLE) {
                 let _ = out.write_str(" noncont");
             }
             Ok(())
@@ -1760,28 +1754,28 @@ mod tests {
     #[test]
     fn trap_rewrite_follows_instruction_form() {
         let mut record = ExceptionRecord {
-            code: 0xc000_008c,
+            code: NtStatus(0xc000_008c),
             parameters: [0x0ca0_ffff, 0, 0, 0],
             ..Default::default()
         };
         rewrite_trap(&mut record);
-        assert_eq!(record.code, 0xc000_0095);
+        assert_eq!(record.code, NtStatus(0xc000_0095));
         let mut record = ExceptionRecord {
-            code: 0xc000_0094,
+            code: NtStatus(0xc000_0094),
             parameters: [0x0cc0_0000, 0, 0, 0],
             ..Default::default()
         };
         rewrite_trap(&mut record);
-        assert_eq!(record.code, 0xc000_0094);
+        assert_eq!(record.code, NtStatus(0xc000_0094));
         let mut record = ExceptionRecord {
-            code: 0xc000_0094,
+            code: NtStatus(0xc000_0094),
             parameters: [0x0fe0_0016, 0, 0, 0],
             ..Default::default()
         };
         rewrite_trap(&mut record);
         assert_eq!(record.code, ExceptionRecord::BREAKPOINT);
         let mut record = ExceptionRecord {
-            code: 0xc000_0094,
+            code: NtStatus(0xc000_0094),
             parameters: [0x7c00_0008, 0, 0, 0],
             ..Default::default()
         };

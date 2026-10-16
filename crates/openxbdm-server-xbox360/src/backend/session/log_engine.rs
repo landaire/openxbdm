@@ -23,6 +23,10 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::KernelError;
+use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::Win32Error;
+use openxbdm_server::commands::session::LogEngineError;
 use openxbdm_server::commands::session::TellLogConfig;
 use openxbdm_server::commands::session::TellLogCounters;
 use openxbdm_server::text::Text;
@@ -101,8 +105,6 @@ const WORKER_FAILED: u32 = u32::MAX;
 /// A pending-queue wait ended by the quit event (wait index 1 as an
 /// HRESULT from the queue).
 const QUIT_REQUESTED: u32 = 0x8007_0001;
-/// Status of a worker whose file could not be created.
-const STATUS_OBJECT_NAME_INVALID: u32 = 0xc000_0033;
 const STATUS_PENDING: u32 = 0x103;
 const STATUS_TIMEOUT: u32 = 0x102;
 const WAIT_ANY: u32 = 1;
@@ -129,12 +131,31 @@ fn call(routine: u32, a0: u32, a1: u32, a2: u32) -> u32 {
     unsafe { kernel::call_export(routine, a0, a1, a2, 0) }
 }
 
-/// HRESULT_FROM_WIN32 for positive codes; other values pass through.
-const fn win32_result(code: u32) -> u32 {
-    if code as i32 > 0 {
-        0x8007_0000 | (code & 0xffff)
-    } else {
-        code
+/// Why the worker stopped early; its result word goes to the engine's
+/// status field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerError {
+    /// The quit or done event is missing.
+    MissingEvent,
+    /// The log file could not be created.
+    NoFile,
+    /// The callback failed with this result.
+    Callback(Hresult),
+    /// The file write failed; the thread's last error, if any.
+    Write(Option<Win32Error>),
+    /// An entry could not be returned to the free queue.
+    Requeue,
+}
+
+impl WorkerError {
+    fn status(self) -> u32 {
+        match self {
+            Self::MissingEvent => Hresult::INVALID_ARGUMENT.0,
+            Self::NoFile => KernelError::ObjectNameInvalid.status().0,
+            Self::Callback(result) => result.0,
+            Self::Write(error) => error.map_or(0, |error| Hresult::from(error).0),
+            Self::Requeue => Hresult::FAIL.0,
+        }
     }
 }
 
@@ -165,6 +186,11 @@ impl Engine {
 
     fn set(self, offset: u32, value: u32) {
         store(self.field(offset), value);
+    }
+
+    /// Record why the worker stopped in the caller-visible status field.
+    fn fail(self, error: WorkerError) {
+        self.set(STATUS, error.status());
     }
 
     fn pointer(self, offset: u32) -> *mut u32 {
@@ -246,22 +272,22 @@ struct Request {
 }
 
 /// Create an engine and store it through `output` (stock 0x91f79470).
-/// Returns the worker creation status or the failure.
+/// Returns the result word of the create exports.
 fn create(request: &Request, output: u32) -> u32 {
     if output == 0 {
         return Hresult::INVALID_ARGUMENT.0;
     }
     store(output, 0);
     match create_engine(request) {
-        Ok((engine, status)) => {
+        Ok(engine) => {
             store(output, engine.0);
-            status
+            NtStatus::SUCCESS.0
         }
-        Err(status) => status,
+        Err(error) => Hresult::from(error).0,
     }
 }
 
-fn create_engine(request: &Request) -> Result<(Engine, u32), u32> {
+fn create_engine(request: &Request) -> Result<Engine, LogEngineError> {
     let processor = if request.processor > DEFAULT_PROCESSOR {
         DEFAULT_PROCESSOR
     } else {
@@ -284,7 +310,7 @@ fn create_engine(request: &Request) -> Result<(Engine, u32), u32> {
         .and_then(|size| size.checked_add(ENTRIES));
     let allocator = CallerAllocator::of(request.options);
     let Some(engine) = size.and_then(|size| Engine::new(allocate(allocator, size))) else {
-        return Err(Hresult::OUT_OF_MEMORY.0);
+        return Err(LogEngineError::OutOfMemory);
     };
     // SAFETY: the header lies inside the new allocation.
     unsafe { core::ptr::write_bytes(engine.0 as usize as *mut u8, 0, ENTRIES as usize) };
@@ -310,18 +336,17 @@ fn create_engine(request: &Request) -> Result<(Engine, u32), u32> {
     if built.is_err() {
         destroy(engine);
     }
-    built.map(|status| (engine, status))
+    built.map(|()| engine)
 }
 
-/// Queues, free entries and worker of a new engine; the worker creation
-/// status.
+/// Queues, free entries and worker of a new engine.
 fn build(
     engine: Engine,
     request: &Request,
     entry_size: u32,
     entries: u32,
     processor: u32,
-) -> Result<u32, u32> {
+) -> Result<(), LogEngineError> {
     let capacity = entries.wrapping_add(1);
     let mut pending = [0u32; DESCRIPTOR_WORDS];
     seed_descriptor(&mut pending, request.options, capacity);
@@ -342,7 +367,7 @@ fn build(
     for _ in 0..(entries as i32).max(0) {
         let status = queue::enqueue(engine.queue(FREE), entry);
         if (status as i32) < 0 {
-            return Err(status);
+            return Err(LogEngineError::Queue(Hresult(status)));
         }
         entry = entry.wrapping_add(entry_size);
     }
@@ -359,11 +384,7 @@ fn build(
         engine.0,
         flags,
     );
-    if (status as i32) < 0 {
-        Err(status)
-    } else {
-        Ok(status)
-    }
+    NtStatus(status).result().map_err(LogEngineError::Thread)
 }
 
 /// Seed a zeroed queue descriptor from the caller options, with the node
@@ -389,7 +410,7 @@ fn create_queue(
     offset: u32,
     options: u32,
     descriptor: &mut [u32; DESCRIPTOR_WORDS],
-) -> Result<(), u32> {
+) -> Result<(), LogEngineError> {
     // Stock stores through a null cell from a caller allocator; it counts
     // as an allocation failure here.
     let cell = allocate(CallerAllocator::of(options), 4);
@@ -398,12 +419,12 @@ fn create_queue(
     }
     engine.set(offset, cell);
     if cell == 0 {
-        return Err(Hresult::OUT_OF_MEMORY.0);
+        return Err(LogEngineError::OutOfMemory);
     }
     descriptor[7] = DESCRIPTOR_SIZE;
     let status = queue::create_export(descriptor.as_ptr() as usize as u32, cell);
     if (status as i32) < 0 {
-        Err(status)
+        Err(LogEngineError::Queue(Hresult(status)))
     } else {
         Ok(())
     }
@@ -479,7 +500,7 @@ fn run(engine: Engine) -> u32 {
         return WORKER_FAILED;
     }
     if engine.get(QUIT) == 0 || engine.get(DONE) == 0 {
-        engine.set(STATUS, Hresult::INVALID_ARGUMENT.0);
+        engine.fail(WorkerError::MissingEvent);
         return WORKER_FAILED;
     }
     if engine.get(CALLBACK) == 0 {
@@ -494,7 +515,7 @@ fn run(engine: Engine) -> u32 {
         );
         engine.set(FILE, file);
         if file == NO_FILE {
-            engine.set(STATUS, STATUS_OBJECT_NAME_INVALID);
+            engine.fail(WorkerError::NoFile);
             return WORKER_FAILED;
         }
     }
@@ -510,12 +531,12 @@ fn run(engine: Engine) -> u32 {
             engine.count(MISSED, Ordering::Release);
             continue;
         }
-        if let Err(status) = deliver(engine, entry) {
-            engine.set(STATUS, status);
+        if let Err(error) = deliver(engine, entry) {
+            engine.fail(error);
             return WORKER_FAILED;
         }
         if (queue::enqueue(engine.queue(FREE), entry) as i32) < 0 {
-            engine.set(STATUS, Hresult::FAIL.0);
+            engine.fail(WorkerError::Requeue);
             engine.set_event(DONE);
             return WORKER_FAILED;
         }
@@ -531,13 +552,13 @@ fn run(engine: Engine) -> u32 {
         if (queue::dequeue(pending, &raw mut entry as usize as u32) as i32) < 0 || entry == 0 {
             continue;
         }
-        if let Err(status) = deliver(engine, entry) {
-            engine.set(STATUS, status);
+        if let Err(error) = deliver(engine, entry) {
+            engine.fail(error);
             engine.set_event(DONE);
             return WORKER_FAILED;
         }
         if (queue::enqueue(engine.queue(FREE), entry) as i32) < 0 {
-            engine.set(STATUS, Hresult::FAIL.0);
+            engine.fail(WorkerError::Requeue);
             write_summary(engine);
             engine.set_event(DONE);
             return WORKER_FAILED;
@@ -546,13 +567,13 @@ fn run(engine: Engine) -> u32 {
 }
 
 /// Hand an entry to the callback, or write its text to the file.
-fn deliver(engine: Engine, entry: u32) -> Result<(), u32> {
+fn deliver(engine: Engine, entry: u32) -> Result<(), WorkerError> {
     let callback = engine.get(CALLBACK);
     let entry_size = engine.get(ENTRY_SIZE);
     if callback != 0 {
-        let status = call(callback, engine.get(CONTEXT), entry, entry_size);
-        return if (status as i32) < 0 {
-            Err(status)
+        let result = Hresult(call(callback, engine.get(CONTEXT), entry, entry_size));
+        return if result.is_failure() {
+            Err(WorkerError::Callback(result))
         } else {
             Ok(())
         };
@@ -569,7 +590,7 @@ fn deliver(engine: Engine, entry: u32) -> Result<(), u32> {
     if write_file(engine.get(FILE), &bytes[..length]) {
         Ok(())
     } else {
-        Err(win32_result(kernel::last_error()))
+        Err(WorkerError::Write(kernel::last_error()))
     }
 }
 
@@ -612,8 +633,8 @@ fn write_file(file: u32, bytes: &[u8]) -> bool {
             status = io_status.status;
         }
     }
-    if (status as i32) < 0 {
-        kernel::set_last_error(status);
+    if let Err(error) = NtStatus(status).result() {
+        kernel::set_last_error(error);
         return false;
     }
     true
@@ -621,9 +642,8 @@ fn write_file(file: u32, bytes: &[u8]) -> bool {
 
 /// `CloseHandle` (stock 0x91f738f8).
 fn close_handle(handle: u32) {
-    let status = kernel::NtClose(handle);
-    if (status as i32) < 0 {
-        kernel::set_last_error(status);
+    if let Err(error) = NtStatus(kernel::NtClose(handle)).result() {
+        kernel::set_last_error(error);
     }
 }
 
@@ -663,13 +683,12 @@ fn release(engine: Engine, free_routine: u32, address: u32) {
 }
 
 /// Engine of `dmtelllog`: processor 5 and `callback(context, entry,
-/// entry_size)`, as stock creates it through export 356. Returns the engine
-/// and the worker creation status.
+/// entry_size)`, as stock creates it through export 356.
 pub(super) fn create_for_callback(
     context: u32,
     callback: u32,
     config: TellLogConfig,
-) -> Result<(Engine, Hresult), Hresult> {
+) -> Result<Engine, LogEngineError> {
     let request = Request {
         processor: DEFAULT_PROCESSOR,
         name: 0,
@@ -680,12 +699,7 @@ pub(super) fn create_for_callback(
         block: config.block,
         options: 0,
     };
-    let mut output = 0u32;
-    let status = create(&request, &raw mut output as usize as u32);
-    match Engine::new(output) {
-        Some(engine) => Ok((engine, Hresult(status))),
-        None => Err(Hresult(status)),
-    }
+    create_engine(&request)
 }
 
 /// Stop the worker once the queued entries are processed and destroy the

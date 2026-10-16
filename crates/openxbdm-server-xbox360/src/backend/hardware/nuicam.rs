@@ -91,7 +91,9 @@ pub(super) fn initialize() {
         return;
     };
     let mut address = 0u32;
-    if (kernel::XexGetProcedureAddress(module, KERNEL_NUICAM_CONTROL, &mut address) as i32) >= 0 {
+    if (kernel::XexGetProcedureAddress(module.raw(), KERNEL_NUICAM_CONTROL, &mut address) as i32)
+        >= 0
+    {
         REQUESTS.with(|requests| requests.control = Some(address));
     }
 }

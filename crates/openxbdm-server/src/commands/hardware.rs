@@ -8,12 +8,15 @@ use core::fmt::Write as _;
 use openxbdm_core::line::Value;
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
 
 use crate::access::Access;
 use crate::commands::console;
+use crate::commands::console::ConfigFlags;
 use crate::commands::console::ConfigSetting;
-use crate::commands::filesystem;
+use crate::commands::console::RetailFlags;
+use crate::commands::console::UserFlags;
 use crate::commands::util;
 use crate::continuation::Continuation as AnyContinuation;
 use crate::continuation::ContinuationContext;
@@ -21,6 +24,10 @@ use crate::invocation::ConnectionIndex;
 use crate::invocation::Invocation;
 use crate::registry::CommandEntry;
 use crate::registry::DispatchFlags;
+use crate::reply;
+use crate::reply::CommandError;
+use crate::reply::CommandResult;
+use crate::reply::Reply;
 use crate::text::Text;
 
 use self::automation::AutomationError;
@@ -124,41 +131,21 @@ const fn entry(
     name: &'static str,
     any_of: Access,
     flags: DispatchFlags,
-    handler: fn(&mut Invocation<'_>) -> Hresult,
+    handler: fn(&mut Invocation<'_>) -> CommandResult,
 ) -> CommandEntry {
     CommandEntry::new(name, any_of, Access::NONE, flags, handler)
 }
 
-const BAD_PARAMETER: Hresult = Hresult::from_error_code(ErrorCode::BAD_PARAMETER);
-const ACCESS_DENIED: Hresult = Hresult::from_error_code(ErrorCode::ACCESS_DENIED);
-const OUT_OF_MEMORY: Hresult = Hresult::from_error_code(ErrorCode::OUT_OF_MEMORY);
-const UNKNOWN_COMMAND: Hresult = Hresult::from_error_code(ErrorCode::UNKNOWN_COMMAND);
-/// `437-`: a required `autoinput` parameter is missing.
-const MISSING_PARAMETER: Hresult = Hresult::error(0x25);
-const NOT_LOGGING: Hresult = Hresult::error(0x18);
-const ALREADY_LOGGING: Hresult = Hresult::error(0x19);
-/// `400-` with no text: a monitor service call failed.
-const SERVICE_FAILED: Hresult = Hresult::error(0x10a);
+const BAD_PARAMETER: CommandError = CommandError::Status(ErrorCode::BadParameter);
+const ACCESS_DENIED: CommandError = CommandError::Status(ErrorCode::AccessDenied);
+const OUT_OF_MEMORY: CommandError = CommandError::Status(ErrorCode::OutOfMemory);
+const UNKNOWN_COMMAND: CommandError = CommandError::Status(ErrorCode::UnknownCommand);
+const MISSING_PARAMETER: CommandError = CommandError::Hardware(HardwareError::MissingParameter);
+const SERVICE_FAILED: CommandError = CommandError::Hardware(HardwareError::ServiceFailed);
 /// `400-` with no text.
-const FAILED: Hresult = Hresult::error(0);
-/// Fallback for a failed optical disc log file.
-const FILE_CANNOT_BE_CREATED: Hresult = Hresult::from_error_code(ErrorCode::FILE_CANNOT_BE_CREATED);
-const PGO_SUCCESS: Hresult = Hresult::OK;
-const PGO_BUSY: Hresult = Hresult::error(0x19);
+const FAILED: CommandError = CommandError::Status(ErrorCode::Undefined);
 
-/// Console configuration flag word that most commands here edit.
-const SETTINGS_FLAGS: u16 = 0xd;
-/// Console configuration word of first-run experience flags.
-const OOBE_FLAGS: u16 = 0xc;
-const BACKGROUND_MODE_TEST: u32 = 0x2;
-const BOOT_ANIMATION_DISABLED: u32 = 0x4;
 const BUILT_IN_MEMORY_UNIT_DISABLED: u32 = 0x4;
-const KINECT_HEALTH_MESSAGE_DISABLED: u32 = 0x20;
-const MOTION_DETECTION_DISABLED: u32 = 0x01;
-const WIRELESS_CONTROLLERS_DISABLED: u32 = 0x800;
-const NUI_OOBE_DISABLED: u32 = 0x2000_0000;
-const OOBE_DISABLED: u32 = 0x40;
-const OOBE_CHECKPOINT_DISABLED: u32 = 0x8000;
 
 /// Global state of this domain.
 #[derive(Debug)]
@@ -211,15 +198,106 @@ impl AvatarHook {
     }
 }
 
+/// Failures of this domain without a status of the result table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HardwareError {
+    /// `424-`: no optical disc log is being written.
+    NotLogging,
+    /// `425-`: an optical disc log is being written.
+    AlreadyLogging,
+    /// `425-`: a PGO count block is allocated, so its settings are fixed.
+    CountBlockAllocated,
+    /// `437-`: a required `autoinput` parameter is missing.
+    MissingParameter,
+    /// `442-`: the virtual controller is absent or not connected.
+    NotConnected,
+    /// `400-` with no text: a monitor service call failed.
+    ServiceFailed,
+    /// A failed XAM call, passed through.
+    Xam(XamError),
+}
+
+impl From<HardwareError> for Hresult {
+    fn from(error: HardwareError) -> Self {
+        match error {
+            HardwareError::NotLogging => Hresult::error(0x18),
+            HardwareError::AlreadyLogging | HardwareError::CountBlockAllocated => {
+                Hresult::error(0x19)
+            }
+            HardwareError::MissingParameter => Hresult::error(0x25),
+            HardwareError::NotConnected => Hresult::error(0x2a),
+            HardwareError::ServiceFailed => Hresult::error(0x10a),
+            HardwareError::Xam(error) => error.into(),
+        }
+    }
+}
+
+impl From<HardwareError> for CommandError {
+    fn from(error: HardwareError) -> Self {
+        Self::Hardware(error)
+    }
+}
+
+/// A failed XAM or system service call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XamError {
+    /// `E_FAIL`; also reported when the export is absent.
+    Fail,
+    InvalidArgument,
+    Other(UnlistedXamResult),
+}
+
+/// A failure result without an [`XamError`] variant. Only
+/// [`XamError::check`] creates it, so equal errors have equal variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnlistedXamResult(Hresult);
+
+impl XamError {
+    /// `Ok` for a success result of a XAM call, the failure otherwise.
+    pub fn check(result: Hresult) -> Result<(), Self> {
+        match result {
+            _ if !result.is_failure() => Ok(()),
+            Hresult::FAIL => Err(Self::Fail),
+            Hresult::INVALID_ARGUMENT => Err(Self::InvalidArgument),
+            other => Err(Self::Other(UnlistedXamResult(other))),
+        }
+    }
+}
+
+impl From<XamError> for Hresult {
+    fn from(error: XamError) -> Self {
+        match error {
+            XamError::Fail => Hresult::FAIL,
+            XamError::InvalidArgument => Hresult::INVALID_ARGUMENT,
+            XamError::Other(UnlistedXamResult(result)) => result,
+        }
+    }
+}
+
+impl From<XamError> for CommandError {
+    fn from(error: XamError) -> Self {
+        Self::Hardware(HardwareError::Xam(error))
+    }
+}
+
 /// Why an avatar hook could not run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AvatarError {
-    /// The hook lookup failed with this result.
-    Lookup(Hresult),
+    /// The hook lookup failed.
+    Lookup(XamError),
     /// The lookup returned no function.
     NoFunction,
-    /// The hook failed with this result.
-    Hook(Hresult),
+    /// The hook failed.
+    Hook(XamError),
+}
+
+impl From<AvatarError> for CommandError {
+    fn from(error: AvatarError) -> Self {
+        match error {
+            AvatarError::Lookup(error) | AvatarError::Hook(error) => error.into(),
+            AvatarError::NoFunction => ACCESS_DENIED,
+        }
+    }
 }
 
 /// Who receives controller input, as reported by the system.
@@ -274,16 +352,24 @@ pub enum OddLogStartError {
     /// A log is already being written.
     Busy,
     /// The log file or writer thread could not be created.
-    Failed(NtStatus),
+    Failed(KernelError),
 }
 
-impl OddLogStartError {
-    /// Result of the start service (export 147).
-    pub fn hresult(self) -> Hresult {
-        match self {
-            Self::Busy => ALREADY_LOGGING,
-            Self::Failed(status) => Hresult::from_nt_status(status, FILE_CANNOT_BE_CREATED),
+impl From<OddLogStartError> for CommandError {
+    fn from(error: OddLogStartError) -> Self {
+        match error {
+            OddLogStartError::Busy => HardwareError::AlreadyLogging.into(),
+            OddLogStartError::Failed(error) => {
+                Self::from_kernel(error, Self::Status(ErrorCode::FileCannotBeCreated))
+            }
         }
+    }
+}
+
+/// Result of the start service (export 147).
+impl From<OddLogStartError> for Hresult {
+    fn from(error: OddLogStartError) -> Self {
+        CommandError::from(error).into()
     }
 }
 
@@ -291,9 +377,17 @@ impl OddLogStartError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OddLogNotRunning;
 
-impl OddLogNotRunning {
-    /// Result of the stop service (export 148).
-    pub const HRESULT: Hresult = NOT_LOGGING;
+impl From<OddLogNotRunning> for CommandError {
+    fn from(OddLogNotRunning: OddLogNotRunning) -> Self {
+        HardwareError::NotLogging.into()
+    }
+}
+
+/// Result of the stop service (export 148).
+impl From<OddLogNotRunning> for Hresult {
+    fn from(error: OddLogNotRunning) -> Self {
+        CommandError::from(error).into()
+    }
 }
 
 /// Selection of instrumented modules for `pogoctrl`.
@@ -305,7 +399,8 @@ pub enum PgoModule {
 }
 
 impl PgoModule {
-    fn from_value(value: u32) -> Self {
+    /// Record address 0 selects every module.
+    pub fn from_value(value: u32) -> Self {
         if value == 0 {
             Self::All
         } else {
@@ -314,22 +409,73 @@ impl PgoModule {
     }
 }
 
-/// Why a `pogoctrl` request failed.
+/// Why a `pogoctrl` request or PGO export failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PgoError {
     /// The module record is not registered.
     NoSuchModule,
-    /// The module's count block is allocated; its allocation scale is fixed.
+    /// The module's count block is allocated; its settings are fixed.
     Busy,
 }
 
-/// System message service and application identifiers.
-pub mod system_message {
-    /// Application of the marketplace service.
-    pub const MARKETPLACE_APP: u32 = 0xfe;
-    /// Mock currency setting message.
-    pub const MOCK_CURRENCY: u32 = 0x23100;
+impl From<PgoError> for CommandError {
+    fn from(error: PgoError) -> Self {
+        match error {
+            PgoError::NoSuchModule => BAD_PARAMETER,
+            PgoError::Busy => HardwareError::CountBlockAllocated.into(),
+        }
+    }
 }
+
+/// Result of the PGO exports 108 to 110.
+impl From<PgoError> for Hresult {
+    fn from(error: PgoError) -> Self {
+        CommandError::from(error).into()
+    }
+}
+
+/// Application of a system service message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SystemApp(pub u32);
+
+impl SystemApp {
+    pub const MARKETPLACE: Self = Self(0xfe);
+}
+
+/// Message of a system service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SystemMessage(pub u32);
+
+impl SystemMessage {
+    /// Mock currency setting of the marketplace service.
+    pub const MOCK_CURRENCY: Self = Self(0x23100);
+}
+
+/// Identifier of a XAM heap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XamHeapId(pub u32);
+
+/// Information class of the XAM heap information export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XamHeapInfoClass {
+    Name = 1,
+    Limits = 2,
+    Usage = 3,
+}
+
+impl XamHeapInfoClass {
+    pub const fn code(self) -> u32 {
+        self as u32
+    }
+}
+
+/// USB host controller number of `usbportctrl`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsbController(pub u32);
+
+/// Port number on a USB host controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsbPort(pub u32);
 
 /// Platform services this domain needs.
 pub trait Backend {
@@ -366,31 +512,41 @@ pub trait Backend {
     fn avatar_hook(&mut self, hook: AvatarHook) -> Result<(), AvatarError>;
 
     /// Switch the wireless controller radio on or off.
-    fn set_wireless_radio(&mut self, enabled: bool) -> NtStatus;
+    fn set_wireless_radio(&mut self, enabled: bool) -> Result<(), KernelError>;
 
     /// Monitor service 8: fill the devkit memory statistics block whose
     /// header is already set.
-    fn devkit_memory_statistics(&mut self, block: &mut [u8; 0x90]) -> NtStatus;
+    fn devkit_memory_statistics(&mut self, block: &mut [u8; 0x90]) -> Result<(), KernelError>;
     /// Resolve the XAM heap count export.
     fn xam_heap_count_available(&mut self) -> bool;
     /// Resolve the XAM heap information export.
     fn xam_heap_info_available(&mut self) -> bool;
     /// Fill the heap count block whose size dword is already set.
-    fn xam_heap_count(&mut self, block: &mut [u8; 12]) -> Hresult;
-    /// Information class 1: the heap name.
-    fn xam_heap_name(&mut self, id: u32, name: &mut [u8; 0x20]) -> Hresult;
+    fn xam_heap_count(&mut self, block: &mut [u8; 12]) -> Result<(), XamError>;
+    /// Information class [`XamHeapInfoClass::Name`]: the heap name.
+    fn xam_heap_name(&mut self, id: XamHeapId, name: &mut [u8; 0x20]) -> Result<(), XamError>;
     /// Information class `class` into a block whose size dword is set.
-    fn xam_heap_info(&mut self, id: u32, class: u32, block: &mut [u8]) -> Hresult;
+    fn xam_heap_info(
+        &mut self,
+        id: XamHeapId,
+        class: XamHeapInfoClass,
+        block: &mut [u8],
+    ) -> Result<(), XamError>;
 
     /// Send a message to a system service without completion notification.
-    fn system_message(&mut self, app: u32, message: u32, buffer: &mut [u8]) -> Hresult;
+    fn system_message(
+        &mut self,
+        app: SystemApp,
+        message: SystemMessage,
+        buffer: &mut [u8],
+    ) -> Result<(), XamError>;
     /// Media service message 0x900002.
-    fn play_to(&mut self, command: PlayToCommand) -> Result<PlayToState, Hresult>;
+    fn play_to(&mut self, command: PlayToCommand) -> Result<PlayToState, XamError>;
     fn stack_addresses(&mut self) -> StackAddresses;
 
     /// Start writing the optical disc log to the object path `path`, or
     /// report the path translation failure as the writer's file status.
-    fn odd_log_start(&mut self, path: Result<&[u8], NtStatus>) -> Result<(), OddLogStartError>;
+    fn odd_log_start(&mut self, path: Result<&[u8], KernelError>) -> Result<(), OddLogStartError>;
     /// Stop the optical disc log and wait for its writer.
     fn odd_log_stop(&mut self) -> Result<(), OddLogNotRunning>;
 
@@ -403,7 +559,7 @@ pub trait Backend {
         reset: bool,
         module: PgoModule,
     ) -> Result<(), PgoError>;
-    fn pgo_set_allocation_scale(&mut self, module: u32, scale: u32) -> Result<(), PgoError>;
+    fn pgo_set_allocation_scale(&mut self, module: PgoModule, scale: u32) -> Result<(), PgoError>;
 
     /// Store the title decompression GDF attribute mode.
     fn set_ignore_gdf_attributes(&mut self, ignore: bool);
@@ -411,10 +567,18 @@ pub trait Backend {
 
     /// Resolve the USB port power export.
     fn usb_port_power_available(&mut self) -> bool;
-    fn set_usb_port_power(&mut self, controller: u32, port: u32, enable: bool) -> NtStatus;
+    fn set_usb_port_power(
+        &mut self,
+        controller: UsbController,
+        port: UsbPort,
+        enable: bool,
+    ) -> Result<(), KernelError>;
 }
 
-pub(crate) fn resume(continuation: &mut Continuation, cx: &mut ContinuationContext<'_>) -> Hresult {
+pub(crate) fn resume(
+    continuation: &mut Continuation,
+    cx: &mut ContinuationContext<'_>,
+) -> CommandResult {
     match *continuation {
         Continuation::QueuePackets {
             user,
@@ -425,18 +589,16 @@ pub(crate) fn resume(continuation: &mut Continuation, cx: &mut ContinuationConte
     }
 }
 
-fn automation_result(result: Result<(), AutomationError>) -> Hresult {
-    match result {
-        Ok(()) => Hresult::OK,
-        Err(error) => error.hresult(),
-    }
+fn automation_result(result: Result<(), AutomationError>) -> CommandResult {
+    result?;
+    Ok(Reply::Ok)
 }
 
 /// `autoinput user=<dword> <subcommand>`: drive the virtual controller of
 /// a user slot.
-fn auto_input(invocation: &mut Invocation<'_>) -> Hresult {
+fn auto_input(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(user) = util::required_dword(invocation, "user") else {
-        return MISSING_PARAMETER;
+        return Err(MISSING_PARAMETER);
     };
     let line = invocation.line;
     if line.has("connect") {
@@ -447,7 +609,7 @@ fn auto_input(invocation: &mut Invocation<'_>) -> Hresult {
     }
     if line.has("bind") {
         let Some(queue_length) = util::required_dword(invocation, "queuelen") else {
-            return MISSING_PARAMETER;
+            return Err(MISSING_PARAMETER);
         };
         return automation_result(invocation.backend.automation_bind(user, queue_length));
     }
@@ -461,43 +623,37 @@ fn auto_input(invocation: &mut Invocation<'_>) -> Hresult {
         return automation_result(invocation.backend.automation_clear_queue(user));
     }
     if line.has("queryqueue") {
-        return match invocation.backend.automation_query_queue(user) {
-            Ok(status) => {
-                invocation.set_text(format_args!(
-                    "nQueue=0x{:08x}, nPacket=0x{:08x}, t_remain_ms=0x{:08x}, t_remain_count=0x{:08x}",
-                    status.queue_length, status.queued, status.remaining_ms, status.remaining_count
-                ));
-                Hresult::OK
-            }
-            Err(error) => error.hresult(),
-        };
+        let status = invocation.backend.automation_query_queue(user)?;
+        invocation.set_text(format_args!(
+            "nQueue=0x{:08x}, nPacket=0x{:08x}, t_remain_ms=0x{:08x}, t_remain_count=0x{:08x}",
+            status.queue_length, status.queued, status.remaining_ms, status.remaining_count
+        ));
+        return Ok(Reply::Ok);
     }
     if line.has("setpacket") {
         let Some(session) = invocation.session.as_deref_mut() else {
-            return Hresult::FAIL;
+            return Err(CommandError::Fail);
         };
         session.continuation = AnyContinuation::Hardware(Continuation::SetPacket { user });
         session.receive_remaining = Some(Gamepad::WIRE_SIZE as u32);
-        return Hresult::SEND_BINARY;
+        return Ok(Reply::SendBinary);
     }
     if line.has("process") {
-        return match invocation.backend.automation_input_owner(user) {
-            Ok(owner) => {
-                invocation.text.set_bytes(match owner {
-                    InputOwner::System => b"system",
-                    InputOwner::Title => b"title",
-                });
-                Hresult::OK
-            }
-            Err(ExportMissing) => UNKNOWN_COMMAND,
-        };
+        let owner = invocation
+            .backend
+            .automation_input_owner(user)
+            .map_err(|ExportMissing| UNKNOWN_COMMAND)?;
+        invocation.text.set_bytes(match owner {
+            InputOwner::System => b"system",
+            InputOwner::Title => b"title",
+        });
     }
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
-fn queue_packets(invocation: &mut Invocation<'_>, user: u32) -> Hresult {
+fn queue_packets(invocation: &mut Invocation<'_>, user: u32) -> CommandResult {
     let Some(count) = util::required_dword(invocation, "count") else {
-        return MISSING_PARAMETER;
+        return Err(MISSING_PARAMETER);
     };
     let layout = UploadLayout {
         count,
@@ -505,18 +661,18 @@ fn queue_packets(invocation: &mut Invocation<'_>, user: u32) -> Hresult {
         counts: invocation.line.has("countarray"),
     };
     let Some(session) = invocation.session.as_deref_mut() else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     // The monitor computes the size in 32 bits; a size that does not fit
     // would overrun its buffer, so it is refused as an allocation failure.
     let Some(size) = layout.size() else {
-        return OUT_OF_MEMORY;
+        return Err(OUT_OF_MEMORY);
     };
     if !invocation
         .backend
         .automation_begin_upload(session.index(), size)
     {
-        return OUT_OF_MEMORY;
+        return Err(OUT_OF_MEMORY);
     }
     session.continuation = AnyContinuation::Hardware(Continuation::QueuePackets {
         user,
@@ -524,7 +680,7 @@ fn queue_packets(invocation: &mut Invocation<'_>, user: u32) -> Hresult {
         received: 0,
     });
     session.receive_remaining = Some(size);
-    Hresult::SEND_BINARY
+    Ok(Reply::SendBinary)
 }
 
 fn queue_packets_resume(
@@ -532,12 +688,12 @@ fn queue_packets_resume(
     layout: UploadLayout,
     received: &mut u32,
     cx: &mut ContinuationContext<'_>,
-) -> Hresult {
+) -> CommandResult {
     let connection = cx.session.index();
     if cx.received.is_empty() {
         cx.session.receive_remaining = Some(0);
         cx.backend.automation_discard_upload(connection);
-        return FAILED;
+        return Err(FAILED);
     }
     cx.backend
         .automation_upload(connection, *received, cx.received);
@@ -545,21 +701,19 @@ fn queue_packets_resume(
     let remaining = cx.session.receive_remaining.unwrap_or(0) - cx.received.len() as u32;
     cx.session.receive_remaining = Some(remaining);
     if remaining != 0 {
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
-    match cx.backend.automation_queue_upload(connection, user, layout) {
-        Ok(accepted) => {
-            let _ = write!(cx.line, "queued=0x{accepted:08x}");
-            Hresult::OK
-        }
-        Err(error) => error.hresult(),
-    }
+    let accepted = cx
+        .backend
+        .automation_queue_upload(connection, user, layout)?;
+    let _ = write!(cx.line, "queued=0x{accepted:08x}");
+    Ok(Reply::Ok)
 }
 
-fn set_packet_resume(user: u32, cx: &mut ContinuationContext<'_>) -> Hresult {
+fn set_packet_resume(user: u32, cx: &mut ContinuationContext<'_>) -> CommandResult {
     cx.session.receive_remaining = Some(0);
     let Ok(bytes) = <&[u8; Gamepad::WIRE_SIZE]>::try_from(cx.received) else {
-        return FAILED;
+        return Err(FAILED);
     };
     automation_result(
         cx.backend
@@ -568,9 +722,9 @@ fn set_packet_resume(user: u32, cx: &mut ContinuationContext<'_>) -> Hresult {
 }
 
 /// `avatar`: run one avatar system test hook.
-fn avatar(invocation: &mut Invocation<'_>) -> Hresult {
+fn avatar(invocation: &mut Invocation<'_>) -> CommandResult {
     if !invocation.backend.avatar_hooks_available() {
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     let clamp = |value: u32| (value as i32).max(0) as u32;
     let hook = if let Some(value) = invocation.line.dword("loadassetdelay") {
@@ -584,17 +738,14 @@ fn avatar(invocation: &mut Invocation<'_>) -> Hresult {
         invocation.line.dword("simulateerrorvalue"),
     ) {
         if kind >= 1 {
-            return Hresult::FAIL;
+            return Err(CommandError::Fail);
         }
         AvatarHook::SimulateError { kind, value }
     } else {
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     };
-    match invocation.backend.avatar_hook(hook) {
-        Ok(()) => Hresult::OK,
-        Err(AvatarError::Lookup(result) | AvatarError::Hook(result)) => result,
-        Err(AvatarError::NoFunction) => ACCESS_DENIED,
-    }
+    invocation.backend.avatar_hook(hook)?;
+    Ok(Reply::Ok)
 }
 
 /// `enable` or `disable`: whether the `enable` form was given.
@@ -615,37 +766,39 @@ fn update_setting(
     setting: ConfigSetting,
     mask: u32,
     bits: u32,
-) -> Hresult {
+) -> CommandResult {
     let mut value = [0u8; 4];
-    let status = match invocation.backend.xconfig_get(setting, &mut value) {
-        Ok(_) => {
+    invocation
+        .backend
+        .xconfig_get(setting, &mut value)
+        .and_then(|_| {
             let new = (u32::from_be_bytes(value) & !mask) | bits;
             invocation.backend.xconfig_set(setting, &new.to_be_bytes())
-        }
-        Err(status) => Err(status),
-    };
-    Hresult::from_nt_status(
-        status.err().unwrap_or(NtStatus::SUCCESS),
-        Hresult::UNEXPECTED,
-    )
+        })
+        .map_err(|error| CommandError::from_kernel(error, CommandError::Unexpected))?;
+    Ok(Reply::Ok)
 }
 
-fn background_mode_test(invocation: &mut Invocation<'_>) -> Hresult {
+fn background_mode_test(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(enable) = enable_flag(invocation) else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
-    let bits = if enable { BACKGROUND_MODE_TEST } else { 0 };
+    let bits = if enable {
+        UserFlags::BACKGROUND_MODE_TEST.bits()
+    } else {
+        0
+    };
     update_setting(
         invocation,
-        ConfigSetting::new(3, SETTINGS_FLAGS),
-        BACKGROUND_MODE_TEST,
+        UserFlags::SETTING,
+        UserFlags::BACKGROUND_MODE_TEST.bits(),
         bits,
     )
 }
 
-fn built_in_memory_unit(invocation: &mut Invocation<'_>) -> Hresult {
+fn built_in_memory_unit(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(enable) = enable_flag(invocation) else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     let bits = if enable {
         0
@@ -675,44 +828,39 @@ fn enabled_is_off(invocation: &Invocation<'_>, capacity: usize) -> bool {
 const SHORT_VALUE: usize = 10;
 
 /// The flag update result is discarded by every caller.
-fn set_flag(invocation: &mut Invocation<'_>, index: u16, mask: u32, set: bool) -> Hresult {
-    let _ = console::modify_config_flag(invocation.backend, index, mask, set);
-    Hresult::OK
+fn set_flag(invocation: &mut Invocation<'_>, flags: impl ConfigFlags, set: bool) -> CommandResult {
+    let _ = console::modify_config_flag(invocation.backend, flags, set);
+    Ok(Reply::Ok)
 }
 
-fn boot_animation(invocation: &mut Invocation<'_>) -> Hresult {
+fn boot_animation(invocation: &mut Invocation<'_>) -> CommandResult {
     let off = enabled_is_off(invocation, SHORT_VALUE);
-    set_flag(invocation, SETTINGS_FLAGS, BOOT_ANIMATION_DISABLED, off)
+    set_flag(invocation, UserFlags::BOOT_ANIMATION_DISABLED, off)
 }
 
-fn kinect_health_message(invocation: &mut Invocation<'_>) -> Hresult {
+fn kinect_health_message(invocation: &mut Invocation<'_>) -> CommandResult {
     let off = invocation.line.has("off");
-    set_flag(
-        invocation,
-        SETTINGS_FLAGS,
-        KINECT_HEALTH_MESSAGE_DISABLED,
-        off,
-    )
+    set_flag(invocation, UserFlags::KINECT_HEALTH_MESSAGE_DISABLED, off)
 }
 
-fn motion_detection(invocation: &mut Invocation<'_>) -> Hresult {
+fn motion_detection(invocation: &mut Invocation<'_>) -> CommandResult {
     let off = enabled_is_off(invocation, SHORT_VALUE);
-    set_flag(invocation, SETTINGS_FLAGS, MOTION_DETECTION_DISABLED, off)
+    set_flag(invocation, UserFlags::MOTION_DETECTION_DISABLED, off)
 }
 
-fn run_nui_oobe(invocation: &mut Invocation<'_>) -> Hresult {
+fn run_nui_oobe(invocation: &mut Invocation<'_>) -> CommandResult {
     let off = enabled_is_off(invocation, SHORT_VALUE);
-    set_flag(invocation, OOBE_FLAGS, NUI_OOBE_DISABLED, off)
+    set_flag(invocation, RetailFlags::NUI_OOBE_DISABLED, off)
 }
 
-fn run_oobe(invocation: &mut Invocation<'_>) -> Hresult {
+fn run_oobe(invocation: &mut Invocation<'_>) -> CommandResult {
     let off = enabled_is_off(invocation, SHORT_VALUE);
-    set_flag(invocation, OOBE_FLAGS, OOBE_DISABLED, off)
+    set_flag(invocation, RetailFlags::OOBE_DISABLED, off)
 }
 
-fn run_oobe_checkpoint(invocation: &mut Invocation<'_>) -> Hresult {
+fn run_oobe_checkpoint(invocation: &mut Invocation<'_>) -> CommandResult {
     let off = enabled_is_off(invocation, SHORT_VALUE);
-    set_flag(invocation, OOBE_FLAGS, OOBE_CHECKPOINT_DISABLED, off)
+    set_flag(invocation, RetailFlags::OOBE_CHECKPOINT_DISABLED, off)
 }
 
 /// Value buffer of `enabled=` for commands that accept on and off.
@@ -736,10 +884,10 @@ fn debug_print(invocation: &mut Invocation<'_>, arguments: core::fmt::Arguments<
     invocation.backend.debug_print(message.as_bytes());
 }
 
-fn enable_wireless_controllers(invocation: &mut Invocation<'_>) -> Hresult {
+fn enable_wireless_controllers(invocation: &mut Invocation<'_>) -> CommandResult {
     let mut buffer = [0u8; LONG_VALUE];
     let Some(value) = invocation.line.param("enabled") else {
-        return BAD_PARAMETER;
+        return Err(BAD_PARAMETER);
     };
     let value = value.copy_into(&mut buffer);
     let length = value.len();
@@ -752,38 +900,42 @@ fn enable_wireless_controllers(invocation: &mut Invocation<'_>) -> Hresult {
         ),
     );
     let Some(enable) = on_off(text) else {
-        return BAD_PARAMETER;
+        return Err(BAD_PARAMETER);
     };
-    if !invocation.backend.set_wireless_radio(enable).is_success() {
-        return ACCESS_DENIED;
+    if invocation.backend.set_wireless_radio(enable).is_err() {
+        return Err(ACCESS_DENIED);
     }
-    let setting = ConfigSetting::new(3, SETTINGS_FLAGS);
+    let setting = UserFlags::SETTING;
     let mut stored = [0u8; 4];
     if invocation.backend.xconfig_get(setting, &mut stored) == Ok(4) {
         let old = u32::from_be_bytes(stored);
+        let disabled = UserFlags::WIRELESS_CONTROLLERS_DISABLED.bits();
         let new = if enable {
-            old & !WIRELESS_CONTROLLERS_DISABLED
+            old & !disabled
         } else {
-            old | WIRELESS_CONTROLLERS_DISABLED
+            old | disabled
         };
-        if let Err(status) = invocation.backend.xconfig_set(setting, &new.to_be_bytes()) {
+        if let Err(error) = invocation.backend.xconfig_set(setting, &new.to_be_bytes()) {
             debug_print(
                 invocation,
                 format_args!(
                     "[xbdm] EnableWirelessControllers, enabled={} ExSetXConfigSetting failed {:X}\n",
                     text.escape_ascii(),
-                    status.0
+                    NtStatus::from(error).0
                 ),
             );
         }
     }
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `irtsweep`: always fails with a fixed status.
-fn irt_sweep(invocation: &mut Invocation<'_>) -> Hresult {
-    invocation.set_text(format_args!("error status 0x{:08x}", 0xc000_0002u32));
-    Hresult::error(0)
+fn irt_sweep(invocation: &mut Invocation<'_>) -> CommandResult {
+    invocation.set_text(format_args!(
+        "error status 0x{:08x}",
+        NtStatus::from(KernelError::NotImplemented).0
+    ));
+    Err(FAILED)
 }
 
 /// Offset of the `mixcmd` subcommand: the monitor assumes `mixcmd ` precedes it.
@@ -803,64 +955,65 @@ fn buffer_text(buffer: &[u8], offset: usize) -> &[u8] {
 
 /// `mixcmd`: memory statistics passed through as hex. The subcommand is
 /// read at a fixed offset of the receive buffer, as the monitor does.
-fn mix_command(invocation: &mut Invocation<'_>) -> Hresult {
+fn mix_command(invocation: &mut Invocation<'_>) -> CommandResult {
     let buffer = invocation.buffer;
     let subcommand = buffer_text(buffer, MIX_SUBCOMMAND);
     if subcommand == b"querystats" {
         let mut block = [0u8; 0x90];
         block[0..4].copy_from_slice(&0x90u32.to_be_bytes());
         block[4..8].copy_from_slice(&0x68u32.to_be_bytes());
-        let status = invocation.backend.devkit_memory_statistics(&mut block);
-        if !status.is_success() {
+        if let Err(error) = invocation.backend.devkit_memory_statistics(&mut block) {
             debug_print(
                 invocation,
                 format_args!(
                     "WRN[MIX]: DMSVC_GET_DEVKIT_MEMORY_STATISTICS failed status 0x{:08X}\n",
-                    status.0
+                    NtStatus::from(error).0
                 ),
             );
-            return SERVICE_FAILED;
+            return Err(SERVICE_FAILED);
         }
         invocation.text.set_bytes(b"OK querystats ");
         let _ = invocation.text.push_hex_upper(&block);
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     if subcommand == b"countxamheaps" {
         if !invocation.backend.xam_heap_count_available() {
-            return ACCESS_DENIED;
+            return Err(ACCESS_DENIED);
         }
         let mut block = [0u8; 12];
         block[0..4].copy_from_slice(&12u32.to_be_bytes());
-        let result = invocation.backend.xam_heap_count(&mut block);
-        if result.is_failure() {
+        if let Err(error) = invocation.backend.xam_heap_count(&mut block) {
             debug_print(
                 invocation,
-                format_args!("WRN[MIX]: XampHeapGetCount failed hr 0x{:08X}\n", result.0),
+                format_args!(
+                    "WRN[MIX]: XampHeapGetCount failed hr 0x{:08X}\n",
+                    Hresult::from(error).0
+                ),
             );
-            return SERVICE_FAILED;
+            return Err(SERVICE_FAILED);
         }
         let system = u32::from_be_bytes([block[4], block[5], block[6], block[7]]);
         let cooperative = u32::from_be_bytes([block[8], block[9], block[10], block[11]]);
         invocation.set_text(format_args!(
             "OK countxamheaps System={system:08X} Coop={cooperative:08X}"
         ));
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     if buffer.get(MIX_SUBCOMMAND..MIX_HEAP_SEPARATOR) == Some(b"xamheap".as_slice()) {
         return mix_xam_heap(invocation);
     }
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
-fn mix_xam_heap(invocation: &mut Invocation<'_>) -> Hresult {
+fn mix_xam_heap(invocation: &mut Invocation<'_>) -> CommandResult {
     if !invocation.backend.xam_heap_info_available() {
-        return ACCESS_DENIED;
+        return Err(ACCESS_DENIED);
     }
     let buffer = invocation.buffer;
     // The monitor traps when no space follows `xamheap`; that is reported
     // as a malformed id instead.
     if buffer_byte(buffer, MIX_HEAP_SEPARATOR) != b' ' {
-        return BAD_PARAMETER;
+        return Err(BAD_PARAMETER);
     }
     let mut id = 0u32;
     for index in 0..MIX_HEAP_ID_DIGITS {
@@ -873,7 +1026,7 @@ fn mix_xam_heap(invocation: &mut Invocation<'_>) -> Hresult {
                 invocation,
                 format_args!("WRN[MIX]: Unsupported id char '{}'\n", byte as char),
             );
-            return BAD_PARAMETER;
+            return Err(BAD_PARAMETER);
         };
         id = (id << 4) | digit;
     }
@@ -882,23 +1035,30 @@ fn mix_xam_heap(invocation: &mut Invocation<'_>) -> Hresult {
     usage[0..4].copy_from_slice(&0x18u32.to_be_bytes());
     let mut limits = [0u8; 0x1c];
     limits[0..4].copy_from_slice(&0x1cu32.to_be_bytes());
-    for class in [1u32, 3, 2] {
+    let id = XamHeapId(id);
+    for class in [
+        XamHeapInfoClass::Name,
+        XamHeapInfoClass::Usage,
+        XamHeapInfoClass::Limits,
+    ] {
         let result = match class {
-            1 => invocation.backend.xam_heap_name(id, &mut name),
-            3 => invocation.backend.xam_heap_info(id, 3, &mut usage),
-            _ => invocation.backend.xam_heap_info(id, 2, &mut limits),
+            XamHeapInfoClass::Name => invocation.backend.xam_heap_name(id, &mut name),
+            XamHeapInfoClass::Usage => invocation.backend.xam_heap_info(id, class, &mut usage),
+            XamHeapInfoClass::Limits => invocation.backend.xam_heap_info(id, class, &mut limits),
         };
-        if result.is_failure() {
-            if result != Hresult::FAIL {
+        if let Err(error) = result {
+            if error != XamError::Fail {
                 debug_print(
                     invocation,
                     format_args!(
-                        "WRN[MIX]: XampHeapGetInfo for id {id:X} info {class} failed hr 0x{:08X}\n",
-                        result.0
+                        "WRN[MIX]: XampHeapGetInfo for id {:X} info {} failed hr 0x{:08X}\n",
+                        id.0,
+                        class.code(),
+                        Hresult::from(error).0
                     ),
                 );
             }
-            return SERVICE_FAILED;
+            return Err(SERVICE_FAILED);
         }
     }
     invocation.text.set_bytes(b"OK xamheap Name=");
@@ -906,52 +1066,47 @@ fn mix_xam_heap(invocation: &mut Invocation<'_>) -> Hresult {
     let _ = invocation.text.push_bytes(b" Data=");
     let _ = invocation.text.push_hex_upper(&usage);
     let _ = invocation.text.push_hex_upper(&limits);
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `mockcurrencyvalue`: send a mock currency setting to the marketplace
 /// service. Only the service's invalid-argument result counts as success.
-fn mock_currency_value(invocation: &mut Invocation<'_>) -> Hresult {
+fn mock_currency_value(invocation: &mut Invocation<'_>) -> CommandResult {
     let mut buffer = [0u8; LONG_VALUE];
     let Some(value) = invocation.line.param("enabled") else {
-        return BAD_PARAMETER;
+        return Err(BAD_PARAMETER);
     };
     let mut message = [0u8; 0x14];
     match on_off(value.copy_into(&mut buffer)) {
         Some(true) => {
             let Some(amount) = invocation.line.dword("value") else {
-                return BAD_PARAMETER;
+                return Err(BAD_PARAMETER);
             };
             message[0..4].copy_from_slice(&1u32.to_be_bytes());
             message[4..8].copy_from_slice(&amount.to_be_bytes());
         }
         Some(false) => {}
-        None => return BAD_PARAMETER,
+        None => return Err(BAD_PARAMETER),
     }
     let result = invocation.backend.system_message(
-        system_message::MARKETPLACE_APP,
-        system_message::MOCK_CURRENCY,
+        SystemApp::MARKETPLACE,
+        SystemMessage::MOCK_CURRENCY,
         &mut message,
     );
-    if result == Hresult::INVALID_ARGUMENT {
-        Hresult::OK
-    } else {
-        ACCESS_DENIED
+    match result {
+        Err(XamError::InvalidArgument) => Ok(Reply::Ok),
+        Ok(()) | Err(_) => Err(ACCESS_DENIED),
     }
 }
 
 /// Size of the optical disc log file name buffer.
 const ODD_LOG_NAME: usize = 0x104;
 
-fn optical_disc_log(invocation: &mut Invocation<'_>) -> Hresult {
+fn optical_disc_log(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.line.has("stop") {
-        return match invocation.backend.odd_log_stop() {
-            Ok(()) => {
-                invocation.text.set_bytes(b"stopped logging");
-                Hresult::OK
-            }
-            Err(OddLogNotRunning) => OddLogNotRunning::HRESULT,
-        };
+        invocation.backend.odd_log_stop()?;
+        invocation.text.set_bytes(b"stopped logging");
+        return Ok(Reply::Ok);
     }
     let mut name = Text::<{ ODD_LOG_NAME - 1 }>::new();
     match invocation.line.param("file") {
@@ -973,20 +1128,16 @@ fn optical_disc_log(invocation: &mut Invocation<'_>) -> Hresult {
     let path = path
         .as_ref()
         .map(|path| path.as_bytes())
-        .ok_or(filesystem::nt::NO_SUCH_FILE);
-    match invocation.backend.odd_log_start(path) {
-        Ok(()) => {
-            invocation.text.set_bytes(b"Logging to '");
-            let _ = invocation.text.push_bytes(name.as_bytes());
-            let _ = invocation.text.push_bytes(b"'");
-            Hresult::OK
-        }
-        Err(error) => error.hresult(),
-    }
+        .ok_or(KernelError::NoSuchFile);
+    invocation.backend.odd_log_start(path)?;
+    invocation.text.set_bytes(b"Logging to '");
+    let _ = invocation.text.push_bytes(name.as_bytes());
+    let _ = invocation.text.push_bytes(b"'");
+    Ok(Reply::Ok)
 }
 
 /// `playto set enable=<value>` or `playto show`.
-fn play_to(invocation: &mut Invocation<'_>) -> Hresult {
+fn play_to(invocation: &mut Invocation<'_>) -> CommandResult {
     let command = if invocation.line.has("set") {
         match invocation
             .line
@@ -1019,14 +1170,14 @@ fn play_to(invocation: &mut Invocation<'_>) -> Hresult {
         on_off(state.xmp_heap),
         on_off(state.play_to)
     ));
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
-fn invalid_play_to(invocation: &mut Invocation<'_>) -> Hresult {
+fn invalid_play_to(invocation: &mut Invocation<'_>) -> CommandResult {
     let line = invocation.line.as_bytes();
     invocation.text.set_bytes(b"Invalid parameter: ");
     let _ = invocation.text.push_bytes(line);
-    BAD_PARAMETER
+    Err(BAD_PARAMETER)
 }
 
 /// A `pogoctrl` dword parameter. The monitor stores the digits it parsed
@@ -1043,7 +1194,7 @@ fn pgo_dword(invocation: &Invocation<'_>, name: &str) -> u32 {
 /// Size of the `phase` name buffer.
 const PGO_PHASE: usize = 0x141;
 
-fn pgo_control(invocation: &mut Invocation<'_>) -> Hresult {
+fn pgo_control(invocation: &mut Invocation<'_>) -> CommandResult {
     let result = if invocation.line.has("start") {
         invocation
             .backend
@@ -1064,24 +1215,20 @@ fn pgo_control(invocation: &mut Invocation<'_>) -> Hresult {
             .backend
             .pgo_snapshot(&buffer[..phase_length], reset, module)
     } else if invocation.line.has("allocscale") {
-        let module = pgo_dword(invocation, "module");
+        let module = PgoModule::from_value(pgo_dword(invocation, "module"));
         let scale = pgo_dword(invocation, "scale");
         invocation.backend.pgo_set_allocation_scale(module, scale)
     } else {
-        invocation.set_text(format_args!("HRESULT 0x{:08x}", FAILED.0));
-        return FAILED;
+        invocation.set_text(format_args!("HRESULT 0x{:08x}", Hresult::from(FAILED).0));
+        return Err(FAILED);
     };
-    let result = match result {
-        Ok(()) => PGO_SUCCESS,
-        Err(PgoError::NoSuchModule) => BAD_PARAMETER,
-        Err(PgoError::Busy) => PGO_BUSY,
-    };
-    invocation.set_text(format_args!("HRESULT 0x{:08x}", result.0));
+    let result = result.map(|()| Reply::Ok).map_err(CommandError::from);
+    invocation.set_text(format_args!("HRESULT 0x{:08x}", reply::hresult(result).0));
     result
 }
 
 /// `tdecomp`: select whether title decompression ignores GDF attributes.
-fn title_decompression(invocation: &mut Invocation<'_>) -> Hresult {
+fn title_decompression(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.line.has("UseGDFAttrib") {
         invocation.backend.set_ignore_gdf_attributes(false);
     } else if invocation.line.has("IgnoreGDFAttrib") {
@@ -1093,33 +1240,30 @@ fn title_decompression(invocation: &mut Invocation<'_>) -> Hresult {
         b"NoGDFAttrib"
     };
     invocation.text.set_bytes(text);
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `usbportctrl controller=<dword> port=<dword> (enable | disable)`.
-fn usb_port_control(invocation: &mut Invocation<'_>) -> Hresult {
+fn usb_port_control(invocation: &mut Invocation<'_>) -> CommandResult {
     if !invocation.backend.usb_port_power_available() {
-        return ACCESS_DENIED;
+        return Err(ACCESS_DENIED);
     }
     let (Some(controller), Some(port)) = (
         invocation.line.dword("controller"),
         invocation.line.dword("port"),
     ) else {
-        return BAD_PARAMETER;
+        return Err(BAD_PARAMETER);
     };
     let enable = if invocation.line.has("enable") {
         true
     } else if invocation.line.has("disable") {
         false
     } else {
-        return BAD_PARAMETER;
+        return Err(BAD_PARAMETER);
     };
-    let status = invocation
+    invocation
         .backend
-        .set_usb_port_power(controller, port, enable);
-    if status.is_success() {
-        Hresult::OK
-    } else {
-        Hresult(status.0 | 0x1000_0000)
-    }
+        .set_usb_port_power(UsbController(controller), UsbPort(port), enable)
+        .map_err(CommandError::Kernel)?;
+    Ok(Reply::Ok)
 }

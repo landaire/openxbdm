@@ -1,10 +1,14 @@
 //! Simulated CIV services. IPTV settings live in the console configuration
 //! store of the console domain.
 
+use openxbdm_core::status::Hresult;
+use openxbdm_core::status::KernelError;
+use openxbdm_core::status::NtStatus;
 use openxbdm_server::commands::services;
 use openxbdm_server::commands::services::CivProgress;
 use openxbdm_server::commands::services::CivResult;
 use openxbdm_server::commands::services::DetectionBit;
+use openxbdm_server::commands::services::DetectionMask;
 use openxbdm_server::commands::services::DetectionRoutineMissing;
 use openxbdm_server::commands::services::DetectionUpdate;
 use openxbdm_server::commands::services::LastError;
@@ -12,8 +16,6 @@ use openxbdm_server::commands::services::ThreadHandle;
 
 use super::MockBackend;
 
-/// Kernel status for a detection bit outside the 64-bit mask.
-const STATUS_INVALID_PARAMETER: u32 = 0xc000_000d;
 /// First handle the simulated kernel hands out.
 const FIRST_THREAD_HANDLE: u32 = 0xf800_0040;
 /// Distance between simulated handles.
@@ -70,8 +72,8 @@ impl Default for Mock {
             // A booted console has loaded its security settings.
             detection_mask: Some(0),
             missing_detection_routine: None,
-            create_result: CivResult(0),
-            verify_result: CivResult(0),
+            create_result: CivResult::Returned(Hresult(0)),
+            verify_result: CivResult::Returned(Hresult(0)),
             progress: Ok(CivProgress::default()),
         }
     }
@@ -85,13 +87,13 @@ impl Mock {
     }
 
     /// The kernel's set export: already-set bits succeed without a change.
-    fn set_detected(&mut self, bit: DetectionBit) -> u32 {
+    fn set_detected(&mut self, bit: DetectionBit) -> NtStatus {
         if bit.0 >= u64::BITS {
-            return STATUS_INVALID_PARAMETER;
+            return KernelError::InvalidParameter.into();
         }
         let mask = self.detection_mask.get_or_insert(0);
         *mask |= 1 << bit.0;
-        0
+        NtStatus::SUCCESS
     }
 }
 
@@ -122,13 +124,13 @@ impl services::Backend for MockBackend {
         if let Some(missing) = mock.missing_detection_routine {
             return Err(missing);
         }
-        let old_mask = mock.detected() as u32;
+        let old_mask = DetectionMask(mock.detected() as u32);
         mock.detection_mask = Some(0);
-        let result = bit.map_or(0, |bit| mock.set_detected(bit));
+        let status = bit.map_or(NtStatus::SUCCESS, |bit| mock.set_detected(bit));
         Ok(DetectionUpdate {
-            result,
+            status,
             old_mask,
-            new_mask: mock.detected() as u32,
+            new_mask: DetectionMask(mock.detected() as u32),
         })
     }
 

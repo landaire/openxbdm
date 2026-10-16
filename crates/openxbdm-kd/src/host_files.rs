@@ -9,7 +9,7 @@ use std::io::SeekFrom;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 
-use openxbdm_kd_core::NtStatus;
+use openxbdm_kd_core::file_io::HostFileError;
 use openxbdm_kd_core::file_io::HostFileHandle;
 use openxbdm_kd_core::file_io::HostFileSystem;
 use openxbdm_kd_core::file_io::HostPath;
@@ -117,16 +117,15 @@ fn read_at(file: &mut File, offset: u64, buffer: &mut [u8]) -> io::Result<usize>
 }
 
 impl HostFileSystem for HostFiles {
-    fn open(&mut self, request: &OpenRequest<'_>) -> Result<OpenedFile, NtStatus> {
+    fn open(&mut self, request: &OpenRequest<'_>) -> Result<OpenedFile, HostFileError> {
         let mapping = self
             .mappings
             .iter()
             .position(|mapping| mapping.matches(&request.path))
-            .ok_or(NtStatus::OBJECT_NAME_NOT_FOUND)?;
+            .ok_or(HostFileError::NotMapped)?;
         self.open_mapping(mapping, request.path.to_string()).map_err(|error| {
             tracing::warn!(%error, local = %self.mappings[mapping].local_path.display(), "host file open failed");
-            // The kernel then opens the file from its own devices.
-            NtStatus::OBJECT_NAME_NOT_FOUND
+            HostFileError::OpenFailed
         })
     }
 
@@ -135,8 +134,11 @@ impl HostFileSystem for HostFiles {
         handle: HostFileHandle,
         offset: u64,
         buffer: &mut [u8],
-    ) -> Result<usize, NtStatus> {
-        let open = self.open.get_mut(&handle).ok_or(NtStatus::INVALID_HANDLE)?;
+    ) -> Result<usize, HostFileError> {
+        let open = self
+            .open
+            .get_mut(&handle)
+            .ok_or(HostFileError::UnknownHandle)?;
         match read_at(&mut open.file, offset, buffer) {
             Ok(count) => {
                 open.bytes_served += count as u64;
@@ -144,16 +146,16 @@ impl HostFileSystem for HostFiles {
             }
             Err(error) => {
                 tracing::warn!(%error, ?handle, offset, "host file read failed");
-                Err(NtStatus::UNSUCCESSFUL)
+                Err(HostFileError::ReadFailed)
             }
         }
     }
 
-    fn close(&mut self, handle: HostFileHandle) -> Result<(), NtStatus> {
+    fn close(&mut self, handle: HostFileHandle) -> Result<(), HostFileError> {
         self.open
             .remove(&handle)
             .map(drop)
-            .ok_or(NtStatus::INVALID_HANDLE)
+            .ok_or(HostFileError::UnknownHandle)
     }
 }
 

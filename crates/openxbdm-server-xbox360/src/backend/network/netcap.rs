@@ -8,7 +8,8 @@ use core::ptr::NonNull;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
-use openxbdm_core::status::Hresult;
+use openxbdm_core::status::KernelError;
+use openxbdm_core::status::NtStatus;
 use openxbdm_server::commands::network::WsaError;
 use openxbdm_server::commands::network::netcap;
 use openxbdm_server::commands::network::netcap::CaptureClose;
@@ -16,6 +17,7 @@ use openxbdm_server::commands::network::netcap::CaptureFlags;
 use openxbdm_server::commands::network::netcap::CaptureRequest;
 use openxbdm_server::commands::network::netcap::capture_file;
 use openxbdm_server::commands::network::netcap::capture_file::Admission;
+use openxbdm_server::commands::network::netcap::capture_file::CaptureFileError;
 use openxbdm_server::commands::network::netcap::capture_file::Clock;
 use openxbdm_server::commands::network::netcap::capture_file::LocalTime;
 use openxbdm_server::commands::network::netcap::capture_file::Recorder;
@@ -48,14 +50,13 @@ struct Context {
     accounting: SpinLocked<Accounting>,
     /// Flags the callbacks apply (0x91f9f694).
     flags: AtomicU32,
-    /// First failing callback result, 0 for none (0x91f9f698).
-    error: AtomicU32,
+    error: CallbackError,
     writer: Writer,
 }
 
 impl Context {
     /// Append one frame (0x91f699f8).
-    fn append(&self, frame: &[u8]) -> Result<(), Hresult> {
+    fn append(&self, frame: &[u8]) -> Result<(), CaptureFileError> {
         let now = kernel::timebase();
         let length = frame.len() as u32;
         self.accounting
@@ -82,14 +83,61 @@ impl Context {
     /// Callback body (0x91f34de0): record the frame unless a frame already
     /// failed; keep the first failure.
     fn record(&self, frame: &[u8]) {
-        if self.error.load(Ordering::Acquire) != 0 {
+        if self.error.is_set() {
             return;
         }
         if let Err(error) = self.append(frame) {
-            let _ = self
-                .error
-                .compare_exchange(0, error.0, Ordering::AcqRel, Ordering::Acquire);
+            self.error.keep_first(error);
         }
+    }
+}
+
+/// The first failing callback result (0x91f9f698) in one word that the
+/// callbacks update without the lock: 0 for none, 1..=5 for the capture
+/// file's own errors, else the status of a failed kernel call (high bit
+/// set).
+struct CallbackError(AtomicU32);
+
+impl CallbackError {
+    const NONE: u32 = 0;
+
+    const fn new() -> Self {
+        Self(AtomicU32::new(Self::NONE))
+    }
+
+    fn is_set(&self) -> bool {
+        self.0.load(Ordering::Acquire) != Self::NONE
+    }
+
+    fn get(&self) -> Option<CaptureFileError> {
+        Some(match self.0.load(Ordering::Acquire) {
+            Self::NONE => return None,
+            1 => CaptureFileError::BadLength,
+            2 => CaptureFileError::DataLimitReached,
+            3 => CaptureFileError::WriteFault,
+            4 => CaptureFileError::InvalidData,
+            5 => CaptureFileError::OutOfMemory,
+            status => CaptureFileError::Kernel(KernelError::from_status(NtStatus(status))),
+        })
+    }
+
+    fn clear(&self) {
+        self.0.store(Self::NONE, Ordering::Release);
+    }
+
+    /// Store `error` unless a failure is stored.
+    fn keep_first(&self, error: CaptureFileError) {
+        let word = match error {
+            CaptureFileError::BadLength => 1,
+            CaptureFileError::DataLimitReached => 2,
+            CaptureFileError::WriteFault => 3,
+            CaptureFileError::InvalidData => 4,
+            CaptureFileError::OutOfMemory => 5,
+            CaptureFileError::Kernel(error) => error.status().0,
+        };
+        let _ = self
+            .0
+            .compare_exchange(Self::NONE, word, Ordering::AcqRel, Ordering::Acquire);
     }
 }
 
@@ -122,7 +170,7 @@ extern "C" fn transmit(context: usize, frame: *mut u8, length: u32) -> u32 {
 extern "C" fn receive(context: usize, frame: *mut u8, length: u32) -> u32 {
     // SAFETY: as for `transmit`.
     let (context, frame) = unsafe { frame_parts(context, frame, length) };
-    if context.error.load(Ordering::Acquire) == 0
+    if !context.error.is_set()
         && !CaptureFlags(context.flags.load(Ordering::Acquire)).skips_received(frame)
     {
         context.record(frame);
@@ -188,7 +236,7 @@ fn local_time() -> LocalTime {
 }
 
 impl netcap::Backend for Console {
-    fn open_capture(&mut self, request: &CaptureRequest<'_>) -> Result<(), Hresult> {
+    fn open_capture(&mut self, request: &CaptureRequest<'_>) -> Result<(), CaptureFileError> {
         let pool = if request.flags.contains(CaptureFlags::PERSISTENT) {
             PERSISTENT_POOL
         } else {
@@ -200,7 +248,7 @@ impl netcap::Backend for Console {
             pool,
         );
         let Some(context) = NonNull::new(memory as usize as *mut Context) else {
-            return Err(Hresult::OUT_OF_MEMORY);
+            return Err(CaptureFileError::OutOfMemory);
         };
         let start = local_time();
         let clock = Clock::new(kernel::timebase(), kernel::performance_frequency());
@@ -214,7 +262,7 @@ impl netcap::Backend for Console {
                     clock,
                 }),
                 flags: AtomicU32::new(0),
-                error: AtomicU32::new(0),
+                error: CallbackError::new(),
                 writer: Writer::new(),
             });
             context
@@ -251,7 +299,7 @@ impl netcap::Backend for Console {
         };
         // SAFETY: the context stays allocated until `close_capture` takes it.
         let context = unsafe { pointer.as_ref() };
-        context.error.store(0, Ordering::Release);
+        context.error.clear();
         context.flags.store(flags.0, Ordering::Release);
         let hook = FrameHook {
             transmit,
@@ -266,8 +314,8 @@ impl netcap::Backend for Console {
                 hook.context,
                 0,
             );
-            if error != 0 {
-                return Err(WsaError(error));
+            if let Some(error) = WsaError::new(error) {
+                return Err(error);
             }
         }
         self.network.netcap.attached = true;
@@ -281,9 +329,8 @@ impl netcap::Backend for Console {
         self.network.netcap.attached = false;
     }
 
-    fn capture_error(&self) -> Option<Hresult> {
-        let error = self.network.netcap.context()?.error.load(Ordering::Acquire);
-        (error != 0).then_some(Hresult(error))
+    fn capture_error(&self) -> Option<CaptureFileError> {
+        self.network.netcap.context()?.error.get()
     }
 
     fn close_capture(&mut self) -> CaptureClose {

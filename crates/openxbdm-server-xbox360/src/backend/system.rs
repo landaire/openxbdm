@@ -11,10 +11,14 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::Win32Error;
 use openxbdm_server::Server;
 use openxbdm_server::commands;
 use openxbdm_server::commands::console::TraceMask;
+use openxbdm_server::commands::filesystem::CreateDisposition;
+use openxbdm_server::commands::filesystem::FileAccess;
 use openxbdm_server::commands::system::BootFlags;
 use openxbdm_server::commands::system::CreateSettingsError;
 use openxbdm_server::commands::system::FlashOptions;
@@ -26,8 +30,9 @@ use openxbdm_server::commands::system::SettingsFile;
 use openxbdm_server::commands::system::SettingsSource;
 use openxbdm_server::commands::system::TitleFlags;
 use openxbdm_server::commands::system::TitleRebootStop;
-use openxbdm_server::commands::system::Win32Error;
 use openxbdm_server::notify::ExecutionState;
+use openxbdm_server::reply;
+use openxbdm_server::reply::CommandError;
 use openxbdm_server::text::Text;
 
 use self::flash::FlashImage;
@@ -65,11 +70,6 @@ const WRITE_BUFFER_SIZE: usize = 0x4000;
 const COPY_BUFFER_SIZE: usize = 0x1000;
 const POOL_TAG: u32 = 0x6d64_6258;
 const POOL_TYPE: u32 = 2;
-const GENERIC_READ: u32 = 0x8000_0000;
-const GENERIC_WRITE: u32 = 0x4000_0000;
-const SYNCHRONIZE: u32 = 0x0010_0000;
-const FILE_OPEN: u32 = 1;
-const FILE_OVERWRITE_IF: u32 = 5;
 const FILE_SHARE_READ: u32 = 1;
 const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
 const FILE_NON_DIRECTORY_FILE: u32 = 0x40;
@@ -176,7 +176,11 @@ fn write_u32(address: u32, value: u32) {
     unsafe { core::ptr::write_volatile(address as usize as *mut u32, value) }
 }
 
-fn create_file(path: &[u8], access: u32, disposition: u32) -> Result<u32, NtStatus> {
+fn create_file(
+    path: &[u8],
+    access: FileAccess,
+    disposition: CreateDisposition,
+) -> Result<u32, KernelError> {
     let name = AnsiString::new(path);
     let attributes = ObjectAttributes {
         root_directory: 0,
@@ -187,20 +191,17 @@ fn create_file(path: &[u8], access: u32, disposition: u32) -> Result<u32, NtStat
     let mut handle = 0;
     let status = kernel::NtCreateFile(
         &mut handle,
-        access,
+        access.0,
         &attributes,
         &mut status_block,
         core::ptr::null(),
         0,
         0,
-        disposition,
+        disposition as u32,
         FILE_SYNCHRONOUS_IO_NONALERT,
     );
-    if (status as i32) < 0 {
-        Err(NtStatus(status))
-    } else {
-        Ok(handle)
-    }
+    NtStatus(status).result()?;
+    Ok(handle)
 }
 
 fn file_exists(path: &[u8]) -> bool {
@@ -301,8 +302,8 @@ impl commands::system::Backend for Console {
         }
         let handle = match create_file(
             SAVED_SETTINGS_PATH,
-            GENERIC_WRITE | SYNCHRONIZE,
-            FILE_OVERWRITE_IF,
+            FileAccess::GENERIC_WRITE.union(FileAccess::SYNCHRONIZE),
+            CreateDisposition::OverwriteIf,
         ) {
             Ok(handle) => handle,
             Err(status) => {
@@ -329,7 +330,7 @@ impl commands::system::Backend for Console {
         self.system.title_caller
     }
 
-    fn settings_file_size(&mut self, file: SettingsFile) -> Result<u32, NtStatus> {
+    fn settings_file_size(&mut self, file: SettingsFile) -> Result<u32, KernelError> {
         let mut status_block = IoStatusBlock::default();
         let mut information = [0u8; NETWORK_OPEN_INFORMATION_SIZE];
         let status = kernel::NtQueryInformationFile(
@@ -339,9 +340,7 @@ impl commands::system::Backend for Console {
             NETWORK_OPEN_INFORMATION_SIZE as u32,
             FILE_NETWORK_OPEN_INFORMATION,
         );
-        if (status as i32) < 0 {
-            return Err(NtStatus(status));
-        }
+        NtStatus(status).result()?;
         let low = &information[END_OF_FILE_LOW..END_OF_FILE_LOW + 4];
         Ok(u32::from_be_bytes([low[0], low[1], low[2], low[3]]))
     }
@@ -398,9 +397,13 @@ impl commands::system::Backend for Console {
             SettingsSource::Saved => SAVED_SETTINGS_PATH,
             SettingsSource::Recint => RECINT_PATH,
         };
-        create_file(path, GENERIC_READ | SYNCHRONIZE, FILE_OPEN)
-            .ok()
-            .map(SettingsFile)
+        create_file(
+            path,
+            FileAccess::GENERIC_READ.union(FileAccess::SYNCHRONIZE),
+            CreateDisposition::Open,
+        )
+        .ok()
+        .map(SettingsFile)
     }
 
     fn write_settings(&mut self, file: SettingsFile, bytes: &[u8]) {
@@ -492,9 +495,7 @@ impl commands::system::Backend for Console {
             return Ok(());
         };
         image.bytes_mut()[length as usize..].fill(0);
-        image
-            .program(options.ignore_version_checking, options.stock_image)
-            .map_err(Win32Error)
+        image.program(options.ignore_version_checking, options.stock_image)
     }
 
     fn flash_abort(&mut self) {
@@ -630,7 +631,7 @@ fn wait_for_disc(image: u32, milliseconds: u32) {
     let mut handle = 0;
     let status = kernel::NtOpenFile(
         &mut handle,
-        SYNCHRONIZE,
+        FileAccess::SYNCHRONIZE.0,
         &attributes,
         &mut status_block,
         FILE_SHARE_READ,
@@ -886,7 +887,7 @@ pub(crate) fn service_launch_override(argument: u32) -> u32 {
 
 /// Result of an export whose server part could not run (on the server
 /// thread, above passive level, or after code 0x02 stopped the server).
-const SERVER_UNAVAILABLE: Hresult = Hresult::FAIL;
+const SERVER_UNAVAILABLE: CommandError = CommandError::Fail;
 
 /// A caller's NUL-terminated string; `None` for a null pointer.
 fn caller_string<'a>(address: u32) -> Option<&'a [u8]> {
@@ -919,7 +920,7 @@ impl TitleArguments {
 
 fn call_with_arguments(service: dispatcher::ServerService, arguments: &TitleArguments) -> u32 {
     call_for_caller(service, arguments as *const TitleArguments as usize as u32)
-        .unwrap_or(SERVER_UNAVAILABLE.0)
+        .unwrap_or(Hresult::from(SERVER_UNAVAILABLE).0)
 }
 
 fn title_arguments<'a>(address: u32) -> &'a TitleArguments {
@@ -960,7 +961,7 @@ extern "C" fn reboot_export(flags: u32) -> u32 {
             let result =
                 commands::system::launch_without_connection(server, console, network, flags, None);
             note_relaunch(console, address);
-            result.0
+            reply::hresult(result).0
         },
         &arguments,
     )
@@ -986,7 +987,7 @@ extern "C" fn launch_title_export(flags: u32, image: u32, drive: u32, command_li
                 caller_string(arguments.command_line),
             );
             note_relaunch(console, address);
-            result.0
+            reply::hresult(result).0
         },
         &arguments,
     )
@@ -1000,15 +1001,15 @@ extern "C" fn set_title_export(dir: u32, name: u32, command_line: u32, flags: u3
     call_with_arguments(
         |server, console, _, address| {
             let arguments = title_arguments(address);
-            commands::system::set_title_from_paths(
+            let result = commands::system::set_title_from_paths(
                 &mut server.state,
                 console,
                 caller_string(arguments.drive),
                 caller_string(arguments.image),
                 caller_string(arguments.command_line),
                 TitleFlags(arguments.flags),
-            )
-            .0
+            );
+            reply::hresult(result).0
         },
         &arguments,
     )

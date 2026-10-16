@@ -1,5 +1,7 @@
 //! Commands for inspecting loaded modules and running threads.
 
+pub use openxbdm_core::status::Win32Error;
+
 use crate::commands::kv::KvLine;
 use crate::commands::kv::parse_kv_line;
 use crate::commands::kv::value_u32;
@@ -236,7 +238,8 @@ pub struct ThreadDetail {
     pub name_address: u32,
     pub name_length: u32,
     pub processor: u32,
-    pub last_error: u32,
+    /// The thread's last Win32 error; `None` for `ERROR_SUCCESS`.
+    pub last_error: Option<Win32Error>,
 }
 
 impl Command for ThreadInfo {
@@ -280,7 +283,9 @@ impl Command for ThreadInfo {
             name_address: require_u32(&kv, "nameaddr").map_err(report_parse)?,
             name_length: require_u32(&kv, "namelen").map_err(report_parse)?,
             processor: require_u32(&kv, "proc").map_err(report_parse)?,
-            last_error: require_u32(&kv, "lasterr").map_err(report_parse)?,
+            last_error: require_u32(&kv, "lasterr")
+                .map(Win32Error::new)
+                .map_err(report_parse)?,
         })
     }
 }
@@ -299,10 +304,6 @@ impl ThreadExitCode {
     pub const STILL_ACTIVE: Self = Self(0x103);
 }
 
-/// Win32 error code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Win32Error(pub u32);
-
 /// `threadstat handle=0x<handle>`: exit status of the thread object a
 /// handle refers to. A missing handle gives `423- bad parameter`.
 #[derive(Debug, Clone, Copy)]
@@ -315,7 +316,8 @@ pub enum ThreadStatus {
     /// `200- Exit Code 0x%x`.
     ExitCode(ThreadExitCode),
     /// `200- Error 0x%x`: the handle did not reference a thread object.
-    LookupFailed(Win32Error),
+    /// `None` when the console translated the failure to `ERROR_SUCCESS`.
+    LookupFailed(Option<Win32Error>),
 }
 
 impl Command for ThreadStat {
@@ -341,7 +343,7 @@ impl Command for ThreadStat {
         if let Some(value) = head.strip_prefix("Exit Code ") {
             hex(value, "Exit Code").map(|code| ThreadStatus::ExitCode(ThreadExitCode(code)))
         } else if let Some(value) = head.strip_prefix("Error ") {
-            hex(value, "Error").map(|code| ThreadStatus::LookupFailed(Win32Error(code)))
+            hex(value, "Error").map(|code| ThreadStatus::LookupFailed(Win32Error::new(code)))
         } else {
             Err(report_parse(ParseError::UnrecognizedShape))
         }
@@ -424,20 +426,21 @@ mod tests {
         let command = ThreadStat {
             handle: ThreadHandle(0x10),
         };
-        let replies: Vec<ThreadStatus> = ["Exit Code 0x103", "Exit Code 0x0", "Error 0x6"]
-            .iter()
-            .map(|head| {
-                command
-                    .parse(Response::Line {
-                        code: SuccessCode::Ok,
-                        head: (*head).to_owned(),
-                    })
-                    .unwrap()
-            })
-            .collect();
+        let replies: Vec<ThreadStatus> =
+            ["Exit Code 0x103", "Exit Code 0x0", "Error 0x6", "Error 0x0"]
+                .iter()
+                .map(|head| {
+                    command
+                        .parse(Response::Line {
+                            code: SuccessCode::Ok,
+                            head: (*head).to_owned(),
+                        })
+                        .unwrap()
+                })
+                .collect();
         insta::assert_snapshot!(
             format!("{replies:x?}"),
-            @"[ExitCode(ThreadExitCode(103)), ExitCode(ThreadExitCode(0)), LookupFailed(Win32Error(6))]"
+            @"[ExitCode(ThreadExitCode(103)), ExitCode(ThreadExitCode(0)), LookupFailed(Some(Win32Error(6))), LookupFailed(None)]"
         );
     }
 }

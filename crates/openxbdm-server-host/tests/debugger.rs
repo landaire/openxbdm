@@ -11,12 +11,15 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use common::TestServer;
+use openxbdm_core::status::NtStatus;
 use openxbdm_server::commands::debugger::BREAKPOINT_BLOCKS;
 use openxbdm_server::commands::debugger::ContextFlags;
 use openxbdm_server::commands::debugger::ExceptionRecord;
+use openxbdm_server::commands::debugger::ExitStatus;
 use openxbdm_server::commands::debugger::MSR_SINGLE_STEP;
 use openxbdm_server::commands::debugger::TRAP_INSTRUCTION;
 use openxbdm_server::commands::debugger::trap;
+use openxbdm_server::commands::services::ThreadHandle;
 use openxbdm_server::notify::ExecutionState;
 use openxbdm_server_host::Host;
 use openxbdm_server_host::backend::memory::MEMORY_BASE;
@@ -471,7 +474,7 @@ fn stop_on_first_chance_exception_and_pass_it_on() {
     session.line();
     assert_eq!(session.command("stopon fce"), "200- OK");
     let record = ExceptionRecord {
-        code: 0xc000_001d,
+        code: NtStatus(0xc000_001d),
         address: CODE,
         parameter_count: 0,
         record_address: 0x7006_e000,
@@ -848,7 +851,7 @@ fn threadstat_reports_exit_code_or_error() {
         .backend
         .debugger
         .thread_handles
-        .insert(0x10, Ok(0x103));
+        .insert(ThreadHandle(0x10), Ok(ExitStatus::STILL_ACTIVE));
     let mut session = server.raw();
     session.line();
     assert_eq!(
@@ -889,7 +892,7 @@ fn kd_commands_switch_routing() {
 
 #[test]
 fn kdnet_settings_are_set_shown_and_switched() {
-    use openxbdm_core::status::NtStatus;
+    use openxbdm_core::status::KernelError;
     use openxbdm_server::commands::console::ConfigSetting;
     use openxbdm_server::commands::debugger::KDNET_RECORD_OFFSET;
     use openxbdm_server::commands::debugger::KDNET_RECORD_SIZE;
@@ -954,7 +957,7 @@ fn kdnet_settings_are_set_shown_and_switched() {
             .contains("\tTarget MAC: 00-11-22-33-44-55\u{1e}")
     );
 
-    server.host.lock().backend.memory.flash_write_failure = Some(NtStatus(0xc000_0022));
+    server.host.lock().backend.memory.flash_write_failure = Some(KernelError::AccessDenied);
     assert_eq!(
         session.command("kdnet set Port=1"),
         "400- kdnet set failed: error code 0xd0000022"
@@ -963,7 +966,7 @@ fn kdnet_settings_are_set_shown_and_switched() {
         session.command("kdnet disable"),
         "200- kdnet disabled: 0xd0000022"
     );
-    server.host.lock().backend.memory.flash_read_failure = Some(NtStatus(0xc000_0001));
+    server.host.lock().backend.memory.flash_read_failure = Some(KernelError::Unsuccessful);
     assert_eq!(
         session.command("kdnet show"),
         "200- kdnet: failed to load current settings: 0xD0000001"
@@ -1179,7 +1182,7 @@ fn data_breakpoint_overlap_uses_the_instruction_access_length() {
 
 #[test]
 fn kdlite_needs_the_hardware_flag_and_persists() {
-    use openxbdm_core::status::NtStatus;
+    use openxbdm_core::status::KernelError;
     use openxbdm_server::commands::console::ConfigSetting;
 
     let server = TestServer::start();
@@ -1213,7 +1216,7 @@ fn kdlite_needs_the_hardware_flag_and_persists() {
         .console
         .xconfig
         .failures
-        .insert(ConfigSetting::new(2, 6), NtStatus(0xc000_0001));
+        .insert(ConfigSetting::new(2, 6), KernelError::Unsuccessful);
     assert_eq!(session.command("kdlite disable"), "400- improper command");
     assert!(server.host.lock().server.state.debugger.kd_lite);
 }

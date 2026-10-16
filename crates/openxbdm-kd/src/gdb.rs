@@ -420,7 +420,7 @@ impl<T: DatagramTransport> KdTarget<T> {
             }
             Some(NtStatus::BREAKPOINT) => SingleThreadStopReason::Signal(Signal::SIGTRAP),
             Some(NtStatus::ACCESS_VIOLATION) => SingleThreadStopReason::Signal(Signal::SIGSEGV),
-            Some(NtStatus(0xc000_001d)) => SingleThreadStopReason::Signal(Signal::SIGILL),
+            Some(NtStatus::ILLEGAL_INSTRUCTION) => SingleThreadStopReason::Signal(Signal::SIGILL),
             _ => SingleThreadStopReason::Signal(Signal::SIGTRAP),
         })
     }

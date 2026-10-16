@@ -12,8 +12,9 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 use core::sync::atomic::fence;
 
-use openxbdm_core::status::Hresult;
+use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::Win32Error;
 
 /// Hook entries, and trampolines (0x91f9f510).
 pub const ENTRY_COUNT: u32 = 0x2e8;
@@ -34,16 +35,29 @@ pub const BLOCK_SIZE: usize = 0x68;
 const COMPLETION_SLOTS: usize = 0x40;
 /// Interval at which the completion worker rechecks delayed completions.
 pub const COMPLETION_POLL_MILLISECONDS: u32 = 200;
-/// `ERROR_IO_PENDING`: the result of a discarded call that completes its
-/// overlapped request later.
-pub const IO_PENDING: u32 = 0x3e5;
 
-/// The engine is not running.
-pub const NOT_RUNNING: Hresult = Hresult::error(0x2a);
-/// The entry id is out of range.
-pub const BAD_ENTRY: Hresult = Hresult::error(0);
-/// Every entry is in use.
-pub const NO_FREE_ENTRY: Hresult = Hresult::error(0x1c);
+/// The word a hooked title function returns: the original's result, or
+/// the configured value of a discarded call. A discarded overlapped call
+/// stores the configured value as the request status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReturnValue(pub u32);
+
+impl ReturnValue {
+    /// `ERROR_IO_PENDING`: the result of a discarded call that completes
+    /// its overlapped request later.
+    pub const IO_PENDING: Self = Self(0x3e5);
+}
+
+/// Why an engine request failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetourError {
+    /// The engine is not running.
+    NotRunning,
+    /// The entry id is out of range.
+    BadEntry,
+    /// Every entry is in use.
+    NoFreeEntry,
+}
 
 /// Index of a hook entry and its trampoline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,11 +147,13 @@ pub struct HookSettings {
     pub address: u32,
     pub param_size: u32,
     pub flags: HookFlags,
-    pub return_value: u32,
+    pub return_value: ReturnValue,
     pub sleep_milliseconds: u32,
     pub discard_frequency: u32,
     pub overlapped_offset: u32,
-    pub extended_error: u32,
+    /// Win32 error a discarded overlapped call completes with; `None`
+    /// for `ERROR_SUCCESS`.
+    pub extended_error: Option<Win32Error>,
 }
 
 /// What `entry query` reports.
@@ -198,6 +214,15 @@ impl Entry {
     fn get(field: &AtomicU32) -> u32 {
         field.load(Ordering::Relaxed)
     }
+
+    fn return_value(&self) -> ReturnValue {
+        ReturnValue(Self::get(&self.return_value))
+    }
+}
+
+/// The stored and logged word of an extended error.
+fn win32_code(error: Option<Win32Error>) -> u32 {
+    error.map_or(0, Win32Error::code)
 }
 
 /// Hook entries on a free list and an in-use list (0x91f9f508,
@@ -519,7 +544,7 @@ pub struct CallContext {
     /// Function the stub calls with the saved arguments; `None` when the
     /// call is discarded.
     pub function: Option<u32>,
-    pub return_value: u32,
+    pub return_value: ReturnValue,
     /// r3 through r10 on entry.
     pub registers: [u64; 8],
     pub overlapped: Option<u32>,
@@ -613,8 +638,8 @@ struct PendingCompletion {
     overlapped: u32,
     event: Option<u32>,
     delay_milliseconds: u32,
-    status: u32,
-    extended_error: u32,
+    status: ReturnValue,
+    extended_error: Option<Win32Error>,
 }
 
 /// The detour engine.
@@ -623,7 +648,8 @@ pub struct Engine {
     log: RecordLog,
     completions: Completions,
     state: AtomicU32,
-    /// Status of the last log open (0x91f9f4f8).
+    /// Status of the last failed log open (0x91f9f4f8); 0 when the last
+    /// open succeeded or none ran since `start`.
     status: AtomicU32,
     /// Sequence number of the last call (0x91f9f504); never reset.
     sequence: AtomicU32,
@@ -660,8 +686,12 @@ impl Engine {
         EngineState::from_code(self.state.load(Ordering::Acquire))
     }
 
-    pub fn status(&self) -> NtStatus {
-        NtStatus(self.status.load(Ordering::Relaxed))
+    /// The error of the last log open.
+    pub fn log_error(&self) -> Option<KernelError> {
+        match self.status.load(Ordering::Relaxed) {
+            0 => None,
+            status => Some(KernelError::from_status(NtStatus(status))),
+        }
     }
 
     fn running(&self) -> bool {
@@ -674,19 +704,19 @@ impl Engine {
             .is_ok()
     }
 
-    fn checked_entry(&self, id: EntryId) -> Result<usize, Hresult> {
+    fn checked_entry(&self, id: EntryId) -> Result<usize, DetourError> {
         if !self.running() {
-            return Err(NOT_RUNNING);
+            return Err(DetourError::NotRunning);
         }
         // Stock accepts an id equal to the entry count and then reads past
         // the table.
-        id.index().ok_or(BAD_ENTRY)
+        id.index().ok_or(DetourError::BadEntry)
     }
 
     /// `log available` (0x91f2bc40): records written but not yet read.
-    pub fn available(&self) -> Result<u32, Hresult> {
+    pub fn available(&self) -> Result<u32, DetourError> {
         if !self.running() {
-            return Err(NOT_RUNNING);
+            return Err(DetourError::NotRunning);
         }
         Ok(self
             .log
@@ -706,23 +736,20 @@ impl Engine {
     }
 
     /// `entry acquire` (0x91f2bac0).
-    pub fn acquire(&self) -> Result<EntryId, Hresult> {
+    pub fn acquire(&self) -> Result<EntryId, DetourError> {
         if !self.running() {
-            return Err(NOT_RUNNING);
+            return Err(DetourError::NotRunning);
         }
         self.table
             .acquire()
             .map(|index| EntryId(index as u32))
-            .ok_or(NO_FREE_ENTRY)
+            .ok_or(DetourError::NoFreeEntry)
     }
 
     /// `entry release` (0x91f2ce68): log a release record and free the
     /// entry.
-    pub fn release(&self, platform: &dyn Platform, id: EntryId) -> Hresult {
-        let index = match self.checked_entry(id) {
-            Ok(index) => index,
-            Err(error) => return error,
-        };
+    pub fn release(&self, platform: &dyn Platform, id: EntryId) -> Result<(), DetourError> {
+        let index = self.checked_entry(id)?;
         if let Some(record) = self.allocate(platform) {
             self.log.set_u32(record, 4, 0);
             self.log.set_u32(record, 0, RecordType::Release as u32);
@@ -731,11 +758,11 @@ impl Engine {
             self.submit(platform, record);
         }
         self.table.release(index);
-        Hresult::OK
+        Ok(())
     }
 
     /// `entry query` (0x91f2bb30).
-    pub fn query(&self, platform: &dyn Platform, id: EntryId) -> Result<Trampoline, Hresult> {
+    pub fn query(&self, platform: &dyn Platform, id: EntryId) -> Result<Trampoline, DetourError> {
         self.checked_entry(id)?;
         let enter = platform.trampolines().wrapping_add(id.0 * TRAMPOLINE_SIZE);
         Ok(Trampoline {
@@ -752,11 +779,8 @@ impl Engine {
         platform: &dyn Platform,
         id: EntryId,
         settings: &HookSettings,
-    ) -> Hresult {
-        let index = match self.checked_entry(id) {
-            Ok(index) => index,
-            Err(error) => return error,
-        };
+    ) -> Result<(), DetourError> {
+        let index = self.checked_entry(id)?;
         if let Some(record) = self.allocate(platform) {
             self.log.set_u32(record, 0x1c, settings.flags.0);
             self.log.set_u32(record, 0x18, id.0);
@@ -765,7 +789,7 @@ impl Engine {
             self.log.set_u64(record, 8, timestamp(platform));
             self.log.set_u32(record, 0x20, settings.address);
             self.log.set_u32(record, 0x24, settings.param_size);
-            self.log.set_u32(record, 0x28, settings.return_value);
+            self.log.set_u32(record, 0x28, settings.return_value.0);
             self.log.set_u64(record, 0x10, platform.system_time());
             self.submit(platform, record);
         }
@@ -776,7 +800,7 @@ impl Engine {
             .store(settings.param_size, Ordering::Relaxed);
         entry
             .return_value
-            .store(settings.return_value, Ordering::Relaxed);
+            .store(settings.return_value.0, Ordering::Relaxed);
         entry.flags.store(settings.flags.0, Ordering::Relaxed);
         entry
             .sleep_milliseconds
@@ -786,11 +810,11 @@ impl Engine {
             .store(settings.discard_frequency, Ordering::Relaxed);
         entry
             .extended_error
-            .store(settings.extended_error, Ordering::Relaxed);
+            .store(win32_code(settings.extended_error), Ordering::Relaxed);
         entry
             .overlapped_offset
             .store(settings.overlapped_offset, Ordering::Relaxed);
-        Hresult::OK
+        Ok(())
     }
 
     /// Release every in-use entry whose address lies in `[base, base +
@@ -865,9 +889,13 @@ impl Engine {
         true
     }
 
-    /// Record the status of a log file open.
-    pub fn set_status(&self, status: NtStatus) {
-        self.status.store(status.0, Ordering::Relaxed);
+    /// Record the result of a log file open.
+    pub fn set_log_result(&self, result: Result<(), KernelError>) {
+        let status = match result {
+            Ok(()) => 0,
+            Err(error) => NtStatus::from(error).0,
+        };
+        self.status.store(status, Ordering::Relaxed);
     }
 
     /// The log files are open: accept records and move from starting to
@@ -1019,7 +1047,7 @@ impl Engine {
             .trampolines()
             .wrapping_add(call.hook.wrapping_mul(TRAMPOLINE_SIZE));
         call.function = Some(enter.wrapping_add(SCRIBBLE_OFFSET));
-        call.return_value = Entry::get(&entry.return_value);
+        call.return_value = entry.return_value();
         call.sequence = self
             .sequence
             .fetch_add(1, Ordering::Relaxed)
@@ -1145,8 +1173,8 @@ impl Engine {
                     } else {
                         0
                     };
-                    call.return_value = IO_PENDING;
-                    platform.write_u32(overlapped, IO_PENDING);
+                    call.return_value = ReturnValue::IO_PENDING;
+                    platform.write_u32(overlapped, ReturnValue::IO_PENDING.0);
                     let handle = platform.read_u32(overlapped.wrapping_add(0xc));
                     let event = if handle != 0 {
                         platform.reference_event(handle)
@@ -1162,12 +1190,12 @@ impl Engine {
                             overlapped,
                             event,
                             delay_milliseconds: delay,
-                            status: Entry::get(&entry.return_value),
-                            extended_error: Entry::get(&entry.extended_error),
+                            status: entry.return_value(),
+                            extended_error: Win32Error::new(Entry::get(&entry.extended_error)),
                         },
                     );
                 }
-                None => call.return_value = Entry::get(&entry.return_value),
+                None => call.return_value = entry.return_value(),
             }
         }
         if entry.flags().contains(HookFlags::SLEEP_AFTER) && call.overlapped.is_none() {
@@ -1184,7 +1212,7 @@ impl Engine {
         self.log.set_u32(record, 4, call.sequence);
         self.log.set_u32(record, 0x14, call.flags.0);
         self.log.set_u32(record, 0x10, call.hook);
-        self.log.set_u32(record, 0x18, call.return_value);
+        self.log.set_u32(record, 0x18, call.return_value.0);
         self.log.set_u64(record, 8, timestamp(platform));
         if entry.flags().contains(HookFlags::SLEEP_AFTER) {
             self.log
@@ -1204,8 +1232,8 @@ impl Engine {
             slot.in_use.store(true, Ordering::Relaxed);
             slot.overlapped.store(pending.overlapped, Ordering::Relaxed);
             slot.extended_error
-                .store(pending.extended_error, Ordering::Relaxed);
-            slot.status.store(pending.status, Ordering::Relaxed);
+                .store(win32_code(pending.extended_error), Ordering::Relaxed);
+            slot.status.store(pending.status.0, Ordering::Relaxed);
             slot.due.store(
                 platform
                     .tick_count()

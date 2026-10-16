@@ -38,5 +38,6 @@ pub use response::ResponseHead;
 pub use response::parse_response_head;
 pub use status::Classified;
 pub use status::ErrorCode;
+pub use status::RemoteStatus;
 pub use status::StatusCode;
 pub use status::SuccessCode;

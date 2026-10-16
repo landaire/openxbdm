@@ -5,6 +5,9 @@
 
 use core::fmt::Write as _;
 
+use openxbdm_core::status::Hresult;
+use openxbdm_core::status::NtStatus;
+
 use crate::text::Text;
 
 /// Characters of an event text: the monitor formats into 0x200 bytes and
@@ -192,20 +195,21 @@ pub fn format_file_event_begin(event: &FileEventBegin<'_>) -> FileEventText {
     text
 }
 
-/// Format an `XBDMFE!End` text.
+/// Format an `XBDMFE!End` text; `result` is the operation's I/O status.
 pub fn format_file_event_end(
     id: FileEventId,
     time_base: u64,
     handle: u32,
-    result: u32,
+    result: NtStatus,
 ) -> FileEventText {
     let mut text = FileEventText::new();
     let _ = write!(
         text,
-        "XBDMFE!End 0x{:08x} \"Perf=0x{:08x}{:08x}\" \"Handle=0x{handle:08x}\" \"Result=0x{result:08x}\"",
+        "XBDMFE!End 0x{:08x} \"Perf=0x{:08x}{:08x}\" \"Handle=0x{handle:08x}\" \"Result=0x{:08x}\"",
         id.0,
         high(time_base),
         time_base as u32,
+        result.0,
     );
     text
 }
@@ -273,12 +277,12 @@ pub fn format_pseudo_begin_io(event: &PseudoBeginIo<'_>) -> FileEventText {
 }
 
 /// Exports 156 (with a handle) and 158 (without): end of a title-reported
-/// event.
+/// event; `result` is the title's value, reported unchanged.
 pub fn format_pseudo_end(
     id: FileEventId,
     time_base: u64,
     handle: Option<u32>,
-    result: u32,
+    result: Hresult,
 ) -> FileEventText {
     let mut text = FileEventText::new();
     let _ = write!(
@@ -292,7 +296,7 @@ pub fn format_pseudo_end(
         Some(handle) => write!(text, " \"Handle=0x{handle:08x}\""),
         None => Ok(()),
     })
-    .and_then(|()| write!(text, " \"Result=0x{result:08x}\""));
+    .and_then(|()| write!(text, " \"Result=0x{:08x}\"", result.0));
     text
 }
 
@@ -410,7 +414,8 @@ mod tests {
 
     #[test]
     fn end_text() {
-        let text = format_file_event_end(FileEventId(7), 0x2_0000_0001, 0x40, 0xc000_0034);
+        let text =
+            format_file_event_end(FileEventId(7), 0x2_0000_0001, 0x40, NtStatus(0xc000_0034));
         assert_eq!(
             text.as_bytes(),
             b"XBDMFE!End 0x00000007 \"Perf=0x0000000200000001\" \"Handle=0x00000040\" \"Result=0xc0000034\""
@@ -548,11 +553,11 @@ mod tests {
     #[test]
     fn pseudo_end_texts() {
         assert_eq!(
-            format_pseudo_end(FileEventId(9), 0x2_0000_0003, Some(0x80), 0).as_bytes(),
+            format_pseudo_end(FileEventId(9), 0x2_0000_0003, Some(0x80), Hresult(0)).as_bytes(),
             b"XBDMFE!PseudoEnd 0x00000009 \"Perf=0x0000000200000003\" \"Handle=0x00000080\" \"Result=0x00000000\""
         );
         assert_eq!(
-            format_pseudo_end(FileEventId(9), 0x2_0000_0003, None, 0x8007_0057).as_bytes(),
+            format_pseudo_end(FileEventId(9), 0x2_0000_0003, None, Hresult(0x8007_0057)).as_bytes(),
             b"XBDMFE!PseudoEnd 0x00000009 \"Perf=0x0000000200000003\" \"Result=0x80070057\""
         );
     }

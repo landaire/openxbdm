@@ -7,7 +7,9 @@ use core::fmt::Write as _;
 use openxbdm_core::line::Value;
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::Win32Error;
 
 use crate::access::Access;
 use crate::commands::console;
@@ -21,6 +23,10 @@ use crate::continuation::ContinuationContext;
 use crate::invocation::Invocation;
 use crate::registry::CommandEntry;
 use crate::registry::DispatchFlags;
+use crate::reply;
+use crate::reply::CommandError;
+use crate::reply::CommandResult;
+use crate::reply::Reply;
 use crate::state::ServerState;
 use crate::text::Text;
 use crate::transfer_blocks::TransferBlock;
@@ -385,14 +391,53 @@ pub enum XexFieldError {
     FieldAbsent,
 }
 
-impl XexFieldError {
-    fn hresult(self) -> Hresult {
-        match self {
-            Self::NoSuchModule => Hresult::from_error_code(ErrorCode::NO_SUCH_MODULE),
-            Self::FieldAbsent => Hresult::error(0x25),
+impl From<XexFieldError> for CommandError {
+    fn from(error: XexFieldError) -> Self {
+        match error {
+            XexFieldError::NoSuchModule => ErrorCode::NoSuchModule.into(),
+            XexFieldError::FieldAbsent => Self::Memory(MemoryError::NoSuchField),
         }
     }
 }
+
+/// Failures of this domain that no other [`CommandError`] form reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryError {
+    /// 437: the XEX header has no such field.
+    NoSuchField,
+    /// 442: the detour engine is not running.
+    DetourNotRunning,
+    /// Saving the tracking records failed; the kernel's Win32 translation
+    /// of the status.
+    TrackingSave(Win32Error),
+}
+
+impl From<MemoryError> for Hresult {
+    fn from(error: MemoryError) -> Self {
+        match error {
+            MemoryError::NoSuchField => Hresult::error(0x25),
+            MemoryError::DetourNotRunning => Hresult::error(0x2a),
+            // Stock moves the code to the Win32 facility without the sign
+            // test of HRESULT_FROM_WIN32.
+            MemoryError::TrackingSave(error) => Hresult(0x8007_0000 | (error.code() & 0xffff)),
+        }
+    }
+}
+
+impl From<detour::DetourError> for CommandError {
+    fn from(error: detour::DetourError) -> Self {
+        match error {
+            detour::DetourError::NotRunning => Self::Memory(MemoryError::DetourNotRunning),
+            detour::DetourError::BadEntry => ErrorCode::Undefined.into(),
+            detour::DetourError::NoFreeEntry => ErrorCode::OutOfMemory.into(),
+        }
+    }
+}
+
+/// `ERROR_NOT_FOUND`: the module has no CodeView record.
+const NOT_FOUND: Win32Error = Win32Error::new(0x490).unwrap();
+/// `ERROR_SERVICE_NOT_ACTIVE`: no allocation type is tracked.
+const SERVICE_NOT_ACTIVE: Win32Error = Win32Error::new(0x426).unwrap();
 
 /// XEX optional header field key: the high bits identify the field and the
 /// low byte encodes its size.
@@ -467,9 +512,9 @@ pub trait Backend {
     fn running_executable_path(&mut self, output: &mut [u8]) -> usize;
 
     /// Read bytes at `offset` of the raw flash device.
-    fn read_flash(&mut self, offset: u32, output: &mut [u8]) -> Result<(), NtStatus>;
+    fn read_flash(&mut self, offset: u32, output: &mut [u8]) -> Result<(), KernelError>;
     /// Write bytes at `offset` of the raw flash device.
-    fn write_flash(&mut self, offset: u32, data: &[u8]) -> Result<(), NtStatus>;
+    fn write_flash(&mut self, offset: u32, data: &[u8]) -> Result<(), KernelError>;
 
     /// Configure kernel import tracing for `module`; `false` when the
     /// kernel rejects the module name.
@@ -479,9 +524,10 @@ pub trait Backend {
     fn tracking_flags(&mut self) -> TrackingFlags;
     fn set_tracking_flags(&mut self, flags: TrackingFlags);
     /// Write every allocation tracking record to `file`.
-    fn write_tracking_records(&mut self, file: filesystem::FileHandle) -> NtStatus;
-    /// `RtlNtStatusToDosError`.
-    fn dos_error_from_nt_status(&mut self, status: NtStatus) -> u32;
+    fn write_tracking_records(&mut self, file: filesystem::FileHandle) -> Result<(), KernelError>;
+    /// `RtlNtStatusToDosError`; `None` when the kernel translates `error`
+    /// to `ERROR_SUCCESS`.
+    fn dos_error_from_nt_status(&mut self, error: KernelError) -> Option<Win32Error>;
 
     /// Run `operation` with the detour engine and the platform services
     /// it uses.
@@ -489,8 +535,8 @@ pub trait Backend {
     /// Create the detour log writer and completion workers. `log` is the
     /// translated log file name, `None` when translation failed. The engine
     /// is starting; the writer opens the log and moves it to running or
-    /// back to stopped. Returns the worker creation status.
-    fn start_detour_log(&mut self, log: Option<&[u8]>) -> NtStatus;
+    /// back to stopped. Fails when a worker cannot be created.
+    fn start_detour_log(&mut self, log: Option<&[u8]>) -> Result<(), KernelError>;
     /// Shut down the workers after [`detour::Engine::begin_stop`], delete
     /// `log` when it translated, and return the engine to stopped.
     fn stop_detour_log(&mut self, log: Option<&[u8]>);
@@ -549,7 +595,10 @@ pub enum ExecutableInfoLine {
     End,
 }
 
-pub(crate) fn resume(continuation: &mut Continuation, cx: &mut ContinuationContext<'_>) -> Hresult {
+pub(crate) fn resume(
+    continuation: &mut Continuation,
+    cx: &mut ContinuationContext<'_>,
+) -> CommandResult {
     match continuation {
         Continuation::GetMemory { address, remaining } => get_memory_lines(address, remaining, cx),
         Continuation::GetMemoryBinary { address, remaining } => {
@@ -632,18 +681,18 @@ fn hex_digit(value: u8) -> u8 {
 
 /// `getmem addr=<dword> length=<dword>`: hex dump in 32-byte lines; bytes
 /// of unmapped pages print as `??`.
-fn get_memory(invocation: &mut Invocation<'_>) -> Hresult {
+fn get_memory(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.session.is_none() {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     let Some(address) = util::required_dword(invocation, "addr") else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let Some(length) = util::required_dword(invocation, "length") else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let Some(session) = invocation.session.as_deref_mut() else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     session.receive_remaining = None;
     session.continuation = AnyContinuation::Memory(Continuation::GetMemory {
@@ -651,7 +700,7 @@ fn get_memory(invocation: &mut Invocation<'_>) -> Hresult {
         remaining: length,
     });
     invocation.set_text(format_args!("memory data follows"));
-    Hresult::MULTILINE
+    Ok(Reply::Multiline)
 }
 
 /// Write up to 16 lines of raw output. A byte whose read fails inside a
@@ -661,9 +710,9 @@ fn get_memory_lines(
     address: &mut u32,
     remaining: &mut u32,
     cx: &mut ContinuationContext<'_>,
-) -> Hresult {
+) -> CommandResult {
     if *remaining == 0 {
-        return Hresult::END_OF_DATA;
+        return Err(CommandError::EndOfData);
     }
     let mut offset = 0usize;
     let mut page_valid = false;
@@ -702,14 +751,14 @@ fn get_memory_lines(
         *remaining -= count;
     }
     cx.binary_len = offset;
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `setmem addr=<dword> data=<hex>`: write bytes until a page is invalid or
 /// a byte cannot be written.
-fn set_memory(invocation: &mut Invocation<'_>) -> Hresult {
+fn set_memory(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(address) = util::required_dword(invocation, "addr") else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let mut digits = invocation.line.param("data").map(|value| value.bytes());
     let mut written = 0u32;
@@ -720,7 +769,7 @@ fn set_memory(invocation: &mut Invocation<'_>) -> Hresult {
         let low = digits.as_mut().and_then(Iterator::next);
         let (Some(high), Some(low)) = (hex_value(high), low.and_then(hex_value)) else {
             invocation.text.set_bytes(b"400- syntax error in data");
-            return Hresult::FAIL;
+            return Err(CommandError::Fail);
         };
         let page = current & !(PAGE_SIZE - 1);
         if checked_page != Some(page) {
@@ -742,9 +791,9 @@ fn set_memory(invocation: &mut Invocation<'_>) -> Hresult {
     }
     invocation.set_text(format_args!("set {written} bytes"));
     if stopped {
-        Hresult::from_error_code(ErrorCode::MEMORY_NOT_MAPPED)
+        Err(ErrorCode::MemoryNotMapped.into())
     } else {
-        Hresult::OK
+        Ok(Reply::Ok)
     }
 }
 
@@ -760,21 +809,21 @@ fn hex_value(digit: u8) -> Option<u8> {
 /// `getmemex addr=<dword> length=<dword>`: binary chunks of at most 0x400
 /// bytes, each after a little-endian u16 header.
 /// The monitor looks up `ADDR` and `LENGTH`; the missing texts name them so.
-fn get_memory_binary(invocation: &mut Invocation<'_>) -> Hresult {
+fn get_memory_binary(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(address) = util::required_dword(invocation, "ADDR") else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let Some(length) = util::required_dword(invocation, "LENGTH") else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
     let Some(session) = invocation.session.as_deref_mut() else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     session.continuation = AnyContinuation::Memory(Continuation::GetMemoryBinary {
         address,
         remaining: length,
     });
-    Hresult::BINARY
+    Ok(Reply::Binary)
 }
 
 /// One chunk. The data ends at the first unreadable page, which also ends
@@ -785,9 +834,9 @@ fn get_memory_chunk(
     address: &mut u32,
     remaining: &mut u32,
     cx: &mut ContinuationContext<'_>,
-) -> Hresult {
+) -> CommandResult {
     if cx.aborted || *remaining == 0 {
-        return Hresult::END_OF_DATA;
+        return Err(CommandError::EndOfData);
     }
     let start = *address;
     let mut count = (*remaining).min(GETMEMEX_CHUNK);
@@ -819,21 +868,21 @@ fn get_memory_chunk(
     cx.state.debugger.restore_saved(start, data);
     cx.binary[..2].copy_from_slice(&header.to_le_bytes());
     cx.binary_len = count as usize + 2;
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `walkmem`: every valid virtual range below 0xa0000000, excluding device
 /// ranges.
-fn walk_memory(invocation: &mut Invocation<'_>) -> Hresult {
+fn walk_memory(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(session) = invocation.session.as_deref_mut() else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     session.continuation = AnyContinuation::Memory(Continuation::WalkMemory {
         cursor: 0,
         active: true,
     });
     invocation.set_text(format_args!("Valid Virtual Address Ranges Follow"));
-    Hresult::MULTILINE
+    Ok(Reply::Multiline)
 }
 
 /// A valid virtual address range.
@@ -891,7 +940,7 @@ fn walk_memory_lines(
     cursor: &mut u32,
     active: &mut bool,
     cx: &mut ContinuationContext<'_>,
-) -> Hresult {
+) -> CommandResult {
     let mut writer = RawWriter {
         buffer: cx.binary,
         len: 0,
@@ -909,26 +958,26 @@ fn walk_memory_lines(
         }
     }
     if writer.len == 0 {
-        return Hresult::END_OF_DATA;
+        return Err(CommandError::EndOfData);
     }
     cx.binary_len = writer.len;
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `modules`: every loaded module with an NT header.
-fn modules(invocation: &mut Invocation<'_>) -> Hresult {
+fn modules(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(session) = invocation.session.as_deref_mut() else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     session.continuation = AnyContinuation::Memory(Continuation::Modules {
         next: ModuleIndex(0),
     });
-    Hresult::MULTILINE
+    Ok(Reply::Multiline)
 }
 
-fn module_line(next: &mut ModuleIndex, cx: &mut ContinuationContext<'_>) -> Hresult {
+fn module_line(next: &mut ModuleIndex, cx: &mut ContinuationContext<'_>) -> CommandResult {
     let Some(module) = cx.backend.module(*next) else {
-        return Hresult::END_OF_DATA;
+        return Err(CommandError::EndOfData);
     };
     next.0 += 1;
     let mut writer = RawWriter {
@@ -951,28 +1000,28 @@ fn module_line(next: &mut ModuleIndex, cx: &mut ContinuationContext<'_>) -> Hres
         module.image_size,
     );
     cx.binary_len = writer.len;
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `modsections name=<str>`: the section table of a loaded module.
-fn module_sections(invocation: &mut Invocation<'_>) -> Hresult {
+fn module_sections(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.session.is_none() {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     let mut name = [0u8; NAME_PARAMETER_CAPACITY];
     if string_param(invocation, "name", &mut name).is_none() {
         invocation.set_text(format_args!("missing name"));
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     if invocation
         .backend
         .module_section(c_string(&name), SectionIndex(1))
         .is_err()
     {
-        return Hresult::from_error_code(ErrorCode::NO_SUCH_MODULE);
+        return Err(ErrorCode::NoSuchModule.into());
     }
     let Some(name) = hold(invocation, &name) else {
-        return Hresult::OUT_OF_MEMORY;
+        return Err(CommandError::OutOfMemory);
     };
     if let Some(session) = invocation.session.as_deref_mut() {
         session.continuation = AnyContinuation::Memory(Continuation::Sections {
@@ -980,7 +1029,7 @@ fn module_sections(invocation: &mut Invocation<'_>) -> Hresult {
             next: SectionIndex(1),
         });
     }
-    Hresult::MULTILINE
+    Ok(Reply::Multiline)
 }
 
 /// Hold `data` for the transfer of the invocation's connection (stock
@@ -1009,11 +1058,11 @@ fn section_line(
     held: TransferBlock,
     next: &mut SectionIndex,
     cx: &mut ContinuationContext<'_>,
-) -> Hresult {
+) -> CommandResult {
     let name = held_name(cx, held);
     let Ok(Some(section)) = cx.backend.module_section(c_string(&name), *next) else {
         cx.state.transfer_blocks.release(cx.backend, held);
-        return Hresult::END_OF_DATA;
+        return Err(CommandError::EndOfData);
     };
     let index = next.0;
     next.0 = next.0.wrapping_add(1);
@@ -1032,24 +1081,24 @@ fn section_line(
         section.flags()
     );
     cx.binary_len = writer.len;
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `pdbinfo addr=<dword>`: GUID, age, and PDB path of the module loaded at
 /// `addr`.
-fn pdb_info(invocation: &mut Invocation<'_>) -> Hresult {
+fn pdb_info(invocation: &mut Invocation<'_>) -> CommandResult {
     let code_view = match invocation.line.dword("addr") {
         Some(base) => invocation
             .backend
             .code_view(base)
-            .ok_or(Hresult(0x8007_0490)),
-        None => Err(Hresult::INVALID_ARGUMENT),
+            .ok_or(CommandError::Win32(NOT_FOUND)),
+        None => Err(CommandError::InvalidArgument),
     };
     let code_view = match code_view {
         Ok(code_view) => code_view,
-        Err(result) => {
-            invocation.set_text(format_args!("HRESULT 0x{:X}", result.0));
-            return result;
+        Err(error) => {
+            invocation.set_text(format_args!("HRESULT 0x{:X}", Hresult::from(error).0));
+            return Err(error);
         }
     };
     invocation.text.clear();
@@ -1059,23 +1108,23 @@ fn pdb_info(invocation: &mut Invocation<'_>) -> Hresult {
             .push_bytes(&[hex_digit(byte >> 4), hex_digit(*byte)]);
     }
     let _ = invocation.text.push_bytes(code_view.path());
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `xexfield module=<str> field=<dword>`: an XEX optional header field of a
 /// loaded module as hex.
-fn xex_field(invocation: &mut Invocation<'_>) -> Hresult {
+fn xex_field(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.session.is_none() {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     let mut module = [0u8; NAME_PARAMETER_CAPACITY];
     if string_param(invocation, "module", &mut module).is_none() {
         invocation.set_text(format_args!("missing module"));
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     let Some(field) = invocation.line.dword("field") else {
         invocation.set_text(format_args!("missing field"));
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     let field = XexFieldKey(field);
     let name = c_string(&module);
@@ -1089,15 +1138,12 @@ fn xex_field(invocation: &mut Invocation<'_>) -> Hresult {
         })?;
         Ok((value, size))
     });
-    let (value, size) = match size {
-        Ok(found) => found,
-        Err(error) => return error.hresult(),
-    };
+    let (value, size) = size?;
     if size == 0 {
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     let Some(module) = hold(invocation, &module) else {
-        return Hresult::OUT_OF_MEMORY;
+        return Err(CommandError::OutOfMemory);
     };
     if let Some(session) = invocation.session.as_deref_mut() {
         session.continuation = AnyContinuation::Memory(Continuation::XexField {
@@ -1108,7 +1154,7 @@ fn xex_field(invocation: &mut Invocation<'_>) -> Hresult {
             remaining: size.wrapping_add(4),
         });
     }
-    Hresult::MULTILINE
+    Ok(Reply::Multiline)
 }
 
 fn xex_field_line(
@@ -1118,15 +1164,15 @@ fn xex_field_line(
     size: u32,
     remaining: &mut u32,
     cx: &mut ContinuationContext<'_>,
-) -> Hresult {
+) -> CommandResult {
     if *remaining > size {
         let _ = write!(cx.line, "fieldsize=0x{size:08x}");
         *remaining = remaining.wrapping_sub(4);
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     if *remaining == 0 {
         cx.state.transfer_blocks.release(cx.backend, held);
-        return Hresult::END_OF_DATA;
+        return Err(CommandError::EndOfData);
     }
     let offset = size - *remaining;
     let count = (*remaining).min(XEX_FIELD_BYTES_PER_LINE);
@@ -1142,7 +1188,7 @@ fn xex_field_line(
             .read_xex_header_field(c_string(&module), field, offset, data)
             .is_err()
         {
-            return Hresult::FAIL;
+            return Err(CommandError::Fail);
         }
     }
     for byte in data.iter() {
@@ -1151,24 +1197,24 @@ fn xex_field_line(
             .push_bytes(&[hex_digit(byte >> 4), hex_digit(*byte)]);
     }
     *remaining -= count;
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `xbeinfo running` or `xbeinfo name=<str> [ondiskonly]`: the object path
 /// of the running executable. A named query reports the running executable
 /// too; `ondiskonly` opens the named file and reports it missing.
-fn executable_info(invocation: &mut Invocation<'_>) -> Hresult {
+fn executable_info(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.session.is_none() {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     let mut name = [0u8; NAME_PARAMETER_CAPACITY];
     let running = invocation.line.has("running");
     if !running && string_param(invocation, "name", &mut name).is_none() {
         invocation.set_text(format_args!("missing name"));
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     let Some(socket) = invocation.session.as_ref().map(|session| session.socket()) else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     // Stock allocates the reply block (0x114 bytes) before the query.
     let Some(held) = invocation.state.transfer_blocks.acquire(
@@ -1176,7 +1222,7 @@ fn executable_info(invocation: &mut Invocation<'_>) -> Hresult {
         socket,
         EXECUTABLE_PATH_CAPACITY as u32,
     ) else {
-        return Hresult::OUT_OF_MEMORY;
+        return Err(CommandError::OutOfMemory);
     };
     if !running && invocation.line.has("ondiskonly") {
         // Stock leaves the handle open and reports the file missing
@@ -1199,7 +1245,7 @@ fn executable_info(invocation: &mut Invocation<'_>) -> Hresult {
             .state
             .transfer_blocks
             .release(invocation.backend, held);
-        return Hresult::from_error_code(ErrorCode::FILE_NOT_FOUND);
+        return Err(ErrorCode::FileNotFound.into());
     }
     let mut object_path = [0u8; EXECUTABLE_PATH_CAPACITY];
     let length = invocation.backend.running_executable_path(&mut object_path);
@@ -1221,7 +1267,7 @@ fn executable_info(invocation: &mut Invocation<'_>) -> Hresult {
             line: ExecutableInfoLine::Header,
         });
     }
-    Hresult::MULTILINE
+    Ok(Reply::Multiline)
 }
 
 fn executable_info_line(
@@ -1229,7 +1275,7 @@ fn executable_info_line(
     path_len: usize,
     line: &mut ExecutableInfoLine,
     cx: &mut ContinuationContext<'_>,
-) -> Hresult {
+) -> CommandResult {
     match *line {
         ExecutableInfoLine::Header => {
             // This build reports no timestamp or checksum.
@@ -1250,15 +1296,15 @@ fn executable_info_line(
         }
         ExecutableInfoLine::End => {
             cx.state.transfer_blocks.release(cx.backend, held);
-            return Hresult::END_OF_DATA;
+            return Err(CommandError::EndOfData);
         }
     }
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `addtitlemem`: the running title's additional title memory when the
 /// console runs its extra memory; 0 otherwise.
-fn additional_title_memory(invocation: &mut Invocation<'_>) -> Hresult {
+fn additional_title_memory(invocation: &mut Invocation<'_>) -> CommandResult {
     let mut value = 0;
     if console::console_memory(invocation.backend).value() & 0x2 != 0 {
         match invocation
@@ -1266,35 +1312,35 @@ fn additional_title_memory(invocation: &mut Invocation<'_>) -> Hresult {
             .title_xex_dword(XexFieldKey(XEX_FIELD_ADDITIONAL_TITLE_MEMORY))
         {
             Ok(field) => value = field.unwrap_or(0),
-            Err(NoSuchModule) => return Hresult::from_error_code(ErrorCode::NO_SUCH_MODULE),
+            Err(NoSuchModule) => return Err(ErrorCode::NoSuchModule.into()),
         }
     }
     invocation.set_text(format_args!("addtitlemem=0x{value:x}"));
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `advmem on|off|status`: the advanced memory flag in the raw flash.
-fn advanced_memory(invocation: &mut Invocation<'_>) -> Hresult {
+fn advanced_memory(invocation: &mut Invocation<'_>) -> CommandResult {
     let mut word = [0u8; 2];
     if invocation
         .backend
         .read_flash(ADVANCED_MEMORY_FLASH_OFFSET, &mut word)
         .is_err()
     {
-        return Hresult::UNEXPECTED;
+        return Err(CommandError::Unexpected);
     }
     let word = u16::from_be_bytes(word);
     let disabled = word & ADVANCED_MEMORY_DISABLED != 0;
     let text = if invocation.line.has("on") {
         if !disabled {
             invocation.set_text(format_args!("already enabled"));
-            return Hresult::OK;
+            return Ok(Reply::Ok);
         }
         "enabled"
     } else if invocation.line.has("off") {
         if disabled {
             invocation.set_text(format_args!("already disabled"));
-            return Hresult::OK;
+            return Ok(Reply::Ok);
         }
         "disabled"
     } else if invocation.line.has("status") {
@@ -1302,10 +1348,10 @@ fn advanced_memory(invocation: &mut Invocation<'_>) -> Hresult {
             "{}",
             if disabled { "disabled" } else { "enabled" }
         ));
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     } else {
         invocation.set_text(format_args!("improper command"));
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     let toggled = (word ^ ADVANCED_MEMORY_DISABLED).to_be_bytes();
     if invocation
@@ -1313,21 +1359,21 @@ fn advanced_memory(invocation: &mut Invocation<'_>) -> Hresult {
         .write_flash(ADVANCED_MEMORY_FLASH_OFFSET, &toggled)
         .is_err()
     {
-        return Hresult::UNEXPECTED;
+        return Err(CommandError::Unexpected);
     }
     invocation.set_text(format_args!("{text}"));
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `traceimports modulename=<str> [enabled=on]`: configure kernel import
 /// tracing for the next title launch.
-fn trace_imports(invocation: &mut Invocation<'_>) -> Hresult {
+fn trace_imports(invocation: &mut Invocation<'_>) -> CommandResult {
     let mut enabled = [0u8; TRACE_ENABLED_CAPACITY];
     let enable = string_param(invocation, "enabled", &mut enabled)
         .is_some_and(|value| value.eq_ignore_ascii_case(b"on"));
     let mut module = [0u8; TRACE_MODULE_CAPACITY];
     let Some(module) = string_param(invocation, "modulename", &mut module) else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     let mut message = Text::<{ TRACE_MODULE_CAPACITY + 0x50 }>::new();
     let accepted = invocation.backend.trace_imports(module, enable);
@@ -1343,12 +1389,16 @@ fn trace_imports(invocation: &mut Invocation<'_>) -> Hresult {
         let _ = message.push_bytes(b"' is not a valid choice\n");
     }
     invocation.backend.debug_print(message.as_bytes());
-    if accepted { Hresult::OK } else { Hresult::FAIL }
+    if accepted {
+        Ok(Reply::Ok)
+    } else {
+        Err(CommandError::Fail)
+    }
 }
 
 /// `detour log|entry|start|stop|getstate ...`: the function detour engine.
 /// Selectors are flags tested in that order.
-fn detour_command(invocation: &mut Invocation<'_>) -> Hresult {
+fn detour_command(invocation: &mut Invocation<'_>) -> CommandResult {
     let line = invocation.line;
     if line.has("log") {
         if line.has("available") {
@@ -1357,7 +1407,7 @@ fn detour_command(invocation: &mut Invocation<'_>) -> Hresult {
         if line.has("getentries") {
             return detour_get_entries(invocation);
         }
-        return Hresult::from_error_code(ErrorCode::UNKNOWN_COMMAND);
+        return Err(ErrorCode::UnknownCommand.into());
     }
     if line.has("entry") {
         return detour_entry(invocation);
@@ -1370,11 +1420,17 @@ fn detour_command(invocation: &mut Invocation<'_>) -> Hresult {
     }
     if line.has("getstate") {
         let reply = run_detour(invocation.backend, DetourOperation::State);
-        let [state, status, _] = reply.values;
-        invocation.set_text(format_args!("state=0x{state:x} status=0x{status:x}"));
-        return Hresult::OK;
+        let status = match reply.log_error {
+            Some(error) => NtStatus::from(error),
+            None => NtStatus::SUCCESS,
+        };
+        invocation.set_text(format_args!(
+            "state=0x{:x} status=0x{:x}",
+            reply.values[0], status.0
+        ));
+        return Ok(Reply::Ok);
     }
-    Hresult::from_error_code(ErrorCode::UNKNOWN_COMMAND)
+    Err(ErrorCode::UnknownCommand.into())
 }
 
 /// An operation of the detour engine.
@@ -1396,44 +1452,52 @@ enum DetourOperation<'a> {
 /// Result of a [`DetourOperation`] and the values it reports.
 #[derive(Clone, Copy)]
 struct DetourReply {
-    result: Hresult,
+    result: Result<(), detour::DetourError>,
     values: [u32; 3],
+    /// `State`: the error of the last log open.
+    log_error: Option<KernelError>,
 }
 
 impl DetourReply {
-    fn of(result: Hresult) -> Self {
+    fn of(result: Result<(), detour::DetourError>) -> Self {
         Self {
             result,
             values: [0; 3],
+            log_error: None,
         }
     }
 
-    fn of_values(values: Result<[u32; 3], Hresult>) -> Self {
+    fn of_values(values: Result<[u32; 3], detour::DetourError>) -> Self {
         match values {
             Ok(values) => Self {
-                result: Hresult::OK,
                 values,
+                ..Self::of(Ok(()))
             },
-            Err(error) => Self::of(error),
+            Err(error) => Self::of(Err(error)),
         }
     }
 
-    /// OK when `running`, else [`detour::NOT_RUNNING`].
+    /// Fails with [`detour::DetourError::NotRunning`] unless `running`.
     fn of_running(running: bool) -> Self {
         Self::of(if running {
-            Hresult::OK
+            Ok(())
         } else {
-            detour::NOT_RUNNING
+            Err(detour::DetourError::NotRunning)
         })
+    }
+
+    fn command_result(self) -> CommandResult {
+        self.result.map(|()| Reply::Ok).map_err(CommandError::from)
     }
 }
 
 impl DetourOperation<'_> {
     fn run(self, engine: &detour::Engine, platform: &dyn detour::Platform) -> DetourReply {
         match self {
-            Self::State => {
-                DetourReply::of_values(Ok([engine.state().code(), engine.status().0, 0]))
-            }
+            Self::State => DetourReply {
+                log_error: engine.log_error(),
+                ..DetourReply::of_values(Ok([engine.state().code(), 0, 0]))
+            },
             Self::Running => {
                 DetourReply::of_running(engine.state() == detour::EngineState::Running)
             }
@@ -1457,12 +1521,12 @@ impl DetourOperation<'_> {
             Self::BeginStart => DetourReply::of_running(engine.begin_start()),
             Self::CancelStart => {
                 engine.cancel_start();
-                DetourReply::of(Hresult::OK)
+                DetourReply::of(Ok(()))
             }
             Self::BeginStop => DetourReply::of_running(engine.begin_stop()),
             Self::ReleaseRange { base, size } => {
                 engine.release_range(platform, base, size);
-                DetourReply::of(Hresult::OK)
+                DetourReply::of(Ok(()))
             }
         }
     }
@@ -1474,99 +1538,99 @@ fn run_detour(
     backend: &mut dyn crate::backend::Backend,
     operation: DetourOperation<'_>,
 ) -> DetourReply {
-    let mut reply = DetourReply::of(detour::NOT_RUNNING);
+    let mut reply = DetourReply::of(Err(detour::DetourError::NotRunning));
     backend.detour(&mut |engine, platform| reply = operation.run(engine, platform));
     reply
 }
 
 /// Set the reply text `hresult=0x<result>` and return `result`.
-fn hresult_reply(invocation: &mut Invocation<'_>, result: Hresult) -> Hresult {
-    invocation.set_text(format_args!("hresult=0x{:x}", result.0));
+fn hresult_reply(invocation: &mut Invocation<'_>, result: CommandResult) -> CommandResult {
+    invocation.set_text(format_args!("hresult=0x{:x}", reply::hresult(result).0));
     result
 }
 
-fn detour_available(invocation: &mut Invocation<'_>) -> Hresult {
+fn detour_available(invocation: &mut Invocation<'_>) -> CommandResult {
     let reply = run_detour(invocation.backend, DetourOperation::Available);
-    if reply.result == Hresult::OK {
-        invocation.set_text(format_args!("available=0x{:x}", reply.values[0]));
-    }
-    reply.result
+    reply.result?;
+    invocation.set_text(format_args!("available=0x{:x}", reply.values[0]));
+    Ok(Reply::Ok)
 }
 
 /// `log getentries [count=]`: up to `count` 0x70-byte records after a 203
 /// line, without a length; the stream ends early when the unread records
 /// run out.
-fn detour_get_entries(invocation: &mut Invocation<'_>) -> Hresult {
+fn detour_get_entries(invocation: &mut Invocation<'_>) -> CommandResult {
     // The getter's result is ignored: an absent count is 0 and a malformed
     // one keeps its parsed prefix.
     let count = invocation
         .line
         .param("count")
         .map_or(0, |value| value.dword_prefix());
-    let running = run_detour(invocation.backend, DetourOperation::Running).result;
-    if running != Hresult::OK {
-        return running;
-    }
+    run_detour(invocation.backend, DetourOperation::Running).result?;
     invocation.set_text(format_args!(
         "OK count=0x{count:x} entrysize=0x{:x}",
         detour::RECORD_SIZE
     ));
     let Some(session) = invocation.session.as_deref_mut() else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     session.continuation = AnyContinuation::Memory(Continuation::DetourLog {
         remaining: count.wrapping_mul(detour::RECORD_SIZE as u32),
     });
-    Hresult::BINARY
+    Ok(Reply::Binary)
 }
 
-fn detour_log_record(remaining: &mut u32, cx: &mut ContinuationContext<'_>) -> Hresult {
+fn detour_log_record(remaining: &mut u32, cx: &mut ContinuationContext<'_>) -> CommandResult {
     if cx.aborted || *remaining == 0 {
-        return Hresult::END_OF_DATA;
+        return Err(CommandError::EndOfData);
     }
     let Some(record) = cx.binary.first_chunk_mut::<{ detour::RECORD_SIZE }>() else {
-        return Hresult::END_OF_DATA;
+        return Err(CommandError::EndOfData);
     };
     if !cx.backend.read_detour_record(record) {
-        return Hresult::END_OF_DATA;
+        return Err(CommandError::EndOfData);
     }
     *remaining = remaining.wrapping_sub(detour::RECORD_SIZE as u32);
     cx.binary_len = detour::RECORD_SIZE;
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
-fn detour_entry(invocation: &mut Invocation<'_>) -> Hresult {
+fn detour_entry(invocation: &mut Invocation<'_>) -> CommandResult {
     let line = invocation.line;
     let id = line.dword("Id").map(detour::EntryId);
-    let bad_parameter = Hresult::from_error_code(ErrorCode::BAD_PARAMETER);
+    let bad_parameter: CommandResult = Err(ErrorCode::BadParameter.into());
     if line.has("acquire") {
         let reply = run_detour(invocation.backend, DetourOperation::Acquire);
-        if reply.result == Hresult::OK {
-            invocation.set_text(format_args!(
-                "hresult=0x{:x} id=0x{:x}",
-                reply.result.0, reply.values[0]
-            ));
-        }
-        return reply.result;
+        reply.result?;
+        invocation.set_text(format_args!(
+            "hresult=0x{:x} id=0x{:x}",
+            Hresult::OK.0,
+            reply.values[0]
+        ));
+        return Ok(Reply::Ok);
     }
     if line.has("release") {
         let result = match id {
-            Some(id) => run_detour(invocation.backend, DetourOperation::Release(id)).result,
+            Some(id) => {
+                run_detour(invocation.backend, DetourOperation::Release(id)).command_result()
+            }
             None => bad_parameter,
         };
         return hresult_reply(invocation, result);
     }
     if line.has("query") {
-        let reply = match id {
-            Some(id) => run_detour(invocation.backend, DetourOperation::Query(id)),
-            None => DetourReply::of(bad_parameter),
+        let (result, [enter, scribble, size]) = match id {
+            Some(id) => {
+                let reply = run_detour(invocation.backend, DetourOperation::Query(id));
+                (reply.command_result(), reply.values)
+            }
+            None => (bad_parameter, [0; 3]),
         };
-        let [enter, scribble, size] = reply.values;
         invocation.set_text(format_args!(
             "hresult=0x{:x} enterdetour=0x{enter:x} scribble=0x{scribble:x} size=0x{size:x}",
-            reply.result.0
+            reply::hresult(result).0
         ));
-        return reply.result;
+        return result;
     }
     if line.has("setinfo") {
         let required = |name: &str| line.dword(name);
@@ -1579,63 +1643,64 @@ fn detour_entry(invocation: &mut Invocation<'_>) -> Hresult {
                     address: required("addr")?,
                     param_size: required("paramsize")?,
                     flags: detour::HookFlags(required("flags")?),
-                    return_value: required("return")?,
+                    return_value: detour::ReturnValue(required("return")?),
                     sleep_milliseconds: optional("sleep"),
                     discard_frequency: optional("disccallfreq"),
                     overlapped_offset: optional("OverlappedOffset"),
-                    extended_error: optional("ExtendedError"),
+                    extended_error: Win32Error::new(optional("ExtendedError")),
                 },
             ))
         })();
         let result = match &settings {
-            Some((id, settings)) => {
-                run_detour(
-                    invocation.backend,
-                    DetourOperation::Configure(*id, settings),
-                )
-                .result
-            }
+            Some((id, settings)) => run_detour(
+                invocation.backend,
+                DetourOperation::Configure(*id, settings),
+            )
+            .command_result(),
             None => bad_parameter,
         };
         return hresult_reply(invocation, result);
     }
-    Hresult::from_error_code(ErrorCode::UNKNOWN_COMMAND)
+    Err(ErrorCode::UnknownCommand.into())
 }
 
 /// `start file=<name>`: open the log (truncating it) in the writer worker.
 /// The reply reports worker creation; a log that fails to open returns
 /// the engine to stopped with the open status in `getstate`.
-fn detour_start(invocation: &mut Invocation<'_>) -> Hresult {
+fn detour_start(invocation: &mut Invocation<'_>) -> CommandResult {
     // Stock leaves the name buffer uninitialized when `file` is absent; an
     // absent name is empty here and fails translation.
     let mut name = DetourLogName::EMPTY;
     if let Some(value) = invocation.line.param("file") {
         name.len = value.copy_into(&mut name.bytes).len();
     }
-    let mut result = run_detour(invocation.backend, DetourOperation::BeginStart).result;
-    if result == Hresult::OK {
+    let mut result = run_detour(invocation.backend, DetourOperation::BeginStart).command_result();
+    if result.is_ok() {
         let state = &mut *invocation.state;
         state.memory.detour_log = name;
         let path = state
             .filesystem
             .drives
             .translate(invocation.backend, state.memory.detour_log.as_bytes());
-        let status = invocation
+        if let Err(error) = invocation
             .backend
-            .start_detour_log(path.as_ref().map(|path| path.as_bytes()));
-        if !status.is_success() {
+            .start_detour_log(path.as_ref().map(|path| path.as_bytes()))
+        {
             run_detour(invocation.backend, DetourOperation::CancelStart);
+            result = Err(CommandError::from_kernel(
+                error,
+                ErrorCode::FileCannotBeCreated.into(),
+            ));
         }
-        result = Hresult::from_nt_status(status, Hresult::error(0xd));
     }
     hresult_reply(invocation, result)
 }
 
 /// `stop`: stop the workers, dropping unwritten records and pending
 /// completions, and delete the log file.
-fn detour_stop(invocation: &mut Invocation<'_>) -> Hresult {
-    let result = run_detour(invocation.backend, DetourOperation::BeginStop).result;
-    if result == Hresult::OK {
+fn detour_stop(invocation: &mut Invocation<'_>) -> CommandResult {
+    let result = run_detour(invocation.backend, DetourOperation::BeginStop).command_result();
+    if result.is_ok() {
         let state = &mut *invocation.state;
         let path = state
             .filesystem
@@ -1677,7 +1742,7 @@ const TRACKING_COMMANDS: [(&str, TrackingCommand); 7] = [
 
 /// `memtrack cmd=<command> ...`: allocation tracking settings, queries, and
 /// record dump.
-fn memory_tracking(invocation: &mut Invocation<'_>) -> Hresult {
+fn memory_tracking(invocation: &mut Invocation<'_>) -> CommandResult {
     let mut command = [0u8; MEMTRACK_COMMAND_CAPACITY];
     let command = string_param(invocation, "cmd", &mut command).and_then(|command| {
         TRACKING_COMMANDS
@@ -1692,13 +1757,13 @@ fn memory_tracking(invocation: &mut Invocation<'_>) -> Hresult {
         Some(TrackingCommand::Disable) => {
             invocation.state.memory.tracking.flags.0 &= !TrackingFlags::TYPE_MASK;
             invocation.state.settings_dirty = true;
-            Hresult::OK
+            Ok(Reply::Ok)
         }
         Some(TrackingCommand::Save) => {
             let mut filename = [0u8; MEMTRACK_FILENAME_CAPACITY];
             match string_param(invocation, "filename", &mut filename) {
                 Some(filename) => save_tracking_records(invocation, filename),
-                None => Hresult::INVALID_ARGUMENT,
+                None => Err(CommandError::InvalidArgument),
             }
         }
         Some(command @ (TrackingCommand::QueryStackDepth | TrackingCommand::QueryFlags)) => {
@@ -1708,7 +1773,7 @@ fn memory_tracking(invocation: &mut Invocation<'_>) -> Hresult {
                 ACTIVE_STACK_DEPTH.0
             };
             invocation.set_text(format_args!("0x{value:x}"));
-            return Hresult::OK;
+            return Ok(Reply::Ok);
         }
         Some(TrackingCommand::QueryType) => {
             match invocation
@@ -1718,15 +1783,15 @@ fn memory_tracking(invocation: &mut Invocation<'_>) -> Hresult {
             {
                 Some(name) => {
                     invocation.text.set_bytes(name.as_bytes());
-                    return Hresult::OK;
+                    return Ok(Reply::Ok);
                 }
-                None => Hresult::INVALID_ARGUMENT,
+                None => Err(CommandError::InvalidArgument),
             }
         }
-        None => Hresult::INVALID_ARGUMENT,
+        None => Err(CommandError::InvalidArgument),
     };
-    if result.is_failure() {
-        invocation.set_text(format_args!("HRESULT 0x{:x}", result.0));
+    if let Err(error) = result {
+        invocation.set_text(format_args!("HRESULT 0x{:x}", Hresult::from(error).0));
     }
     result
 }
@@ -1734,7 +1799,7 @@ fn memory_tracking(invocation: &mut Invocation<'_>) -> Hresult {
 /// `enable` persists the settings; `enableonce` changes the flags in
 /// effect and marks the saved flags. The reply text names the last
 /// parameter that was missing.
-fn tracking_enable(invocation: &mut Invocation<'_>, once: bool) -> Hresult {
+fn tracking_enable(invocation: &mut Invocation<'_>, once: bool) -> CommandResult {
     let mut missing = None;
     let (depth, depth_valid) = dword_param(invocation.line.param("stackdepth"));
     if !depth_valid {
@@ -1747,7 +1812,7 @@ fn tracking_enable(invocation: &mut Invocation<'_>, once: bool) -> Hresult {
     let depth = StackDepth(depth.unwrap_or(0));
     let flags = TrackingFlags(flags.unwrap_or(TrackingFlags::DEFAULT.0));
     if depth.0 > MEMTRACK_MAX_STACK_DEPTH || flags.0 & 0xff == 0 {
-        return Hresult::INVALID_ARGUMENT;
+        return Err(CommandError::InvalidArgument);
     }
     let saved = &mut invocation.state.memory.tracking;
     if once {
@@ -1762,14 +1827,14 @@ fn tracking_enable(invocation: &mut Invocation<'_>, once: bool) -> Hresult {
         Some(name) => invocation.set_text(format_args!("missing {name}")),
         None => invocation.text.clear(),
     }
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// Write the tracking records to `filename` with the title stopped. A
 /// failed write deletes the file.
-fn save_tracking_records(invocation: &mut Invocation<'_>, filename: &[u8]) -> Hresult {
+fn save_tracking_records(invocation: &mut Invocation<'_>, filename: &[u8]) -> CommandResult {
     if !invocation.backend.tracking_flags().is_active() {
-        return Hresult(0x8007_0426);
+        return Err(CommandError::Win32(SERVICE_NOT_ACTIVE));
     }
     let request = filesystem::CreateRequest {
         access: filesystem::FileAccess(0x4011_0000),
@@ -1779,34 +1844,34 @@ fn save_tracking_records(invocation: &mut Invocation<'_>, filename: &[u8]) -> Hr
         disposition: filesystem::CreateDisposition::OverwriteIf,
         options: filesystem::CreateOptions(0x20),
     };
-    let status =
-        match filesystem::open_translated(invocation.state, invocation.backend, filename, &request)
-        {
-            Ok(file) => {
+    let written =
+        filesystem::open_translated(invocation.state, invocation.backend, filename, &request)
+            .and_then(|file| {
                 let stopped = debugger::stop_execution(
                     invocation.state,
                     invocation.backend,
                     invocation.network,
                 );
-                let status = invocation.backend.write_tracking_records(file);
-                if stopped == Hresult::OK {
-                    debugger::go_execution(
+                let written = invocation.backend.write_tracking_records(file);
+                if stopped.is_ok() {
+                    let _ = debugger::go_execution(
                         invocation.state,
                         invocation.backend,
                         invocation.network,
                     );
                 }
-                if !status.is_success() {
+                if written.is_err() {
                     let _ = invocation.backend.set_delete_disposition(file, true);
                 }
                 invocation.backend.close_file(file);
-                status
-            }
-            Err(status) => status,
-        };
-    match invocation.backend.dos_error_from_nt_status(status) {
-        0 => Hresult::OK,
-        error => Hresult(0x8007_0000 | (error & 0xffff)),
+                written
+            });
+    let Err(error) = written else {
+        return Ok(Reply::Ok);
+    };
+    match invocation.backend.dos_error_from_nt_status(error) {
+        Some(error) => Err(CommandError::Memory(MemoryError::TrackingSave(error))),
+        None => Ok(Reply::Ok),
     }
 }
 

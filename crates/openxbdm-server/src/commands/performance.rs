@@ -10,8 +10,8 @@ pub mod xtrace;
 
 use core::fmt::Write as _;
 
+use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
-use openxbdm_core::status::NtStatus;
 
 use crate::access::Access;
 use crate::commands::console::ConfigSetting;
@@ -29,6 +29,10 @@ use crate::continuation::ContinuationContext;
 use crate::invocation::Invocation;
 use crate::registry::CommandEntry;
 use crate::registry::DispatchFlags;
+use crate::reply;
+use crate::reply::CommandError;
+use crate::reply::CommandResult;
+use crate::reply::Reply;
 use crate::server::MAX_CONNECTIONS;
 use crate::text::Text;
 
@@ -61,8 +65,6 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
 const HARDWARE_AUTO_PROFILE: u32 = 0x10;
 /// Console setting holding the automatic sign-in profile XUID.
 const AUTO_PROFILE_SETTING: ConfigSetting = ConfigSetting::new(3, 8);
-/// Kernel status codes become failures outside the monitor facility.
-const NT_FAILURE_MARKER: u32 = 0x1000_0000;
 /// Bytes of a counter name the enumeration copies.
 pub const COUNTER_NAME_CAPACITY: usize = 0x100;
 /// Path buffers of `capctrl` and `lopctrl`.
@@ -82,17 +84,36 @@ pub const TILE_SIZE: u32 = 0x1000;
 /// Pixels along a tile edge.
 const TILE_EDGE: u32 = 32;
 
-const BAD_PARAMETER: Hresult = Hresult::error(0x17);
-const UNKNOWN_COMMAND: Hresult = Hresult::error(0x07);
-const MEMORY_NOT_MAPPED: Hresult = Hresult::error(0x04);
-const EDID_FAILED: Hresult = Hresult::error(0x1d);
-const CAPTURE_FILE_FAILED: Hresult = Hresult::error(0x0d);
-const FAST_CAP_ENABLED: Hresult = Hresult::success(0x07);
-const FAST_CAP_DISABLED: Hresult = Hresult::error(0x1b);
-const CALL_CAP_ENABLED: Hresult = Hresult::success(0x08);
-const CALL_CAP_DISABLED: Hresult = Hresult::error(0x21);
-/// `capctrl` and `lopctrl` without a subcommand.
-const NO_SUBCOMMAND: Hresult = Hresult::error(0);
+/// A failed `vd` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayError {
+    BadParameter,
+    /// The extended video encoder banks are absent.
+    MemoryNotMapped,
+    /// The kernel lacks the EDID export.
+    Unsupported,
+    EdidFailed,
+    /// No transfer block holds the EDID block.
+    NoTransferBlock,
+}
+
+impl From<DisplayError> for Hresult {
+    fn from(error: DisplayError) -> Self {
+        match error {
+            DisplayError::BadParameter => Hresult::from_error_code(ErrorCode::BadParameter),
+            DisplayError::MemoryNotMapped => Hresult::from_error_code(ErrorCode::MemoryNotMapped),
+            DisplayError::Unsupported => Hresult::from_error_code(ErrorCode::UnknownCommand),
+            DisplayError::EdidFailed => Hresult::error(0x1d),
+            DisplayError::NoTransferBlock => super::console::BufferTooSmall.into(),
+        }
+    }
+}
+
+impl From<DisplayError> for CommandError {
+    fn from(error: DisplayError) -> Self {
+        CommandError::Display(error)
+    }
+}
 
 /// Global state of this domain.
 #[derive(Debug)]
@@ -237,17 +258,24 @@ pub trait Backend {
     fn performance_frequency(&mut self) -> u64;
 
     /// Next object of the counter directory after `context` (0 restarts).
-    /// Fails with [`Hresult::END_OF_DATA`] at the end or without a
-    /// directory, and with `0x82da0105` when the name does not fit.
+    /// Fails with [`counters::CounterError::End`] at the end or without a
+    /// directory, and with [`counters::CounterError::NameTooLong`] when the
+    /// name does not fit.
     fn next_counter(
         &mut self,
         context: &mut u32,
         name: &mut [u8; COUNTER_NAME_CAPACITY],
-    ) -> Result<CounterEntry, Hresult>;
+    ) -> Result<CounterEntry, counters::CounterError>;
     /// Open counter `name` and evaluate it with [`counters::query`].
-    /// Fails with `0x82da0002` without a directory and `0x82da000e` when
-    /// the counter cannot be opened.
-    fn query_counter(&mut self, name: &[u8], query: u32, out: &mut CounterSample) -> Hresult;
+    /// Fails with [`counters::CounterError::NoDirectory`] without a
+    /// directory and [`counters::CounterError::NotFound`] when the counter
+    /// cannot be opened.
+    fn query_counter(
+        &mut self,
+        name: &[u8],
+        query: counters::CounterQuery,
+        out: &mut CounterSample,
+    ) -> Result<counters::Evaluation, counters::CounterError>;
 
     /// Wait up to 500 ms for the GPU to finish the pending flip, then read
     /// the front buffer registers and the display mode.
@@ -270,24 +298,29 @@ pub trait Backend {
     fn read_edid(&mut self, block: u8, output: &mut [u8; EDID_BLOCK_SIZE]) -> EdidRead;
 
     /// Open a listener for the Xbox Studio service and return its port.
-    fn dedicate_studio_socket(&mut self) -> Result<u16, Hresult>;
+    fn dedicate_studio_socket(&mut self) -> Result<u16, studio::StudioError>;
 
     /// Delete the validated capture file `path` (the object name of
     /// `name`), record the start time, and start a capture into `name`
     /// (stock 0x91f29d08).
-    fn capture_start(&mut self, name: &[u8], path: &[u8], buffer_size: u32) -> Hresult;
+    fn capture_start(
+        &mut self,
+        name: &[u8],
+        path: &[u8],
+        buffer: capture::BufferRequest,
+    ) -> Result<capture::Started, capture::CaptureError>;
     /// A loaded module carries fast-cap instrumentation.
     fn fast_cap_present(&mut self) -> bool;
     /// A loaded module carries call-cap instrumentation.
     fn call_cap_present(&mut self) -> bool;
     /// Stop and write the capture file, naming it through `drives`
     /// (export 74).
-    fn capture_stop(&mut self, drives: &DriveTable) -> Hresult;
+    fn capture_stop(&mut self, drives: &DriveTable) -> Result<(), capture::CaptureError>;
     fn capture_set_flags(&mut self, flags: capture::CaptureFlags);
     /// Export 146.
-    fn capture_status(&mut self) -> Hresult;
+    fn capture_status(&mut self) -> Result<(), capture::CaptureError>;
     /// Export 162.
-    fn capture_abort(&mut self) -> Hresult;
+    fn capture_abort(&mut self) -> Result<(), capture::CaptureError>;
 
     /// Start the CPU sampling profiler (export 149, 0x91f32c90); `drives`
     /// translates the drive path `name`.
@@ -296,12 +329,12 @@ pub trait Backend {
         drives: &DriveTable,
         name: &[u8],
         interval: u32,
-        flags: u32,
-    ) -> Hresult;
+        flags: profiler::ProfilerFlags,
+    ) -> Result<(), profiler::ProfilerError>;
     /// Stop sampling and write the capture file (export 150, 0x91f33010).
-    fn cpu_profiler_stop(&mut self) -> Hresult;
+    fn cpu_profiler_stop(&mut self) -> Result<(), profiler::ProfilerError>;
     /// Export 151 (0x91f32e30).
-    fn cpu_profiler_info(&mut self) -> Result<CpuProfilerInfo, Hresult>;
+    fn cpu_profiler_info(&mut self) -> Result<CpuProfilerInfo, profiler::ProfilerError>;
 
     /// Post message `code` with `payload` (at most 12 words) to the PIX
     /// engine; false without a session or with a full queue. Code 0xc
@@ -337,12 +370,15 @@ pub trait Backend {
     fn pix_trace_read(&mut self, output: &mut [u8]) -> usize;
 }
 
-pub(crate) fn resume(continuation: &mut Continuation, cx: &mut ContinuationContext<'_>) -> Hresult {
+pub(crate) fn resume(
+    continuation: &mut Continuation,
+    cx: &mut ContinuationContext<'_>,
+) -> CommandResult {
     match continuation {
         Continuation::CounterList => next_counter_line(cx),
         Continuation::CounterData { sent } => {
             if *sent {
-                return Hresult::END_OF_DATA;
+                return Err(CommandError::EndOfData);
             }
             *sent = true;
             let sample = cx.state.performance.scratch[usize::from(cx.session.index().0)];
@@ -355,69 +391,58 @@ pub(crate) fn resume(continuation: &mut Continuation, cx: &mut ContinuationConte
                 sample.rate as u32,
                 (sample.rate >> 32) as u32
             );
-            Hresult::OK
+            Ok(Reply::Ok)
         }
         Continuation::Screenshot(transfer) => transfer.resume(cx),
         Continuation::Edid { block, sent } => {
             if *sent || cx.aborted {
                 cx.state.transfer_blocks.release(cx.backend, *block);
-                return Hresult::END_OF_DATA;
+                return Err(CommandError::EndOfData);
             }
             *sent = true;
             cx.binary[..EDID_BLOCK_SIZE].copy_from_slice(
                 &cx.state.transfer_blocks.bytes(cx.backend, *block)[..EDID_BLOCK_SIZE],
             );
             cx.binary_len = EDID_BLOCK_SIZE;
-            Hresult::OK
+            Ok(Reply::Ok)
         }
         Continuation::Trace => {
             if cx.aborted {
-                return Hresult::END_OF_DATA;
+                return Err(CommandError::EndOfData);
             }
             let count = cx.backend.pix_trace_read(cx.binary);
             if count == 0 {
-                return Hresult::END_OF_DATA;
+                return Err(CommandError::EndOfData);
             }
             cx.binary_len = count;
-            Hresult::OK
+            Ok(Reply::Ok)
         }
     }
 }
 
-/// Map a failed kernel status the way the monitor reports it.
-fn nt_failure(status: NtStatus) -> Hresult {
-    Hresult(status.0 | NT_FAILURE_MARKER)
-}
-
 /// `autoprof [xuid=0q<hex>]`: read or set the automatic sign-in profile.
-fn auto_profile(invocation: &mut Invocation<'_>) -> Hresult {
+fn auto_profile(invocation: &mut Invocation<'_>) -> CommandResult {
     let xuid = invocation
         .line
         .param("xuid")
         .and_then(|value| value.qword());
     if invocation.backend.hardware_flags() & HARDWARE_AUTO_PROFILE == 0 {
-        return UNKNOWN_COMMAND;
+        return Err(ErrorCode::UnknownCommand.into());
     }
     match xuid {
-        Some(xuid) => match invocation
+        Some(xuid) => invocation
             .backend
             .xconfig_set(AUTO_PROFILE_SETTING, &xuid.to_be_bytes())
-        {
-            Ok(()) => Hresult::OK,
-            Err(status) => nt_failure(status),
-        },
+            .map(|()| Reply::Ok)
+            .map_err(CommandError::Kernel),
         None => {
             let mut value = [0u8; 8];
-            match invocation
+            invocation
                 .backend
                 .xconfig_get(AUTO_PROFILE_SETTING, &mut value)
-            {
-                Ok(_) => {
-                    invocation.set_text(format_args!("xuid==0q{:016x}", u64::from_be_bytes(value)));
-                    Hresult::OK
-                }
-                Err(status) => nt_failure(status),
-            }
+                .map_err(CommandError::Kernel)?;
+            invocation.set_text(format_args!("xuid==0q{:016x}", u64::from_be_bytes(value)));
+            Ok(Reply::Ok)
         }
     }
 }
@@ -442,52 +467,64 @@ fn optional_dword(invocation: &Invocation<'_>, name: &str) -> u32 {
 }
 
 /// `capctrl`: profiler capture control. Every reply is `HRESULT 0x%08x`.
-fn capture_control(invocation: &mut Invocation<'_>) -> Hresult {
+fn capture_control(invocation: &mut Invocation<'_>) -> CommandResult {
     let line = invocation.line;
     let result = if line.has("start") {
         let mut name = [0u8; PROFILE_NAME_CAPACITY];
         match profile_name(invocation, &mut name) {
             Some(name) => {
-                let buffer_size = optional_dword(invocation, "buffersize");
-                start_capture(invocation, name, buffer_size)
+                let buffer = capture::BufferRequest(optional_dword(invocation, "buffersize"));
+                start_capture(invocation, name, buffer)
+                    .map(Reply::from)
+                    .map_err(CommandError::from)
             }
-            None => Hresult::INVALID_ARGUMENT,
+            None => Err(CommandError::InvalidArgument),
         }
     } else if line.has("fastcapenabled") {
-        if invocation.backend.fast_cap_present() {
-            FAST_CAP_ENABLED
-        } else {
-            FAST_CAP_DISABLED
-        }
+        capture::fast_cap_state(invocation.backend.fast_cap_present())
+            .map(Reply::Capture)
+            .map_err(CommandError::from)
     } else if line.has("callcapenabled") {
-        if invocation.backend.call_cap_present() {
-            CALL_CAP_ENABLED
-        } else {
-            CALL_CAP_DISABLED
-        }
+        capture::call_cap_state(invocation.backend.call_cap_present())
+            .map(Reply::Capture)
+            .map_err(CommandError::from)
     } else if line.has("stop") {
         invocation
             .backend
             .capture_stop(&invocation.state.filesystem.drives)
+            .map(|()| Reply::Ok)
+            .map_err(CommandError::from)
     } else if let Some(flags) = line.dword("flags") {
         invocation
             .backend
             .capture_set_flags(capture::CaptureFlags::from_request(flags));
-        Hresult::OK
+        Ok(Reply::Ok)
     } else if line.has("profilingstatus") {
-        invocation.backend.capture_status()
+        invocation
+            .backend
+            .capture_status()
+            .map(|()| Reply::Ok)
+            .map_err(CommandError::from)
     } else if line.has("abort") {
-        invocation.backend.capture_abort()
+        invocation
+            .backend
+            .capture_abort()
+            .map(|()| Reply::Ok)
+            .map_err(CommandError::from)
     } else {
-        NO_SUBCOMMAND
+        Err(ErrorCode::Undefined.into())
     };
-    invocation.set_text(format_args!("HRESULT 0x{:08x}", result.0));
+    invocation.set_text(format_args!("HRESULT 0x{:08x}", reply::hresult(result).0));
     result
 }
 
 /// Create the capture file once to validate the path, then hand it to the
 /// capture engine (stock 0x91f29d08).
-fn start_capture(invocation: &mut Invocation<'_>, name: &[u8], buffer_size: u32) -> Hresult {
+fn start_capture(
+    invocation: &mut Invocation<'_>,
+    name: &[u8],
+    buffer: capture::BufferRequest,
+) -> Result<capture::Started, capture::CaptureError> {
     let request = CreateRequest {
         access: FileAccess(FileAccess::GENERIC_WRITE.0 | FileAccess::SYNCHRONIZE.0),
         allocation_size: None,
@@ -502,46 +539,49 @@ fn start_capture(invocation: &mut Invocation<'_>, name: &[u8], buffer_size: u32)
         .drives
         .translate(invocation.backend, name)
     else {
-        return CAPTURE_FILE_FAILED;
+        return Err(capture::CaptureError::FileFailed);
     };
     match invocation.backend.create_file(path.as_bytes(), &request) {
         Ok(handle) => invocation.backend.close_file(handle),
-        Err(_) => return CAPTURE_FILE_FAILED,
+        Err(_) => return Err(capture::CaptureError::FileFailed),
     }
     invocation
         .backend
-        .capture_start(name, path.as_bytes(), buffer_size)
+        .capture_start(name, path.as_bytes(), buffer)
 }
 
 /// `gpucount enable|disable`: accepted without effect.
-fn gpu_count(invocation: &mut Invocation<'_>) -> Hresult {
+fn gpu_count(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.line.has("enable") || invocation.line.has("disable") {
-        Hresult::OK
+        Ok(Reply::Ok)
     } else {
-        UNKNOWN_COMMAND
+        Err(ErrorCode::UnknownCommand.into())
     }
 }
 
 /// `lopctrl start|stop|info`: CPU sampling profiler control.
-fn cpu_profiler_control(invocation: &mut Invocation<'_>) -> Hresult {
+fn cpu_profiler_control(invocation: &mut Invocation<'_>) -> CommandResult {
     let line = invocation.line;
     let result = if line.has("start") {
         let mut name = [0u8; PROFILE_NAME_CAPACITY];
         match profile_name(invocation, &mut name) {
             Some(name) => {
                 let interval = optional_dword(invocation, "interval");
-                let flags = optional_dword(invocation, "flags");
-                invocation.backend.cpu_profiler_start(
-                    &invocation.state.filesystem.drives,
-                    name,
-                    interval,
-                    flags,
-                )
+                let flags = profiler::ProfilerFlags(optional_dword(invocation, "flags"));
+                invocation
+                    .backend
+                    .cpu_profiler_start(&invocation.state.filesystem.drives, name, interval, flags)
+                    .map(|()| Reply::Ok)
+                    .map_err(CommandError::from)
             }
-            None => Hresult::INVALID_ARGUMENT,
+            None => Err(CommandError::InvalidArgument),
         }
     } else if line.has("stop") {
-        invocation.backend.cpu_profiler_stop()
+        invocation
+            .backend
+            .cpu_profiler_stop()
+            .map(|()| Reply::Ok)
+            .map_err(CommandError::from)
     } else if line.has("info") {
         match invocation.backend.cpu_profiler_info() {
             Ok(info) => {
@@ -549,66 +589,63 @@ fn cpu_profiler_control(invocation: &mut Invocation<'_>) -> Hresult {
                     "elapsedTime=0x{:08x} totalSamp=0x{:08x} overheadInt=0x{:08x}",
                     info.elapsed_time, info.total_samples, info.overhead_interrupts
                 ));
-                return Hresult::OK;
+                return Ok(Reply::Ok);
             }
-            Err(result) => result,
+            Err(error) => Err(error.into()),
         }
     } else {
-        NO_SUBCOMMAND
+        Err(ErrorCode::Undefined.into())
     };
-    invocation.set_text(format_args!("HRESULT 0x{:08x}", result.0));
+    invocation.set_text(format_args!("HRESULT 0x{:08x}", reply::hresult(result).0));
     result
 }
 
 /// `pclist`: one line per object of the counter directory.
-fn counter_list(invocation: &mut Invocation<'_>) -> Hresult {
+fn counter_list(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(session) = invocation.session.as_deref_mut() else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     let scratch = &mut invocation.state.performance.scratch[usize::from(session.index().0)];
     scratch.value &= u64::from(u32::MAX);
     session.continuation = AnyContinuation::Performance(Continuation::CounterList);
-    Hresult::MULTILINE
+    Ok(Reply::Multiline)
 }
 
-fn next_counter_line(cx: &mut ContinuationContext<'_>) -> Hresult {
+fn next_counter_line(cx: &mut ContinuationContext<'_>) -> CommandResult {
     let scratch = &mut cx.state.performance.scratch[usize::from(cx.session.index().0)];
     let mut context = (scratch.value >> 32) as u32;
     let mut name = [0u8; COUNTER_NAME_CAPACITY];
     let result = cx.backend.next_counter(&mut context, &mut name);
     scratch.value = (u64::from(context) << 32) | (scratch.value & u64::from(u32::MAX));
-    match result {
-        Ok(entry) => {
-            let _ = cx.line.push_bytes(b"name=\"");
-            let _ = cx.line.push_bytes(&name[..entry.name_len]);
-            let _ = write!(cx.line, "\" type=0x{:08x}", entry.counter_type);
-            Hresult::OK
-        }
-        Err(result) => result,
-    }
+    let entry = result?;
+    let _ = cx.line.push_bytes(b"name=\"");
+    let _ = cx.line.push_bytes(&name[..entry.name_len]);
+    let _ = write!(cx.line, "\" type=0x{:08x}", entry.counter_type);
+    Ok(Reply::Ok)
 }
 
 /// `perfstat`: the performance counter frequency.
-fn performance_status(invocation: &mut Invocation<'_>) -> Hresult {
+fn performance_status(invocation: &mut Invocation<'_>) -> CommandResult {
     let frequency = invocation.backend.performance_frequency();
     invocation.set_text(format_args!("PerfFreq=0x{frequency:X}"));
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `pixpreview`: always fails.
-fn pix_preview(invocation: &mut Invocation<'_>) -> Hresult {
-    invocation.set_text(format_args!("HRESULT 0x{:08x}", BAD_PARAMETER.0));
-    BAD_PARAMETER
+fn pix_preview(invocation: &mut Invocation<'_>) -> CommandResult {
+    let error = CommandError::Status(ErrorCode::BadParameter);
+    invocation.set_text(format_args!("HRESULT 0x{:08x}", Hresult::from(error).0));
+    Err(error)
 }
 
 /// `querypc name=<counter> type=<dword>`.
-fn query_counter(invocation: &mut Invocation<'_>) -> Hresult {
+fn query_counter(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(index) = invocation
         .session
         .as_ref()
         .map(|session| usize::from(session.index().0))
     else {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     let mut name = [0u8; COUNTER_NAME_CAPACITY];
     let Some(name) = invocation
@@ -617,25 +654,22 @@ fn query_counter(invocation: &mut Invocation<'_>) -> Hresult {
         .map(|value| value.copy_into(&mut name))
     else {
         invocation.set_text(format_args!("missing name"));
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     };
     let Some(query) = util::required_dword(invocation, "type") else {
-        return util::MISSING;
+        return Err(util::MISSING);
     };
-    let result = invocation.backend.query_counter(
+    invocation.backend.query_counter(
         name,
-        query,
+        counters::CounterQuery(query),
         &mut invocation.state.performance.scratch[index],
-    );
-    if result.is_failure() {
-        return result;
-    }
+    )?;
     if let Some(session) = invocation.session.as_deref_mut() {
         session.continuation =
             AnyContinuation::Performance(Continuation::CounterData { sent: false });
     }
     invocation.set_text(format_args!("counter data follows"));
-    Hresult::MULTILINE
+    Ok(Reply::Multiline)
 }
 
 const fn align_tile(value: u32) -> u32 {
@@ -699,13 +733,13 @@ impl ScreenshotTransfer {
     }
 
     /// The header line first, then whole tiles in row-major order.
-    fn resume(&mut self, cx: &mut ContinuationContext<'_>) -> Hresult {
+    fn resume(&mut self, cx: &mut ContinuationContext<'_>) -> CommandResult {
         if self.remaining == 0 || cx.aborted {
             if self.stopped {
                 self.stopped = false;
-                debugger::go_execution(cx.state, cx.backend, cx.network);
+                let _ = debugger::go_execution(cx.state, cx.backend, cx.network);
             }
-            return Hresult::END_OF_DATA;
+            return Err(CommandError::EndOfData);
         }
         if !self.header_sent {
             self.header_sent = true;
@@ -728,7 +762,7 @@ impl ScreenshotTransfer {
             let bytes = header.as_bytes();
             cx.binary[..bytes.len()].copy_from_slice(bytes);
             cx.binary_len = bytes.len();
-            return Hresult::OK;
+            return Ok(Reply::Ok);
         }
         let chunk = self.remaining.min(cx.binary.len() as u32) & !(TILE_SIZE - 1);
         let tiles_per_row = self
@@ -738,7 +772,7 @@ impl ScreenshotTransfer {
             >> 5;
         if chunk != 0 && tiles_per_row == 0 {
             // The monitor divides by the tile count and traps.
-            return Hresult::UNEXPECTED;
+            return Err(CommandError::Unexpected);
         }
         let mut left = (self.remaining >> 12).wrapping_sub(1);
         for page in cx.binary[..chunk as usize]
@@ -757,72 +791,72 @@ impl ScreenshotTransfer {
         }
         cx.binary_len = chunk as usize;
         self.remaining -= chunk;
-        Hresult::OK
+        Ok(Reply::Ok)
     }
 }
 
 /// `screenshot`: stop the title and send the front buffer tiles.
-fn screenshot(invocation: &mut Invocation<'_>) -> Hresult {
+fn screenshot(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.session.is_none() {
-        return Hresult::FAIL;
+        return Err(CommandError::Fail);
     }
     let stop = debugger::stop_execution(invocation.state, invocation.backend, invocation.network);
     let capture = invocation.backend.capture_display();
-    let transfer = ScreenshotTransfer::new(&capture, stop == Hresult::OK);
+    let transfer = ScreenshotTransfer::new(&capture, stop.is_ok());
     if let Some(session) = invocation.session.as_deref_mut() {
         session.continuation = AnyContinuation::Performance(Continuation::Screenshot(transfer));
     }
-    Hresult::BINARY
+    Ok(Reply::Binary)
 }
 
 /// Fail with the result as `HRESULT 0x%x` text.
-fn vd_failure(invocation: &mut Invocation<'_>, result: Hresult) -> Hresult {
-    invocation.set_text(format_args!("HRESULT 0x{:x}", result.0));
-    result
+fn vd_failure(invocation: &mut Invocation<'_>, error: DisplayError) -> CommandResult {
+    invocation.set_text(format_args!("HRESULT 0x{:x}", Hresult::from(error).0));
+    Err(error.into())
 }
 
 /// `vd cmd=<peek|poke|gpeek|gpoke|edid> ...`: video encoder, GPU register,
 /// and EDID access.
-fn video_display(invocation: &mut Invocation<'_>) -> Hresult {
+fn video_display(invocation: &mut Invocation<'_>) -> CommandResult {
     let mut buffer = [0u8; VD_COMMAND_CAPACITY];
     let Some(command) = invocation
         .line
         .param("cmd")
         .map(|value| value.copy_into(&mut buffer))
     else {
-        return vd_failure(invocation, BAD_PARAMETER);
+        return vd_failure(invocation, DisplayError::BadParameter);
     };
     let line = invocation.line;
     let dword = |name: &str| line.dword(name);
     if command.eq_ignore_ascii_case(b"peek") {
         let Some(register) = dword("addr").filter(|&register| register < VD_REGISTER_END) else {
-            return vd_failure(invocation, BAD_PARAMETER);
+            return vd_failure(invocation, DisplayError::BadParameter);
         };
         if register < VD_EXTENDED_FIRST {
             let value = invocation.backend.read_video_encoder(register);
             invocation.set_text(format_args!("0x{value:08x}"));
         } else {
             if !invocation.backend.video_encoder_extended() {
-                return vd_failure(invocation, MEMORY_NOT_MAPPED);
+                return vd_failure(invocation, DisplayError::MemoryNotMapped);
             }
             let value = invocation.backend.read_video_encoder(register) as u8;
             invocation.set_text(format_args!("0x{value:02x}"));
         }
     } else if command.eq_ignore_ascii_case(b"poke") {
         let Some(register) = dword("addr").filter(|&register| register < VD_REGISTER_END) else {
-            return vd_failure(invocation, BAD_PARAMETER);
+            return vd_failure(invocation, DisplayError::BadParameter);
         };
         let Some(value) = dword("data") else {
-            return vd_failure(invocation, BAD_PARAMETER);
+            return vd_failure(invocation, DisplayError::BadParameter);
         };
         if register > 0xff && value > 0xff {
-            return vd_failure(invocation, BAD_PARAMETER);
+            return vd_failure(invocation, DisplayError::BadParameter);
         }
         if register < VD_EXTENDED_FIRST {
             invocation.backend.write_video_encoder(register, value);
         } else {
             if !invocation.backend.video_encoder_extended() {
-                return vd_failure(invocation, MEMORY_NOT_MAPPED);
+                return vd_failure(invocation, DisplayError::MemoryNotMapped);
             }
             invocation
                 .backend
@@ -830,24 +864,24 @@ fn video_display(invocation: &mut Invocation<'_>) -> Hresult {
         }
     } else if command.eq_ignore_ascii_case(b"gpeek") {
         let Some(index) = dword("addr").filter(|&index| index <= VD_GPU_LAST) else {
-            return vd_failure(invocation, BAD_PARAMETER);
+            return vd_failure(invocation, DisplayError::BadParameter);
         };
         let value = invocation.backend.read_gpu_register(index);
         invocation.set_text(format_args!("0x{value:08x}"));
     } else if command.eq_ignore_ascii_case(b"gpoke") {
         let Some(index) = dword("addr").filter(|&index| index <= VD_GPU_LAST) else {
-            return vd_failure(invocation, BAD_PARAMETER);
+            return vd_failure(invocation, DisplayError::BadParameter);
         };
         let Some(value) = dword("data") else {
-            return vd_failure(invocation, BAD_PARAMETER);
+            return vd_failure(invocation, DisplayError::BadParameter);
         };
         invocation.backend.write_gpu_register(index, value);
     } else if command.eq_ignore_ascii_case(b"edid") {
         let Some(block) = dword("block").filter(|&block| block <= 0xff) else {
-            return vd_failure(invocation, BAD_PARAMETER);
+            return vd_failure(invocation, DisplayError::BadParameter);
         };
         let Some(socket) = invocation.session.as_ref().map(|session| session.socket()) else {
-            return Hresult::FAIL;
+            return Err(CommandError::Fail);
         };
         // Stock allocates the block before the read (and leaks it when the
         // read fails).
@@ -856,7 +890,7 @@ fn video_display(invocation: &mut Invocation<'_>) -> Hresult {
             socket,
             EDID_BLOCK_SIZE as u32,
         ) else {
-            return vd_failure(invocation, super::console::BUFFER_TOO_SMALL);
+            return vd_failure(invocation, DisplayError::NoTransferBlock);
         };
         let mut data = [0u8; EDID_BLOCK_SIZE];
         let read = invocation.backend.read_edid(block as u8, &mut data);
@@ -868,8 +902,8 @@ fn video_display(invocation: &mut Invocation<'_>) -> Hresult {
             return vd_failure(
                 invocation,
                 match read {
-                    EdidRead::Unsupported => UNKNOWN_COMMAND,
-                    _ => EDID_FAILED,
+                    EdidRead::Unsupported => DisplayError::Unsupported,
+                    _ => DisplayError::EdidFailed,
                 },
             );
         }
@@ -884,13 +918,13 @@ fn video_display(invocation: &mut Invocation<'_>) -> Hresult {
                 sent: false,
             });
         }
-        return Hresult::BINARY;
+        return Ok(Reply::Binary);
     }
-    Hresult::OK
+    Ok(Reply::Ok)
 }
 
 /// `xstudio DedicateSocket`: open a listener for the Xbox Studio service.
-fn studio(invocation: &mut Invocation<'_>) -> Hresult {
+fn studio(invocation: &mut Invocation<'_>) -> CommandResult {
     let end = invocation
         .buffer
         .iter()
@@ -908,11 +942,11 @@ fn studio(invocation: &mut Invocation<'_>) -> Hresult {
     let token = &rest[..rest.iter().position(is_delimiter).unwrap_or(rest.len())];
     if token != b"DedicateSocket" {
         invocation.text.set_bytes(b"NO");
-        return Hresult::OK;
+        return Ok(Reply::Ok);
     }
     match invocation.backend.dedicate_studio_socket() {
         Ok(port) => invocation.set_text(format_args!("OK {port}")),
         Err(_) => invocation.text.set_bytes(b"NO"),
     }
-    Hresult::OK
+    Ok(Reply::Ok)
 }

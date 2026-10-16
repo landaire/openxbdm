@@ -7,6 +7,7 @@
 - Add `openxbdm-server`, a `no_std`, allocation-free command engine with the stock dispatch rules (access masks, development-kit-only and own-thread flags, dedicated connections), continuations for 202/203/204 transfers, notification channels, command processors, and the settings file.
 - Implement all 177 stock XBDM 2.0.21256.0 commands in eleven domains (session, security, console, system, file system, memory, debugger, network, performance, hardware, services) over per-domain backend traits.
 - Move the protocol grammar, status codes, and authentication function shared by client and server into `openxbdm-core`.
+- Keep status integers at the wire and the kernel/title ABI: handlers and continuations return `Result<Reply, CommandError>`, converted to the reply line's result in `send_status`; backend traits fail with `KernelError` (a kernel status with named variants and exact passthrough of others) or per-domain error enums; exports, control codes, and reply texts that print a code convert typed errors at that point. `ErrorCode` is an enum of the result-table codes, and `Win32Error` carries Win32 codes.
 
 ### Host server
 

@@ -2,12 +2,11 @@
 //! 0x20-byte queue counters, and the blobs the exports build from them
 //! before calling the command helpers.
 
-use openxbdm_core::status::Hresult;
-
 use super::BLOB_VERSION;
 use super::CONFIG_CAPACITY;
 use super::ConfigMask;
 use super::InvalidConfig;
+use super::NetsimError;
 use super::QueueConfig;
 use super::QueueStats;
 use super::RedirectConfig;
@@ -103,7 +102,7 @@ pub fn queue_blob(
     config: &QueueConfig,
     program: Option<Source<'_>>,
     blob: &mut [u8; CONFIG_CAPACITY],
-) -> Result<usize, Hresult> {
+) -> Result<usize, NetsimError> {
     let mut length = 0;
     let mut put = |bytes: &[u8]| {
         blob[length..length + bytes.len()].copy_from_slice(bytes);
@@ -143,7 +142,7 @@ pub fn redirect_blob(
     config: &RedirectConfig,
     program: Option<Source<'_>>,
     blob: &mut [u8; CONFIG_CAPACITY],
-) -> Result<usize, Hresult> {
+) -> Result<usize, NetsimError> {
     let fixed = config.serialize();
     blob[..fixed.len()].copy_from_slice(&fixed);
     append_program(program, blob, fixed.len())

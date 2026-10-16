@@ -105,6 +105,49 @@ mod poll {
     }
 }
 
+/// The send buffer space at which `poll` reports a socket writable
+/// (SO_SNDLOWAT). The engine sends at most `TRANSFER_CAPACITY` bytes per
+/// writable report, so with that much free the send does not block while
+/// the host lock is held. macOS defaults to 2048 bytes; Linux reports
+/// writable only with a third of the buffer free and does not accept the
+/// option, and Windows has no such option.
+#[cfg(target_os = "macos")]
+fn reserve_send_space(stream: &TcpStream) {
+    use std::os::fd::AsRawFd;
+
+    use openxbdm_server::server::TRANSFER_CAPACITY;
+
+    const SOL_SOCKET: std::ffi::c_int = 0xffff;
+    const SO_SNDLOWAT: std::ffi::c_int = 0x1003;
+
+    unsafe extern "C" {
+        fn setsockopt(
+            socket: std::ffi::c_int,
+            level: std::ffi::c_int,
+            name: std::ffi::c_int,
+            value: *const std::ffi::c_void,
+            length: u32,
+        ) -> std::ffi::c_int;
+    }
+
+    let low_water =
+        std::ffi::c_int::try_from(TRANSFER_CAPACITY).expect("TRANSFER_CAPACITY fits in c_int");
+    // SAFETY: `low_water` outlives the call and its size is passed.
+    // A failure leaves the default, under which a send may block.
+    unsafe {
+        setsockopt(
+            stream.as_raw_fd(),
+            SOL_SOCKET,
+            SO_SNDLOWAT,
+            (&raw const low_water).cast(),
+            size_of::<std::ffi::c_int>() as u32,
+        );
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn reserve_send_space(_stream: &TcpStream) {}
+
 /// Open sockets by identifier.
 #[derive(Debug, Default)]
 pub struct SocketTable {
@@ -119,6 +162,7 @@ impl SocketTable {
         // A peer that stops reading fails the send instead of holding the
         // host lock indefinitely.
         let _ = stream.set_write_timeout(Some(SEND_LIMIT));
+        reserve_send_space(&stream);
         self.next += 1;
         self.sockets.insert(self.next, stream);
         SocketId(self.next)

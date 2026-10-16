@@ -1,5 +1,52 @@
 # Developing
 
+## Overview
+
+This repository builds two kinds of things:
+
+- Host tools that run on your PC: the `xeedee` client, the `openxbdm-kd`
+  kernel debugger host, and the FFI libraries.
+- The console module, `openxbdm.xex`: our replacement for `xbdm.xex`, the
+  debug monitor (XBDM) that a development kit normally loads from its
+  flash at boot.
+
+The console module comes in two builds. They hold the same server; they
+differ only in how they get onto the console and how they recover from a
+bad boot.
+
+| Build | Target | Use it when |
+| --- | --- | --- |
+| `openxbdm.xex` | `//xbox360:openxbdm` | You run `openxbdm-kd host` on your PC and it hands the module to the console at boot. Nothing is written to the console. |
+| `openxbdm-boot-guard.xex` | `//xbox360:openxbdm-boot-guard` | You copy the module to `DEVKIT:\FlashEx\xbdm.xex` on the console's disk, with no PC involved at boot. |
+
+Loading from the kd host is the safer method: if the module breaks, stop
+the host and restart the console, and it boots the stock monitor again.
+
+Copying to `DEVKIT:\FlashEx\xbdm.xex` makes the console load that file
+instead of the stock monitor at every boot, for as long as the file
+exists. If that module hangs or crashes during boot, the console hangs at
+every boot, and without a running monitor you cannot delete the file over
+the network. The boot guard exists to prevent that:
+
+1. Every build of the module deletes `DEVKIT:\FlashEx\xbdm.xex` once its
+   server has started, so a good boot runs openxbdm once and the next boot
+   is back to the stock monitor.
+2. The boot-guard build also checks for a marker file,
+   `DEVKIT:\FlashEx\openxbdm.arm`, as the very first thing it does. You
+   create the marker each time you install the module.
+   - Marker there: the module deletes the marker and starts normally.
+   - Marker gone: the marker was used up by an earlier boot, so that boot
+     must have failed before it could delete `xbdm.xex`. The module does
+     not start; it deletes `xbdm.xex` and restarts the console, which then
+     boots the stock monitor.
+
+So if a boot with openxbdm hangs, turn the console off and on: the second
+boot finds no marker and puts the stock monitor back. This only fails if
+the module crashes before its first instruction runs (for example, the
+loader rejects the file); then use the kd host to serve a working module
+for the same path, which deletes the file once it starts. Steps for both
+methods: Console deployment, below.
+
 ## Environment
 
 `devenv shell` (`devenv.nix`) provides Buck2 (the release that
@@ -186,40 +233,35 @@ hardware (bug check 0x2b).
 
 ### FlashEx file
 
-A module placed at `DEVKIT:\FlashEx\xbdm.xex` loads at every boot, before
-the network is available, until the file is removed. A build that stops
-the console during boot freezes every following boot until the file is
-removed. Use only `boot-guard` builds:
+Use only the boot-guard build here (Overview, above, explains why):
 
 1. Build `//xbox360:openxbdm-boot-guard`.
-2. Upload it to `DEVKIT:\FlashEx\xbdm.xex`.
-3. Create the marker file `DEVKIT:\FlashEx\openxbdm.arm` (any content).
-4. Reboot the console cold.
+2. Copy it to `DEVKIT:\FlashEx\xbdm.xex`.
+3. Copy any file to `DEVKIT:\FlashEx\openxbdm.arm` (the marker).
+4. Turn the console off and on.
 
 For example:
 
     xeedee -H <console> file put "$(buck2 build //xbox360:openxbdm-boot-guard --show-simple-output)" 'DEVKIT:\FlashEx\xbdm.xex'
     xeedee -H <console> file put openxbdm.arm 'DEVKIT:\FlashEx\openxbdm.arm'
 
-Boot behavior of a `boot-guard` build:
+What happens at boot:
 
 - Marker present: the module deletes the marker and starts. Its server
-  thread then deletes `DEVKIT:\FlashEx\xbdm.xex` (up to 30 attempts, one
-  second apart) before opening the listener, so the next boot loads the
-  flash monitor.
-- Marker absent: the previous boot of this build started but did not
-  remove the override. The module installs no hook, deletes
-  `DEVKIT:\FlashEx\xbdm.xex`, and restarts the console into the flash
-  monitor. If the deletion fails the console continues without a debug
-  monitor.
+  thread deletes `DEVKIT:\FlashEx\xbdm.xex` (up to 30 attempts, one
+  second apart, while the disk comes up) before it accepts connections,
+  so the next boot loads the stock monitor from flash.
+- Marker absent: an earlier boot used the marker but never got far enough
+  to delete `xbdm.xex`. The module starts nothing, deletes `xbdm.xex`, and
+  restarts the console into the stock monitor. If the deletion fails, the
+  console runs on without any debug monitor.
 
-Recovery: if the armed boot stops, power-cycle the console. The next boot
-runs without the marker and restores the flash monitor. This requires the
-module to reach its entry point. A stop before that point, or a build
-without `boot-guard`, needs the kd host: serve a working image for the
-same path with `openxbdm-kd host --file` and reboot; its server thread
-deletes the override. Each deployment arms one boot; repeat steps 2 to 4
-for the next run.
+If the boot hangs, turn the console off and on; the next boot restores
+the stock monitor. If the module never starts at all (it fails before its
+entry point), or you installed a build without the boot guard, start
+`openxbdm-kd host --file` serving a working module for the same path and
+restart the console; that module deletes the file once its server starts.
+Each installation covers one boot; repeat steps 2 to 4 for the next one.
 
 ## Differential testing
 

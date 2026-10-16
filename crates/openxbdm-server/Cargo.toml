@@ -12,8 +12,14 @@ path = "src/lib.rs"
 # crate cannot be without a panic handler. It has no doctests.
 doctest = false
 
+[features]
+default = ["smb"]
+# File sharing over SMB 2.
+smb = ["dep:smb2-server"]
+
 [dependencies]
 openxbdm-core = { path = "../openxbdm-core" }
+smb2-server = { path = "../smb2-server", optional = true }
 
 [dev-dependencies]
 insta = "1.47.2"

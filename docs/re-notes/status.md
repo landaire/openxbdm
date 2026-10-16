@@ -21,6 +21,7 @@ Status labels:
 | Client library, CLI, C bindings | `openxbdm-client`, `openxbdm-cli`, `openxbdm-ffi` | implemented | Snapshot tests over captured replies; parity fixes listed per domain under `parity/` |
 | Command engine | `openxbdm-server` | implemented | `no_std`, allocation-free; 177 of 177 stock commands in 11 domains |
 | Host server and simulated console | `openxbdm-server-host` | implemented | One simulated console shared by all connections; every command exercised over TCP by `tests/` |
+| SMB file sharing | `openxbdm-server` (`smb`), `smb2-server` | implemented | SMB 2.0.2 and 2.1 shares of every drive whose device exists; host listener on `--smb-listen`, console listener on TCP port 445 |
 | Xbox 360 module | `openxbdm-server-xbox360` | verified | Backends for every domain, 253 of 253 exports, 102 of 103 non-default control codes; boots on a devkit as `xbdm.xex` and xshell loads against its exports |
 | Command specifications | `docs/re-notes/commands/` | specified | 165 complete, 4 wire complete, 8 partial |
 | Export table | `docs/re-notes/exports.md` | specified | 253 populated ordinals of 373 |

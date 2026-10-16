@@ -109,6 +109,26 @@ pub enum FileData<'a> {
     Pool(PoolRange),
 }
 
+/// Destination of a file read.
+#[derive(Debug)]
+pub enum ReadTarget<'a> {
+    Bytes(&'a mut [u8]),
+    Pool(PoolRange),
+}
+
+impl ReadTarget<'_> {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Bytes(bytes) => bytes.len(),
+            Self::Pool(range) => range.length as usize,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// Kernel access mask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileAccess(pub u32);
@@ -117,9 +137,13 @@ impl FileAccess {
     pub const LIST_DIRECTORY: Self = Self(0x1);
     pub const READ_DATA: Self = Self(0x1);
     pub const WRITE_DATA: Self = Self(0x2);
+    pub const APPEND_DATA: Self = Self(0x4);
+    pub const READ_ATTRIBUTES: Self = Self(0x80);
     pub const WRITE_ATTRIBUTES: Self = Self(0x100);
     pub const DELETE: Self = Self(0x1_0000);
     pub const SYNCHRONIZE: Self = Self(0x10_0000);
+    pub const MAXIMUM_ALLOWED: Self = Self(0x200_0000);
+    pub const GENERIC_ALL: Self = Self(0x1000_0000);
     pub const GENERIC_WRITE: Self = Self(0x4000_0000);
     pub const GENERIC_READ: Self = Self(0x8000_0000);
 
@@ -129,6 +153,10 @@ impl FileAccess {
 
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
+    }
+
+    pub const fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
     }
 }
 
@@ -165,6 +193,7 @@ impl CreateOptions {
     pub const SYNCHRONOUS_IO_ALERT: Self = Self(0x10);
     pub const SYNCHRONOUS_IO_NONALERT: Self = Self(0x20);
     pub const NON_DIRECTORY_FILE: Self = Self(0x40);
+    pub const DELETE_ON_CLOSE: Self = Self(0x1000);
     pub const OPEN_FOR_BACKUP: Self = Self(0x4000);
 
     pub const fn union(self, other: Self) -> Self {
@@ -273,6 +302,45 @@ pub struct VolumeSize {
     pub bytes_per_sector: u32,
 }
 
+/// File system attribute bits (FILE_FS_ATTRIBUTE_INFORMATION).
+#[cfg(feature = "smb")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FileSystemFlags(pub u32);
+
+#[cfg(feature = "smb")]
+impl FileSystemFlags {
+    pub const CASE_PRESERVED_NAMES: Self = Self(0x2);
+    pub const READ_ONLY_VOLUME: Self = Self(0x8_0000);
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+/// Bytes of a file system name the backend reports.
+#[cfg(feature = "smb")]
+pub const FILE_SYSTEM_NAME_CAPACITY: usize = 16;
+
+/// Name and capabilities of the file system of a volume
+/// (FileFsAttributeInformation).
+#[cfg(feature = "smb")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeAttributes {
+    pub flags: FileSystemFlags,
+    /// Longest file name component, in characters.
+    pub maximum_component_length: u32,
+    /// The file system name in ASCII, such as `FATX`.
+    pub name: [u8; FILE_SYSTEM_NAME_CAPACITY],
+    pub name_length: usize,
+}
+
+#[cfg(feature = "smb")]
+impl VolumeAttributes {
+    pub fn name(&self) -> &[u8] {
+        &self.name[..self.name_length.min(FILE_SYSTEM_NAME_CAPACITY)]
+    }
+}
+
 /// Direction of a raw device transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferDirection {
@@ -308,13 +376,13 @@ pub trait Backend {
     /// Count the close of a file a command may have changed (0x91f9feec,
     /// read by export 85).
     fn count_file_change(&mut self);
-    /// Read up to `target.length` bytes at `offset`, or at the current
+    /// Read up to `target.len()` bytes at `offset`, or at the current
     /// position when `None`; returns the bytes read.
     fn read_file(
         &mut self,
         handle: FileHandle,
         offset: Option<u64>,
-        target: PoolRange,
+        target: ReadTarget<'_>,
     ) -> Result<u32, KernelError>;
     /// Write at `offset`, or at the current position when `None`.
     fn write_file(
@@ -355,6 +423,12 @@ pub trait Backend {
         name: &mut [u8],
     ) -> Result<DirectoryEntry, KernelError>;
     fn query_volume_size(&mut self, handle: FileHandle) -> Result<VolumeSize, KernelError>;
+    /// File system name and attributes of the volume holding the file.
+    #[cfg(feature = "smb")]
+    fn query_volume_attributes(
+        &mut self,
+        handle: FileHandle,
+    ) -> Result<VolumeAttributes, KernelError>;
     /// Resolve the symbolic link object `link` into `target`; returns the
     /// target length.
     fn translate_symbolic_link(
@@ -489,7 +563,7 @@ pub struct Drive {
     pub enabled: bool,
 }
 
-const BADPATH: &[u8] = b"\\Badpath";
+pub(crate) const BADPATH: &[u8] = b"\\Badpath";
 const NETWORK_SHARE_PREFIX: &[u8] = b"\\Network\\Smb\\";
 /// `\Network\Smb\` plus at most 0x3d server characters.
 const NETWORK_SHARE_CAPACITY: usize = 0x50;
@@ -639,6 +713,14 @@ const INTERNAL_DRIVES: &[(&[u8], &[u8], bool)] = &[
     ),
 ];
 
+/// Names and targets of the internal drive mapping, in order.
+#[cfg(feature = "smb")]
+pub(crate) fn internal_drives() -> impl Iterator<Item = (&'static [u8], &'static [u8])> {
+    INTERNAL_DRIVES
+        .iter()
+        .map(|&(name, target, _)| (name, target))
+}
+
 /// Drive names and the object directories they map to (0x91f96bf8).
 #[derive(Debug, Clone)]
 pub struct DriveTable {
@@ -708,7 +790,7 @@ impl DriveTable {
 
     /// The bytes of `target`; `None` when a mapped string cannot be read.
     /// Mapped strings are read only up to `limit` bytes.
-    fn target_bytes<'a>(
+    pub(crate) fn target_bytes<'a>(
         &'a self,
         backend: &'a mut dyn crate::backend::Backend,
         target: DriveTarget,
@@ -1779,7 +1861,11 @@ fn get_file_data(transfer: &mut GetFile, cx: &mut ContinuationContext<'_>) -> Co
             offset: 0,
             length: count,
         };
-        if cx.backend.read_file(transfer.handle, None, range).is_err() {
+        if cx
+            .backend
+            .read_file(transfer.handle, None, ReadTarget::Pool(range))
+            .is_err()
+        {
             cx.backend.pool(transfer.buffer)[..count as usize].fill(0);
         }
         transfer.remaining -= count;
@@ -3346,7 +3432,7 @@ fn copy_local_file(
                 offset: 0,
                 length: 0x1_0000,
             };
-            let count = backend.read_file(input, Some(offset), range)?;
+            let count = backend.read_file(input, Some(offset), ReadTarget::Pool(range))?;
             backend.write_file(
                 output,
                 Some(offset),

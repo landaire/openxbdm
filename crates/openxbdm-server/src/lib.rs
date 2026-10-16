@@ -20,6 +20,8 @@ pub mod processors;
 pub mod registry;
 pub mod reply;
 pub mod server;
+#[cfg(feature = "smb")]
+pub mod smb;
 pub mod state;
 pub mod text;
 pub mod transfer_blocks;

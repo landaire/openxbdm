@@ -1,0 +1,12 @@
+---
+source: crates/openxbdm-server/src/smb/shares.rs
+expression: share_list(&drives)
+---
+A -> \\Device\\Cdrom0
+DVD -> \\Device\\Cdrom0
+E -> \\Device\\Harddisk0\\Partition1\\DEVKIT
+DEVKIT -> \\Device\\Harddisk0\\Partition1\\DEVKIT
+HDD -> \\Device\\Harddisk0\\Partition1
+Z -> \\Device\\Harddisk0\\Partition1
+FLASH -> \\Device\\Flash
+GAME -> \\Device\\Harddisk0\\Partition1\\DEVKIT\\title

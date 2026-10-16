@@ -16,6 +16,8 @@ mod kernel;
 mod lockfree;
 #[cfg(target_arch = "powerpc")]
 mod net;
+#[cfg(all(target_arch = "powerpc", feature = "smb"))]
+mod smb;
 
 #[cfg(target_arch = "powerpc")]
 mod xbox360 {
@@ -184,6 +186,8 @@ mod xbox360 {
                 *slot = Some(socket);
                 read.insert(socket.0);
             }
+            #[cfg(feature = "smb")]
+            let smb_sockets = crate::smb::select_sockets(&mut read, &mut write);
             // Threads waiting at debug events are seen at the next pass.
             let timeout =
                 TimeVal::from_milliseconds(timer_ms.min(POLL_INTERVAL_MS).min(DEBUG_EVENT_POLL_MS));
@@ -203,12 +207,16 @@ mod xbox360 {
                     server.on_fast_pipe_readable(socket, console, network);
                 }
             }
+            #[cfg(feature = "smb")]
+            crate::smb::dispatch(&smb_sockets, &read, &write, server, console, network);
             if let Some(discovery) = discovery
                 && read.contains(discovery)
             {
                 answer_discovery(server, discovery);
             }
             timer_ms = server.poll_timers(console).unwrap_or(POLL_INTERVAL_MS);
+            #[cfg(feature = "smb")]
+            crate::smb::poll(server, console, network);
             crate::backend::dispatcher::drain(server, console, network);
             crate::backend::session::poll_processor_calls(server, console, network);
             server.poll_debug_events(console, network);
@@ -265,6 +273,8 @@ mod xbox360 {
         let Some((server, console)) = crate::backend::dispatcher::begin_serving() else {
             return;
         };
+        #[cfg(feature = "smb")]
+        crate::smb::open(console);
         while !shutting_down() {
             let Ok(listener) = net::listen(XBDM_PORT, LISTEN_BACKLOG) else {
                 kernel::debug_print(c"openxbdm: listen failed\n");
@@ -290,6 +300,8 @@ mod xbox360 {
             close_listener();
         }
         close_listener();
+        #[cfg(feature = "smb")]
+        crate::smb::shut_down(server, console, &mut network);
         server.shut_down();
         let mut open = [None::<ConnectionIndex>; MAX_CONNECTIONS];
         for (slot, (index, _, _)) in server.connections().enumerate() {
@@ -371,6 +383,8 @@ mod xbox360 {
             0 => {
                 SHUTDOWN.store(true, Ordering::SeqCst);
                 close_listener();
+                #[cfg(feature = "smb")]
+                crate::smb::close_listener();
                 let handle = THREAD_HANDLE.swap(0, Ordering::SeqCst);
                 if handle != 0 {
                     // Commands on the server thread can arm engine hooks,

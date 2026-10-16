@@ -24,9 +24,19 @@ const SEND_LIMIT: Duration = Duration::from_secs(60);
 /// Wait up to `timeout` until `stream` can accept data or has failed.
 /// `false` means the time ran out.
 pub fn wait_writable(stream: &TcpStream, timeout: Duration) -> io::Result<bool> {
+    wait(stream, poll::WRITABLE, timeout)
+}
+
+/// Wait up to `timeout` until `stream` has input, has been closed by the
+/// peer, or has failed. `false` means the time ran out.
+pub fn wait_readable(stream: &TcpStream, timeout: Duration) -> io::Result<bool> {
+    wait(stream, poll::READABLE, timeout)
+}
+
+fn wait(stream: &TcpStream, events: std::ffi::c_short, timeout: Duration) -> io::Result<bool> {
     let milliseconds =
         std::ffi::c_int::try_from(timeout.as_millis()).unwrap_or(std::ffi::c_int::MAX);
-    match poll::wait_writable(stream, milliseconds) {
+    match poll::wait(stream, events, milliseconds) {
         -1 => Err(io::Error::last_os_error()),
         0 => Ok(false),
         _ => Ok(true),
@@ -45,7 +55,8 @@ mod poll {
         revents: std::ffi::c_short,
     }
 
-    const POLLOUT: std::ffi::c_short = 0x4;
+    pub const READABLE: std::ffi::c_short = 0x1;
+    pub const WRITABLE: std::ffi::c_short = 0x4;
 
     #[cfg(target_os = "linux")]
     type PollCount = std::ffi::c_ulong;
@@ -56,11 +67,15 @@ mod poll {
         fn poll(fds: *mut PollFd, count: PollCount, timeout: std::ffi::c_int) -> std::ffi::c_int;
     }
 
-    /// `poll` for writability: the number of ready sockets, or -1.
-    pub fn wait_writable(stream: &TcpStream, milliseconds: std::ffi::c_int) -> std::ffi::c_int {
+    /// `poll` for `events`: the number of ready sockets, or -1.
+    pub fn wait(
+        stream: &TcpStream,
+        events: std::ffi::c_short,
+        milliseconds: std::ffi::c_int,
+    ) -> std::ffi::c_int {
         let mut entry = PollFd {
             fd: stream.as_raw_fd(),
-            events: POLLOUT,
+            events,
             revents: 0,
         };
         // SAFETY: `entry` is one valid pollfd for the duration of the call.
@@ -80,8 +95,9 @@ mod poll {
         revents: std::ffi::c_short,
     }
 
-    /// POLLWRNORM, which WinSock names POLLOUT.
-    const POLLOUT: std::ffi::c_short = 0x10;
+    /// POLLRDNORM and POLLWRNORM, which WinSock names POLLIN and POLLOUT.
+    pub const READABLE: std::ffi::c_short = 0x100;
+    pub const WRITABLE: std::ffi::c_short = 0x10;
 
     #[link(name = "ws2_32")]
     unsafe extern "system" {
@@ -92,12 +108,16 @@ mod poll {
         ) -> std::ffi::c_int;
     }
 
-    /// `WSAPoll` for writability: the number of ready sockets, or -1
+    /// `WSAPoll` for `events`: the number of ready sockets, or -1
     /// (SOCKET_ERROR, with the error in `GetLastError`).
-    pub fn wait_writable(stream: &TcpStream, milliseconds: std::ffi::c_int) -> std::ffi::c_int {
+    pub fn wait(
+        stream: &TcpStream,
+        events: std::ffi::c_short,
+        milliseconds: std::ffi::c_int,
+    ) -> std::ffi::c_int {
         let mut entry = WsaPollFd {
             fd: stream.as_raw_socket() as usize,
-            events: POLLOUT,
+            events,
             revents: 0,
         };
         // SAFETY: `entry` is one valid WSAPOLLFD for the duration of the call.
@@ -147,6 +167,90 @@ fn reserve_send_space(stream: &TcpStream) {
 
 #[cfg(not(target_os = "macos"))]
 fn reserve_send_space(_stream: &TcpStream) {}
+
+/// Enable TCP keep-alive probes on `stream`, so a peer that vanished
+/// fails the socket.
+pub fn set_keepalive(stream: &TcpStream) -> io::Result<()> {
+    match keepalive::enable(stream) {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+#[cfg(unix)]
+mod keepalive {
+    use std::net::TcpStream;
+    use std::os::fd::AsRawFd;
+
+    #[cfg(target_os = "linux")]
+    const SOL_SOCKET: std::ffi::c_int = 1;
+    #[cfg(target_os = "linux")]
+    const SO_KEEPALIVE: std::ffi::c_int = 9;
+    #[cfg(not(target_os = "linux"))]
+    const SOL_SOCKET: std::ffi::c_int = 0xffff;
+    #[cfg(not(target_os = "linux"))]
+    const SO_KEEPALIVE: std::ffi::c_int = 8;
+
+    unsafe extern "C" {
+        fn setsockopt(
+            socket: std::ffi::c_int,
+            level: std::ffi::c_int,
+            name: std::ffi::c_int,
+            value: *const std::ffi::c_void,
+            length: u32,
+        ) -> std::ffi::c_int;
+    }
+
+    /// 0 on success, -1 on failure.
+    pub fn enable(stream: &TcpStream) -> std::ffi::c_int {
+        let enabled: std::ffi::c_int = 1;
+        // SAFETY: `enabled` outlives the call and its size is passed.
+        unsafe {
+            setsockopt(
+                stream.as_raw_fd(),
+                SOL_SOCKET,
+                SO_KEEPALIVE,
+                (&enabled as *const std::ffi::c_int).cast(),
+                size_of::<std::ffi::c_int>() as u32,
+            )
+        }
+    }
+}
+
+#[cfg(windows)]
+mod keepalive {
+    use std::net::TcpStream;
+    use std::os::windows::io::AsRawSocket;
+
+    const SOL_SOCKET: std::ffi::c_int = 0xffff;
+    const SO_KEEPALIVE: std::ffi::c_int = 8;
+
+    #[link(name = "ws2_32")]
+    unsafe extern "system" {
+        fn setsockopt(
+            socket: usize,
+            level: std::ffi::c_int,
+            name: std::ffi::c_int,
+            value: *const std::ffi::c_char,
+            length: std::ffi::c_int,
+        ) -> std::ffi::c_int;
+    }
+
+    /// 0 on success, SOCKET_ERROR (-1) on failure.
+    pub fn enable(stream: &TcpStream) -> std::ffi::c_int {
+        let enabled: u32 = 1;
+        // SAFETY: `enabled` outlives the call and its size is passed.
+        unsafe {
+            setsockopt(
+                stream.as_raw_socket() as usize,
+                SOL_SOCKET,
+                SO_KEEPALIVE,
+                (&enabled as *const u32).cast(),
+                size_of::<u32>() as std::ffi::c_int,
+            )
+        }
+    }
+}
 
 /// Open sockets by identifier.
 #[derive(Debug, Default)]

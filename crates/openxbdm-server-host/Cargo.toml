@@ -14,9 +14,14 @@ path = "src/lib.rs"
 name = "openxbdm-server"
 path = "src/main.rs"
 
+[features]
+default = ["smb"]
+# SMB file server listener.
+smb = ["openxbdm-server/smb"]
+
 [dependencies]
 openxbdm-core = { path = "../openxbdm-core" }
-openxbdm-server = { path = "../openxbdm-server" }
+openxbdm-server = { path = "../openxbdm-server", default-features = false }
 
 [dev-dependencies]
 openxbdm-client = { path = "../openxbdm-client" }

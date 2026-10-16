@@ -22,6 +22,7 @@ use openxbdm_server::commands::filesystem::FileTime;
 use openxbdm_server::commands::filesystem::ObjectDirectory;
 use openxbdm_server::commands::filesystem::PoolBuffer;
 use openxbdm_server::commands::filesystem::PoolRange;
+use openxbdm_server::commands::filesystem::ReadTarget;
 use openxbdm_server::commands::filesystem::ShareAccess;
 use openxbdm_server::commands::filesystem::TransferDirection;
 use openxbdm_server::commands::filesystem::VolumeSize;
@@ -44,6 +45,20 @@ pub const HARDDISK: &str = "\\Device\\Harddisk0\\Partition0";
 
 /// FATX names are at most 42 characters.
 const MAX_NAME: usize = 42;
+/// Rights that permit reading file data.
+const READ_ACCESS: FileAccess = FileAccess(
+    FileAccess::READ_DATA.0
+        | FileAccess::MAXIMUM_ALLOWED.0
+        | FileAccess::GENERIC_ALL.0
+        | FileAccess::GENERIC_READ.0,
+);
+/// Rights that permit writing file data.
+const WRITE_ACCESS: FileAccess = FileAccess(
+    FileAccess::WRITE_DATA.0
+        | FileAccess::APPEND_DATA.0
+        | FileAccess::GENERIC_ALL.0
+        | FileAccess::GENERIC_WRITE.0,
+);
 const CLUSTER: u64 = 0x4000;
 const DVD_TRACE_SIZE: u32 = 0x20_0000;
 
@@ -473,7 +488,7 @@ impl filesystem::Backend for MockBackend {
         if !valid_name(leaf(&path)) {
             return Err(KernelError::ObjectNameInvalid);
         }
-        let writes = request.access.contains(FileAccess::GENERIC_WRITE);
+        let writes = request.access.intersects(WRITE_ACCESS);
         let path = match disk.find(&path) {
             Some(index) => {
                 let entry = &mut disk.entries[index];
@@ -541,7 +556,7 @@ impl filesystem::Backend for MockBackend {
             path: Some(path),
             access: request.access,
             position: 0,
-            delete_pending: false,
+            delete_pending: request.options.contains(CreateOptions::DELETE_ON_CLOSE),
             cursor: 0,
         };
         Ok(state.insert_handle(file))
@@ -583,12 +598,12 @@ impl filesystem::Backend for MockBackend {
         &mut self,
         handle: FileHandle,
         offset: Option<u64>,
-        target: PoolRange,
+        target: ReadTarget<'_>,
     ) -> Result<u32, KernelError> {
         let (volume, index) = self.filesystem.entry_of(handle)?;
         let index = index.ok_or(KernelError::InvalidParameter)?;
         let file = self.filesystem.file(handle)?;
-        if !file.access.contains(FileAccess::GENERIC_READ) {
+        if !file.access.intersects(READ_ACCESS) {
             return Err(KernelError::AccessDenied);
         }
         let position = offset.unwrap_or(file.position);
@@ -597,14 +612,13 @@ impl filesystem::Backend for MockBackend {
             return Err(KernelError::EndOfFile);
         }
         let start = position as usize;
-        let count = (target.length as usize).min(data.len() - start);
+        let count = target.len().min(data.len() - start);
         let bytes = data[start..start + count].to_vec();
-        self.filesystem
-            .pool_slice(PoolRange {
-                length: count as u32,
-                ..target
-            })
-            .copy_from_slice(&bytes);
+        let output = match target {
+            ReadTarget::Bytes(bytes) => bytes,
+            ReadTarget::Pool(range) => self.filesystem.pool_slice(range),
+        };
+        output[..count].copy_from_slice(&bytes);
         if let Some(file) = self.filesystem.handles.get_mut(&handle.0) {
             file.position = position + count as u64;
         }
@@ -621,7 +635,7 @@ impl filesystem::Backend for MockBackend {
         let (volume, index) = self.filesystem.entry_of(handle)?;
         let index = index.ok_or(KernelError::InvalidParameter)?;
         let file = self.filesystem.file(handle)?;
-        if !file.access.contains(FileAccess::GENERIC_WRITE) {
+        if !file.access.intersects(WRITE_ACCESS) {
             return Err(KernelError::AccessDenied);
         }
         let position = offset.unwrap_or(file.position);
@@ -863,6 +877,23 @@ impl filesystem::Backend for MockBackend {
             available_units: volume.total_units.saturating_sub(volume.used_units()),
             sectors_per_unit: (CLUSTER / 0x200) as u32,
             bytes_per_sector: 0x200,
+        })
+    }
+
+    /// Every simulated volume is FATX.
+    #[cfg(feature = "smb")]
+    fn query_volume_attributes(
+        &mut self,
+        handle: FileHandle,
+    ) -> Result<filesystem::VolumeAttributes, KernelError> {
+        self.filesystem.file(handle)?;
+        let mut name = [0; filesystem::FILE_SYSTEM_NAME_CAPACITY];
+        name[..4].copy_from_slice(b"FATX");
+        Ok(filesystem::VolumeAttributes {
+            flags: filesystem::FileSystemFlags::CASE_PRESERVED_NAMES,
+            maximum_component_length: MAX_NAME as u32,
+            name,
+            name_length: 4,
         })
     }
 

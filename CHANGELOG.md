@@ -8,12 +8,18 @@
 - Implement all 177 stock XBDM 2.0.21256.0 commands in eleven domains (session, security, console, system, file system, memory, debugger, network, performance, hardware, services) over per-domain backend traits.
 - Move the protocol grammar, status codes, and authentication function shared by client and server into `openxbdm-core`.
 - Keep status integers at the wire and the kernel/title ABI: handlers and continuations return `Result<Reply, CommandError>`, converted to the reply line's result in `send_status`; backend traits fail with `KernelError` (a kernel status with named variants and exact passthrough of others) or per-domain error enums; exports, control codes, and reply texts that print a code convert typed errors at that point. `ErrorCode` is an enum of the result-table codes, and `Win32Error` carries Win32 codes.
+- Add the `smb` feature (default): every drive whose device exists, from the drive table and the internal drive mapping, is an SMB share served through `smb2-server`, with share identifiers common to all connections; logons need no password while security is off; while the console is locked, logons, opens, renames, and deletes fail. Optical drives and read-only volumes are read-only shares, and volume information comes from FileFsAttributeInformation. Change notifications report changes made by titles and XBDM through a scan of the watched directory every 2 seconds. Connections close without a logon after 30 seconds, when stalled for 30 seconds, and when idle without open files for 15 minutes; a full table replaces the oldest connection without a session, or else the one silent longest if silent for 5 minutes; a logon naming a previous session ends that session. File reads take a byte slice or a pool range (`ReadTarget`).
+
+### SMB server
+
+- Add `smb2-server`, a `no_std`, allocation-free, sans-io SMB 2 and SMB 3 file server: dialects 2.0.2, 2.1, 3.0, 3.0.2, and 3.1.1 (also from an SMB 1 multi-protocol negotiate) with 3.1.1 negotiate contexts, preauthentication integrity, and FSCTL_VALIDATE_NEGOTIATE_INFO; compound requests; NTLMv2 logons in SPNEGO or raw NTLMSSP; HMAC-SHA256, AES-CMAC, and AES-GMAC signing; AES-128-CCM and AES-128-GCM encryption; byte-range locks and change notification kept across a server's connections, with asynchronous replies and CANCEL; NT wildcard directory queries; file, file system and security information; and share enumeration through the `srvsvc` pipe. Failures are typed (`FsError` from backends, `AuthError`, `PipeError`, `PathError`) and become NT statuses only in replies.
 
 ### Host server
 
 - Add `openxbdm-server-host`: the engine over std TCP sockets with one simulated console shared by all connections, and UDP name discovery.
 - Add integration tests per domain that send every command to the host server over TCP.
 - Run on Windows (writability through `WSAPoll`) and macOS, where a socket is reported writable only with a full transfer block of send space free, so a stalled reader does not block other connections.
+- Serve SMB on `--smb-listen` (default `127.0.0.1:1445`) over the simulated volumes.
 
 ### Xbox 360 module
 
@@ -32,10 +38,12 @@
 - Place the export table in an executable section (`.xexp`); the loader hypercall reads it only from protected code pages.
 - `threads` reads the process objects at debug monitor data +0x50 and +0x54; the listener sets SO_REUSEADDR before bind; `getmemex` missing texts are `missing ADDR` and `missing LENGTH`.
 - Boots on a devkit in place of stock XBDM; xshell loads against its exports.
+- Serve SMB on TCP port 445 from the server thread's select loop, with two connections of two 0x10400-byte pool buffers each; without the port the monitor runs without SMB.
 
 ### Kernel debugger
 
 - Add `openxbdm-kd host`: acts as the console's debugger host, serves the kernel's host file requests from `--file` mappings (for example XBDM from a local image), and keeps an image's load-symbols stop (`--stop-on-load`) so memory can be patched before its entry point runs.
+- The host file service fails with `HostFileError`, converted to the FILE_IO reply status.
 - Serving `DEVKIT\FlashEx\xbdm.xex` from the host boots openxbdm without writing the console disk; stopping the host and rebooting returns to stock XBDM.
 
 ### Client
@@ -43,6 +51,7 @@
 - Match stock replies in the client: debugger commands (`isbreak`, `isstopped`, `stopon`/`nostopon`, `continue`, `dbgextld`; no `execute` data breakpoint), `consoletype`, `consolemem`, `getnetaddrs`, `setmem` partial writes, `getmem` lengths, file transfer ranges and `fileeof` dispositions, `screenshot` detiling, and discovery name matching.
 - Add client commands for `getcontext`, `setcontext`, `isdebugger`, `debugger`, `kd`, `kdlite`, `kdnet`, `threadstat`, `crashdump`, `break now`, lock mode, users, privileges, `authuser`, `adminpw`, and `keyxchg`.
 - Add `xeedee parity record` and `xeedee parity compare`: record the replies to a command list and compare two recordings outside listed varying fields.
+- Report 4xx replies outside the result table as remote errors with their code (`RemoteStatus`); parse stop exception codes as `NtStatus`, thread last errors as `Win32Error`, and the PIX capture file result as a hexadecimal HRESULT, failing on malformed text.
 - The command-line client is `xeedee`.
 
 ### Build

@@ -35,6 +35,7 @@ use crate::commands::filesystem::FileData;
 use crate::commands::filesystem::FileHandle;
 use crate::commands::filesystem::PoolBuffer;
 use crate::commands::filesystem::PoolRange;
+use crate::commands::filesystem::ReadTarget;
 use crate::commands::filesystem::ShareAccess;
 use crate::invocation::Invocation;
 use crate::reply::CommandError;
@@ -1401,7 +1402,10 @@ fn execute_file(invocation: &mut Invocation<'_>, handle: FileHandle, buffer: Poo
             offset: count as u32,
             length: (FILE_BUFFER_SIZE - count) as u32,
         };
-        if let Ok(read) = invocation.backend.read_file(handle, None, target) {
+        if let Ok(read) = invocation
+            .backend
+            .read_file(handle, None, ReadTarget::Pool(target))
+        {
             count += read as usize;
         }
         if count == 0 {

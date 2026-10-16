@@ -1,0 +1,21 @@
+---
+source: crates/openxbdm-server/src/smb/shares.rs
+expression: results
+---
+[
+    Ok(
+        "\\Device\\Harddisk0\\Partition1\\DEVKIT\\",
+    ),
+    Ok(
+        "\\Device\\Cdrom0\\",
+    ),
+    Ok(
+        "\\Device\\Harddisk0\\Partition1\\DEVKIT\\dir\\caf\xe9.txt",
+    ),
+    Err(
+        NameInvalid,
+    ),
+    Err(
+        NameInvalid,
+    ),
+]

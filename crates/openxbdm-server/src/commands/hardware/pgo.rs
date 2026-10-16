@@ -1254,7 +1254,8 @@ pub fn load_ini(
                 offset: count as u32,
                 length: (INI_BUFFER_SIZE - count) as u32,
             };
-            if let Ok(read) = backend.read_file(handle, None, target) {
+            if let Ok(read) = backend.read_file(handle, None, filesystem::ReadTarget::Pool(target))
+            {
                 count += read as usize;
             }
             if count == 0 {

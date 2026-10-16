@@ -25,7 +25,10 @@ rust_library(
     crate_root = "src/lib.rs",
     edition = "2024",
     env = ENV,
-    features = [],
+    features = [
+        "default",
+        "smb",
+    ],
     deps = [
         "//crates/openxbdm-core:openxbdm_core",
         "//crates/openxbdm-server:openxbdm_server",
@@ -43,7 +46,10 @@ rust_test(
     crate_root = "src/lib.rs",
     edition = "2024",
     env = ENV | {"INSTA_WORKSPACE_ROOT": "."},
-    features = [],
+    features = [
+        "default",
+        "smb",
+    ],
     run_env = {
         "CARGO_MANIFEST_DIR": "crates/openxbdm-server-host",
     },
@@ -62,7 +68,10 @@ rust_binary(
     crate_root = "src/main.rs",
     edition = "2024",
     env = ENV | {"CARGO_BIN_NAME": "openxbdm-server"},
-    features = [],
+    features = [
+        "default",
+        "smb",
+    ],
     deps = [
         "//crates/openxbdm-core:openxbdm_core",
         "//crates/openxbdm-server:openxbdm_server",
@@ -80,7 +89,10 @@ rust_test(
     crate_root = "src/main.rs",
     edition = "2024",
     env = ENV | {"CARGO_BIN_NAME": "openxbdm-server"} | {"INSTA_WORKSPACE_ROOT": "."},
-    features = [],
+    features = [
+        "default",
+        "smb",
+    ],
     run_env = {
         "CARGO_MANIFEST_DIR": "crates/openxbdm-server-host",
     },
@@ -100,7 +112,10 @@ rust_test(
     crate_root = "tests/console.rs",
     edition = "2024",
     env = ENV | {"INSTA_WORKSPACE_ROOT": "."},
-    features = [],
+    features = [
+        "default",
+        "smb",
+    ],
     run_env = {
         "CARGO_MANIFEST_DIR": "crates/openxbdm-server-host",
     },
@@ -120,7 +135,10 @@ rust_test(
     crate_root = "tests/debugger.rs",
     edition = "2024",
     env = ENV | {"INSTA_WORKSPACE_ROOT": "."},
-    features = [],
+    features = [
+        "default",
+        "smb",
+    ],
     run_env = {
         "CARGO_MANIFEST_DIR": "crates/openxbdm-server-host",
     },
@@ -140,7 +158,10 @@ rust_test(
     crate_root = "tests/filesystem.rs",
     edition = "2024",
     env = ENV | {"INSTA_WORKSPACE_ROOT": "."},
-    features = [],
+    features = [
+        "default",
+        "smb",
+    ],
     run_env = {
         "CARGO_MANIFEST_DIR": "crates/openxbdm-server-host",
     },
@@ -160,7 +181,10 @@ rust_test(
     crate_root = "tests/framework.rs",
     edition = "2024",
     env = ENV | {"INSTA_WORKSPACE_ROOT": "."},
-    features = [],
+    features = [
+        "default",
+        "smb",
+    ],
     run_env = {
         "CARGO_MANIFEST_DIR": "crates/openxbdm-server-host",
     },
@@ -180,7 +204,10 @@ rust_test(
     crate_root = "tests/hardware.rs",
     edition = "2024",
     env = ENV | {"INSTA_WORKSPACE_ROOT": "."},
-    features = [],
+    features = [
+        "default",
+        "smb",
+    ],
     run_env = {
         "CARGO_MANIFEST_DIR": "crates/openxbdm-server-host",
     },
@@ -200,7 +227,10 @@ rust_test(
     crate_root = "tests/memory.rs",
     edition = "2024",
     env = ENV | {"INSTA_WORKSPACE_ROOT": "."},
-    features = [],
+    features = [
+        "default",
+        "smb",
+    ],
     run_env = {
         "CARGO_MANIFEST_DIR": "crates/openxbdm-server-host",
     },
@@ -220,7 +250,10 @@ rust_test(
     crate_root = "tests/network.rs",
     edition = "2024",
     env = ENV | {"INSTA_WORKSPACE_ROOT": "."},
-    features = [],
+    features = [
+        "default",
+        "smb",
+    ],
     run_env = {
         "CARGO_MANIFEST_DIR": "crates/openxbdm-server-host",
     },
@@ -240,7 +273,10 @@ rust_test(
     crate_root = "tests/performance.rs",
     edition = "2024",
     env = ENV | {"INSTA_WORKSPACE_ROOT": "."},
-    features = [],
+    features = [
+        "default",
+        "smb",
+    ],
     run_env = {
         "CARGO_MANIFEST_DIR": "crates/openxbdm-server-host",
     },
@@ -260,7 +296,10 @@ rust_test(
     crate_root = "tests/security.rs",
     edition = "2024",
     env = ENV | {"INSTA_WORKSPACE_ROOT": "."},
-    features = [],
+    features = [
+        "default",
+        "smb",
+    ],
     run_env = {
         "CARGO_MANIFEST_DIR": "crates/openxbdm-server-host",
     },
@@ -280,7 +319,10 @@ rust_test(
     crate_root = "tests/services.rs",
     edition = "2024",
     env = ENV | {"INSTA_WORKSPACE_ROOT": "."},
-    features = [],
+    features = [
+        "default",
+        "smb",
+    ],
     run_env = {
         "CARGO_MANIFEST_DIR": "crates/openxbdm-server-host",
     },
@@ -300,7 +342,33 @@ rust_test(
     crate_root = "tests/session.rs",
     edition = "2024",
     env = ENV | {"INSTA_WORKSPACE_ROOT": "."},
-    features = [],
+    features = [
+        "default",
+        "smb",
+    ],
+    run_env = {
+        "CARGO_MANIFEST_DIR": "crates/openxbdm-server-host",
+    },
+    deps = [
+        "//crates/openxbdm-client:openxbdm_client",
+        "//crates/openxbdm-core:openxbdm_core",
+        "//crates/openxbdm-server:openxbdm_server",
+        "//third-party/rust:tokio",
+        ":openxbdm_server_host",
+    ],
+)
+
+rust_test(
+    name = "smb-test",
+    srcs = glob(["Cargo.toml", "src/**", "tests/**"]),
+    crate = "smb",
+    crate_root = "tests/smb.rs",
+    edition = "2024",
+    env = ENV | {"INSTA_WORKSPACE_ROOT": "."},
+    features = [
+        "default",
+        "smb",
+    ],
     run_env = {
         "CARGO_MANIFEST_DIR": "crates/openxbdm-server-host",
     },
@@ -320,7 +388,10 @@ rust_test(
     crate_root = "tests/system.rs",
     edition = "2024",
     env = ENV | {"INSTA_WORKSPACE_ROOT": "."},
-    features = [],
+    features = [
+        "default",
+        "smb",
+    ],
     run_env = {
         "CARGO_MANIFEST_DIR": "crates/openxbdm-server-host",
     },
@@ -340,7 +411,10 @@ rust_test(
     crate_root = "tests/trace.rs",
     edition = "2024",
     env = ENV | {"INSTA_WORKSPACE_ROOT": "."},
-    features = [],
+    features = [
+        "default",
+        "smb",
+    ],
     run_env = {
         "CARGO_MANIFEST_DIR": "crates/openxbdm-server-host",
     },

@@ -129,6 +129,12 @@ same sources.
 `//third-party/rust` is not built as a whole: its rules for other hosts
 are incompatible with this one.
 
+The `smb` feature of `openxbdm-server`, `openxbdm-server-host`, and
+`openxbdm-server-xbox360` is on by default; the platform crates depend on
+`openxbdm-server` without its default features and enable `smb` through
+their own. `cargo build -p openxbdm-server --no-default-features` builds
+the engine without `smb2-server`.
+
 `buck2 build -c rust.profile=release` builds host crates like Cargo's
 release profile: every crate gets `-Copt-level=3` and `-Cstrip=debuginfo`,
 and binaries and tests get the workspace's `lto = "thin"` as `-Clto=thin`.

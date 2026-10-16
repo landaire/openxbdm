@@ -12,13 +12,16 @@ name = "openxbdm-server-xbox360"
 path = "src/main.rs"
 
 [features]
+default = ["smb"]
+# SMB file server on TCP port 445.
+smb = ["openxbdm-server/smb"]
 # Deployment through DEVKIT:\FlashEx: a boot without the marker file
 # DEVKIT:\FlashEx\openxbdm.arm removes the override module and restarts.
 boot-guard = []
 
 [dependencies]
 openxbdm-core = { path = "../openxbdm-core" }
-openxbdm-server = { path = "../openxbdm-server" }
+openxbdm-server = { path = "../openxbdm-server", default-features = false }
 
 # The module targets powerpc-unknown-xbox360, which Buck2 builds
 # (build_defs/update_buck_files.py, xbox360/BUCK); for the host, Cargo

@@ -3,9 +3,12 @@
 //!
 //! The engine is single-threaded; each connection has a thread that waits
 //! for readability without holding the lock and then reports the event.
+//! SMB connections take the SMB service's lock before the host's.
 
 pub mod backend;
 pub mod network;
+#[cfg(feature = "smb")]
+mod smb;
 
 use std::io;
 use std::net::Ipv4Addr;
@@ -59,17 +62,27 @@ impl Host {
 
 /// A host shared between connection threads.
 #[derive(Clone)]
-pub struct SharedHost(Arc<Mutex<Host>>);
+pub struct SharedHost {
+    host: Arc<Mutex<Host>>,
+    #[cfg(feature = "smb")]
+    smb: Arc<Mutex<smb::Service>>,
+}
 
 impl SharedHost {
     /// Start `host` and share it.
     pub fn new(mut host: Host) -> Self {
         host.start();
-        Self(Arc::new(Mutex::new(host)))
+        #[cfg(feature = "smb")]
+        let smb = smb::start(&mut host);
+        Self {
+            host: Arc::new(Mutex::new(host)),
+            #[cfg(feature = "smb")]
+            smb,
+        }
     }
 
     pub fn lock(&self) -> MutexGuard<'_, Host> {
-        self.0
+        self.host
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -98,6 +111,8 @@ impl SharedHost {
                 server.drain_posted_notifications(backend, network);
                 server.poll_timers(backend)
             };
+            #[cfg(feature = "smb")]
+            self.poll_smb_timers();
             let delay = delay.map_or(TIMER_PERIOD, |milliseconds| {
                 Duration::from_millis(u64::from(milliseconds))
             });

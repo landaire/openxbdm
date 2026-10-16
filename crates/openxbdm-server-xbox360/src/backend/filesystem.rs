@@ -20,6 +20,7 @@ use openxbdm_server::commands::filesystem::FileTime;
 use openxbdm_server::commands::filesystem::ObjectDirectory;
 use openxbdm_server::commands::filesystem::PoolBuffer;
 use openxbdm_server::commands::filesystem::PoolRange;
+use openxbdm_server::commands::filesystem::ReadTarget;
 use openxbdm_server::commands::filesystem::ShareAccess;
 use openxbdm_server::commands::filesystem::TransferDirection;
 use openxbdm_server::commands::filesystem::VolumeSize;
@@ -89,6 +90,8 @@ const FILE_DISPOSITION_INFORMATION: u32 = 0xd;
 const FILE_END_OF_FILE_INFORMATION: u32 = 0x14;
 const FILE_NETWORK_OPEN_INFORMATION: u32 = 0x22;
 const FILE_FS_SIZE_INFORMATION: u32 = 3;
+#[cfg(feature = "smb")]
+const FILE_FS_ATTRIBUTE_INFORMATION: u32 = 5;
 const FILE_FS_DEVICE_INFORMATION: u32 = 4;
 const IRP_MJ_READ: u32 = 2;
 const IRP_MJ_WRITE: u32 = 3;
@@ -109,6 +112,31 @@ const MONITOR_TRACE_POINTER: u32 = 0x3c;
 const MONITOR_DVD_TRACE: u32 = 0x20;
 /// Longest object name passed to the kernel.
 const PATH_CAPACITY: usize = 0x200;
+
+/// FileFsAttributeInformation fields. The kernel's file information
+/// structures carry names as single bytes, as FileDirectoryInformation
+/// does. `None` when the name is longer than the capacity or holds a byte
+/// outside printable ASCII.
+#[cfg(feature = "smb")]
+fn volume_attributes(
+    flags: u32,
+    maximum_component_length: u32,
+    name: &[u8],
+) -> Option<commands::filesystem::VolumeAttributes> {
+    if name.len() > commands::filesystem::FILE_SYSTEM_NAME_CAPACITY
+        || !name.iter().all(u8::is_ascii_graphic)
+    {
+        return None;
+    }
+    let mut output = [0u8; commands::filesystem::FILE_SYSTEM_NAME_CAPACITY];
+    output[..name.len()].copy_from_slice(name);
+    Some(commands::filesystem::VolumeAttributes {
+        flags: commands::filesystem::FileSystemFlags(flags),
+        maximum_component_length,
+        name: output,
+        name_length: name.len(),
+    })
+}
 
 /// Platform state of this domain.
 pub struct Data {
@@ -466,9 +494,12 @@ impl commands::filesystem::Backend for Console {
         &mut self,
         handle: FileHandle,
         offset: Option<u64>,
-        target: PoolRange,
+        target: ReadTarget<'_>,
     ) -> Result<u32, KernelError> {
-        let buffer = pool_range(target);
+        let buffer = match target {
+            ReadTarget::Bytes(bytes) => bytes,
+            ReadTarget::Pool(range) => pool_range(range),
+        };
         let mut io_status = IoStatusBlock::default();
         let offset_pointer = offset
             .as_ref()
@@ -480,7 +511,7 @@ impl commands::filesystem::Backend for Console {
             0,
             &mut io_status,
             buffer.as_mut_ptr(),
-            target.length,
+            buffer.len() as u32,
             offset_pointer,
         );
         status(complete(handle.0, raw, &io_status))?;
@@ -661,6 +692,28 @@ impl commands::filesystem::Backend for Console {
             sectors_per_unit: word(&bytes[0x10..]),
             bytes_per_sector: word(&bytes[0x14..]),
         })
+    }
+
+    #[cfg(feature = "smb")]
+    fn query_volume_attributes(
+        &mut self,
+        handle: FileHandle,
+    ) -> Result<commands::filesystem::VolumeAttributes, KernelError> {
+        // Attributes, maximum component length, name length, and the name.
+        let mut bytes = [0u8; 12 + commands::filesystem::FILE_SYSTEM_NAME_CAPACITY];
+        let mut io_status = IoStatusBlock::default();
+        status(NtQueryVolumeInformationFile(
+            handle.0,
+            &mut io_status,
+            bytes.as_mut_ptr(),
+            bytes.len() as u32,
+            FILE_FS_ATTRIBUTE_INFORMATION,
+        ))?;
+        let name = bytes[12..]
+            .get(..word(&bytes[8..]) as usize)
+            .ok_or(KernelError::BufferOverflow)?;
+        volume_attributes(word(&bytes[0..]), word(&bytes[4..]), name)
+            .ok_or(KernelError::ObjectNameInvalid)
     }
 
     fn translate_symbolic_link(

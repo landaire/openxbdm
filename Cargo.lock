@@ -1142,6 +1142,7 @@ version = "0.1.0"
 dependencies = [
  "insta",
  "openxbdm-core",
+ "smb2-server",
 ]
 
 [[package]]

@@ -21,6 +21,7 @@ multi-line and binary bodies, and answer name discovery on UDP port 730.
 | `openxbdm-server` | `no_std`, allocation-free command engine: all 177 stock commands in `src/commands/<domain>` over per-domain backend traits |
 | `openxbdm-server-host` | The engine over std TCP sockets with a simulated console (`openxbdm-server` binary), and the integration tests |
 | `openxbdm-server-xbox360` | The Xbox 360 system-debugger module: console backends, control dispatcher, and the 253 exports |
+| `smb2-server` | `no_std`, allocation-free, sans-io SMB 2 and SMB 3 file server (dialects 2.0.2 to 3.1.1, NTLMv2, signing, encryption, byte-range locks, change notification) over backend traits; `examples/serve_directory.rs` serves host directories |
 | `openxbdm-kd-core` | `no_std` kdnet packet codec and session |
 | `openxbdm-kd` | Kernel debugger client over kdnet: the `openxbdm-kd` binary, GDB server, and debugger host |
 | `openxbdm-asm-rewrite` | Assembly rewrite and the rewrite and reservation audits of the console module build |
@@ -113,6 +114,38 @@ The default listen address is `127.0.0.1:1730`; name discovery is served
 on the UDP port with the same number. All connections share one simulated
 console, which starts by executing its settings file as the console
 monitor does.
+
+### File sharing over SMB
+
+The server also shares the console's drives over SMB 2 and SMB 3
+(dialects 2.0.2 through 3.1.1, with signing and encryption), on
+`127.0.0.1:1445` by default (`--smb-listen HOST:PORT`; port
+445 needs privileges on most hosts). SMB file operations reach the same
+simulated volumes as `getfile` and `sendfile`.
+
+```text
+smbclient //127.0.0.1/DEVKIT -p 1445 -U any%
+smbclient -L //127.0.0.1 -p 1445 -U any%
+```
+
+On the console the module listens on TCP port 445:
+
+```text
+net use \\console\DEVKIT /user:xbox ""
+```
+
+Every drive whose device exists is a share named as the drive, for
+example `DEVKIT`, `E`, `HDD`, `FLASH`, `DVD`, or `USBMASS0`, including
+drives that `drivelist` hides and those of the internal drive mapping.
+While security is off, any user name logs on with an empty password, and
+guest and anonymous logons are allowed; while the console is locked, no
+SMB logon succeeds and opens, renames, and deletes fail. Shares on
+optical drives are read-only. Change notifications name the files
+changed over SMB; changes made by titles or XBDM are found by a scan of
+the watched directory every 2 seconds and reported as a changed
+directory. The `smb` Cargo feature of
+`openxbdm-server`, `openxbdm-server-host`, and `openxbdm-server-xbox360`,
+on by default, builds the file server.
 
 ## Tests
 

@@ -11,8 +11,8 @@ xbox360_module(
     visibility = ["PUBLIC"],
 )
 
-# For DEVKIT:\FlashEx. `boot-guard` is the module's only feature, so the
-# `-all-features` executable is the boot-guard build.
+# For DEVKIT:\FlashEx. `boot-guard` is the module's only feature outside
+# the defaults, so the `-all-features` executable is the boot-guard build.
 xbox360_module(
     name = "openxbdm-boot-guard",
     executable = _MODULE + "-all-features-bin",

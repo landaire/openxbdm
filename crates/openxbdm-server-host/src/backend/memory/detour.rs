@@ -20,6 +20,7 @@ use openxbdm_server::commands::filesystem::FileAttributes;
 use openxbdm_server::commands::filesystem::FileData;
 use openxbdm_server::commands::filesystem::FileHandle;
 use openxbdm_server::commands::filesystem::PoolRange;
+use openxbdm_server::commands::filesystem::ReadTarget;
 use openxbdm_server::commands::filesystem::ShareAccess;
 use openxbdm_server::commands::memory::Backend as _;
 use openxbdm_server::commands::memory::detour;
@@ -362,11 +363,11 @@ impl MockBackend {
         let read = self.read_file(
             handle,
             None,
-            PoolRange {
+            ReadTarget::Pool(PoolRange {
                 buffer,
                 offset: 0,
                 length: RECORD_SIZE as u32,
-            },
+            }),
         );
         output.copy_from_slice(&self.pool(buffer)[..RECORD_SIZE]);
         self.free_pool(buffer);

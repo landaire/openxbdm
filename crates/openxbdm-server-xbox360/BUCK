@@ -25,7 +25,10 @@ xbox360_executable(
     crate_root = "src/main.rs",
     edition = "2024",
     env = ENV | {"CARGO_BIN_NAME": "openxbdm-server-xbox360"},
-    features = [],
+    features = [
+        "default",
+        "smb",
+    ],
     deps = [
         "//crates/openxbdm-core:openxbdm_core",
         "//crates/openxbdm-server:openxbdm_server",
@@ -45,6 +48,8 @@ xbox360_executable(
     env = ENV | {"CARGO_BIN_NAME": "openxbdm-server-xbox360"},
     features = [
         "boot-guard",
+        "default",
+        "smb",
     ],
     deps = [
         "//crates/openxbdm-core:openxbdm_core",

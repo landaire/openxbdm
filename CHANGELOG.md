@@ -12,6 +12,7 @@
 
 - Add `openxbdm-server-host`: the engine over std TCP sockets with one simulated console shared by all connections, and UDP name discovery.
 - Add integration tests per domain that send every command to the host server over TCP.
+- Run on Windows (writability through `WSAPoll`) and macOS, where a socket is reported writable only with a full transfer block of send space free, so a stalled reader does not block other connections.
 
 ### Xbox 360 module
 

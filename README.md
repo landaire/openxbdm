@@ -1,167 +1,79 @@
 # openxbdm
 
-Clean-room Rust reimplementation of the Xbox 360 [XBDM][xbdm] (Xbox Debug
-Monitor): a client library and CLI, and a server that replaces the
-monitor on the console.
+Clean-room Rust reimplementation of the Xbox 360 [XBDM][xbdm] (Xbox Debug Monitor): a client library and CLI, and a server that replaces the monitor on the console.
 
 [xbdm]: https://xboxdevwiki.net/Xbox_Debug_Monitor
 
-Xbox 360 development kits serve a text-line protocol on TCP port 730, with
-multi-line and binary bodies, and answer name discovery on UDP port 730.
+## tl;dr
 
-## Crates
-
-| Crate | Contents |
-| --- | --- |
-| `openxbdm-core` | `no_std` protocol grammar, status codes, value encodings, and the authentication response function shared by client and server |
-| `openxbdm-client` | Async client: transports (including `MockTransport`), response parsers, typed commands, discovery |
-| `openxbdm-cli` | The `xeedee` command-line client, including `parity record` and `parity compare` for differential testing |
-| `openxbdm-ffi` | C/C++ bindings for the client (`cdylib`, `staticlib`) |
-| `openxbdm-ffi-bindgen` | Generates the C++ headers of `openxbdm-ffi` with diplomat |
-| `openxbdm-server` | `no_std`, allocation-free command engine: all 177 stock commands in `src/commands/<domain>` over per-domain backend traits |
-| `openxbdm-server-host` | The engine over std TCP sockets with a simulated console (`openxbdm-server` binary), and the integration tests |
-| `openxbdm-server-xbox360` | The Xbox 360 system-debugger module: console backends, control dispatcher, and the 253 exports |
-| `smb2-server` | `no_std`, allocation-free, sans-io SMB 2 and SMB 3 file server (dialects 2.0.2 to 3.1.1, NTLMv2, signing, encryption, byte-range locks, change notification) over backend traits; `examples/serve_directory.rs` serves host directories |
-| `openxbdm-kd-core` | `no_std` kdnet packet codec and session |
-| `openxbdm-kd` | Kernel debugger client over kdnet: the `openxbdm-kd` binary, GDB server, and debugger host |
-| `openxbdm-asm-rewrite` | Assembly rewrite and the rewrite and reservation audits of the console module build |
-
-## Build
-
-Buck2 builds, tests and lints the workspace on Linux x86_64, macOS arm64
-and Windows x86_64, including the console module. It downloads the Rust
-release, a pinned nightly rustfmt, a Python interpreter, each crates.io
-dependency, and the Xbox 360 toolchain, and checks every download against
-a pinned SHA-256 (crates and Rust archives) or commit (the toolchain). The
-host provides the C++ compiler driver, which links host executables: `c++`
-on Linux, Xcode's `clang++` on macOS, and the Visual Studio build tools on
-Windows.
-
-The Xbox 360 toolchain is the `xbox360` cell, the
-[rust-xbox360](https://github.com/landaire/rust-xbox360) repository at the
-commit that `.buckconfig` pins: the target specification, the standard
-library overlay that Buck2 builds the console's `core`, `alloc` and
-`compiler_builtins` from, and `xex-link`. The Rust release is the one that
-cell pins; `rust-toolchain.toml` names the same release for Cargo and
-rust-analyzer.
-
-Each workspace crate has a generated `crates/<name>/BUCK`; the crates.io
-dependencies are in the generated `third-party/rust/BUCK`. Cargo.toml stays
-the description of every crate. A crate with optional features also has
-`-all-features` variants of its library and binaries, so that builds and
-lints cover the optional code. Cargo builds the host crates from the same
-sources (`cargo build --workspace`, `cargo test --workspace`).
-
-With [devenv](https://devenv.sh), `devenv shell` provides Buck2, reindeer,
-Python, and the same Rust release for Cargo and rust-analyzer; the C
-compiler stays the host's. Without devenv, install:
-
-- Buck2, the release that `toolchains/buck2_release.json` names. The test
-  rules require that release or a later one.
-- git, which Buck2 runs to fetch the `xbox360` cell.
-- Python 3.11 or later.
-- rustup, which installs the release that `rust-toolchain.toml` names, and
-  [reindeer](https://github.com/facebookincubator/reindeer), to regenerate
-  the build files.
-
-| Command | Purpose |
-| --- | --- |
-| `buck2 build //: //bindings/... //crates/... //xbox360/...` | Build everything: host crates, C++ headers, and the console module. |
-| `buck2 test //: //bindings/... //crates/... //xbox360/...` | Run the unit, integration and documentation tests, and check the Rust release pin. |
-| `buck2 build //xbox360:openxbdm --show-output` | Build the console module, `openxbdm.xex`. |
-| `buck2 run //crates/openxbdm-cli:xeedee-bin -- ARGS` | Run a tool; each binary is `//crates/<crate>:<binary>-bin`. |
-| `buck2 build -c rust.profile=release //crates/...` | Build the host crates with the optimizations of Cargo's release profile. |
-| `build_defs/lint.py` | Check formatting and clippy diagnostics. |
-| `build_defs/lint.py --format` | Format the workspace crates. |
-| `build_defs/package_release.py --version V --target T` | Archive the host tools and the FFI libraries. |
-| `build_defs/package_module.py --version V` | Copy out the console module builds under release names. |
-| `build_defs/update_buck_files.py` | Regenerate the build files after a change to a `Cargo.toml` or `Cargo.lock`. |
-| `toolchains/update_rustfmt_release.py` | Regenerate `toolchains/rustfmt_release.bzl` after a change to `RUSTFMT_NIGHTLY` in the script. |
-
-`mise.toml` defines the same commands as tasks. See `DEVELOPING.md` for
-the console module build, local changes to rust-xbox360, the Buck rules,
-and console deployment.
+- `openxbdm.xex` is a drop-in replacement for XBDM.
+- SMBv2 and v3 are supported by the server. Connect with username `xbox` and no password. Supports NTLMv2 with AES-128-GCM.
+- Client library provides sync/async modes and has a sans-io core that can be used in flexible and weird environments (like [my hex editor](https://github.com/landaire/hxy)).
+- Client library has an FFI crate which can be used to generate bindings for any target language supported by [diplomat](https://github.com/rust-diplomat/diplomat).
+- `kdnet` supported and a `kdnet` to `gdbstub` bridge is provided, so you can debug your console with `gdb` or `lldb`.
+- There is a `xeedee` cli which provides some features wrapping the client library for interacting with the devkit.
 
 ## Releases
 
-A `vX.Y.Z` tag that names the workspace version publishes a GitHub release.
-Every day the `nightly` pre-release is rebuilt from the default branch when
-the branch has changed since the last one. The notes of each release give
-its build date and commit and the console installation steps. Each release
-has:
+Nightly releases will be built iff there have been changes since last nightly.
 
-- `openxbdm-boot-guard-<version>.xex`: the console module for
-  `DEVKIT:\FlashEx\xbdm.xex` on a development kit.
-- `openxbdm-<version>.xex`: the console module for the kernel debugger
-  host.
-- For Linux x86_64, macOS arm64 and Windows x86_64:
-  - `xeedee-<version>-<target>`: the `xeedee` and `openxbdm-kd`
-    executables.
-  - `xeedee-ffi-<version>-<target>`: the `openxbdm-ffi` shared and static
-    libraries and their C++ headers.
+Release artifacts:
 
-Buck2 builds every file. `<version>` is `nightly` for the nightly
-pre-release.
+- `openxbdm-boot-guard-<version>.xex`: the console module for `DEVKIT:\FlashEx\xbdm.xex` on a development kit which has some startup safety checks to avoid accidentally killing xbdm connectivity if something goes wrong.
+- `openxbdm-<version>.xex`: the console module if you're deploying using the kernel debugger host (temp). For Linux x86_64, macOS arm64 and Windows x86_64:
+- `xeedee-<version>-<target>`: the `xeedee` and `openxbdm-kd` executables.
+- `xeedee-ffi-<version>-<target>`: the `openxbdm-ffi` shared and static libraries and their C++ headers.
 
-## Host server
+## Xbox 360 module
+
+`buck2 build //xbox360:openxbdm` builds `openxbdm.xex` which is intended to be the replacement for XBDM.
+
+Its XEX2 header info can be found under [xbox360/xex.toml](xbox360/xex.toml)
+
+Development loop, without writing the console disk: with kdnet enabled, run the kernel debugger host and reboot the console. The kernel then loads the module from the host:
 
 ```text
-buck2 run //crates/openxbdm-server-host:openxbdm-server-bin -- --listen 127.0.0.1:1730
-xeedee -H 127.0.0.1:1730 dmversion
+openxbdm-kd host --file "host:\Device\Harddisk0\Partition1\DEVKIT\FlashEx\xbdm.xex=$(buck2 build //xbox360:openxbdm --show-simple-output)"
 ```
 
-The default listen address is `127.0.0.1:1730`; name discovery is served
-on the UDP port with the same number. All connections share one simulated
-console, which starts by executing its settings file as the console
-monitor does.
+Stopping the host and rebooting returns to stock XBDM from flash. Placed at `DEVKIT:\FlashEx\xbdm.xex` the boot-guard build also loads in place of the flash monitor and removes that file at startup. Read the hazards and recovery in `DEVELOPING.md` before using that method.
 
-### File sharing over SMB
+## Kernel debugger (openxbdm-kd)
 
-The server also shares the console's drives over SMB 2 and SMB 3
-(dialects 2.0.2 through 3.1.1, with signing and encryption), on
-`127.0.0.1:1445` by default (`--smb-listen HOST:PORT`; port
-445 needs privileges on most hosts). SMB file operations reach the same
-simulated volumes as `getfile` and `sendfile`.
+`openxbdm-kd` talks to the kernel debugger over the kdnet UDP transport and serves GDB.
 
-```text
-smbclient //127.0.0.1/DEVKIT -p 1445 -U any%
-smbclient -L //127.0.0.1 -p 1445 -U any%
-```
+Enable kdnet with stock XBDM (`kdnet set IP=<host> Port=50000`, `kdnet enable`, reboot).
 
-On the console the module listens on TCP port 445:
+    openxbdm-kd listen [--passive] [--log-file kd.log]
+    openxbdm-kd [--target 169.254.59.14] break
+    openxbdm-kd mem 0x80040000 64
+    openxbdm-kd gdbserver --listen 127.0.0.1:2159
+    openxbdm-kd host [--file CONSOLE_PATH=LOCAL_PATH] [--stop-on-load IMAGE]
+    openxbdm-kd reboot
 
-```text
-net use \\console\DEVKIT /user:xbox ""
-```
+Without `--target` the address is learned from the kernel's beacon. While the tool is attached the kernel waits for it at every print, module load and stop.
 
-Every drive whose device exists is a share named as the drive, for
-example `DEVKIT`, `E`, `HDD`, `FLASH`, `DVD`, or `USBMASS0`, including
-drives that `drivelist` hides and those of the internal drive mapping.
-While security is off, any user name logs on with an empty password, and
-guest and anonymous logons are allowed; while the console is locked, no
-SMB logon succeeds and opens, renames, and deletes fail. Shares on
-optical drives are read-only. Change notifications name the files
-changed over SMB; changes made by titles or XBDM are found by a scan of
-the watched directory every 2 seconds and reported as a changed
-directory. The `smb` Cargo feature of
-`openxbdm-server`, `openxbdm-server-host`, and `openxbdm-server-xbox360`,
-on by default, builds the file server.
+The `host` command keeps the console running while attached. It continues every event, prints debug output and module loads, and answers the kernel's host file requests.
 
-## Tests
+Each module load asks the host first with a path such as `host:\Device\Flash\xbdm.xex`. Every requested path is printed, and if something catches your eye you can use `--file` to serve that path (compared case-insensitively) from a local file. Other paths are answered as not found and the kernel loads from its own devices.
 
-- `crates/openxbdm-server-host/tests/<domain>.rs`: integration tests that
-  start the host server and send every command over TCP, through
-  `openxbdm-client` where it has the command and as raw lines otherwise.
-  `framework.rs` covers dispatch and access rules, `trace.rs` the
-  `verbose` trace texts, `network/` the `ipproxy`, `netcap`, and `netsim`
-  engines; `common/` holds the shared harness.
-- `crates/openxbdm-client/tests/`: Insta snapshot tests of command
-  encoding and reply parsing against captured fixtures.
-- Unit tests in `openxbdm-core`, `openxbdm-client`, `openxbdm-cli`, and
-  `openxbdm-server`.
+To boot XBDM from a local image:
 
-`build_defs/update_buck_files.py` generates a Buck2 test target for each
-unit test and `tests/*.rs` file.
+    openxbdm-kd host --file 'host:\Device\Flash\xbdm.xex=xbdm.xex'
+
+`--stop-on-load xbdm.xex` keeps the console stopped at that image's load, after it is mapped and before its entry point runs, and reads commands from standard input: `mem ADDRESS [LENGTH]`, `write ADDRESS HEXBYTES` and `continue` (end of input also continues). `--log-file` appends every received datagram in the `listen --log-file` format.
+
+### GDB
+
+GDB can be used with `openxbdm-kd` (any build of GDB with PowerPC support):
+
+    gdb -ex 'set architecture powerpc:common64' -ex 'set endian big' \
+        -ex 'target remote 127.0.0.1:2159'
+
+- Registers, memory, software breakpoints, `stepi` (software single step), interrupt and detach are supported.
+- Detaching removes breakpoints and resumes the console.
+- Do not set breakpoints in the kernel debugger's own code paths, such as the kd poll path at `0x801b4990`.
+- Single step through MSR.SE stops the console with bug check 0x2b.
 
 ## Client
 
@@ -211,57 +123,46 @@ xeedee -H 192.168.1.26 file get 'DEVKIT:\my-capture.xbm'
 xeedee -H 192.168.1.26 dump-module xboxkrnl.exe /tmp/xboxkrnl.exe
 ```
 
-### Features
+## Building
 
-`openxbdm-client`:
+_For in-depth info see [`DEVELOPING.md`](DEVELOPING.md)_.
 
-| Feature | Enables |
-| --- | --- |
-| `tokio` (default) | `tokio::net::TcpStream` transport |
-| `jiff` | `jiff::Zoned` conversions on time-bearing response types |
-| `capture` | Video capture over the PIX! protocol and `.xbm` decoding |
-| `dangerous` | In-memory patches to xbdm (drive map enable, code patches) |
+buck2 is used for building, testing, and linting across all platforms. It will automatically download all requirements (Rust, Python). Your host C++ compiler will be used where necessary (TODO: fix).
 
-`openxbdm-cli` enables `capture` and `dangerous` by default.
+We have a custom [rust-xbox360](https://github.com/landaire/rust-xbox360) toolchain used and creates the `xbox360` buck2 cell. Additionally, tools from [acceleration](https://github.com/landaire/acceleration) are used for translating from ppc64 ELF to ppc64 PE, then wrapping that as an XEX2.
 
-The client was exercised against a stock v10888-based development kit
-(`xbdm-main-nov11`): directory listing, `getfile`, `sendfile`, `getmem`,
-`setmem`, `reboot`, `threadinfo`, notification channels, UDP discovery,
-PIX! video capture, and the `dangerous` helpers. MP4 output shells out to
-`ffmpeg` for H.264 muxing.
+If you are a nix user, a [devenv](https://devenv.sh), is present whcih can provide all necessary tooling. Run `devenv shell` to activate.
 
-## Xbox 360 module
+Otherwise, you will need:
 
-`buck2 build //xbox360:openxbdm` builds `openxbdm.xex`: load address
-`0x91f00000`, system-debugger DLL flags, build 21256 import versions,
-small pages, compression, development-key encryption, and the bounding
-path `\Device\Harddisk0\Partition1\DEVKIT\FlashEx\xbdm.xex`
-(`xbox360/xex.toml`). `//xbox360:openxbdm-boot-guard` is the build for
-`DEVKIT:\FlashEx`. The module boots on a devkit in place of stock XBDM;
-see `docs/re-notes/status.md`.
+- [buck2](https://buck2.build/) (you can see which toolchain is pinned at [`toolchains/buck2_release.json`](toolchains/buck2_release.json), but this hopefully shouldn't matter too much)
+- Python 3.11 or later.
+- rustup, which installs the release that `rust-toolchain.toml` names, and [reindeer](https://github.com/facebookincubator/reindeer), to regenerate the build files.
 
-Development loop, without writing the console disk: with kdnet enabled,
-run the kernel debugger host and reboot the console; the kernel loads
-the module from the host.
+| Command                                                     | Purpose                                                                                        |
+| ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `buck2 build //: //bindings/... //crates/... //xbox360/...` | Build everything: host crates, C++ headers, and the console module.                            |
+| `buck2 test //: //bindings/... //crates/... //xbox360/...`  | Run the unit, integration and documentation tests, and check the Rust release pin.             |
+| `buck2 build //xbox360:openxbdm --show-output`              | Build the console module, `openxbdm.xex`.                                                      |
+| `buck2 run //crates/openxbdm-cli:xeedee-bin -- ARGS`        | Run a tool; each binary is `//crates/<crate>:<binary>-bin`.                                    |
+| `buck2 build -c rust.profile=release //crates/...`          | Build the host crates with the optimizations of Cargo's release profile.                       |
+| `build_defs/lint.py`                                        | Check formatting and clippy diagnostics.                                                       |
+| `build_defs/lint.py --format`                               | Format the workspace crates.                                                                   |
+| `build_defs/package_release.py --version V --target T`      | Archive the host tools and the FFI libraries.                                                  |
+| `build_defs/package_module.py --version V`                  | Copy out the console module builds under release names.                                        |
+| `build_defs/update_buck_files.py`                           | Regenerate the build files after a change to a `Cargo.toml` or `Cargo.lock`.                   |
+| `toolchains/update_rustfmt_release.py`                      | Regenerate `toolchains/rustfmt_release.bzl` after a change to `RUSTFMT_NIGHTLY` in the script. |
 
-```text
-openxbdm-kd host --file "host:\Device\Harddisk0\Partition1\DEVKIT\FlashEx\xbdm.xex=$(buck2 build //xbox360:openxbdm --show-simple-output)"
-```
+## Tests
 
-Stopping the host and rebooting returns to stock XBDM from flash. Placed
-at `DEVKIT:\FlashEx\xbdm.xex` the boot-guard build also loads in place of
-the flash monitor and removes that file at startup; read the hazards and
-recovery in `DEVELOPING.md` before using that method.
+- `crates/openxbdm-server-host/tests/<domain>.rs`: integration tests that start the host server and send every command over TCP, through `openxbdm-client` where it has the command and as raw lines otherwise. `framework.rs` covers dispatch and access rules, `trace.rs` the `verbose` trace texts, `network/` the `ipproxy`, `netcap`, and `netsim` engines; `common/` holds the shared harness.
+- `crates/openxbdm-client/tests/`: Insta snapshot tests of command encoding and reply parsing against captured fixtures.
+- Unit tests in `openxbdm-core`, `openxbdm-client`, `openxbdm-cli`, and `openxbdm-server`.
 
-## Differential testing
+`build_defs/update_buck_files.py` generates a Buck2 test target for each
+unit test and `tests/*.rs` file.
 
-`xeedee parity record` sends a command list to a monitor and records
-the replies; `xeedee parity compare` reports differences between two
-recordings outside listed varying fields. Against stock XBDM on a devkit,
-the 399 lines of `docs/re-notes/parity/hardware-commands.txt` give 0
-differences (`docs/re-notes/parity.md`). Usage: `DEVELOPING.md`.
-
-## Documentation
+## Other Documentation
 
 - `DEVELOPING.md`: environment, build, third-party code, deployment, recovery, differential testing.
 - `docs/re-notes/status.md`: component status.
@@ -284,49 +185,3 @@ Dual-licensed under either of:
 - MIT license
 
 at your option.
-
-## Kernel debugger (openxbdm-kd)
-
-`openxbdm-kd` talks to the kernel debugger over the kdnet UDP transport and
-serves GDB. Enable kdnet with stock XBDM (`kdnet set IP=<host> Port=50000`,
-`kdnet enable`, reboot). The host must reach the kdnet target address on the
-local link; for an APIPA target address (169.254.x.y) add a host route, for
-example `nmcli device modify eth0 +ipv4.routes 169.254.59.14/32`.
-
-    openxbdm-kd listen [--passive] [--log-file kd.log]
-    openxbdm-kd [--target 169.254.59.14] break
-    openxbdm-kd mem 0x80040000 64
-    openxbdm-kd gdbserver --listen 127.0.0.1:2159
-    openxbdm-kd host [--file CONSOLE_PATH=LOCAL_PATH] [--stop-on-load IMAGE]
-    openxbdm-kd reboot
-
-Without `--target` the address is learned from the kernel's beacon. While
-the tool is attached the kernel waits for it at every print, module load
-and stop.
-
-`host` keeps the console running while attached: it continues every event,
-prints debug output and module loads, and answers the kernel's host file
-requests. Each module load asks the host first with a path such as
-`host:\Device\Flash\xbdm.xex`; every requested path is printed. `--file`
-serves a requested path (compared case-insensitively) from a local file;
-other paths are answered as not found and the kernel loads from its own
-devices. To boot XBDM from a local image:
-
-    openxbdm-kd host --file 'host:\Device\Flash\xbdm.xex=xbdm.xex'
-
-`--stop-on-load xbdm.xex` keeps the console stopped at that image's load,
-after it is mapped and before its entry point runs, and reads commands from
-standard input: `mem ADDRESS [LENGTH]`, `write ADDRESS HEXBYTES` and
-`continue` (end of input also continues). `--log-file` appends every
-received datagram in the `listen --log-file` format.
-
-GDB (any build with PowerPC support):
-
-    gdb -ex 'set architecture powerpc:common64' -ex 'set endian big' \
-        -ex 'target remote 127.0.0.1:2159'
-
-Registers, memory, software breakpoints, `stepi` (software single step),
-interrupt and detach are supported. Detaching removes breakpoints and
-resumes the console. Do not set breakpoints in the kernel debugger's own
-code paths, such as the kd poll path at `0x801b4990`. Single step through
-MSR.SE stops the console with bug check 0x2b.

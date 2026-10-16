@@ -9,7 +9,6 @@ use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use std::net::SocketAddrV4;
 use std::net::TcpStream;
-use std::os::fd::AsRawFd;
 use std::time::Duration;
 
 use openxbdm_server::network::Endpoint;
@@ -22,39 +21,87 @@ use openxbdm_server::network::SocketId;
 /// notification socket 60 seconds to become writable.
 const SEND_LIMIT: Duration = Duration::from_secs(60);
 
-#[repr(C)]
-struct PollFd {
-    fd: std::ffi::c_int,
-    events: std::ffi::c_short,
-    revents: std::ffi::c_short,
-}
-
-const POLLOUT: std::ffi::c_short = 0x4;
-
-#[cfg(target_os = "linux")]
-type PollCount = std::ffi::c_ulong;
-#[cfg(not(target_os = "linux"))]
-type PollCount = std::ffi::c_uint;
-
-unsafe extern "C" {
-    fn poll(fds: *mut PollFd, count: PollCount, timeout: std::ffi::c_int) -> std::ffi::c_int;
-}
-
 /// Wait up to `timeout` until `stream` can accept data or has failed.
 /// `false` means the time ran out.
 pub fn wait_writable(stream: &TcpStream, timeout: Duration) -> io::Result<bool> {
-    let mut entry = PollFd {
-        fd: stream.as_raw_fd(),
-        events: POLLOUT,
-        revents: 0,
-    };
     let milliseconds =
         std::ffi::c_int::try_from(timeout.as_millis()).unwrap_or(std::ffi::c_int::MAX);
-    // SAFETY: `entry` is one valid pollfd for the duration of the call.
-    match unsafe { poll(&mut entry, 1, milliseconds) } {
+    match poll::wait_writable(stream, milliseconds) {
         -1 => Err(io::Error::last_os_error()),
         0 => Ok(false),
         _ => Ok(true),
+    }
+}
+
+#[cfg(unix)]
+mod poll {
+    use std::net::TcpStream;
+    use std::os::fd::AsRawFd;
+
+    #[repr(C)]
+    struct PollFd {
+        fd: std::ffi::c_int,
+        events: std::ffi::c_short,
+        revents: std::ffi::c_short,
+    }
+
+    const POLLOUT: std::ffi::c_short = 0x4;
+
+    #[cfg(target_os = "linux")]
+    type PollCount = std::ffi::c_ulong;
+    #[cfg(not(target_os = "linux"))]
+    type PollCount = std::ffi::c_uint;
+
+    unsafe extern "C" {
+        fn poll(fds: *mut PollFd, count: PollCount, timeout: std::ffi::c_int) -> std::ffi::c_int;
+    }
+
+    /// `poll` for writability: the number of ready sockets, or -1.
+    pub fn wait_writable(stream: &TcpStream, milliseconds: std::ffi::c_int) -> std::ffi::c_int {
+        let mut entry = PollFd {
+            fd: stream.as_raw_fd(),
+            events: POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: `entry` is one valid pollfd for the duration of the call.
+        unsafe { poll(&mut entry, 1, milliseconds) }
+    }
+}
+
+#[cfg(windows)]
+mod poll {
+    use std::net::TcpStream;
+    use std::os::windows::io::AsRawSocket;
+
+    #[repr(C)]
+    struct WsaPollFd {
+        fd: usize,
+        events: std::ffi::c_short,
+        revents: std::ffi::c_short,
+    }
+
+    /// POLLWRNORM, which WinSock names POLLOUT.
+    const POLLOUT: std::ffi::c_short = 0x10;
+
+    #[link(name = "ws2_32")]
+    unsafe extern "system" {
+        fn WSAPoll(
+            fds: *mut WsaPollFd,
+            count: std::ffi::c_ulong,
+            timeout: std::ffi::c_int,
+        ) -> std::ffi::c_int;
+    }
+
+    /// `WSAPoll` for writability: the number of ready sockets, or -1
+    /// (SOCKET_ERROR, with the error in `GetLastError`).
+    pub fn wait_writable(stream: &TcpStream, milliseconds: std::ffi::c_int) -> std::ffi::c_int {
+        let mut entry = WsaPollFd {
+            fd: stream.as_raw_socket() as usize,
+            events: POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: `entry` is one valid WSAPOLLFD for the duration of the call.
+        unsafe { WSAPoll(&mut entry, 1, milliseconds) }
     }
 }
 

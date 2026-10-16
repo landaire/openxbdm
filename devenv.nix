@@ -38,6 +38,16 @@ let
     paths = [ (pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml) ];
     pathsToLink = [ "/bin" "/etc" "/lib" "/libexec" "/share" ];
   };
+
+  # Reindeer for build_defs/update_buck_files.py. One of its tests fails on
+  # darwin, so there it is built without them. Elsewhere the unmodified
+  # package comes prebuilt from the binary cache; overriding it would
+  # rebuild it from source.
+  reindeer =
+    if pkgs.stdenv.hostPlatform.isDarwin then
+      pkgs.reindeer.overrideAttrs { doCheck = false; }
+    else
+      pkgs.reindeer;
 in
 {
   # Buck2 links with the host's C compiler driver (cc, c++ and ar on Linux,
@@ -48,8 +58,7 @@ in
   packages = [
     buck2
     rustToolchain
-    # One of its tests fails on darwin.
-    (pkgs.reindeer.overrideAttrs { doCheck = false; })
+    reindeer
     pkgs.python3
   ];
 

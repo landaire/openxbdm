@@ -25,6 +25,7 @@ mod xbox360 {
     use core::sync::atomic::AtomicBool;
     use core::sync::atomic::AtomicU32;
     use core::sync::atomic::Ordering;
+    use core::time::Duration;
 
     use openxbdm_core::status::KernelError;
     use openxbdm_core::status::NtStatus;
@@ -36,16 +37,26 @@ mod xbox360 {
     use openxbdm_server::network::Ipv4Address;
     use openxbdm_server::server::MAX_CONNECTIONS;
     use openxbdm_server::server::Owner;
+    use xbox360_sys::processor;
+    use xbox360_sys::xam;
+    use xbox360_sys::xam::FdSet;
+    use xbox360_sys::xam::Socket;
+    use xbox360_sys::xam::TimeVal;
+    use xbox360_sys::xam::XnCaller;
+    use xbox360_sys::xboxkrnl;
+    use xbox360_sys::xboxkrnl::Handle;
+    use xbox360_sys::xboxkrnl::Irql;
+    use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
+    use xbox360_sys::xboxkrnl::ObjectAttributes;
+    use xbox360_sys::xboxkrnl::ProcessorMode;
+    use xbox360_sys::xboxkrnl::ThreadCreationFlags;
+    // The crate, not this module.
+    use ::xbox360::time::sleep;
 
     use crate::backend::Console;
     use crate::kernel;
-    use crate::kernel::AnsiString;
-    use crate::kernel::ObjectAttributes;
     use crate::net;
-    use crate::net::FdSet;
-    use crate::net::INVALID_SOCKET;
-    use crate::net::TimeVal;
-    use crate::net::XNCALLER_XBDM;
+    use crate::net::FdSetExt as _;
     use crate::net::XamNetwork;
 
     const XBDM_PORT: u16 = 730;
@@ -56,7 +67,8 @@ mod xbox360 {
     /// `ExCreateThread` flags of stock's server thread (docs framework
     /// notes); bit 0x400 makes it not debuggable, so its own thread
     /// notifications never wait for it.
-    const SERVER_THREAD_FLAGS: u32 = 0x0400_04a6;
+    const SERVER_THREAD_FLAGS: ThreadCreationFlags =
+        ThreadCreationFlags::from_bits_retain(0x40004a6);
     /// Bug check code of a panic above passive level ('OXDP').
     const BUG_CHECK_PANIC: u32 = 0x4f58_4450;
     /// A failed listen is retried after LISTEN_RETRY_STEPS steps of
@@ -72,7 +84,7 @@ mod xbox360 {
 
     static SHUTDOWN: AtomicBool = AtomicBool::new(false);
     static THREAD_HANDLE: AtomicU32 = AtomicU32::new(0);
-    static LISTENER_SOCKET: AtomicU32 = AtomicU32::new(INVALID_SOCKET);
+    static LISTENER_SOCKET: AtomicU32 = AtomicU32::new(Socket::INVALID.raw());
 
     fn shutting_down() -> bool {
         SHUTDOWN.load(Ordering::SeqCst)
@@ -97,13 +109,14 @@ mod xbox360 {
     const OVERRIDE_MODULE_PATH: &[u8] = br"\Device\Harddisk0\Partition1\DEVKIT\FlashEx\xbdm.xex";
 
     fn delete_file(path: &[u8]) -> Removal {
-        let name = AnsiString::new(path);
+        let name = kernel::ansi_string(path);
         let attributes = ObjectAttributes {
-            root_directory: 0,
+            root_directory: Handle::NULL,
             object_name: &name,
-            attributes: kernel::OBJ_CASE_INSENSITIVE,
+            attributes: ObjectAttributeFlags::CASE_INSENSITIVE,
         };
-        match NtStatus(kernel::NtDeleteFile(&attributes)).result() {
+        // SAFETY: `attributes` and the name it points at are live locals.
+        match unsafe { xboxkrnl::NtDeleteFile(&attributes) }.result() {
             Ok(()) => Removal::Removed,
             Err(
                 KernelError::NoSuchFile
@@ -122,16 +135,20 @@ mod xbox360 {
         startup[0] = 0x0d;
         startup[1] = 0x81;
         startup[4] = 0x40;
-        if net::NetDll_XNetStartup(XNCALLER_XBDM, startup.as_ptr()) != 0 {
+        // SAFETY: `startup` is a live 13-byte parameter block.
+        if unsafe { xam::NetDll_XNetStartup(XnCaller::DebugMonitor, startup.as_ptr()) } != 0 {
             return false;
         }
         let mut wsa_data = [0u8; 512];
-        net::NetDll_WSAStartup(XNCALLER_XBDM, 2, wsa_data.as_mut_ptr()) == 0
+        // SAFETY: `wsa_data` is a live buffer larger than WSADATA.
+        let status =
+            unsafe { xam::NetDll_WSAStartup(XnCaller::DebugMonitor, 2, wsa_data.as_mut_ptr()) };
+        status.0 == 0
     }
 
     fn close_listener() {
-        let socket = LISTENER_SOCKET.swap(INVALID_SOCKET, Ordering::SeqCst);
-        if socket != INVALID_SOCKET {
+        let socket = LISTENER_SOCKET.swap(Socket::INVALID.raw(), Ordering::SeqCst);
+        if socket != Socket::INVALID.raw() {
             net::close(socket);
         }
     }
@@ -261,7 +278,7 @@ mod xbox360 {
                 return;
             }
             kernel::debug_print(c"openxbdm: network initialization failed\n");
-            kernel::sleep_milliseconds(1000);
+            sleep(Duration::from_millis(1000));
         }
 
         // Stock initializes the studio subsystem last, once the network runs.
@@ -283,7 +300,7 @@ mod xbox360 {
                         break;
                     }
                     crate::backend::dispatcher::drain(server, console, &mut network);
-                    kernel::sleep_milliseconds(LISTEN_RETRY_STEP_MS);
+                    sleep(Duration::from_millis(u64::from(LISTEN_RETRY_STEP_MS)));
                 }
                 continue;
             };
@@ -331,7 +348,7 @@ mod xbox360 {
             if removal != Removal::Failed || shutting_down() {
                 break;
             }
-            kernel::sleep_milliseconds(1000);
+            sleep(Duration::from_millis(1000));
             removal = delete_file(OVERRIDE_MODULE_PATH);
         }
         kernel::debug_print(match removal {
@@ -352,10 +369,8 @@ mod xbox360 {
             run_server();
         }
         stop_server_services();
-        kernel::ExTerminateThread(0);
-        loop {
-            core::hint::spin_loop();
-        }
+        // SAFETY: called on the server thread, which owns no further state.
+        unsafe { xboxkrnl::ExTerminateThread(0) }
     }
 
     /// Later calls and events take their default without waiting.
@@ -374,7 +389,7 @@ mod xbox360 {
             "addi 12, 12, {target}@l",
             "b {bridge}",
             target = sym module_entry,
-            bridge = sym crate::exports::module_bridge,
+            bridge = sym xbox360_sys::entry_bridge,
         )
     }
 
@@ -389,8 +404,17 @@ mod xbox360 {
                 if handle != 0 {
                     // Commands on the server thread can arm engine hooks,
                     // so the engines stop only after it has exited.
-                    kernel::NtWaitForSingleObjectEx(handle, 0, 0, core::ptr::null());
-                    kernel::NtClose(handle);
+                    // SAFETY: the handle came from `ExCreateThread` and the
+                    // swap above makes this the only owner.
+                    unsafe {
+                        xboxkrnl::NtWaitForSingleObjectEx(
+                            Handle::from_raw(handle),
+                            ProcessorMode::Kernel,
+                            false,
+                            core::ptr::null(),
+                        );
+                        xboxkrnl::NtClose(Handle::from_raw(handle));
+                    }
                 }
                 stop_server_services();
                 crate::backend::debugger::uninstall();
@@ -437,15 +461,19 @@ mod xbox360 {
         SHUTDOWN.store(false, Ordering::SeqCst);
         let mut handle = 0u32;
         let entry = entry as *const () as usize as u32;
-        let status = NtStatus(kernel::ExCreateThread(
-            &mut handle,
-            SERVER_STACK_SIZE,
-            core::ptr::null_mut(),
-            0,
-            entry,
-            0,
-            SERVER_THREAD_FLAGS,
-        ));
+        // SAFETY: `handle` is a live local and `entry` is a thread routine
+        // with the start signature.
+        let status = unsafe {
+            xboxkrnl::ExCreateThread(
+                &mut handle,
+                SERVER_STACK_SIZE,
+                core::ptr::null_mut(),
+                0,
+                entry,
+                0,
+                SERVER_THREAD_FLAGS,
+            )
+        };
         if status.result().is_err() {
             kernel::debug_print(c"openxbdm: server thread creation failed\n");
             return Err(ThreadCreationFailed);
@@ -462,12 +490,11 @@ mod xbox360 {
     extern "C" fn recovery_thread(_context: u32) -> u32 {
         kernel::debug_print(c"openxbdm: boot marker absent, restoring the flash monitor\n");
         if remove_override_module() != Removal::Failed {
-            kernel::HalReturnToFirmware(kernel::FIRMWARE_REBOOT);
+            // SAFETY: no hook is installed; the reboot ends the title.
+            unsafe { xboxkrnl::HalReturnToFirmware(xboxkrnl::FirmwareRequest::RebootQuiesce) };
         }
-        kernel::ExTerminateThread(0);
-        loop {
-            core::hint::spin_loop();
-        }
+        // SAFETY: called on the recovery thread, which owns no further state.
+        unsafe { xboxkrnl::ExTerminateThread(0) }
     }
 
     #[cfg(feature = "boot-guard")]
@@ -478,17 +505,18 @@ mod xbox360 {
     /// threads break into the debugger and then stay parked.
     #[panic_handler]
     fn panic(_info: &PanicInfo<'_>) -> ! {
-        if kernel::current_irql() != 0 {
-            kernel::KeBugCheckEx(BUG_CHECK_PANIC, 0, 0, 0, 0);
+        if processor::current_irql() != Irql::PASSIVE {
+            xboxkrnl::KeBugCheckEx(BUG_CHECK_PANIC, 0, 0, 0, 0);
         }
         kernel::debug_print(c"openxbdm: panic\n");
-        if kernel::current_thread() == crate::backend::debugger::server_thread() {
+        if processor::current_thread() == crate::backend::debugger::server_thread() {
             stop_server_services();
-            kernel::ExTerminateThread(0);
+            // SAFETY: the server thread has released every waiter above.
+            unsafe { xboxkrnl::ExTerminateThread(0) };
         }
-        kernel::DbgBreakPoint();
+        xboxkrnl::DbgBreakPoint();
         loop {
-            kernel::sleep_milliseconds(1000);
+            sleep(Duration::from_millis(1000));
         }
     }
 }

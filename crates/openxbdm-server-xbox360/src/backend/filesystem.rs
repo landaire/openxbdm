@@ -4,6 +4,7 @@ use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::Win32Error;
+use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::commands;
 use openxbdm_server::commands::filesystem::BasicInformation;
 use openxbdm_server::commands::filesystem::CreateOptions;
@@ -24,75 +25,37 @@ use openxbdm_server::commands::filesystem::ReadTarget;
 use openxbdm_server::commands::filesystem::ShareAccess;
 use openxbdm_server::commands::filesystem::TransferDirection;
 use openxbdm_server::commands::filesystem::VolumeSize;
+use xbox360::module::SystemModule;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::AnsiString;
+use xbox360_sys::xboxkrnl::FileInformationClass;
+use xbox360_sys::xboxkrnl::FsInformationClass;
+use xbox360_sys::xboxkrnl::HalOpenCloseODDTray;
+use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::IoDeviceObjectType;
+use xbox360_sys::xboxkrnl::IoDismountVolumeByFileHandle;
+use xbox360_sys::xboxkrnl::IoStatusBlock;
+use xbox360_sys::xboxkrnl::IoSynchronousFsdRequest;
+use xbox360_sys::xboxkrnl::NtOpenDirectoryObject;
+use xbox360_sys::xboxkrnl::NtQueryDirectoryFile;
+use xbox360_sys::xboxkrnl::NtQueryVolumeInformationFile;
+use xbox360_sys::xboxkrnl::ObCreateSymbolicLink;
+use xbox360_sys::xboxkrnl::ObTranslateSymbolicLink;
+use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
+use xbox360_sys::xboxkrnl::ObjectAttributes;
+use xbox360_sys::xboxkrnl::PoolTag;
+use xbox360_sys::xboxkrnl::ProcessType;
+use xbox360_sys::xboxkrnl::ProcessorMode;
 
 use super::Console;
 use crate::exports::export;
 use crate::kernel;
-use crate::kernel::AnsiString;
-use crate::kernel::IoStatusBlock;
-use crate::kernel::ObjectAttributes;
-use crate::kernel::import_thunk;
-use crate::kernel::import_thunk_stack;
-
-import_thunk_stack!(
-    NtQueryDirectoryFile(
-        handle: u32,
-        event: u32,
-        apc_routine: u32,
-        apc_context: u32,
-        io_status: *mut IoStatusBlock,
-        information: *mut u8,
-        length: u32,
-        file_name: *const AnsiString,
-        restart: u32,
-    ) -> u32,
-    lib = kernel::LIB_KERNEL,
-    ordinal = 228
-);
-use crate::kernel::NtQueryVolumeInformationFile;
-import_thunk!(
-    ObTranslateSymbolicLink(attributes: *const ObjectAttributes, target: *mut AnsiString) -> u32,
-    lib = kernel::LIB_KERNEL,
-    ordinal = 275
-);
-use crate::kernel::NtOpenDirectoryObject;
-import_thunk!(
-    IoSynchronousFsdRequest(
-        major: u32,
-        device: u32,
-        buffer: *mut u8,
-        length: u32,
-        offset: *const u64,
-    ) -> u32,
-    lib = kernel::LIB_KERNEL,
-    ordinal = 76
-);
-import_thunk!(
-    IoDismountVolumeByFileHandle(handle: u32) -> u32,
-    lib = kernel::LIB_KERNEL,
-    ordinal = 60
-);
-import_thunk!(
-    HalOpenCloseODDTray(value: u32) -> u32,
-    lib = kernel::LIB_KERNEL,
-    ordinal = 36
-);
-use crate::kernel::IO_DEVICE_OBJECT_TYPE;
 
 const STATUS_PENDING: u32 = 0x103;
-const POOL_TAG: u32 = 0x7864_626d;
+const POOL_TAG: PoolTag = PoolTag::new(*b"xdbm");
 /// Pool blocks carry their size in a header of this many bytes.
 const POOL_HEADER: u32 = 8;
-const FILE_POSITION_INFORMATION: u32 = 0xe;
-const FILE_BASIC_INFORMATION: u32 = 4;
-const FILE_RENAME_INFORMATION: u32 = 0xa;
-const FILE_DISPOSITION_INFORMATION: u32 = 0xd;
-const FILE_END_OF_FILE_INFORMATION: u32 = 0x14;
-const FILE_NETWORK_OPEN_INFORMATION: u32 = 0x22;
-const FILE_FS_SIZE_INFORMATION: u32 = 3;
 #[cfg(feature = "smb")]
-const FILE_FS_ATTRIBUTE_INFORMATION: u32 = 5;
-const FILE_FS_DEVICE_INFORMATION: u32 = 4;
 const IRP_MJ_READ: u32 = 2;
 const IRP_MJ_WRITE: u32 = 3;
 const IOCTL_DISK_GET_DRIVE_GEOMETRY: u32 = 0x7_0000;
@@ -156,20 +119,20 @@ fn status(raw: u32) -> Result<(), KernelError> {
 
 /// `RtlNtStatusToDosError` of a failed kernel call.
 fn dos_error(error: KernelError) -> Option<Win32Error> {
-    Win32Error::new(kernel::RtlNtStatusToDosError(NtStatus::from(error).0))
+    xboxkrnl::RtlNtStatusToDosError(NtStatus::from(error)).error()
 }
 
 /// A counted name; the kernel copies it, so the bytes only live for the
 /// call.
 fn ansi(bytes: &[u8]) -> AnsiString {
-    AnsiString::new(&bytes[..bytes.len().min(PATH_CAPACITY)])
+    kernel::ansi_string(&bytes[..bytes.len().min(PATH_CAPACITY)])
 }
 
 fn attributes(root: u32, name: &AnsiString) -> ObjectAttributes {
     ObjectAttributes {
-        root_directory: root,
+        root_directory: Handle::from_raw(root),
         object_name: name,
-        attributes: kernel::OBJ_CASE_INSENSITIVE,
+        attributes: ObjectAttributeFlags::CASE_INSENSITIVE,
     }
 }
 
@@ -178,9 +141,17 @@ fn complete(handle: u32, raw: u32, io_status: &IoStatusBlock) -> u32 {
     if raw != STATUS_PENDING {
         return raw;
     }
-    kernel::NtWaitForSingleObjectEx(handle, 0, 0, core::ptr::null());
+    // SAFETY: `handle` is the open file the pending request was issued on.
+    unsafe {
+        xboxkrnl::NtWaitForSingleObjectEx(
+            Handle::from_raw(handle),
+            ProcessorMode::Kernel,
+            false,
+            core::ptr::null(),
+        )
+    };
     // SAFETY: the kernel completed the request and wrote the status block.
-    unsafe { core::ptr::read_volatile(&io_status.status) }
+    unsafe { core::ptr::read_volatile(&io_status.status) }.0
 }
 
 /// Create or open a file by object name.
@@ -193,29 +164,56 @@ pub(crate) fn create_file(path: &[u8], request: &CreateRequest) -> Result<FileHa
     let allocation_pointer = allocation
         .as_ref()
         .map_or(core::ptr::null(), |size| size as *const u64);
-    status(kernel::NtCreateFile(
-        &mut handle,
-        request.access.0,
-        &object,
-        &mut io_status,
-        allocation_pointer,
-        request.attributes.0,
-        request.share.0,
-        request.disposition as u32,
-        request.options.0,
-    ))?;
+    // SAFETY: every pointer refers to a live local; `name` outlives the call.
+    let raw = unsafe {
+        xboxkrnl::NtCreateFile(
+            (&raw mut handle).cast(),
+            xboxkrnl::AccessMask::from_bits_retain(request.access.0),
+            &object,
+            &mut io_status,
+            allocation_pointer,
+            xboxkrnl::FileAttributes::from_bits_retain(request.attributes.0),
+            xboxkrnl::ShareAccess::from_bits_retain(request.share.0),
+            kernel_disposition(request.disposition),
+            xboxkrnl::CreateOptions::from_bits_retain(request.options.0),
+        )
+    };
+    status(raw.0)?;
     Ok(FileHandle(handle))
 }
 
-fn set_information(handle: FileHandle, class: u32, information: &[u8]) -> Result<(), KernelError> {
+/// The kernel value of a create disposition.
+pub(crate) fn kernel_disposition(
+    disposition: commands::filesystem::CreateDisposition,
+) -> xboxkrnl::CreateDisposition {
+    use commands::filesystem::CreateDisposition;
+    match disposition {
+        CreateDisposition::Supersede => xboxkrnl::CreateDisposition::Supersede,
+        CreateDisposition::Open => xboxkrnl::CreateDisposition::Open,
+        CreateDisposition::Create => xboxkrnl::CreateDisposition::Create,
+        CreateDisposition::OpenIf => xboxkrnl::CreateDisposition::OpenIf,
+        CreateDisposition::Overwrite => xboxkrnl::CreateDisposition::Overwrite,
+        CreateDisposition::OverwriteIf => xboxkrnl::CreateDisposition::OverwriteIf,
+    }
+}
+
+fn set_information(
+    handle: FileHandle,
+    class: FileInformationClass,
+    information: &[u8],
+) -> Result<(), KernelError> {
     let mut io_status = IoStatusBlock::default();
-    status(kernel::NtSetInformationFile(
-        handle.0,
-        &mut io_status,
-        information.as_ptr(),
-        information.len() as u32,
-        class,
-    ))
+    // SAFETY: `information` is a live slice of the stated length.
+    let raw = unsafe {
+        xboxkrnl::NtSetInformationFile(
+            Handle::from_raw(handle.0),
+            &mut io_status,
+            information.as_ptr(),
+            information.len() as u32,
+            class,
+        )
+    };
+    status(raw.0)
 }
 
 fn time(bytes: &[u8]) -> FileTime {
@@ -257,7 +255,7 @@ fn pool_range(range: PoolRange) -> &'static mut [u8] {
 }
 
 fn monitor_block() -> Option<u32> {
-    let slot = kernel::KE_DEBUG_MONITOR_DATA.load(core::sync::atomic::Ordering::Relaxed);
+    let slot = xboxkrnl::KeDebugMonitorData.address();
     // SAFETY: the loader stored the address of the kernel variable.
     let block = unsafe { core::ptr::read_volatile(slot as usize as *const u32) };
     (block != 0).then_some(block)
@@ -273,7 +271,8 @@ fn format_xtaf(device: &[u8], cluster_size: u32) -> Result<(), KernelError> {
         CreateOptions::SYNCHRONOUS_IO_ALERT.union(CreateOptions::NO_INTERMEDIATE_BUFFERING);
     let handle = open_file(None, device, ACCESS, ShareAccess::NONE, OPTIONS)?;
     let result = format_open_volume(handle, cluster_size);
-    kernel::NtClose(handle.0);
+    // SAFETY: `handle` was opened above and is closed once.
+    unsafe { xboxkrnl::NtClose(Handle::from_raw(handle.0)) };
     result
 }
 
@@ -290,14 +289,18 @@ fn open_file(
     let object = attributes(root.map_or(0, |root| root.0), &name);
     let mut io_status = IoStatusBlock::default();
     let mut handle = 0u32;
-    status(kernel::NtOpenFile(
-        &mut handle,
-        access.0,
-        &object,
-        &mut io_status,
-        share.0,
-        options.0,
-    ))?;
+    // SAFETY: every pointer refers to a live local; `name` outlives the call.
+    let raw = unsafe {
+        xboxkrnl::NtOpenFile(
+            (&raw mut handle).cast(),
+            xboxkrnl::AccessMask::from_bits_retain(access.0),
+            &object,
+            &mut io_status,
+            xboxkrnl::ShareAccess::from_bits_retain(share.0),
+            xboxkrnl::CreateOptions::from_bits_retain(options.0),
+        )
+    };
+    status(raw.0)?;
     Ok(FileHandle(handle))
 }
 
@@ -309,30 +312,38 @@ pub(crate) fn device_control(
     output: &mut [u8],
 ) -> Result<(), KernelError> {
     let mut io_status = IoStatusBlock::default();
-    status(kernel::NtDeviceIoControlFile(
-        handle.0,
-        0,
-        0,
-        0,
-        &mut io_status,
-        code,
-        core::ptr::null(),
-        0,
-        output.as_mut_ptr(),
-        output.len() as u32,
-    ))
+    // SAFETY: `output` is a live mutable slice of the stated length.
+    let raw = unsafe {
+        xboxkrnl::NtDeviceIoControlFile(
+            Handle::from_raw(handle.0),
+            Handle::NULL,
+            0,
+            0,
+            &mut io_status,
+            code,
+            core::ptr::null(),
+            0,
+            output.as_mut_ptr(),
+            output.len() as u32,
+        )
+    };
+    status(raw.0)
 }
 
 fn format_open_volume(handle: FileHandle, cluster_size: u32) -> Result<(), KernelError> {
     let mut io_status = IoStatusBlock::default();
     let mut device = [0u8; 8];
-    status(NtQueryVolumeInformationFile(
-        handle.0,
-        &mut io_status,
-        device.as_mut_ptr(),
-        8,
-        FILE_FS_DEVICE_INFORMATION,
-    ))?;
+    // SAFETY: `device` is a live 8-byte local.
+    let raw = unsafe {
+        NtQueryVolumeInformationFile(
+            Handle::from_raw(handle.0),
+            &mut io_status,
+            device.as_mut_ptr(),
+            8,
+            FsInformationClass::Device,
+        )
+    };
+    status(raw.0)?;
     let mut geometry = [0u8; 8];
     device_control(handle, IOCTL_DISK_GET_DRIVE_GEOMETRY, &mut geometry)?;
     let bytes_per_sector = word(&geometry[4..]);
@@ -380,7 +391,8 @@ fn format_open_volume(handle: FileHandle, cluster_size: u32) -> Result<(), Kerne
         sector_shift,
     );
     free(base);
-    IoDismountVolumeByFileHandle(handle.0);
+    // SAFETY: `handle` is an open volume handle owned by the caller.
+    unsafe { IoDismountVolumeByFileHandle(Handle::from_raw(handle.0)) };
     result
 }
 
@@ -398,16 +410,20 @@ fn write_format(
     let mut offset = 0u64;
     let write = |buffer: &mut [u8], offset: &mut u64| -> Result<(), KernelError> {
         let mut io_status = IoStatusBlock::default();
-        status(kernel::NtWriteFile(
-            handle.0,
-            0,
-            0,
-            0,
-            &mut io_status,
-            buffer.as_ptr(),
-            page,
-            offset,
-        ))?;
+        // SAFETY: `buffer` holds at least `page` bytes and `offset` is live.
+        let raw = unsafe {
+            xboxkrnl::NtWriteFile(
+                Handle::from_raw(handle.0),
+                Handle::NULL,
+                0,
+                0,
+                &mut io_status,
+                buffer.as_ptr(),
+                page,
+                offset,
+            )
+        };
+        status(raw.0)?;
         *offset += u64::from(page);
         Ok(())
     };
@@ -434,7 +450,8 @@ fn write_format(
     }
     buffer.fill(0xff);
     buffer[..4].copy_from_slice(b"XTAF");
-    buffer[4..8].copy_from_slice(&(kernel::system_time() as u32).to_be_bytes());
+    buffer[4..8]
+        .copy_from_slice(&(xbox360::time::FileTime::now().intervals() as u32).to_be_bytes());
     buffer[8..12].copy_from_slice(&((cluster >> sector_shift) & 0xff).to_be_bytes());
     buffer[12..16].copy_from_slice(&1u32.to_be_bytes());
     buffer[16..18].fill(0);
@@ -449,7 +466,8 @@ fn write_format(
 }
 
 fn allocate(size: u32) -> Option<PoolBuffer> {
-    let base = kernel::ExAllocatePoolWithTag(size.checked_add(POOL_HEADER)?, POOL_TAG);
+    // SAFETY: pool allocation has no pointer arguments.
+    let base = unsafe { xboxkrnl::ExAllocatePoolWithTag(size.checked_add(POOL_HEADER)?, POOL_TAG) };
     if base == 0 {
         return None;
     }
@@ -459,7 +477,8 @@ fn allocate(size: u32) -> Option<PoolBuffer> {
 }
 
 fn free(buffer: PoolBuffer) {
-    kernel::ExFreePool(buffer.0 - POOL_HEADER);
+    // SAFETY: `buffer` came from `allocate`, which offset the block by the header.
+    unsafe { xboxkrnl::ExFreePool(buffer.0 - POOL_HEADER) };
 }
 
 impl commands::filesystem::Backend for Console {
@@ -483,7 +502,8 @@ impl commands::filesystem::Backend for Console {
     }
 
     fn close_file(&mut self, handle: FileHandle) {
-        kernel::NtClose(handle.0);
+        // SAFETY: the protocol layer passes an open handle and drops it after.
+        unsafe { xboxkrnl::NtClose(Handle::from_raw(handle.0)) };
     }
 
     fn count_file_change(&mut self) {
@@ -504,17 +524,21 @@ impl commands::filesystem::Backend for Console {
         let offset_pointer = offset
             .as_ref()
             .map_or(core::ptr::null(), |offset| offset as *const u64);
-        let raw = kernel::NtReadFile(
-            handle.0,
-            0,
-            0,
-            0,
-            &mut io_status,
-            buffer.as_mut_ptr(),
-            buffer.len() as u32,
-            offset_pointer,
-        );
-        status(complete(handle.0, raw, &io_status))?;
+        // SAFETY: `buffer` is a live mutable slice; `io_status` and the offset
+        // stay live until `complete` returns.
+        let raw = unsafe {
+            xboxkrnl::NtReadFile(
+                Handle::from_raw(handle.0),
+                Handle::NULL,
+                0,
+                0,
+                &mut io_status,
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                offset_pointer,
+            )
+        };
+        status(complete(handle.0, raw.0, &io_status))?;
         Ok(io_status.information)
     }
 
@@ -532,17 +556,21 @@ impl commands::filesystem::Backend for Console {
         let offset_pointer = offset
             .as_ref()
             .map_or(core::ptr::null(), |offset| offset as *const u64);
-        let raw = kernel::NtWriteFile(
-            handle.0,
-            0,
-            0,
-            0,
-            &mut io_status,
-            bytes.as_ptr(),
-            bytes.len() as u32,
-            offset_pointer,
-        );
-        status(complete(handle.0, raw, &io_status))
+        // SAFETY: `bytes` is a live slice; `io_status` and the offset stay live
+        // until `complete` returns.
+        let raw = unsafe {
+            xboxkrnl::NtWriteFile(
+                Handle::from_raw(handle.0),
+                Handle::NULL,
+                0,
+                0,
+                &mut io_status,
+                bytes.as_ptr(),
+                bytes.len() as u32,
+                offset_pointer,
+            )
+        };
+        status(complete(handle.0, raw.0, &io_status))
     }
 
     fn set_delete_disposition(
@@ -550,15 +578,23 @@ impl commands::filesystem::Backend for Console {
         handle: FileHandle,
         delete: bool,
     ) -> Result<(), KernelError> {
-        set_information(handle, FILE_DISPOSITION_INFORMATION, &[u8::from(delete)])
+        set_information(
+            handle,
+            FileInformationClass::Disposition,
+            &[u8::from(delete)],
+        )
     }
 
     fn set_end_of_file(&mut self, handle: FileHandle, size: u64) -> Result<(), KernelError> {
-        set_information(handle, FILE_END_OF_FILE_INFORMATION, &size.to_be_bytes())
+        set_information(handle, FileInformationClass::EndOfFile, &size.to_be_bytes())
     }
 
     fn set_file_position(&mut self, handle: FileHandle, position: u64) -> Result<(), KernelError> {
-        set_information(handle, FILE_POSITION_INFORMATION, &position.to_be_bytes())
+        set_information(
+            handle,
+            FileInformationClass::Position,
+            &position.to_be_bytes(),
+        )
     }
 
     fn set_basic_information(
@@ -577,7 +613,7 @@ impl commands::filesystem::Backend for Console {
             slot.copy_from_slice(&time.0.to_be_bytes());
         }
         bytes[0x20..0x24].copy_from_slice(&information.attributes.0.to_be_bytes());
-        set_information(handle, FILE_BASIC_INFORMATION, &bytes)
+        set_information(handle, FileInformationClass::Basic, &bytes)
     }
 
     fn rename_file(
@@ -599,13 +635,17 @@ impl commands::filesystem::Backend for Console {
         };
         let mut io_status = IoStatusBlock::default();
         let pointer = (&information as *const RenameInformation).cast::<u8>();
-        status(kernel::NtSetInformationFile(
-            handle.0,
-            &mut io_status,
-            pointer,
-            size_of::<RenameInformation>() as u32,
-            FILE_RENAME_INFORMATION,
-        ))
+        // SAFETY: `information` and the name it refers to outlive the call.
+        let raw = unsafe {
+            xboxkrnl::NtSetInformationFile(
+                Handle::from_raw(handle.0),
+                &mut io_status,
+                pointer,
+                size_of::<RenameInformation>() as u32,
+                FileInformationClass::Rename,
+            )
+        };
+        status(raw.0)
     }
 
     fn query_file_information(
@@ -614,13 +654,17 @@ impl commands::filesystem::Backend for Console {
     ) -> Result<FileInformation, KernelError> {
         let mut bytes = [0u8; 0x38];
         let mut io_status = IoStatusBlock::default();
-        status(kernel::NtQueryInformationFile(
-            handle.0,
-            &mut io_status,
-            bytes.as_mut_ptr(),
-            0x38,
-            FILE_NETWORK_OPEN_INFORMATION,
-        ))?;
+        // SAFETY: `bytes` is a live local of the stated length.
+        let raw = unsafe {
+            xboxkrnl::NtQueryInformationFile(
+                Handle::from_raw(handle.0),
+                &mut io_status,
+                bytes.as_mut_ptr(),
+                0x38,
+                FileInformationClass::NetworkOpen,
+            )
+        };
+        status(raw.0)?;
         Ok(network_open_information(&bytes))
     }
 
@@ -628,10 +672,9 @@ impl commands::filesystem::Backend for Console {
         let name = ansi(path);
         let object = attributes(0, &name);
         let mut bytes = [0u8; 0x38];
-        status(kernel::NtQueryFullAttributesFile(
-            &object,
-            bytes.as_mut_ptr(),
-        ))?;
+        // SAFETY: `object` refers to `name`; `bytes` holds the 0x38-byte result.
+        let raw = unsafe { xboxkrnl::NtQueryFullAttributesFile(&object, bytes.as_mut_ptr()) };
+        status(raw.0)?;
         Ok(network_open_information(&bytes))
     }
 
@@ -643,18 +686,21 @@ impl commands::filesystem::Backend for Console {
     ) -> Result<DirectoryEntry, KernelError> {
         let mut bytes = [0u8; DIRECTORY_BUFFER];
         let mut io_status = IoStatusBlock::default();
-        let raw = NtQueryDirectoryFile(
-            handle.0,
-            0,
-            0,
-            0,
-            &mut io_status,
-            bytes.as_mut_ptr(),
-            DIRECTORY_BUFFER as u32,
-            core::ptr::null(),
-            u32::from(restart),
-        );
-        status(complete(handle.0, raw, &io_status))?;
+        // SAFETY: `bytes` and `io_status` stay live until `complete` returns.
+        let raw = unsafe {
+            NtQueryDirectoryFile(
+                Handle::from_raw(handle.0),
+                Handle::NULL,
+                0,
+                0,
+                &mut io_status,
+                bytes.as_mut_ptr(),
+                DIRECTORY_BUFFER as u32,
+                core::ptr::null(),
+                restart,
+            )
+        };
+        status(complete(handle.0, raw.0, &io_status))?;
         let length = (word(&bytes[0x3c..]) as usize).min(DIRECTORY_BUFFER - DIRECTORY_NAME_OFFSET);
         if length > name.len() {
             return Err(KernelError::BufferOverflow);
@@ -679,13 +725,17 @@ impl commands::filesystem::Backend for Console {
     fn query_volume_size(&mut self, handle: FileHandle) -> Result<VolumeSize, KernelError> {
         let mut bytes = [0u8; 0x18];
         let mut io_status = IoStatusBlock::default();
-        status(NtQueryVolumeInformationFile(
-            handle.0,
-            &mut io_status,
-            bytes.as_mut_ptr(),
-            0x18,
-            FILE_FS_SIZE_INFORMATION,
-        ))?;
+        // SAFETY: `bytes` is a live local of the stated length.
+        let raw = unsafe {
+            NtQueryVolumeInformationFile(
+                Handle::from_raw(handle.0),
+                &mut io_status,
+                bytes.as_mut_ptr(),
+                0x18,
+                FsInformationClass::Size,
+            )
+        };
+        status(raw.0)?;
         Ok(VolumeSize {
             total_units: time(&bytes[0..]).0,
             available_units: time(&bytes[8..]).0,
@@ -702,13 +752,17 @@ impl commands::filesystem::Backend for Console {
         // Attributes, maximum component length, name length, and the name.
         let mut bytes = [0u8; 12 + commands::filesystem::FILE_SYSTEM_NAME_CAPACITY];
         let mut io_status = IoStatusBlock::default();
-        status(NtQueryVolumeInformationFile(
-            handle.0,
-            &mut io_status,
-            bytes.as_mut_ptr(),
-            bytes.len() as u32,
-            FILE_FS_ATTRIBUTE_INFORMATION,
-        ))?;
+        // SAFETY: `bytes` is a live local of the stated length.
+        let raw = unsafe {
+            NtQueryVolumeInformationFile(
+                Handle::from_raw(handle.0),
+                &mut io_status,
+                bytes.as_mut_ptr(),
+                bytes.len() as u32,
+                FsInformationClass::Attribute,
+            )
+        };
+        status(raw.0)?;
         let name = bytes[12..]
             .get(..word(&bytes[8..]) as usize)
             .ok_or(KernelError::BufferOverflow)?;
@@ -728,7 +782,9 @@ impl commands::filesystem::Backend for Console {
             maximum_length: target.len() as u16,
             buffer: target.as_mut_ptr(),
         };
-        status(ObTranslateSymbolicLink(&object, &mut output))?;
+        // SAFETY: `output` describes the live `target` slice; `object` refers to `name`.
+        let raw = unsafe { ObTranslateSymbolicLink(&object, &mut output) };
+        status(raw.0)?;
         Ok(usize::from(output.length))
     }
 
@@ -736,7 +792,9 @@ impl commands::filesystem::Backend for Console {
         let name = ansi(path);
         let object = attributes(0, &name);
         let mut handle = 0u32;
-        status(NtOpenDirectoryObject(&mut handle, &object))?;
+        // SAFETY: `handle` and `object` are live locals.
+        let raw = unsafe { NtOpenDirectoryObject((&raw mut handle).cast(), &object) };
+        status(raw.0)?;
         Ok(ObjectDirectory(handle))
     }
 
@@ -750,14 +808,18 @@ impl commands::filesystem::Backend for Console {
         #[repr(C, align(4))]
         struct Buffer([u8; OBJECT_DIRECTORY_BUFFER]);
         let mut buffer = Buffer([0; OBJECT_DIRECTORY_BUFFER]);
-        status(kernel::NtQueryDirectoryObject(
-            directory.0,
-            buffer.0.as_mut_ptr(),
-            OBJECT_DIRECTORY_BUFFER as u32,
-            u32::from(restart),
-            context,
-            core::ptr::null_mut(),
-        ))?;
+        // SAFETY: `buffer` and `context` are live for the stated length.
+        let raw = unsafe {
+            xboxkrnl::NtQueryDirectoryObject(
+                Handle::from_raw(directory.0),
+                buffer.0.as_mut_ptr(),
+                OBJECT_DIRECTORY_BUFFER as u32,
+                restart,
+                context,
+                core::ptr::null_mut(),
+            )
+        };
+        status(raw.0)?;
         // SAFETY: the kernel wrote an object name descriptor at the start
         // of the buffer whose text lies inside the buffer.
         let entry = unsafe { core::ptr::read((buffer.0.as_ptr()).cast::<AnsiString>()) };
@@ -769,25 +831,32 @@ impl commands::filesystem::Backend for Console {
     }
 
     fn close_object_directory(&mut self, directory: ObjectDirectory) {
-        kernel::NtClose(directory.0);
+        // SAFETY: the protocol layer passes an open directory handle and drops it after.
+        unsafe { xboxkrnl::NtClose(Handle::from_raw(directory.0)) };
     }
 
     fn reference_device(&mut self, name: &[u8]) -> Result<DeviceObject, KernelError> {
         let name = ansi(name);
-        let slot = IO_DEVICE_OBJECT_TYPE.load(core::sync::atomic::Ordering::Relaxed);
+        let slot = IoDeviceObjectType.address();
         let mut object = 0u32;
-        status(kernel::ObReferenceObjectByName(
-            &name,
-            0,
-            slot,
-            0,
-            &mut object,
-        ))?;
+        // SAFETY: `name` and `object` are live locals; `slot` is the kernel
+        // device object type.
+        let raw = unsafe {
+            xboxkrnl::ObReferenceObjectByName(
+                &name,
+                ObjectAttributeFlags::empty(),
+                slot,
+                0,
+                &mut object,
+            )
+        };
+        status(raw.0)?;
         Ok(DeviceObject(object))
     }
 
     fn dereference_device(&mut self, device: DeviceObject) {
-        kernel::ObDereferenceObject(device.0);
+        // SAFETY: `device` holds the reference taken by `reference_device`.
+        unsafe { xboxkrnl::ObDereferenceObject(device.0) };
     }
 
     fn transfer_device(
@@ -802,13 +871,12 @@ impl commands::filesystem::Backend for Console {
             TransferDirection::Write => IRP_MJ_WRITE,
         };
         let bytes = pool_range(buffer);
-        status(IoSynchronousFsdRequest(
-            major,
-            device.0,
-            bytes.as_mut_ptr(),
-            buffer.length,
-            &offset,
-        ))
+        // SAFETY: `device` is referenced; `bytes` is a live pool range of
+        // `buffer.length` bytes.
+        let raw = unsafe {
+            IoSynchronousFsdRequest(major, device.0, bytes.as_mut_ptr(), buffer.length, &offset)
+        };
+        status(raw.0)
     }
 
     fn allocate_pool(&mut self, size: u32) -> Option<PoolBuffer> {
@@ -832,7 +900,8 @@ impl commands::filesystem::Backend for Console {
     }
 
     fn open_close_tray(&mut self, value: u32) {
-        HalOpenCloseODDTray(value);
+        // SAFETY: the request takes no pointers.
+        unsafe { HalOpenCloseODDTray(value) };
     }
 
     fn format_partition(&mut self, device: &[u8], cluster_size: u32) -> Result<(), KernelError> {
@@ -840,7 +909,7 @@ impl commands::filesystem::Backend for Console {
     }
 
     fn update_sequence(&mut self) -> u16 {
-        let address = kernel::KE_TIME_STAMP_BUNDLE.load(core::sync::atomic::Ordering::Relaxed);
+        let address = xboxkrnl::KeTimeStampBundle.address();
         // SAFETY: the loader stored the address of the kernel export.
         unsafe { core::ptr::read_volatile((address + 0x12) as usize as *const u16) }
     }
@@ -950,26 +1019,19 @@ extern "C" fn file_change_count(count: u32) -> u32 {
 }
 export!(85, file_change_count);
 
-import_thunk!(
-    ObCreateSymbolicLink(link: *const AnsiString, target: *const AnsiString) -> u32,
-    lib = kernel::LIB_KERNEL,
-    ordinal = 0x103
-);
-
-/// `KeGetCurrentProcessType` of the system process.
-const SYSTEM_PROCESS: u32 = 2;
-
 /// Export 141 (stock 0x91f33438): link `E:` and `DEVKIT:` to the devkit
 /// directory in the caller's process namespace. Existing links count as
 /// success; the result is the HRESULT of the DOS error.
 extern "C" fn map_devkit_drive() -> u32 {
-    let (drive, devkit): (&[u8], &[u8]) = if kernel::KeGetCurrentProcessType() == SYSTEM_PROCESS {
-        (b"\\system??\\E:", b"\\system??\\DEVKIT:")
-    } else {
-        (b"\\??\\E:", b"\\??\\DEVKIT:")
-    };
+    let (drive, devkit): (&[u8], &[u8]) =
+        if xboxkrnl::KeGetCurrentProcessType() == ProcessType::SYSTEM {
+            (b"\\system??\\E:", b"\\system??\\DEVKIT:")
+        } else {
+            (b"\\??\\E:", b"\\??\\DEVKIT:")
+        };
     let target = ansi(b"\\Device\\Harddisk0\\Partition1\\DEVKIT");
-    let link = |name: &[u8]| status(ObCreateSymbolicLink(&ansi(name), &target));
+    // SAFETY: both counted names refer to live bytes for the call.
+    let link = |name: &[u8]| status(unsafe { ObCreateSymbolicLink(&ansi(name), &target) }.0);
     let linked = match link(drive) {
         Ok(()) | Err(KernelError::ObjectNameCollision) => match link(devkit) {
             Err(KernelError::ObjectNameCollision) => Ok(()),
@@ -1003,13 +1065,12 @@ extern "C" fn call_kernel_routine(a: u32, b: u32, c: u32, d: u32) -> u32 {
     let mut routine = KERNEL_ROUTINE.load(Ordering::Acquire);
     if routine == 0 && !KERNEL_ROUTINE_CLAIMED.swap(true, Ordering::AcqRel) {
         let mut address = 0u32;
-        let resolved = kernel::module_handle(c"xboxkrnl.exe").is_ok_and(|module| {
-            status(kernel::XexGetProcedureAddress(
-                module.raw(),
-                KERNEL_ROUTINE_ORDINAL,
-                &mut address,
-            ))
-            .is_ok()
+        let resolved = SystemModule::Kernel.handle().is_ok_and(|module| {
+            // SAFETY: `module` is a loaded module handle; `address` is a live local.
+            let raw = unsafe {
+                xboxkrnl::XexGetProcedureAddress(module.raw(), KERNEL_ROUTINE_ORDINAL, &mut address)
+            };
+            status(raw.0).is_ok()
         });
         routine = if resolved { address } else { 0 };
         KERNEL_ROUTINE.store(routine, Ordering::Release);
@@ -1019,7 +1080,7 @@ extern "C" fn call_kernel_routine(a: u32, b: u32, c: u32, d: u32) -> u32 {
     }
     // SAFETY: the kernel export takes five register arguments.
     let status = unsafe { call_five(routine, 0, a, b, c, d) };
-    kernel::RtlNtStatusToDosError(status)
+    xboxkrnl::RtlNtStatusToDosError(NtStatus(status)).0
 }
 export!(144, call_kernel_routine);
 

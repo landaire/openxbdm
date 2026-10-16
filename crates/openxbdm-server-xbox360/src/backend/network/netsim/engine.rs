@@ -18,14 +18,21 @@ use openxbdm_server::commands::network::netsim::QueueStats;
 use openxbdm_server::commands::network::netsim::RedirectConfig;
 use openxbdm_server::commands::network::netsim::RedirectIndex;
 use openxbdm_server::commands::network::netsim::RedirectSnapshot;
+use xbox360::time::TickCount;
+use xbox360::time::Timebase;
+use xbox360_sys::xam::NetDll_XnpEthernetInterceptRecv;
+use xbox360_sys::xam::NetDll_XnpEthernetInterceptXmit;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::Irql;
+use xbox360_sys::xboxkrnl::KeCancelTimer;
+use xbox360_sys::xboxkrnl::KeInitializeDpc;
+use xbox360_sys::xboxkrnl::KeInitializeTimerEx;
+use xbox360_sys::xboxkrnl::KeRemoveQueueDpc;
+use xbox360_sys::xboxkrnl::KeSetTimerEx;
+use xbox360_sys::xboxkrnl::ProcessType;
+use xbox360_sys::xboxkrnl::TimerType;
+use xbox360_sys::xboxkrnl::XeCryptRandom;
 
-use super::KeCancelTimer;
-use super::KeInitializeDpc;
-use super::KeInitializeTimerEx;
-use super::KeRemoveQueueDpc;
-use super::NetDll_XnpEthernetInterceptRecv;
-use super::NetDll_XnpEthernetInterceptXmit;
-use super::XeCryptRandom;
 use super::filter;
 use super::frame;
 use super::frame::Ipv4Frame;
@@ -36,7 +43,6 @@ use super::pipeline::NEVER;
 use super::pipeline::Packet;
 use super::pipeline::Pipeline;
 use super::pipeline::Random;
-use super::set_timer;
 use crate::backend::network::FrameCallback;
 use crate::backend::network::FrameHook;
 use crate::backend::network::XNCALLER_SYSAPP;
@@ -63,15 +69,16 @@ struct CryptRandom;
 
 impl Random for CryptRandom {
     fn fill(&mut self, buffer: &mut [u8]) {
-        XeCryptRandom(buffer.as_mut_ptr(), buffer.len() as u32);
+        // SAFETY: `buffer` is a live slice of the stated length.
+        unsafe { XeCryptRandom(buffer.as_mut_ptr(), buffer.len() as u32) };
     }
 }
 
 /// The time base, read again when its low word is zero as stock does.
 fn now() -> u64 {
-    let time = kernel::timebase();
+    let time = Timebase::now().ticks();
     if time as u32 == 0 {
-        kernel::timebase()
+        Timebase::now().ticks()
     } else {
         time
     }
@@ -381,12 +388,16 @@ impl Inner {
         } else {
             0
         };
-        set_timer(
-            instance.timer.as_ptr(),
-            (due >> 32) as u32,
-            due as u32,
-            instance.dpc.as_ptr(),
-        );
+        // SAFETY: the timer and DPC of the instance were initialized by `create`
+        // and stay at their pool address until `destroy` cancels them.
+        unsafe {
+            KeSetTimerEx(
+                instance.timer.as_ptr().cast(),
+                due,
+                0,
+                instance.dpc.as_ptr().cast(),
+            )
+        };
         self.due = next;
     }
 
@@ -463,7 +474,7 @@ pub(super) struct Instance {
 /// The locked state.
 struct Guard<'a> {
     instance: &'a Instance,
-    irql: u32,
+    irql: Irql,
 }
 
 impl Guard<'_> {
@@ -475,7 +486,8 @@ impl Guard<'_> {
 
 impl Drop for Guard<'_> {
     fn drop(&mut self) {
-        kernel::KfReleaseSpinLock(self.instance.lock.get(), self.irql);
+        // SAFETY: the instance spin lock was acquired by `lock` at `irql`.
+        unsafe { xboxkrnl::KfReleaseSpinLock(self.instance.lock.get().cast(), self.irql) };
     }
 }
 
@@ -509,9 +521,13 @@ impl Instance {
                 }),
             });
             let this = &*instance;
-            KeInitializeTimerEx(this.timer.as_ptr(), 0);
+            KeInitializeTimerEx(
+                this.timer.as_ptr().cast(),
+                TimerType::Notification,
+                ProcessType::SYSTEM,
+            );
             KeInitializeDpc(
-                this.dpc.as_ptr(),
+                this.dpc.as_ptr().cast(),
                 release_dpc_entry as *const () as usize,
                 instance as usize,
             );
@@ -553,13 +569,18 @@ impl Instance {
                 free_redirect(redirect);
             }
         }
-        KeCancelTimer(this.timer.as_ptr());
-        KeRemoveQueueDpc(this.dpc.as_ptr());
+        // SAFETY: the timer and DPC were initialized by `create`; the instance
+        // is detached, so nothing arms them again.
+        unsafe {
+            KeCancelTimer(this.timer.as_ptr().cast());
+            KeRemoveQueueDpc(this.dpc.as_ptr().cast());
+        }
         memory::free(instance.cast());
     }
 
     fn lock(&self) -> Guard<'_> {
-        let irql = kernel::KfAcquireSpinLock(self.lock.get());
+        // SAFETY: the spin lock word lives in the instance for its lifetime.
+        let irql = unsafe { xboxkrnl::KfAcquireSpinLock(self.lock.get().cast()) };
         Guard {
             instance: self,
             irql,
@@ -834,7 +855,7 @@ struct Flow {
 /// the slot already holding the flow, whichever the scan meets first, else
 /// the last slot idle for two minutes. `false` drops the frame.
 fn claim_session(inner: &mut Inner, redirect: *mut Redirect, flow: &Flow) -> bool {
-    let now = kernel::tick_count();
+    let now = TickCount::now().milliseconds();
     let mut idle: Option<*mut Session> = None;
     for slot in Redirect::sessions(redirect).iter_mut() {
         let Some(protocol) = slot.protocol else {
@@ -899,7 +920,7 @@ fn emit(
                 unsafe {
                     kernel::call_export(
                         transmit_unmodified,
-                        XNCALLER_SYSAPP,
+                        XNCALLER_SYSAPP.raw(),
                         frame.as_mut_ptr() as u32,
                         length,
                         0,
@@ -907,10 +928,16 @@ fn emit(
                 }
             }
             Direction::Outbound => {
-                NetDll_XnpEthernetInterceptXmit(XNCALLER_SYSAPP, frame.as_mut_ptr(), length);
+                // SAFETY: `frame` is the live frame of an owned packet.
+                unsafe {
+                    NetDll_XnpEthernetInterceptXmit(XNCALLER_SYSAPP, frame.as_mut_ptr(), length)
+                };
             }
             Direction::Inbound => {
-                NetDll_XnpEthernetInterceptRecv(XNCALLER_SYSAPP, frame.as_mut_ptr(), length);
+                // SAFETY: `frame` is the live frame of an owned packet.
+                unsafe {
+                    NetDll_XnpEthernetInterceptRecv(XNCALLER_SYSAPP, frame.as_mut_ptr(), length)
+                };
             }
         }
     }
@@ -1098,7 +1125,7 @@ fn redirect(
     {
         // SAFETY: members are live slots.
         let slot = unsafe { &mut *session };
-        slot.last_used = kernel::tick_count();
+        slot.last_used = TickCount::now().milliseconds();
         return rewrite(slot.original_address, slot.original_port);
     }
     let mut matched = None;

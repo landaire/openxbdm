@@ -7,6 +7,7 @@ use std::io::Write;
 use common::RawSession;
 use common::TestServer;
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::processors::ProcessorFlags;
 use openxbdm_server_host::Host;
 use openxbdm_server_host::backend::console::SERVER_THREAD;

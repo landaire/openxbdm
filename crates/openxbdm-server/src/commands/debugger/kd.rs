@@ -5,6 +5,7 @@ use openxbdm_core::line::CommandLine;
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
+use openxbdm_core::status::xbdm_error;
 
 use super::ExtensionHandle;
 use super::HARDWARE_KD_ENABLED;
@@ -275,7 +276,7 @@ impl KdnetSetError {
     /// The error code the failure text prints.
     fn code(self) -> Hresult {
         match self {
-            Self::BadParameter => Hresult::from_error_code(ErrorCode::BadParameter),
+            Self::BadParameter => ErrorCode::BadParameter.hresult(),
             Self::ConsoleAddress(error) | Self::Save(error) => Hresult::from(error),
         }
     }
@@ -435,8 +436,8 @@ pub enum ExtensionError {
 impl From<ExtensionError> for Hresult {
     fn from(error: ExtensionError) -> Self {
         match error {
-            ExtensionError::OtherLoaded => Hresult::error(0x2b),
-            ExtensionError::UnknownHandle => Hresult::from_error_code(ErrorCode::BadParameter),
+            ExtensionError::OtherLoaded => xbdm_error(0x2b),
+            ExtensionError::UnknownHandle => ErrorCode::BadParameter.hresult(),
             ExtensionError::Kernel(error) => {
                 CommandError::from_kernel(error, CommandError::Fail).into()
             }

@@ -450,7 +450,7 @@ fn advmem_toggles_the_flash_flag() {
     assert_eq!(session.command("advmem"), "400- improper command");
 
     server.host.lock().backend.memory.flash_write_failure =
-        Some(KernelError::from_status(NtStatus(0xc000_0185)));
+        KernelError::from_status(NtStatus(0xc000_0185));
     assert_eq!(session.command("advmem on"), "400- unexpected error");
     server.host.lock().backend.memory.flash_read_failure = Some(KernelError::ObjectNameNotFound);
     assert_eq!(session.command("advmem"), "400- unexpected error");

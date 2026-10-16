@@ -14,6 +14,10 @@ use openxbdm_server::commands::filesystem::CreateRequest;
 use openxbdm_server::commands::filesystem::FileAccess;
 use openxbdm_server::commands::filesystem::FileAttributes;
 use openxbdm_server::commands::filesystem::ShareAccess;
+use xbox360_sys::xam;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::IoStatusBlock;
 
 use super::session;
 use super::status;
@@ -21,7 +25,6 @@ use super::status::Status;
 use crate::backend::Console;
 use crate::backend::dispatcher;
 use crate::kernel;
-use crate::kernel::IoStatusBlock;
 use crate::net::XamNetwork;
 
 /// An open capture file handle.
@@ -69,16 +72,21 @@ pub(super) fn write(file: CaptureFile, data: u32, length: u32) -> u32 {
         return 0;
     }
     let mut io_status = IoStatusBlock::default();
-    kernel::NtWriteFile(
-        file.0,
-        0,
-        0,
-        0,
-        &mut io_status,
-        data as usize as *const u8,
-        length,
-        core::ptr::null(),
-    )
+    // SAFETY: the handle is an open capture file and callers pass `length`
+    // readable bytes at `data`; the write is synchronous.
+    unsafe {
+        xboxkrnl::NtWriteFile(
+            Handle::from_raw(file.0),
+            Handle::NULL,
+            0,
+            0,
+            &mut io_status,
+            data as usize as *const u8,
+            length,
+            core::ptr::null(),
+        )
+    }
+    .0
 }
 
 pub(super) fn write_words(file: CaptureFile, words: &[u32]) -> u32 {
@@ -168,7 +176,8 @@ fn open_on_server(
         };
         if let Ok(handle) = filesystem::open_translated(&server.state, console, directory, &create)
         {
-            kernel::NtClose(handle.0);
+            // SAFETY: the handle was just opened and is not used again.
+            unsafe { xboxkrnl::NtClose(Handle::from_raw(handle.0)) };
         }
         push(directory);
         push(b"\\");
@@ -273,8 +282,11 @@ pub(crate) fn service_resource_begin(argument: u32) -> u32 {
     RESOURCE_FLAG.store(flag, Ordering::Release);
     // `{frequency, counter}` as stock lays out its two stack quadwords.
     let mut timer = [0u64; 2];
-    kernel::QueryPerformanceCounter(&mut timer[1]);
-    kernel::QueryPerformanceFrequency(&mut timer[0]);
+    // SAFETY: both point to quadwords of `timer`.
+    unsafe {
+        xam::QueryPerformanceCounter(&mut timer[1]);
+        xam::QueryPerformanceFrequency(&mut timer[0]);
+    }
     let record = [RESOURCE_TIMER, 4, timer.as_ptr() as usize as u32];
     service_resource_record(record.as_ptr() as usize as u32);
     0
@@ -306,7 +318,9 @@ pub(crate) fn service_resource_end(argument: u32) -> u32 {
         return 0;
     };
     write_words(file, &[RESOURCE_END]);
-    kernel::NtClose(file.0);
+    // SAFETY: the resource file handle, closed once here. RESOURCE keeps
+    // the stale value until the reset below, in stock order.
+    unsafe { xboxkrnl::NtClose(Handle::from_raw(file.0)) };
     if super::read_u32(argument) != 0 {
         let result: &[u8] = if RESOURCE_TRUNCATED.load(Ordering::Acquire) {
             b"Trunc\0"

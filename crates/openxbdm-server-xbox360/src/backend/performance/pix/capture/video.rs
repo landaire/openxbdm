@@ -8,6 +8,19 @@
 //! a ring of 0x24-byte requests `{kind << 4 | flags, unit u16, iosb,
 //! record[5]}` (kinds 1 GPU frame, 2 frame without data, 3 audio, 4 end).
 
+use xbox360::module::ExportAddress;
+use xbox360::module::Ordinal;
+use xbox360::module::SystemModule;
+use xbox360::module::resolve_export;
+use xbox360::time::TickCount;
+use xbox360_sys::xam;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::IoStatusBlock;
+use xbox360_sys::xboxkrnl::PoolTag;
+use xbox360_sys::xboxkrnl::PoolType;
+use xbox360_sys::xboxkrnl::XAudioSubmitRenderDriverFrame;
+
 use super::S;
 use super::buffers;
 use super::rd;
@@ -23,7 +36,7 @@ const COMPLETION: u32 = 0x8000_0000;
 const GPU: u32 = 0x4000_0000;
 const AUDIO: u32 = 0x2000_0000;
 const FRAME_RECORD: u32 = 0x5f4;
-const POOL_TAG: u32 = 0x504d_4f56;
+const POOL_TAG: PoolTag = PoolTag::new(*b"PMOV");
 /// Ticks of the title's vertical position routine per frame.
 const POSITION_LIMIT: i32 = 0xbebc;
 const SAMPLES: u32 = 0x600;
@@ -233,7 +246,10 @@ fn initialize(v: V) -> bool {
     let buffers = count - 3;
     v.set(0xcc, buffers);
     let requests = buffers.max(1000);
-    let ring = kernel::ExAllocatePoolTypeWithTag(requests * REQUEST, POOL_TAG, 2);
+    // SAFETY: allocates from the system pool; no pointer arguments.
+    let ring = unsafe {
+        xboxkrnl::ExAllocatePoolTypeWithTag(requests * REQUEST, POOL_TAG, PoolType::System)
+    };
     if ring == 0 {
         return false;
     }
@@ -248,12 +264,16 @@ fn initialize(v: V) -> bool {
     true
 }
 
+/// Kernel export that cancels the I/O of a file handle.
+const CANCEL_IO_ROUTINE: Ordinal = Ordinal::new(0x2b8).unwrap();
+
 /// End the reads: kernel export 0x2b8 cancels the partition handle's
 /// I/O, else wait for them (stock 0x91f5a138).
 fn finish(v: V) {
-    let routine = kernel::module_handle(c"xboxkrnl.exe")
-        .and_then(|kernel| kernel::resolve_export(kernel, 0x2b8))
-        .unwrap_or(0);
+    let routine = SystemModule::Kernel
+        .handle()
+        .and_then(|kernel| resolve_export(kernel, CANCEL_IO_ROUTINE))
+        .map_or(0, ExportAddress::raw);
     if routine != 0 {
         let handle = buffers::stream_handle(v.s(), 0);
         // SAFETY: kernel export 0x2b8 takes one argument, a file handle.
@@ -279,16 +299,20 @@ fn prefetch(v: V) {
         let offset =
             u64::from(rd(stream + buffers::STREAM_TABLE + index * 8 + 4) & 0x00ff_ffff) << 14;
         wr(slot + 8, STATUS_PENDING);
-        kernel::NtReadFile(
-            buffers::stream_handle(s, 0),
-            0,
-            0,
-            0,
-            (slot + 8) as usize as *mut kernel::IoStatusBlock,
-            rd(slot + 4) as usize as *mut u8,
-            buffers::BUFFER_BYTES,
-            &offset,
-        );
+        // SAFETY: the status block and buffer belong to the slot in session
+        // memory that outlives the read; `offset` is read during the call.
+        unsafe {
+            xboxkrnl::NtReadFile(
+                Handle::from_raw(buffers::stream_handle(s, 0)),
+                Handle::NULL,
+                0,
+                0,
+                (slot + 8) as usize as *mut xboxkrnl::IoStatusBlock,
+                rd(slot + 4) as usize as *mut u8,
+                buffers::BUFFER_BYTES,
+                &offset,
+            )
+        };
         v.set(
             0x54,
             if index + 1 < buffers::TABLE_ENTRIES {
@@ -461,7 +485,10 @@ fn end_submissions(v: V) {
 fn report(v: V, start: u32) {
     if v.flags() & GPU != 0 {
         let frames = v.w(0x20);
-        let elapsed = kernel::tick_count().wrapping_sub(start).wrapping_add(1);
+        let elapsed = TickCount::now()
+            .milliseconds()
+            .wrapping_sub(start)
+            .wrapping_add(1);
         let range = (v.w(0x10) >> 8).wrapping_sub(v.w(0xc) >> 8);
         // Stock traps on an empty range.
         let percent = (frames.wrapping_mul(100)).checked_div(range).unwrap_or(0);
@@ -533,17 +560,22 @@ fn wait_position(v: V, target: u32) {
 
 /// Write movie data to the operation's file (stock 0x91f5a790).
 fn emit(v: V, data: u32, bytes: u32) {
-    let mut io_status = kernel::IoStatusBlock::default();
-    if (kernel::NtWriteFile(
-        v.w(0x14),
-        0,
-        0,
-        0,
-        &mut io_status,
-        data as usize as *const u8,
-        bytes,
-        core::ptr::null(),
-    ) as i32)
+    let mut io_status = xboxkrnl::IoStatusBlock::default();
+    // SAFETY: the operation's open file; callers pass `bytes` readable
+    // bytes at `data`; the write is synchronous.
+    if (unsafe {
+        xboxkrnl::NtWriteFile(
+            Handle::from_raw(v.w(0x14)),
+            Handle::NULL,
+            0,
+            0,
+            &mut io_status,
+            data as usize as *const u8,
+            bytes,
+            core::ptr::null(),
+        )
+    }
+    .0 as i32)
         < 0
     {
         v.set(0x18, 1);
@@ -779,16 +811,20 @@ fn fill_requests(v: V) {
             };
             wr(io_status, STATUS_PENDING);
             let offset = u64::from(rd(pending + 4) & 0x00ff_ffff) << 14;
-            buffers::NtReadFileScatter(
-                buffers::stream_handle(s, 0),
-                0,
-                0,
-                0,
-                io_status,
-                segments.as_ptr(),
-                chunk << 14,
-                &offset,
-            );
+            // SAFETY: the status block lies in session memory that outlives
+            // the read; `segments` and `offset` are read during the call.
+            unsafe {
+                xboxkrnl::NtReadFileScatter(
+                    Handle::from_raw(buffers::stream_handle(s, 0)),
+                    Handle::NULL,
+                    0,
+                    0,
+                    io_status as usize as *mut IoStatusBlock,
+                    segments.as_ptr(),
+                    chunk << 14,
+                    &offset,
+                )
+            };
             left -= chunk;
             budget -= chunk;
             let position = rd(pending + 4);
@@ -845,7 +881,8 @@ fn audio_due(v: V, record: u32) -> bool {
 
 fn performance_counter() -> u32 {
     let mut counter = 0u64;
-    kernel::QueryPerformanceCounter(&mut counter);
+    // SAFETY: `counter` is a live local.
+    unsafe { xam::QueryPerformanceCounter(&mut counter) };
     (counter as i64 >> 10) as u32
 }
 
@@ -902,7 +939,9 @@ extern "C" fn render(context: u32) {
     if position <= BUFFER_SAMPLES - SAMPLES {
         to_float(output, rd(client + 0x10) + position * 2, SAMPLES);
         wr(client + 0xc, position + SAMPLES);
-        XAudioSubmitRenderDriverFrame(s.word(0x1_2290), output);
+        // SAFETY: the client registered by `pause_engine`; `output` is its
+        // sample buffer.
+        unsafe { XAudioSubmitRenderDriverFrame(s.word(0x1_2290), output) };
         v.set(0x24, v.w(0x24) + 1);
         return;
     }
@@ -948,7 +987,8 @@ extern "C" fn render(context: u32) {
     wr(client + 0xc, rest);
     wr(client + 0x10, data);
     to_float(output + first * 4, data, rest);
-    XAudioSubmitRenderDriverFrame(s.word(0x1_2290), output);
+    // SAFETY: as above.
+    unsafe { XAudioSubmitRenderDriverFrame(s.word(0x1_2290), output) };
     v.set(0x24, v.w(0x24) + 1);
     copy_request(current, next_address);
 }
@@ -1114,8 +1154,8 @@ fn multiple(v: V) -> u32 {
     let mut extra = [0u32; 0x40];
     let first_address = first.as_mut_ptr() as usize as u32;
     let next_address = next.as_mut_ptr() as usize as u32;
-    let mut last_status = kernel::tick_count();
-    let start = kernel::tick_count();
+    let mut last_status = TickCount::now().milliseconds();
+    let start = TickCount::now().milliseconds();
     let mut interrupted = false;
     let mut result = begin(v, true, false);
     if result != 0 {
@@ -1182,8 +1222,8 @@ fn multiple(v: V) -> u32 {
                 break 'frames;
             }
             fill_requests(v);
-            if kernel::tick_count().wrapping_sub(last_status) > 100 {
-                last_status = kernel::tick_count();
+            if TickCount::now().milliseconds().wrapping_sub(last_status) > 100 {
+                last_status = TickCount::now().milliseconds();
                 status(v, false);
             }
             super::super::session::leave(
@@ -1280,7 +1320,8 @@ fn movie_frame(v: V, first: u32, next: u32) -> u32 {
         let data = buffer + position;
         let bytes = 0x4000 - position;
         emit(v, data, bytes);
-        kernel::KeFlushCacheRange(data, bytes);
+        // SAFETY: `data` and `bytes` lie in a capture buffer.
+        unsafe { xboxkrnl::KeFlushCacheRange(data, bytes) };
         position = 0;
     }
     0
@@ -1303,8 +1344,11 @@ fn movie_audio(v: V, previous: u32, current: u32) {
     emit(v, header.as_ptr() as usize as u32, 0xc);
     emit(v, first, first_bytes);
     emit(v, second, second_bytes);
-    kernel::KeFlushCacheRange(first, first_bytes);
-    kernel::KeFlushCacheRange(second, second_bytes);
+    // SAFETY: both ranges lie in capture buffers.
+    unsafe {
+        xboxkrnl::KeFlushCacheRange(first, first_bytes);
+        xboxkrnl::KeFlushCacheRange(second, second_bytes);
+    }
 }
 
 /// Write the frame range as movie data (stock 0x91f5bf10).
@@ -1403,7 +1447,9 @@ pub(super) fn run(s: S, first: u32, count: u32, argument: u32) -> Option<u32> {
     v.set(0x10, end_byte | (v.w(8) & 0xffff_ff00));
     let result = if count == 1 { single(v) } else { multiple(v) };
     finish(v);
-    kernel::ExFreePool(v.w(0x9c));
+    // SAFETY: the request ring `initialize` allocated; its slot is cleared
+    // below.
+    unsafe { xboxkrnl::ExFreePool(v.w(0x9c)) };
     v.set(0x9c, 0);
     (result != 0).then_some(result)
 }
@@ -1420,16 +1466,11 @@ pub(super) fn write(s: S, file: u32, no_gpu: u32, first: u32, count: u32) -> u32
     let v = setup(s, first, count);
     let mut result = movie(v, no_gpu);
     finish(v);
-    kernel::ExFreePool(v.w(0x9c));
+    // SAFETY: as in `run`.
+    unsafe { xboxkrnl::ExFreePool(v.w(0x9c)) };
     v.set(0x9c, 0);
     if result == 0 && v.w(0x18) != 0 {
         result = 8;
     }
     result
 }
-
-crate::kernel::import_thunk!(
-    XAudioSubmitRenderDriverFrame(client: u32, samples: u32) -> u32,
-    lib = crate::kernel::LIB_KERNEL,
-    ordinal = 0x1f5
-);

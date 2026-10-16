@@ -2,15 +2,15 @@
 //! it): the loaded modules and console facts that capture and trace files
 //! embed.
 
-use core::sync::atomic::Ordering;
-
 use openxbdm_server::Server;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::ExLoadedImageName;
+use xbox360_sys::xboxkrnl::PageProtection;
+use xbox360_sys::xboxkrnl::RtlImageDirectoryEntryToData;
 
 use crate::backend::Console;
 use crate::backend::console;
 use crate::backend::dispatcher;
-use crate::backend::memory::EXECUTABLE_PATH;
-use crate::backend::memory::RtlImageDirectoryEntryToData;
 use crate::exports::export;
 use crate::kernel;
 use crate::net::XamNetwork;
@@ -19,7 +19,6 @@ use crate::net::XamNetwork;
 pub(crate) const SIZE: u32 = 0xc000;
 /// Physical memory type of the block (`MmFreePhysicalMemory` takes it too).
 const MEMORY_TYPE: u32 = 1;
-const PAGE_READWRITE: u32 = 4;
 const VERSION: u32 = 0xa;
 const MODULE_CAPACITY: u32 = 0x80;
 /// Module records start at +8.
@@ -132,7 +131,11 @@ fn debug_directory(base: u32, lists: [u32; 2]) -> Option<(u32, u32)> {
     let mut size = 0u32;
     for list in lists {
         if contains(list, base) {
-            let directory = RtlImageDirectoryEntryToData(base, 1, IMAGE_DIRECTORY_DEBUG, &mut size);
+            // SAFETY: `base` is a loaded image on a list whose lock the
+            // caller holds; `size` is a live u32.
+            let directory = unsafe {
+                RtlImageDirectoryEntryToData(base, true, IMAGE_DIRECTORY_DEBUG, &mut size)
+            };
             if directory != 0 && size != 0 {
                 return Some((directory, size));
             }
@@ -191,8 +194,17 @@ fn store_module(record: u32, entry: u32, base: u32, lists: [u32; 2]) -> bool {
 /// the running executable (stock converts the object path through the
 /// drive table, 0x91f33c38).
 pub(crate) fn build(executable: &[u8], capture: CaptureFields) -> Option<Snapshot> {
-    let block =
-        kernel::MmAllocatePhysicalMemoryEx(MEMORY_TYPE, SIZE, PAGE_READWRITE, 0, u32::MAX, 0x1000);
+    // SAFETY: physical allocation of SIZE bytes; the result is checked below.
+    let block = unsafe {
+        xboxkrnl::MmAllocatePhysicalMemoryEx(
+            MEMORY_TYPE,
+            SIZE,
+            PageProtection::READWRITE,
+            0,
+            u32::MAX,
+            0x1000,
+        )
+    };
     if block == 0 {
         return None;
     }
@@ -212,8 +224,9 @@ pub(crate) fn build(executable: &[u8], capture: CaptureFields) -> Option<Snapsho
         &executable[..executable.len().min(PATH_LIMIT)],
     );
 
-    let lock = data.loader_lock() as usize as *mut u32;
-    let irql = kernel::KfAcquireSpinLock(lock);
+    let lock = data.loader_lock() as usize as *mut _;
+    // SAFETY: the loader lock lives in the kernel debug monitor data.
+    let irql = unsafe { xboxkrnl::KfAcquireSpinLock(lock) };
     let mut count = 0;
     'lists: for head in lists {
         // Stock reads the second list head without a null check.
@@ -233,7 +246,8 @@ pub(crate) fn build(executable: &[u8], capture: CaptureFields) -> Option<Snapsho
             entry = read_u32(entry);
         }
     }
-    kernel::KfReleaseSpinLock(lock, irql);
+    // SAFETY: acquired above at `irql`.
+    unsafe { xboxkrnl::KfReleaseSpinLock(lock, irql) };
 
     write_u32(block + 4, count);
     write_u32(
@@ -248,12 +262,13 @@ pub(crate) fn build(executable: &[u8], capture: CaptureFields) -> Option<Snapsho
 }
 
 pub(crate) fn free(snapshot: Snapshot) {
-    kernel::MmFreePhysicalMemory(MEMORY_TYPE, snapshot.0);
+    // SAFETY: the snapshot owns a block from `build`, consumed here.
+    unsafe { xboxkrnl::MmFreePhysicalMemory(MEMORY_TYPE, snapshot.0) };
 }
 
 /// Object path of the running executable.
 pub(crate) fn executable_object_path() -> &'static [u8] {
-    let path = EXECUTABLE_PATH.load(Ordering::Relaxed);
+    let path = ExLoadedImageName.address();
     let mut length = 0;
     while read_u8(path + length) != 0 {
         length += 1;
@@ -313,11 +328,20 @@ extern "C" fn export_build() -> u32 {
 }
 export!(131, export_build);
 
-/// Export 132: free a block from export 131; null is ignored.
-extern "C" fn export_free(address: u32) -> u32 {
-    if address == 0 {
-        return 0;
-    }
-    kernel::MmFreePhysicalMemory(MEMORY_TYPE, address)
+/// Export 132: free a block from export 131; null is ignored and returns 0.
+/// Tail-calls MmFreePhysicalMemory, so its r3 passes through.
+#[unsafe(naked)]
+extern "C" fn export_free(_address: u32) -> u32 {
+    core::arch::naked_asm!(
+        "cmpwi 3, 0",
+        "bne 1f",
+        "blr",
+        "1:",
+        "mr 4, 3",
+        "li 3, {kind}",
+        "b {free}",
+        kind = const MEMORY_TYPE,
+        free = sym xboxkrnl::MmFreePhysicalMemory,
+    )
 }
 export!(132, export_free);

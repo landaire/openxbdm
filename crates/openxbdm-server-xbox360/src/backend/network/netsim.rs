@@ -24,75 +24,38 @@ use openxbdm_server::commands::network::netsim::QueueStats;
 use openxbdm_server::commands::network::netsim::RedirectConfig;
 use openxbdm_server::commands::network::netsim::RedirectIndex;
 use openxbdm_server::commands::network::netsim::RedirectSnapshot;
+use xbox360_sys::xam::NetDll_XnpEthernetInterceptSetCallbacks;
+use xbox360_sys::xboxkrnl::XeKeysGetStatus;
 
 use self::engine::Instance;
 use super::FrameHook;
-use super::NetDll_XnpEthernetInterceptSetCallbacks;
 use super::XNCALLER_SYSAPP;
 use crate::backend::Console;
-use crate::kernel::LIB_KERNEL;
-use crate::kernel::LIB_XAM;
-use crate::kernel::import_thunk;
 
 /// Intercept flags of the simulator registration; a capture registers with
 /// none.
 const INTERCEPT_FLAGS: u32 = 2;
 
-use crate::kernel::KeCancelTimer;
-use crate::kernel::KeInitializeDpc;
-use crate::kernel::KeInitializeTimerEx;
-use crate::kernel::KeRemoveQueueDpc;
-use crate::kernel::KeSetTimerEx;
-import_thunk!(
-    XeCryptRandom(buffer: *mut u8, length: u32) -> u32,
-    lib = LIB_KERNEL,
-    ordinal = 0x18a
-);
-import_thunk!(
-    XeKeysGetStatus(status: *mut u32) -> u32,
-    lib = LIB_KERNEL,
-    ordinal = 0x23f
-);
-import_thunk!(
-    NetDll_XnpEthernetInterceptXmit(caller: u32, frame: *mut u8, length: u32) -> u32,
-    lib = LIB_XAM,
-    ordinal = 0x6e
-);
-import_thunk!(
-    NetDll_XnpEthernetInterceptRecv(caller: u32, frame: *mut u8, length: u32) -> u32,
-    lib = LIB_XAM,
-    ordinal = 0x6f
-);
-
-/// `KeSetTimerEx(timer, due, 0, dpc)`. The console takes the due time in one
-/// 64-bit register; this joins the two halves the 32-bit ABI passes.
-#[unsafe(naked)]
-extern "C" fn set_timer(timer: *mut u8, due_high: u32, due_low: u32, dpc: *mut u8) -> u32 {
-    core::arch::naked_asm!(
-        // rldimi 5, 4, 32, 0: the high half into the upper word of r5.
-        ".long 0x7885000e",
-        "mr 4, 5",
-        "li 5, 0",
-        "b {set}",
-        set = sym KeSetTimerEx,
-    )
-}
-
 /// Pool blocks of the library (stock allocator 0x91f36460: tag `DMNS`,
 /// pool type 2).
 mod memory {
-    use crate::kernel;
+    use xbox360_sys::xboxkrnl;
+    use xbox360_sys::xboxkrnl::PoolTag;
+    use xbox360_sys::xboxkrnl::PoolType;
 
-    const TAG: u32 = 0x444d_4e53;
-    const POOL_TYPE: u32 = 2;
+    const TAG: PoolTag = PoolTag::new(*b"DMNS");
 
     pub(super) fn allocate(size: usize) -> Option<*mut u8> {
-        let address = kernel::ExAllocatePoolTypeWithTag(u32::try_from(size).ok()?, TAG, POOL_TYPE);
+        // SAFETY: pool allocation of the requested size; the result is checked below.
+        let address = unsafe {
+            xboxkrnl::ExAllocatePoolTypeWithTag(u32::try_from(size).ok()?, TAG, PoolType::System)
+        };
         (address != 0).then_some(address as usize as *mut u8)
     }
 
     pub(super) fn free(block: *mut u8) {
-        kernel::ExFreePool(block as usize as u32);
+        // SAFETY: callers pass a block from `allocate` that they no longer use.
+        unsafe { xboxkrnl::ExFreePool(block as usize as u32) };
     }
 }
 
@@ -187,19 +150,25 @@ impl netsim::Backend for Console {
         }
         if let Some(hook) = self.network.netcap.hook() {
             instance.chain(Some(hook), false);
-            let error = NetDll_XnpEthernetInterceptSetCallbacks(XNCALLER_SYSAPP, 0, 0, 0, 0);
+            // SAFETY: clearing the callbacks passes no pointers.
+            let error =
+                unsafe { NetDll_XnpEthernetInterceptSetCallbacks(XNCALLER_SYSAPP, 0, 0, 0, 0) };
             if let Some(error) = WsaError::new(error) {
                 Instance::destroy(pointer.as_ptr());
                 return Err(registration_error(error, false));
             }
         }
-        let error = NetDll_XnpEthernetInterceptSetCallbacks(
-            XNCALLER_SYSAPP,
-            engine::transmit_entry as *const () as usize,
-            engine::receive_entry as *const () as usize,
-            instance.context(),
-            INTERCEPT_FLAGS,
-        );
+        // SAFETY: the entries take the instance context, which stays allocated
+        // until `destroy_simulator` removes the callbacks.
+        let error = unsafe {
+            NetDll_XnpEthernetInterceptSetCallbacks(
+                XNCALLER_SYSAPP,
+                engine::transmit_entry as *const () as usize,
+                engine::receive_entry as *const () as usize,
+                instance.context(),
+                INTERCEPT_FLAGS,
+            )
+        };
         if let Some(error) = WsaError::new(error) {
             Instance::destroy(pointer.as_ptr());
             return Err(registration_error(error, true));
@@ -212,15 +181,19 @@ impl netsim::Backend for Console {
     fn destroy_simulator(&mut self) -> Result<(), NetsimError> {
         let pointer = NonNull::new(INSTANCE.swap(null_mut(), Ordering::AcqRel))
             .ok_or(NetsimError::InstanceChanged)?;
-        NetDll_XnpEthernetInterceptSetCallbacks(XNCALLER_SYSAPP, 0, 0, 0, INTERCEPT_FLAGS);
-        if let Some(hook) = self.network.netcap.hook() {
-            NetDll_XnpEthernetInterceptSetCallbacks(
-                XNCALLER_SYSAPP,
-                super::netcap::transmit_entry as *const () as usize,
-                super::netcap::receive_entry as *const () as usize,
-                hook.context,
-                0,
-            );
+        // SAFETY: the capture entries take its context, which stays allocated
+        // until `close_capture`, after `detach_capture` removes the hook.
+        unsafe {
+            NetDll_XnpEthernetInterceptSetCallbacks(XNCALLER_SYSAPP, 0, 0, 0, INTERCEPT_FLAGS);
+            if let Some(hook) = self.network.netcap.hook() {
+                NetDll_XnpEthernetInterceptSetCallbacks(
+                    XNCALLER_SYSAPP,
+                    super::netcap::transmit_entry as *const () as usize,
+                    super::netcap::receive_entry as *const () as usize,
+                    hook.context,
+                    0,
+                );
+            }
         }
         Instance::destroy(pointer.as_ptr());
         Ok(())
@@ -297,7 +270,8 @@ impl netsim::Backend for Console {
 
     fn key_status(&mut self) -> KeyStatus {
         let mut value = 0u32;
-        XeKeysGetStatus(&mut value);
+        // SAFETY: `value` is a live u32.
+        unsafe { XeKeysGetStatus(&mut value) };
         KeyStatus(value)
     }
 }

@@ -11,24 +11,32 @@ use core::sync::atomic::AtomicI32;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
-use openxbdm_core::status::NtStatus;
 use openxbdm_server::Server;
 use openxbdm_server::commands::console::TraceMask;
 use openxbdm_server::commands::filesystem::Backend as _;
 use openxbdm_server::commands::session::debug_capture_print;
 use openxbdm_server::text::Text;
+use xbox360::console::hardware_flags;
+use xbox360::console::kernel_version;
+use xbox360_sys::processor::current_irql;
+use xbox360_sys::processor::pcr;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::DebugMonitorService;
+use xbox360_sys::xboxkrnl::Irql;
+use xbox360_sys::xboxkrnl::Kdpc;
+use xbox360_sys::xboxkrnl::KspinLock;
+use xbox360_sys::xboxkrnl::Ktimer;
+use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
 
 use super::Console;
 use crate::exports::bridged;
 use crate::kernel;
-use crate::kernel::AnsiString;
-use crate::kernel::current_irql;
-use crate::kernel::import_thunk;
-use crate::kernel::pcr;
+use crate::kernel::version_words;
 
-import_thunk!(
+xbox360_sys::import_thunk!(
+    #[allow(non_snake_case)]
     DbgPrintInquiry(format: *const u8, vendor: *const u8, product: *const u8) -> u32,
-    lib = kernel::LIB_KERNEL,
+    lib = xbox360_sys::lib_index::XBOXKRNL,
     ordinal = 3
 );
 
@@ -39,11 +47,6 @@ const DISPATCH_LEVEL: u8 = 2;
 const PCR_PRCB: u32 = 0x100;
 const PCR_PROCESSOR: u32 = 0x10c;
 
-/// Debug monitor service that returns the CD-ROM channel extension and the
-/// channel's packet routines.
-const DEBUG_MONITOR_CDROM_CHANNEL: u32 = 4;
-/// Debug monitor service that selects hypervisor DVD emulation mode.
-const DEBUG_MONITOR_DVD_EMULATION: u32 = 7;
 /// Hardware flag under which every request fails; its kernel meaning is
 /// unknown.
 const HARDWARE_FLAG_FAIL_OPTICAL_REQUESTS: u32 = 0x4000;
@@ -488,17 +491,20 @@ impl TraceQueue {
     /// level the producer may have interrupted the lock holder, so it only
     /// tries the lock.
     fn push(&self, trace: Trace) {
-        let lock = self.lock.get();
+        let lock = self.lock.get().cast::<KspinLock>();
         let irql = current_irql();
-        let previous = if irql < DISPATCH_LEVEL {
-            Some(kernel::KfAcquireSpinLock(lock))
-        } else if irql == DISPATCH_LEVEL {
-            kernel::KeAcquireSpinLockAtRaisedIrql(lock);
-            None
-        } else if kernel::KeTryToAcquireSpinLockAtRaisedIrql(lock) & 0xff != 0 {
-            None
-        } else {
-            return;
+        // SAFETY: `lock` is the queue's spin lock word, which starts released.
+        let previous = unsafe {
+            if irql < Irql::DISPATCH {
+                Some(xboxkrnl::KfAcquireSpinLock(lock))
+            } else if irql == Irql::DISPATCH {
+                xboxkrnl::KeAcquireSpinLockAtRaisedIrql(lock);
+                None
+            } else if xboxkrnl::KeTryToAcquireSpinLockAtRaisedIrql(lock).get() {
+                None
+            } else {
+                return;
+            }
         };
         // SAFETY: the spin lock is held.
         let ring = unsafe { &mut *self.ring.get() };
@@ -506,16 +512,20 @@ impl TraceQueue {
             ring.traces[(ring.first + ring.count) % TRACE_SLOTS] = trace;
             ring.count += 1;
         }
-        match previous {
-            Some(previous) => kernel::KfReleaseSpinLock(lock, previous),
-            None => kernel::KeReleaseSpinLockFromRaisedIrql(lock),
+        // SAFETY: this thread holds `lock`, taken above in the mode `previous` records.
+        unsafe {
+            match previous {
+                Some(previous) => xboxkrnl::KfReleaseSpinLock(lock, previous),
+                None => xboxkrnl::KeReleaseSpinLockFromRaisedIrql(lock),
+            }
         };
     }
 
     /// Take the oldest trace; called on the server thread.
     fn pop(&self) -> Option<Trace> {
-        let lock = self.lock.get();
-        let previous = kernel::KfAcquireSpinLock(lock);
+        let lock = self.lock.get().cast::<KspinLock>();
+        // SAFETY: `lock` is the queue's spin lock word.
+        let previous = unsafe { xboxkrnl::KfAcquireSpinLock(lock) };
         // SAFETY: the spin lock is held.
         let ring = unsafe { &mut *self.ring.get() };
         let trace = (ring.count != 0).then(|| {
@@ -524,7 +534,8 @@ impl TraceQueue {
             ring.count -= 1;
             trace
         });
-        kernel::KfReleaseSpinLock(lock, previous);
+        // SAFETY: this thread acquired `lock` above.
+        unsafe { xboxkrnl::KfReleaseSpinLock(lock, previous) };
         trace
     }
 }
@@ -649,9 +660,14 @@ impl Channel {
 
     /// Take the channel lock at the channel IRQL from `expected` IRQL.
     fn lock(self, expected: u8) -> ChannelLock {
-        check(current_irql() == expected);
-        kernel::KfRaiseIrql(u32::from(self.irql()));
-        kernel::KeAcquireSpinLockAtRaisedIrql((self.0 + CHANNEL_LOCK) as usize as *mut u32);
+        check(current_irql() == Irql::new(expected));
+        // SAFETY: CHANNEL_LOCK is the spin lock of the kernel's channel extension.
+        unsafe {
+            xboxkrnl::KfRaiseIrql(Irql::new(self.irql()));
+            xboxkrnl::KeAcquireSpinLockAtRaisedIrql(
+                (self.0 + CHANNEL_LOCK) as usize as *mut KspinLock,
+            );
+        }
         self.write(CHANNEL_LOCK_OWNER, pcr() + PCR_PRCB);
         ChannelLock(self)
     }
@@ -662,10 +678,15 @@ struct ChannelLock(Channel);
 impl ChannelLock {
     fn release(self, irql: u8) {
         let channel = self.0;
-        check(current_irql() == channel.irql());
+        check(current_irql() == Irql::new(channel.irql()));
         check(channel.read(CHANNEL_LOCK_OWNER) == pcr() + PCR_PRCB);
-        kernel::KeReleaseSpinLockFromRaisedIrql((channel.0 + CHANNEL_LOCK) as usize as *mut u32);
-        kernel::KfLowerIrql(u32::from(irql));
+        // SAFETY: this processor holds the channel lock, as checked above.
+        unsafe {
+            xboxkrnl::KeReleaseSpinLockFromRaisedIrql(
+                (channel.0 + CHANNEL_LOCK) as usize as *mut KspinLock,
+            );
+            xboxkrnl::KfLowerIrql(Irql::new(irql));
+        }
     }
 }
 
@@ -677,48 +698,36 @@ fn routine(address: u32) -> Option<u32> {
 fn start_packet(channel: Channel, irp: Irp) {
     match routine(START_PACKET.load(Ordering::Relaxed)) {
         // SAFETY: the kernel gave a routine taking (channel, irp).
-        Some(routine) => unsafe { kernel::call_export(routine, channel.0, irp.0, 0, 0) },
-        None => kernel::IoStartPacket(channel.device().0, irp.0, core::ptr::null()),
-    };
+        Some(routine) => {
+            unsafe { kernel::call_export(routine, channel.0, irp.0, 0, 0) };
+        }
+        // SAFETY: the device and request are the channel's live kernel objects.
+        None => unsafe { xboxkrnl::IoStartPacket(channel.device().0, irp.0, core::ptr::null()) },
+    }
 }
 
 fn start_next_packet(channel: Channel) {
     match routine(START_NEXT_PACKET.load(Ordering::Relaxed)) {
         // SAFETY: the kernel gave a routine taking (channel).
-        Some(routine) => unsafe { kernel::call_export(routine, channel.0, 0, 0, 0) },
-        None => kernel::IoStartNextPacket(channel.device().0),
-    };
-}
-
-/// `KeSetTimerEx(timer, due, period, dpc)`: the console takes the due time
-/// in one 64-bit register; this joins the two halves the 32-bit ABI passes.
-#[unsafe(naked)]
-extern "C" fn set_timer(
-    timer: *mut u8,
-    due_high: u32,
-    due_low: u32,
-    period: u32,
-    dpc: *mut u8,
-) -> u32 {
-    core::arch::naked_asm!(
-        // rldimi 5, 4, 32, 0: the high half into the upper word of r5.
-        ".long 0x7885000e",
-        "mr 4, 5",
-        "mr 5, 6",
-        "mr 6, 7",
-        "b {set}",
-        set = sym kernel::KeSetTimerEx,
-    )
+        Some(routine) => {
+            unsafe { kernel::call_export(routine, channel.0, 0, 0, 0) };
+        }
+        // SAFETY: the device is the channel's live kernel device object.
+        None => unsafe { xboxkrnl::IoStartNextPacket(channel.device().0) },
+    }
 }
 
 fn start_channel_timer(channel: Channel, due: i64, period_ms: u32) {
-    set_timer(
-        (channel.0 + CHANNEL_TIMER) as usize as *mut u8,
-        (due >> 32) as u32,
-        due as u32,
-        period_ms,
-        (channel.0 + CHANNEL_TIMER_DPC) as usize as *mut u8,
-    );
+    // SAFETY: the timer and its DPC are initialized objects inside the
+    // kernel's channel extension.
+    unsafe {
+        xboxkrnl::KeSetTimerEx(
+            (channel.0 + CHANNEL_TIMER) as usize as *mut Ktimer,
+            due,
+            period_ms,
+            (channel.0 + CHANNEL_TIMER_DPC) as usize as *mut Kdpc,
+        )
+    };
 }
 
 bridged!(tray_notification_entry, tray_notification);
@@ -744,12 +753,18 @@ pub(crate) fn install(trace_mask: TraceMask) {
             0,
         ]
     };
-    kernel::HalRegisterSMCNotification(TRAY_REGISTRATION.get().cast(), 1);
+    // SAFETY: TRAY_REGISTRATION is static and holds the registration record
+    // written above.
+    unsafe { xboxkrnl::HalRegisterSMCNotification(TRAY_REGISTRATION.get().cast(), true) };
 
     let verbose = trace_mask.contains(TraceMask::CDROM);
-    let name = AnsiString::new(b"\\Device\\Cdrom0");
+    let name = kernel::ansi_string(b"\\Device\\Cdrom0");
     let mut object = 0u32;
-    let found = NtStatus(kernel::ObReferenceObjectByName(&name, 0, 0, 0, &mut object)).result();
+    // SAFETY: `name` refers to a static string and `object` is a local word.
+    let found = unsafe {
+        xboxkrnl::ObReferenceObjectByName(&name, ObjectAttributeFlags::empty(), 0, 0, &mut object)
+    }
+    .result();
     if (found.is_err() || object == 0) && verbose {
         kernel::debug_print(c"[xbdm] Failed to find object: CdRom0.\n");
     }
@@ -779,15 +794,16 @@ enum PatchError {
 fn patch(device: Option<Device>) -> Result<(), PatchError> {
     let device = device.ok_or(PatchError::NoDevice)?;
     trace(Trace::UpdatingDriver);
-    let version = kernel::kernel_version();
-    let channel = find_channel(device, version)?;
+    let version = kernel_version();
+    let channel = find_channel(device, version_words(version))?;
     initialize(device)?;
     let driver = read_u32(device.0 + DEVICE_DRIVER_OBJECT);
     if driver == 0 {
         return Err(PatchError::NoDriverObject);
     }
 
-    let irql = kernel::IoAcquireDeviceObjectLock();
+    // SAFETY: released below after the driver object is replaced.
+    let irql = unsafe { xboxkrnl::IoAcquireDeviceObjectLock() };
     let copy = DRIVER_OBJECT.get();
     // SAFETY: the driver object holds DRIVER_OBJECT_SIZE bytes; the copy
     // is unused until the device points at it below.
@@ -798,7 +814,8 @@ fn patch(device: Option<Device>) -> Result<(), PatchError> {
             .write(start_io_hook_entry as *const () as usize as u32);
     }
     write_u32(device.0 + DEVICE_DRIVER_OBJECT, copy as usize as u32);
-    kernel::IoReleaseDeviceObjectLock(irql);
+    // SAFETY: `irql` is the result of the acquisition above.
+    unsafe { xboxkrnl::IoReleaseDeviceObjectLock(irql) };
 
     let lock = channel.lock(PASSIVE_LEVEL);
     channel.write(
@@ -809,7 +826,9 @@ fn patch(device: Option<Device>) -> Result<(), PatchError> {
     trace(Trace::UpdatedChannelIsr);
 
     detect_dvd_emulator(device);
-    trace(Trace::Patched { build: version[2] });
+    trace(Trace::Patched {
+        build: version.build,
+    });
     Ok(())
 }
 
@@ -827,13 +846,16 @@ fn find_channel(device: Device, version: [u16; 4]) -> Result<Channel, PatchError
         0x973 | 0x974 => 0x8012_76c0,
         _ => {
             let mut data = [0u32; 8];
-            let status = kernel::ExDebugMonitorService(
-                DEBUG_MONITOR_CDROM_CHANNEL,
-                1,
-                core::mem::size_of_val(&data) as u32,
-                data.as_mut_ptr() as usize as u32,
-            );
-            let channel = if (status as i32) < 0 {
+            // SAFETY: `data` is a local buffer of the size passed.
+            let status = unsafe {
+                xboxkrnl::ExDebugMonitorService(
+                    DebugMonitorService::CdromChannel,
+                    1,
+                    core::mem::size_of_val(&data) as u32,
+                    data.as_mut_ptr() as usize as u32,
+                )
+            };
+            let channel = if (status.0 as i32) < 0 {
                 0
             } else {
                 START_PACKET.store(data[3], Ordering::Relaxed);
@@ -865,17 +887,25 @@ fn find_channel(device: Device, version: [u16; 4]) -> Result<Channel, PatchError
 /// starts zeroed, as stock clears it here.
 fn initialize(device: Device) -> Result<(), PatchError> {
     let dpc = HOTPLUG_DPC.get().cast::<u8>();
-    kernel::KeInitializeDpc(
-        dpc,
-        hotplug_dpc_entry as *const () as usize,
-        device.0 as usize,
-    );
+    // SAFETY: HOTPLUG_DPC is static storage of DPC_SIZE bytes, aligned 8.
+    unsafe {
+        xboxkrnl::KeInitializeDpc(
+            dpc.cast(),
+            hotplug_dpc_entry as *const () as usize,
+            device.0 as usize,
+        )
+    };
     // SAFETY: the byte lies inside the initialized DPC.
     unsafe { dpc.add(DPC_IMPORTANCE_OFFSET).write(DPC_IMPORTANCE) };
-    let reinit = Irp::new(kernel::IoAllocateIrp(0));
-    let inquiry = Irp::new(kernel::IoAllocateIrp(u32::from(read_u8(
-        device.0 + DEVICE_STACK_SIZE,
-    ))));
+    // SAFETY: IoAllocateIrp takes only a stack location count.
+    let (reinit, inquiry) = unsafe {
+        (
+            Irp::new(xboxkrnl::IoAllocateIrp(0)),
+            Irp::new(xboxkrnl::IoAllocateIrp(u32::from(read_u8(
+                device.0 + DEVICE_STACK_SIZE,
+            )))),
+        )
+    };
     let (Some(reinit), Some(inquiry)) = (reinit, inquiry) else {
         return Err(PatchError::NoIrp);
     };
@@ -899,7 +929,10 @@ extern "C" fn interrupt_hook(interrupt: u32, registers: u32) -> u32 {
             hotplug & !(HOTPLUG_REMOVED | HOTPLUG_INSERTED),
         );
         HOTPLUG_FLAGS.fetch_or(FLAG_EVENT_PENDING, Ordering::SeqCst);
-        return kernel::KeInsertQueueDpc(HOTPLUG_DPC.get().cast(), channel.0, hotplug);
+        // SAFETY: HOTPLUG_DPC was initialized by `initialize` before the hook
+        // was installed.
+        return unsafe { xboxkrnl::KeInsertQueueDpc(HOTPLUG_DPC.get().cast(), channel.0, hotplug) }
+            .0;
     }
     match routine(channel.read(CHANNEL_INTERRUPT_ROUTINE)) {
         // SAFETY: the channel's interrupt routine takes (channel,
@@ -979,12 +1012,13 @@ fn queue_reinitialize(device: Device, channel: Channel) {
 /// and start the next request (0x91f3f0d8).
 fn fail_request(channel: Channel, irp: Option<Irp>) {
     check(irp.is_some());
-    check(current_irql() == DISPATCH_LEVEL);
+    check(current_irql() == Irql::DISPATCH);
     if let Some(irp) = irp
         && irp != reinit_irp()
     {
         write_u32(irp.0 + IRP_STATUS, STATUS_DEVICE_REMOVED);
-        kernel::IoCompleteRequest(irp.0, 0);
+        // SAFETY: `irp` is a live request the channel owns.
+        unsafe { xboxkrnl::IoCompleteRequest(irp.0, 0) };
     }
     start_next_packet(channel);
 }
@@ -999,8 +1033,8 @@ extern "C" fn start_io_hook(_device: u32, irp: u32) {
         channel.write_u8(CHANNEL_HELD_IRP_STARTED, 1);
         return;
     }
-    if kernel::HalIsExecutingPowerDownDpc() != 0
-        || kernel::hardware_flags() & HARDWARE_FLAG_FAIL_OPTICAL_REQUESTS != 0
+    if xboxkrnl::HalIsExecutingPowerDownDpc().get()
+        || hardware_flags().bits() & HARDWARE_FLAG_FAIL_OPTICAL_REQUESTS != 0
     {
         fail_request(channel, Irp::new(irp));
         return;
@@ -1052,7 +1086,7 @@ fn wait_until_ready(registers: SataRegisters) -> bool {
         if registers.read_u8(SATA_COMMAND) & DEVICE_STATUS_BUSY == 0 {
             return true;
         }
-        kernel::KeStallExecutionProcessor(READY_POLL_MICROSECONDS);
+        xboxkrnl::KeStallExecutionProcessor(READY_POLL_MICROSECONDS);
     }
     false
 }
@@ -1085,7 +1119,7 @@ extern "C" fn start_reinitialize(channel: u32) {
             serror,
             status,
         });
-        kernel::DbgBreakPoint();
+        xboxkrnl::DbgBreakPoint();
         // Stock returns with the channel lock held, which hangs the next
         // acquisition.
         lock.release(DISPATCH_LEVEL);
@@ -1115,7 +1149,11 @@ extern "C" fn start_reinitialize(channel: u32) {
 extern "C" fn reinit_interrupt(channel: u32, _registers: u32, status: u32) -> u32 {
     let channel = Channel(channel);
     channel.write(CHANNEL_INTERRUPT_ROUTINE, 0);
-    kernel::KeInsertQueueDpc((channel.0 + CHANNEL_DPC) as usize as *mut u8, 0, status)
+    // SAFETY: CHANNEL_DPC is the initialized DPC of the kernel's channel extension.
+    unsafe {
+        xboxkrnl::KeInsertQueueDpc((channel.0 + CHANNEL_DPC) as usize as *mut Kdpc, 0, status)
+    }
+    .0
 }
 
 /// Channel completion routine of the reinitialization (0x91f3fba0,
@@ -1194,23 +1232,34 @@ extern "C" fn inquiry_completion(_device: u32, irp: u32, channel: u32) -> u32 {
     STATUS_MORE_PROCESSING_REQUIRED
 }
 
+crate::kernel::forward!(
+    /// IoSynchronousDeviceIoControlRequest with a raw `internal` word: stock
+    /// passes the request size there.
+    fn device_io_control(u32, u32, *const u8, u32, *mut u8, u32, *mut u32, u32) -> xboxkrnl::NtStatus
+        => xboxkrnl::IoSynchronousDeviceIoControlRequest
+);
+
 /// Identify a DVD emulator by SCSI INQUIRY of the optical drive
 /// (0x91f3f918).
 fn detect_dvd_emulator(device: Device) {
     let mut data = [0u8; INQUIRY_LENGTH];
     let request = PassThrough::inquiry(data.as_mut_ptr() as usize as u32);
-    // The last argument is the value stock leaves in r10 from the request.
-    let status = kernel::IoSynchronousDeviceIoControlRequest(
-        IOCTL_SCSI_PASS_THROUGH_DIRECT,
-        device.0,
-        request.0.as_ptr(),
-        PASS_THROUGH_SIZE as u32,
-        core::ptr::null_mut(),
-        0,
-        core::ptr::null_mut(),
-        PASS_THROUGH_SIZE as u32,
-    );
-    report_inquiry(status, &data);
+    // Stock leaves the request size in r10, a nonzero BOOLEAN.
+    // SAFETY: `device` is the optical drive's device object; the request
+    // and the inquiry buffer it points at are live locals.
+    let status = unsafe {
+        device_io_control(
+            IOCTL_SCSI_PASS_THROUGH_DIRECT,
+            device.0,
+            request.0.as_ptr(),
+            PASS_THROUGH_SIZE as u32,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            PASS_THROUGH_SIZE as u32,
+        )
+    };
+    report_inquiry(status.0, &data);
 }
 
 /// Record the emulator state from inquiry data and select the matching
@@ -1219,13 +1268,17 @@ fn report_inquiry(status: u32, data: &[u8; INQUIRY_LENGTH]) {
     let (state, message) = if (status as i32) < 0 {
         (0, c"XBDM: ODD SCSIOP_INQUIRY Failed.\n")
     } else {
-        DbgPrintInquiry(
-            c"XBDM: ODD VendorId=%.8s, ProductId=%.16s\n"
-                .as_ptr()
-                .cast(),
-            data[8..].as_ptr(),
-            data[0x10..].as_ptr(),
-        );
+        // SAFETY: the format is NUL-terminated and its precisions bound the
+        // reads to the inquiry data.
+        unsafe {
+            DbgPrintInquiry(
+                c"XBDM: ODD VendorId=%.8s, ProductId=%.16s\n"
+                    .as_ptr()
+                    .cast(),
+                data[8..].as_ptr(),
+                data[0x10..].as_ptr(),
+            )
+        };
         if &data[8..10] != b"MS" || &data[0x10..0x20] != b"XBox 360 DVD Emu" {
             (0, c"XBDM: DVD Emulator Not Running.\n")
         } else if &data[0x20..0x24] != b"0002" {
@@ -1244,8 +1297,16 @@ fn report_inquiry(status: u32, data: &[u8; INQUIRY_LENGTH]) {
     };
     DVD_EMULATOR_STATE.store(state, Ordering::Relaxed);
     kernel::debug_print(message);
-    if (kernel::ExDebugMonitorService(DEBUG_MONITOR_DVD_EMULATION, u32::from(state != 0), 0, 0)
-        as i32)
+    // SAFETY: the DVD emulation service takes no buffer.
+    if (unsafe {
+        xboxkrnl::ExDebugMonitorService(
+            DebugMonitorService::DvdEmulation,
+            u32::from(state != 0),
+            0,
+            0,
+        )
+    }
+    .0 as i32)
         < 0
     {
         kernel::debug_print(c"XBDM: Hypervisor DVD Emulation mode not supported.\n");
@@ -1280,7 +1341,9 @@ pub(crate) fn drain(server: &mut Server, console: &mut Console) {
     if DRIVE_REINITIALIZED.swap(false, Ordering::AcqRel) {
         let mut message = [0u8; SMC_MESSAGE_SIZE];
         message[..SMC_REINITIALIZED.len()].copy_from_slice(&SMC_REINITIALIZED);
-        kernel::HalSendSMCMessage(message.as_ptr(), core::ptr::null_mut());
+        // SAFETY: `message` is a local SMC message of SMC_MESSAGE_SIZE bytes;
+        // no reply is requested.
+        unsafe { xboxkrnl::HalSendSMCMessage(message.as_ptr(), core::ptr::null_mut()) };
         console.open_close_tray(0);
     }
 }

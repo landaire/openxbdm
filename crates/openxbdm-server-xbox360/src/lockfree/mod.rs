@@ -27,35 +27,31 @@ use core::num::NonZeroU32;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::Win32Error;
+use xbox360::status::set_last_error;
+use xbox360::status::set_last_error_value;
+use xbox360_sys::interlocked::compare_exchange32;
+use xbox360_sys::interlocked::compare_exchange64;
+use xbox360_sys::interlocked::exchange32;
+use xbox360_sys::interlocked::fetch_add32;
+use xbox360_sys::interlocked::load64;
+use xbox360_sys::interlocked::store64;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::DispatcherObject;
+use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::KeReleaseSemaphore;
+use xbox360_sys::xboxkrnl::Ksemaphore;
+use xbox360_sys::xboxkrnl::NtCreateSemaphore;
+use xbox360_sys::xboxkrnl::NtReleaseSemaphore;
+use xbox360_sys::xboxkrnl::PoolTag;
+use xbox360_sys::xboxkrnl::PoolType;
+use xbox360_sys::xboxkrnl::ProcessorMode;
+use xbox360_sys::xboxkrnl::WaitReason;
 
 use crate::exports::export;
 use crate::kernel;
-use crate::kernel::LIB_KERNEL;
-use crate::kernel::import_thunk;
-
-import_thunk!(
-    KeInitializeSemaphore(semaphore: u32, count: u32, limit: u32) -> u32,
-    lib = LIB_KERNEL,
-    ordinal = 0x74
-);
-import_thunk!(
-    KeReleaseSemaphore(semaphore: u32, increment: u32, adjustment: u32, wait: u32) -> u32,
-    lib = LIB_KERNEL,
-    ordinal = 0x88
-);
-import_thunk!(
-    NtCreateSemaphore(handle: *mut u32, attributes: u32, count: u32, limit: u32) -> u32,
-    lib = LIB_KERNEL,
-    ordinal = 0xd5
-);
-import_thunk!(
-    NtReleaseSemaphore(handle: u32, count: u32, previous: u32) -> u32,
-    lib = LIB_KERNEL,
-    ordinal = 0xf3
-);
 
 /// Pool tag of library allocations.
-const POOL_TAG: u32 = u32::from_be_bytes(*b"Detr");
+const POOL_TAG: PoolTag = PoolTag::new(*b"Detr");
 /// Successful export result.
 const SUCCESS: Hresult = Hresult(0);
 /// HRESULT_FROM_WIN32(ERROR_NOT_ENOUGH_MEMORY): a creation or allocation
@@ -75,129 +71,6 @@ const SEMAPHORE_LIMIT: u32 = 0x7fff_ffff;
 const UNLIMITED: u32 = u32::MAX;
 /// Highest IRQL at which a kernel semaphore is released.
 const DISPATCH_LEVEL: u8 = 2;
-/// Wait reason and processor mode of every library wait.
-const USER_REQUEST: u32 = 3;
-const KERNEL_MODE: u32 = 0;
-
-/// Compare the quadword at `target` with `expected` and store `new` on a
-/// match; returns the observed quadword. A mismatch stores the observed
-/// value back to end the reservation, as stock does.
-#[unsafe(naked)]
-unsafe extern "C" fn compare_exchange64(target: usize, expected: u64, new: u64) -> u64 {
-    core::arch::naked_asm!(
-        "lwsync",
-        // rldimi 6, 5, 32, 0 and rldimi 8, 7, 32, 0: join the word pairs.
-        ".long 0x78a6000e",
-        ".long 0x78e8000e",
-        "1:",
-        "mfmsr 9",
-        // mtmsrd 13, 1: r13 holds the processor control region address,
-        // whose external interrupt enable bit is clear.
-        ".long 0x7da10164",
-        // ldarx 10, 0, 3
-        ".long 0x7d4018a8",
-        // cmpd 10, 6
-        ".long 0x7c2a3000",
-        "bne 2f",
-        // stdcx. 8, 0, 3
-        ".long 0x7d0019ad",
-        // mtmsrd 9, 1
-        ".long 0x7d210164",
-        "bne 1b",
-        "b 3f",
-        "2:",
-        // stdcx. 10, 0, 3
-        ".long 0x7d4019ad",
-        ".long 0x7d210164",
-        "3:",
-        // rldicl 3, 10, 32, 32: the high word into r3.
-        ".long 0x79430022",
-        "mr 4, 10",
-        "blr",
-    )
-}
-
-/// Compare the word at `target` with `expected` and store `new` on a
-/// match; returns the observed word.
-#[unsafe(naked)]
-unsafe extern "C" fn compare_exchange32(target: usize, expected: u32, new: u32) -> u32 {
-    core::arch::naked_asm!(
-        "lwsync",
-        "1:",
-        "mfmsr 9",
-        ".long 0x7da10164",
-        "lwarx 10, 0, 3",
-        "cmpw 10, 4",
-        "bne 2f",
-        "stwcx. 5, 0, 3",
-        ".long 0x7d210164",
-        "bne 1b",
-        "b 3f",
-        "2:",
-        "stwcx. 10, 0, 3",
-        ".long 0x7d210164",
-        "3:",
-        "mr 3, 10",
-        "blr",
-    )
-}
-
-/// Add `delta` to the word at `target`; returns the previous value.
-#[unsafe(naked)]
-unsafe extern "C" fn fetch_add32(target: usize, delta: u32) -> u32 {
-    core::arch::naked_asm!(
-        "1:",
-        "mfmsr 9",
-        ".long 0x7da10164",
-        "lwarx 10, 0, 3",
-        "add 11, 10, 4",
-        "stwcx. 11, 0, 3",
-        ".long 0x7d210164",
-        "bne 1b",
-        "mr 3, 10",
-        "blr",
-    )
-}
-
-/// Store `value` at `target`; returns the previous value.
-#[unsafe(naked)]
-unsafe extern "C" fn exchange32(target: usize, value: u32) -> u32 {
-    core::arch::naked_asm!(
-        "1:",
-        "mfmsr 9",
-        ".long 0x7da10164",
-        "lwarx 10, 0, 3",
-        "stwcx. 4, 0, 3",
-        ".long 0x7d210164",
-        "bne 1b",
-        "mr 3, 10",
-        "blr",
-    )
-}
-
-/// Load the quadword at `address` in one access.
-#[unsafe(naked)]
-unsafe extern "C" fn load64(address: usize) -> u64 {
-    core::arch::naked_asm!(
-        // ld 4, 0(3)
-        ".long 0xe8830000",
-        // rldicl 3, 4, 32, 32
-        ".long 0x78830022",
-        "blr",
-    )
-}
-
-/// Store `value` at `address` in one access.
-#[unsafe(naked)]
-unsafe extern "C" fn store64(address: usize, value: u64) {
-    core::arch::naked_asm!(
-        // rldimi 6, 5, 32, 0
-        ".long 0x78a6000e",
-        // std 6, 0(3)
-        ".long 0xf8c30000",
-        "blr",
-    )
-}
 
 fn load(address: usize) -> u32 {
     // SAFETY: see the module documentation.
@@ -211,7 +84,7 @@ fn store(address: usize, value: u32) {
 
 fn fetch_add(address: usize, delta: u32) -> u32 {
     // SAFETY: see the module documentation.
-    unsafe { fetch_add32(address, delta) }
+    unsafe { fetch_add32(address as *mut u32, delta) }
 }
 
 fn fetch_sub(address: usize, delta: u32) -> u32 {
@@ -220,28 +93,28 @@ fn fetch_sub(address: usize, delta: u32) -> u32 {
 
 fn compare_exchange(address: usize, expected: u32, new: u32) -> u32 {
     // SAFETY: see the module documentation.
-    unsafe { compare_exchange32(address, expected, new) }
+    unsafe { compare_exchange32(address as *mut u32, expected, new) }
 }
 
 fn exchange(address: usize, value: u32) -> u32 {
     // SAFETY: see the module documentation.
-    unsafe { exchange32(address, value) }
+    unsafe { exchange32(address as *mut u32, value) }
 }
 
 fn load_quad(address: usize) -> u64 {
     // SAFETY: see the module documentation.
-    unsafe { load64(address) }
+    unsafe { load64(address as *const u64) }
 }
 
 fn store_quad(address: usize, value: u64) {
     // SAFETY: see the module documentation.
-    unsafe { store64(address, value) }
+    unsafe { store64(address as *mut u64, value) }
 }
 
 /// Store `new` when the quadword at `address` equals `expected`.
 fn swap_quad(address: usize, expected: u64, new: u64) -> bool {
     // SAFETY: see the module documentation.
-    unsafe { compare_exchange64(address, expected, new) == expected }
+    unsafe { compare_exchange64(address as *mut u64, expected, new) == expected }
 }
 
 fn copy(destination: usize, source: usize, length: usize) {
@@ -471,7 +344,11 @@ impl WaitObject {
         match self.kind {
             SemaphoreKind::Object => {
                 if irql() <= DISPATCH_LEVEL {
-                    KeReleaseSemaphore(self.raw, 1, count, 0);
+                    // SAFETY: an object-kind `raw` is the address of an
+                    // initialized semaphore inside a live queue object.
+                    unsafe {
+                        KeReleaseSemaphore(self.raw as usize as *mut Ksemaphore, 1, count, false)
+                    };
                 }
             }
             SemaphoreKind::Handle => release_semaphore(self.raw, count),
@@ -489,52 +366,76 @@ impl WaitObject {
             .as_ref()
             .map_or(core::ptr::null(), |value| value as *const i64);
         Failure::of_wait(match self.kind {
-            SemaphoreKind::Object => kernel::KeWaitForSingleObject(
-                self.raw as usize as *mut u32,
-                USER_REQUEST,
-                KERNEL_MODE,
-                u32::from(alertable),
-                pointer,
-            ),
-            SemaphoreKind::Handle | SemaphoreKind::GatedHandle => kernel::NtWaitForSingleObjectEx(
-                self.raw,
-                KERNEL_MODE,
-                u32::from(alertable),
-                pointer,
-            ),
+            // SAFETY: an object-kind `raw` is the address of an initialized
+            // semaphore inside a live queue object; `pointer` is null or a
+            // live local.
+            SemaphoreKind::Object => unsafe {
+                xboxkrnl::KeWaitForSingleObject(
+                    self.raw as usize as *mut DispatcherObject,
+                    WaitReason::UserRequest,
+                    ProcessorMode::Kernel,
+                    alertable,
+                    pointer,
+                )
+                .0
+            },
+            // SAFETY: a handle-kind `raw` is a semaphore handle owned by the
+            // queue; `pointer` is null or a live local.
+            SemaphoreKind::Handle | SemaphoreKind::GatedHandle => unsafe {
+                xboxkrnl::NtWaitForSingleObjectEx(
+                    Handle::from_raw(self.raw),
+                    ProcessorMode::Kernel,
+                    alertable,
+                    pointer,
+                )
+                .0
+            },
         })
     }
 }
 
 /// Unnamed semaphore at count 0; failures set the thread's last error.
 fn create_semaphore() -> u32 {
-    let mut handle = 0;
-    if let Err(error) = NtStatus(NtCreateSemaphore(&mut handle, 0, 0, SEMAPHORE_LIMIT)).result() {
-        kernel::set_last_error(error);
+    let mut handle = Handle::NULL;
+    // SAFETY: `handle` is a live local; null attributes create an unnamed
+    // semaphore.
+    if let Err(error) =
+        unsafe { NtCreateSemaphore(&mut handle, core::ptr::null(), 0, SEMAPHORE_LIMIT) }.result()
+    {
+        set_last_error(error);
         return 0;
     }
     // Stock records ERROR_SUCCESS, the conversion of STATUS_SUCCESS.
-    kernel::set_last_error_value(None);
-    handle
+    set_last_error_value(None);
+    handle.raw()
 }
 
 /// Record a failed kernel call as the thread's last error.
 fn record_failure(status: NtStatus) {
     if let Err(error) = status.result() {
-        kernel::set_last_error(error);
+        set_last_error(error);
     }
 }
 
 fn release_semaphore(handle: u32, count: u32) {
-    record_failure(NtStatus(NtReleaseSemaphore(handle, count, 0)));
+    // SAFETY: callers pass a semaphore handle owned by the queue; a null
+    // previous-count pointer is allowed.
+    record_failure(unsafe {
+        NtReleaseSemaphore(Handle::from_raw(handle), count, core::ptr::null_mut())
+    });
 }
 
 fn close_handle(handle: u32) {
-    record_failure(NtStatus(kernel::NtClose(handle)));
+    // SAFETY: callers pass a handle owned by the queue and close it once.
+    record_failure(unsafe { xboxkrnl::NtClose(Handle::from_raw(handle)) });
 }
 
 fn set_event(handle: u32) {
-    record_failure(NtStatus(kernel::NtSetEvent(handle, core::ptr::null_mut())));
+    // SAFETY: callers pass an event handle owned by the queue; a null
+    // previous-state pointer is allowed.
+    record_failure(unsafe {
+        xboxkrnl::NtSetEvent(Handle::from_raw(handle), core::ptr::null_mut())
+    });
 }
 
 /// Wait behavior of one operation, from the container options.
@@ -623,11 +524,15 @@ const ALLOCATOR_SIZE: u32 = 0x10;
 const ALLOCATOR_ALIGNMENT: u32 = 16;
 
 extern "C" fn default_allocate(_context: u32, size: u32) -> u32 {
-    kernel::ExAllocatePoolTypeWithTag(size, POOL_TAG, 0)
+    // SAFETY: pool allocation of any size is valid; failure is null.
+    unsafe { xboxkrnl::ExAllocatePoolTypeWithTag(size, POOL_TAG, PoolType::Default) }
 }
 
-extern "C" fn default_free(_context: u32, address: u32) -> u32 {
-    kernel::ExFreePool(address)
+/// Tail-calls ExFreePool with `address`, as stock does, so its r3 passes
+/// through.
+#[unsafe(naked)]
+extern "C" fn default_free(_context: u32, _address: u32) -> u32 {
+    core::arch::naked_asm!("mr 3, 4", "b {free}", free = sym xboxkrnl::ExFreePool)
 }
 
 /// Address of a two-argument routine for a caller-visible record.
@@ -1074,12 +979,13 @@ fn read_field(object: u32, shape: &'static Shape, offset: u8, output: u32) -> u3
 }
 
 pub(crate) extern "C" fn allocate(size: u32) -> u32 {
-    kernel::ExAllocatePoolTypeWithTag(size, POOL_TAG, 0)
+    // SAFETY: pool allocation of any size is valid; failure is null.
+    unsafe { xboxkrnl::ExAllocatePoolTypeWithTag(size, POOL_TAG, PoolType::Default) }
 }
 export!(300, allocate);
 
-/// Stock tail-calls ExFreePool, so its result passes through.
-pub(crate) extern "C" fn free(address: u32) -> u32 {
-    kernel::ExFreePool(address)
-}
+crate::kernel::forward!(
+    /// Stock tail-calls ExFreePool, so its r3 passes through.
+    pub(crate) fn free(u32) -> u32 => xboxkrnl::ExFreePool
+);
 export!(301, free);

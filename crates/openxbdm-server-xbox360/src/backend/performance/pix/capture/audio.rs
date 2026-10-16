@@ -3,11 +3,13 @@
 //! are converted to 16-bit samples, staged in the session block, and
 //! queued in buffers of 0x2000 samples (type 0xc).
 
+use xbox360_sys::xam;
+use xbox360_sys::xboxkrnl;
+
 use super::S;
 use super::buffers;
 use super::rd;
 use super::wr;
-use crate::kernel;
 
 const BLOCK_SAMPLES: u32 = 0x600;
 const BUFFER_SAMPLES: u32 = 0x2000;
@@ -70,12 +72,14 @@ pub(crate) fn service_samples(block: u32) -> u32 {
         s.set_word(STAGED, staged + BLOCK_SAMPLES);
         return 1;
     }
-    let irql = kernel::KfAcquireSpinLock(s.at(0x1b4));
+    // SAFETY: the spin lock word lies in the session block.
+    let irql = unsafe { xboxkrnl::KfAcquireSpinLock(s.at(0x1b4).cast()) };
     match ready_buffer(s, k) {
         None => s.set_word(DROPPED, s.word(DROPPED).wrapping_add(1)),
         Some(entry) => {
             let mut counter = 0u64;
-            kernel::QueryPerformanceCounter(&mut counter);
+            // SAFETY: `counter` is a live local.
+            unsafe { xam::QueryPerformanceCounter(&mut counter) };
             let record = [
                 (s.word(DROPPED) << 16 | (staged & 0xffff)) << 3 | 5,
                 0,
@@ -100,7 +104,8 @@ pub(crate) fn service_samples(block: u32) -> u32 {
             s.set_word(DROPPED, 0);
         }
     }
-    kernel::KfReleaseSpinLock(s.at(0x1b4), irql);
+    // SAFETY: as above; the lock is held.
+    unsafe { xboxkrnl::KfReleaseSpinLock(s.at(0x1b4).cast(), irql) };
     service_from_render_thread(s);
     1
 }
@@ -110,18 +115,28 @@ pub(crate) fn service_samples(block: u32) -> u32 {
 fn service_from_render_thread(s: S) {
     let start = super::timebase_low();
     let expired = || super::timebase_low().wrapping_sub(start) > 0x61a8;
-    while crate::kernel::RtlTryEnterCriticalSection(s.at(super::super::session::LOCK)) == 0 {
+    let lock: *mut xboxkrnl::RtlCriticalSection = s.at(super::super::session::LOCK).cast();
+    let engine_lock: *mut xboxkrnl::RtlCriticalSection =
+        s.at(super::super::session::ENGINE_LOCK).cast();
+    // SAFETY: both critical sections lie in the session block and were
+    // initialized by `session::create`.
+    while !unsafe { xboxkrnl::RtlTryEnterCriticalSection(lock) }.get() {
         if expired() {
             return;
         }
     }
-    while crate::kernel::RtlTryEnterCriticalSection(s.at(super::super::session::ENGINE_LOCK)) == 0 {
+    // SAFETY: as above.
+    while !unsafe { xboxkrnl::RtlTryEnterCriticalSection(engine_lock) }.get() {
         if expired() {
-            kernel::RtlLeaveCriticalSection(s.at(super::super::session::LOCK));
+            // SAFETY: as above; `lock` is held.
+            unsafe { xboxkrnl::RtlLeaveCriticalSection(lock) };
             return;
         }
     }
     super::gpu::service(s, true);
-    kernel::RtlLeaveCriticalSection(s.at(super::super::session::ENGINE_LOCK));
-    kernel::RtlLeaveCriticalSection(s.at(super::super::session::LOCK));
+    // SAFETY: as above; both are held.
+    unsafe {
+        xboxkrnl::RtlLeaveCriticalSection(engine_lock);
+        xboxkrnl::RtlLeaveCriticalSection(lock);
+    }
 }

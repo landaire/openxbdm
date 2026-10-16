@@ -19,6 +19,8 @@
 
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
+use openxbdm_core::status::XbdmHresult;
+use openxbdm_core::status::xbdm_error;
 
 use crate::reply::CommandError;
 
@@ -128,12 +130,12 @@ impl From<CounterError> for Hresult {
     #[inline(never)]
     fn from(error: CounterError) -> Self {
         match error {
-            CounterError::TypeInvalid => Hresult::error(0x11),
-            CounterError::DataNotAvailable => Hresult::error(0x12),
+            CounterError::TypeInvalid => xbdm_error(0x11),
+            CounterError::DataNotAvailable => xbdm_error(0x12),
             CounterError::Routine(result) => result,
-            CounterError::NoDirectory => Hresult::error(0x02),
-            CounterError::NotFound => Hresult::error(0x0e),
-            CounterError::NameTooLong => Hresult::error(0x105),
+            CounterError::NoDirectory => xbdm_error(0x02),
+            CounterError::NotFound => xbdm_error(0x0e),
+            CounterError::NameTooLong => xbdm_error(0x105),
             CounterError::Kernel(_) | CounterError::End | CounterError::Unexpected => {
                 CommandError::from(error).into()
             }

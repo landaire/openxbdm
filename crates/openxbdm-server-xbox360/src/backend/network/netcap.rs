@@ -21,23 +21,27 @@ use openxbdm_server::commands::network::netcap::capture_file::CaptureFileError;
 use openxbdm_server::commands::network::netcap::capture_file::Clock;
 use openxbdm_server::commands::network::netcap::capture_file::LocalTime;
 use openxbdm_server::commands::network::netcap::capture_file::Recorder;
+use xbox360::sync::SpinLock;
+use xbox360::time::Timebase;
+use xbox360_sys::xam;
+use xbox360_sys::xam::NetDll_XNetSetOpt;
+use xbox360_sys::xam::NetDll_XnpEthernetInterceptSetCallbacks;
+use xbox360_sys::xam::XnetOption;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::PoolTag;
+use xbox360_sys::xboxkrnl::PoolType;
 
 use self::writer::Writer;
 use super::FrameHook;
-use super::NetDll_XNetSetOpt;
-use super::NetDll_XnpEthernetInterceptSetCallbacks;
 use super::XNCALLER_SYSAPP;
 use crate::backend::Console;
 use crate::kernel;
-use crate::kernel::SpinLocked;
 
 /// Pool tag of capture allocations (`DMNC`).
-const CAPTURE_TAG: u32 = 0x444d_4e43;
-/// `XNetSetOpt` option for promiscuous receive.
-const XNET_OPT_PROMISCUOUS: u32 = 0x1390;
+const CAPTURE_TAG: PoolTag = PoolTag::new(*b"DMNC");
 /// Pool types of the allocator stubs 0x91f34f70 and 0x91f34f60.
-const TITLE_POOL: u32 = 1;
-const PERSISTENT_POOL: u32 = 2;
+const TITLE_POOL: PoolType = PoolType::Title;
+const PERSISTENT_POOL: PoolType = PoolType::System;
 
 /// Frame accounting shared with the frame callbacks.
 struct Accounting {
@@ -47,7 +51,7 @@ struct Accounting {
 
 /// Capture context in pool memory, shared with the frame callbacks.
 struct Context {
-    accounting: SpinLocked<Accounting>,
+    accounting: SpinLock<Accounting>,
     /// Flags the callbacks apply (0x91f9f694).
     flags: AtomicU32,
     error: CallbackError,
@@ -57,10 +61,11 @@ struct Context {
 impl Context {
     /// Append one frame (0x91f699f8).
     fn append(&self, frame: &[u8]) -> Result<(), CaptureFileError> {
-        let now = kernel::timebase();
+        let now = Timebase::now().ticks();
         let length = frame.len() as u32;
-        self.accounting
-            .with(|accounting| match accounting.recorder.admit(length) {
+        {
+            let mut accounting = self.accounting.lock();
+            match accounting.recorder.admit(length) {
                 Err(error) => Err(error),
                 Ok(Admission::Discard) => Ok(()),
                 Ok(Admission::Record) => {
@@ -77,7 +82,8 @@ impl Context {
                     }
                     written
                 }
-            })
+            }
+        }
     }
 
     /// Callback body (0x91f34de0): record the frame unless a frame already
@@ -117,7 +123,7 @@ impl CallbackError {
             3 => CaptureFileError::WriteFault,
             4 => CaptureFileError::InvalidData,
             5 => CaptureFileError::OutOfMemory,
-            status => CaptureFileError::Kernel(KernelError::from_status(NtStatus(status))),
+            status => CaptureFileError::Kernel(KernelError::from_status(NtStatus(status))?),
         })
     }
 
@@ -212,7 +218,8 @@ impl Data {
 
 fn local_time() -> LocalTime {
     let mut fields = [0u16; 8];
-    kernel::GetLocalTime(fields.as_mut_ptr());
+    // SAFETY: `fields` is a live SYSTEMTIME-sized array of eight u16 values.
+    unsafe { xam::GetLocalTime(fields.as_mut_ptr().cast()) };
     let [
         year,
         month,
@@ -242,22 +249,25 @@ impl netcap::Backend for Console {
         } else {
             TITLE_POOL
         };
-        let memory = kernel::ExAllocatePoolTypeWithTag(
-            core::mem::size_of::<Context>() as u32,
-            CAPTURE_TAG,
-            pool,
-        );
+        // SAFETY: pool allocation of a fixed size; the result is checked below.
+        let memory = unsafe {
+            xboxkrnl::ExAllocatePoolTypeWithTag(
+                core::mem::size_of::<Context>() as u32,
+                CAPTURE_TAG,
+                pool,
+            )
+        };
         let Some(context) = NonNull::new(memory as usize as *mut Context) else {
             return Err(CaptureFileError::OutOfMemory);
         };
         let start = local_time();
-        let clock = Clock::new(kernel::timebase(), kernel::performance_frequency());
+        let clock = Clock::new(Timebase::now().ticks(), kernel::performance_frequency());
         // SAFETY: the allocation is large enough and suitably aligned for a
         // `Context`; the writer initializes in place because its event links
         // to itself.
         let context = unsafe {
             context.as_ptr().write(Context {
-                accounting: SpinLocked::new(Accounting {
+                accounting: SpinLock::new(Accounting {
                     recorder: Recorder::new(request.data_limit),
                     clock,
                 }),
@@ -276,7 +286,8 @@ impl netcap::Backend for Console {
             CAPTURE_TAG,
         );
         if let Err(error) = opened {
-            kernel::ExFreePool(context.as_ptr() as usize as u32);
+            // SAFETY: the context was allocated above and no callback can reach it.
+            unsafe { xboxkrnl::ExFreePool(context.as_ptr() as usize as u32) };
             return Err(error);
         }
         self.network.netcap.context = Some(context);
@@ -285,12 +296,16 @@ impl netcap::Backend for Console {
 
     fn set_promiscuous(&mut self, enable: bool) -> bool {
         let value = u32::from(enable);
-        NetDll_XNetSetOpt(
-            XNCALLER_SYSAPP,
-            XNET_OPT_PROMISCUOUS,
-            (&raw const value).cast(),
-            4,
-        ) == 0
+        // SAFETY: `value` is a live u32 option value of the stated size.
+        let error = unsafe {
+            NetDll_XNetSetOpt(
+                XNCALLER_SYSAPP,
+                XnetOption::PROMISCUOUS,
+                (&raw const value).cast(),
+                4,
+            )
+        };
+        error == 0
     }
 
     fn attach_capture(&mut self, flags: CaptureFlags) -> Result<(), WsaError> {
@@ -307,13 +322,17 @@ impl netcap::Backend for Console {
             context: pointer.as_ptr() as usize,
         };
         if !super::netsim::chain_capture(Some(hook)) {
-            let error = NetDll_XnpEthernetInterceptSetCallbacks(
-                XNCALLER_SYSAPP,
-                transmit_entry as *const () as usize,
-                receive_entry as *const () as usize,
-                hook.context,
-                0,
-            );
+            // SAFETY: the entries take `hook.context`, which stays allocated
+            // until `close_capture`, after `detach_capture` removes the hook.
+            let error = unsafe {
+                NetDll_XnpEthernetInterceptSetCallbacks(
+                    XNCALLER_SYSAPP,
+                    transmit_entry as *const () as usize,
+                    receive_entry as *const () as usize,
+                    hook.context,
+                    0,
+                )
+            };
             if let Some(error) = WsaError::new(error) {
                 return Err(error);
             }
@@ -324,7 +343,8 @@ impl netcap::Backend for Console {
 
     fn detach_capture(&mut self) {
         if !super::netsim::chain_capture(None) {
-            NetDll_XnpEthernetInterceptSetCallbacks(XNCALLER_SYSAPP, 0, 0, 0, 0);
+            // SAFETY: clearing the callbacks passes no pointers.
+            unsafe { NetDll_XnpEthernetInterceptSetCallbacks(XNCALLER_SYSAPP, 0, 0, 0, 0) };
         }
         self.network.netcap.attached = false;
     }
@@ -345,14 +365,16 @@ impl netcap::Backend for Console {
         let context = unsafe { pointer.as_ref() };
         // Frames arriving from now on are discarded, so the copy stays
         // current.
-        let mut recorder = context.accounting.with(|accounting| {
+        let mut recorder = {
+            let mut accounting = context.accounting.lock();
             accounting.recorder.begin_close();
             accounting.recorder
-        });
+        };
         let result = context.writer.finish(&mut recorder);
         let frames = recorder.frames();
         context.writer.release();
-        kernel::ExFreePool(pointer.as_ptr() as usize as u32);
+        // SAFETY: the context was taken from `Data` and the writer is released.
+        unsafe { xboxkrnl::ExFreePool(pointer.as_ptr() as usize as u32) };
         CaptureClose { result, frames }
     }
 }

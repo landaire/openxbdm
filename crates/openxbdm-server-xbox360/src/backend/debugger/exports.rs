@@ -8,7 +8,8 @@ use core::sync::atomic::Ordering;
 
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
-use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::XbdmHresult;
+use openxbdm_core::status::xbdm_error;
 use openxbdm_server::commands::debugger;
 use openxbdm_server::commands::debugger::ContextFlags;
 use openxbdm_server::commands::debugger::DataTarget;
@@ -19,25 +20,20 @@ use openxbdm_server::commands::debugger::ThreadId;
 use openxbdm_server::notify::ExecutionState;
 use openxbdm_server::reply::CommandError;
 use openxbdm_server::state::ServerState;
+use xbox360::status::set_last_error;
+use xbox360_sys::export_raw;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::RtlGetStackLimits;
+use xbox360_sys::xboxkrnl::ThreadCreationFlags;
 
 use super::super::dispatcher;
 use super::super::dispatcher::ServerService;
 use crate::exports::export;
-use crate::exports::export_raw;
-use crate::kernel;
-use crate::kernel::LIB_KERNEL;
-use crate::kernel::import_thunk;
-
-import_thunk!(
-    RtlGetStackLimits(low: *mut u32, high: *mut u32) -> u32,
-    lib = LIB_KERNEL,
-    ordinal = 0x12a
-);
 
 /// Export 178's result for a missing or overlong name.
-const BAD_PARAMETER: Hresult = Hresult::from_error_code(ErrorCode::BadParameter);
+const BAD_PARAMETER: Hresult = ErrorCode::BadParameter.hresult();
 /// More threads exist than the caller's list holds.
-const BUFFER_TOO_SMALL: Hresult = Hresult::error(0x105);
+const BUFFER_TOO_SMALL: Hresult = xbdm_error(0x105);
 /// Longest extension name export 178 accepts.
 const EXTENSION_NAME_LIMIT: usize = 0x3f;
 /// Return addresses export 82 stores at most.
@@ -451,7 +447,8 @@ extern "C" fn capture_back_trace(count: u32, buffer: u32, stack: u32, return_add
         return BAD_PARAMETER.0;
     }
     let (mut low, mut high) = (0u32, 0u32);
-    RtlGetStackLimits(&mut low, &mut high);
+    // SAFETY: both outputs are live locals.
+    unsafe { RtlGetStackLimits(&mut low, &mut high) };
     let mut stored = 0;
     let mut frame = stack;
     while stored < count && frame < high && frame > low {
@@ -597,17 +594,21 @@ extern "C" fn create_thread(
 ) -> u32 {
     let mut handle = 0u32;
     let creation = DEBUG_THREAD_FLAGS | ((flags >> 2) & 1);
-    let status = kernel::ExCreateThread(
-        &mut handle,
-        stack_size,
-        thread_id as usize as *mut u32,
-        0,
-        start,
-        parameter,
-        creation,
-    );
-    if let Err(error) = NtStatus(status).result() {
-        kernel::set_last_error(error);
+    // SAFETY: `handle` is a live local; the caller supplies the thread id
+    // output (or null) and the start routine, as the stock export takes them.
+    let status = unsafe {
+        xboxkrnl::ExCreateThread(
+            &mut handle,
+            stack_size,
+            thread_id as usize as *mut u32,
+            0,
+            start,
+            parameter,
+            ThreadCreationFlags::from_bits_retain(creation),
+        )
+    };
+    if let Err(error) = status.result() {
+        set_last_error(error);
         return 0;
     }
     handle

@@ -5,6 +5,7 @@ use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::Win32Error;
+use openxbdm_core::status::XbdmHresult;
 
 /// What a handler or continuation reports when it succeeds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,7 +126,7 @@ impl From<CommandError> for Hresult {
     #[inline(never)]
     fn from(error: CommandError) -> Self {
         match error {
-            CommandError::Status(code) => Hresult::from_error_code(code),
+            CommandError::Status(code) => code.hresult(),
             CommandError::Fail => Hresult::FAIL,
             CommandError::Unexpected => Hresult::UNEXPECTED,
             CommandError::OutOfMemory => Hresult::OUT_OF_MEMORY,
@@ -214,7 +215,7 @@ mod tests {
 
     #[test]
     fn missing_path_maps_by_fallback() {
-        let missing = KernelError::from_status(NtStatus(0xc000_003a));
+        let missing = KernelError::from_status(NtStatus(0xc000_003a)).unwrap();
         let create = CommandError::Status(ErrorCode::FileCannotBeCreated);
         assert_eq!(
             CommandError::from_kernel(missing, create),

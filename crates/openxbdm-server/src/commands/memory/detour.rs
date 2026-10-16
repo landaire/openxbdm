@@ -688,10 +688,7 @@ impl Engine {
 
     /// The error of the last log open.
     pub fn log_error(&self) -> Option<KernelError> {
-        match self.status.load(Ordering::Relaxed) {
-            0 => None,
-            status => Some(KernelError::from_status(NtStatus(status))),
-        }
+        KernelError::from_status(NtStatus(self.status.load(Ordering::Relaxed)))
     }
 
     fn running(&self) -> bool {

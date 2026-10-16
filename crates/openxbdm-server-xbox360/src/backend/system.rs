@@ -9,10 +9,10 @@ use core::fmt::Write as _;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
+use core::time::Duration;
 
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
-use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::Win32Error;
 use openxbdm_server::Server;
 use openxbdm_server::commands;
@@ -34,9 +34,28 @@ use openxbdm_server::notify::ExecutionState;
 use openxbdm_server::reply;
 use openxbdm_server::reply::CommandError;
 use openxbdm_server::text::Text;
+use xbox360::console::hardware_flags;
+use xbox360::time::sleep;
+use xbox360_sys::xam;
+use xbox360_sys::xam::XamLoaderGetDvdTrayState;
+use xbox360_sys::xam::XamNotifyCreateListenerInternal;
+use xbox360_sys::xam::XnCaller;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::FileAttributes;
+use xbox360_sys::xboxkrnl::FileInformationClass;
+use xbox360_sys::xboxkrnl::FirmwareRequest;
+use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::IoStatusBlock;
+use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
+use xbox360_sys::xboxkrnl::ObjectAttributes;
+use xbox360_sys::xboxkrnl::PoolTag;
+use xbox360_sys::xboxkrnl::PoolType;
+use xbox360_sys::xboxkrnl::ProcessType;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
 use self::flash::FlashImage;
-
 use super::Console;
 use super::debugger as monitor;
 use super::dispatcher;
@@ -44,20 +63,7 @@ use super::network;
 use super::session;
 use crate::exports::export;
 use crate::kernel;
-use crate::kernel::AnsiString;
-use crate::kernel::IoStatusBlock;
-use crate::kernel::LIB_XAM;
-use crate::kernel::OBJ_CASE_INSENSITIVE;
-use crate::kernel::ObjectAttributes;
-use crate::kernel::import_thunk;
 use crate::net::XamNetwork;
-
-import_thunk!(XamLoaderGetDvdTrayState() -> u32, lib = LIB_XAM, ordinal = 0x1aa);
-import_thunk!(
-    XamNotifyCreateListenerInternal(areas: u32, flags: u32, count: u32) -> u32,
-    lib = LIB_XAM,
-    ordinal = 0x291
-);
 
 /// The settings file the monitor writes.
 const SAVED_SETTINGS_PATH: &[u8] = b"\\SystemRoot\\MobileJ.dat";
@@ -68,22 +74,13 @@ const RECINT_PATH: &[u8] = b"\\SystemRoot\\recint.ini";
 const WRITE_BUFFER_SIZE: usize = 0x4000;
 /// Write buffer of a settings copy to a caller's file.
 const COPY_BUFFER_SIZE: usize = 0x1000;
-const POOL_TAG: u32 = 0x6d64_6258;
-const POOL_TYPE: u32 = 2;
-const FILE_SHARE_READ: u32 = 1;
-const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
-const FILE_NON_DIRECTORY_FILE: u32 = 0x40;
+const POOL_TAG: PoolTag = PoolTag::new(*b"mdbX");
 /// Hardware boot flag: the console booted from disc.
 const BOOT_FROM_DISC: u16 = 0x400;
 /// Bug check code stock raises when a settings write fails.
 const BUG_CHECK_SETTINGS_WRITE: u32 = 0x2c;
-/// `NetDll_XnpNoteSystemTime` caller argument stock passes.
-const XNP_CALLER: u32 = 3;
-/// `KeGetCurrentProcessType` of the title process.
-const TITLE_PROCESS: u32 = 1;
-/// File information class and size stock queries for the size of the
+/// Size of the network open information stock queries for the size of the
 /// settings file; the low dword of the end of file is at +0x2c.
-const FILE_NETWORK_OPEN_INFORMATION: u32 = 0x22;
 const NETWORK_OPEN_INFORMATION_SIZE: usize = 0x38;
 const END_OF_FILE_LOW: usize = 0x2c;
 
@@ -181,38 +178,45 @@ fn create_file(
     access: FileAccess,
     disposition: CreateDisposition,
 ) -> Result<u32, KernelError> {
-    let name = AnsiString::new(path);
+    let name = kernel::ansi_string(path);
     let attributes = ObjectAttributes {
-        root_directory: 0,
+        root_directory: Handle::NULL,
         object_name: &name,
-        attributes: OBJ_CASE_INSENSITIVE,
+        attributes: ObjectAttributeFlags::CASE_INSENSITIVE,
     };
     let mut status_block = IoStatusBlock::default();
-    let mut handle = 0;
-    let status = kernel::NtCreateFile(
-        &mut handle,
-        access.0,
-        &attributes,
-        &mut status_block,
-        core::ptr::null(),
-        0,
-        0,
-        disposition as u32,
-        FILE_SYNCHRONOUS_IO_NONALERT,
-    );
-    NtStatus(status).result()?;
+    let mut handle = 0u32;
+    // SAFETY: `handle`, `attributes`, the name it refers to and
+    // `status_block` are live locals.
+    let status = unsafe {
+        xboxkrnl::NtCreateFile(
+            (&raw mut handle).cast(),
+            AccessMask::from_bits_retain(access.0),
+            &attributes,
+            &mut status_block,
+            core::ptr::null(),
+            FileAttributes::empty(),
+            ShareAccess::empty(),
+            super::filesystem::kernel_disposition(disposition),
+            CreateOptions::SYNCHRONOUS_IO_NONALERT,
+        )
+    };
+    status.result()?;
     Ok(handle)
 }
 
 fn file_exists(path: &[u8]) -> bool {
-    let name = AnsiString::new(path);
+    let name = kernel::ansi_string(path);
     let attributes = ObjectAttributes {
-        root_directory: 0,
+        root_directory: Handle::NULL,
         object_name: &name,
-        attributes: OBJ_CASE_INSENSITIVE,
+        attributes: ObjectAttributeFlags::CASE_INSENSITIVE,
     };
     let mut information = [0u8; 0x38];
-    (kernel::NtQueryFullAttributesFile(&attributes, information.as_mut_ptr()) as i32) >= 0
+    // SAFETY: `attributes` and its name are live; `information` holds the
+    // 0x38-byte result.
+    (unsafe { xboxkrnl::NtQueryFullAttributesFile(&attributes, information.as_mut_ptr()) }.0 as i32)
+        >= 0
 }
 
 impl WriteBuffer {
@@ -220,20 +224,24 @@ impl WriteBuffer {
     /// stock.
     fn write_out(&self, length: usize) {
         let mut status_block = IoStatusBlock::default();
-        let status = kernel::NtWriteFile(
-            self.handle,
-            0,
-            0,
-            0,
-            &mut status_block,
-            self.buffer,
-            length as u32,
-            core::ptr::null(),
-        );
-        if is_error(status) {
-            kernel::KeBugCheckEx(
+        // SAFETY: `handle` is open and `buffer` holds at least `length`
+        // bytes; the file is synchronous.
+        let status = unsafe {
+            xboxkrnl::NtWriteFile(
+                Handle::from_raw(self.handle),
+                Handle::NULL,
+                0,
+                0,
+                &mut status_block,
+                self.buffer,
+                length as u32,
+                core::ptr::null(),
+            )
+        };
+        if is_error(status.0) {
+            xboxkrnl::KeBugCheckEx(
                 BUG_CHECK_SETTINGS_WRITE,
-                status,
+                status.0,
                 self.handle,
                 &status_block as *const IoStatusBlock as usize as u32,
                 self.buffer as usize as u32,
@@ -294,9 +302,14 @@ impl WriteBuffer {
 
 impl commands::system::Backend for Console {
     fn create_settings(&mut self) -> Result<SettingsFile, CreateSettingsError> {
-        let buffer =
-            kernel::ExAllocatePoolTypeWithTag(WRITE_BUFFER_SIZE as u32, POOL_TAG, POOL_TYPE)
-                as usize as *mut u8;
+        // SAFETY: the allocation takes only a size, tag and pool type.
+        let buffer = unsafe {
+            xboxkrnl::ExAllocatePoolTypeWithTag(
+                WRITE_BUFFER_SIZE as u32,
+                POOL_TAG,
+                PoolType::System,
+            )
+        } as usize as *mut u8;
         if buffer.is_null() {
             return Err(CreateSettingsError::NoBuffer);
         }
@@ -307,7 +320,8 @@ impl commands::system::Backend for Console {
         ) {
             Ok(handle) => handle,
             Err(status) => {
-                kernel::ExFreePool(buffer as usize as u32);
+                // SAFETY: `buffer` was allocated above and is not stored.
+                unsafe { xboxkrnl::ExFreePool(buffer as usize as u32) };
                 return Err(CreateSettingsError::Create(status));
             }
         };
@@ -333,14 +347,18 @@ impl commands::system::Backend for Console {
     fn settings_file_size(&mut self, file: SettingsFile) -> Result<u32, KernelError> {
         let mut status_block = IoStatusBlock::default();
         let mut information = [0u8; NETWORK_OPEN_INFORMATION_SIZE];
-        let status = kernel::NtQueryInformationFile(
-            file.0,
-            &mut status_block,
-            information.as_mut_ptr(),
-            NETWORK_OPEN_INFORMATION_SIZE as u32,
-            FILE_NETWORK_OPEN_INFORMATION,
-        );
-        NtStatus(status).result()?;
+        // SAFETY: `information` holds the size passed; `status_block` is a
+        // live local.
+        let status = unsafe {
+            xboxkrnl::NtQueryInformationFile(
+                Handle::from_raw(file.0),
+                &mut status_block,
+                information.as_mut_ptr(),
+                NETWORK_OPEN_INFORMATION_SIZE as u32,
+                FileInformationClass::NetworkOpen,
+            )
+        };
+        status.result()?;
         let low = &information[END_OF_FILE_LOW..END_OF_FILE_LOW + 4];
         Ok(u32::from_be_bytes([low[0], low[1], low[2], low[3]]))
     }
@@ -348,9 +366,14 @@ impl commands::system::Backend for Console {
     fn begin_settings_copy(&mut self, copy: SettingsCopy) -> Option<SettingsFile> {
         let write = match copy {
             SettingsCopy::File { handle, pad } => {
-                let buffer =
-                    kernel::ExAllocatePoolTypeWithTag(COPY_BUFFER_SIZE as u32, POOL_TAG, POOL_TYPE)
-                        as usize as *mut u8;
+                // SAFETY: the allocation takes only a size, tag and pool type.
+                let buffer = unsafe {
+                    xboxkrnl::ExAllocatePoolTypeWithTag(
+                        COPY_BUFFER_SIZE as u32,
+                        POOL_TAG,
+                        PoolType::System,
+                    )
+                } as usize as *mut u8;
                 if buffer.is_null() {
                     return None;
                 }
@@ -385,7 +408,9 @@ impl commands::system::Backend for Console {
             Destination::Memory => write.count as u32,
             _ => {
                 write.finish();
-                kernel::ExFreePool(write.buffer as usize as u32);
+                // SAFETY: a file copy owns the pool buffer allocated in
+                // `begin_settings_copy`.
+                unsafe { xboxkrnl::ExFreePool(write.buffer as usize as u32) };
                 write.total
             }
         }
@@ -419,50 +444,64 @@ impl commands::system::Backend for Console {
 
     fn read_settings(&mut self, file: SettingsFile, buffer: &mut [u8]) -> Option<usize> {
         let mut status_block = IoStatusBlock::default();
-        let status = kernel::NtReadFile(
-            file.0,
-            0,
-            0,
-            0,
-            &mut status_block,
-            buffer.as_mut_ptr(),
-            buffer.len() as u32,
-            core::ptr::null(),
-        );
-        ((status as i32) >= 0).then_some(status_block.information as usize)
+        // SAFETY: `buffer` is valid for its length; the file is synchronous.
+        let status = unsafe {
+            xboxkrnl::NtReadFile(
+                Handle::from_raw(file.0),
+                Handle::NULL,
+                0,
+                0,
+                &mut status_block,
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                core::ptr::null(),
+            )
+        };
+        ((status.0 as i32) >= 0).then_some(status_block.information as usize)
     }
 
     fn close_settings(&mut self, file: SettingsFile) {
         if let Some(mut write) = self.system.write.take_if(|write| write.handle == file.0) {
             write.finish();
-            kernel::NtClose(write.handle);
-            kernel::ExFreePool(write.buffer as usize as u32);
+            // SAFETY: the writer owns the file handle and the pool buffer of
+            // a file destination.
+            unsafe {
+                xboxkrnl::NtClose(Handle::from_raw(write.handle));
+                xboxkrnl::ExFreePool(write.buffer as usize as u32);
+            }
         } else {
-            kernel::NtClose(file.0);
+            // SAFETY: `file` is a handle `open_settings` returned.
+            unsafe { xboxkrnl::NtClose(Handle::from_raw(file.0)) };
         }
     }
 
     fn sleep_milliseconds(&mut self, milliseconds: u32) {
-        kernel::sleep_milliseconds(milliseconds);
+        sleep(Duration::from_millis(u64::from(milliseconds)));
     }
 
     /// Handlers run below dispatch level, so a normal restart uses the
     /// reboot routine rather than the halt routine.
     fn reboot(&mut self, kind: RebootKind) {
-        kernel::HalReturnToFirmware(match kind {
-            RebootKind::Normal => kernel::FIRMWARE_REBOOT,
-            RebootKind::SmcReset => kernel::FIRMWARE_SMC_RESET,
-        });
+        // SAFETY: both requests restart the console.
+        unsafe {
+            xboxkrnl::HalReturnToFirmware(match kind {
+                RebootKind::Normal => FirmwareRequest::RebootQuiesce,
+                RebootKind::SmcReset => FirmwareRequest::SmcReset,
+            })
+        };
     }
 
     fn set_system_time(&mut self, file_time: u64) {
         let mut previous = 0u64;
-        kernel::NtSetSystemTime(&file_time, &mut previous);
-        kernel::NetDll_XnpNoteSystemTime(XNP_CALLER);
+        // SAFETY: `file_time` and `previous` are live locals.
+        unsafe {
+            xboxkrnl::NtSetSystemTime(&file_time, &mut previous);
+            xam::NetDll_XnpNoteSystemTime(XnCaller::DebugMonitor);
+        }
     }
 
     fn hardware_flags(&mut self) -> u32 {
-        kernel::hardware_flags()
+        hardware_flags().bits()
     }
 
     /// A registration without the version dword cannot relaunch.
@@ -546,7 +585,8 @@ pub(crate) fn service_register_xam_globals(argument: u32) -> u32 {
     };
     XAM_VERSION.store(version, Ordering::Release);
     // Stock keeps the listener handle but never reads it.
-    if XamNotifyCreateListenerInternal(1, 1, 0xa) == 0
+    // SAFETY: the listener takes no caller memory.
+    if unsafe { XamNotifyCreateListenerInternal(1, 1, 0xa) } == Handle::NULL
         && super::console::trace_mask().contains(TraceMask::TITLE_LAUNCH)
     {
         kernel::debug_print(c"[xbdm] Failed to register for XAM notifications.\n");
@@ -580,7 +620,7 @@ fn wait_for_disc(image: u32, milliseconds: u32) {
     let mut polls = milliseconds / DISC_POLL_MS;
     let mut tray = XamLoaderGetDvdTrayState();
     while polls != 0 && tray != 0 {
-        kernel::sleep_milliseconds(DISC_POLL_MS);
+        sleep(Duration::from_millis(u64::from(DISC_POLL_MS)));
         polls -= 1;
         tray = XamLoaderGetDvdTrayState();
     }
@@ -621,24 +661,29 @@ fn wait_for_disc(image: u32, milliseconds: u32) {
         .unwrap_or(LAUNCH_STRING_SIZE as usize);
     // SAFETY: `length` bytes at `image` were just read.
     let path = unsafe { core::slice::from_raw_parts(image as usize as *const u8, length) };
-    let name = AnsiString::new(path);
+    let name = kernel::ansi_string(path);
     let attributes = ObjectAttributes {
-        root_directory: 0,
+        root_directory: Handle::NULL,
         object_name: &name,
-        attributes: OBJ_CASE_INSENSITIVE,
+        attributes: ObjectAttributeFlags::CASE_INSENSITIVE,
     };
     let mut status_block = IoStatusBlock::default();
-    let mut handle = 0;
-    let status = kernel::NtOpenFile(
-        &mut handle,
-        FileAccess::SYNCHRONIZE.0,
-        &attributes,
-        &mut status_block,
-        FILE_SHARE_READ,
-        FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
-    );
-    if (status as i32) >= 0 {
-        kernel::NtClose(handle);
+    let mut handle = Handle::NULL;
+    // SAFETY: `handle`, `attributes`, the path it refers to and
+    // `status_block` are live.
+    let status = unsafe {
+        xboxkrnl::NtOpenFile(
+            &mut handle,
+            AccessMask::SYNCHRONIZE,
+            &attributes,
+            &mut status_block,
+            ShareAccess::READ,
+            CreateOptions::SYNCHRONOUS_IO_NONALERT | CreateOptions::NON_DIRECTORY_FILE,
+        )
+    };
+    if (status.0 as i32) >= 0 {
+        // SAFETY: `handle` was opened above and is closed once.
+        unsafe { xboxkrnl::NtClose(handle) };
     }
 }
 
@@ -683,7 +728,7 @@ fn call_for_caller(service: dispatcher::ServerService, argument: u32) -> Option<
     let request = CallerRequest {
         service,
         argument,
-        title_process: kernel::KeGetCurrentProcessType() == TITLE_PROCESS,
+        title_process: xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE,
     };
     dispatcher::call_on_server(
         serve_for_caller,
@@ -935,9 +980,11 @@ fn title_arguments<'a>(address: u32) -> &'a TitleArguments {
 fn launch_export(service: dispatcher::ServerService, arguments: &TitleArguments) -> u32 {
     let result = call_with_arguments(service, arguments);
     if arguments.relaunched.load(Ordering::Acquire)
-        && kernel::KeGetCurrentProcessType() == TITLE_PROCESS
+        && xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE
     {
-        kernel::ExTerminateThread(0);
+        // SAFETY: the calling title thread was relaunched in place and owns
+        // nothing the monitor still uses; stock ends it here.
+        unsafe { xboxkrnl::ExTerminateThread(0) };
     }
     result
 }

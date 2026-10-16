@@ -10,12 +10,17 @@ use core::sync::atomic::Ordering;
 
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::commands::memory::is_device_address;
 use openxbdm_server::commands::session::compare_names;
 use openxbdm_server::commands::session::notification_kind_length;
 use openxbdm_server::notify::DataAccess;
 use openxbdm_server::notify::Event;
 use openxbdm_server::notify::ExceptionDetail;
+use xbox360_sys::processor;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::Irql;
+use xbox360_sys::xboxkrnl::PoolTag;
 
 use super::THREAD_ID;
 use super::TITLE_PROCESS;
@@ -40,7 +45,7 @@ export!(36, send_notification);
 /// lists (0x20 per kind, kinds 1..=0x16), +0xb08 + 4 * kind handler
 /// counts, +0xb64 processors.
 const SESSION_TAG: u32 = 0x786e_6f74;
-const SESSION_POOL_TAG: u32 = 0x736e_6d64;
+const SESSION_POOL_TAG: PoolTag = PoolTag::new(*b"snmd");
 const SESSION_SIZE: u32 = 0xba4;
 const SESSION_NEXT: u32 = 0x4;
 const SESSION_FLAGS: u32 = 0x8;
@@ -53,7 +58,7 @@ const LAST_KIND: u32 = 0x16;
 /// Opened by a title process; unlinked when the title ends.
 const SESSION_TITLE: u32 = 0x1_0000;
 /// Processor block: a name of at most 0x3f characters, then the handler.
-const PROCESSOR_POOL_TAG: u32 = 0x6863_6d64;
+const PROCESSOR_POOL_TAG: PoolTag = PoolTag::new(*b"hcmd");
 const PROCESSOR_SIZE: u32 = 0x44;
 const PROCESSOR_NAME_LIMIT: usize = 0x3f;
 const PROCESSOR_HANDLER: u32 = 0x40;
@@ -65,7 +70,6 @@ const KIND_MODULE_LOAD: u32 = 5;
 /// while kind 0xa has handlers [purpose of the kernel call unknown].
 const KIND_KERNEL_CALLBACK: u32 = 0xa;
 const KIND_THREAD_SWITCH: u32 = 0xf;
-const DISPATCH_LEVEL: u32 = 2;
 const ASSERT_PASSIVE: &core::ffi::CStr = c"KeGetCurrentIrql() == PASSIVE_LEVEL";
 const ASSERT_FILE: &core::ffi::CStr =
     c"e:\\xenon\\xdksep13\\core\\private\\xdk\\tools\\debug\\xbdm\\core\\dmnotify.c";
@@ -88,7 +92,8 @@ const READER: u32 = 0x8;
 
 impl ListLock {
     fn shared(&self) -> ListGuard<'_> {
-        let irql = kernel::KfRaiseIrql(DISPATCH_LEVEL);
+        // SAFETY: the guard lowers the IRQL back to `irql` on drop.
+        let irql = unsafe { xboxkrnl::KfRaiseIrql(Irql::DISPATCH) };
         loop {
             let state = self.0.load(Ordering::Relaxed);
             if state & (WRITER | WRITER_WAITING) == 0
@@ -113,7 +118,8 @@ impl ListLock {
     }
 
     fn exclusive(&self) -> ListGuard<'_> {
-        let irql = kernel::KfRaiseIrql(DISPATCH_LEVEL);
+        // SAFETY: the guard lowers the IRQL back to `irql` on drop.
+        let irql = unsafe { xboxkrnl::KfRaiseIrql(Irql::DISPATCH) };
         loop {
             let state = self.0.load(Ordering::Relaxed);
             if state & !WRITER_WAITING == 0 {
@@ -138,7 +144,7 @@ impl ListLock {
 
 struct ListGuard<'a> {
     lock: &'a ListLock,
-    irql: u32,
+    irql: Irql,
     exclusive: bool,
 }
 
@@ -150,19 +156,23 @@ impl Drop for ListGuard<'_> {
         } else {
             self.lock.0.fetch_sub(READER, Ordering::Release);
         }
-        kernel::KfLowerIrql(self.irql);
+        // SAFETY: `irql` is the level the guard raised from.
+        unsafe { xboxkrnl::KfLowerIrql(self.irql) };
     }
 }
 
 /// `RtlAssert` as stock reports a call above passive level.
 fn assert_passive(line: u32) {
     if !passive() {
-        crate::backend::memory::RtlAssert(
-            ASSERT_PASSIVE.as_ptr().cast(),
-            ASSERT_FILE.as_ptr().cast(),
-            line,
-            core::ptr::null(),
-        );
+        // SAFETY: the message and file name are static NUL-terminated strings.
+        unsafe {
+            xboxkrnl::RtlAssert(
+                ASSERT_PASSIVE.as_ptr().cast(),
+                ASSERT_FILE.as_ptr().cast(),
+                line,
+                core::ptr::null(),
+            )
+        };
     }
 }
 
@@ -218,12 +228,13 @@ extern "C" fn open_notification_session(flags: u32, session: *mut u32) -> u32 {
         return Hresult::INVALID_ARGUMENT.0;
     }
     assert_passive(0xbf9);
-    let flags = if kernel::KeGetCurrentProcessType() == TITLE_PROCESS {
+    let flags = if xboxkrnl::KeGetCurrentProcessType().0 == TITLE_PROCESS {
         flags | SESSION_TITLE
     } else {
         flags
     };
-    let block = kernel::ExAllocatePoolWithTag(SESSION_SIZE, SESSION_POOL_TAG);
+    // SAFETY: the allocation takes only a size and tag.
+    let block = unsafe { xboxkrnl::ExAllocatePoolWithTag(SESSION_SIZE, SESSION_POOL_TAG) };
     // SAFETY: the caller passes a writable handle location.
     unsafe { session.write_unaligned(block) };
     if block == 0 {
@@ -244,7 +255,8 @@ extern "C" fn open_notification_session(flags: u32, session: *mut u32) -> u32 {
 /// state until the next registration change.
 extern "C" fn close_notification_session(session: u32) -> u32 {
     let readable = session != 0 && {
-        let mapped = kernel::MmDbgReadCheck(session);
+        // SAFETY: the check only translates the address.
+        let mapped = unsafe { xboxkrnl::MmDbgReadCheck(session) };
         mapped != 0 && !is_device_address(mapped)
     };
     if !readable || read_u32(session) != SESSION_TAG {
@@ -254,7 +266,8 @@ extern "C" fn close_notification_session(session: u32) -> u32 {
     unlink_sessions(
         |candidate| candidate == session,
         |removed| {
-            kernel::ExFreePool(removed);
+            // SAFETY: the unlinked session is a pool block of this module.
+            unsafe { xboxkrnl::ExFreePool(removed) };
         },
     );
     Hresult::OK.0
@@ -385,7 +398,7 @@ fn notify_sessions(kind: u32, data: u32) {
     } else {
         data
     };
-    if u32::from(kernel::current_irql()) > DISPATCH_LEVEL {
+    if processor::current_irql() > Irql::DISPATCH {
         return;
     }
     let list = kind & KIND_MASK;
@@ -716,7 +729,8 @@ extern "C" fn register_notification_processor(session: u32, name: u32, handler: 
         if name == 0 {
             return Hresult::INVALID_ARGUMENT.0;
         }
-        match kernel::ExAllocatePoolWithTag(PROCESSOR_SIZE, PROCESSOR_POOL_TAG) {
+        // SAFETY: the allocation takes only a size and tag.
+        match unsafe { xboxkrnl::ExAllocatePoolWithTag(PROCESSOR_SIZE, PROCESSOR_POOL_TAG) } {
             0 => return Hresult::OUT_OF_MEMORY.0,
             allocated => block = Some(allocated),
         }
@@ -747,7 +761,9 @@ extern "C" fn register_notification_processor(session: u32, name: u32, handler: 
                     }
                 };
                 if matches {
-                    kernel::ExFreePool(processor);
+                    // SAFETY: a session slot holds a processor pool block; the
+                    // slot is cleared below with the lock held.
+                    unsafe { xboxkrnl::ExFreePool(processor) };
                     write_u32(slot, 0);
                 }
             }
@@ -776,7 +792,8 @@ extern "C" fn register_notification_processor(session: u32, name: u32, handler: 
     };
     drop(guard);
     if let Some(unused) = block {
-        kernel::ExFreePool(unused);
+        // SAFETY: the block was allocated above and never linked.
+        unsafe { xboxkrnl::ExFreePool(unused) };
     }
     result.map_or_else(|error| Hresult::from(error).0, |()| Hresult::OK.0)
 }
@@ -791,9 +808,7 @@ enum AddProcessorError {
 impl From<AddProcessorError> for Hresult {
     fn from(error: AddProcessorError) -> Self {
         match error {
-            AddProcessorError::NoFreeSlot => {
-                Hresult::from_error_code(ErrorCode::MaxConnectionsExceeded)
-            }
+            AddProcessorError::NoFreeSlot => ErrorCode::MaxConnectionsExceeded.hresult(),
             AddProcessorError::NameTooLong => Hresult::INVALID_ARGUMENT,
         }
     }

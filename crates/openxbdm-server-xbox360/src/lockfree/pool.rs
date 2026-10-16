@@ -31,6 +31,9 @@
 use core::num::NonZeroU32;
 
 use openxbdm_core::status::Hresult;
+use xbox360_sys::xam::CreateEventA;
+use xbox360_sys::xam::GetCurrentThreadId;
+use xbox360_sys::xboxkrnl::Handle;
 
 use super::Allocator;
 use super::Backoff;
@@ -61,8 +64,6 @@ use super::store_quad;
 use super::swap_tagged;
 use super::zero;
 use crate::exports::export;
-use crate::kernel::CreateEventA;
-use crate::kernel::GetCurrentThreadId;
 
 const LFPL: u32 = u32::from_be_bytes(*b"LfPl");
 const ENTRIES: usize = 0x00;
@@ -301,13 +302,14 @@ impl Pool {
             let semaphore = create_semaphore();
             store(entry as usize, semaphore);
             if semaphore != 0 {
-                let event = CreateEventA(0, 0, 0, core::ptr::null());
-                store(entry as usize + ENTRY_EVENT, event);
-                if event != 0 {
+                // SAFETY: a null name creates an unnamed auto-reset event.
+                let event = unsafe { CreateEventA(0, false, false, core::ptr::null()) };
+                store(entry as usize + ENTRY_EVENT, event.raw());
+                if event != Handle::NULL {
                     if self.install(entry) {
                         return Some(Entry(entry));
                     }
-                    close_handle(event);
+                    close_handle(event.raw());
                 }
                 close_handle(semaphore);
             }

@@ -12,6 +12,7 @@ use core::fmt::Write as _;
 
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::xbdm_error;
 
 use crate::access::Access;
 use crate::commands::console::ConfigSetting;
@@ -100,10 +101,10 @@ pub enum DisplayError {
 impl From<DisplayError> for Hresult {
     fn from(error: DisplayError) -> Self {
         match error {
-            DisplayError::BadParameter => Hresult::from_error_code(ErrorCode::BadParameter),
-            DisplayError::MemoryNotMapped => Hresult::from_error_code(ErrorCode::MemoryNotMapped),
-            DisplayError::Unsupported => Hresult::from_error_code(ErrorCode::UnknownCommand),
-            DisplayError::EdidFailed => Hresult::error(0x1d),
+            DisplayError::BadParameter => ErrorCode::BadParameter.hresult(),
+            DisplayError::MemoryNotMapped => ErrorCode::MemoryNotMapped.hresult(),
+            DisplayError::Unsupported => ErrorCode::UnknownCommand.hresult(),
+            DisplayError::EdidFailed => xbdm_error(0x1d),
             DisplayError::NoTransferBlock => super::console::BufferTooSmall.into(),
         }
     }

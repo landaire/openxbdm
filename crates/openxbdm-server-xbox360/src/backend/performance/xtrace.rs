@@ -17,7 +17,6 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 use core::sync::atomic::fence;
 
-use openxbdm_core::status::NtStatus;
 use openxbdm_server::Server;
 use openxbdm_server::commands::filesystem::CreateDisposition;
 use openxbdm_server::commands::filesystem::CreateOptions;
@@ -32,6 +31,19 @@ use openxbdm_server::commands::performance::xtrace::Encoder;
 use openxbdm_server::commands::performance::xtrace::Region;
 use openxbdm_server::commands::performance::xtrace::Sink;
 use openxbdm_server::commands::performance::xtrace::Thread;
+use xbox360_sys::export_raw;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::AllocationType;
+use xbox360_sys::xboxkrnl::DebugMonitorService;
+use xbox360_sys::xboxkrnl::FileInformationClass;
+use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::IoStatusBlock;
+use xbox360_sys::xboxkrnl::MmQueryAddressProtect;
+use xbox360_sys::xboxkrnl::MmQueryAllocationSize;
+use xbox360_sys::xboxkrnl::NtQueryVirtualMemory;
+use xbox360_sys::xboxkrnl::PageProtection;
+use xbox360_sys::xboxkrnl::ProcessorMode;
+use xbox360_sys::xboxkrnl::ThreadCreationFlags;
 
 use super::c_string;
 use super::module_snapshot;
@@ -39,27 +51,8 @@ use crate::backend::Console;
 use crate::backend::dispatcher;
 use crate::backend::filesystem;
 use crate::exports::export;
-use crate::exports::export_raw;
 use crate::kernel;
-use crate::kernel::IoStatusBlock;
-use crate::kernel::import_thunk;
 use crate::net::XamNetwork;
-
-import_thunk!(
-    NtQueryVirtualMemory(address: u32, information: *mut u32, process_type: u32) -> u32,
-    lib = kernel::LIB_KERNEL,
-    ordinal = 0xee
-);
-import_thunk!(
-    MmQueryAddressProtect(address: u32) -> u32,
-    lib = kernel::LIB_KERNEL,
-    ordinal = 0xc4
-);
-import_thunk!(
-    MmQueryAllocationSize(address: u32) -> u32,
-    lib = kernel::LIB_KERNEL,
-    ordinal = 0xc5
-);
 
 const BUFFER_COUNT: usize = 5;
 /// Session memory before the stream buffers.
@@ -68,9 +61,9 @@ const CACHE_SIZE: u32 = (xtrace::CACHE_WORDS * 4) as u32;
 const DEFAULT_SIZE_LIMIT: u32 = 0x40_0000;
 const MINIMUM_SIZE_LIMIT: u32 = 0x10_0000;
 const MAXIMUM_ALLOCATION: u32 = 0x8000_0000;
-const MEM_COMMIT_RESERVE_LARGE: u32 = 0x2000_3000;
-const MEM_RELEASE: u32 = 0x8000;
-const PAGE_READWRITE: u32 = 4;
+const MEM_COMMIT_RESERVE_LARGE: AllocationType = AllocationType::COMMIT
+    .union(AllocationType::RESERVE)
+    .union(AllocationType::LARGE_PAGES);
 /// Memory options of the session allocation: debug memory, then title
 /// memory when that fails.
 const DEBUG_MEMORY: u32 = 3;
@@ -90,15 +83,12 @@ const STATUS_SINGLE_STEP: u32 = 0x8000_0004;
 const STATUS_PENDING: u32 = 0x103;
 const STATUS_WAIT_0: u32 = 0;
 const MSR_SINGLE_STEP: u32 = 0x400;
-/// `ExDebugMonitorService` 6: address of the kernel's trace exception hook.
-const DEBUG_MONITOR_TRACE_HOOK: u32 = 6;
 /// Hardware flag that disables running the spin lock routines natively.
 const HARDWARE_NO_SPOOF: u32 = 0x0200_0000;
 const TITLE_TERMINATE_PRIORITY: u32 = 0x6f00_0000;
 const PROGRESS_INTERVAL: i64 = 100_000;
 /// Progress interval when the kernel has the fast trace hook.
 const FAST_PROGRESS_INTERVAL: i64 = 500_000;
-const FILE_NETWORK_OPEN_INFORMATION: u32 = 0x22;
 const NETWORK_OPEN_INFORMATION_SIZE: usize = 0x38;
 const DEFAULT_DIRECTORY: &[u8] = b"e:\\pix";
 const DEFAULT_FILE: &core::ffi::CStr = c"e:\\pix\\unnamed.pix2";
@@ -106,12 +96,12 @@ const DEFAULT_FILE: &core::ffi::CStr = c"e:\\pix\\unnamed.pix2";
 /// Kernel routines the handler runs natively instead of stepping through
 /// them (their reservation loops never complete under single-step), and
 /// whether the walk of the routine's body follows forward branches.
-const SPOOFED_ROUTINES: [(u32, bool); 5] = [
-    (0x125, false), // RtlEnterCriticalSection
-    (0x4d, false),  // KeAcquireSpinLockAtRaisedIrql
-    (0xb1, false),  // KfAcquireSpinLock
-    (0x10f, false), // ObReferenceObject
-    (0x105, true),  // ObDereferenceObject
+const SPOOFED_ROUTINES: [(Ordinal, bool); 5] = [
+    (Ordinal::new(0x125).unwrap(), false), // RtlEnterCriticalSection
+    (Ordinal::new(0x4d).unwrap(), false),  // KeAcquireSpinLockAtRaisedIrql
+    (Ordinal::new(0xb1).unwrap(), false),  // KfAcquireSpinLock
+    (Ordinal::new(0x10f).unwrap(), false), // ObReferenceObject
+    (Ordinal::new(0x105).unwrap(), true),  // ObDereferenceObject
 ];
 
 /// Trap frame offsets.
@@ -260,6 +250,16 @@ static TITLE_TERMINATE: Shared<[u32; 4]> = Shared(UnsafeCell::new([0; 4]));
 /// of at most eight words each.
 static SCRATCH: Shared<[u32; 16]> = Shared(UnsafeCell::new([0; 16]));
 
+use core::time::Duration;
+
+use xbox360::console::hardware_flags;
+use xbox360::module::Ordinal;
+use xbox360::module::SystemModule;
+use xbox360::module::resolve_export;
+use xbox360::status::set_last_error;
+use xbox360::time::Timebase;
+use xbox360::time::sleep;
+
 use crate::exports::bridged;
 
 fn read_u32(address: u32) -> u32 {
@@ -308,12 +308,16 @@ fn print(format: &core::ffi::CStr, arguments: &[u64]) {
     let mut slots = [0u64; 4];
     slots[..arguments.len()].copy_from_slice(arguments);
     let mut text = [0u8; 0x200];
-    let length = kernel::_vsnprintf(
-        text.as_mut_ptr(),
-        text.len() as u32,
-        format.as_ptr() as usize as u32,
-        slots.as_ptr() as usize as u32,
-    );
+    // SAFETY: `text` is a live buffer of the stated length; `format` is
+    // NUL-terminated and `slots` holds every argument it consumes.
+    let length = unsafe {
+        xboxkrnl::_vsnprintf(
+            text.as_mut_ptr(),
+            text.len() as u32,
+            format.as_ptr() as usize as u32,
+            slots.as_ptr() as usize as u32,
+        )
+    };
     let length = usize::try_from(length).map_or(text.len(), |length| length.min(text.len()));
     output_debug_string(&text[..length]);
 }
@@ -432,47 +436,65 @@ fn append(name: &[u8], data: u32, length: u32) -> bool {
     };
     let mut io_status = IoStatusBlock::default();
     let mut information = [0u8; NETWORK_OPEN_INFORMATION_SIZE];
-    let status = kernel::NtQueryInformationFile(
-        handle,
-        &mut io_status,
-        information.as_mut_ptr(),
-        NETWORK_OPEN_INFORMATION_SIZE as u32,
-        FILE_NETWORK_OPEN_INFORMATION,
-    );
+    // SAFETY: `handle` was opened above; `io_status` and `information` are
+    // live and sized as stated.
+    let status = unsafe {
+        xboxkrnl::NtQueryInformationFile(
+            Handle::from_raw(handle),
+            &mut io_status,
+            information.as_mut_ptr(),
+            NETWORK_OPEN_INFORMATION_SIZE as u32,
+            FileInformationClass::NetworkOpen,
+        )
+    };
     // Stock seeks to the end; when that fails the write goes to the start.
-    let offset = match NtStatus(status).result() {
+    let offset = match status.result() {
         Err(error) => {
-            kernel::set_last_error(error);
+            set_last_error(error);
             0
         }
         Ok(()) => u64::from_be_bytes(information[0x28..0x30].try_into().unwrap_or([0; 8])),
     };
     let mut io_status = IoStatusBlock::default();
-    let mut status = kernel::NtWriteFile(
-        handle,
-        0,
-        0,
-        0,
-        &mut io_status,
-        data as usize as *const u8,
-        length,
-        &offset,
-    );
-    if status == STATUS_PENDING {
-        status = kernel::NtWaitForSingleObjectEx(handle, 1, 0, core::ptr::null());
-        if !is_failure(status) {
+    // SAFETY: `handle` was opened above; `io_status`, `offset`, and the
+    // `length` bytes at `data` stay live until the write completes, which
+    // the wait below ensures.
+    let mut status = unsafe {
+        xboxkrnl::NtWriteFile(
+            Handle::from_raw(handle),
+            Handle::NULL,
+            0,
+            0,
+            &mut io_status,
+            data as usize as *const u8,
+            length,
+            &offset,
+        )
+    };
+    if status.0 == STATUS_PENDING {
+        // SAFETY: `handle` was opened above.
+        status = unsafe {
+            xboxkrnl::NtWaitForSingleObjectEx(
+                Handle::from_raw(handle),
+                ProcessorMode::User,
+                false,
+                core::ptr::null(),
+            )
+        };
+        if !is_failure(status.0) {
             status = io_status.status;
         }
     }
-    let written = if !is_failure(status) || status & 0xc000_0000 == 0x8000_0000 {
+    let written = if !is_failure(status.0) || status.0 & 0xc000_0000 == 0x8000_0000 {
         io_status.information
     } else {
         0
     };
-    if let Err(error) = NtStatus(status).result() {
-        kernel::set_last_error(error);
+    if let Err(error) = status.result() {
+        set_last_error(error);
     }
-    kernel::NtClose(handle);
+    // SAFETY: `handle` was opened above and is closed once.
+    unsafe { xboxkrnl::NtClose(Handle::from_raw(handle)) };
     written == length
 }
 
@@ -698,7 +720,7 @@ extern "C" fn trace_hook(trap_frame: u32, record_address: u32) -> u32 {
         let mut stop = iar == stop_entry_address() || STOP_REQUESTED.load(Ordering::Acquire);
         if SPOOF_ENABLED.load(Ordering::Relaxed) {
             let mut spoofed = spoofed_routine(iar).is_some();
-            if kernel::hardware_flags() & HARDWARE_NO_SPOOF != 0 {
+            if hardware_flags().bits() & HARDWARE_NO_SPOOF != 0 {
                 spoofed = false;
                 SPOOF_ENABLED.store(false, Ordering::Relaxed);
             }
@@ -778,12 +800,12 @@ fn resolve_spoofed_routines() {
     if SPOOF_RESOLVED.swap(true, Ordering::AcqRel) {
         return;
     }
-    let Ok(module) = kernel::module_handle(c"xboxkrnl.exe") else {
+    let Ok(module) = SystemModule::Kernel.handle() else {
         return;
     };
     for (target, &(ordinal, _)) in SPOOF_TARGETS.iter().zip(&SPOOFED_ROUTINES) {
-        if let Ok(address) = kernel::resolve_export(module, ordinal) {
-            target.store(address, Ordering::Relaxed);
+        if let Ok(address) = resolve_export(module, ordinal) {
+            target.store(address.raw(), Ordering::Relaxed);
         }
     }
 }
@@ -806,15 +828,22 @@ fn hook() {
                 0,
             ]
         };
-        kernel::ExRegisterTitleTerminateNotification(TITLE_TERMINATE.0.get().cast(), 1);
+        // SAFETY: TITLE_TERMINATE is a static registration filled in above.
+        unsafe {
+            xboxkrnl::ExRegisterTitleTerminateNotification(TITLE_TERMINATE.0.get().cast(), true)
+        };
     }
     let mut hook_slot = [0u32; 2];
-    if !is_failure(kernel::ExDebugMonitorService(
-        DEBUG_MONITOR_TRACE_HOOK,
-        hook_slot.as_mut_ptr() as usize as u32,
-        0,
-        0,
-    )) {
+    // SAFETY: `hook_slot` is a live two-word reply block.
+    let status = unsafe {
+        xboxkrnl::ExDebugMonitorService(
+            DebugMonitorService::TraceHook,
+            hook_slot.as_mut_ptr() as usize as u32,
+            0,
+            0,
+        )
+    };
+    if !is_failure(status.0) {
         HOOK_SLOT.store(hook_slot[0], Ordering::Release);
         write_u32(hook_slot[0], trace_hook_entry as *const () as usize as u32);
     }
@@ -837,7 +866,10 @@ fn unhook() {
     let slot = ROUTINE_SLOT.swap(0, Ordering::AcqRel);
     if slot != 0 {
         write_u32(slot, PREVIOUS_ROUTINE.load(Ordering::Acquire));
-        kernel::ExRegisterTitleTerminateNotification(TITLE_TERMINATE.0.get().cast(), 0);
+        // SAFETY: TITLE_TERMINATE is the static registration added by `hook`.
+        unsafe {
+            xboxkrnl::ExRegisterTitleTerminateNotification(TITLE_TERMINATE.0.get().cast(), false)
+        };
         TERMINATE_REGISTERED.store(false, Ordering::Release);
     }
     let hook_slot = HOOK_SLOT.load(Ordering::Acquire);
@@ -920,7 +952,7 @@ fn flush() {
 /// Writer thread (stock 0x91f660f0).
 extern "C" fn writer(_context: u32) -> u32 {
     while WRITER_RUNNING.load(Ordering::Acquire) {
-        kernel::sleep_milliseconds(WRITER_INTERVAL_MS);
+        sleep(Duration::from_millis(u64::from(WRITER_INTERVAL_MS)));
         flush();
     }
     flush();
@@ -933,8 +965,22 @@ fn track_writer(handle: u32) {
     let now = 0i64;
     for slot in &WRITERS {
         let ended = slot.load(Ordering::Acquire);
-        if ended != 0 && kernel::NtWaitForSingleObjectEx(ended, 1, 0, &now) == STATUS_WAIT_0 {
-            kernel::NtClose(ended);
+        if ended == 0 {
+            continue;
+        }
+        // SAFETY: `ended` is a tracked writer handle; `now` is a live zero
+        // timeout.
+        let wait = unsafe {
+            xboxkrnl::NtWaitForSingleObjectEx(
+                Handle::from_raw(ended),
+                ProcessorMode::User,
+                false,
+                &now,
+            )
+        };
+        if wait.0 == STATUS_WAIT_0 {
+            // SAFETY: the writer has ended; its tracked handle is closed once.
+            unsafe { xboxkrnl::NtClose(Handle::from_raw(ended)) };
             slot.store(0, Ordering::Release);
         }
     }
@@ -963,25 +1009,31 @@ fn allocate() -> bool {
         }
         MEMORY_OPTION.store(DEBUG_MEMORY, Ordering::Relaxed);
         let mut size = limit + 0x1_0000;
-        let mut status = kernel::NtAllocateVirtualMemory(
-            BASE.as_ptr(),
-            &mut size,
-            MEM_COMMIT_RESERVE_LARGE,
-            PAGE_READWRITE,
-            DEBUG_MEMORY,
-        );
-        if is_failure(status) {
-            BASE.store(0, Ordering::Relaxed);
-            MEMORY_OPTION.store(TITLE_MEMORY, Ordering::Relaxed);
-            size = limit + 0x1_0000;
-            status = kernel::NtAllocateVirtualMemory(
+        // SAFETY: BASE and `size` are live u32 values.
+        let mut status = unsafe {
+            xboxkrnl::NtAllocateVirtualMemory(
                 BASE.as_ptr(),
                 &mut size,
                 MEM_COMMIT_RESERVE_LARGE,
-                PAGE_READWRITE,
-                TITLE_MEMORY,
-            );
-            if is_failure(status) {
+                PageProtection::READWRITE,
+                DEBUG_MEMORY,
+            )
+        };
+        if is_failure(status.0) {
+            BASE.store(0, Ordering::Relaxed);
+            MEMORY_OPTION.store(TITLE_MEMORY, Ordering::Relaxed);
+            size = limit + 0x1_0000;
+            // SAFETY: as above.
+            status = unsafe {
+                xboxkrnl::NtAllocateVirtualMemory(
+                    BASE.as_ptr(),
+                    &mut size,
+                    MEM_COMMIT_RESERVE_LARGE,
+                    PageProtection::READWRITE,
+                    TITLE_MEMORY,
+                )
+            };
+            if is_failure(status.0) {
                 if limit <= MINIMUM_SIZE_LIMIT {
                     return BASE.load(Ordering::Relaxed) != 0;
                 }
@@ -1007,19 +1059,24 @@ fn initialize(name: Option<&[u8]>) {
                 FAILED.store(true, Ordering::Release);
                 return;
             };
-            kernel::NtClose(handle);
+            // SAFETY: `handle` was just opened and is closed once.
+            unsafe { xboxkrnl::NtClose(Handle::from_raw(handle)) };
             let processor = WRITER_PROCESSOR.load(Ordering::Relaxed) & 0x3f;
             let affinity = if processor < 32 { 1u32 << processor } else { 0 };
-            let status = kernel::ExCreateThread(
-                WRITER_HANDLE.as_ptr(),
-                WRITER_STACK,
-                core::ptr::null_mut(),
-                0,
-                writer as *const () as usize as u32,
-                0,
-                affinity << 24,
-            );
-            if is_failure(status) {
+            // SAFETY: WRITER_HANDLE is a static u32; the writer takes no
+            // context and reads only static state.
+            let status = unsafe {
+                xboxkrnl::ExCreateThread(
+                    WRITER_HANDLE.as_ptr(),
+                    WRITER_STACK,
+                    core::ptr::null_mut(),
+                    0,
+                    writer as *const () as usize as u32,
+                    0,
+                    ThreadCreationFlags::from_bits_retain(affinity << 24),
+                )
+            };
+            if is_failure(status.0) {
                 output_debug_string(b"Tracing: Thread creation failed.\n");
                 FAILED.store(true, Ordering::Release);
                 return;
@@ -1073,9 +1130,10 @@ struct KernelSpace;
 impl AddressSpace for KernelSpace {
     fn query(&mut self, address: u32) -> Option<Region> {
         let mut information = [0u32; 7];
-        let status = NtQueryVirtualMemory(address, information.as_mut_ptr(), 0);
-        if let Err(error) = NtStatus(status).result() {
-            kernel::set_last_error(error);
+        // SAFETY: `information` is a live seven-word basic information block.
+        let status = unsafe { NtQueryVirtualMemory(address, information.as_mut_ptr(), 0) };
+        if let Err(error) = status.result() {
+            set_last_error(error);
             return None;
         }
         Some(Region {
@@ -1086,11 +1144,12 @@ impl AddressSpace for KernelSpace {
     }
 
     fn protect(&mut self, address: u32) -> u32 {
-        MmQueryAddressProtect(address)
+        MmQueryAddressProtect(address).bits()
     }
 
     fn allocation_size(&mut self, address: u32) -> u32 {
-        MmQueryAllocationSize(address)
+        // SAFETY: the kernel validates `address` against its pool and heap regions.
+        unsafe { MmQueryAllocationSize(address) }
     }
 }
 
@@ -1161,7 +1220,7 @@ fn arm() {
         return;
     }
     let session = session();
-    session.start_time = kernel::timebase();
+    session.start_time = Timebase::now().ticks();
     session.encoder.arm();
     set_progress_mark(0);
     session.stop_address = None;
@@ -1231,7 +1290,7 @@ export!(135, set_size_limit);
 fn report_timing() {
     let session = session();
     if BASE.load(Ordering::Acquire) != 0 {
-        let elapsed = kernel::timebase().wrapping_sub(session.start_time) as i64;
+        let elapsed = Timebase::now().ticks().wrapping_sub(session.start_time) as i64;
         let frequency = kernel::performance_frequency() as i64;
         let deferred = i64::from(session.encoder.deferred());
         print(
@@ -1274,12 +1333,16 @@ fn report_mismatches() {
 /// Free the session memory (stock passes the buffer base, 0x78 past the
 /// allocation, and the size limit variable).
 fn free_memory() {
-    kernel::NtFreeVirtualMemory(
-        BASE.as_ptr(),
-        SIZE_LIMIT.as_ptr(),
-        MEM_RELEASE,
-        MEMORY_OPTION.load(Ordering::Relaxed),
-    );
+    // SAFETY: BASE and SIZE_LIMIT are static u32 values that describe the
+    // session allocation, which no thread uses any more.
+    unsafe {
+        xboxkrnl::NtFreeVirtualMemory(
+            BASE.as_ptr(),
+            SIZE_LIMIT.as_ptr(),
+            AllocationType::RELEASE,
+            MEMORY_OPTION.load(Ordering::Relaxed),
+        )
+    };
 }
 
 /// Stock 0x91f668c0: a session with a file frees its memory; the hooks go.
@@ -1305,8 +1368,17 @@ extern "C" fn stop_recording() -> u32 {
     let handle = WRITER_HANDLE.load(Ordering::Acquire);
     if handle != 0 {
         WRITER_RUNNING.store(false, Ordering::Release);
-        kernel::NtWaitForSingleObjectEx(handle, 1, 0, core::ptr::null());
-        kernel::NtClose(handle);
+        // SAFETY: `handle` is the owned writer thread handle, closed once
+        // after the wait.
+        unsafe {
+            xboxkrnl::NtWaitForSingleObjectEx(
+                Handle::from_raw(handle),
+                ProcessorMode::User,
+                false,
+                core::ptr::null(),
+            );
+            xboxkrnl::NtClose(Handle::from_raw(handle));
+        }
         forget_writer(handle);
         WRITER_HANDLE.store(0, Ordering::Release);
     }
@@ -1348,7 +1420,8 @@ extern "C" fn save_recording(name: u32) -> u32 {
     set_file_name(name);
     match create_trace_file(name) {
         Some(handle) => {
-            kernel::NtClose(handle);
+            // SAFETY: `handle` was just opened and is closed once.
+            unsafe { xboxkrnl::NtClose(Handle::from_raw(handle)) };
         }
         None => {
             output_debug_string(b"Tracing: File open failed.\n");
@@ -1411,7 +1484,8 @@ pub(crate) fn start_default() -> u32 {
         CreateOptions::DIRECTORY_FILE.union(CreateOptions::SYNCHRONOUS_IO_NONALERT),
     );
     if let Some(handle) = open(DEFAULT_DIRECTORY, &request) {
-        kernel::NtClose(handle);
+        // SAFETY: `handle` was just opened and is closed once.
+        unsafe { xboxkrnl::NtClose(Handle::from_raw(handle)) };
     }
     start(DEFAULT_FILE.as_ptr() as usize as u32)
 }
@@ -1457,15 +1531,27 @@ pub(crate) fn shut_down() {
     ARMED.store(false, Ordering::Release);
     unhook();
     if TERMINATE_REGISTERED.swap(false, Ordering::AcqRel) {
-        kernel::ExRegisterTitleTerminateNotification(TITLE_TERMINATE.0.get().cast(), 0);
+        // SAFETY: TITLE_TERMINATE is the static registration added by `hook`.
+        unsafe {
+            xboxkrnl::ExRegisterTitleTerminateNotification(TITLE_TERMINATE.0.get().cast(), false)
+        };
     }
     WRITER_RUNNING.store(false, Ordering::Release);
     WRITER_HANDLE.store(0, Ordering::Release);
     for slot in &WRITERS {
         let handle = slot.swap(0, Ordering::AcqRel);
         if handle != 0 {
-            kernel::NtWaitForSingleObjectEx(handle, 1, 0, core::ptr::null());
-            kernel::NtClose(handle);
+            // SAFETY: `handle` was taken out of its tracking slot and is
+            // closed once after the wait.
+            unsafe {
+                xboxkrnl::NtWaitForSingleObjectEx(
+                    Handle::from_raw(handle),
+                    ProcessorMode::User,
+                    false,
+                    core::ptr::null(),
+                );
+                xboxkrnl::NtClose(Handle::from_raw(handle));
+            }
         }
     }
 }

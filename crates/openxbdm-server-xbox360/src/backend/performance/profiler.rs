@@ -13,9 +13,11 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
+use core::time::Duration;
 
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::Server;
 use openxbdm_server::commands::filesystem::CreateDisposition;
 use openxbdm_server::commands::filesystem::CreateOptions;
@@ -32,6 +34,26 @@ use openxbdm_server::commands::performance::profiler::BufferMemory;
 use openxbdm_server::commands::performance::profiler::MAX_BLOCKS;
 use openxbdm_server::commands::performance::profiler::ProfilerError;
 use openxbdm_server::commands::performance::profiler::ProfilerFlags;
+use xbox360::module::Ordinal;
+use xbox360::module::SystemModule;
+use xbox360::module::resolve_export;
+use xbox360::time::FileTime;
+use xbox360::time::Timebase;
+use xbox360::time::sleep;
+use xbox360_sys::processor;
+use xbox360_sys::xam::GetCurrentThreadId;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::AllocationType;
+use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::InterlockedFlushSList;
+use xbox360_sys::xboxkrnl::InterlockedPopEntrySList;
+use xbox360_sys::xboxkrnl::IoStatusBlock;
+use xbox360_sys::xboxkrnl::Kevent;
+use xbox360_sys::xboxkrnl::PageProtection;
+use xbox360_sys::xboxkrnl::ProcessorMode;
+use xbox360_sys::xboxkrnl::RtlImageDirectoryEntryToData;
+use xbox360_sys::xboxkrnl::ThreadCreationFlags;
+use xbox360_sys::xboxkrnl::WaitReason;
 
 use super::module_snapshot;
 use super::pmc;
@@ -40,31 +62,15 @@ use super::pmc::print;
 use crate::backend::Console;
 use crate::backend::dispatcher;
 use crate::backend::filesystem;
-use crate::backend::memory::RtlImageDirectoryEntryToData;
 use crate::exports::export;
 use crate::kernel;
-use crate::kernel::IoStatusBlock;
-use crate::kernel::LIB_KERNEL;
-use crate::kernel::import_thunk;
 use crate::net::XamNetwork;
-
-use crate::kernel::GetCurrentThreadId;
-import_thunk!(
-    InterlockedPopEntrySList(header: *mut u64) -> u32,
-    lib = LIB_KERNEL,
-    ordinal = 0x2c
-);
-import_thunk!(
-    InterlockedFlushSList(header: *mut u64) -> u32,
-    lib = LIB_KERNEL,
-    ordinal = 0x2b
-);
 
 /// Kernel exports of the profile interrupt: enable on a processor mask,
 /// disable, and set the routine.
-const ENABLE_PROFILE_INTERRUPT: u32 = 669;
-const DISABLE_PROFILE_INTERRUPT: u32 = 670;
-const SET_PROFILE_ROUTINE: u32 = 671;
+const ENABLE_PROFILE_INTERRUPT: Ordinal = Ordinal::new(669).unwrap();
+const DISABLE_PROFILE_INTERRUPT: Ordinal = Ordinal::new(670).unwrap();
+const SET_PROFILE_ROUTINE: Ordinal = Ordinal::new(671).unwrap();
 const PROCESSORS: usize = 6;
 /// Deepest call stack a sample records, the interrupted address included.
 const MAX_FRAMES: usize = 500;
@@ -96,9 +102,9 @@ const WRITER_FLAGS: u32 = 0x4a2;
 const POLL_INTERVAL_MS: u32 = 250;
 const FILETIME_PER_SECOND: u64 = 10_000_000;
 /// `NtAllocateVirtualMemory` type: commit, reserve, 64 KiB pages.
-const ALLOCATION_TYPE: u32 = 0x2000_3000;
-const PAGE_READWRITE: u32 = 4;
-const MEM_RELEASE: u32 = 0x8000;
+const ALLOCATION_TYPE: AllocationType = AllocationType::COMMIT
+    .union(AllocationType::RESERVE)
+    .union(AllocationType::LARGE_PAGES);
 /// Memory options of the sample buffers.
 const TITLE_MEMORY: u32 = 3;
 const SYSTEM_FALLBACK_MEMORY: u32 = 1;
@@ -205,7 +211,7 @@ fn read_u32(address: u32) -> u32 {
 }
 
 fn pcr_word(offset: u32) -> u32 {
-    read_u32(kernel::pcr() + offset)
+    read_u32(processor::pcr() + offset)
 }
 
 /// A kernel notification event in static storage.
@@ -215,23 +221,34 @@ struct NotificationEvent(UnsafeCell<[u32; 4]>);
 unsafe impl Sync for NotificationEvent {}
 
 impl NotificationEvent {
-    fn pointer(&self) -> *mut u32 {
+    fn pointer(&self) -> *mut Kevent {
         self.0.get().cast()
     }
 
     /// Unsignaled, with the wait list head pointing at itself.
     fn reset(&self) {
-        let list = self.pointer().wrapping_add(2) as usize as u32;
+        let list = self.0.get().cast::<u32>().wrapping_add(2) as usize as u32;
         // SAFETY: called before the writer thread exists.
         unsafe { *self.0.get() = [0, 0, list, list] };
     }
 
     fn set(&self) {
-        kernel::KeSetEvent(self.pointer(), 1, 0);
+        // SAFETY: the event lives in static storage initialized by `reset`.
+        unsafe { xboxkrnl::KeSetEvent(self.pointer(), 1, false) };
     }
 
     fn wait(&self) -> bool {
-        (kernel::KeWaitForSingleObject(self.pointer(), 0, 0, 0, core::ptr::null()) as i32) >= 0
+        // SAFETY: the event lives in static storage initialized by `reset`.
+        let status = unsafe {
+            xboxkrnl::KeWaitForSingleObject(
+                self.pointer().cast(),
+                WaitReason::Executive,
+                ProcessorMode::Kernel,
+                false,
+                core::ptr::null(),
+            )
+        };
+        (status.0 as i32) >= 0
     }
 }
 
@@ -254,14 +271,16 @@ impl ListHead {
     }
 
     fn pop(&self) -> Option<u32> {
-        match InterlockedPopEntrySList(self.0.get()) {
+        // SAFETY: the head is an aligned static list of entries from one block set.
+        match unsafe { InterlockedPopEntrySList(self.0.get()) } {
             0 => None,
             entry => Some(entry),
         }
     }
 
     fn flush(&self) {
-        InterlockedFlushSList(self.0.get());
+        // SAFETY: as in `pop`.
+        unsafe { InterlockedFlushSList(self.0.get()) };
     }
 
     fn push(&self, entry: u32) {
@@ -439,7 +458,7 @@ impl TrapFrame {
 }
 
 fn valid(address: u32) -> bool {
-    kernel::MmIsAddressValid(address) != 0
+    xboxkrnl::MmIsAddressValid(address).get()
 }
 
 /// The interrupted code is a leaf epilogue: the instructions up to `blr`
@@ -528,7 +547,7 @@ fn sample(frame: TrapFrame, processor: usize) {
     processor_word(header::BYTES, processor).fetch_add(size, Ordering::Relaxed);
     processor_word(header::LARGEST, processor).fetch_max(size, Ordering::Relaxed);
     processor_word(header::SMALLEST, processor).fetch_min(size, Ordering::Relaxed);
-    let time = kernel::timebase();
+    let time = Timebase::now().ticks();
     head[1] = (time >> 32) as u32;
     head[2] = time as u32;
     let blocks = &THREADS[processor];
@@ -585,27 +604,19 @@ extern "C" fn profile_interrupt(frame: u32, irql: u32) {
     }
 }
 
-/// Kernel entry of [`profile_interrupt`], preserving the full nonvolatile
-/// registers.
-#[unsafe(naked)]
-extern "C" fn profile_interrupt_entry() {
-    core::arch::naked_asm!(
-        "lis 12, {routine}@ha",
-        "addi 12, 12, {routine}@l",
-        "b {bridge}",
-        routine = sym profile_interrupt,
-        bridge = sym crate::exports::export_bridge,
-    )
-}
+// Kernel entry of `profile_interrupt`, preserving the full nonvolatile
+// registers.
+crate::exports::bridged!(profile_interrupt_entry, profile_interrupt);
 
 /// Call profile interrupt export `ordinal` of the kernel (stock
 /// 0x91f8eeb0, 0x91f8ef48, 0x91f8efd0).
-fn call_kernel(ordinal: u32, argument: u32) -> Result<u32, ProfilerError> {
-    let kernel = kernel::module_handle(c"xboxkrnl.exe").map_err(|_| ProfilerError::NoKernel)?;
-    let function =
-        kernel::resolve_export(kernel, ordinal).map_err(|_| ProfilerError::NoProfileExport)?;
+fn call_kernel(ordinal: Ordinal, argument: u32) -> Result<u32, ProfilerError> {
+    let kernel = SystemModule::Kernel
+        .handle()
+        .map_err(|_| ProfilerError::NoKernel)?;
+    let function = resolve_export(kernel, ordinal).map_err(|_| ProfilerError::NoProfileExport)?;
     // SAFETY: the profile exports take one register argument.
-    Ok(unsafe { kernel::call_export(function, argument, 0, 0, 0) })
+    Ok(unsafe { kernel::call_export(function.raw(), argument, 0, 0, 0) })
 }
 
 fn set_profile_routine(routine: u32) -> Result<(), ProfilerError> {
@@ -638,14 +649,18 @@ fn create_buffers(flags: ProfilerFlags) -> bool {
     let mut bytes = layout.bytes();
     let mut allocate = |memory| {
         BUFFER_MEMORY.store(memory, Ordering::Relaxed);
-        (kernel::NtAllocateVirtualMemory(
-            &mut base,
-            &mut bytes,
-            ALLOCATION_TYPE,
-            PAGE_READWRITE,
-            memory,
-        ) as i32)
-            >= 0
+        // SAFETY: `base` and `bytes` are live u32 values of the enclosing
+        // function.
+        let status = unsafe {
+            xboxkrnl::NtAllocateVirtualMemory(
+                &mut base,
+                &mut bytes,
+                ALLOCATION_TYPE,
+                PageProtection::READWRITE,
+                memory,
+            )
+        };
+        (status.0 as i32) >= 0
     };
     let allocated = match layout.memory {
         BufferMemory::Title => allocate(TITLE_MEMORY) || allocate(SYSTEM_FALLBACK_MEMORY),
@@ -706,12 +721,16 @@ fn free_buffers() {
     let mut base = BUFFER.load(Ordering::Relaxed);
     if base != 0 {
         let mut bytes = BUFFER_BYTES.load(Ordering::Relaxed);
-        kernel::NtFreeVirtualMemory(
-            &mut base,
-            &mut bytes,
-            MEM_RELEASE,
-            BUFFER_MEMORY.load(Ordering::Relaxed),
-        );
+        // SAFETY: `base` and `bytes` describe the allocation of
+        // `create_buffers`, which no processor uses any more.
+        unsafe {
+            xboxkrnl::NtFreeVirtualMemory(
+                &mut base,
+                &mut bytes,
+                AllocationType::RELEASE,
+                BUFFER_MEMORY.load(Ordering::Relaxed),
+            )
+        };
         BUFFER.store(0, Ordering::Relaxed);
     }
 }
@@ -721,23 +740,27 @@ fn free_buffers() {
 /// `None`.
 fn write(address: u32, length: u32, offset: Option<u64>) -> bool {
     let mut io_status = IoStatusBlock {
-        status: 0,
+        status: NtStatus::SUCCESS,
         information: 0,
     };
     let offset_pointer = offset
         .as_ref()
         .map_or(core::ptr::null(), |offset| offset as *const u64);
-    let status = kernel::NtWriteFile(
-        FILE.load(Ordering::Relaxed),
-        0,
-        0,
-        0,
-        &mut io_status,
-        address as usize as *const u8,
-        length,
-        offset_pointer,
-    );
-    (status as i32) >= 0 && io_status.information == length
+    // SAFETY: FILE is the writer's open file; `io_status`, the offset, and
+    // the `length` bytes at `address` are live for the synchronous call.
+    let status = unsafe {
+        xboxkrnl::NtWriteFile(
+            Handle::from_raw(FILE.load(Ordering::Relaxed)),
+            Handle::NULL,
+            0,
+            0,
+            &mut io_status,
+            address as usize as *const u8,
+            length,
+            offset_pointer,
+        )
+    };
+    (status.0 as i32) >= 0 && io_status.information == length
 }
 
 /// A module's exception directory copy (stock 0x91f32e90 entries).
@@ -753,8 +776,9 @@ struct FunctionTable {
 /// memory (stock 0x91f32e90); `None` when a copy cannot be allocated.
 fn copy_function_tables(tables: &mut [FunctionTable; MODULE_CAPACITY]) -> Option<usize> {
     let data = kernel::debug_monitor_data();
-    let lock = data.loader_lock() as usize as *mut u32;
-    let irql = kernel::KfAcquireSpinLock(lock);
+    let lock = data.loader_lock() as usize as *mut _;
+    // SAFETY: the loader lock lives in the kernel debug monitor data.
+    let irql = unsafe { xboxkrnl::KfAcquireSpinLock(lock) };
     let mut count = 0;
     let mut result = Some(0);
     'lists: for &head in &[data.module_list(), data.secondary_module_list()] {
@@ -767,8 +791,11 @@ fn copy_function_tables(tables: &mut [FunctionTable; MODULE_CAPACITY]) -> Option
             let base = read_u32(entry + 0x18);
             if base != 0 {
                 let mut size = 0u32;
-                let directory =
-                    RtlImageDirectoryEntryToData(base, 1, IMAGE_DIRECTORY_EXCEPTION, &mut size);
+                // SAFETY: `base` is a loaded image on a list whose lock is
+                // held; `size` is a live u32.
+                let directory = unsafe {
+                    RtlImageDirectoryEntryToData(base, true, IMAGE_DIRECTORY_EXCEPTION, &mut size)
+                };
                 let mut table = FunctionTable {
                     base,
                     image_size: read_u32(entry + 0x20),
@@ -776,20 +803,27 @@ fn copy_function_tables(tables: &mut [FunctionTable; MODULE_CAPACITY]) -> Option
                     copy: 0,
                 };
                 if directory != 0 {
-                    table.copy = kernel::MmAllocatePhysicalMemoryEx(
-                        PHYSICAL_MEMORY,
-                        size,
-                        PAGE_READWRITE,
-                        0,
-                        u32::MAX,
-                        0x1000,
-                    );
+                    // SAFETY: physical allocation of `size` bytes; the
+                    // result is checked below.
+                    table.copy = unsafe {
+                        xboxkrnl::MmAllocatePhysicalMemoryEx(
+                            PHYSICAL_MEMORY,
+                            size,
+                            PageProtection::READWRITE,
+                            0,
+                            u32::MAX,
+                            0x1000,
+                        )
+                    };
                     if table.copy == 0 {
                         // Stock also passes the null copies of modules
                         // without a directory to MmFreePhysicalMemory.
                         for table in &tables[..count] {
                             if table.copy != 0 {
-                                kernel::MmFreePhysicalMemory(PHYSICAL_MEMORY, table.copy);
+                                // SAFETY: the copy was allocated above and is dropped.
+                                unsafe {
+                                    xboxkrnl::MmFreePhysicalMemory(PHYSICAL_MEMORY, table.copy)
+                                };
                             }
                         }
                         result = None;
@@ -811,7 +845,8 @@ fn copy_function_tables(tables: &mut [FunctionTable; MODULE_CAPACITY]) -> Option
             entry = read_u32(entry);
         }
     }
-    kernel::KfReleaseSpinLock(lock, irql);
+    // SAFETY: acquired above at `irql`.
+    unsafe { xboxkrnl::KfReleaseSpinLock(lock, irql) };
     result.map(|_| count)
 }
 
@@ -840,7 +875,7 @@ static WRITER_PATHS: WriterPaths = WriterPaths(UnsafeCell::new(WriterPathData {
 fn report_fatal(message: &core::ffi::CStr) {
     print(message, &[]);
     print(c"[LOP] Please try to free up disk space or memory\n", &[]);
-    kernel::DbgBreakPoint();
+    xboxkrnl::DbgBreakPoint();
 }
 
 /// Write the module snapshot, the header, and the function tables (stock
@@ -861,7 +896,7 @@ fn write_prologue() -> bool {
     }
     // SAFETY: see `WriterPaths`.
     let paths = unsafe { &*WRITER_PATHS.0.get() };
-    let time = kernel::system_time();
+    let time = FileTime::now().intervals();
     let capture = module_snapshot::CaptureFields {
         start_time: time,
         previous_flags: 0,
@@ -899,7 +934,8 @@ fn write_prologue() -> bool {
             && (table.size == 0 || {
                 let written = write(table.copy, table.size, None);
                 if written {
-                    kernel::MmFreePhysicalMemory(PHYSICAL_MEMORY, table.copy);
+                    // SAFETY: the copy is from `copy_function_tables` and was written.
+                    unsafe { xboxkrnl::MmFreePhysicalMemory(PHYSICAL_MEMORY, table.copy) };
                 }
                 written
             });
@@ -950,9 +986,9 @@ extern "C" fn writer_thread(_context: u32) -> u32 {
         Err(error) => {
             print(
                 c"[LOP] Error! %d\n",
-                &[u64::from(kernel::RtlNtStatusToDosError(
-                    NtStatus::from(error).0,
-                ))],
+                &[u64::from(
+                    xboxkrnl::RtlNtStatusToDosError(NtStatus::from(error)).0,
+                )],
             );
             return fail_writer();
         }
@@ -961,13 +997,14 @@ extern "C" fn writer_thread(_context: u32) -> u32 {
     if !write_prologue() {
         // Stock passes a stale register as the number.
         print(c"[LOP] Error! %d\n", &[0]);
-        kernel::NtClose(handle.0);
+        // SAFETY: `handle` was opened above and is closed once.
+        unsafe { xboxkrnl::NtClose(Handle::from_raw(handle.0)) };
         return fail_writer();
     }
     WRITER_STARTED.set();
     let last = &THREADS[last_processor()];
     while last.state.load(Ordering::Acquire) != STOPPING {
-        kernel::sleep_milliseconds(POLL_INTERVAL_MS);
+        sleep(Duration::from_millis(u64::from(POLL_INTERVAL_MS)));
         write_blocks();
     }
     while THREADS.iter().enumerate().any(|(processor, blocks)| {
@@ -975,7 +1012,7 @@ extern "C" fn writer_thread(_context: u32) -> u32 {
     }) {}
     write_blocks();
     let seconds =
-        kernel::timebase().wrapping_sub(start_timebase()) / kernel::performance_frequency();
+        Timebase::now().ticks().wrapping_sub(start_timebase()) / kernel::performance_frequency();
     set_header_time(
         header::END_TIME,
         seconds * FILETIME_PER_SECOND + header_time(header::START_TIME),
@@ -987,7 +1024,8 @@ extern "C" fn writer_thread(_context: u32) -> u32 {
     ) {
         report_fatal(c"[LOP] Fatal error. Error updating header file!\n");
     }
-    if (kernel::NtClose(handle.0) as i32) < 0 {
+    // SAFETY: `handle` was opened above and is closed once.
+    if (unsafe { xboxkrnl::NtClose(Handle::from_raw(handle.0)) }.0 as i32) < 0 {
         print(c"[LOP] Close handle failed!\n", &[]);
     }
     WRITER_FINISHED.set();
@@ -1001,18 +1039,9 @@ fn fail_writer() -> u32 {
     0
 }
 
-/// Kernel entry of [`writer_thread`], preserving the full nonvolatile
-/// registers.
-#[unsafe(naked)]
-extern "C" fn writer_thread_entry() {
-    core::arch::naked_asm!(
-        "lis 12, {routine}@ha",
-        "addi 12, 12, {routine}@l",
-        "b {bridge}",
-        routine = sym writer_thread,
-        bridge = sym crate::exports::export_bridge,
-    )
-}
+// Kernel entry of `writer_thread`, preserving the full nonvolatile
+// registers.
+crate::exports::bridged!(writer_thread_entry, writer_thread);
 
 /// Start the writer and wait until it has written the prologue (stock
 /// 0x91f8fcc0). The thread handle stays open, as in stock.
@@ -1027,16 +1056,20 @@ fn start_writer() -> bool {
     WRITER_FAILED.store(false, Ordering::Relaxed);
     let writer_processor = ProfilerFlags(FLAGS.load(Ordering::Relaxed)).writer_processor();
     let mut handle = 0u32;
-    let created = kernel::ExCreateThread(
-        &mut handle,
-        WRITER_STACK,
-        core::ptr::null_mut(),
-        0,
-        writer_thread_entry as *const () as usize as u32,
-        0,
-        (1u32 << writer_processor) << 24 | WRITER_FLAGS,
-    );
-    if (created as i32) < 0 {
+    // SAFETY: `handle` is a live u32; the writer takes no context and reads
+    // only static state.
+    let created = unsafe {
+        xboxkrnl::ExCreateThread(
+            &mut handle,
+            WRITER_STACK,
+            core::ptr::null_mut(),
+            0,
+            writer_thread_entry as *const () as usize as u32,
+            0,
+            ThreadCreationFlags::from_bits_retain((1u32 << writer_processor) << 24 | WRITER_FLAGS),
+        )
+    };
+    if (created.0 as i32) < 0 {
         return false;
     }
     if !WRITER_STARTED.wait() {
@@ -1100,7 +1133,8 @@ impl profiler::Engine for Sampler {
         }
         let mut statistics = [0u32; 0x68 / 4];
         statistics[0] = 0x68;
-        kernel::MmQueryStatistics(statistics.as_mut_ptr());
+        // SAFETY: `statistics` is a live block with its length word set.
+        unsafe { xboxkrnl::MmQueryStatistics(statistics.as_mut_ptr()) };
         header_word(header::VERSION).store(HEADER_VERSION, Ordering::Relaxed);
         header_word(header::PROCESSORS).store(flags.processors(), Ordering::Relaxed);
         for (index, &word) in TITLE_WORDS.iter().enumerate() {
@@ -1142,7 +1176,8 @@ impl profiler::Engine for Sampler {
             .filter(|&(_, &byte)| byte == b'\\')
         {
             if let Ok(handle) = filesystem::create_file(&path[..index], &request) {
-                kernel::NtClose(handle.0);
+                // SAFETY: `handle` was just opened and is closed once.
+                unsafe { xboxkrnl::NtClose(Handle::from_raw(handle.0)) };
             }
         }
     }
@@ -1165,8 +1200,8 @@ impl profiler::Engine for Sampler {
             print(c"[LOP] Prologue Failed!!!\n", &[]);
             return Err(ProfilerError::PrologueFailed);
         }
-        set_header_time(header::START_TIME, kernel::system_time());
-        let timebase = kernel::timebase();
+        set_header_time(header::START_TIME, FileTime::now().intervals());
+        let timebase = Timebase::now().ticks();
         START_TIMEBASE[0].store((timebase >> 32) as u32, Ordering::Relaxed);
         START_TIMEBASE[1].store(timebase as u32, Ordering::Relaxed);
         if !start_sampling(interval) {
@@ -1195,7 +1230,7 @@ impl profiler::Engine for Sampler {
 
     /// Stock 0x91f90370.
     fn info(&mut self) -> CpuProfilerInfo {
-        let elapsed = pmc::to_double(kernel::timebase().wrapping_sub(start_timebase()))
+        let elapsed = pmc::to_double(Timebase::now().ticks().wrapping_sub(start_timebase()))
             / pmc::to_double(kernel::performance_frequency());
         let last = last_processor();
         CpuProfilerInfo {

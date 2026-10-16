@@ -10354,6 +10354,97 @@ cargo.rust_library(
     deps = [":memchr-2"],
 )
 
+alias(
+    name = "xbox360",
+    actual = ":xbox360-0.1",
+    visibility = ["PUBLIC"],
+)
+
+cargo.http_archive(
+    name = "xbox360-0.1.0.crate",
+    sha256 = "c33dd22097eb0c02f644d5f2abe486c6b945a29fc8d26da59ec1cc93400d14f8",
+    strip_prefix = "xbox360-0.1.0",
+    urls = ["https://static.crates.io/crates/xbox360/0.1.0/download"],
+    visibility = [],
+)
+
+cargo.rust_library(
+    name = "xbox360-0.1",
+    srcs = [":xbox360-0.1.0.crate"],
+    crate = "xbox360",
+    crate_root = "xbox360-0.1.0.crate/src/lib.rs",
+    edition = "2024",
+    env = {
+        "CARGO_BIN_NAME": "xbox360",
+        "CARGO_CRATE_NAME": "xbox360",
+        "CARGO_MANIFEST_DIR": "xbox360-0.1.0.crate",
+        "CARGO_PKG_AUTHORS": "",
+        "CARGO_PKG_DESCRIPTION": "Safe Xbox 360 kernel and XAM interfaces for no_std code and for what std does not cover",
+        "CARGO_PKG_HOMEPAGE": "",
+        "CARGO_PKG_NAME": "xbox360",
+        "CARGO_PKG_README": "README.md",
+        "CARGO_PKG_REPOSITORY": "https://github.com/landaire/rust-xbox360",
+        "CARGO_PKG_RUST_VERSION": "1.95",
+        "CARGO_PKG_VERSION": "0.1.0",
+        "CARGO_PKG_VERSION_MAJOR": "0",
+        "CARGO_PKG_VERSION_MINOR": "1",
+        "CARGO_PKG_VERSION_PATCH": "0",
+        "CARGO_PKG_VERSION_PRE": "",
+    },
+    platform = {
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [":xbox360-sys-0.1"],
+)
+
+alias(
+    name = "xbox360-sys",
+    actual = ":xbox360-sys-0.1",
+    visibility = ["PUBLIC"],
+)
+
+cargo.http_archive(
+    name = "xbox360-sys-0.1.0.crate",
+    sha256 = "eaa7fd5031b4062a96cf18a4d32f7dec542745b9ffce5ed20977e3ba291bf878",
+    strip_prefix = "xbox360-sys-0.1.0",
+    urls = ["https://static.crates.io/crates/xbox360-sys/0.1.0/download"],
+    visibility = [],
+)
+
+cargo.rust_library(
+    name = "xbox360-sys-0.1",
+    srcs = [":xbox360-sys-0.1.0.crate"],
+    crate = "xbox360_sys",
+    crate_root = "xbox360-sys-0.1.0.crate/src/lib.rs",
+    edition = "2024",
+    env = {
+        "CARGO_BIN_NAME": "xbox360_sys",
+        "CARGO_CRATE_NAME": "xbox360_sys",
+        "CARGO_MANIFEST_DIR": "xbox360-sys-0.1.0.crate",
+        "CARGO_PKG_AUTHORS": "",
+        "CARGO_PKG_DESCRIPTION": "Raw Xbox 360 kernel and XAM bindings for the powerpc-unknown-xbox360 target",
+        "CARGO_PKG_HOMEPAGE": "",
+        "CARGO_PKG_NAME": "xbox360-sys",
+        "CARGO_PKG_README": "README.md",
+        "CARGO_PKG_REPOSITORY": "https://github.com/landaire/rust-xbox360",
+        "CARGO_PKG_RUST_VERSION": "1.95",
+        "CARGO_PKG_VERSION": "0.1.0",
+        "CARGO_PKG_VERSION_MAJOR": "0",
+        "CARGO_PKG_VERSION_MINOR": "1",
+        "CARGO_PKG_VERSION_PATCH": "0",
+        "CARGO_PKG_VERSION_PRE": "",
+    },
+    platform = {
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+)
+
 cargo.http_archive(
     name = "xecrypt-0.1.0.crate",
     sha256 = "6187cad56c43cd6a25bf4b6e69b1e478803273d02bc4c5f101cb862e5445644c",

@@ -22,6 +22,9 @@ use openxbdm_client::discovery::DiscoveryConfig;
 use openxbdm_client::discovery::discover_all;
 use openxbdm_client::discovery::find_by_name;
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::XbdmHresult;
+use openxbdm_core::status::xbdm_error;
+use openxbdm_core::status::xbdm_success;
 use openxbdm_server::ConnectionIndex;
 use openxbdm_server::commands::session::FileEventId;
 use openxbdm_server::commands::session::TellLogAreas;
@@ -205,21 +208,21 @@ fn status_lines_follow_the_line_builder() {
         host.backend
             .register_processor(
                 b"low",
-                Some(Box::new(|_, _| Hresult::success(0x64))),
+                Some(Box::new(|_, _| xbdm_success(0x64))),
                 ProcessorFlags::NONE,
             )
             .unwrap();
         host.backend
             .register_processor(
                 b"mid",
-                Some(Box::new(|_, _| Hresult::success(0xc8))),
+                Some(Box::new(|_, _| xbdm_success(0xc8))),
                 ProcessorFlags::NONE,
             )
             .unwrap();
         host.backend
             .register_processor(
                 b"bad",
-                Some(Box::new(|_, _| Hresult::error(0x96))),
+                Some(Box::new(|_, _| xbdm_error(0x96))),
                 ProcessorFlags::NONE,
             )
             .unwrap();

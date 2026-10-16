@@ -23,12 +23,23 @@ use openxbdm_server::commands::memory::TrackingFlags;
 use openxbdm_server::commands::memory::XexFieldError;
 use openxbdm_server::commands::memory::XexFieldKey;
 use openxbdm_server::text::Text;
+use xbox360::module::Ordinal;
+use xbox360::module::SystemModule;
+use xbox360::module::resolve_export;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::DebugMonitorService;
+use xbox360_sys::xboxkrnl::ExLoadedImageName;
+use xbox360_sys::xboxkrnl::Irql;
+use xbox360_sys::xboxkrnl::KspinLock;
+use xbox360_sys::xboxkrnl::PoolTag;
+use xbox360_sys::xboxkrnl::RtlAssert;
+use xbox360_sys::xboxkrnl::RtlImageDirectoryEntryToData;
+use xbox360_sys::xboxkrnl::RtlImageNtHeader;
+use xbox360_sys::xboxkrnl::RtlImageXexHeaderField;
+use xbox360_sys::xboxkrnl::XexExecutableModuleHandle;
 
 use super::Console;
 use crate::kernel;
-use crate::kernel::LIB_KERNEL;
-use crate::kernel::import_thunk;
-use crate::kernel::import_variable;
 
 mod detour;
 mod exports;
@@ -37,29 +48,6 @@ pub(crate) use exports::MODULE_RECORD_SHORT_SIZE;
 pub(crate) use exports::ModuleWalkError;
 pub(crate) use exports::get_module_debug_directory;
 pub(crate) use exports::next_module;
-
-import_thunk!(pub RtlImageNtHeader(base: u32) -> u32, lib = LIB_KERNEL, ordinal = 0x1a9);
-import_thunk!(
-    pub RtlImageDirectoryEntryToData(base: u32, mapped: u32, directory: u32, size: *mut u32) -> u32,
-    lib = LIB_KERNEL,
-    ordinal = 0x1a8
-);
-import_thunk!(pub(crate) RtlImageXexHeaderField(header: u32, key: u32) -> u32, lib = LIB_KERNEL, ordinal = 0x12b);
-import_thunk!(
-    pub(crate) RtlAssert(message: *const u8, file: *const u8, line: u32, extra: *const u8) -> u32,
-    lib = LIB_KERNEL,
-    ordinal = 0x118
-);
-import_variable!(
-    /// The running executable's module handle.
-    EXECUTABLE_MODULE_HANDLE,
-    lib = LIB_KERNEL,
-    ordinal = 403
-);
-import_variable!(
-    /// NUL-terminated object path of the running executable.
-    pub(crate) EXECUTABLE_PATH, lib = LIB_KERNEL, ordinal = 431
-);
 
 /// Debugger context the kernel fills for a writable mapping.
 const WRITE_CONTEXT_WORDS: usize = 14;
@@ -82,18 +70,16 @@ const DEBUG_DIRECTORY_ENTRY_SIZE: u32 = 0x1c;
 const SECTION_HEADER_SIZE: u32 = 0x28;
 const CODEVIEW_RSDS: u32 = u32::from_be_bytes(*b"RSDS");
 
-/// `ExDebugMonitorService` 8: debug-adjusted memory statistics.
-const DEBUG_MONITOR_MEMORY_STATISTICS: u32 = 8;
 /// Words of the service 8 reply, including its size and length header.
 const MEMORY_STATISTICS_REPLY_WORDS: usize = 0x90 / 4;
 /// Length of an `MmQueryStatistics` block.
 const MEMORY_STATISTICS_LENGTH: u32 = 0x68;
 
 /// Kernel export that configures import tracing for a module name.
-const TRACE_IMPORTS_ORDINAL: u32 = 0x2cf;
+const TRACE_IMPORTS_ORDINAL: Ordinal = Ordinal::new(0x2cf).unwrap();
 
 /// Pool tag of allocation tracking records ('xmem').
-const TRACKING_POOL_TAG: u32 = 0x6d65_6d78;
+const TRACKING_POOL_TAG: PoolTag = PoolTag::new(*b"memx");
 const TRACKING_ASSERT_FILE: &core::ffi::CStr =
     c"e:\\xenon\\xdksep13\\core\\private\\xdk\\tools\\debug\\xbdm\\core\\alloctrk.c";
 const TRACKING_ASSERT_LINE: u32 = 0x73;
@@ -104,12 +90,15 @@ const UNTRACK_ASSERT_LINE: u32 = 0xef;
 
 /// Stock asserts a null allocation pointer whatever the tracking flags.
 fn assert_allocation_pointer(line: u32) {
-    RtlAssert(
-        c"AllocPtr != NULL".as_ptr().cast(),
-        TRACKING_ASSERT_FILE.as_ptr().cast(),
-        line,
-        core::ptr::null(),
-    );
+    // SAFETY: both strings are static NUL-terminated literals.
+    unsafe {
+        RtlAssert(
+            c"AllocPtr != NULL".as_ptr().cast(),
+            TRACKING_ASSERT_FILE.as_ptr().cast(),
+            line,
+            core::ptr::null(),
+        )
+    };
 }
 
 /// A tracking hook call that did not fail.
@@ -186,20 +175,23 @@ pub(crate) fn initialize() {
 /// Holds the loader spin lock for its lifetime.
 struct LoaderLock {
     lock: u32,
-    irql: u32,
+    irql: Irql,
 }
 
 impl LoaderLock {
     fn acquire() -> Self {
         let lock = kernel::debug_monitor_data().loader_lock();
-        let irql = kernel::KfAcquireSpinLock(lock as usize as *mut u32);
+        // SAFETY: the debug monitor data holds the address of the kernel
+        // loader spin lock.
+        let irql = unsafe { xboxkrnl::KfAcquireSpinLock(lock as usize as *mut KspinLock) };
         Self { lock, irql }
     }
 }
 
 impl Drop for LoaderLock {
     fn drop(&mut self) {
-        kernel::KfReleaseSpinLock(self.lock as usize as *mut u32, self.irql);
+        // SAFETY: `acquire` took this lock at `self.irql`.
+        unsafe { xboxkrnl::KfReleaseSpinLock(self.lock as usize as *mut KspinLock, self.irql) };
     }
 }
 
@@ -276,7 +268,8 @@ fn nt_header(entry: u32) -> Option<u32> {
     if base == 0 {
         return None;
     }
-    Some(RtlImageNtHeader(base)).filter(|&header| header != 0)
+    // SAFETY: `base` is the image base of a loaded module entry.
+    Some(unsafe { RtlImageNtHeader(base) }).filter(|&header| header != 0)
 }
 
 /// Address of the section table after the NT header `header`.
@@ -317,20 +310,27 @@ fn tracking_diagnostic(arguments: core::fmt::Arguments<'_>) {
     let mut message = [0u8; TRACKING_MESSAGE_LIMIT + 1];
     message[..text.as_bytes().len()].copy_from_slice(text.as_bytes());
     if TRACKING.flags.load(Ordering::Relaxed) & TRACKING_ASSERT != 0 {
-        RtlAssert(
-            message.as_ptr(),
-            TRACKING_ASSERT_FILE.as_ptr().cast(),
-            TRACKING_ASSERT_LINE,
-            core::ptr::null(),
-        );
+        // SAFETY: `message` is NUL-terminated and the file name is a static literal.
+        unsafe {
+            RtlAssert(
+                message.as_ptr(),
+                TRACKING_ASSERT_FILE.as_ptr().cast(),
+                TRACKING_ASSERT_LINE,
+                core::ptr::null(),
+            )
+        };
     } else {
         // The message pointer goes in the first variadic argument slot, as
         // `kernel::debug_print` passes it.
-        kernel::DbgPrint(
-            c"DM: %s\n".as_ptr().cast(),
-            message.as_ptr() as usize as u32,
-            core::ptr::null(),
-        );
+        // SAFETY: the format is a static literal whose one `%s` takes the
+        // NUL-terminated `message`.
+        unsafe {
+            kernel::DbgPrint(
+                c"DM: %s\n".as_ptr().cast(),
+                message.as_ptr() as usize as u32,
+                core::ptr::null(),
+            )
+        };
     }
 }
 
@@ -452,7 +452,8 @@ fn track_allocation(address: u32, size: u32, kind: u16) -> TrackingResult {
         return Ok(Tracked::TypeNotTracked);
     }
     let length = record_length();
-    let record = kernel::ExAllocatePoolWithTag(length, TRACKING_POOL_TAG);
+    // SAFETY: pool allocation has no pointer arguments.
+    let record = unsafe { xboxkrnl::ExAllocatePoolWithTag(length, TRACKING_POOL_TAG) };
     if record == 0 {
         tracking_diagnostic(format_args!(
             "unable to allocate buffer for allocation tracking"
@@ -475,11 +476,13 @@ fn track_allocation(address: u32, size: u32, kind: u16) -> TrackingResult {
         };
     }
     let lock = TRACKING.lock.as_ptr();
-    let irql = kernel::KfAcquireSpinLock(lock);
+    // SAFETY: `lock` is the static tracking spin lock.
+    let irql = unsafe { xboxkrnl::KfAcquireSpinLock(lock.cast()) };
     write_unaligned_u32(record, TRACKING.head.load(Ordering::Relaxed));
     TRACKING.head.store(record, Ordering::Relaxed);
     TRACKING.count.fetch_add(1, Ordering::Relaxed);
-    kernel::KfReleaseSpinLock(lock, irql);
+    // SAFETY: the lock was acquired above at `irql`.
+    unsafe { xboxkrnl::KfReleaseSpinLock(lock.cast(), irql) };
     Ok(Tracked::Done)
 }
 
@@ -521,7 +524,8 @@ fn untrack_allocation(address: u32, size: u32, kind: u16) -> Untracked {
         return Untracked::Skipped(Ok(Tracked::TypeNotTracked));
     }
     let lock = TRACKING.lock.as_ptr();
-    let irql = kernel::KfAcquireSpinLock(lock);
+    // SAFETY: `lock` is the static tracking spin lock.
+    let irql = unsafe { xboxkrnl::KfAcquireSpinLock(lock.cast()) };
     let mut previous = None;
     let mut record = TRACKING.head.load(Ordering::Relaxed);
     while record != 0 && read_unaligned_u32(record + RECORD_ADDRESS) != address {
@@ -567,9 +571,11 @@ fn untrack_allocation(address: u32, size: u32, kind: u16) -> Untracked {
             Err(TrackingError::SizeMismatch)
         }
     };
-    kernel::KfReleaseSpinLock(lock, irql);
+    // SAFETY: the lock was acquired above at `irql`.
+    unsafe { xboxkrnl::KfReleaseSpinLock(lock.cast(), irql) };
     if release {
-        kernel::ExFreePool(record);
+        // SAFETY: the record is a pool block unlinked from the list above.
+        unsafe { xboxkrnl::ExFreePool(record) };
     }
     Untracked::Lookup(result)
 }
@@ -580,15 +586,16 @@ fn untrack_allocation(address: u32, size: u32, kind: u16) -> Untracked {
 pub(crate) fn service_get_module_proc_address(argument: u32) -> u32 {
     let name = read_u32(argument) as usize as *const u8;
     let mut module = 0u32;
-    if (kernel::XexGetModuleHandle(name, &mut module) as i32) < 0 {
+    // SAFETY: the caller passes a NUL-terminated module name; `module` is a
+    // live local.
+    if (unsafe { xboxkrnl::XexGetModuleHandle(name, &mut module) }.0 as i32) < 0 {
         return 0;
     }
     let mut address = 0u32;
-    if (kernel::XexGetProcedureAddress(module, read_u32(argument + 4), &mut address) as i32) < 0 {
-        0
-    } else {
-        address
-    }
+    // SAFETY: `module` was returned by the kernel; `address` is a live local.
+    let status =
+        unsafe { xboxkrnl::XexGetProcedureAddress(module, read_u32(argument + 4), &mut address) };
+    if (status.0 as i32) < 0 { 0 } else { address }
 }
 
 /// Debug monitor control code 0x86 (stock 0x91f3ba40 -> 0x91f330f0):
@@ -599,13 +606,16 @@ pub(crate) fn service_adjust_memory_statistics(argument: u32) -> u32 {
     let mut reply = [0u32; MEMORY_STATISTICS_REPLY_WORDS];
     reply[0] = (MEMORY_STATISTICS_REPLY_WORDS * 4) as u32;
     reply[1] = MEMORY_STATISTICS_LENGTH;
-    let status = kernel::ExDebugMonitorService(
-        DEBUG_MONITOR_MEMORY_STATISTICS,
-        reply.as_mut_ptr() as usize as u32,
-        0,
-        0,
-    );
-    if (status as i32) < 0 || reply[0] < (MEMORY_STATISTICS_REPLY_WORDS * 4) as u32 {
+    // SAFETY: `reply` is a live local of the length stored in its first word.
+    let status = unsafe {
+        xboxkrnl::ExDebugMonitorService(
+            DebugMonitorService::MemoryStatistics,
+            reply.as_mut_ptr() as usize as u32,
+            0,
+            0,
+        )
+    };
+    if (status.0 as i32) < 0 || reply[0] < (MEMORY_STATISTICS_REPLY_WORDS * 4) as u32 {
         return 0;
     }
     let length = read_u32(argument);
@@ -631,7 +641,8 @@ pub(crate) fn service_adjust_memory_statistics(argument: u32) -> u32 {
 
 /// Whether the debugger may read the page of `address`.
 fn debug_readable(address: u32) -> bool {
-    let mapped = kernel::MmDbgReadCheck(address);
+    // SAFETY: the kernel validates the address before it maps it.
+    let mapped = unsafe { xboxkrnl::MmDbgReadCheck(address) };
     mapped != 0 && !memory::is_device_address(mapped)
 }
 
@@ -648,19 +659,24 @@ fn read_debug_byte(address: u32) -> Option<u8> {
 /// instruction cache for it (0x91f26cb8 without breakpoints).
 fn write_debug_byte(address: u32, value: u8) -> bool {
     let mut context = [0u32; WRITE_CONTEXT_WORDS];
-    let mapped = kernel::MmDbgWriteCheck(address, context.as_mut_ptr());
+    // SAFETY: `context` is a live local of the size the kernel fills.
+    let mapped = unsafe { xboxkrnl::MmDbgWriteCheck(address, context.as_mut_ptr()) };
     if mapped == 0 {
         return false;
     }
     if memory::is_device_address(mapped) {
-        kernel::MmDbgReleaseAddress(mapped, context.as_mut_ptr());
+        // SAFETY: `mapped` and `context` come from `MmDbgWriteCheck` above.
+        unsafe { xboxkrnl::MmDbgReleaseAddress(mapped, context.as_mut_ptr()) };
         return false;
     }
     let pointer = mapped as usize as *mut u8;
-    // SAFETY: the kernel mapped the address writable for the debugger.
-    unsafe { core::ptr::write_volatile(pointer, value) };
-    kernel::KeSweepIcacheRange(pointer, 1);
-    kernel::MmDbgReleaseAddress(mapped, context.as_mut_ptr());
+    // SAFETY: the kernel mapped the address writable for the debugger;
+    // `mapped` and `context` come from `MmDbgWriteCheck` above.
+    unsafe {
+        core::ptr::write_volatile(pointer, value);
+        xboxkrnl::KeSweepIcacheRange(pointer, 1);
+        xboxkrnl::MmDbgReleaseAddress(mapped, context.as_mut_ptr());
+    }
     true
 }
 
@@ -687,12 +703,17 @@ fn code_view_of(base: u32) -> Option<CodeView> {
     let mut directory = 0u32;
     let mut size = 0u32;
     if list_has_base(data.module_list(), base) {
-        directory = RtlImageDirectoryEntryToData(base, 1, IMAGE_DIRECTORY_DEBUG, &mut size);
+        // SAFETY: `base` is a module in the loader list, held by the loader lock.
+        directory =
+            unsafe { RtlImageDirectoryEntryToData(base, true, IMAGE_DIRECTORY_DEBUG, &mut size) };
     }
     if directory == 0 || size == 0 {
         directory = 0;
         if list_has_base(data.secondary_module_list(), base) {
-            directory = RtlImageDirectoryEntryToData(base, 1, IMAGE_DIRECTORY_DEBUG, &mut size);
+            // SAFETY: `base` is a module in the loader list, held by the loader lock.
+            directory = unsafe {
+                RtlImageDirectoryEntryToData(base, true, IMAGE_DIRECTORY_DEBUG, &mut size)
+            };
         }
     }
     if directory == 0 || size == 0 {
@@ -733,7 +754,7 @@ fn code_view_of(base: u32) -> Option<CodeView> {
 
 impl memory::Backend for Console {
     fn is_address_valid(&mut self, address: u32) -> bool {
-        kernel::MmIsAddressValid(address) != 0
+        xboxkrnl::MmIsAddressValid(address).get()
     }
 
     fn read_byte(&mut self, address: u32) -> Option<u8> {
@@ -775,8 +796,10 @@ impl memory::Backend for Console {
             .nth(index.0 as usize)?;
         let base = read_u32(entry + ENTRY_BASE as u32);
         let mut pdata_size = 0u32;
-        let pdata =
-            RtlImageDirectoryEntryToData(base, 1, IMAGE_DIRECTORY_EXCEPTION, &mut pdata_size);
+        // SAFETY: `base` is a module image with an NT header, held by the loader lock.
+        let pdata = unsafe {
+            RtlImageDirectoryEntryToData(base, true, IMAGE_DIRECTORY_EXCEPTION, &mut pdata_size)
+        };
         Some(ModuleInfo {
             name: ModuleName::from_units(entry_name_units(entry)),
             base,
@@ -818,7 +841,10 @@ impl memory::Backend for Console {
     ) -> Result<u32, XexFieldError> {
         let _lock = LoaderLock::acquire();
         let entry = find_entry(module).ok_or(XexFieldError::NoSuchModule)?;
-        match RtlImageXexHeaderField(read_u32(entry + ENTRY_XEX_HEADER as u32), field.0) {
+        // SAFETY: the entry's XEX header stays mapped under the loader lock.
+        let value =
+            unsafe { RtlImageXexHeaderField(read_u32(entry + ENTRY_XEX_HEADER as u32), field.0) };
+        match value {
             0 => Err(XexFieldError::FieldAbsent),
             value => Ok(value),
         }
@@ -833,8 +859,10 @@ impl memory::Backend for Console {
     ) -> Result<(), XexFieldError> {
         let _lock = LoaderLock::acquire();
         let entry = find_entry(module).ok_or(XexFieldError::NoSuchModule)?;
-        let data = match RtlImageXexHeaderField(read_u32(entry + ENTRY_XEX_HEADER as u32), field.0)
-        {
+        // SAFETY: the entry's XEX header stays mapped under the loader lock.
+        let data =
+            unsafe { RtlImageXexHeaderField(read_u32(entry + ENTRY_XEX_HEADER as u32), field.0) };
+        let data = match data {
             0 => return Err(XexFieldError::FieldAbsent),
             data => data,
         };
@@ -851,18 +879,21 @@ impl memory::Backend for Console {
     }
 
     fn title_xex_dword(&mut self, field: XexFieldKey) -> Result<Option<u32>, NoSuchModule> {
-        let module = read_u32(EXECUTABLE_MODULE_HANDLE.load(Ordering::Relaxed));
+        let module = read_u32(XexExecutableModuleHandle.address());
         if module == 0 {
             return Err(NoSuchModule);
         }
-        match RtlImageXexHeaderField(read_u32(module + ENTRY_XEX_HEADER as u32), field.0) {
+        // SAFETY: the running executable's XEX header stays mapped while it runs.
+        let value =
+            unsafe { RtlImageXexHeaderField(read_u32(module + ENTRY_XEX_HEADER as u32), field.0) };
+        match value {
             0 => Ok(None),
             data => Ok(Some(read_u32(data))),
         }
     }
 
     fn running_executable_path(&mut self, output: &mut [u8]) -> usize {
-        let path = EXECUTABLE_PATH.load(Ordering::Relaxed);
+        let path = ExLoadedImageName.address();
         let mut length = 0;
         while length < output.len() {
             // SAFETY: the export is a NUL-terminated string the kernel owns.
@@ -885,10 +916,10 @@ impl memory::Backend for Console {
     }
 
     fn trace_imports(&mut self, module: &[u8], enable: bool) -> bool {
-        let Ok(kernel_module) = kernel::module_handle(c"xboxkrnl.exe") else {
+        let Ok(kernel_module) = SystemModule::Kernel.handle() else {
             return false;
         };
-        let Ok(function) = kernel::resolve_export(kernel_module, TRACE_IMPORTS_ORDINAL) else {
+        let Ok(function) = resolve_export(kernel_module, TRACE_IMPORTS_ORDINAL) else {
             return false;
         };
         let mut name = [0u8; 0x104];
@@ -897,7 +928,7 @@ impl memory::Backend for Console {
         // SAFETY: the export takes a module name and an enable flag.
         unsafe {
             kernel::call_export(
-                function,
+                function.raw(),
                 name.as_ptr() as usize as u32,
                 u32::from(enable),
                 0,
@@ -929,7 +960,7 @@ impl memory::Backend for Console {
     }
 
     fn dos_error_from_nt_status(&mut self, error: KernelError) -> Option<Win32Error> {
-        Win32Error::new(kernel::RtlNtStatusToDosError(NtStatus::from(error).0))
+        xboxkrnl::RtlNtStatusToDosError(NtStatus::from(error)).error()
     }
 
     fn detour(

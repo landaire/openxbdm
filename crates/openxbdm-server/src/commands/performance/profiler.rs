@@ -9,6 +9,7 @@ use core::sync::atomic::AtomicBool;
 use core::sync::atomic::Ordering;
 
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::xbdm_error;
 
 use super::CpuProfilerInfo;
 use crate::reply::CommandError;
@@ -38,7 +39,7 @@ pub enum ProfilerError {
 
 impl From<ProfilerError> for Hresult {
     fn from(error: ProfilerError) -> Self {
-        Hresult::error(match error {
+        xbdm_error(match error {
             ProfilerError::AlreadyRunning => 0x19,
             ProfilerError::NotRunning => 0x18,
             ProfilerError::Suspended => 0x27,

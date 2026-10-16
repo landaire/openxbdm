@@ -18,6 +18,7 @@ use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::Win32Error;
+use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::Server;
 use openxbdm_server::commands::filesystem::DriveTable;
 use openxbdm_server::commands::filesystem::FileHandle;
@@ -39,6 +40,25 @@ use openxbdm_server::commands::performance::capture::Started;
 use openxbdm_server::reply;
 use openxbdm_server::reply::CommandError;
 use openxbdm_server::reply::Reply;
+use xbox360_sys::export_raw;
+use xbox360_sys::processor;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::AnsiString;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::DebugMonitorService;
+use xbox360_sys::xboxkrnl::FileAttributes;
+use xbox360_sys::xboxkrnl::FileInformationClass;
+use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::IoStatusBlock;
+use xbox360_sys::xboxkrnl::KeIpiGenericCall;
+use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
+use xbox360_sys::xboxkrnl::ObjectAttributes;
+use xbox360_sys::xboxkrnl::PageProtection;
+use xbox360_sys::xboxkrnl::RtlAssert;
+use xbox360_sys::xboxkrnl::RtlImageXexHeaderField;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
 use super::counters;
 use super::module_snapshot;
@@ -46,16 +66,9 @@ use super::pix;
 use super::pmc;
 use super::pmc::Owner;
 use crate::backend::Console;
-use crate::backend::debugger::KeIpiGenericCall;
 use crate::backend::dispatcher;
-use crate::backend::memory::RtlAssert;
-use crate::backend::memory::RtlImageXexHeaderField;
 use crate::exports::export;
-use crate::exports::export_raw;
 use crate::kernel;
-use crate::kernel::AnsiString;
-use crate::kernel::IoStatusBlock;
-use crate::kernel::ObjectAttributes;
 use crate::net::XamNetwork;
 
 /// Memory controller counter block (selectors 0x11 to 0x13).
@@ -81,15 +94,8 @@ const MEMORY_TYPE: u32 = 1;
 const PAGE_READWRITE: u32 = 4;
 const BUFFER_PROTECT: u32 = 0x404;
 const PAGE_SIZE: u32 = 0x1000;
-/// File access, attributes, share, disposition, and options of the
-/// capture file (stock 0x91f2eb68 callers).
-const FILE_ACCESS: u32 = 0x4010_0000;
-const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
-const FILE_SHARE_READ: u32 = 1;
-const FILE_OVERWRITE_IF: u32 = 5;
-const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
-const FILE_END_OF_FILE_INFORMATION: u32 = 0x14;
-const FILE_ALLOCATION_INFORMATION: u32 = 0x13;
+/// Access of the capture file (stock 0x91f2eb68 callers).
+const FILE_ACCESS: AccessMask = AccessMask::SYNCHRONIZE.union(AccessMask::GENERIC_WRITE);
 /// Loader data table entry: XEX header pointer.
 const ENTRY_XEX_HEADER: u32 = 0x58;
 /// Processor control region: processor number.
@@ -206,12 +212,12 @@ fn write(address: u32, value: u32) {
 fn current_processor() -> usize {
     // SAFETY: the processor control region is always mapped.
     usize::from(unsafe {
-        core::ptr::read_volatile((kernel::pcr() + PCR_PROCESSOR) as usize as *const u8)
+        core::ptr::read_volatile((processor::pcr() + PCR_PROCESSOR) as usize as *const u8)
     })
 }
 
 fn current_thread_id() -> u32 {
-    read(kernel::current_thread() + THREAD_ID)
+    read(processor::current_thread() + THREAD_ID)
 }
 
 fn timebase_low() -> u32 {
@@ -260,6 +266,13 @@ fn swap_routine_slot() -> Option<u32> {
         slot => Some(slot),
     }
 }
+
+use core::time::Duration;
+
+use xbox360::time::FileTime;
+use xbox360::time::TickCount;
+use xbox360::time::Timebase;
+use xbox360::time::sleep;
 
 use crate::exports::bridged;
 
@@ -609,7 +622,9 @@ extern "C" fn reset_on_processor(_context: u32) -> u32 {
 bridged!(reset_on_processor_entry, reset_on_processor);
 
 fn on_every_processor(routine: unsafe extern "C" fn(), context: u32) {
-    KeIpiGenericCall(routine as *const () as usize as u32, context);
+    // SAFETY: `routine` is a bridged IPI entry of this image that reads only
+    // static state; `context` is passed through.
+    unsafe { KeIpiGenericCall(routine as *const () as usize as u32, context) };
 }
 
 /// Buffers exist and the lowest recording processor has not stopped.
@@ -621,11 +636,22 @@ fn recording() -> bool {
 }
 
 fn allocate(size: u32, protect: u32) -> u32 {
-    kernel::MmAllocatePhysicalMemoryEx(MEMORY_TYPE, size, protect, 0, u32::MAX, PAGE_SIZE)
+    // SAFETY: physical allocation of the requested size; callers check the result.
+    unsafe {
+        xboxkrnl::MmAllocatePhysicalMemoryEx(
+            MEMORY_TYPE,
+            size,
+            PageProtection::from_bits_retain(protect),
+            0,
+            u32::MAX,
+            PAGE_SIZE,
+        )
+    }
 }
 
 fn free(address: u32) {
-    kernel::MmFreePhysicalMemory(MEMORY_TYPE, address);
+    // SAFETY: callers pass a buffer from `allocate`, or 0, that is no longer used.
+    unsafe { xboxkrnl::MmFreePhysicalMemory(MEMORY_TYPE, address) };
 }
 
 /// Restore the thread switch routine replaced at start.
@@ -660,51 +686,60 @@ fn release_buffers() {
 
 fn file_attributes(name: &AnsiString) -> ObjectAttributes {
     ObjectAttributes {
-        root_directory: 0,
+        root_directory: Handle::NULL,
         object_name: name,
-        attributes: kernel::OBJ_CASE_INSENSITIVE,
+        attributes: ObjectAttributeFlags::CASE_INSENSITIVE,
     }
 }
 
 /// Create (overwrite) the capture file `path`.
 fn create_file(path: &[u8]) -> Result<FileHandle, KernelError> {
-    let name = AnsiString::new(path);
+    let name = kernel::ansi_string(path);
     let attributes = file_attributes(&name);
     let mut handle = 0u32;
     let mut io_status = IoStatusBlock::default();
-    NtStatus(kernel::NtCreateFile(
-        &mut handle,
-        FILE_ACCESS,
-        &attributes,
-        &mut io_status,
-        core::ptr::null(),
-        FILE_ATTRIBUTE_NORMAL,
-        FILE_SHARE_READ,
-        FILE_OVERWRITE_IF,
-        FILE_SYNCHRONOUS_IO_NONALERT,
-    ))
-    .result()?;
+    // SAFETY: `handle`, `attributes`, the name it refers to, and `io_status`
+    // are live for the call.
+    let status = unsafe {
+        xboxkrnl::NtCreateFile(
+            (&raw mut handle).cast(),
+            FILE_ACCESS,
+            &attributes,
+            &mut io_status,
+            core::ptr::null(),
+            FileAttributes::NORMAL,
+            ShareAccess::READ,
+            CreateDisposition::OverwriteIf,
+            CreateOptions::SYNCHRONOUS_IO_NONALERT,
+        )
+    };
+    status.result()?;
     Ok(FileHandle(handle))
 }
 
 fn delete_file(path: &[u8]) {
-    let name = AnsiString::new(path);
-    kernel::NtDeleteFile(&file_attributes(&name));
+    let name = kernel::ansi_string(path);
+    // SAFETY: the attributes and the name they refer to are live for the call.
+    unsafe { xboxkrnl::NtDeleteFile(&file_attributes(&name)) };
 }
 
 fn write_file(handle: FileHandle, address: u32, length: u32) -> Result<(), KernelError> {
     let mut io_status = IoStatusBlock::default();
-    NtStatus(kernel::NtWriteFile(
-        handle.0,
-        0,
-        0,
-        0,
-        &mut io_status,
-        address as usize as *const u8,
-        length,
-        core::ptr::null(),
-    ))
-    .result()
+    // SAFETY: `handle` is the open capture file; `io_status` and the
+    // `length` bytes at `address` are live for the synchronous call.
+    let status = unsafe {
+        xboxkrnl::NtWriteFile(
+            Handle::from_raw(handle.0),
+            Handle::NULL,
+            0,
+            0,
+            &mut io_status,
+            address as usize as *const u8,
+            length,
+            core::ptr::null(),
+        )
+    };
+    status.result()
 }
 
 /// A recorded chunk of one processor, or `None` after printing `message`
@@ -757,34 +792,44 @@ fn write_capture(handle: FileHandle, snapshot: u32) -> Result<(), KernelError> {
             };
             total = total.wrapping_add(end - start);
             if start & (PAGE_SIZE - 1) != 0 {
-                RtlAssert(
-                    ASSERT_PAGE_ALIGNED.as_ptr(),
-                    ASSERT_FILE.as_ptr(),
-                    ASSERT_PAGE_ALIGNED_LINE,
-                    core::ptr::null(),
-                );
+                // SAFETY: the assertion strings are static and NUL-terminated.
+                unsafe {
+                    RtlAssert(
+                        ASSERT_PAGE_ALIGNED.as_ptr(),
+                        ASSERT_FILE.as_ptr(),
+                        ASSERT_PAGE_ALIGNED_LINE,
+                        core::ptr::null(),
+                    )
+                };
             }
             write_file(handle, start, end - start)?;
         }
     }
     let size = u64::from(total.wrapping_add(capture::FILE_HEADER_SIZE)).to_be_bytes();
     let mut io_status = IoStatusBlock::default();
-    NtStatus(kernel::NtSetInformationFile(
-        handle.0,
-        &mut io_status,
-        size.as_ptr(),
-        8,
-        FILE_END_OF_FILE_INFORMATION,
-    ))
-    .result()?;
-    NtStatus(kernel::NtSetInformationFile(
-        handle.0,
-        &mut io_status,
-        size.as_ptr(),
-        8,
-        FILE_ALLOCATION_INFORMATION,
-    ))
-    .result()
+    // SAFETY: `handle` is the open capture file; `io_status` and the 8-byte
+    // `size` are live.
+    let status = unsafe {
+        xboxkrnl::NtSetInformationFile(
+            Handle::from_raw(handle.0),
+            &mut io_status,
+            size.as_ptr(),
+            8,
+            FileInformationClass::EndOfFile,
+        )
+    };
+    status.result()?;
+    // SAFETY: as above.
+    let status = unsafe {
+        xboxkrnl::NtSetInformationFile(
+            Handle::from_raw(handle.0),
+            &mut io_status,
+            size.as_ptr(),
+            8,
+            FileInformationClass::Allocation,
+        )
+    };
+    status.result()
 }
 
 /// The capture engine over this module's state.
@@ -794,25 +839,37 @@ impl capture::Engine for Engine {
     /// Stock 0x91f28ae0: the first loader list only, under the loader lock.
     fn instrumented(&mut self, kind: Instrumentation) -> bool {
         let data = kernel::debug_monitor_data();
-        let lock = data.loader_lock() as usize as *mut u32;
-        let irql = kernel::KfAcquireSpinLock(lock);
+        let lock = data.loader_lock() as usize as *mut _;
+        // SAFETY: the loader lock lives in the kernel debug monitor data.
+        let irql = unsafe { xboxkrnl::KfAcquireSpinLock(lock) };
         let head = data.module_list();
         let mut entry = read(head);
         let mut found = false;
         while entry != head {
             let header = read(entry + ENTRY_XEX_HEADER);
-            if header != 0 && RtlImageXexHeaderField(header, kind.header_field()) != 0 {
+            // SAFETY: `header` is the XEX header of a loaded module.
+            if header != 0 && unsafe { RtlImageXexHeaderField(header, kind.header_field()) } != 0 {
                 found = true;
                 break;
             }
             entry = read(entry);
         }
-        kernel::KfReleaseSpinLock(lock, irql);
+        // SAFETY: acquired above at `irql`.
+        unsafe { xboxkrnl::KfReleaseSpinLock(lock, irql) };
         found
     }
 
     fn set_kernel_call_cap(&mut self, enable: bool) -> Result<(), KernelError> {
-        NtStatus(kernel::ExDebugMonitorService(2, u32::from(enable), 0, 0)).result()
+        // SAFETY: the service takes no pointers.
+        let status = unsafe {
+            xboxkrnl::ExDebugMonitorService(
+                DebugMonitorService::KernelCallCapture,
+                u32::from(enable),
+                0,
+                0,
+            )
+        };
+        status.result()
     }
 
     fn set_title_terminated(&mut self, terminated: bool) {
@@ -833,10 +890,10 @@ impl capture::Engine for Engine {
             return Err(CaptureError::TitleCaptureFailed);
         };
         write(control, read(control) | 0x100);
-        let start = kernel::tick_count();
+        let start = TickCount::now().milliseconds();
         loop {
-            kernel::sleep_milliseconds(TITLE_CAPTURE_POLL_MS);
-            if kernel::tick_count().wrapping_sub(start) > TITLE_CAPTURE_TIMEOUT_MS {
+            sleep(Duration::from_millis(u64::from(TITLE_CAPTURE_POLL_MS)));
+            if TickCount::now().milliseconds().wrapping_sub(start) > TITLE_CAPTURE_TIMEOUT_MS {
                 return Err(CaptureError::TitleCaptureFailed);
             }
             let request = counters::title_capture_request();
@@ -992,7 +1049,7 @@ impl capture::Engine for Engine {
             }
         }
         restore_interrupts(state);
-        store_pair(&START_TIMEBASE, kernel::timebase());
+        store_pair(&START_TIMEBASE, Timebase::now().ticks());
         on_every_processor(
             start_on_processor_entry,
             &raw const arguments as usize as u32,
@@ -1029,7 +1086,11 @@ impl capture::Engine for Engine {
             LOCK.store(0, Ordering::Release);
             return Err(CaptureError::NoCapture);
         }
-        if kernel::timebase().wrapping_sub(load_pair(&START_TIMEBASE)) > TIMEBASE_LIMIT {
+        if Timebase::now()
+            .ticks()
+            .wrapping_sub(load_pair(&START_TIMEBASE))
+            > TIMEBASE_LIMIT
+        {
             LOCK.store(0, Ordering::Release);
             return Err(CaptureError::TooLong);
         }
@@ -1117,7 +1178,8 @@ impl capture::Engine for Engine {
             }
             Some(snapshot) => write_capture(handle, snapshot.address()),
         };
-        kernel::NtClose(handle.0);
+        // SAFETY: `handle` was opened by `create_file` above and is closed once.
+        unsafe { xboxkrnl::NtClose(Handle::from_raw(handle.0)) };
         if let Some(snapshot) = snapshot {
             module_snapshot::free(snapshot);
         }
@@ -1126,7 +1188,7 @@ impl capture::Engine for Engine {
     }
 
     fn dos_error(&mut self, error: KernelError) -> Option<Win32Error> {
-        Win32Error::new(kernel::RtlNtStatusToDosError(NtStatus::from(error).0))
+        xboxkrnl::RtlNtStatusToDosError(NtStatus::from(error)).error()
     }
 
     /// Stock 0x91f28a10 after the flags: the buffers are forgotten, not
@@ -1186,7 +1248,7 @@ pub(super) fn start(
     buffer: BufferRequest,
 ) -> Result<Started, CaptureError> {
     delete_file(path);
-    store_pair(&START_TIME, kernel::system_time());
+    store_pair(&START_TIME, FileTime::now().intervals());
     capture::start(&mut Engine, name, buffer, true)
 }
 
@@ -1200,10 +1262,11 @@ fn start_for_title(
     if !recording() {
         let path = paths.object_path(name).ok_or(CaptureError::FileFailed)?;
         let handle = create_file(path.as_bytes()).map_err(|_| CaptureError::FileFailed)?;
-        kernel::NtClose(handle.0);
+        // SAFETY: `handle` was just opened by `create_file` and is closed once.
+        unsafe { xboxkrnl::NtClose(Handle::from_raw(handle.0)) };
         delete_file(path.as_bytes());
     }
-    store_pair(&START_TIME, kernel::system_time());
+    store_pair(&START_TIME, FileTime::now().intervals());
     capture::start(&mut Engine, name, buffer, false)
 }
 

@@ -7,6 +7,7 @@ use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::Win32Error;
+use openxbdm_core::status::xbdm_error;
 
 use self::capture_file::CaptureFileError;
 use super::NetworkError;
@@ -224,8 +225,8 @@ pub enum StartError {
 impl From<StartError> for Hresult {
     fn from(error: StartError) -> Self {
         match error {
-            StartError::AlreadyCapturing => Hresult::error(0x08),
-            StartError::InterceptBusy => Hresult::error(0x10),
+            StartError::AlreadyCapturing => xbdm_error(0x08),
+            StartError::InterceptBusy => xbdm_error(0x10),
             StartError::Intercept(error) => intercept_result(error),
             StartError::Open(error) => capture_result(error),
         }
@@ -294,8 +295,10 @@ fn capture_result(error: CaptureFileError) -> Hresult {
 /// negative intercept value with that bit reads as a kernel status.
 fn intercept_result(error: WsaError) -> Hresult {
     let result = Hresult::from(Win32Error::from(error));
-    if result.is_failure() && result.0 & 0x1000_0000 != 0 {
-        let status = KernelError::from_status(NtStatus(result.0 & !0x1000_0000));
+    if result.is_failure()
+        && result.0 & 0x1000_0000 != 0
+        && let Some(status) = KernelError::from_status(NtStatus(result.0 & !0x1000_0000))
+    {
         capture_result(CaptureFileError::Kernel(status))
     } else {
         result
@@ -431,9 +434,9 @@ mod tests {
     fn kernel_failures_map_through_the_status_table() {
         assert_eq!(
             capture_result(CaptureFileError::Kernel(KernelError::ObjectNameCollision)),
-            Hresult::from_error_code(ErrorCode::FileAlreadyExists)
+            ErrorCode::FileAlreadyExists.hresult()
         );
-        let unlisted = KernelError::from_status(NtStatus(0xc000_0010));
+        let unlisted = KernelError::from_status(NtStatus(0xc000_0010)).unwrap();
         assert_eq!(
             capture_result(CaptureFileError::Kernel(unlisted)),
             Hresult(0xd000_0010)

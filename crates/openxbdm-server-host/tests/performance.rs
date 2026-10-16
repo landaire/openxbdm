@@ -11,6 +11,7 @@ use common::run;
 use openxbdm_client::commands::PerfCounterList;
 use openxbdm_client::commands::QueryPerfCounter;
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::commands::performance::CpuProfilerInfo;
 use openxbdm_server::commands::performance::DisplayInformation;
 use openxbdm_server::commands::performance::PixDogma;

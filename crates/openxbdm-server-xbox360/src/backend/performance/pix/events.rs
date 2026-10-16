@@ -5,9 +5,10 @@
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
+use xbox360_sys::processor;
+
 use super::plugin;
 use super::ring;
-use crate::kernel;
 
 /// Event types with a callback slot.
 const FIRST_TYPE: u32 = 2;
@@ -113,7 +114,7 @@ pub(crate) fn service_release_owner(callback: u32) -> u32 {
 /// Monitor control code 0x3c (stock 0x91f56010): the slot of the calling
 /// hardware thread, with `+0` pointing at the shared flags word.
 pub(crate) fn service_thread_slot(_argument: u32) -> u32 {
-    let thread = kernel::current_thread();
+    let thread = processor::current_thread();
     let hardware_thread = usize::from(super::read_u8(thread + 0xbf));
     // Stock asserts and indexes past the table for other values; the
     // kernel only runs six hardware threads.

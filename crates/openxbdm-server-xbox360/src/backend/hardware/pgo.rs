@@ -12,7 +12,7 @@ use core::sync::atomic::Ordering;
 use core::sync::atomic::fence;
 
 use openxbdm_core::status::Hresult;
-use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::Server;
 use openxbdm_server::commands::filesystem::CreateDisposition;
 use openxbdm_server::commands::filesystem::CreateOptions;
@@ -40,83 +40,50 @@ use openxbdm_server::commands::hardware::pgo::TreeDescriptor;
 use openxbdm_server::commands::hardware::pgo::WidePath;
 use openxbdm_server::commands::hardware::pgo::WriteWarning;
 use openxbdm_server::commands::hardware::pgo::block;
+use xbox360::status::last_error;
+use xbox360::status::set_last_error;
+use xbox360::status::set_last_error_value;
+use xbox360::time::FileTime;
+use xbox360_sys::export_raw;
+use xbox360_sys::processor;
+use xbox360_sys::xam;
+use xbox360_sys::xam::DuplicateHandle;
+use xbox360_sys::xam::DuplicateOptions;
+use xbox360_sys::xam::GetCurrentThreadId;
+use xbox360_sys::xam::GetProcessHeap;
+use xbox360_sys::xam::ResetEvent;
+use xbox360_sys::xam::RtlAllocateHeap;
+use xbox360_sys::xam::RtlFreeHeap;
+use xbox360_sys::xam::WaitResult;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::AllocationType;
+use xbox360_sys::xboxkrnl::FileInformationClass;
+use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::IoStatusBlock;
+use xbox360_sys::xboxkrnl::KeBugCheck;
+use xbox360_sys::xboxkrnl::KeTlsAlloc;
+use xbox360_sys::xboxkrnl::KeTlsGetValue;
+use xbox360_sys::xboxkrnl::KeTlsSetValue;
+use xbox360_sys::xboxkrnl::PageProtection;
+use xbox360_sys::xboxkrnl::ProcessorMode;
+use xbox360_sys::xboxkrnl::TlsIndex;
+use xbox360_sys::xboxkrnl::XexPcToFileHeader;
 
 use super::super::Console;
 use super::super::debugger;
 use super::super::dispatcher;
 use super::super::filesystem;
 use crate::exports::export;
-use crate::exports::export_raw;
 use crate::kernel;
 use crate::kernel::CriticalSection;
-use crate::kernel::IoStatusBlock;
-use crate::kernel::LIB_KERNEL;
-use crate::kernel::LIB_XAM;
-use crate::kernel::import_thunk;
 use crate::net::XamNetwork;
-
-import_thunk!(
-    KeBugCheck(code: u32) -> u32,
-    lib = LIB_KERNEL,
-    ordinal = 0x52
-);
-import_thunk!(KeTlsAlloc() -> u32, lib = LIB_KERNEL, ordinal = 0x152);
-import_thunk!(
-    KeTlsGetValue(index: u32) -> u32,
-    lib = LIB_KERNEL,
-    ordinal = 0x154
-);
-import_thunk!(
-    KeTlsSetValue(index: u32, value: u32) -> u32,
-    lib = LIB_KERNEL,
-    ordinal = 0x155
-);
-import_thunk!(
-    XexPcToFileHeader(address: u32, entry: *mut u32) -> u32,
-    lib = LIB_KERNEL,
-    ordinal = 0x19c
-);
-import_thunk!(GetProcessHeap() -> u32, lib = LIB_XAM, ordinal = 0x7d2);
-import_thunk!(
-    RtlAllocateHeap(heap: u32, flags: u32, size: u32) -> u32,
-    lib = LIB_XAM,
-    ordinal = 0x3fc
-);
-import_thunk!(
-    RtlFreeHeap(heap: u32, flags: u32, block: u32) -> u32,
-    lib = LIB_XAM,
-    ordinal = 0x3ff
-);
-import_thunk!(
-    DuplicateHandle(
-        source_process: u32,
-        source: u32,
-        target_process: u32,
-        target: *mut u32,
-        access: u32,
-        inherit: u32,
-        options: u32,
-    ) -> u32,
-    lib = LIB_XAM,
-    ordinal = 0x45b
-);
-use crate::kernel::GetCurrentThreadId;
-import_thunk!(
-    ResetEvent(event: u32) -> u32,
-    lib = LIB_XAM,
-    ordinal = 0x42b
-);
 
 /// KMODE_EXCEPTION_NOT_HANDLED, the code of every runtime failure.
 const BUG_CHECK_CODE: u32 = 0x1e;
 const INFINITE: u32 = u32::MAX;
 const HEAP_ZERO_MEMORY: u32 = 8;
-const MEM_COMMIT: u32 = 0x1000;
-const PAGE_READWRITE: u32 = 4;
 const STATUS_PENDING: u32 = 0x103;
-const FILE_POSITION_INFORMATION: u32 = 0xe;
-const CURRENT_THREAD: u32 = 0xffff_fffe;
-const DUPLICATE_SAME_ACCESS: u32 = 2;
 /// FILE_READ_ATTRIBUTES, added to both profile opens.
 const READ_ATTRIBUTES: u32 = 0x80;
 
@@ -326,16 +293,13 @@ fn write_units(address: u32, units: &[u16]) {
 /// Whether the calling thread belongs to the title process (stock
 /// 0x91f713b8: current thread +0x72 is 1); other threads get no record.
 fn title_thread() -> bool {
-    read8(kernel::current_thread() + 0x72) == 1
+    read8(processor::current_thread() + 0x72) == 1
 }
 
 /// Print a failure and stop the console (0x91f74280, then KeBugCheck).
 fn fatal(failure: Fatal) -> ! {
     kernel::debug_print_bytes(failure.text().as_bytes());
-    KeBugCheck(BUG_CHECK_CODE);
-    loop {
-        core::hint::spin_loop();
-    }
+    KeBugCheck(BUG_CHECK_CODE)
 }
 
 fn warn(warning: WriteWarning) {
@@ -444,7 +408,7 @@ fn locked_node_of_block(block: u32) -> Node {
 /// treated as that fault.
 fn store_entry(record: u32, table: u32, index: u32, value: u32) -> bool {
     let address = table.wrapping_add(4 * index);
-    if kernel::MmIsAddressValid(address) == 0 {
+    if !xboxkrnl::MmIsAddressValid(address).get() {
         write8(record + node::DEAD, 1);
         return false;
     }
@@ -500,12 +464,14 @@ fn lose(block: u32) {
 
 fn sleep_zero() {
     let interval = 0i64;
-    kernel::KeDelayExecutionThread(1, 0, &interval);
+    // SAFETY: `interval` is a live local.
+    unsafe { xboxkrnl::KeDelayExecutionThread(ProcessorMode::User, false, &interval) };
 }
 
 fn close_handle(handle: u32) -> bool {
-    if let Err(error) = NtStatus(kernel::NtClose(handle)).result() {
-        kernel::set_last_error(error);
+    // SAFETY: callers pass a handle they own and close once.
+    if let Err(error) = unsafe { xboxkrnl::NtClose(Handle::from_raw(handle)) }.result() {
+        set_last_error(error);
         return false;
     }
     true
@@ -528,8 +494,14 @@ fn enter_probe(block: u32, record: Option<u32>) -> bool {
         let Some(record) = record else {
             return false;
         };
-        write32(record + thread::STATE, kernel::pcr());
-        kernel::WaitForSingleObject(SWEEP_EVENT.load(Ordering::Acquire), INFINITE);
+        write32(record + thread::STATE, processor::pcr());
+        // SAFETY: SWEEP_EVENT holds the event created at startup.
+        unsafe {
+            xam::WaitForSingleObject(
+                Handle::from_raw(SWEEP_EVENT.load(Ordering::Acquire)),
+                INFINITE,
+            )
+        };
         write32(record + thread::STATE, record);
         fence(Ordering::Release);
     }
@@ -538,7 +510,7 @@ fn enter_probe(block: u32, record: Option<u32>) -> bool {
 
 fn leave_probe(block: u32, record: Option<u32>) {
     match record {
-        Some(record) => write32(record + thread::STATE, kernel::pcr()),
+        Some(record) => write32(record + thread::STATE, processor::pcr()),
         None => {
             fetch_add(block + block::UNTRACKED, u32::MAX);
         }
@@ -551,30 +523,35 @@ fn thread_record(block: u32) -> Option<u32> {
         return None;
     }
     let index = TLS_INDEX.load(Ordering::Acquire);
-    let existing = KeTlsGetValue(index);
+    let existing = KeTlsGetValue(TlsIndex(index));
     if existing != 0 {
         return Some(existing);
     }
-    let record = RtlAllocateHeap(GetProcessHeap(), 0, thread::SIZE);
+    // SAFETY: the process heap takes a size only.
+    let record = unsafe { RtlAllocateHeap(GetProcessHeap(), 0, thread::SIZE) };
     if record == 0 {
         fatal(Fatal::ThreadListAllocation);
     }
     write32(record + thread::STATE, 0);
     write32(record + thread::ID, GetCurrentThreadId());
-    let mut handle = 0u32;
-    if DuplicateHandle(
-        0,
-        CURRENT_THREAD,
-        0,
-        &mut handle,
-        0,
-        0,
-        DUPLICATE_SAME_ACCESS,
-    ) == 0
+    let mut handle = Handle::NULL;
+    // SAFETY: `handle` is a local handle slot.
+    if !unsafe {
+        DuplicateHandle(
+            Handle::NULL,
+            Handle::CURRENT_THREAD,
+            Handle::NULL,
+            &mut handle,
+            AccessMask::empty(),
+            false,
+            DuplicateOptions::SAME_ACCESS,
+        )
+    }
+    .get()
     {
         fatal(Fatal::ThreadHandle);
     }
-    write32(record + thread::HANDLE, handle);
+    write32(record + thread::HANDLE, handle.raw());
     fetch_add(block + block::THREADS, 1);
     loop {
         let head = THREADS.load(Ordering::Acquire);
@@ -586,7 +563,8 @@ fn thread_record(block: u32) -> Option<u32> {
             break;
         }
     }
-    KeTlsSetValue(index, record);
+    // SAFETY: `index` is the slot allocated at startup.
+    unsafe { KeTlsSetValue(TlsIndex(index), record) };
     Some(record)
 }
 
@@ -598,12 +576,13 @@ fn acquire(block: u32) -> (Option<u32>, bool) {
 /// Leave the probe ahead of a sweep (0x91f6c618).
 fn release_for_sweep(block: u32) -> Option<u32> {
     let record = if title_thread() {
-        Some(KeTlsGetValue(TLS_INDEX.load(Ordering::Acquire))).filter(|&record| record != 0)
+        Some(KeTlsGetValue(TlsIndex(TLS_INDEX.load(Ordering::Acquire))))
+            .filter(|&record| record != 0)
     } else {
         None
     };
     match record {
-        Some(record) => write32(record + thread::STATE, kernel::pcr()),
+        Some(record) => write32(record + thread::STATE, processor::pcr()),
         None => {
             fetch_add(block + block::UNTRACKED, u32::MAX);
         }
@@ -622,7 +601,8 @@ fn begin_sweep(block: u32, new_generation: bool) {
     if format(block) != BlockFormat::Extended {
         return;
     }
-    ResetEvent(SWEEP_EVENT.load(Ordering::Acquire));
+    // SAFETY: SWEEP_EVENT holds the event created at startup.
+    unsafe { ResetEvent(Handle::from_raw(SWEEP_EVENT.load(Ordering::Acquire))) };
     fence(Ordering::Release);
     SWEEPING.store(true, Ordering::Release);
     if new_generation {
@@ -634,7 +614,7 @@ fn begin_sweep(block: u32, new_generation: bool) {
     }
     fence(Ordering::SeqCst);
     let own = if title_thread() {
-        KeTlsGetValue(TLS_INDEX.load(Ordering::Acquire))
+        KeTlsGetValue(TlsIndex(TLS_INDEX.load(Ordering::Acquire)))
     } else {
         0
     };
@@ -644,11 +624,15 @@ fn begin_sweep(block: u32, new_generation: bool) {
         let mut record = read32(link);
         while record != 0 {
             if record != own {
-                if kernel::WaitForSingleObject(read32(record + thread::HANDLE), 0) == 0
+                // SAFETY: a record holds the duplicated handle of its thread.
+                if unsafe {
+                    xam::WaitForSingleObject(Handle::from_raw(read32(record + thread::HANDLE)), 0)
+                } == WaitResult::OBJECT_0
                     && exchange(link, record, read32(record + thread::NEXT)) == record
                 {
                     close_handle(read32(record + thread::HANDLE));
-                    RtlFreeHeap(GetProcessHeap(), 0, record);
+                    // SAFETY: the record was unlinked above and came from the process heap.
+                    unsafe { RtlFreeHeap(GetProcessHeap(), 0, record) };
                     record = read32(link);
                     continue;
                 }
@@ -669,16 +653,22 @@ fn begin_sweep(block: u32, new_generation: bool) {
 fn end_sweep() {
     fence(Ordering::SeqCst);
     SWEEPING.store(false, Ordering::Release);
-    let status = kernel::NtSetEvent(SWEEP_EVENT.load(Ordering::Acquire), core::ptr::null_mut());
-    if let Err(error) = NtStatus(status).result() {
-        kernel::set_last_error(error);
+    // SAFETY: SWEEP_EVENT holds the event created at startup.
+    let status = unsafe {
+        xboxkrnl::NtSetEvent(
+            Handle::from_raw(SWEEP_EVENT.load(Ordering::Acquire)),
+            core::ptr::null_mut(),
+        )
+    };
+    if let Err(error) = status.result() {
+        set_last_error(error);
     }
 }
 
 /// Count block time: GetSystemTime through SystemTimeToFileTime keeps
 /// whole milliseconds.
 fn block_time() -> u64 {
-    kernel::system_time() / 10_000 * 10_000
+    FileTime::now().intervals() / 10_000 * 10_000
 }
 
 /// Raise the committed size to cover `offset` (0x91f6bc18); past the
@@ -1115,7 +1105,13 @@ extern "C" fn export_lookup(frame: u32) -> u32 {
             loop {
                 let record = read32(frame + context::THREAD);
                 leave_probe(block, (record != 0).then_some(record));
-                kernel::WaitForSingleObject(SWEEP_EVENT.load(Ordering::Acquire), INFINITE);
+                // SAFETY: SWEEP_EVENT holds the event created at startup.
+                unsafe {
+                    xam::WaitForSingleObject(
+                        Handle::from_raw(SWEEP_EVENT.load(Ordering::Acquire)),
+                        INFINITE,
+                    )
+                };
                 let record = read32(frame + context::THREAD);
                 enter_probe(block, (record != 0).then_some(record));
                 if !SWEEPING.load(Ordering::Acquire) {
@@ -1617,7 +1613,8 @@ fn module_file_name(address: u32) -> ModuleFileName {
         length: 0,
     };
     let mut entry = 0u32;
-    XexPcToFileHeader(address, &mut entry);
+    // SAFETY: `entry` is a local word.
+    unsafe { XexPcToFileHeader(address, &mut entry) };
     // An address outside every module leaves the image with an unset
     // entry; the name is taken as empty.
     if entry == 0 {
@@ -1658,10 +1655,18 @@ fn create_block(node: Node) {
     header.encode(block_time(), &mut bytes);
     let mut base = 0u32;
     let mut size = header.reserved;
-    let status =
-        kernel::NtAllocateVirtualMemory(&mut base, &mut size, MEM_COMMIT, PAGE_READWRITE, 0);
-    if let Err(error) = NtStatus(status).result() {
-        kernel::set_last_error(error);
+    // SAFETY: `base` and `size` are live locals.
+    let status = unsafe {
+        xboxkrnl::NtAllocateVirtualMemory(
+            &mut base,
+            &mut size,
+            AllocationType::COMMIT,
+            PageProtection::READWRITE,
+            0,
+        )
+    };
+    if let Err(error) = status.result() {
+        set_last_error(error);
         base = 0;
     }
     write32(node.at(node::BLOCK), base);
@@ -1783,15 +1788,16 @@ fn initialize_module(node: Node, name: &ModuleFileName, values: u32) {
     create_block(node);
     connect_interface(node, values);
     if SWEEP_EVENT.load(Ordering::Acquire) == 0 {
-        let event = kernel::CreateEventA(0, 1, 1, core::ptr::null());
-        SWEEP_EVENT.store(event, Ordering::Release);
-        if event == 0 {
+        // SAFETY: the event is unnamed, so no name pointer is read.
+        let event = unsafe { xam::CreateEventA(0, true, true, core::ptr::null()) };
+        SWEEP_EVENT.store(event.raw(), Ordering::Release);
+        if event == Handle::NULL {
             fatal(Fatal::EventCreation);
         }
     }
     let index = KeTlsAlloc();
-    TLS_INDEX.store(index, Ordering::Release);
-    if index == u32::MAX {
+    TLS_INDEX.store(index.0, Ordering::Release);
+    if index == TlsIndex::OUT_OF_INDEXES {
         close_handle(SWEEP_EVENT.swap(0, Ordering::AcqRel));
         fatal(Fatal::TlsAllocation);
     }
@@ -1836,7 +1842,7 @@ extern "C" fn export_register(
     scratch[(node::STUBS / 4) as usize + 1] = stub_b;
     scratch[(node::STUBS / 4) as usize + 2] = stub_c;
     stop_counting(scratch.as_mut_ptr() as usize as u32);
-    let error = kernel::last_error();
+    let error = last_error();
     SECTION.enter();
     let name = module_file_name(address);
     // The units past the name are zero, so the slice is terminated.
@@ -1855,7 +1861,8 @@ extern "C" fn export_register(
                 SECTION.leave();
                 fatal(Fatal::ModuleNameTooLong);
             }
-            let record = RtlAllocateHeap(GetProcessHeap(), HEAP_ZERO_MEMORY, node::SIZE);
+            // SAFETY: the process heap takes a size only.
+            let record = unsafe { RtlAllocateHeap(GetProcessHeap(), HEAP_ZERO_MEMORY, node::SIZE) };
             if record == 0 {
                 fatal(Fatal::NodeAllocation);
             }
@@ -1881,7 +1888,7 @@ extern "C" fn export_register(
         stop_counting(node.0);
     }
     SECTION.leave();
-    kernel::set_last_error_value(error);
+    set_last_error_value(error);
 }
 
 /// Export 106 (stock 0x91f70628): look a module up without a name, which
@@ -2049,30 +2056,43 @@ fn create_profile(name: &ProfileName) -> Option<u32> {
             &profile_request(FileAccess::GENERIC_READ.0, CreateDisposition::Open),
         )
         .ok()?;
-        kernel::NtClose(handle.0);
+        // SAFETY: `handle` was opened above and is closed once.
+        unsafe { xboxkrnl::NtClose(Handle::from_raw(handle.0)) };
         number = number.wrapping_add(1);
     }
 }
 
 fn write_file(handle: u32, buffer: u32, length: u32) -> bool {
     let mut io_status = IoStatusBlock::default();
-    let mut status = kernel::NtWriteFile(
-        handle,
-        0,
-        0,
-        0,
-        &mut io_status,
-        buffer as usize as *const u8,
-        length,
-        core::ptr::null(),
-    );
-    if status == STATUS_PENDING {
-        kernel::NtWaitForSingleObjectEx(handle, 1, 0, core::ptr::null());
+    // SAFETY: `buffer` holds `length` readable bytes; `io_status` outlives
+    // the request, which is waited for below when pending.
+    let mut status = unsafe {
+        xboxkrnl::NtWriteFile(
+            Handle::from_raw(handle),
+            Handle::NULL,
+            0,
+            0,
+            &mut io_status,
+            buffer as usize as *const u8,
+            length,
+            core::ptr::null(),
+        )
+    };
+    if status.0 == STATUS_PENDING {
+        // SAFETY: `handle` is the open profile file.
+        unsafe {
+            xboxkrnl::NtWaitForSingleObjectEx(
+                Handle::from_raw(handle),
+                ProcessorMode::User,
+                false,
+                core::ptr::null(),
+            )
+        };
         // SAFETY: the kernel completed the request and wrote the block.
         status = unsafe { core::ptr::read_volatile(&io_status.status) };
     }
-    if let Err(error) = NtStatus(status).result() {
-        kernel::set_last_error(error);
+    if let Err(error) = status.result() {
+        set_last_error(error);
         return false;
     }
     true
@@ -2102,22 +2122,26 @@ fn write_profile(node: Node) {
         warn(WriteWarning::Write);
     }
     let mut io_status = IoStatusBlock::default();
-    let status = kernel::NtFlushBuffersFile(handle, &mut io_status);
-    if let Err(error) = NtStatus(status).result() {
-        kernel::set_last_error(error);
+    // SAFETY: `handle` is the open profile file; `io_status` is a live local.
+    let status = unsafe { xboxkrnl::NtFlushBuffersFile(Handle::from_raw(handle), &mut io_status) };
+    if let Err(error) = status.result() {
+        set_last_error(error);
         warn(WriteWarning::Flush);
     }
     // The image reports a seek only when the new position is 0.
     let position = pgo::COMPLETION_OFFSET.to_be_bytes();
-    let status = kernel::NtSetInformationFile(
-        handle,
-        &mut io_status,
-        position.as_ptr(),
-        8,
-        FILE_POSITION_INFORMATION,
-    );
-    if let Err(error) = NtStatus(status).result() {
-        kernel::set_last_error(error);
+    // SAFETY: `position` holds the 8-byte position information.
+    let status = unsafe {
+        xboxkrnl::NtSetInformationFile(
+            Handle::from_raw(handle),
+            &mut io_status,
+            position.as_ptr(),
+            8,
+            FileInformationClass::Position,
+        )
+    };
+    if let Err(error) = status.result() {
+        set_last_error(error);
     }
     let complete = 1u8;
     if !write_file(handle, &complete as *const u8 as usize as u32, 1) {

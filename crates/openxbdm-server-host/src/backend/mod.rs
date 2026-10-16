@@ -15,6 +15,7 @@ pub mod system;
 use std::time::Instant;
 
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::ConnectionIndex;
 use openxbdm_server::Platform;
 use openxbdm_server::notify::ExecutionState;

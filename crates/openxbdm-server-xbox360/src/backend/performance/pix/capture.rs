@@ -20,11 +20,14 @@ mod replay;
 mod timing;
 mod video;
 
+use xbox360::time::Timebase;
+use xbox360_sys::processor;
+use xbox360_sys::processor::pcr;
+use xbox360_sys::xboxkrnl;
+
 use super::session;
 use super::session::Session as S;
 use crate::kernel;
-use crate::kernel::current_thread;
-use crate::kernel::pcr;
 
 pub(crate) use audio::service_samples;
 pub(crate) use timing::service_end;
@@ -71,7 +74,7 @@ fn processor() -> u32 {
 }
 
 fn timebase_low() -> u32 {
-    kernel::timebase() as u32
+    Timebase::now().ticks() as u32
 }
 
 /// Bit of stream `k` in a stream mask (`slw`: 0 from 32 on).
@@ -93,16 +96,14 @@ fn active_parts(s: S) -> u32 {
 }
 
 fn interrupts_off() {
-    // SAFETY: mtmsrd r13, 1 copies the interrupt enable bit of the PCR
-    // address, which is clear.
-    unsafe { core::arch::asm!(".long 0x7da10164", options(nostack)) };
+    // SAFETY: interrupts_on follows every call; nothing in between waits or
+    // faults.
+    unsafe { processor::disable_interrupts() };
 }
 
 fn interrupts_on() {
-    // SAFETY: mtmsrd r11, 1 with r11 = 0x8000 sets the interrupt enable bit.
-    unsafe {
-        core::arch::asm!("lis 11, 0", "ori 11, 11, 0x8000", ".long 0x7d610164", out("r11") _, options(nostack))
-    };
+    // SAFETY: follows interrupts_off.
+    unsafe { processor::enable_interrupts() };
 }
 
 fn fence() {
@@ -233,7 +234,8 @@ pub(super) fn module_records() {
         timing::write_long_record(0x67, &directory[..0x46]);
     }
     if walk != 0 {
-        kernel::ExFreePool(walk);
+        // SAFETY: the pool block `next_module` allocated for the walk.
+        unsafe { xboxkrnl::ExFreePool(walk) };
     }
 }
 

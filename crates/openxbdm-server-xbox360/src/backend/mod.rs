@@ -17,6 +17,9 @@ pub mod system;
 
 use openxbdm_server::Platform;
 use openxbdm_server::notify::ExecutionState;
+use xbox360::console::hardware_flags;
+use xbox360::time::FileTime;
+use xbox360::time::Timebase;
 
 use crate::kernel;
 use crate::net;
@@ -55,15 +58,15 @@ impl Console {
 
 impl Platform for Console {
     fn system_time(&mut self) -> u64 {
-        kernel::system_time()
+        FileTime::now().intervals()
     }
 
     fn timebase(&mut self) -> u64 {
-        kernel::timebase()
+        Timebase::now().ticks()
     }
 
     fn is_test_kit(&self) -> bool {
-        kernel::hardware_flags() & HARDWARE_NOT_DEBUGGABLE != 0 || console::test_kit_marked()
+        hardware_flags().bits() & HARDWARE_NOT_DEBUGGABLE != 0 || console::test_kit_marked()
     }
 
     fn execution_state(&mut self) -> ExecutionState {

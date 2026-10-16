@@ -6,6 +6,7 @@ use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::Win32Error;
+use openxbdm_core::status::xbdm_error;
 
 use crate::access::Access;
 use crate::backend::Backend as AnyBackend;
@@ -48,7 +49,7 @@ pub enum ConsoleError {
 impl From<ConsoleError> for Hresult {
     fn from(error: ConsoleError) -> Self {
         match error {
-            ConsoleError::AddressPending => Hresult::error(0x2a),
+            ConsoleError::AddressPending => xbdm_error(0x2a),
         }
     }
 }
@@ -276,7 +277,7 @@ pub struct BufferTooSmall;
 
 impl From<BufferTooSmall> for Hresult {
     fn from(_: BufferTooSmall) -> Self {
-        Hresult::error(0x105)
+        xbdm_error(0x105)
     }
 }
 
@@ -707,11 +708,11 @@ pub enum RegistrationError {
 impl From<RegistrationError> for Hresult {
     fn from(error: RegistrationError) -> Self {
         match error {
-            RegistrationError::NotRegistered => Hresult::error(0x150),
-            RegistrationError::Cleared => Hresult::error(0x2),
-            RegistrationError::Failed => Hresult::error(0x100),
-            RegistrationError::Rejected => Hresult::error(0x10a),
-            RegistrationError::ResponseTooLarge => Hresult::error(0xf),
+            RegistrationError::NotRegistered => xbdm_error(0x150),
+            RegistrationError::Cleared => xbdm_error(0x2),
+            RegistrationError::Failed => xbdm_error(0x100),
+            RegistrationError::Rejected => xbdm_error(0x10a),
+            RegistrationError::ResponseTooLarge => xbdm_error(0xf),
             RegistrationError::BufferTooSmall => BufferTooSmall.into(),
         }
     }
@@ -2583,7 +2584,7 @@ mod tests {
                 registration.export_response(Some(&mut [0; 8])),
                 failed(error)
             );
-            assert_eq!(Hresult::from(error), Hresult::error(code));
+            assert_eq!(Hresult::from(error), xbdm_error(code));
         }
         registration.state = RegistrationState::Registered;
         registration.transaction = 0x0123_4567_89ab_cdef;
@@ -2606,7 +2607,7 @@ mod tests {
         );
         assert_eq!(
             Hresult::from(RegistrationError::BufferTooSmall),
-            Hresult::error(0x105)
+            xbdm_error(0x105)
         );
         assert_eq!(registration.export_response(None), registered(Ok(())));
     }

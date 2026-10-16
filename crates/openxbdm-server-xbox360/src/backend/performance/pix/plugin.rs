@@ -10,24 +10,32 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
 use openxbdm_core::status::KernelError;
-use openxbdm_core::status::NtStatus;
 use openxbdm_server::commands::performance::PixDogma;
 use openxbdm_server::text::Text;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::ImageFlags;
+use xbox360_sys::xboxkrnl::ImageVersion;
+use xbox360_sys::xboxkrnl::IoStatusBlock;
+use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
+use xbox360_sys::xboxkrnl::ObjectAttributes;
+use xbox360_sys::xboxkrnl::PoolTag;
+use xbox360_sys::xboxkrnl::PoolType;
+use xbox360_sys::xboxkrnl::ProcessType;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
 use super::events;
 use super::files;
 use crate::backend::memory;
 use crate::backend::memory::ModuleWalkError;
 use crate::kernel;
-use crate::kernel::AnsiString;
-use crate::kernel::IoStatusBlock;
-use crate::kernel::ObjectAttributes;
 
 const CATMA: &[u8] = b"\\Device\\Flash\\catma.xex\0";
 const DOGMA: &[u8] = b"\\Device\\Flash\\dogma.xex\0";
 /// `XexLoadImage` flags of the two images.
-const CATMA_LOAD_FLAGS: u32 = 9;
-const DOGMA_LOAD_FLAGS: u32 = 8;
+const CATMA_LOAD_FLAGS: ImageFlags = ImageFlags::TITLE.union(ImageFlags::DLL);
 /// Owner and type 2 callback operation that carries the submit hook.
 const SUBMIT_HOOK: u32 = 0x22;
 /// Plugin exports 5 to 10: start, stop, the two-routine pair, and the
@@ -41,7 +49,7 @@ const RELEASE: usize = 3;
 const INSTALL_CALLBACKS: usize = 4;
 const UNINSTALL: usize = 5;
 /// Pool tag `PIXd` of plugin allocations.
-const PLUGIN_TAG: u32 = 0x5049_5864;
+const PLUGIN_TAG: PoolTag = PoolTag::new(*b"PIXd");
 /// Flag of DLL module records.
 const MODULE_DLL: u32 = 4;
 const RECORD_SIZE: usize = memory::MODULE_RECORD_SHORT_SIZE;
@@ -74,25 +82,29 @@ fn debug_print(arguments: core::fmt::Arguments<'_>) {
 
 /// Probe for the plugin image (stock 0x91f55a60).
 pub(super) fn initialize() {
-    let name = AnsiString::new(&CATMA[..CATMA.len() - 1]);
+    let name = kernel::ansi_string(&CATMA[..CATMA.len() - 1]);
     let attributes = ObjectAttributes {
-        root_directory: 0,
+        root_directory: Handle::NULL,
         object_name: &name,
-        attributes: kernel::OBJ_CASE_INSENSITIVE,
+        attributes: ObjectAttributeFlags::CASE_INSENSITIVE,
     };
-    let mut handle = 0u32;
+    let mut handle = Handle::NULL;
     let mut io_status = IoStatusBlock::default();
-    kernel::NtOpenFile(
-        &mut handle,
-        0x8000_0000,
-        &attributes,
-        &mut io_status,
-        1,
-        0x20,
-    );
-    PRESENT.store(handle != 0, Ordering::Release);
-    if handle != 0 {
-        kernel::NtClose(handle);
+    // SAFETY: all pointers refer to live locals; the open is synchronous.
+    unsafe {
+        xboxkrnl::NtOpenFile(
+            &mut handle,
+            AccessMask::GENERIC_READ,
+            &attributes,
+            &mut io_status,
+            ShareAccess::READ,
+            CreateOptions::SYNCHRONOUS_IO_NONALERT,
+        )
+    };
+    PRESENT.store(!handle.is_null(), Ordering::Release);
+    if !handle.is_null() {
+        // SAFETY: the handle was just opened and is not used again.
+        unsafe { xboxkrnl::NtClose(handle) };
     }
 }
 
@@ -111,7 +123,18 @@ fn load() {
         return;
     }
     let mut handle = 0u32;
-    if (kernel::XexLoadImage(CATMA.as_ptr(), CATMA_LOAD_FLAGS, 0, &mut handle) as i32) < 0 {
+    // SAFETY: `CATMA` is NUL-terminated and `handle` is a live local.
+    if (unsafe {
+        xboxkrnl::XexLoadImage(
+            CATMA.as_ptr(),
+            CATMA_LOAD_FLAGS,
+            ImageVersion::ANY,
+            &mut handle,
+        )
+    }
+    .0 as i32)
+        < 0
+    {
         handle = 0;
     }
     HANDLE.store(handle, Ordering::Release);
@@ -131,7 +154,11 @@ fn attach(starting: bool) {
     HOOK.store(hook, Ordering::Release);
     for (index, slot) in PROCEDURE.iter().enumerate() {
         let mut address = 0u32;
-        kernel::XexGetProcedureAddress(handle, FIRST_PROCEDURE + index as u32, &mut address);
+        // SAFETY: `handle` is the loaded plugin image; `address` is a live
+        // local.
+        unsafe {
+            xboxkrnl::XexGetProcedureAddress(handle, FIRST_PROCEDURE + index as u32, &mut address)
+        };
         slot.store(address, Ordering::Release);
     }
     if starting {
@@ -167,16 +194,19 @@ crate::exports::bridged!(free_entry, free);
 
 /// Plugin allocator (stock 0x91f559c8).
 extern "C" fn allocate(size: u32) -> u32 {
-    kernel::ExAllocatePoolTypeWithTag(size, PLUGIN_TAG, 2)
+    // SAFETY: allocates from the system pool; no pointer arguments.
+    unsafe { xboxkrnl::ExAllocatePoolTypeWithTag(size, PLUGIN_TAG, PoolType::System) }
 }
 
-extern "C" fn free(block: u32) -> u32 {
-    kernel::ExFreePool(block)
-}
+crate::kernel::forward!(
+    /// Tail-calls ExFreePool, so its r3 passes through.
+    fn free(u32) -> u32 => xboxkrnl::ExFreePool
+);
 
 /// Stock 0x91f55b48: start once, in a title.
 pub(super) fn start() {
-    if ACTIVE.load(Ordering::Acquire) || kernel::KeGetCurrentProcessType() == SYSTEM_PROCESS {
+    if ACTIVE.load(Ordering::Acquire) || xboxkrnl::KeGetCurrentProcessType() == ProcessType::SYSTEM
+    {
         return;
     }
     load();
@@ -195,15 +225,13 @@ pub(super) fn restart() {
     attach(false);
 }
 
-const SYSTEM_PROCESS: u32 = 2;
-
 /// Stock 0x91f55cb0: stop the plugin and forget its image (it stays
 /// loaded).
 pub(super) fn stop() {
     if !ACTIVE.swap(false, Ordering::AcqRel) {
         return;
     }
-    if kernel::KeGetCurrentProcessType() != SYSTEM_PROCESS {
+    if xboxkrnl::KeGetCurrentProcessType() != ProcessType::SYSTEM {
         call(STOP);
     }
     call(RELEASE);
@@ -267,10 +295,14 @@ fn submit_hook(image: u32, hook: &mut u32) -> Result<(), KernelError> {
                 core::str::from_utf8(name).unwrap_or_default()
             ));
             let libraries = memory::loader_entry(name).map_or(0, |entry| {
-                memory::RtlImageXexHeaderField(
-                    super::read_u32(entry + ENTRY_XEX_HEADER),
-                    XEX_LIBRARIES,
-                )
+                // SAFETY: the loader entry of a loaded module holds its XEX
+                // header address.
+                unsafe {
+                    xboxkrnl::RtlImageXexHeaderField(
+                        super::read_u32(entry + ENTRY_XEX_HEADER),
+                        XEX_LIBRARIES,
+                    )
+                }
             });
             if libraries != 0 {
                 let end = libraries + super::read_u32(libraries);
@@ -299,7 +331,8 @@ fn submit_hook(image: u32, hook: &mut u32) -> Result<(), KernelError> {
         }
     }
     if walk != 0 {
-        kernel::ExFreePool(walk);
+        // SAFETY: the pool block `next_module` allocated for the walk.
+        unsafe { xboxkrnl::ExFreePool(walk) };
     }
     let ordinal = if returns {
         kernel::debug_print(c"Catma: Use Submit hook with returns\n");
@@ -308,7 +341,8 @@ fn submit_hook(image: u32, hook: &mut u32) -> Result<(), KernelError> {
         kernel::debug_print(c"Catma: Use Submit hook NO returns\n");
         ORDINAL_SUBMIT
     };
-    NtStatus(kernel::XexGetProcedureAddress(image, ordinal, hook)).result()
+    // SAFETY: `image` is a loaded image handle; `hook` is a live reference.
+    unsafe { xboxkrnl::XexGetProcedureAddress(image, ordinal, hook) }.result()
 }
 
 /// `pixcmd h` (stock 0x91f58b20): the plugin image, or `dogma.xex` loaded
@@ -320,7 +354,18 @@ pub(super) fn dogma() -> Option<PixDogma> {
         Some(image) => image,
         None => {
             let mut image = 0u32;
-            if (kernel::XexLoadImage(DOGMA.as_ptr(), DOGMA_LOAD_FLAGS, 0, &mut image) as i32) < 0 {
+            // SAFETY: `DOGMA` is NUL-terminated and `image` is a live local.
+            if (unsafe {
+                xboxkrnl::XexLoadImage(
+                    DOGMA.as_ptr(),
+                    ImageFlags::DLL,
+                    ImageVersion::ANY,
+                    &mut image,
+                )
+            }
+            .0 as i32)
+                < 0
+            {
                 return None;
             }
             image
@@ -330,22 +375,17 @@ pub(super) fn dogma() -> Option<PixDogma> {
         handle: image,
         ..PixDogma::default()
     };
+    // SAFETY: `image` is a loaded image handle; the outputs are fields of
+    // the live `dogma`.
     let found = submit_hook(image, &mut dogma.info).is_ok()
-        && NtStatus(kernel::XexGetProcedureAddress(
-            image,
-            1,
-            &mut dogma.procedure_1,
-        ))
-        .is_success()
-        && NtStatus(kernel::XexGetProcedureAddress(
-            image,
-            3,
-            &mut dogma.procedure_3,
-        ))
-        .is_success();
+        && unsafe { xboxkrnl::XexGetProcedureAddress(image, 1, &mut dogma.procedure_1) }
+            .is_success()
+        && unsafe { xboxkrnl::XexGetProcedureAddress(image, 3, &mut dogma.procedure_3) }
+            .is_success();
     if found || cached.is_some() {
         return Some(dogma);
     }
-    kernel::XexUnloadImage(image);
+    // SAFETY: `image` was loaded above and nothing refers to it.
+    unsafe { xboxkrnl::XexUnloadImage(image) };
     None
 }

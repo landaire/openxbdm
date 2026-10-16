@@ -172,6 +172,25 @@ overlay. `xbox360/BUCK` builds the module from it with the cell's
 | `//xbox360:openxbdm-boot-guard` | `openxbdm-boot-guard.xex`, with the `boot-guard` feature, for `DEVKIT:\FlashEx` |
 | `//xbox360:openxbdm-no-rewrite` | `openxbdm-no-rewrite.xex`, without the save and restore rewrite |
 
+The module declares its kernel and XAM imports through `xbox360-sys` and
+uses the `xbox360` crate (both from crates.io) for spin locks, module and
+export lookup, the time base, system time, tick count, sleeps, last-error
+values, the kernel version and the hardware flags. `src/kernel.rs` keeps
+the helpers whose stock behaviour the `xbox360` crate does not have:
+events and critical sections initialized in place, `DbgPrint` with the
+message as its argument, the 64-bit performance frequency, the base
+kernel version read without the unresolved-import check, and the write
+of the hardware flags and read of the boot flags.
+`openxbdm-core` takes `NtStatus`, `KernelError`, `Win32Error` and
+`Hresult` from `xbox360_sys::status`, which builds on every host; the
+monitor's result codes and reply texts are its `XbdmHresult` trait,
+`xbdm_success`, `xbdm_error` and `ErrorCode::hresult`.
+
+Each import record is in a section `.xthunks.<path>` and each data
+import slot in a section `.xvars.<path>`, so `--gc-sections` removes the
+ones nothing uses. `link.x` collects them with `*(.xthunks .xthunks.*)`
+and `*(.xvars .xvars.*)`.
+
 Console crates are built for size (`toolchains/BUCK`): `-Copt-level=z`,
 one code generation unit, and `-Cpanic=immediate-abort`.
 `xbox360_executable_core` compiles the executable as one fat LTO code

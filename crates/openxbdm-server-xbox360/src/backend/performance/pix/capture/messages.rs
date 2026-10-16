@@ -13,6 +13,15 @@ use core::fmt::Write as _;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
+use openxbdm_server::text::Text;
+use xbox360::time::TickCount;
+use xbox360::time::Timebase;
+use xbox360_sys::processor;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::XAudioRegisterRenderDriverClient;
+use xbox360_sys::xboxkrnl::XAudioUnregisterRenderDriverClient;
+
 use super::super::backend::EVENT_NAME_BYTES;
 use super::super::status::Status;
 use super::super::status::post as post_status;
@@ -22,7 +31,6 @@ use super::engine;
 use super::rd;
 use super::wr;
 use crate::kernel;
-use openxbdm_server::text::Text;
 
 const MESSAGE: u32 = super::CURRENT_MESSAGE;
 const MESSAGE_WORD: u32 = 0x598;
@@ -179,7 +187,8 @@ fn capture_frames(s: S, flags: u32, step: u32, payload: u32) -> bool {
     if let Some(file) = file {
         wr(payload + 8, file);
         written = super::replay::write_stream(s, file, frames, frames);
-        kernel::NtClose(file);
+        // SAFETY: the capture file handle, not used after the write.
+        unsafe { xboxkrnl::NtClose(Handle::from_raw(file)) };
     }
     engine::start(s);
     if rd(payload + 4) != 0 {
@@ -193,7 +202,7 @@ fn capture_frames(s: S, flags: u32, step: u32, payload: u32) -> bool {
 /// `pixcmd k`, giving up after 10 s.
 fn trace(s: S, step: u32, payload: u32, by_event: bool) -> bool {
     if step == 0 {
-        wr(payload, kernel::tick_count());
+        wr(payload, TickCount::now().milliseconds());
         reconfigure(s, super::OFF, super::OFF, u32::from(by_event));
         if !by_event {
             super::super::super::xtrace::start_default();
@@ -205,7 +214,7 @@ fn trace(s: S, step: u32, payload: u32, by_event: bool) -> bool {
         post_status(Status::Trace, 0);
         return true;
     }
-    let now = kernel::tick_count();
+    let now = TickCount::now().milliseconds();
     if s.word(MESSAGE_WORD) != 0 {
         post_status(Status::Trace, 0);
         return true;
@@ -251,7 +260,7 @@ fn trace_event_begin(name: &[u8; EVENT_NAME_BYTES]) {
 }
 
 fn on_capture_thread() -> bool {
-    let thread = kernel::current_thread();
+    let thread = processor::current_thread();
     super::super::backend::capture_thread() == u32::from(super::rd8(thread + 0xbf))
 }
 
@@ -294,13 +303,16 @@ fn capture_to_file(s: S, flags: u32, step: u32, payload: u32) -> bool {
         super::super::files::set_capture_file(None);
         let file = super::super::files::CaptureFile(rd(payload + 4));
         super::super::files::write_words(file, &[0x0100_0018]);
-        kernel::NtClose(file.0);
+        // SAFETY: the capture file handle, detached above.
+        unsafe { xboxkrnl::NtClose(Handle::from_raw(file.0)) };
         if rd(payload) != 0 {
             post_status(Status::Gpu, 0);
         }
         // Stock unloads the image here and once more for plugin captures.
         if super::super::plugin::handle().is_none() && rd(payload + 0xc) != 0 {
-            kernel::XexUnloadImage(rd(payload + 0xc));
+            // SAFETY: the image `dogma` loaded for this capture; its slot
+            // is cleared below.
+            unsafe { xboxkrnl::XexUnloadImage(rd(payload + 0xc)) };
             wr(payload + 0xc, 0);
         }
         return true;
@@ -392,7 +404,8 @@ fn write_frames(s: S, payload: u32) -> bool {
         && let Some(file) = open_unnamed()
     {
         written = super::replay::write_stream(s, file.0, rd(payload), rd(payload + 4));
-        kernel::NtClose(file.0);
+        // SAFETY: the file opened above, not used after the write.
+        unsafe { xboxkrnl::NtClose(Handle::from_raw(file.0)) };
     }
     post_status(
         if written {
@@ -517,7 +530,7 @@ fn resource_state(payload: u32, out: &mut u32) -> bool {
 /// The frame thread services messages while paused; a message other than
 /// 11 resumes and is handled at the next frame.
 fn pause(s: S) -> bool {
-    super::super::ring::capture_timing(1, super::active_parts(s), kernel::timebase());
+    super::super::ring::capture_timing(1, super::active_parts(s), Timebase::now().ticks());
     if s.word(FRAME_RECORD + 0x18) != 0 {
         relock(s, || {
             // SAFETY: the title's frame record names a routine taking one
@@ -560,7 +573,7 @@ fn pause(s: S) -> bool {
         }
     };
     resume_engine(s);
-    super::super::ring::capture_timing(2, super::active_parts(s), kernel::timebase());
+    super::super::ring::capture_timing(2, super::active_parts(s), Timebase::now().ticks());
     if rd(resumed) == 11 {
         return true;
     }
@@ -584,7 +597,8 @@ fn relock(s: S, f: impl FnOnce()) {
 fn paused_video(s: S, payload: u32) {
     let written = open_unnamed().is_some_and(|file| {
         let error = super::video::write(s, file.0, rd(payload + 8), rd(payload), rd(payload + 4));
-        kernel::NtClose(file.0);
+        // SAFETY: the file opened above, not used after the write.
+        unsafe { xboxkrnl::NtClose(Handle::from_raw(file.0)) };
         error == 0
     });
     post_status(
@@ -602,21 +616,25 @@ fn paused_video(s: S, payload: u32) {
 /// a monitor audio client, stop with an execution state notification, and
 /// stop controller vibration.
 fn pause_engine(s: S) {
-    kernel::KeEnterCriticalRegion();
+    // SAFETY: `resume_engine` leaves the region.
+    unsafe { xboxkrnl::KeEnterCriticalRegion() };
     s.set_word(0xc880, s.word(0xe210));
     let routine = s.word(super::super::session::KERNEL_ROUTINE);
     if routine != 0 {
         let client = [super::video::render_entry_address(), s.0 + 0xc930];
-        XAudioRegisterRenderDriverClient(client.as_ptr(), s.at(AUDIO_CLIENT));
+        // SAFETY: `client` is live for the call; the handle slot lies in
+        // the session block.
+        unsafe { XAudioRegisterRenderDriverClient(client.as_ptr(), s.at(AUDIO_CLIENT)) };
         call_kernel_routine(routine, s.word(AUDIO_CLIENT), 1);
-        let thread = kernel::XAudioGetRenderDriverThread();
+        // SAFETY: takes no arguments; returns the thread object address.
+        let thread = unsafe { xboxkrnl::XAudioGetRenderDriverThread() } as usize as u32;
         if let Some(previous) =
             crate::backend::debugger::exchange_record_flags(thread, RECORD_PAUSE_MASK, 0x0200_1000)
         {
             s.set_word(AUDIO_THREAD_FLAGS, previous);
         }
     }
-    let thread = kernel::current_thread();
+    let thread = processor::current_thread();
     if let Some(previous) =
         crate::backend::debugger::exchange_record_flags(thread, RECORD_PAUSE_MASK, 0x0200_1000)
     {
@@ -641,7 +659,7 @@ fn resume_engine(s: S) {
         openxbdm_server::notify::ExecutionState::Started
     };
     crate::backend::debugger::request_execution(target, true);
-    let thread = kernel::current_thread();
+    let thread = processor::current_thread();
     crate::backend::debugger::exchange_record_flags(
         thread,
         RECORD_PAUSE_MASK,
@@ -649,17 +667,20 @@ fn resume_engine(s: S) {
     );
     let routine = s.word(super::super::session::KERNEL_ROUTINE);
     if routine != 0 {
-        let audio = kernel::XAudioGetRenderDriverThread();
+        // SAFETY: takes no arguments; returns the thread object address.
+        let audio = unsafe { xboxkrnl::XAudioGetRenderDriverThread() } as usize as u32;
         crate::backend::debugger::exchange_record_flags(
             audio,
             RECORD_PAUSE_MASK,
             s.word(AUDIO_THREAD_FLAGS),
         );
         call_kernel_routine(routine, s.word(AUDIO_CLIENT), 0);
-        XAudioUnregisterRenderDriverClient(s.word(AUDIO_CLIENT));
+        // SAFETY: the client `pause_engine` registered.
+        unsafe { XAudioUnregisterRenderDriverClient(s.word(AUDIO_CLIENT)) };
         s.set_word(AUDIO_CLIENT, 0);
     }
-    kernel::KeLeaveCriticalRegion();
+    // SAFETY: pairs with the `KeEnterCriticalRegion` of `pause_engine`.
+    unsafe { xboxkrnl::KeLeaveCriticalRegion() };
     s.set_word(PAUSED, 0);
 }
 
@@ -674,7 +695,8 @@ fn call_kernel_routine(routine: u32, client: u32, enable: u32) {
 /// two speeds).
 fn stop_vibration(port: u32) {
     let vibration = [0u16; 2];
-    XamInputSetState(port, 0, vibration.as_ptr(), 0, 0, 0);
+    // SAFETY: `vibration` is live for the synchronous call.
+    unsafe { XamInputSetState(port, 0, vibration.as_ptr(), 0, 0, 0) };
 }
 
 /// Title end part (stock 0x91f62100, from the title terminate routine):
@@ -734,17 +756,10 @@ pub(super) fn configure(argument: u32) -> u32 {
     1
 }
 
-crate::kernel::import_thunk!(
-    XAudioRegisterRenderDriverClient(client: *const u32, handle: *mut u32) -> u32,
-    lib = crate::kernel::LIB_KERNEL,
-    ordinal = 0x1f3
-);
-crate::kernel::import_thunk!(
-    XAudioUnregisterRenderDriverClient(handle: u32) -> u32,
-    lib = crate::kernel::LIB_KERNEL,
-    ordinal = 0x1f4
-);
-crate::kernel::import_thunk!(
+// Xenia names xam 0x190 XamInputGetCapabilities; the ordinal follows the
+// stock import.
+xbox360_sys::import_thunk!(
+    #[allow(non_snake_case)]
     XamInputSetState(
         user: u32,
         flags: u32,
@@ -753,6 +768,6 @@ crate::kernel::import_thunk!(
         completion: u32,
         context: u32,
     ) -> u32,
-    lib = crate::kernel::LIB_XAM,
+    lib = xbox360_sys::lib_index::XAM,
     ordinal = 0x190
 );

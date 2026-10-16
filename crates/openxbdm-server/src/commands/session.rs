@@ -59,6 +59,7 @@ use core::fmt::Write as _;
 
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::KernelError;
+use openxbdm_core::status::XbdmHresult;
 
 use crate::access::Access;
 use crate::backend::Backend as AnyBackend;

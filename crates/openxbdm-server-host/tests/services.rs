@@ -10,6 +10,7 @@ use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::Win32Error;
+use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::commands::console::ConfigSetting;
 use openxbdm_server::commands::services::CivProgress;
 use openxbdm_server::commands::services::CivResult;
@@ -304,7 +305,7 @@ fn civsetbits_reports_an_unresolved_export() {
         .services
         .missing_detection_routine = Some(DetectionRoutineMissing {
         routine: DetectionRoutine::GetDetected,
-        error: KernelError::from_status(NtStatus(0xc000_0139)),
+        error: KernelError::from_status(NtStatus(0xc000_0139)).unwrap(),
     });
     let mut session = session(&server);
     assert_eq!(

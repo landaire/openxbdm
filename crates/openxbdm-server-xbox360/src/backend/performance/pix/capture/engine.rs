@@ -4,12 +4,15 @@
 //! (0x91f5f948), the 100 ms marker timer, and the frame records
 //! (0x91f5e5b8).
 
+use openxbdm_server::notify::ExecutionState;
+use xbox360::time::Timebase;
+use xbox360_sys::xboxkrnl;
+
 use super::S;
 use super::buffers;
 use super::rd;
 use super::wr;
 use crate::kernel;
-use openxbdm_server::notify::ExecutionState;
 
 /// Processor control region fields of the capture buffers: cursor and
 /// limit of the first (types 0-5) and second (types 6-11) buffer, the
@@ -67,24 +70,36 @@ pub(super) fn start(s: S) {
             streams |= super::stream_bit(audio);
         }
     }
-    crate::backend::debugger::KeIpiGenericCall(
-        install_entry as *const () as usize as u32,
-        context.as_ptr() as usize as u32,
-    );
+    // SAFETY: `install_entry` is an IPI routine; `context` outlives the
+    // call, which returns after every processor ran it.
+    unsafe {
+        xboxkrnl::KeIpiGenericCall(
+            install_entry as *const () as usize as u32,
+            context.as_ptr() as usize as u32,
+        )
+    };
     if s.word(0) != super::OFF {
-        kernel::KeInitializeDpc(
-            s.at(MARKER_DPC).cast(),
-            marker_entry as *const () as usize,
-            0,
-        );
-        initialize_timer(s.at(TIMER).cast());
-        super::super::super::counters::set_timer(
-            s.at(TIMER).cast(),
-            u32::MAX,
-            (-1_000_000i32) as u32,
-            100,
-            s.at(MARKER_DPC).cast(),
-        );
+        // SAFETY: the DPC and timer storage lie in the session block, which
+        // lives until the timer is cancelled in `stop`.
+        unsafe {
+            xboxkrnl::KeInitializeDpc(
+                s.at(MARKER_DPC).cast(),
+                marker_entry as *const () as usize,
+                0,
+            )
+        };
+        // SAFETY: as above.
+        unsafe {
+            xboxkrnl::KeInitializeTimerEx(
+                s.at(TIMER).cast(),
+                xboxkrnl::TimerType::Notification,
+                xboxkrnl::ProcessType::SYSTEM,
+            )
+        };
+        // SAFETY: as above; the timer was just initialized.
+        unsafe {
+            xboxkrnl::KeSetTimerEx(s.at(TIMER).cast(), -1_000_000, 100, s.at(MARKER_DPC).cast())
+        };
     }
     for k in 0..2 {
         if streams & 1 << k != 0 {
@@ -99,15 +114,6 @@ pub(super) fn start(s: S) {
         s.set_word(0x1b0, 1);
     }
     update_swap_routine(s);
-}
-
-/// `KeInitializeTimerEx(timer, NotificationTimer, 2)` as stock passes it.
-fn initialize_timer(timer: *mut u8) {
-    // SAFETY: the export takes the timer, its type and a process type in
-    // r3 to r5; the shared declaration names the first two.
-    let initialize: extern "C" fn(*mut u8, u32, u32) -> u32 =
-        unsafe { core::mem::transmute(kernel::KeInitializeTimerEx as *const ()) };
-    initialize(timer, 0, 2);
 }
 
 /// Register the swap routine while capturing per-thread data and not
@@ -196,7 +202,8 @@ extern "C" fn uninstall(context: u32) -> u32 {
 
 /// Timer DPC (stock 0x91f5cf20): a marker record on every processor.
 extern "C" fn marker_dpc(_dpc: u32, _context: u32, _argument1: u32, _argument2: u32) {
-    crate::backend::debugger::KeIpiGenericCall(marker_ipi_entry as *const () as usize as u32, 0);
+    // SAFETY: `marker_ipi_entry` is an IPI routine without a context.
+    unsafe { xboxkrnl::KeIpiGenericCall(marker_ipi_entry as *const () as usize as u32, 0) };
 }
 
 /// Stock 0x91f5cef0.
@@ -280,18 +287,25 @@ fn walk_stack(output: u32, mut frame: u32, thread: u32, skip: u32) -> u32 {
 pub(super) fn stop(s: S, record: u32, closing: bool, notify: bool) {
     s.set_word(super::FLAGS, s.word(super::FLAGS) & !super::RUNNING);
     update_swap_routine(s);
-    let irql = kernel::KfAcquireSpinLock(s.at(0x1b4));
+    // SAFETY: the spin lock word lies in the session block.
+    let irql = unsafe { xboxkrnl::KfAcquireSpinLock(s.at(0x1b4).cast()) };
     s.set_word(0x1b0, 0);
-    kernel::KfReleaseSpinLock(s.at(0x1b4), irql);
+    // SAFETY: as above; the lock is held.
+    unsafe { xboxkrnl::KfReleaseSpinLock(s.at(0x1b4).cast(), irql) };
     super::gpu::service(s, false);
     let mut context = [[s.0, 0, 0]; PROCESSORS as usize];
     if s.word(0) != super::OFF {
-        kernel::KeCancelTimer(s.at(TIMER).cast());
+        // SAFETY: the timer `start` initialized in the session block.
+        unsafe { xboxkrnl::KeCancelTimer(s.at(TIMER).cast()) };
     }
-    crate::backend::debugger::KeIpiGenericCall(
-        uninstall_entry as *const () as usize as u32,
-        context.as_mut_ptr() as usize as u32,
-    );
+    // SAFETY: `uninstall_entry` is an IPI routine; `context` outlives the
+    // call.
+    unsafe {
+        xboxkrnl::KeIpiGenericCall(
+            uninstall_entry as *const () as usize as u32,
+            context.as_mut_ptr() as usize as u32,
+        )
+    };
     if s.word(0) != super::OFF || s.word(8) != super::OFF {
         let routine = rd(record + 0x18);
         if routine != 0 {
@@ -464,7 +478,7 @@ fn position(
 /// `Ccap` stream record of the active parts (stock 0x91f5ce58); retried at
 /// the next frame when the ring dropped it.
 pub(super) fn capture_record(s: S) {
-    let time = kernel::timebase();
+    let time = Timebase::now().ticks();
     let words = [super::active_parts(s), (time >> 32) as u32, time as u32];
     s.set_word(
         0xe208,

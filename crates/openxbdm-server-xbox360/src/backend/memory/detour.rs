@@ -14,7 +14,6 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
 use openxbdm_core::status::KernelError;
-use openxbdm_core::status::NtStatus;
 use openxbdm_server::commands::filesystem::CreateDisposition;
 use openxbdm_server::commands::filesystem::CreateOptions;
 use openxbdm_server::commands::filesystem::CreateRequest;
@@ -26,14 +25,27 @@ use openxbdm_server::commands::memory::detour::BLOCK_SIZE;
 use openxbdm_server::commands::memory::detour::CallContext;
 use openxbdm_server::commands::memory::detour::Engine;
 use openxbdm_server::commands::memory::detour::RECORD_SIZE;
+use xbox360::time::FileTime;
+use xbox360::time::TickCount;
+use xbox360::time::Timebase;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::DispatcherObject;
+use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::IoStatusBlock;
+use xbox360_sys::xboxkrnl::Kevent;
+use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
+use xbox360_sys::xboxkrnl::ObjectAttributes;
+use xbox360_sys::xboxkrnl::PoolTag;
+use xbox360_sys::xboxkrnl::PoolType;
+use xbox360_sys::xboxkrnl::ProcessorMode;
+use xbox360_sys::xboxkrnl::ThreadCreationFlags;
+use xbox360_sys::xboxkrnl::WaitReason;
+use xbox360_sys::xboxkrnl::WaitType;
 
 use crate::backend::filesystem::create_file;
 use crate::kernel;
-use crate::kernel::AnsiString;
 use crate::kernel::CriticalSection;
-use crate::kernel::IoStatusBlock;
 use crate::kernel::KernelEvent;
-use crate::kernel::ObjectAttributes;
 
 core::arch::global_asm!(
     ".section .text.openxbdm_detour,\"ax\",@progbits",
@@ -240,11 +252,9 @@ const ELAPSED_TIMEOUT: i64 = 1_000_000;
 const COMPLETION_POLL: i64 = -(detour::COMPLETION_POLL_MILLISECONDS as i64) * 10_000;
 const STATUS_TIMEOUT: u32 = 0x102;
 const WORKER_STACK_SIZE: u32 = 0x8000;
-const WORKER_FLAGS: u32 = 0x0400_02a6;
-const OBJ_CASE_INSENSITIVE: u32 = 0x40;
+const WORKER_FLAGS: ThreadCreationFlags = ThreadCreationFlags::from_bits_retain(0x40002a6);
 const GENERIC_WRITE: u32 = 0x4000_0000;
 const GENERIC_READ_SYNCHRONIZE: u32 = 0x8010_0000;
-const WAIT_ANY: u32 = 1;
 /// Bytes of an object path the log name translates to.
 const LOG_PATH_CAPACITY: usize = 0x141;
 
@@ -296,15 +306,15 @@ impl detour::Platform for ConsolePlatform {
     }
 
     fn timebase(&self) -> u64 {
-        kernel::timebase()
+        Timebase::now().ticks()
     }
 
     fn system_time(&self) -> u64 {
-        kernel::system_time()
+        FileTime::now().intervals()
     }
 
     fn tick_count(&self) -> u32 {
-        kernel::tick_count()
+        TickCount::now().milliseconds()
     }
 
     /// 0x91f72a58: `u32::MAX` sleeps forever.
@@ -314,11 +324,21 @@ impl detour::Platform for ConsolePlatform {
         } else {
             -(i64::from(milliseconds) * 10_000)
         };
-        kernel::KeDelayExecutionThread(1, 0, &interval);
+        // SAFETY: `interval` is a live local.
+        unsafe { xboxkrnl::KeDelayExecutionThread(ProcessorMode::User, false, &interval) };
     }
 
     fn wait_for_record(&self) {
-        kernel::KeWaitForSingleObject(RECORD_FREED.pointer(), 0, 0, 0, &ELAPSED_TIMEOUT);
+        // SAFETY: `RECORD_FREED` is a static event initialized by `initialize`.
+        unsafe {
+            xboxkrnl::KeWaitForSingleObject(
+                RECORD_FREED.pointer().cast(),
+                WaitReason::Executive,
+                ProcessorMode::Kernel,
+                false,
+                &ELAPSED_TIMEOUT,
+            )
+        };
     }
 
     fn records(&self) -> Option<&'static [AtomicU32]> {
@@ -341,11 +361,14 @@ impl detour::Platform for ConsolePlatform {
         if RECORDS.load(Ordering::Acquire) != 0 {
             return true;
         }
-        let base = kernel::ExAllocatePoolTypeWithTag(
-            (detour::RECORD_STORAGE_WORDS * 4) as u32,
-            u32::from_be_bytes(*b"Detr"),
-            2,
-        );
+        // SAFETY: pool allocation has no pointer arguments.
+        let base = unsafe {
+            xboxkrnl::ExAllocatePoolTypeWithTag(
+                (detour::RECORD_STORAGE_WORDS * 4) as u32,
+                PoolTag::new(*b"Detr"),
+                PoolType::System,
+            )
+        };
         RECORDS.store(base, Ordering::Release);
         base != 0
     }
@@ -386,12 +409,14 @@ impl detour::Platform for ConsolePlatform {
 
     fn reference_event(&self, handle: u32) -> Option<u32> {
         let mut object = 0u32;
-        kernel::ObReferenceObjectByHandle(handle, 0, &mut object);
+        // SAFETY: `object` is a live local; the kernel validates the handle.
+        unsafe { xboxkrnl::ObReferenceObjectByHandle(Handle::from_raw(handle), 0, &mut object) };
         (object != 0).then_some(object)
     }
 
     fn signal_event(&self, event: u32) {
-        kernel::KeSetEvent(event as usize as *mut u32, 1, 0);
+        // SAFETY: `event` is an event object referenced by `reference_event`.
+        unsafe { xboxkrnl::KeSetEvent(event as usize as *mut Kevent, 1, false) };
     }
 
     fn lock_completions(&self) {
@@ -407,7 +432,8 @@ impl detour::Platform for ConsolePlatform {
     }
 
     fn completions_idle(&self) {
-        kernel::KeResetEvent(COMPLETION_WORK.pointer());
+        // SAFETY: `COMPLETION_WORK` is a static event initialized by `initialize`.
+        unsafe { xboxkrnl::KeResetEvent(COMPLETION_WORK.pointer().cast()) };
     }
 }
 
@@ -437,15 +463,19 @@ pub(crate) fn initialize() {
 /// writable debugger mapping.
 fn write_code_word(address: u32, value: u32) {
     let mut context = [0u32; super::WRITE_CONTEXT_WORDS];
-    let mapped = kernel::MmDbgWriteCheck(address, context.as_mut_ptr());
+    // SAFETY: `context` is a live local of the size the kernel fills.
+    let mapped = unsafe { xboxkrnl::MmDbgWriteCheck(address, context.as_mut_ptr()) };
     if mapped == 0 {
         return;
     }
     let pointer = mapped as usize as *mut u32;
-    // SAFETY: the kernel mapped the word writable for the debugger.
-    unsafe { core::ptr::write_volatile(pointer, value) };
-    kernel::KeSweepIcacheRange(pointer.cast(), 4);
-    kernel::MmDbgReleaseAddress(mapped, context.as_mut_ptr());
+    // SAFETY: the kernel mapped the word writable for the debugger;
+    // `mapped` and `context` come from `MmDbgWriteCheck` above.
+    unsafe {
+        core::ptr::write_volatile(pointer, value);
+        xboxkrnl::KeSweepIcacheRange(pointer.cast(), 4);
+        xboxkrnl::MmDbgReleaseAddress(mapped, context.as_mut_ptr());
+    }
 }
 
 fn load_context(address: u32) -> CallContext {
@@ -519,53 +549,70 @@ pub(super) fn start(log: Option<&[u8]>) -> Result<(), KernelError> {
         let (bytes, _) = stored.insert(([0; LOG_PATH_CAPACITY], length));
         bytes[..length].copy_from_slice(&log[..length]);
     }
-    kernel::KeResetEvent(WRITER_DONE.pointer());
     let mut writer = 0u32;
-    let created = kernel::ExCreateThread(
-        &mut writer,
-        WORKER_STACK_SIZE,
-        core::ptr::null_mut(),
-        0,
-        writer_thread as *const () as usize as u32,
-        0,
-        WORKER_FLAGS,
-    );
-    NtStatus(created).result()?;
     let mut completion = 0u32;
-    let created = kernel::ExCreateThread(
-        &mut completion,
-        WORKER_STACK_SIZE,
-        core::ptr::null_mut(),
-        0,
-        completion_thread as *const () as usize as u32,
-        0,
-        WORKER_FLAGS,
-    );
-    NtStatus(created).result()?;
+    // SAFETY: the events are static and initialized by `initialize`; the
+    // thread entries are functions of this module and the handle outputs
+    // are live locals.
+    unsafe {
+        xboxkrnl::KeResetEvent(WRITER_DONE.pointer().cast());
+        let created = xboxkrnl::ExCreateThread(
+            &mut writer,
+            WORKER_STACK_SIZE,
+            core::ptr::null_mut(),
+            0,
+            writer_thread as *const () as usize as u32,
+            0,
+            WORKER_FLAGS,
+        );
+        created.result()?;
+        let created = xboxkrnl::ExCreateThread(
+            &mut completion,
+            WORKER_STACK_SIZE,
+            core::ptr::null_mut(),
+            0,
+            completion_thread as *const () as usize as u32,
+            0,
+            WORKER_FLAGS,
+        );
+        created.result()?;
+    }
     COMPLETION_THREAD.set(completion);
     Ok(())
 }
 
 /// The rest of `stop` (0x91f2cd54).
 pub(super) fn stop(log: Option<&[u8]>) {
-    kernel::KeSetEvent(RECORD_QUEUED.pointer(), 1, 1);
+    // SAFETY: `RECORD_QUEUED` is a static event initialized by `initialize`.
+    unsafe { xboxkrnl::KeSetEvent(RECORD_QUEUED.pointer().cast(), 1, true) };
     WRITER_DONE.wait();
     if let Some(log) = log {
-        let name = AnsiString::new(log);
+        let name = kernel::ansi_string(log);
         let attributes = ObjectAttributes {
-            root_directory: 0,
+            root_directory: Handle::NULL,
             object_name: &name,
-            attributes: OBJ_CASE_INSENSITIVE,
+            attributes: ObjectAttributeFlags::CASE_INSENSITIVE,
         };
-        kernel::NtDeleteFile(&attributes);
+        // SAFETY: `attributes` refers to `name`, which refers to `log`.
+        unsafe { xboxkrnl::NtDeleteFile(&attributes) };
     }
-    kernel::KeSetEvent(COMPLETION_STOP.pointer(), 1, 1);
-    if let Some(thread) = COMPLETION_THREAD.take() {
-        kernel::KeWaitForSingleObject(thread as usize as *mut u32, 0, 0, 0, core::ptr::null());
-        kernel::ObDereferenceObject(thread);
+    // SAFETY: the events are static and initialized by `initialize`;
+    // `thread` is the referenced completion worker thread object.
+    unsafe {
+        xboxkrnl::KeSetEvent(COMPLETION_STOP.pointer().cast(), 1, true);
+        if let Some(thread) = COMPLETION_THREAD.take() {
+            xboxkrnl::KeWaitForSingleObject(
+                thread as usize as *mut DispatcherObject,
+                WaitReason::Executive,
+                ProcessorMode::Kernel,
+                false,
+                core::ptr::null(),
+            );
+            xboxkrnl::ObDereferenceObject(thread);
+        }
+        xboxkrnl::KeResetEvent(COMPLETION_STOP.pointer().cast());
+        xboxkrnl::KeResetEvent(COMPLETION_WORK.pointer().cast());
     }
-    kernel::KeResetEvent(COMPLETION_STOP.pointer());
-    kernel::KeResetEvent(COMPLETION_WORK.pointer());
     ENGINE.finish_stop(&ConsolePlatform);
 }
 
@@ -578,17 +625,20 @@ pub(super) fn read_record(output: &mut [u8; RECORD_SIZE]) -> bool {
         return false;
     };
     let mut io = IoStatusBlock::default();
-    let status = kernel::NtReadFile(
-        handle,
-        0,
-        0,
-        0,
-        &mut io,
-        output.as_mut_ptr(),
-        RECORD_SIZE as u32,
-        core::ptr::null(),
-    );
-    if status & 0xc000_0000 == 0xc000_0000 {
+    // SAFETY: `output` holds RECORD_SIZE bytes and `io` is a live local.
+    let status = unsafe {
+        xboxkrnl::NtReadFile(
+            Handle::from_raw(handle),
+            Handle::NULL,
+            0,
+            0,
+            &mut io,
+            output.as_mut_ptr(),
+            RECORD_SIZE as u32,
+            core::ptr::null(),
+        )
+    };
+    if status.0 & 0xc000_0000 == 0xc000_0000 {
         return false;
     }
     ENGINE.note_read();
@@ -626,7 +676,8 @@ fn open_log() -> Result<(), KernelError> {
 fn close_log() {
     for slot in [&READ_HANDLE, &WRITE_HANDLE] {
         if let Some(handle) = slot.take() {
-            kernel::NtClose(handle);
+            // SAFETY: the slot held an open handle and `take` cleared it.
+            unsafe { xboxkrnl::NtClose(Handle::from_raw(handle)) };
         }
     }
 }
@@ -636,17 +687,20 @@ fn write_record(record: &[u8; RECORD_SIZE]) -> bool {
         return false;
     };
     let mut io = IoStatusBlock::default();
-    let status = kernel::NtWriteFile(
-        handle,
-        0,
-        0,
-        0,
-        &mut io,
-        record.as_ptr(),
-        RECORD_SIZE as u32,
-        core::ptr::null(),
-    );
-    (status as i32) >= 0
+    // SAFETY: `record` holds RECORD_SIZE bytes and `io` is a live local.
+    let status = unsafe {
+        xboxkrnl::NtWriteFile(
+            Handle::from_raw(handle),
+            Handle::NULL,
+            0,
+            0,
+            &mut io,
+            record.as_ptr(),
+            RECORD_SIZE as u32,
+            core::ptr::null(),
+        )
+    };
+    (status.0 as i32) >= 0
 }
 
 /// Log writer (0x91f2d040).
@@ -670,7 +724,16 @@ extern "C" fn writer_thread(_context: u32) -> u32 {
         ENGINE.write_queued(&ConsolePlatform, &mut write_record);
     }
     while ENGINE.discard_queued(&ConsolePlatform) {
-        kernel::KeWaitForSingleObject(RECORD_QUEUED.pointer(), 0, 0, 0, &ELAPSED_TIMEOUT);
+        // SAFETY: `RECORD_QUEUED` is a static event initialized by `initialize`.
+        unsafe {
+            xboxkrnl::KeWaitForSingleObject(
+                RECORD_QUEUED.pointer().cast(),
+                WaitReason::Executive,
+                ProcessorMode::Kernel,
+                false,
+                &ELAPSED_TIMEOUT,
+            )
+        };
     }
     close_log();
     WRITER_DONE.set();
@@ -687,21 +750,34 @@ extern "C" fn completion_thread(_context: u32) -> u32 {
         COMPLETION_STOP.pointer() as usize as u32,
     ];
     let mut wait_blocks = [0u32; 0x10];
-    while kernel::KeWaitForMultipleObjects(
-        2,
-        objects.as_ptr(),
-        WAIT_ANY,
-        0,
-        0,
-        0,
-        core::ptr::null(),
-        wait_blocks.as_mut_ptr(),
-    ) == 0
+    // SAFETY: `objects` holds the addresses of two static events initialized
+    // by `initialize`; `wait_blocks` is a live local.
+    while unsafe {
+        xboxkrnl::KeWaitForMultipleObjects(
+            2,
+            objects.as_ptr().cast(),
+            WaitType::Any,
+            WaitReason::Executive,
+            ProcessorMode::Kernel,
+            false,
+            core::ptr::null(),
+            wait_blocks.as_mut_ptr(),
+        )
+    }
+    .0 == 0
     {
         while ENGINE.service_completions(&ConsolePlatform) {
-            if kernel::KeWaitForSingleObject(COMPLETION_STOP.pointer(), 0, 0, 0, &COMPLETION_POLL)
-                != STATUS_TIMEOUT
-            {
+            // SAFETY: `COMPLETION_STOP` is a static event initialized by `initialize`.
+            let waited = unsafe {
+                xboxkrnl::KeWaitForSingleObject(
+                    COMPLETION_STOP.pointer().cast(),
+                    WaitReason::Executive,
+                    ProcessorMode::Kernel,
+                    false,
+                    &COMPLETION_POLL,
+                )
+            };
+            if waited.0 != STATUS_TIMEOUT {
                 return 0;
             }
         }

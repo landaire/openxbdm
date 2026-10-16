@@ -12,6 +12,8 @@ use openxbdm_core::line::CommandLine;
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::Win32Error;
+use openxbdm_core::status::XbdmHresult;
+use openxbdm_core::status::xbdm_error;
 
 use crate::access::Access;
 use crate::backend::Backend as AnyBackend;
@@ -206,15 +208,15 @@ impl From<NetworkError> for Hresult {
         let result = match error {
             NetworkError::Netsim(error) => error.into(),
             NetworkError::CaptureStart(error) => error.into(),
-            NetworkError::ProxyNotStarted => Hresult::error(0x1a),
-            NetworkError::NotCapturing => Hresult::error(0x23),
-            NetworkError::FramesLost => Hresult::error(0x26),
-            NetworkError::UploadAborted => Hresult::error(0x101),
+            NetworkError::ProxyNotStarted => xbdm_error(0x1a),
+            NetworkError::NotCapturing => xbdm_error(0x23),
+            NetworkError::FramesLost => xbdm_error(0x26),
+            NetworkError::UploadAborted => xbdm_error(0x101),
         };
         if result.0 & 0x1fff_0000 == Hresult::OK.0 & 0x1fff_0000 {
             result
         } else {
-            Hresult::from_error_code(ErrorCode::Undefined)
+            ErrorCode::Undefined.hresult()
         }
     }
 }

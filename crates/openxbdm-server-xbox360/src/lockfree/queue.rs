@@ -12,13 +12,14 @@
 //! value in the high word; the free list links through +8.
 
 use openxbdm_core::status::Hresult;
+use xbox360_sys::xboxkrnl::KeInitializeSemaphore;
+use xbox360_sys::xboxkrnl::Ksemaphore;
 
 use super::ALLOCATOR_SIZE;
 use super::Allocator;
 use super::CREATE_FAILED;
 use super::Creation;
 use super::Failure;
-use super::KeInitializeSemaphore;
 use super::MARK;
 use super::OPTIONS_SIZE;
 use super::Object;
@@ -110,14 +111,28 @@ pub(super) fn create(shape: &'static Shape, creation: &Creation, extra: u32) -> 
     store(object.field(shape.grow), initial);
     store(object.field(shape.remaining), limit.unwrap_or(UNLIMITED));
     if creation.item_wait() {
-        KeInitializeSemaphore((base + ITEM_SEMAPHORE) as u32, 0, SEMAPHORE_LIMIT);
+        // SAFETY: the semaphore storage lies inside the zeroed object block.
+        unsafe {
+            KeInitializeSemaphore(
+                (base + ITEM_SEMAPHORE) as *mut Ksemaphore,
+                0,
+                SEMAPHORE_LIMIT,
+            )
+        };
         store(
             object.field(shape.item_semaphore),
             (base + ITEM_SEMAPHORE) as u32,
         );
     }
     if creation.free_wait() && limit.is_some() {
-        KeInitializeSemaphore((base + FREE_SEMAPHORE) as u32, 0, SEMAPHORE_LIMIT);
+        // SAFETY: the semaphore storage lies inside the zeroed object block.
+        unsafe {
+            KeInitializeSemaphore(
+                (base + FREE_SEMAPHORE) as *mut Ksemaphore,
+                0,
+                SEMAPHORE_LIMIT,
+            )
+        };
         store(
             object.field(shape.free_semaphore),
             (base + FREE_SEMAPHORE) as u32,

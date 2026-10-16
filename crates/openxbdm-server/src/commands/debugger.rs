@@ -14,6 +14,7 @@ use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::Win32Error;
+use openxbdm_core::status::xbdm_error;
 
 pub use self::breakpoints::BREAKPOINT_BLOCKS;
 pub use self::breakpoints::Breakpoints;
@@ -1125,10 +1126,10 @@ pub enum ExecutionError {
 impl From<ExecutionError> for Hresult {
     fn from(error: ExecutionError) -> Self {
         match error {
-            ExecutionError::AlreadyStopped => Hresult::error(0x1a),
-            ExecutionError::NotStopped => Hresult::from_error_code(ErrorCode::NotStopped),
-            ExecutionError::Rebooting => Hresult::from_error_code(ErrorCode::Undefined),
-            ExecutionError::AccessDenied => Hresult::from_error_code(ErrorCode::AccessDenied),
+            ExecutionError::AlreadyStopped => xbdm_error(0x1a),
+            ExecutionError::NotStopped => ErrorCode::NotStopped.hresult(),
+            ExecutionError::Rebooting => ErrorCode::Undefined.hresult(),
+            ExecutionError::AccessDenied => ErrorCode::AccessDenied.hresult(),
         }
     }
 }

@@ -1082,6 +1082,9 @@ dependencies = [
 [[package]]
 name = "openxbdm-core"
 version = "0.1.0"
+dependencies = [
+ "xbox360-sys",
+]
 
 [[package]]
 name = "openxbdm-ffi"
@@ -1152,6 +1155,8 @@ version = "0.1.0"
 dependencies = [
  "openxbdm-core",
  "openxbdm-server",
+ "xbox360",
+ "xbox360-sys",
 ]
 
 [[package]]
@@ -2324,6 +2329,21 @@ dependencies = [
  "unicode-xid",
  "wasmparser",
 ]
+
+[[package]]
+name = "xbox360"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c33dd22097eb0c02f644d5f2abe486c6b945a29fc8d26da59ec1cc93400d14f8"
+dependencies = [
+ "xbox360-sys",
+]
+
+[[package]]
+name = "xbox360-sys"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eaa7fd5031b4062a96cf18a4d32f7dec542745b9ffce5ed20977e3ba291bf878"
 
 [[package]]
 name = "xecrypt"

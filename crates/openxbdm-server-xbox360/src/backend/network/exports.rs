@@ -8,6 +8,8 @@ use core::ffi::c_char;
 
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::XbdmHresult;
+use openxbdm_core::status::xbdm_error;
 use openxbdm_server::Server;
 use openxbdm_server::commands::network::LinkFlags;
 use openxbdm_server::commands::network::NetworkError;
@@ -24,17 +26,16 @@ use openxbdm_server::commands::network::netsim::RedirectIndex;
 use openxbdm_server::commands::network::netsim::Source;
 use openxbdm_server::commands::network::netsim::api;
 use openxbdm_server::commands::network::netsim::classifier;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::ProcessType;
 
 use crate::backend::Console;
 use crate::backend::dispatcher;
 use crate::exports::export;
-use crate::kernel;
 use crate::net::XamNetwork;
 
-/// `KeGetCurrentProcessType` of the system process.
-const SYSTEM_PROCESS_TYPE: u32 = 1;
-/// A persistent capture requested from the system process.
-const PERSISTENT_FROM_SYSTEM: Hresult = Hresult::error(0x22);
+/// A persistent capture requested from the title process.
+const PERSISTENT_FROM_TITLE: Hresult = xbdm_error(0x22);
 /// Position argument that selects every entry or appends.
 const ALL: u32 = u32::MAX;
 
@@ -43,7 +44,7 @@ const ALL: u32 = u32::MAX;
 /// report a generic failure.
 fn on_server<T>(request: &mut T, service: dispatcher::ServerService) -> Hresult {
     dispatcher::call_on_server(service, request as *mut T as usize as u32)
-        .map_or(Hresult::from_error_code(ErrorCode::Undefined), Hresult)
+        .map_or(ErrorCode::Undefined.hresult(), Hresult)
 }
 
 /// A helper failure as the exports report it, through the facility rule
@@ -117,9 +118,9 @@ struct CaptureStart<'a> {
 extern "C" fn capture_start(name: u32, data_limit: u32, buffer: u32, flags: u32) -> u32 {
     let flags = CaptureFlags(flags);
     if flags.contains(CaptureFlags::PERSISTENT)
-        && kernel::KeGetCurrentProcessType() == SYSTEM_PROCESS_TYPE
+        && xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE
     {
-        return PERSISTENT_FROM_SYSTEM.0;
+        return PERSISTENT_FROM_TITLE.0;
     }
     let mut start = CaptureStart {
         name: c_string(name).unwrap_or_default(),

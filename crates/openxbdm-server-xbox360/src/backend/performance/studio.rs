@@ -22,12 +22,26 @@ use openxbdm_server::commands::performance::studio::Stream;
 use openxbdm_server::commands::performance::studio::StudioError;
 use openxbdm_server::commands::performance::studio::Transport;
 use openxbdm_server::commands::performance::studio::routine_result;
+use xbox360_sys::status::Win32Error;
+use xbox360_sys::xam;
+use xbox360_sys::xam::AddressFamily;
+use xbox360_sys::xam::IoctlCommand;
+use xbox360_sys::xam::MessageFlags;
+use xbox360_sys::xam::NetworkEvents;
+use xbox360_sys::xam::Protocol;
+use xbox360_sys::xam::Socket;
+use xbox360_sys::xam::SocketType;
+use xbox360_sys::xam::XnCaller;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::KspinLock;
+use xbox360_sys::xboxkrnl::PoolTag;
+use xbox360_sys::xboxkrnl::PoolType;
+use xbox360_sys::xboxkrnl::ProcessorMode;
+use xbox360_sys::xboxkrnl::ThreadCreationFlags;
+use xbox360_sys::xboxkrnl::WaitType;
 
 use crate::kernel;
 use crate::kernel::CriticalSection;
-use crate::net;
-use crate::net::INVALID_SOCKET;
-use crate::net::XNCALLER_XBDM;
 
 /// Kernel export that queues null-cable transfers.
 const NULL_CABLE_ORDINAL: u32 = 810;
@@ -47,23 +61,16 @@ const NULL_CABLE_CANCEL: u32 = 3;
 const NULL_CABLE_REPORT_STATUS: u32 = 4;
 
 const WORKER_STACK_SIZE: u32 = 0x4000;
-const WORKER_CREATION_FLAGS: u32 = 0x1000_042f;
-const POOL_TYPE: u32 = 2;
-const NULL_CABLE_POOL_TAG: u32 = 0x754e_5358;
-const SOCKET_POOL_TAG: u32 = 0x734e_5358;
+const WORKER_CREATION_FLAGS: ThreadCreationFlags =
+    ThreadCreationFlags::from_bits_retain(0x1000042f);
+const NULL_CABLE_POOL_TAG: PoolTag = PoolTag::new(*b"uNSX");
+const SOCKET_POOL_TAG: PoolTag = PoolTag::new(*b"sNSX");
 
-const SOCK_STREAM: u32 = 1;
-const IPPROTO_TCP: u32 = 6;
-const FIONBIO: u32 = 0x8004_667e;
-const FD_READ_WRITE: u32 = 3;
-const FD_ACCEPT: u32 = 8;
+const FD_READ_WRITE: NetworkEvents = NetworkEvents::READ.union(NetworkEvents::WRITE);
 const SOCKADDR_SIZE: i32 = 16;
-const WSAEWOULDBLOCK: i32 = 10035;
 
 const STATUS_PENDING: u32 = 0x103;
 const INFINITE: u32 = u32::MAX;
-const WAIT_ANY: u32 = 1;
-const USER_MODE: u32 = 1;
 
 /// Offset of the event handle in a caller request; +0 receives the
 /// transfer count or request handle and +4 the null-cable status.
@@ -106,21 +113,31 @@ fn raw_handle(handle: Option<Handle>) -> u32 {
 
 /// `SetEvent` (stock 0x91f738b8).
 fn set_event(handle: Option<Handle>) {
-    let status = kernel::NtSetEvent(raw_handle(handle), core::ptr::null_mut());
-    if let Err(error) = NtStatus(status).result() {
-        kernel::set_last_error(error);
+    // SAFETY: the handle is an event handle of this module or 0, which the
+    // kernel rejects; the previous-state pointer is null.
+    let status = unsafe {
+        xboxkrnl::NtSetEvent(
+            xboxkrnl::Handle::from_raw(raw_handle(handle)),
+            core::ptr::null_mut(),
+        )
+    };
+    if let Err(error) = status.result() {
+        set_last_error(error);
     }
 }
 
 /// `CloseHandle` (stock 0x91f738f8).
 fn close_handle(handle: Handle) {
-    if let Err(error) = NtStatus(kernel::NtClose(handle.0)).result() {
-        kernel::set_last_error(error);
+    // SAFETY: callers pass an owned handle and drop it afterwards.
+    let status = unsafe { xboxkrnl::NtClose(xboxkrnl::Handle::from_raw(handle.0)) };
+    if let Err(error) = status.result() {
+        set_last_error(error);
     }
 }
 
 fn close_socket(socket: SocketId) {
-    net::NetDll_closesocket(XNCALLER_XBDM, socket.0);
+    // SAFETY: callers pass an owned socket and drop it afterwards.
+    unsafe { xam::NetDll_closesocket(XnCaller::DebugMonitor, Socket::from_raw(socket.0)) };
 }
 
 /// A kernel spin lock word in static memory.
@@ -130,14 +147,16 @@ struct SpinLock(UnsafeCell<u32>);
 unsafe impl Sync for SpinLock {}
 
 impl SpinLock {
-    fn pointer(&self) -> *mut u32 {
-        self.0.get()
+    fn pointer(&self) -> *mut KspinLock {
+        self.0.get().cast()
     }
 
     fn with<R>(&self, operation: impl FnOnce() -> R) -> R {
-        let irql = kernel::KfAcquireSpinLock(self.pointer());
+        // SAFETY: the lock word lives in static memory.
+        let irql = unsafe { xboxkrnl::KfAcquireSpinLock(self.pointer()) };
         let result = operation();
-        kernel::KfReleaseSpinLock(self.pointer(), irql);
+        // SAFETY: acquired above at `irql`.
+        unsafe { xboxkrnl::KfReleaseSpinLock(self.pointer(), irql) };
         result
     }
 }
@@ -191,15 +210,12 @@ static SESSION: SessionCell = SessionCell(UnsafeCell::new(Session {
 static NULL_CABLE_REQUEST: AtomicU32 = AtomicU32::new(0);
 static STUDIO_SERVICE: AtomicU32 = AtomicU32::new(0);
 
-fn resolve(module: &core::ffi::CStr, ordinal: u32) -> Result<u32, KernelError> {
-    let handle = kernel::module_handle(module)?;
+fn resolve(module: SystemModule, ordinal: u32) -> Result<u32, KernelError> {
+    let handle = module.handle()?;
     let mut address = 0u32;
-    NtStatus(kernel::XexGetProcedureAddress(
-        handle.raw(),
-        ordinal,
-        &mut address,
-    ))
-    .result()?;
+    // SAFETY: `handle` is a loaded module handle and `address` a live u32.
+    let status = unsafe { xboxkrnl::XexGetProcedureAddress(handle.raw(), ordinal, &mut address) };
+    status.result()?;
     Ok(address)
 }
 
@@ -214,8 +230,8 @@ fn call(function: &AtomicU32, a0: u32, a1: u32) -> u32 {
 pub(crate) fn initialize() {
     SECTION.initialize();
     SECTION_READY.store(true, Ordering::Release);
-    let exports = resolve(c"xboxkrnl.exe", NULL_CABLE_ORDINAL)
-        .and_then(|request| Ok((request, resolve(c"xam.xex", STUDIO_SERVICE_ORDINAL)?)));
+    let exports = resolve(SystemModule::Kernel, NULL_CABLE_ORDINAL)
+        .and_then(|request| Ok((request, resolve(SystemModule::Xam, STUDIO_SERVICE_ORDINAL)?)));
     match exports {
         Err(error) => {
             super::pmc::print(
@@ -248,7 +264,7 @@ pub(super) fn shut_down() {
         if idle {
             break;
         }
-        kernel::sleep_milliseconds(1);
+        sleep(Duration::from_millis(1));
     }
 }
 
@@ -278,13 +294,16 @@ pub(crate) fn poll() {
 /// Monitor control code 0x99 (stock 0x91f65ab8), issued by the kernel's
 /// null-cable driver with `{+0 u8 status}`.
 pub(crate) fn service_set_device_status(argument: u32) -> u32 {
-    kernel::KeAcquireSpinLockAtRaisedIrql(LOCK.pointer());
+    // SAFETY: LOCK is a static spin lock word; the kernel calls this at
+    // raised IRQL.
+    unsafe { xboxkrnl::KeAcquireSpinLockAtRaisedIrql(LOCK.pointer()) };
     if INITIALIZED.load(Ordering::Relaxed) {
         // SAFETY: the kernel passes the address of the status byte.
         let status = unsafe { core::ptr::read_volatile(argument as usize as *const u8) };
         DEVICE_ATTACHED.store(status != 0, Ordering::Relaxed);
     }
-    kernel::KeReleaseSpinLockFromRaisedIrql(LOCK.pointer());
+    // SAFETY: acquired above.
+    unsafe { xboxkrnl::KeReleaseSpinLockFromRaisedIrql(LOCK.pointer()) };
     0
 }
 
@@ -327,11 +346,19 @@ fn open_listener() -> Result<u16, StudioError> {
     if let Some(failure) = failure {
         return Err(failure);
     }
-    let socket = net::NetDll_socket(XNCALLER_XBDM, net::AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if socket == INVALID_SOCKET {
+    // SAFETY: no pointer arguments; the result is checked below.
+    let socket = unsafe {
+        xam::NetDll_socket(
+            XnCaller::DebugMonitor,
+            AddressFamily::Inet,
+            SocketType::Stream,
+            Protocol::Tcp,
+        )
+    };
+    if socket == Socket::INVALID {
         return Err(StudioError::Fail);
     }
-    let socket = SocketId(socket);
+    let socket = SocketId(socket.raw());
     let Some(port) = configure_listener(socket) else {
         close_socket(socket);
         return Err(StudioError::Fail);
@@ -345,18 +372,44 @@ fn open_listener() -> Result<u16, StudioError> {
 /// Non-blocking, bound to an ephemeral port on every interface, backlog 1.
 fn configure_listener(socket: SocketId) -> Option<u16> {
     let mut nonblocking = 1u32;
-    if net::NetDll_ioctlsocket(XNCALLER_XBDM, socket.0, FIONBIO, &mut nonblocking) != 0 {
-        return None;
-    }
-    let mut address = [0u8; SOCKADDR_SIZE as usize];
-    address[..2].copy_from_slice(&(net::AF_INET as u16).to_be_bytes());
-    if net::NetDll_bind(XNCALLER_XBDM, socket.0, address.as_ptr(), SOCKADDR_SIZE) != 0
-        || net::NetDll_listen(XNCALLER_XBDM, socket.0, 1) != 0
+    // SAFETY: `socket` is the listener opened by the caller; `nonblocking`
+    // is a live u32.
+    if unsafe {
+        xam::NetDll_ioctlsocket(
+            XnCaller::DebugMonitor,
+            Socket::from_raw(socket.0),
+            IoctlCommand::Fionbio,
+            &mut nonblocking,
+        )
+    } != 0
     {
         return None;
     }
+    let mut address = [0u8; SOCKADDR_SIZE as usize];
+    address[..2].copy_from_slice(&(AddressFamily::Inet.raw() as u16).to_be_bytes());
+    // SAFETY: `address` is a live sockaddr of SOCKADDR_SIZE bytes.
+    if unsafe {
+        xam::NetDll_bind(
+            XnCaller::DebugMonitor,
+            Socket::from_raw(socket.0),
+            address.as_ptr(),
+            SOCKADDR_SIZE,
+        ) != 0
+            || xam::NetDll_listen(XnCaller::DebugMonitor, Socket::from_raw(socket.0), 1) != 0
+    } {
+        return None;
+    }
     let mut length = SOCKADDR_SIZE;
-    if net::NetDll_getsockname(XNCALLER_XBDM, socket.0, address.as_mut_ptr(), &mut length) != 0 {
+    // SAFETY: `address` and `length` are live and describe SOCKADDR_SIZE bytes.
+    if unsafe {
+        xam::NetDll_getsockname(
+            XnCaller::DebugMonitor,
+            Socket::from_raw(socket.0),
+            address.as_mut_ptr(),
+            &mut length,
+        )
+    } != 0
+    {
         return None;
     }
     Some(u16::from_be_bytes([address[2], address[3]]))
@@ -386,25 +439,32 @@ fn start_session() {
 }
 
 fn create_worker() -> bool {
-    let Some(event) = Handle::new(kernel::CreateEventA(0, 0, 0, core::ptr::null())) else {
+    // SAFETY: unnamed event without security attributes.
+    let event = unsafe { xam::CreateEventA(0, false, false, core::ptr::null()) };
+    let Some(event) = Handle::new(event.raw()) else {
         return false;
     };
     with_session(|session| session.stop_event = Some(event));
     let mut thread = 0u32;
     let entry = worker as *const () as usize as u32;
-    let status = kernel::ExCreateThread(
-        &mut thread,
-        WORKER_STACK_SIZE,
-        core::ptr::null_mut(),
-        0,
-        entry,
-        0,
-        WORKER_CREATION_FLAGS,
-    );
-    if failed(status) {
+    // SAFETY: `thread` is a live u32; the worker takes no context and reads
+    // the session under SECTION.
+    let status = unsafe {
+        xboxkrnl::ExCreateThread(
+            &mut thread,
+            WORKER_STACK_SIZE,
+            core::ptr::null_mut(),
+            0,
+            entry,
+            0,
+            WORKER_CREATION_FLAGS,
+        )
+    };
+    if failed(status.0) {
         return false;
     }
-    kernel::ResumeThread(thread);
+    // SAFETY: `thread` is the handle of the suspended worker created above.
+    unsafe { xam::ResumeThread(xboxkrnl::Handle::from_raw(thread)) };
     with_session(|session| session.worker = Handle::new(thread));
     true
 }
@@ -424,7 +484,8 @@ fn stop_session() {
     });
     SECTION.leave();
     let Some(worker) = worker else { return };
-    kernel::WaitForSingleObject(worker.0, INFINITE);
+    // SAFETY: `worker` is the owned worker thread handle, closed below.
+    unsafe { xam::WaitForSingleObject(xboxkrnl::Handle::from_raw(worker.0), INFINITE) };
     SECTION.enter();
     let event = with_session(|session| {
         session.worker = None;
@@ -501,42 +562,74 @@ fn accept_connection(
     listener: SocketId,
     stop_event: Option<Handle>,
 ) -> Result<SocketId, StudioError> {
-    let Some(ready) = Handle::new(kernel::CreateEventA(0, 1, 0, core::ptr::null())) else {
+    // SAFETY: unnamed event without security attributes.
+    let ready = unsafe { xam::CreateEventA(0, true, false, core::ptr::null()) };
+    let Some(ready) = Handle::new(ready.raw()) else {
         return Err(StudioError::OutOfMemory);
     };
     let mut outcome = Err(StudioError::Fail);
-    if net::NetDll_WSAEventSelect(XNCALLER_XBDM, listener.0, ready.0, FD_ACCEPT) == 0 {
+    // SAFETY: `listener` is the open listener and `ready` the event created
+    // above.
+    if unsafe {
+        xam::NetDll_WSAEventSelect(
+            XnCaller::DebugMonitor,
+            Socket::from_raw(listener.0),
+            xboxkrnl::Handle::from_raw(ready.0),
+            NetworkEvents::ACCEPT,
+        )
+    } == 0
+    {
         let handles = [raw_handle(stop_event), ready.0];
         outcome = loop {
-            let wait = kernel::NtWaitForMultipleObjectsEx(
-                2,
-                handles.as_ptr(),
-                WAIT_ANY,
-                USER_MODE,
-                0,
-                core::ptr::null(),
-            );
-            if let Err(error) = NtStatus(wait).result() {
-                kernel::set_last_error(error);
-            } else if wait == 0 {
+            // SAFETY: `handles` is a live array of two handle words.
+            let wait = unsafe {
+                xboxkrnl::NtWaitForMultipleObjectsEx(
+                    2,
+                    handles.as_ptr().cast(),
+                    WaitType::Any,
+                    ProcessorMode::User,
+                    false,
+                    core::ptr::null(),
+                )
+            };
+            if let Err(error) = wait.result() {
+                set_last_error(error);
+            } else if wait.0 == 0 {
                 break Err(StudioError::Aborted);
-            } else if wait == 1 {
-                let socket = net::NetDll_accept(
-                    XNCALLER_XBDM,
-                    listener.0,
-                    core::ptr::null_mut(),
-                    core::ptr::null_mut(),
-                );
-                if socket != INVALID_SOCKET {
-                    break Ok(SocketId(socket));
+            } else if wait.0 == 1 {
+                // SAFETY: `listener` is the open listener; no address is requested.
+                let socket = unsafe {
+                    xam::NetDll_accept(
+                        XnCaller::DebugMonitor,
+                        Socket::from_raw(listener.0),
+                        core::ptr::null_mut(),
+                        core::ptr::null_mut(),
+                    )
+                };
+                if socket != Socket::INVALID {
+                    break Ok(SocketId(socket.raw()));
                 }
             }
         };
     }
-    net::NetDll_WSAEventSelect(XNCALLER_XBDM, listener.0, 0, 0);
+    // SAFETY: `listener` is the open listener; a null event clears the selection.
+    unsafe {
+        xam::NetDll_WSAEventSelect(
+            XnCaller::DebugMonitor,
+            Socket::from_raw(listener.0),
+            xboxkrnl::Handle::NULL,
+            NetworkEvents::empty(),
+        )
+    };
     close_handle(ready);
     outcome
 }
+
+use core::time::Duration;
+
+use xbox360::module::SystemModule;
+use xbox360::status::set_last_error;
+use xbox360::time::sleep;
 
 use crate::exports::bridged;
 
@@ -552,32 +645,37 @@ struct NullCableTransport {
 }
 
 fn create_null_cable_transport() -> Result<u32, StudioError> {
-    let object = kernel::ExAllocatePoolTypeWithTag(
-        size_of::<NullCableTransport>() as u32,
-        NULL_CABLE_POOL_TAG,
-        POOL_TYPE,
-    );
+    // SAFETY: pool allocation of the object size; the result is checked below.
+    let object = unsafe {
+        xboxkrnl::ExAllocatePoolTypeWithTag(
+            size_of::<NullCableTransport>() as u32,
+            NULL_CABLE_POOL_TAG,
+            PoolType::System,
+        )
+    };
     // Stock passes the null pointer to ExFreePool here.
     if object == 0 {
         return Err(StudioError::OutOfMemory);
     }
-    let request = kernel::module_handle(c"xboxkrnl.exe")
+    let request = SystemModule::Kernel
+        .handle()
         .map_err(|_| StudioError::Fail)
         .and_then(|module| {
             let mut address = 0u32;
-            NtStatus(kernel::XexGetProcedureAddress(
-                module.raw(),
-                NULL_CABLE_ORDINAL,
-                &mut address,
-            ))
-            .result()
-            .map(|()| address)
-            .map_err(|_| StudioError::NotImplemented)
+            // SAFETY: `module` is the loaded kernel handle and `address` a live u32.
+            let status = unsafe {
+                xboxkrnl::XexGetProcedureAddress(module.raw(), NULL_CABLE_ORDINAL, &mut address)
+            };
+            status
+                .result()
+                .map(|()| address)
+                .map_err(|_| StudioError::NotImplemented)
         });
     let request = match request {
         Ok(request) => request,
         Err(failure) => {
-            kernel::ExFreePool(object);
+            // SAFETY: `object` was allocated above and is not used afterwards.
+            unsafe { xboxkrnl::ExFreePool(object) };
             return Err(failure);
         }
     };
@@ -623,7 +721,7 @@ fn null_cable_transfer(this: u32, code: u32, buffer: u32, length: u32, request: 
         buffer,
         length,
         read_u32(request + REQUEST_EVENT),
-        kernel::KeGetCurrentProcessType(),
+        xboxkrnl::KeGetCurrentProcessType().0,
         request,
         request + REQUEST_STATUS,
     ];
@@ -647,7 +745,8 @@ extern "C" fn null_cable_kind(_this: u32) -> u32 {
 }
 
 extern "C" fn null_cable_release(this: u32) -> u32 {
-    kernel::ExFreePool(this);
+    // SAFETY: the studio service releases each transport once, after its last use.
+    unsafe { xboxkrnl::ExFreePool(this) };
     0
 }
 
@@ -676,7 +775,8 @@ extern "C" fn null_cable_result(_this: u32, request: u32, transferred: u32, wait
         if wait == 0 {
             return routine_result(Err(StudioError::Pending)).0;
         }
-        kernel::WaitForSingleObject(event, INFINITE);
+        // SAFETY: `event` is the caller's event handle of the request.
+        unsafe { xam::WaitForSingleObject(xboxkrnl::Handle::from_raw(event), INFINITE) };
     };
     core::sync::atomic::fence(Ordering::Acquire);
     write_u32(transferred, read_u32(request));
@@ -689,7 +789,7 @@ extern "C" fn null_cable_result(_this: u32, request: u32, transferred: u32, wait
 }
 
 extern "C" fn null_cable_cancel(this: u32) -> u32 {
-    let parameters = [kernel::KeGetCurrentProcessType()];
+    let parameters = [xboxkrnl::KeGetCurrentProcessType()];
     // SAFETY: the object holds the resolved kernel export.
     let status = unsafe {
         kernel::call_export(
@@ -743,14 +843,17 @@ impl Stream for SocketStream {
                 (buffer.address as usize as *const u8, buffer.length as i32)
             }
         };
-        u32::try_from(net::NetDll_send(
-            XNCALLER_XBDM,
-            self.socket.0,
-            pointer,
-            length,
-            0,
-        ))
-        .ok()
+        // SAFETY: `pointer` addresses `length` readable bytes of the request.
+        let sent = unsafe {
+            xam::NetDll_send(
+                XnCaller::DebugMonitor,
+                Socket::from_raw(self.socket.0),
+                pointer,
+                length,
+                MessageFlags::empty(),
+            )
+        };
+        u32::try_from(sent).ok()
     }
 
     fn receive(&mut self, into: Incoming<'_>) -> Option<u32> {
@@ -758,18 +861,21 @@ impl Stream for SocketStream {
             Incoming::Local(bytes) => (bytes.as_mut_ptr(), bytes.len() as i32),
             Incoming::Caller(buffer) => (buffer.address as usize as *mut u8, buffer.length as i32),
         };
-        u32::try_from(net::NetDll_recv(
-            XNCALLER_XBDM,
-            self.socket.0,
-            pointer,
-            length,
-            0,
-        ))
-        .ok()
+        // SAFETY: `pointer` addresses `length` writable bytes of the request.
+        let received = unsafe {
+            xam::NetDll_recv(
+                XnCaller::DebugMonitor,
+                Socket::from_raw(self.socket.0),
+                pointer,
+                length,
+                MessageFlags::empty(),
+            )
+        };
+        u32::try_from(received).ok()
     }
 
     fn would_block(&mut self) -> bool {
-        net::NetDll_WSAGetLastError(XNCALLER_XBDM) == WSAEWOULDBLOCK
+        xam::NetDll_WSAGetLastError(XnCaller::DebugMonitor).error() == Some(Win32Error::WOULD_BLOCK)
     }
 
     fn read_length(&mut self, address: u32) -> u32 {
@@ -786,11 +892,14 @@ impl Stream for SocketStream {
 }
 
 fn create_socket_transport(socket: SocketId) -> Result<u32, StudioError> {
-    let object = kernel::ExAllocatePoolTypeWithTag(
-        size_of::<SocketTransport>() as u32,
-        SOCKET_POOL_TAG,
-        POOL_TYPE,
-    );
+    // SAFETY: pool allocation of the object size; the result is checked below.
+    let object = unsafe {
+        xboxkrnl::ExAllocatePoolTypeWithTag(
+            size_of::<SocketTransport>() as u32,
+            SOCKET_POOL_TAG,
+            PoolType::System,
+        )
+    };
     if object == 0 {
         return Err(StudioError::OutOfMemory);
     }
@@ -815,10 +924,18 @@ fn create_socket_transport(socket: SocketId) -> Result<u32, StudioError> {
         (*pointer).section.initialize();
     }
     let mut nonblocking = 1u32;
-    if net::NetDll_ioctlsocket(XNCALLER_XBDM, socket.0, FIONBIO, &mut nonblocking)
-        == net::SOCKET_ERROR
+    // SAFETY: `socket` is the accepted connection; `nonblocking` is a live u32.
+    if unsafe {
+        xam::NetDll_ioctlsocket(
+            XnCaller::DebugMonitor,
+            Socket::from_raw(socket.0),
+            IoctlCommand::Fionbio,
+            &mut nonblocking,
+        )
+    } == xam::SOCKET_ERROR
     {
-        kernel::ExFreePool(object);
+        // SAFETY: `object` was allocated above and is not used afterwards.
+        unsafe { xboxkrnl::ExFreePool(object) };
         return Err(StudioError::Fail);
     }
     Ok(object)
@@ -872,10 +989,18 @@ impl SocketTransport {
     fn bind_event(&mut self, event: u32) {
         if self.event.is_none() {
             self.event = Handle::new(event);
-            let status =
-                net::NetDll_WSAEventSelect(XNCALLER_XBDM, self.socket.0, event, FD_READ_WRITE);
+            // SAFETY: `socket` is the transport's connection and `event` the
+            // caller's event handle.
+            let status = unsafe {
+                xam::NetDll_WSAEventSelect(
+                    XnCaller::DebugMonitor,
+                    Socket::from_raw(self.socket.0),
+                    xboxkrnl::Handle::from_raw(event),
+                    FD_READ_WRITE,
+                )
+            };
             set_event(self.event);
-            if status == net::SOCKET_ERROR {
+            if status == xam::SOCKET_ERROR {
                 let mut stream = self.stream();
                 self.engine.socket_error(&mut stream);
             }
@@ -913,7 +1038,8 @@ extern "C" fn socket_kind(_this: u32) -> u32 {
 
 extern "C" fn socket_release(this: u32) -> u32 {
     socket_cancel(this);
-    kernel::ExFreePool(this);
+    // SAFETY: the studio service releases each transport once, after its last use.
+    unsafe { xboxkrnl::ExFreePool(this) };
     0
 }
 
@@ -951,8 +1077,11 @@ extern "C" fn socket_result(this: u32, request: u32, transferred: u32, wait: u32
             }
             let event = object.event;
             leave(this);
-            kernel::WaitForSingleObject(raw_handle(event), INFINITE);
-            // SAFETY: as above.
+            // SAFETY: `event` is the caller's event handle bound to the transport.
+            unsafe {
+                xam::WaitForSingleObject(xboxkrnl::Handle::from_raw(raw_handle(event)), INFINITE)
+            };
+            // SAFETY: the studio service passes the transport it was given.
             unsafe { enter(this) }.pump();
         }
     }

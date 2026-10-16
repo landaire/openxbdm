@@ -20,6 +20,7 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::ConnectionIndex;
 use openxbdm_server::Server;
 use openxbdm_server::SocketId;
@@ -39,9 +40,15 @@ use openxbdm_server::server::MAX_CONNECTIONS;
 use openxbdm_server::server::Owner;
 use openxbdm_server::text::ResponseText;
 use openxbdm_server::text::Text;
+use xbox360::time::TickCount;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::KeResumeThread;
+use xbox360_sys::xboxkrnl::ProcessorMode;
+use xbox360_sys::xboxkrnl::ThreadCreationFlags;
+use xbox360_sys::xboxkrnl::WaitReason;
+use xbox360_sys::xboxkrnl::WaitType;
 
 use super::super::Console;
-use super::super::debugger::KeResumeThread;
 use super::CriticalSection;
 use super::THREAD_SYSTEM_PROCESS;
 use super::TITLE_PROCESS;
@@ -81,7 +88,6 @@ const TITLE_IDLE_MILLISECONDS: u32 = 30_000;
 /// other work; one pass of its loop.
 const FAST_WAIT: i64 = -20 * 10_000;
 const NO_WAIT: i64 = 0;
-const WAIT_ANY: u32 = 1;
 const STATUS_WAIT_0: u32 = 0;
 const STATUS_TIMEOUT: u32 = 0x102;
 
@@ -140,7 +146,7 @@ extern "C" fn register_processor_ex(name: u32, handler: u32, dedicated: u32) -> 
     // One byte past the longest stored name tells an overlong name apart.
     let name = c_string(name, PROCESSOR_NAME_CAPACITY + 1);
     let mut flags = ProcessorFlags::NONE;
-    if kernel::KeGetCurrentProcessType() == TITLE_PROCESS {
+    if xboxkrnl::KeGetCurrentProcessType().0 == TITLE_PROCESS {
         flags = flags.union(ProcessorFlags::TITLE);
     }
     if dedicated != 0 {
@@ -386,26 +392,40 @@ impl ExecutorThread {
             THREAD_FLAGS | THREAD_SYSTEM_PROCESS
         };
         let mut object = 0u32;
-        let status = kernel::ExCreateThread(
-            &mut object,
-            THREAD_STACK_SIZE,
-            core::ptr::null_mut(),
-            0,
-            executor_thread as *const () as usize as u32,
-            tag,
-            flags,
-        );
-        if (status as i32) < 0 {
+        // SAFETY: `object` is a local word; `executor_thread` takes the tag
+        // as its context.
+        let status = unsafe {
+            xboxkrnl::ExCreateThread(
+                &mut object,
+                THREAD_STACK_SIZE,
+                core::ptr::null_mut(),
+                0,
+                executor_thread as *const () as usize as u32,
+                tag,
+                ThreadCreationFlags::from_bits_retain(flags),
+            )
+        };
+        if (status.0 as i32) < 0 {
             return None;
         }
         let object = NonZeroU32::new(object)?;
-        KeResumeThread(object.get());
+        // SAFETY: `object` is the referenced, suspended thread created above.
+        unsafe { KeResumeThread(object.get() as usize as *mut xboxkrnl::Kthread) };
         Some(Self { object, tag })
     }
 
     fn ended(&self) -> bool {
-        kernel::KeWaitForSingleObject(self.object.get() as usize as *mut u32, 0, 0, 0, &NO_WAIT)
-            == STATUS_WAIT_0
+        // SAFETY: `object` is the referenced thread object `self` owns.
+        unsafe {
+            xboxkrnl::KeWaitForSingleObject(
+                self.object.get() as usize as *mut xboxkrnl::DispatcherObject,
+                WaitReason::Executive,
+                ProcessorMode::Kernel,
+                false,
+                &NO_WAIT,
+            )
+        }
+        .0 == STATUS_WAIT_0
     }
 
     /// Whether a call posted to this thread is waiting or running.
@@ -425,8 +445,18 @@ impl ExecutorThread {
     /// Wait for a retired thread to exit and release the object.
     fn join(self) {
         let object = self.object.get();
-        kernel::KeWaitForSingleObject(object as usize as *mut u32, 0, 0, 0, core::ptr::null());
-        kernel::ObDereferenceObject(object);
+        // SAFETY: `object` is the referenced thread object `self` owned; the
+        // reference is dropped once.
+        unsafe {
+            xboxkrnl::KeWaitForSingleObject(
+                object as usize as *mut xboxkrnl::DispatcherObject,
+                WaitReason::Executive,
+                ProcessorMode::Kernel,
+                false,
+                core::ptr::null(),
+            );
+            xboxkrnl::ObDereferenceObject(object);
+        }
     }
 
     /// Make an idle thread exit and release the object.
@@ -456,7 +486,8 @@ impl ExecutorThread {
                 slot.state.store(SLOT_LOST, Ordering::Release);
             }
         }
-        kernel::ObDereferenceObject(self.object.get());
+        // SAFETY: `self` owns the reference and is consumed here.
+        unsafe { xboxkrnl::ObDereferenceObject(self.object.get()) };
     }
 }
 
@@ -662,22 +693,26 @@ impl Data {
         let objects = [call.done.pointer() as usize as u32, object];
         let mut wait_blocks = [0u32; 0x10];
         loop {
-            let status = kernel::KeWaitForMultipleObjects(
-                2,
-                objects.as_ptr(),
-                WAIT_ANY,
-                0,
-                0,
-                0,
-                &FAST_WAIT,
-                wait_blocks.as_mut_ptr(),
-            );
+            // SAFETY: the slot's event and the executor thread are live
+            // dispatcher objects; `wait_blocks` outlives the wait.
+            let status = unsafe {
+                xboxkrnl::KeWaitForMultipleObjects(
+                    2,
+                    objects.as_ptr().cast(),
+                    WaitType::Any,
+                    WaitReason::Executive,
+                    ProcessorMode::Kernel,
+                    false,
+                    &FAST_WAIT,
+                    wait_blocks.as_mut_ptr(),
+                )
+            };
             return match take_result(call) {
                 Some(Taken::Returned(result)) => Started::Finished(result.0),
                 Some(Taken::Lost) => Started::Unavailable,
-                None if status == STATUS_TIMEOUT => Started::Running,
+                None if status.0 == STATUS_TIMEOUT => Started::Running,
                 // A late signal of the slot's previous call.
-                None if status == STATUS_WAIT_0 => continue,
+                None if status.0 == STATUS_WAIT_0 => continue,
                 // The thread ended (the title process went away) before the
                 // call finished.
                 None => {
@@ -715,7 +750,7 @@ impl Data {
         {
             self.title_idle_since = None;
         } else if self.title.as_ref().is_some_and(|thread| !thread.busy()) {
-            let now = kernel::tick_count();
+            let now = TickCount::now().milliseconds();
             let since = *self.title_idle_since.get_or_insert(now);
             if now.wrapping_sub(since) >= TITLE_IDLE_MILLISECONDS {
                 self.title_idle_since = None;

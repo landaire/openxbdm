@@ -16,6 +16,7 @@ use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::ConnectionIndex;
 use openxbdm_server::Server;
 use openxbdm_server::commands;
@@ -57,6 +58,22 @@ use openxbdm_server::commands::hardware::automation::QueueEntry;
 use openxbdm_server::commands::hardware::automation::QueueStatus;
 use openxbdm_server::commands::hardware::automation::UploadLayout;
 use openxbdm_server::text::Text;
+use xbox360::module::Ordinal;
+use xbox360::module::SystemModule;
+use xbox360::module::resolve_export;
+use xbox360::sync::SpinLock;
+use xbox360::time::TickCount;
+use xbox360::time::Timebase;
+use xbox360_sys::xam;
+use xbox360_sys::xam::XnCaller;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::DebugMonitorService;
+use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
+use xbox360_sys::xboxkrnl::PoolTag;
+use xbox360_sys::xboxkrnl::PoolType;
+use xbox360_sys::xboxkrnl::ThreadCreationFlags;
+use xbox360_sys::xboxkrnl::XInputdSetRFPowerMode;
 
 use super::Console;
 use super::dispatcher;
@@ -65,32 +82,7 @@ use super::performance::pix;
 use crate::exports::export;
 use crate::kernel;
 use crate::kernel::KernelEvent;
-use crate::kernel::LIB_KERNEL;
-use crate::kernel::LIB_XAM;
-use crate::kernel::SpinLocked;
-use crate::kernel::import_thunk;
 use crate::net::XamNetwork;
-
-import_thunk!(
-    XAutomationpBindController(user: u32) -> u32,
-    lib = LIB_XAM,
-    ordinal = 0x3d5
-);
-import_thunk!(
-    XAutomationpUnbindController(user: u32) -> u32,
-    lib = LIB_XAM,
-    ordinal = 0x3d6
-);
-import_thunk!(
-    XAutomationpInputXenonButton(user: u32) -> u32,
-    lib = LIB_XAM,
-    ordinal = 0x3d7
-);
-import_thunk!(
-    XInputdSetRFPowerMode(enable: u32) -> u32,
-    lib = LIB_KERNEL,
-    ordinal = 0x1ef
-);
 
 /// XAM ordinal: input focus query, nonzero when the system has focus.
 const XAM_INPUT_FOCUS: u32 = 0x3dd;
@@ -101,19 +93,15 @@ const XAM_HEAP_INFO: u32 = 0x827;
 /// XAM ordinal: heap counts `(buffer) -> HRESULT`.
 const XAM_HEAP_COUNT: u32 = 0x828;
 /// Kernel ordinal: USB port power `(controller, port, enable) -> NTSTATUS`.
-const KERNEL_USB_PORT_POWER: u32 = 825;
-/// Monitor service: devkit memory statistics.
-const MONITOR_MEMORY_STATISTICS: u32 = 8;
+const KERNEL_USB_PORT_POWER: Ordinal = Ordinal::new(825).unwrap();
 /// Media service application and PlayTo message.
 const MEDIA_APP: SystemApp = SystemApp(0xf0);
 const MEDIA_PLAY_TO: SystemMessage = SystemMessage(0x900002);
-/// Caller identifier passed to the network address queries.
-const NETWORK_CALLER: u32 = 3;
+/// Size of a network address record.
 const XNADDR_SIZE: usize = 0x24;
 const ERROR_DEVICE_NOT_CONNECTED: u32 = 0x48f;
-const POOL_TAG_CONTROLLER: u32 = 0x646d_6175;
-const POOL_TAG_UPLOAD: u32 = 0x444d_4155;
-const POOL_TYPE: u32 = 2;
+const POOL_TAG_CONTROLLER: PoolTag = PoolTag::new(*b"dmau");
+const POOL_TAG_UPLOAD: PoolTag = PoolTag::new(*b"DMAU");
 const MAX_CONNECTIONS: usize = 8;
 
 /// Pool memory owned by a Rust value; freed on drop.
@@ -123,9 +111,12 @@ struct PoolBlock {
 }
 
 impl PoolBlock {
-    fn allocate(bytes: u64, tag: u32) -> Option<Self> {
+    fn allocate(bytes: u64, tag: PoolTag) -> Option<Self> {
         let size = u32::try_from(bytes).ok()?;
-        let address = NonZeroU32::new(kernel::ExAllocatePoolTypeWithTag(size, tag, POOL_TYPE))?;
+        // SAFETY: the allocation takes only a size, tag and pool type.
+        let address = NonZeroU32::new(unsafe {
+            xboxkrnl::ExAllocatePoolTypeWithTag(size, tag, PoolType::System)
+        })?;
         let block = Self {
             address,
             len: size as usize,
@@ -152,7 +143,8 @@ impl PoolBlock {
 
 impl Drop for PoolBlock {
     fn drop(&mut self) {
-        kernel::ExFreePool(self.address.get());
+        // SAFETY: the block owns the pool allocation at `address`.
+        unsafe { xboxkrnl::ExFreePool(self.address.get()) };
     }
 }
 
@@ -180,7 +172,7 @@ impl AsMut<[QueueEntry]> for PoolEntries {
 }
 
 /// The input system polls the controllers from other threads.
-static AUTOMATION: SpinLocked<Automation<PoolEntries>> = SpinLocked::new(Automation::new());
+static AUTOMATION: SpinLock<Automation<PoolEntries>> = SpinLock::new(Automation::new());
 /// Title decompression ignores GDF attributes (`tdecomp`).
 static IGNORE_GDF_ATTRIBUTES: AtomicBool = AtomicBool::new(false);
 
@@ -188,13 +180,20 @@ struct Input;
 
 impl InputPlatform for Input {
     fn tick(&mut self) -> u32 {
-        kernel::tick_count()
+        TickCount::now().milliseconds()
     }
 
     fn press_guide(&mut self, user: u32) {
-        XAutomationpInputXenonButton(user);
+        // SAFETY: the export takes only a user number.
+        unsafe { press_guide_button(user) };
     }
 }
+
+// The automation exports take the user number from the request as stock
+// passes it, without the `UserIndex` check.
+kernel::forward!(fn bind_automation_controller(u32) -> u32 => xam::XAutomationpBindController);
+kernel::forward!(fn unbind_automation_controller(u32) -> u32 => xam::XAutomationpUnbindController);
+kernel::forward!(fn press_guide_button(u32) -> u32 => xam::XAutomationpInputXenonButton);
 
 struct XboxControllers;
 
@@ -205,7 +204,7 @@ impl Controllers for XboxControllers {
         &mut self,
         operation: impl FnOnce(&mut Automation<PoolEntries>, &mut dyn InputPlatform) -> R,
     ) -> R {
-        AUTOMATION.with(|automation| operation(automation, &mut Input))
+        operation(&mut AUTOMATION.lock(), &mut Input)
     }
 
     fn allocate(&mut self, queue_length: u32) -> Option<PoolEntries> {
@@ -221,16 +220,18 @@ impl Controllers for XboxControllers {
     }
 
     fn bind_controller(&mut self, user: u32) -> bool {
-        XAutomationpBindController(user) != 0
+        // SAFETY: the export takes only a user number.
+        unsafe { bind_automation_controller(user) != 0 }
     }
 
     fn unbind_controller(&mut self, user: u32) -> bool {
-        XAutomationpUnbindController(user) != 0
+        // SAFETY: the export takes only a user number.
+        unsafe { unbind_automation_controller(user) != 0 }
     }
 
     fn tell_debugger(&mut self, message: DebuggerMessage) {
         let (payload, _) = message.payload();
-        let slot = kernel::KE_DEBUG_MONITOR_DATA.load(Ordering::Relaxed);
+        let slot = xboxkrnl::KeDebugMonitorData.address();
         // SAFETY: the loader stored the address of the kernel variable.
         let block = unsafe { core::ptr::read_volatile(slot as usize as *const u32) };
         if block == 0 {
@@ -273,13 +274,13 @@ impl CachedExport {
         Some(address)
     }
 
-    fn kernel(&self, ordinal: u32) -> Option<u32> {
+    fn kernel(&self, ordinal: Ordinal) -> Option<u32> {
         let cached = self.0.load(Ordering::Relaxed);
         if cached != 0 {
             return Some(cached);
         }
-        let module = kernel::module_handle(c"xboxkrnl.exe").ok()?;
-        let address = kernel::resolve_export(module, ordinal).ok()?;
+        let module = SystemModule::Kernel.handle().ok()?;
+        let address = resolve_export(module, ordinal).ok()?.raw();
         self.0.store(address, Ordering::Relaxed);
         Some(address)
     }
@@ -343,7 +344,9 @@ pub(crate) fn service_automation_get_state(request: u32) -> u32 {
     let user = read_word(request);
     let state = read_word(request + 4);
     let status = read_word(request + 8);
-    match AUTOMATION.with(|automation| automation.poll(user, &mut Input)) {
+    // The lock is released before the results are written.
+    let polled = AUTOMATION.lock().poll(user, &mut Input);
+    match polled {
         None => 0,
         Some(Poll::NotConnected) => {
             write_word(status, NtStatus::from(KernelError::DeviceNotConnected).0);
@@ -368,7 +371,8 @@ pub(crate) fn service_automation_get_state(request: u32) -> u32 {
 pub(crate) fn service_automation_get_status(request: u32) -> u32 {
     let user = read_word(request);
     let status = read_word(request + 8);
-    match AUTOMATION.with(|automation| automation.is_connected(user)) {
+    let connected = AUTOMATION.lock().is_connected(user);
+    match connected {
         None => 0,
         Some(connected) => {
             write_word(
@@ -395,7 +399,8 @@ pub(crate) fn service_automation_get_capabilities(request: u32) -> u32 {
     let user = read_word(request);
     let capabilities = read_word(request + 4);
     let status = read_word(request + 8);
-    match AUTOMATION.with(|automation| automation.is_connected(user)) {
+    let connected = AUTOMATION.lock().is_connected(user);
+    match connected {
         None => 0,
         Some(true) => {
             write_word(status, 0);
@@ -500,7 +505,7 @@ const ODD_LOG_HEADER: &[u8] = b"# Optical Disc Log Created on Console\r\n\
 # DROP,<DropCount>,;indicates dropped log entries\r\n";
 
 const ODD_WRITER_STACK: u32 = 0x8000;
-const ODD_WRITER_FLAGS: u32 = 0x0400_02a6;
+const ODD_WRITER_FLAGS: ThreadCreationFlags = ThreadCreationFlags::from_bits_retain(0x40002a6);
 
 impl OddLog {
     /// Queue a record of `kind` (a `SLOT_*` ready state).
@@ -551,20 +556,23 @@ fn speed_name(code: u32) -> &'static str {
 }
 
 fn write_text(handle: u32, text: &[u8]) {
-    let mut io_status = kernel::IoStatusBlock {
-        status: 0,
+    let mut io_status = xboxkrnl::IoStatusBlock {
+        status: NtStatus::SUCCESS,
         information: 0,
     };
-    kernel::NtWriteFile(
-        handle,
-        0,
-        0,
-        0,
-        &mut io_status,
-        text.as_ptr(),
-        text.len() as u32,
-        core::ptr::null(),
-    );
+    // SAFETY: `handle` is the open log file and `text` is valid for its length.
+    unsafe {
+        xboxkrnl::NtWriteFile(
+            Handle::from_raw(handle),
+            Handle::NULL,
+            0,
+            0,
+            &mut io_status,
+            text.as_ptr(),
+            text.len() as u32,
+            core::ptr::null(),
+        )
+    };
 }
 
 /// Trace stream record tag `ODD `.
@@ -581,7 +589,7 @@ fn trace_payload<const WORDS: usize>(words: [u32; WORDS]) -> [[u8; 4]; WORDS] {
 /// `{u32 sector, u32 count}`.
 pub(crate) fn service_odd_read_start(request: u32) -> u32 {
     let (start, count) = (read_word(request), read_word(request + 4));
-    let time = kernel::timebase();
+    let time = Timebase::now().ticks();
     if pix::stream_active() {
         let words = [
             (time >> 32) as u32,
@@ -606,7 +614,7 @@ pub(crate) fn service_odd_read_start(request: u32) -> u32 {
 /// Monitor control 0x47: the pending read completed; the argument is the
 /// completion status itself.
 pub(crate) fn service_odd_read_complete(status: u32) -> u32 {
-    let completed = kernel::timebase();
+    let completed = Timebase::now().ticks();
     if pix::stream_active() {
         let words = [
             (completed >> 32) as u32,
@@ -639,7 +647,7 @@ pub(crate) fn service_odd_read_complete(status: u32) -> u32 {
 /// volume descriptor's root directory sector and size first.
 pub(crate) fn service_odd_mount(request: u32) -> u32 {
     let (sector, size) = (read_word(request), read_word(request + 4));
-    let time = kernel::timebase();
+    let time = Timebase::now().ticks();
     ODD_LOG.publish(
         SLOT_MOUNT,
         [sector, size, (time >> 32) as u32, time as u32, 0, 0, 0],
@@ -655,7 +663,7 @@ pub(crate) fn service_odd_speed_change(request: u32) -> u32 {
         read_word(request + 4),
         read_word(request + 8),
     );
-    let time = kernel::timebase();
+    let time = Timebase::now().ticks();
     ODD_LOG.publish(
         SLOT_SPEED_CHANGE,
         [
@@ -688,7 +696,8 @@ pub(crate) fn service_odd_auth_state(state: u32) -> u32 {
 const OPTICAL_DRIVE: &[u8] = b"\\Device\\CdRom0";
 const IOCTL_ODD_AUTH_STATE: u32 = 0x2_40cc;
 /// Object attributes stock passes when opening the drive.
-const OPTICAL_DRIVE_ATTRIBUTES: u32 = 0x50;
+const OPTICAL_DRIVE_ATTRIBUTES: ObjectAttributeFlags =
+    ObjectAttributeFlags::PERMANENT.union(ObjectAttributeFlags::CASE_INSENSITIVE);
 
 /// Startup steps of this domain, in stock's order (0x91f32628).
 pub(crate) fn initialize() {
@@ -705,45 +714,53 @@ pub(crate) fn initialize() {
 fn odd_initialize() {
     ODD_LOG.work.initialize();
     ODD_LOG.finished.initialize_notification(true);
-    let name = kernel::AnsiString::new(OPTICAL_DRIVE);
-    let attributes = kernel::ObjectAttributes {
-        root_directory: 0,
+    let name = kernel::ansi_string(OPTICAL_DRIVE);
+    let attributes = xboxkrnl::ObjectAttributes {
+        root_directory: Handle::NULL,
         object_name: &name,
         attributes: OPTICAL_DRIVE_ATTRIBUTES,
     };
-    let mut io_status = kernel::IoStatusBlock::default();
+    let mut io_status = xboxkrnl::IoStatusBlock::default();
     let mut handle = 0u32;
-    let opened = kernel::NtCreateFile(
-        &mut handle,
-        FileAccess::GENERIC_READ.0,
-        &attributes,
-        &mut io_status,
-        core::ptr::null(),
-        FileAttributes::NORMAL.0,
-        0,
-        CreateDisposition::Open as u32,
-        CreateOptions::SYNCHRONOUS_IO_NONALERT.0,
-    );
-    if NtStatus(opened).result().is_err() {
+    // SAFETY: `handle`, `attributes`, the name it refers to and `io_status`
+    // are live locals.
+    let opened = unsafe {
+        xboxkrnl::NtCreateFile(
+            (&raw mut handle).cast(),
+            xboxkrnl::AccessMask::GENERIC_READ,
+            &attributes,
+            &mut io_status,
+            core::ptr::null(),
+            xboxkrnl::FileAttributes::NORMAL,
+            xboxkrnl::ShareAccess::empty(),
+            xboxkrnl::CreateDisposition::Open,
+            xboxkrnl::CreateOptions::SYNCHRONOUS_IO_NONALERT,
+        )
+    };
+    if opened.result().is_err() {
         return;
     }
     // Stock reads the output even when the request fails (uninitialized
     // stack); a failed request leaves 0 here.
     let mut state = [0u8; 4];
-    kernel::NtDeviceIoControlFile(
-        handle,
-        0,
-        0,
-        0,
-        &mut io_status,
-        IOCTL_ODD_AUTH_STATE,
-        core::ptr::null(),
-        0,
-        state.as_mut_ptr(),
-        4,
-    );
+    // SAFETY: `handle` was opened above; `state` holds the 4 output bytes.
+    unsafe {
+        xboxkrnl::NtDeviceIoControlFile(
+            Handle::from_raw(handle),
+            Handle::NULL,
+            0,
+            0,
+            &mut io_status,
+            IOCTL_ODD_AUTH_STATE,
+            core::ptr::null(),
+            0,
+            state.as_mut_ptr(),
+            4,
+        )
+    };
     ODD_AUTH_STATE.store(odd_auth_state(u32::from_be_bytes(state)), Ordering::Relaxed);
-    kernel::NtClose(handle);
+    // SAFETY: `handle` was opened above and is closed once.
+    unsafe { xboxkrnl::NtClose(Handle::from_raw(handle)) };
 }
 
 fn odd_write_record(handle: u32, kind: u32, words: OddWords) {
@@ -820,7 +837,8 @@ extern "C" fn odd_writer(handle: u32) -> u32 {
         log.work.wait();
         odd_drain(handle);
     }
-    kernel::NtClose(handle);
+    // SAFETY: the writer thread owns the log file handle passed at creation.
+    unsafe { xboxkrnl::NtClose(Handle::from_raw(handle)) };
     log.finished.set();
     0
 }
@@ -828,7 +846,11 @@ extern "C" fn odd_writer(handle: u32) -> u32 {
 /// The failure of a status with both severity bits set, the only statuses
 /// the optical disc log treats as failures.
 fn failure(status: NtStatus) -> Option<KernelError> {
-    (status.0 & 0xc000_0000 == 0xc000_0000).then(|| KernelError::from_status(status))
+    if status.0 & 0xc000_0000 == 0xc000_0000 {
+        KernelError::from_status(status)
+    } else {
+        None
+    }
 }
 
 /// Start the optical disc log (stock export 147 0x91f3dad0).
@@ -863,38 +885,47 @@ fn odd_log_start(path: Result<&[u8], KernelError>) -> Result<(), OddLogStartErro
     let opened = path.and_then(|path| super::filesystem::create_file(path, &request));
     let status = match opened {
         Ok(FileHandle(handle)) => {
-            let mut io_status = kernel::IoStatusBlock {
-                status: 0,
+            let mut io_status = xboxkrnl::IoStatusBlock {
+                status: NtStatus::SUCCESS,
                 information: 0,
             };
-            let status = NtStatus(kernel::NtWriteFile(
-                handle,
-                0,
-                0,
-                0,
-                &mut io_status,
-                ODD_LOG_HEADER.as_ptr(),
-                ODD_LOG_HEADER.len() as u32,
-                core::ptr::null(),
-            ));
+            // SAFETY: `handle` was opened above; the header is static.
+            let status = unsafe {
+                xboxkrnl::NtWriteFile(
+                    Handle::from_raw(handle),
+                    Handle::NULL,
+                    0,
+                    0,
+                    &mut io_status,
+                    ODD_LOG_HEADER.as_ptr(),
+                    ODD_LOG_HEADER.len() as u32,
+                    core::ptr::null(),
+                )
+            };
             if failure(status).is_some() {
-                kernel::NtClose(handle);
+                // SAFETY: `handle` was opened above and no writer owns it.
+                unsafe { xboxkrnl::NtClose(Handle::from_raw(handle)) };
             } else {
                 let mut thread = 0u32;
-                let created = NtStatus(kernel::ExCreateThread(
-                    &mut thread,
-                    ODD_WRITER_STACK,
-                    core::ptr::null_mut(),
-                    0,
-                    odd_writer as *const () as usize as u32,
-                    handle,
-                    ODD_WRITER_FLAGS,
-                ));
+                // SAFETY: `thread` is a local word; `odd_writer` takes the
+                // handle as its context.
+                let created = unsafe {
+                    xboxkrnl::ExCreateThread(
+                        &mut thread,
+                        ODD_WRITER_STACK,
+                        core::ptr::null_mut(),
+                        0,
+                        odd_writer as *const () as usize as u32,
+                        handle,
+                        ODD_WRITER_FLAGS,
+                    )
+                };
                 if let Some(error) = failure(created) {
                     // Stock leaves the finished event clear here, so its
                     // next stop waits forever; no writer runs, so mark it
                     // finished.
-                    kernel::NtClose(handle);
+                    // SAFETY: no writer started, so `handle` is still owned here.
+                    unsafe { xboxkrnl::NtClose(Handle::from_raw(handle)) };
                     log.finished.set();
                     log.busy.store(0, Ordering::Release);
                     return Err(OddLogStartError::Failed(error));
@@ -903,7 +934,9 @@ fn odd_log_start(path: Result<&[u8], KernelError>) -> Result<(), OddLogStartErro
                 // object behind.
                 let previous = log.thread.swap(thread, Ordering::AcqRel);
                 if previous != 0 {
-                    kernel::ObDereferenceObject(previous);
+                    // SAFETY: `previous` is a referenced thread object from
+                    // an earlier start.
+                    unsafe { xboxkrnl::ObDereferenceObject(previous) };
                 }
                 return Ok(());
             }
@@ -939,7 +972,8 @@ fn odd_log_stop() -> Result<(), OddLogNotRunning> {
     // handle.
     let thread = log.thread.swap(0, Ordering::AcqRel);
     if thread != 0 {
-        kernel::ObDereferenceObject(thread);
+        // SAFETY: `thread` is the referenced object ExCreateThread returned.
+        unsafe { xboxkrnl::ObDereferenceObject(thread) };
     }
     log.busy.store(0, Ordering::Release);
     Ok(())
@@ -961,22 +995,22 @@ fn export_result<E: Into<Hresult>>(result: Result<(), E>) -> u32 {
 // Shared by the exports and the command backend.
 #[inline(never)]
 fn connect(user: u32) -> Result<(), AutomationError> {
-    AUTOMATION.with(|automation| automation.connect(user))
+    AUTOMATION.lock().connect(user)
 }
 
 #[inline(never)]
 fn disconnect(user: u32) -> Result<(), AutomationError> {
-    AUTOMATION.with(|automation| automation.disconnect(user))
+    AUTOMATION.lock().disconnect(user)
 }
 
 #[inline(never)]
 fn clear_queue(user: u32) -> Result<(), AutomationError> {
-    AUTOMATION.with(|automation| automation.clear_queue(user))
+    AUTOMATION.lock().clear_queue(user)
 }
 
 #[inline(never)]
 fn query_queue(user: u32) -> Result<QueueStatus, AutomationError> {
-    AUTOMATION.with(|automation| automation.query(user, &mut Input))
+    AUTOMATION.lock().query(user, &mut Input)
 }
 
 /// Export 166 (stock 0x91f24468): input focus of `user` into `focus`;
@@ -984,7 +1018,7 @@ fn query_queue(user: u32) -> Result<QueueStatus, AutomationError> {
 extern "C" fn export_query_input_focus(user: u32, focus: *mut u32) -> u32 {
     let (value, result) = match query_input_focus(user) {
         Ok(value) => (value, Hresult::OK),
-        Err(ExportMissing) => (0, Hresult::from_error_code(ErrorCode::UnknownCommand)),
+        Err(ExportMissing) => (0, ErrorCode::UnknownCommand.hresult()),
     };
     // SAFETY: the caller passes a writable dword.
     unsafe { focus.write_volatile(value) };
@@ -1066,7 +1100,10 @@ extern "C" fn export_automation_queue(
             },
         }
     };
-    match AUTOMATION.with(|automation| automation.queue_entries(user, layout, entry, &mut Input)) {
+    let accepted = AUTOMATION
+        .lock()
+        .queue_entries(user, layout, entry, &mut Input);
+    match accepted {
         Ok(accepted) => {
             // SAFETY: checked non-null above; the caller passes a writable dword.
             unsafe { queued.write_volatile(accepted) };
@@ -1228,7 +1265,7 @@ impl commands::hardware::Backend for Console {
     ) -> Result<u32, AutomationError> {
         let upload = self.hardware.uploads[connection.0 as usize].take();
         let bytes = upload.as_ref().map_or(&[][..], PoolBlock::bytes);
-        AUTOMATION.with(|automation| automation.queue(user, layout, bytes, &mut Input))
+        AUTOMATION.lock().queue(user, layout, bytes, &mut Input)
     }
 
     fn automation_input_owner(&mut self, user: u32) -> Result<InputOwner, ExportMissing> {
@@ -1268,16 +1305,20 @@ impl commands::hardware::Backend for Console {
     }
 
     fn set_wireless_radio(&mut self, enabled: bool) -> Result<(), KernelError> {
-        NtStatus(XInputdSetRFPowerMode(u32::from(enabled))).result()
+        // SAFETY: the radio service takes only the mode.
+        NtStatus(unsafe { XInputdSetRFPowerMode(u32::from(enabled)) }).result()
     }
 
     fn devkit_memory_statistics(&mut self, block: &mut [u8; 0x90]) -> Result<(), KernelError> {
-        NtStatus(kernel::ExDebugMonitorService(
-            MONITOR_MEMORY_STATISTICS,
-            output_address(&mut block[..]),
-            0,
-            0,
-        ))
+        // SAFETY: `block` is the 0x90-byte buffer the statistics service fills.
+        unsafe {
+            xboxkrnl::ExDebugMonitorService(
+                DebugMonitorService::MemoryStatistics,
+                output_address(&mut block[..]),
+                0,
+                0,
+            )
+        }
         .result()
     }
 
@@ -1339,25 +1380,32 @@ impl commands::hardware::Backend for Console {
         message: SystemMessage,
         buffer: &mut [u8],
     ) -> Result<(), XamError> {
-        XamError::check(Hresult(kernel::XMsgStartIORequest(
-            app.0,
-            message.0,
-            0,
-            buffer.as_mut_ptr(),
-            buffer.len() as u32,
-        )))
+        // SAFETY: `buffer` is valid for its length; the request is synchronous.
+        XamError::check(Hresult(unsafe {
+            xam::XMsgStartIORequest(
+                app.0,
+                message.0,
+                core::ptr::null_mut(),
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+            )
+        }))
     }
 
     fn play_to(&mut self, command: PlayToCommand) -> Result<PlayToState, XamError> {
         let mut output = [0u32; 2];
         let mut input = [command.code(), output_address(&mut output[..]), 8];
-        let result = kernel::XMsgStartIORequest(
-            MEDIA_APP.0,
-            MEDIA_PLAY_TO.0,
-            0,
-            input.as_mut_ptr().cast(),
-            12,
-        );
+        // SAFETY: `input` holds the 12-byte request and points at `output`;
+        // the request is synchronous.
+        let result = unsafe {
+            xam::XMsgStartIORequest(
+                MEDIA_APP.0,
+                MEDIA_PLAY_TO.0,
+                core::ptr::null_mut(),
+                input.as_mut_ptr().cast(),
+                12,
+            )
+        };
         XamError::check(Hresult(result))?;
         Ok(PlayToState {
             xmp_heap: output[0],
@@ -1368,8 +1416,11 @@ impl commands::hardware::Backend for Console {
     fn stack_addresses(&mut self) -> StackAddresses {
         let mut title = [0u8; XNADDR_SIZE];
         let mut debug = [0u8; XNADDR_SIZE];
-        kernel::NetDll_XNetGetTitleXnAddr(NETWORK_CALLER, title.as_mut_ptr());
-        kernel::NetDll_XNetGetDebugXnAddr(NETWORK_CALLER, debug.as_mut_ptr());
+        // SAFETY: each buffer holds XNADDR_SIZE bytes.
+        unsafe {
+            xam::NetDll_XNetGetTitleXnAddr(XnCaller::DebugMonitor, title.as_mut_ptr());
+            xam::NetDll_XNetGetDebugXnAddr(XnCaller::DebugMonitor, debug.as_mut_ptr());
+        }
         StackAddresses {
             title: [title[0], title[1], title[2], title[3]],
             debug: [debug[0], debug[1], debug[2], debug[3]],

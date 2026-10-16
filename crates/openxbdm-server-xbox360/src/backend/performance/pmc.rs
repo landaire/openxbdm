@@ -11,6 +11,8 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::XbdmHresult;
+use openxbdm_core::status::xbdm_error;
 use openxbdm_server::commands::performance::pmc;
 use openxbdm_server::commands::performance::pmc::BusRegister;
 use openxbdm_server::commands::performance::pmc::COUNTERS;
@@ -19,34 +21,21 @@ use openxbdm_server::commands::performance::pmc::Counting;
 use openxbdm_server::commands::performance::pmc::Event;
 use openxbdm_server::commands::performance::pmc::EventName;
 use openxbdm_server::commands::performance::pmc::Setup;
+use xbox360::time::TickCount;
+use xbox360::time::Timebase;
+use xbox360_sys::export_raw;
+use xbox360_sys::processor;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::Irql;
+use xbox360_sys::xboxkrnl::KeEnablePPUPerformanceMonitor;
+use xbox360_sys::xboxkrnl::KeGetPMWRegister;
+use xbox360_sys::xboxkrnl::KeGetSpecialPurposeRegister;
+use xbox360_sys::xboxkrnl::KeSetPMWRegister;
+use xbox360_sys::xboxkrnl::KeSetPRVRegister;
 
 use crate::exports::export;
-use crate::exports::export_raw;
 use crate::kernel;
-use crate::kernel::LIB_KERNEL;
-use crate::kernel::import_thunk;
-
-import_thunk!(
-    KeSetPRVRegister(register: u32, value: u32) -> u32,
-    lib = LIB_KERNEL,
-    ordinal = 0xa1
-);
-import_thunk!(
-    KeGetSpecialPurposeRegister(register: u32) -> u32,
-    lib = LIB_KERNEL,
-    ordinal = 0x6a
-);
-import_thunk!(KeEnablePPUPerformanceMonitor() -> u32, lib = LIB_KERNEL, ordinal = 0x5e);
-import_thunk!(
-    KeSetPMWRegister(register: u32, value: u32) -> u32,
-    lib = LIB_KERNEL,
-    ordinal = 0x9f
-);
-import_thunk!(
-    KeGetPMWRegister(register: u32) -> u32,
-    lib = LIB_KERNEL,
-    ordinal = 0x67
-);
 
 /// Counter run control.
 const PRV_RUN: u32 = 0x1c0;
@@ -77,8 +66,8 @@ const QUIET: u32 = 0xffff_fff9;
 /// Handle of the calling thread.
 const CURRENT_THREAD: u32 = 0xffff_fffe;
 
-const NOT_ACQUIRED: Hresult = Hresult::error(0x2c);
-const NOT_OWNER: Hresult = Hresult::error(0x2d);
+const NOT_ACQUIRED: Hresult = xbdm_error(0x2c);
+const NOT_OWNER: Hresult = xbdm_error(0x2d);
 
 /// A counter owner; a higher priority preempts a lower one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,7 +170,7 @@ static NAME_BUFFER: NameBuffer = NameBuffer(UnsafeCell::new([0; 0x40]));
 
 pub(super) fn pcr_byte(offset: u32) -> u8 {
     // SAFETY: the processor control region is always mapped.
-    unsafe { core::ptr::read_volatile((kernel::pcr() + offset) as usize as *const u8) }
+    unsafe { core::ptr::read_volatile((processor::pcr() + offset) as usize as *const u8) }
 }
 
 pub(super) fn current_processor() -> u8 {
@@ -190,17 +179,20 @@ pub(super) fn current_processor() -> u8 {
 
 /// The monitor lock, taken without lowering an IRQL above dispatch level.
 struct Locked {
-    irql: Option<u32>,
+    irql: Option<Irql>,
 }
 
 impl Locked {
     fn take() -> Self {
-        if kernel::current_irql() >= 2 {
-            kernel::KeAcquireSpinLockAtRaisedIrql(MONITOR.lock.get());
+        if processor::current_irql() >= Irql::DISPATCH {
+            // SAFETY: MONITOR.lock is a static spin lock word; the IRQL is
+            // already at or above dispatch level.
+            unsafe { xboxkrnl::KeAcquireSpinLockAtRaisedIrql(MONITOR.lock.get().cast()) };
             Self { irql: None }
         } else {
             Self {
-                irql: Some(kernel::KfAcquireSpinLock(MONITOR.lock.get())),
+                // SAFETY: MONITOR.lock is a static spin lock word.
+                irql: Some(unsafe { xboxkrnl::KfAcquireSpinLock(MONITOR.lock.get().cast()) }),
             }
         }
     }
@@ -219,45 +211,14 @@ impl Locked {
 
 impl Drop for Locked {
     fn drop(&mut self) {
-        match self.irql {
-            Some(irql) => kernel::KfReleaseSpinLock(MONITOR.lock.get(), irql),
-            None => kernel::KeReleaseSpinLockFromRaisedIrql(MONITOR.lock.get()),
+        // SAFETY: `take` acquired MONITOR.lock in the matching way.
+        unsafe {
+            match self.irql {
+                Some(irql) => xboxkrnl::KfReleaseSpinLock(MONITOR.lock.get().cast(), irql),
+                None => xboxkrnl::KeReleaseSpinLockFromRaisedIrql(MONITOR.lock.get().cast()),
+            }
         };
     }
-}
-
-/// `KeSetPRVRegister` with the value in one 64-bit register.
-#[unsafe(naked)]
-extern "C" fn set_prv(register: u32, high: u32, low: u32) -> u32 {
-    core::arch::naked_asm!(
-        // rldimi 5, 4, 32, 0: the high half into the upper word of r5.
-        ".long 0x7885000e",
-        "mr 4, 5",
-        "b {set}",
-        set = sym KeSetPRVRegister,
-    )
-}
-
-/// `KeSetSpecialPurposeRegister` with the value in one 64-bit register.
-#[unsafe(naked)]
-extern "C" fn set_spr(register: u32, high: u32, low: u32) -> u32 {
-    core::arch::naked_asm!(
-        ".long 0x7885000e",
-        "mr 4, 5",
-        "b {set}",
-        set = sym kernel::KeSetSpecialPurposeRegister,
-    )
-}
-
-/// `KeSetPMWRegister` with the value in one 64-bit register.
-#[unsafe(naked)]
-extern "C" fn set_pmw(register: u32, high: u32, low: u32) -> u32 {
-    core::arch::naked_asm!(
-        ".long 0x7885000e",
-        "mr 4, 5",
-        "b {set}",
-        set = sym KeSetPMWRegister,
-    )
 }
 
 /// `KeGetSpecialPurposeRegister`, splitting the 64-bit result into r3:r4.
@@ -339,11 +300,19 @@ fn pointer(text: &[u8]) -> u64 {
 }
 
 fn set_prv_value(register: u32, value: u64) {
-    set_prv(register, (value >> 32) as u32, value as u32);
+    // SAFETY: PRV register writes reach only the performance monitor.
+    unsafe { KeSetPRVRegister(register, value) };
 }
 
 fn set_spr_value(register: u32, value: u64) {
-    set_spr(register, (value >> 32) as u32, value as u32);
+    // SAFETY: the callers write only the monitor control and event select
+    // registers.
+    unsafe { xboxkrnl::KeSetSpecialPurposeRegister(register, value) };
+}
+
+fn set_pmw_value(register: u32, value: u64) {
+    // SAFETY: PMW register writes reach only the event bus selection.
+    unsafe { KeSetPMWRegister(register, value) };
 }
 
 /// u64 to double by truncating the mantissa (stock 0x91f28f78).
@@ -445,7 +414,7 @@ pub(super) fn start(owner: Owner) -> bool {
         u64::from(0x8000_0000 | (locked.hardware().trigger & 3) << 26) << 32,
     );
     set_spr_value(SPR_MONITOR_CONTROL, control | 4);
-    locked.hardware().started = kernel::timebase();
+    locked.hardware().started = Timebase::now().ticks();
     true
 }
 
@@ -455,7 +424,7 @@ pub(super) fn stop(owner: Owner) -> bool {
     if locked.hardware().owner != owner {
         return false;
     }
-    locked.hardware().stopped = kernel::timebase();
+    locked.hardware().stopped = Timebase::now().ticks();
     set_spr_value(SPR_MONITOR_CONTROL, get_spr(SPR_MONITOR_CONTROL) | 2);
     set_prv_value(PRV_RUN, 0);
     true
@@ -487,7 +456,8 @@ pub(super) fn set_trigger_processor(owner: Owner, processor: u32) -> bool {
 /// controls (stock 0x91f91800).
 pub(super) fn reset() {
     set_spr_value(SPR_EVENT_SELECT, 0);
-    KeEnablePPUPerformanceMonitor();
+    // SAFETY: enables the monitor of the current processor; no memory is involved.
+    unsafe { KeEnablePPUPerformanceMonitor() };
     set_prv_value(PRV_TRIGGER, u64::from(TRIGGERS[0]) << 32);
     set_spr_value(
         SPR_MONITOR_CONTROL,
@@ -595,14 +565,10 @@ fn configure_locked(locked: &mut Locked, owner: Owner, setup: &Setup) -> bool {
         route_counter(route.source, route.lane, counter);
     }
     for (register, value) in pmc::bus_selection(5) {
-        set_pmw(register.0, (value >> 32) as u32, value as u32);
+        set_pmw_value(register.0, value);
     }
     locked.hardware().trigger = setup.trigger & 3;
-    set_pmw(
-        BusRegister::L2_GROUP.0,
-        (setup.group >> 32) as u32,
-        setup.group as u32,
-    );
+    set_pmw_value(BusRegister::L2_GROUP.0, setup.group);
     write_controls();
     clear_locked(locked, owner)
 }
@@ -686,11 +652,24 @@ fn current_setup(index: u32) -> Option<Setup> {
 /// Run the calling thread on processor `processor` (stock 0x91f78a68).
 fn set_processor(processor: u8) {
     let mut thread = 0u32;
-    let object_type = kernel::EX_THREAD_OBJECT_TYPE.load(Ordering::Relaxed);
-    if (kernel::ObReferenceObjectByHandle(CURRENT_THREAD, object_type, &mut thread) as i32) >= 0 {
+    let object_type = xboxkrnl::ExThreadObjectType.address();
+    // SAFETY: CURRENT_THREAD is the pseudo-handle of the calling thread,
+    // `object_type` the kernel thread type, and `thread` a live u32.
+    let status = unsafe {
+        xboxkrnl::ObReferenceObjectByHandle(
+            Handle::from_raw(CURRENT_THREAD),
+            object_type,
+            &mut thread,
+        )
+    };
+    if (status.0 as i32) >= 0 {
         let mut previous = 0u32;
-        kernel::KeSetAffinityThread(thread, 1 << processor, &mut previous);
-        kernel::ObDereferenceObject(thread);
+        // SAFETY: `thread` is the referenced calling thread, released here;
+        // `previous` is a live u32.
+        unsafe {
+            xboxkrnl::KeSetAffinityThread(thread as usize as *mut _, 1 << processor, &mut previous);
+            xboxkrnl::ObDereferenceObject(thread);
+        }
     }
 }
 
@@ -732,18 +711,9 @@ extern "C" fn select_on_processor(request: u32) -> u32 {
     u32::from(select_events(request.owner, unsafe { &*request.setup }))
 }
 
-/// Kernel entry of [`select_on_processor`], preserving the full
-/// nonvolatile registers.
-#[unsafe(naked)]
-extern "C" fn select_on_processor_entry() {
-    core::arch::naked_asm!(
-        "lis 12, {routine}@ha",
-        "addi 12, 12, {routine}@l",
-        "b {bridge}",
-        routine = sym select_on_processor,
-        bridge = sym crate::exports::export_bridge,
-    )
-}
+// Kernel entry of `select_on_processor`, preserving the full nonvolatile
+// registers.
+crate::exports::bridged!(select_on_processor_entry, select_on_processor);
 
 /// Install built-in setup `index` on every core at once (stock 0x91f92c58).
 pub(super) fn install_on_all_processors(owner: Owner, index: u32) -> bool {
@@ -757,10 +727,14 @@ pub(super) fn install_on_all_processors(owner: Owner, index: u32) -> bool {
         owner,
         setup: &setup,
     };
-    crate::backend::debugger::KeIpiGenericCall(
-        select_on_processor_entry as *const () as usize as u32,
-        &request as *const SelectRequest as usize as u32,
-    );
+    // SAFETY: `select_on_processor_entry` reads `request`, which outlives
+    // the call because the kernel returns only after every processor ran it.
+    unsafe {
+        xboxkrnl::KeIpiGenericCall(
+            select_on_processor_entry as *const () as usize as u32,
+            &request as *const SelectRequest as usize as u32,
+        )
+    };
     configure(owner, &setup)
 }
 
@@ -953,7 +927,7 @@ fn print_ecc_counts() {
 /// export 211, 0x91f927e0); 0 when the counters are unavailable. A failed
 /// step keeps the counters acquired, as in stock.
 fn measure_clock() -> u64 {
-    let begun = kernel::tick_count();
+    let begun = TickCount::now().milliseconds();
     let clock = if acquire(Owner::EXPORTS)
         && {
             reset();
@@ -963,7 +937,7 @@ fn measure_clock() -> u64 {
     {
         // Stock compares the zero-extended tick counts, which never ends
         // when the count wraps during the wait.
-        while kernel::tick_count().wrapping_sub(begun) < 100 {}
+        while TickCount::now().milliseconds().wrapping_sub(begun) < 100 {}
         if stop(Owner::EXPORTS) {
             let interval = (read_register(INTERVAL_COUNT) >> 32) as i64 as f64;
             let ticks = {

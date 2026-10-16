@@ -3,8 +3,6 @@
 //! does. IPTV settings go through the console domain's configuration
 //! store.
 
-use core::ffi::CStr;
-
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::NtStatus;
 use openxbdm_server::commands;
@@ -17,32 +15,35 @@ use openxbdm_server::commands::services::DetectionRoutineMissing;
 use openxbdm_server::commands::services::DetectionUpdate;
 use openxbdm_server::commands::services::LastError;
 use openxbdm_server::commands::services::ThreadHandle;
+use xbox360::module::ExportAddress;
+use xbox360::module::Ordinal;
+use xbox360::module::SystemModule;
+use xbox360::module::resolve_export;
+use xbox360::status::set_last_error;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::FirmwareRequest;
+use xbox360_sys::xboxkrnl::ThreadCreationFlags;
 
 use super::Console;
 use crate::kernel;
 
-const XAM_MODULE: &CStr = c"xam.xex";
-const KERNEL_MODULE: &CStr = c"xboxkrnl.exe";
-
-const XAM_CREATE_PROCESS: u32 = 0x9bb;
-const XAM_CLOSE_PROCESS: u32 = 0x9bc;
-const XAM_VERIFY: u32 = 0x9bd;
-const XAM_FAILED_BLOCKS: u32 = 0x9be;
-const XAM_INJECT: u32 = 0x9bf;
-const XAM_FAILURE: u32 = 0x9c0;
+const XAM_CREATE_PROCESS: Ordinal = Ordinal::new(0x9bb).unwrap();
+const XAM_CLOSE_PROCESS: Ordinal = Ordinal::new(0x9bc).unwrap();
+const XAM_VERIFY: Ordinal = Ordinal::new(0x9bd).unwrap();
+const XAM_FAILED_BLOCKS: Ordinal = Ordinal::new(0x9be).unwrap();
+const XAM_INJECT: Ordinal = Ordinal::new(0x9bf).unwrap();
+const XAM_FAILURE: Ordinal = Ordinal::new(0x9c0).unwrap();
 
 /// Argument the failure thread passes to XAM 0x9c0.
 const FAILURE_CODE: u32 = 0xff;
-/// `HalReturnToFirmware` routine the failure thread uses.
-const FAILURE_FIRMWARE_ROUTINE: u32 = 1;
 /// `ExCreateThread` creation flags of the failure thread.
-const FAILURE_THREAD_FLAGS: u32 = 0x20;
+const FAILURE_THREAD_FLAGS: ThreadCreationFlags = ThreadCreationFlags::from_bits_retain(0x20);
 /// Size of the XAM 0x9be record, stored in its first dword.
 const FAILED_BLOCKS_RECORD_SIZE: u32 = 0x18;
 
 /// The calling thread's last-error value.
 fn last_error() -> LastError {
-    LastError::from_win32(kernel::last_error())
+    LastError::from_win32(xbox360::status::last_error())
 }
 
 /// Why a XAM export could not be called.
@@ -54,20 +55,22 @@ enum Unresolved {
 }
 
 /// Resolve a XAM export; failures set the last error.
-fn xam_export(ordinal: u32) -> Result<u32, Unresolved> {
-    let module = kernel::module_handle(XAM_MODULE).map_err(|status| {
-        kernel::set_last_error(status);
+fn xam_export(ordinal: Ordinal) -> Result<u32, Unresolved> {
+    let module = SystemModule::Xam.handle().map_err(|status| {
+        set_last_error(status);
         Unresolved::Module
     })?;
-    kernel::resolve_export(module, ordinal).map_err(|status| {
-        kernel::set_last_error(status);
-        Unresolved::Export
-    })
+    resolve_export(module, ordinal)
+        .map(ExportAddress::raw)
+        .map_err(|status| {
+            set_last_error(status);
+            Unresolved::Export
+        })
 }
 
 /// Call a XAM export reporting a value: its return, or the last error
 /// when xam.xex or the export is absent.
-fn call_reporting(ordinal: u32, a0: u32, a1: u32, a2: u32) -> CivResult {
+fn call_reporting(ordinal: Ordinal, a0: u32, a1: u32, a2: u32) -> CivResult {
     match xam_export(ordinal) {
         // SAFETY: the export takes at most three dword arguments.
         Ok(function) => CivResult::Returned(Hresult(unsafe {
@@ -89,7 +92,8 @@ extern "C" fn failure_thread(context: u32) -> u32 {
         Err(Unresolved::Export) => {}
     }
     if context != 0 {
-        kernel::HalReturnToFirmware(FAILURE_FIRMWARE_ROUTINE);
+        // SAFETY: the civfail thread reboots by request; no state survives.
+        unsafe { xboxkrnl::HalReturnToFirmware(FirmwareRequest::Reboot) };
     }
     0
 }
@@ -98,19 +102,19 @@ extern "C" fn failure_thread(context: u32) -> u32 {
 fn detection_exports() -> Result<([u32; 4], NtStatus), DetectionRoutineMissing> {
     // The monitor holds the kernel handle from startup; the kernel is
     // always loaded.
-    let kernel_module =
-        kernel::module_handle(KERNEL_MODULE).map_err(|error| DetectionRoutineMissing {
+    let kernel_module = SystemModule::Kernel
+        .handle()
+        .map_err(|error| DetectionRoutineMissing {
             routine: DetectionRoutine::SetDetected,
             error,
         })?;
     let mut addresses = [0u32; 4];
     let mut last_status = NtStatus::SUCCESS;
     for (address, routine) in addresses.iter_mut().zip(DetectionRoutine::ORDER) {
-        let status = NtStatus(kernel::XexGetProcedureAddress(
-            kernel_module.raw(),
-            routine.ordinal(),
-            address,
-        ));
+        // SAFETY: `address` is a live array element.
+        let status = unsafe {
+            xboxkrnl::XexGetProcedureAddress(kernel_module.raw(), routine.ordinal(), address)
+        };
         status
             .result()
             .map_err(|error| DetectionRoutineMissing { routine, error })?;
@@ -123,18 +127,22 @@ impl commands::services::Backend for Console {
     fn start_civ_failure_thread(&mut self, reboot: bool) -> Result<ThreadHandle, LastError> {
         let mut handle = 0u32;
         let mut thread_id = 0u32;
-        let status = kernel::ExCreateThread(
-            &mut handle,
-            0,
-            &mut thread_id,
-            0,
-            failure_thread as *const () as usize as u32,
-            u32::from(reboot),
-            FAILURE_THREAD_FLAGS,
-        );
+        // SAFETY: `handle` and `thread_id` are live locals; `failure_thread`
+        // has the thread start signature.
+        let status = unsafe {
+            xboxkrnl::ExCreateThread(
+                &mut handle,
+                0,
+                &mut thread_id,
+                0,
+                failure_thread as *const () as usize as u32,
+                u32::from(reboot),
+                FAILURE_THREAD_FLAGS,
+            )
+        };
         // Thread creation does not set the last error; stock reports
         // whatever the thread held before.
-        if !NtStatus(status).is_success() || handle == 0 {
+        if !status.is_success() || handle == 0 {
             Err(last_error())
         } else {
             Ok(ThreadHandle(handle))

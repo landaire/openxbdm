@@ -7,6 +7,7 @@
 - Add `openxbdm-server`, a `no_std`, allocation-free command engine with the stock dispatch rules (access masks, development-kit-only and own-thread flags, dedicated connections), continuations for 202/203/204 transfers, notification channels, command processors, and the settings file.
 - Implement all 177 stock XBDM 2.0.21256.0 commands in eleven domains (session, security, console, system, file system, memory, debugger, network, performance, hardware, services) over per-domain backend traits.
 - Move the protocol grammar, status codes, and authentication function shared by client and server into `openxbdm-core`.
+- `openxbdm-core` takes `NtStatus`, `KernelError`, `Win32Error` and `Hresult` from `xbox360-sys`; the monitor's result codes and default reply texts are the `XbdmHresult` trait, `xbdm_success`, `xbdm_error` and `ErrorCode::hresult`.
 - Keep status integers at the wire and the kernel/title ABI: handlers and continuations return `Result<Reply, CommandError>`, converted to the reply line's result in `send_status`; backend traits fail with `KernelError` (a kernel status with named variants and exact passthrough of others) or per-domain error enums; exports, control codes, and reply texts that print a code convert typed errors at that point. `ErrorCode` is an enum of the result-table codes, and `Win32Error` carries Win32 codes.
 - Add the `smb` feature (default): every drive whose device exists, from the drive table and the internal drive mapping, is an SMB share served through `smb2-server`, with share identifiers common to all connections; logons need no password while security is off; while the console is locked, logons, opens, renames, and deletes fail. Optical drives and read-only volumes are read-only shares, and volume information comes from FileFsAttributeInformation. Change notifications report changes made by titles and XBDM through a scan of the watched directory every 2 seconds. Connections close without a logon after 30 seconds, when stalled for 30 seconds, and when idle without open files for 15 minutes; a full table replaces the oldest connection without a session, or else the one silent longest if silent for 5 minutes; a logon naming a previous session ends that session. File reads take a byte slice or a pool range (`ReadTarget`).
 
@@ -38,6 +39,11 @@
 - Place the export table in an executable section (`.xexp`); the loader hypercall reads it only from protected code pages.
 - `threads` reads the process objects at debug monitor data +0x50 and +0x54; the listener sets SO_REUSEADDR before bind; `getmemex` missing texts are `missing ADDR` and `missing LENGTH`.
 - Boots on a devkit in place of stock XBDM; xshell loads against its exports.
+- Declare kernel and XAM imports through `xbox360-sys`, and use the `xbox360` crate for spin locks, module and export lookup, the time base, system time, tick count, sleeps, last-error values, the kernel version and the hardware flags. Import records and data import slots are in per-import `.xthunks.*` and `.xvars.*` sections, so the XEX imports only what the module calls.
+- The counter sampler timer (stock 0x91f2b110) and the network simulator timer (stock 0x91f8ed88 region) are initialized with `KeInitializeTimerEx` process type 2 (`ProcessType::SYSTEM`), the `li r5,2` of both stock call sites.
+- Kernel BOOLEAN results (`MmIsAddressValid`, `HalIsExecutingPowerDownDpc`, `RtlTryEnterCriticalSection`) are tested on their low byte.
+- `xconfig` writes fail with `InvalidParameter` for values above 0xffff bytes, the largest size `ExSetXConfigSetting` takes.
+- Data breakpoints write DABR with a zero upper word.
 - Serve SMB on TCP port 445 from the server thread's select loop, with two connections of two 0x10400-byte pool buffers each; without the port the monitor runs without SMB.
 
 ### Kernel debugger

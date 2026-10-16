@@ -8,10 +8,23 @@
 //! bits 30-31, the buffer type in bits 25-29 and the frame index in bits
 //! 1-24. The first dword of the data is the header `type | dwords << 8`.
 
+use xbox360::time::Timebase;
+use xbox360_sys::processor;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::EventType;
+use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::IoStatusBlock;
+use xbox360_sys::xboxkrnl::NtWriteFileGather;
+use xbox360_sys::xboxkrnl::PageProtection;
+use xbox360_sys::xboxkrnl::PoolTag;
+use xbox360_sys::xboxkrnl::PoolType;
+use xbox360_sys::xboxkrnl::ProcessType;
+use xbox360_sys::xboxkrnl::ProcessorMode;
+use xbox360_sys::xboxkrnl::WaitType;
+
 use super::S;
 use super::rd;
 use super::wr;
-use crate::kernel;
 
 const STATUS_PENDING: u32 = 0x103;
 pub(super) const BUFFER_BYTES: u32 = 0x4000;
@@ -20,8 +33,7 @@ const REQUEST: u32 = 0x34;
 const REQUEST_BUFFERS: u32 = 8;
 /// Bytes one request writes (eight buffers).
 const REQUEST_BYTES: u64 = 0x2_0000;
-const POOL_TAG: u32 = 0x5053_5452;
-const TITLE_PROCESS: u32 = 1;
+const POOL_TAG: PoolTag = PoolTag::new(*b"PSTR");
 /// Temporary per-thread blocks used while a capture buffer is replaced.
 pub(super) const TEMPORARY_BLOCKS: u32 = 13;
 const TEMPORARY_BYTES: u32 = 0x800;
@@ -91,9 +103,10 @@ fn physical_size(kind: u32) -> u32 {
 /// Allocate `size` zeroed bytes against the system budget, else the title
 /// budget (stock 0x91f5c418).
 pub(super) fn allocate(s: S, size: u32) -> u32 {
-    for kind in (1..3).rev() {
+    for (kind, pool_type) in [(2, PoolType::System), (1, PoolType::Title)] {
         if s.word(used(kind)).wrapping_add(size) <= s.word(budget(kind)) {
-            let block = kernel::ExAllocatePoolTypeWithTag(size, POOL_TAG, kind);
+            // SAFETY: allocates from the pool; no pointer arguments.
+            let block = unsafe { xboxkrnl::ExAllocatePoolTypeWithTag(size, POOL_TAG, pool_type) };
             if block != 0 {
                 // SAFETY: a fresh pool block of `size` bytes.
                 unsafe { core::ptr::write_bytes(block as usize as *mut u8, 0, size as usize) };
@@ -155,7 +168,9 @@ pub(super) fn free(s: S) {
         if address != 0 {
             let start = cached(address);
             flush(start, start.wrapping_add(s.word(physical_size(kind))));
-            kernel::MmFreePhysicalMemory(kind, address);
+            // SAFETY: the physical block of this kind that `try_allocate`
+            // allocated; its slot is cleared below.
+            unsafe { xboxkrnl::MmFreePhysicalMemory(kind, address) };
             s.set_word(physical_block(kind), 0);
             s.set_word(physical_size(kind), 0);
         }
@@ -165,7 +180,9 @@ pub(super) fn free(s: S) {
     let release = |offset: u32| {
         let block = s.word(offset);
         if block != 0 {
-            kernel::ExFreePool(block);
+            // SAFETY: a pool block from `allocate`; its slot is cleared
+            // below.
+            unsafe { xboxkrnl::ExFreePool(block) };
             s.set_word(offset, 0);
             true
         } else {
@@ -189,15 +206,18 @@ pub(super) fn free(s: S) {
     }
     let requests = s.word(0x120);
     if requests != 0 {
-        if kernel::KeGetCurrentProcessType() == TITLE_PROCESS {
+        if xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE {
             for index in 0..s.word(0x124) {
                 let event = rd(requests + index * REQUEST + 8);
                 if event != 0 {
-                    kernel::NtClose(event);
+                    // SAFETY: an event this title created for the request.
+                    unsafe { xboxkrnl::NtClose(Handle::from_raw(event)) };
                 }
             }
         }
-        kernel::ExFreePool(requests);
+        // SAFETY: the request table from `allocate`; its slot is cleared
+        // below.
+        unsafe { xboxkrnl::ExFreePool(requests) };
         s.set_word(0x120, 0);
         s.set_word(0x124, 0);
         s.set_word(0x128, 0);
@@ -291,8 +311,19 @@ fn try_allocate(s: S) -> bool {
         if limit > start {
             let bytes = limit - start;
             s.set_word(physical_size(kind), bytes);
-            let address =
-                kernel::MmAllocatePhysicalMemoryEx(kind, bytes, 0x2000_0404, 0, u32::MAX, 0);
+            // SAFETY: no pointer arguments.
+            let address = unsafe {
+                xboxkrnl::MmAllocatePhysicalMemoryEx(
+                    kind,
+                    bytes,
+                    PageProtection::READWRITE
+                        | PageProtection::WRITECOMBINE
+                        | PageProtection::LARGE_PAGES,
+                    0,
+                    u32::MAX,
+                    0,
+                )
+            };
             s.set_word(physical_block(kind), address);
             if address == 0 {
                 s.set_word(physical_size(kind), 0);
@@ -326,8 +357,16 @@ fn try_allocate(s: S) -> bool {
     for index in 0..requests {
         let request = table + index * REQUEST;
         wr(request, 0);
-        if (kernel::NtCreateEvent((request + 8) as usize as *mut u32, core::ptr::null(), 0, 1)
-            as i32)
+        // SAFETY: the handle slot lies in the request table allocated above.
+        if (unsafe {
+            xboxkrnl::NtCreateEvent(
+                (request + 8) as usize as *mut Handle,
+                core::ptr::null(),
+                EventType::Notification,
+                true,
+            )
+        }
+        .0 as i32)
             < 0
         {
             return false;
@@ -370,7 +409,7 @@ fn wrap(index: u32, count: u32) -> u32 {
 
 /// `STRE` stream record marking a wait for the writer (stock 0x91f5c968).
 fn stream_wait_record(waiting: u32) {
-    let time = kernel::timebase();
+    let time = Timebase::now().ticks();
     super::super::write_tagged_words(0x5354_5245, &[(time >> 32) as u32, time as u32, waiting]);
 }
 
@@ -379,7 +418,7 @@ fn stream_wait_record(waiting: u32) {
 fn wait_for_request(s: S) {
     let mut events = [0u32; 2];
     let mut count = 0;
-    let mut wait = kernel::KeGetCurrentProcessType() == TITLE_PROCESS;
+    let mut wait = xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE;
     for k in 0..2 {
         let base = s.0 + stream(k);
         let head = rd(base + STREAM_HEAD);
@@ -394,14 +433,17 @@ fn wait_for_request(s: S) {
         }
     }
     if wait {
-        kernel::NtWaitForMultipleObjectsEx(
-            count as u32,
-            events.as_ptr(),
-            1,
-            0,
-            0,
-            core::ptr::null(),
-        );
+        // SAFETY: `events` holds `count` request event handles.
+        unsafe {
+            xboxkrnl::NtWaitForMultipleObjectsEx(
+                count as u32,
+                events.as_ptr().cast(),
+                WaitType::Any,
+                ProcessorMode::Kernel,
+                false,
+                core::ptr::null(),
+            )
+        };
         return;
     }
     loop {
@@ -421,20 +463,21 @@ fn wait_for_request(s: S) {
 /// `KeDelayExecutionThread` for 100 us.
 pub(super) fn delay() {
     let interval: i64 = -1000;
-    kernel::KeDelayExecutionThread(0, 0, &interval);
+    // SAFETY: `interval` is a live local.
+    unsafe { xboxkrnl::KeDelayExecutionThread(ProcessorMode::Kernel, false, &interval) };
 }
 
 /// Handle of stream `base` for the calling process (stock 0x91f5cb08):
 /// titles open their own handle to the partition once.
 fn handle(s: S, base: u32) -> u32 {
-    if kernel::KeGetCurrentProcessType() == TITLE_PROCESS && s.word(base + 4) == 0 {
+    if xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE && s.word(base + 4) == 0 {
         let mut handle = 0u32;
         if !super::super::session::open_partition(&mut handle) {
             return 0;
         }
         s.set_word(base + 4, handle);
     }
-    if kernel::KeGetCurrentProcessType() == TITLE_PROCESS {
+    if xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE {
         s.word(base + 4)
     } else {
         s.word(base)
@@ -545,20 +588,25 @@ pub(super) fn submit(s: S, entry: u32, frame: u32) {
         if super::super::discard_output() {
             wr(request, 0);
         } else if k == 0 {
-            let title = kernel::KeGetCurrentProcessType() == TITLE_PROCESS;
+            let title = xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE;
             let event = if title { rd(request + 8) } else { 0 };
-            NtWriteFileGather(
-                handle(s, base),
-                event,
-                0,
-                0,
-                request,
-                segments.as_ptr(),
-                REQUEST_BYTES as u32,
-                (base + STREAM_OFFSET) as usize as *const u64,
-            );
+            // SAFETY: the status block and the stream offset lie in session
+            // memory that outlives the request; `segments` is read during
+            // the call.
+            unsafe {
+                NtWriteFileGather(
+                    Handle::from_raw(handle(s, base)),
+                    Handle::from_raw(event),
+                    0,
+                    0,
+                    request as usize as *mut IoStatusBlock,
+                    segments.as_ptr(),
+                    REQUEST_BYTES as u32,
+                    (base + STREAM_OFFSET) as usize as *const u64,
+                )
+            };
             wr(request + 0xc, u32::from(title));
-            wr(request + 0x10, super::current_thread());
+            wr(request + 0x10, processor::current_thread());
         }
         let offset = s.quad(stream(k) + STREAM_OFFSET) + REQUEST_BYTES;
         s.set_quad(stream(k) + STREAM_OFFSET, offset);
@@ -645,7 +693,7 @@ pub(super) fn wait_for_thread(s: S) {
     s.set_word(0xe210, s.word(0xe210).wrapping_add(1));
     let saved = super::super::session::enter(s.at(super::super::session::ENGINE_LOCK));
     s.set_word(super::super::session::ENGINE_LOCK_PRIORITY, saved);
-    let thread = super::current_thread();
+    let thread = processor::current_thread();
     for k in 0..2 {
         let base = s.0 + stream(k);
         let tail = rd(base + STREAM_TAIL);
@@ -653,8 +701,16 @@ pub(super) fn wait_for_thread(s: S) {
         while index != tail {
             let request = rd(rd(base + STREAM_QUEUE) + index * 4);
             if rd(request + 0x10) == thread && rd(request) == STATUS_PENDING {
-                if kernel::KeGetCurrentProcessType() == TITLE_PROCESS {
-                    kernel::NtWaitForSingleObjectEx(rd(request + 8), 0, 0, core::ptr::null());
+                if xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE {
+                    // SAFETY: the request's event, created by this title.
+                    unsafe {
+                        xboxkrnl::NtWaitForSingleObjectEx(
+                            Handle::from_raw(rd(request + 8)),
+                            ProcessorMode::Kernel,
+                            false,
+                            core::ptr::null(),
+                        )
+                    };
                 } else {
                     while rd(request) == STATUS_PENDING {
                         delay();
@@ -698,38 +754,31 @@ pub(super) fn read_unit(s: S, unit: u32, position: u32) -> u32 {
     let address = data(s.word(0x12c) + position * 8);
     wr(request, STATUS_PENDING);
     let offset = u64::from(unit) << 14 & 0x3fff_ffff_c000;
-    kernel::NtReadFile(
-        handle(s, s.0 + stream(0)),
-        rd(request + 8),
-        0,
-        0,
-        request as usize as *mut kernel::IoStatusBlock,
-        address as usize as *mut u8,
-        BUFFER_BYTES,
-        &offset,
-    );
+    // SAFETY: the status block, buffer and event belong to request
+    // `position` of the session block; `offset` is live until the wait
+    // below completes the read.
+    unsafe {
+        xboxkrnl::NtReadFile(
+            Handle::from_raw(handle(s, s.0 + stream(0))),
+            Handle::from_raw(rd(request + 8)),
+            0,
+            0,
+            request as usize as *mut xboxkrnl::IoStatusBlock,
+            address as usize as *mut u8,
+            BUFFER_BYTES,
+            &offset,
+        )
+    };
     let start = cached(address);
     flush(start, start + BUFFER_BYTES);
-    kernel::NtWaitForSingleObjectEx(rd(request + 8), 0, 0, core::ptr::null());
+    // SAFETY: the request's event.
+    unsafe {
+        xboxkrnl::NtWaitForSingleObjectEx(
+            Handle::from_raw(rd(request + 8)),
+            ProcessorMode::Kernel,
+            false,
+            core::ptr::null(),
+        )
+    };
     start
 }
-
-crate::kernel::import_thunk!(
-    NtWriteFileGather(
-        handle: u32,
-        event: u32,
-        apc: u32,
-        context: u32,
-        io_status: u32,
-        segments: *const u32,
-        length: u32,
-        offset: *const u64,
-    ) -> u32,
-    lib = crate::kernel::LIB_KERNEL,
-    ordinal = 0x100
-);
-crate::kernel::import_thunk!(
-    pub(super) NtReadFileScatter(handle: u32, event: u32, apc: u32, context: u32, io_status: u32, segments: *const u32, length: u32, offset: *const u64) -> u32,
-    lib = crate::kernel::LIB_KERNEL,
-    ordinal = 0xf1
-);

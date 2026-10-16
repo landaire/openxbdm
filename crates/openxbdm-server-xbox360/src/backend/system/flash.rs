@@ -9,16 +9,22 @@ use core::ptr::NonNull;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::Win32Error;
-use openxbdm_server::commands::filesystem::CreateDisposition;
-use openxbdm_server::commands::filesystem::FileAccess;
+use xbox360::console::hardware_flags;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::AllocationType;
+use xbox360_sys::xboxkrnl::AnsiString;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::FileAttributes;
+use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::IoStatusBlock;
+use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
+use xbox360_sys::xboxkrnl::ObjectAttributes;
+use xbox360_sys::xboxkrnl::PageProtection;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
-use super::FILE_SYNCHRONOUS_IO_NONALERT;
 use super::POOL_TAG;
 use crate::kernel;
-use crate::kernel::AnsiString;
-use crate::kernel::IoStatusBlock;
-use crate::kernel::OBJ_CASE_INSENSITIVE;
-use crate::kernel::ObjectAttributes;
 
 const DEVICE_NAME: &[u8] = b"\\Device\\Flash\0";
 /// Returns the 0x14-byte flash geometry; dwords 0 and 2 multiply to the
@@ -26,12 +32,9 @@ const DEVICE_NAME: &[u8] = b"\\Device\\Flash\0";
 const IOCTL_FLASH_GEOMETRY: u32 = 0x003c_0028;
 const GEOMETRY_SIZE: u32 = 0x14;
 const PAGE_SIZE: u32 = 0x4000;
-const MEM_COMMIT: u32 = 0x1000;
-const MEM_RESERVE: u32 = 0x2000;
-const MEM_RELEASE: u32 = 0x8000;
-const PAGE_READWRITE: u32 = 4;
 /// `MmAllocatePhysicalMemory` protection of the boot loader buffer.
-const BOOT_LOADER_PROTECT: u32 = 0x2000_0004;
+const BOOT_LOADER_PROTECT: PageProtection =
+    PageProtection::READWRITE.union(PageProtection::LARGE_PAGES);
 const ERROR_BAD_FORMAT: Win32Error = Win32Error::new(0xb).unwrap();
 const ERROR_REVISION_MISMATCH: Win32Error = Win32Error::new(0x51a).unwrap();
 const HEADER_WRITE_SIZE: u32 = 0x80;
@@ -65,7 +68,8 @@ pub struct FlashImage {
 impl FlashImage {
     /// Allocate `rounded_size` bytes (a multiple of 0x4000). None on allocation failure.
     pub fn allocate(rounded_size: u32) -> Option<Self> {
-        let address = kernel::ExAllocatePoolWithTag(rounded_size, POOL_TAG);
+        // SAFETY: the allocation takes only a size and tag.
+        let address = unsafe { xboxkrnl::ExAllocatePoolWithTag(rounded_size, POOL_TAG) };
         NonNull::new(address as usize as *mut u8).map(|base| Self {
             base,
             size: rounded_size,
@@ -97,12 +101,7 @@ impl FlashImage {
         buffers.release();
         match result {
             Ok(()) => Ok(()),
-            Err(Failure::Kernel(error)) => {
-                match Win32Error::new(kernel::RtlNtStatusToDosError(error.status().0)) {
-                    Some(error) => Err(error),
-                    None => Ok(()),
-                }
-            }
+            Err(Failure::Kernel(error)) => xboxkrnl::RtlNtStatusToDosError(error.status()).result(),
             Err(Failure::Win32(error)) => Err(error),
         }
     }
@@ -110,7 +109,8 @@ impl FlashImage {
 
 impl Drop for FlashImage {
     fn drop(&mut self) {
-        kernel::ExFreePool(self.base.as_ptr() as usize as u32);
+        // SAFETY: `base` is the pool block `allocate` returned and `self` owns it.
+        unsafe { xboxkrnl::ExFreePool(self.base.as_ptr() as usize as u32) };
     }
 }
 
@@ -138,10 +138,14 @@ impl Buffers {
         if let Some(patch) = self.patch {
             let mut base = patch.get();
             let mut size = 0;
-            kernel::NtFreeVirtualMemory(&mut base, &mut size, MEM_RELEASE, 0);
+            // SAFETY: `patch` is the virtual allocation of the writer.
+            unsafe {
+                xboxkrnl::NtFreeVirtualMemory(&mut base, &mut size, AllocationType::RELEASE, 0)
+            };
         }
         if let Some(boot_loader) = self.boot_loader {
-            kernel::MmFreePhysicalMemory(0, boot_loader.get());
+            // SAFETY: `boot_loader` is the physical allocation of the writer.
+            unsafe { xboxkrnl::MmFreePhysicalMemory(0, boot_loader.get()) };
         }
     }
 }
@@ -220,15 +224,18 @@ fn flash_kernel_image(
 
     let mut patch_size = image.patch_size();
     let mut patch_base = 0;
-    let status = kernel::NtAllocateVirtualMemory(
-        &mut patch_base,
-        &mut patch_size,
-        MEM_COMMIT,
-        PAGE_READWRITE,
-        0,
-    );
+    // SAFETY: `patch_base` and `patch_size` are live locals.
+    let status = unsafe {
+        xboxkrnl::NtAllocateVirtualMemory(
+            &mut patch_base,
+            &mut patch_size,
+            AllocationType::COMMIT,
+            PageProtection::READWRITE,
+            0,
+        )
+    };
     buffers.patch = NonZeroU32::new(patch_base);
-    NtStatus(status).result()?;
+    status.result()?;
 
     let patch = match read_patch_block(image, patch_base as usize as *mut u8, patch_size) {
         Some(patch) => patch,
@@ -250,14 +257,16 @@ fn flash_kernel_image(
 
     let mut loader_size = image.word(HEADER_BOOT_LOADER_SIZE);
     let mut flags = 0;
-    let loader = NonZeroU32::new(kernel::MmAllocatePhysicalMemory(
-        0,
-        loader_size,
-        BOOT_LOADER_PROTECT,
-    ))
+    // SAFETY: the allocation takes only a size and protection.
+    let loader = NonZeroU32::new(unsafe {
+        xboxkrnl::MmAllocatePhysicalMemory(0, loader_size, BOOT_LOADER_PROTECT)
+    })
     .ok_or(KernelError::NoMemory)?;
     buffers.boot_loader = Some(loader);
-    let status = kernel::XeKeysSaveBootLoader(&mut flags, &mut loader_size, loader.get());
+    // SAFETY: `flags` and `loader_size` are live locals; `loader` holds
+    // `loader_size` bytes.
+    let status =
+        unsafe { xboxkrnl::XeKeysSaveBootLoader(&mut flags, &mut loader_size, loader.get()) };
     if !NtStatus(status).is_success() || flags != 0 {
         // Stock reports this only on the debug output and returns success.
         kernel::debug_print(
@@ -277,7 +286,7 @@ fn flash_kernel_image(
 /// Stock 0x91f73260.
 fn hardware_matches(image: Image) -> bool {
     let identifier = image.half(image.word(HEADER_HARDWARE_ID_OFFSET) as usize);
-    if kernel::hardware_flags() & 3 == 3 {
+    if hardware_flags().bits() & 3 == 3 {
         identifier & 0xfff == 0x342
     } else {
         identifier == 0
@@ -364,16 +373,16 @@ fn write_ranges(
 
 /// `\Device\Flash`, opened per operation as stock does.
 struct Device {
-    handle: u32,
+    handle: Handle,
     io_status: IoStatusBlock,
 }
 
 impl Device {
     fn attributes(name: &AnsiString) -> ObjectAttributes {
         ObjectAttributes {
-            root_directory: 0,
+            root_directory: Handle::NULL,
             object_name: name,
-            attributes: OBJ_CASE_INSENSITIVE,
+            attributes: ObjectAttributeFlags::CASE_INSENSITIVE,
         }
     }
 
@@ -390,17 +399,21 @@ impl Device {
         let name = Self::name();
         let attributes = Self::attributes(&name);
         let mut device = Self {
-            handle: 0,
+            handle: Handle::NULL,
             io_status: IoStatusBlock::default(),
         };
-        NtStatus(kernel::NtOpenFile(
-            &mut device.handle,
-            FileAccess::GENERIC_READ.union(FileAccess::SYNCHRONIZE).0,
-            &attributes,
-            &mut device.io_status,
-            0,
-            FILE_SYNCHRONOUS_IO_NONALERT,
-        ))
+        // SAFETY: `attributes` refers to the static device name; the handle
+        // and status block are fields of the local `device`.
+        unsafe {
+            xboxkrnl::NtOpenFile(
+                &mut device.handle,
+                AccessMask::GENERIC_READ | AccessMask::SYNCHRONIZE,
+                &attributes,
+                &mut device.io_status,
+                ShareAccess::empty(),
+                CreateOptions::SYNCHRONOUS_IO_NONALERT,
+            )
+        }
         .result()?;
         Ok(device)
     }
@@ -409,77 +422,88 @@ impl Device {
         let name = Self::name();
         let attributes = Self::attributes(&name);
         let mut device = Self {
-            handle: 0,
+            handle: Handle::NULL,
             io_status: IoStatusBlock::default(),
         };
-        NtStatus(kernel::NtCreateFile(
-            &mut device.handle,
-            FileAccess::GENERIC_READ
-                .union(FileAccess::GENERIC_WRITE)
-                .union(FileAccess::SYNCHRONIZE)
-                .0,
-            &attributes,
-            &mut device.io_status,
-            core::ptr::null(),
-            0,
-            0,
-            CreateDisposition::Open as u32,
-            FILE_SYNCHRONOUS_IO_NONALERT,
-        ))
+        // SAFETY: as in `open_read`.
+        unsafe {
+            xboxkrnl::NtCreateFile(
+                &mut device.handle,
+                AccessMask::GENERIC_READ | AccessMask::GENERIC_WRITE | AccessMask::SYNCHRONIZE,
+                &attributes,
+                &mut device.io_status,
+                core::ptr::null(),
+                FileAttributes::empty(),
+                ShareAccess::empty(),
+                xboxkrnl::CreateDisposition::Open,
+                CreateOptions::SYNCHRONOUS_IO_NONALERT,
+            )
+        }
         .result()?;
         Ok(device)
     }
 
     fn write_unit(&mut self) -> Result<u32, KernelError> {
         let mut geometry = [0u32; GEOMETRY_SIZE as usize / 4];
-        NtStatus(kernel::NtDeviceIoControlFile(
-            self.handle,
-            0,
-            0,
-            0,
-            &mut self.io_status,
-            IOCTL_FLASH_GEOMETRY,
-            core::ptr::null(),
-            0,
-            geometry.as_mut_ptr().cast(),
-            GEOMETRY_SIZE,
-        ))
+        // SAFETY: the handle is open and `geometry` holds GEOMETRY_SIZE bytes.
+        unsafe {
+            xboxkrnl::NtDeviceIoControlFile(
+                self.handle,
+                Handle::NULL,
+                0,
+                0,
+                &mut self.io_status,
+                IOCTL_FLASH_GEOMETRY,
+                core::ptr::null(),
+                0,
+                geometry.as_mut_ptr().cast(),
+                GEOMETRY_SIZE,
+            )
+        }
         .result()?;
         Ok(geometry[0].wrapping_mul(geometry[2]))
     }
 
     fn read(&mut self, buffer: *mut u8, length: u32, offset: u64) -> Result<(), KernelError> {
-        NtStatus(kernel::NtReadFile(
-            self.handle,
-            0,
-            0,
-            0,
-            &mut self.io_status,
-            buffer,
-            length,
-            &offset,
-        ))
+        // SAFETY: the handle is open; callers pass a buffer of `length`
+        // bytes; the device is synchronous.
+        unsafe {
+            xboxkrnl::NtReadFile(
+                self.handle,
+                Handle::NULL,
+                0,
+                0,
+                &mut self.io_status,
+                buffer,
+                length,
+                &offset,
+            )
+        }
         .result()
     }
 
     fn write(&mut self, buffer: *const u8, length: u32, offset: u64) -> Result<(), KernelError> {
-        NtStatus(kernel::NtWriteFile(
-            self.handle,
-            0,
-            0,
-            0,
-            &mut self.io_status,
-            buffer,
-            length,
-            &offset,
-        ))
+        // SAFETY: as in `read`.
+        unsafe {
+            xboxkrnl::NtWriteFile(
+                self.handle,
+                Handle::NULL,
+                0,
+                0,
+                &mut self.io_status,
+                buffer,
+                length,
+                &offset,
+            )
+        }
         .result()
     }
 }
 
 impl Drop for Device {
     fn drop(&mut self) {
-        kernel::NtClose(self.handle);
+        // SAFETY: `self` owns the open device handle.
+        unsafe { xboxkrnl::NtClose(self.handle) };
     }
 }
 
@@ -504,15 +528,18 @@ impl Scratch {
             return Ok(base.get() as usize as *mut u8);
         }
         let mut base = 0;
-        let status = kernel::NtAllocateVirtualMemory(
-            &mut base,
-            &mut self.size,
-            MEM_COMMIT | MEM_RESERVE,
-            PAGE_READWRITE,
-            0,
-        );
+        // SAFETY: `base` and `self.size` are live.
+        let status = unsafe {
+            xboxkrnl::NtAllocateVirtualMemory(
+                &mut base,
+                &mut self.size,
+                AllocationType::COMMIT | AllocationType::RESERVE,
+                PageProtection::READWRITE,
+                0,
+            )
+        };
         self.base = NonZeroU32::new(base);
-        NtStatus(status).result()?;
+        status.result()?;
         Ok(base as usize as *mut u8)
     }
 
@@ -520,7 +547,10 @@ impl Scratch {
     fn release(mut self) {
         if let Some(base) = self.base {
             let mut base = base.get();
-            kernel::NtFreeVirtualMemory(&mut base, &mut self.size, MEM_RELEASE, 0);
+            // SAFETY: `base` is the allocation `page` made.
+            unsafe {
+                xboxkrnl::NtFreeVirtualMemory(&mut base, &mut self.size, AllocationType::RELEASE, 0)
+            };
         }
     }
 }

@@ -10,15 +10,20 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::commands::performance::CounterSample;
 use openxbdm_server::commands::performance::counters::CounterQuery;
 use openxbdm_server::commands::performance::counters::Evaluation;
+use xbox360::time::Timebase;
+use xbox360_sys::processor;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::DebugMonitorService;
+use xbox360_sys::xboxkrnl::ProcessType;
 
 use super::super::counters;
 use super::super::pmc;
 use super::events;
 use super::ring;
-use crate::kernel;
 
 /// Frames since the last `pixcmd r` and the last frame value (stock
 /// 0x91fa2a5c and 0x91fa2a60).
@@ -27,9 +32,6 @@ static FRAME: AtomicU32 = AtomicU32::new(0);
 /// The title uses the old protocol (stock 0x91fa2a84): counter values are
 /// also written as float records.
 static LEGACY: AtomicBool = AtomicBool::new(false);
-/// `KeGetCurrentProcessType` of the system process.
-const SYSTEM_PROCESS: u32 = 2;
-const TITLE_PROCESS: u32 = 1;
 /// Callback operation sent at each frame.
 const FRAME_EVENT: u32 = 0xff;
 /// Old-protocol frame number record.
@@ -85,7 +87,7 @@ fn boundary(frame: u32, record: u32) -> u32 {
     if super::stream_active() {
         sample_counters();
         sample_pmc();
-        if kernel::KeGetCurrentProcessType() != SYSTEM_PROCESS {
+        if xboxkrnl::KeGetCurrentProcessType() != ProcessType::SYSTEM {
             let d3d = events::callback(2);
             if d3d != 0 {
                 call_event(d3d);
@@ -105,7 +107,7 @@ fn boundary(frame: u32, record: u32) -> u32 {
         ring::call_consumers(frame);
         ring::write_frame_marker(frame);
     }
-    if kernel::KeGetCurrentProcessType() == TITLE_PROCESS {
+    if xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE {
         if record != 0 {
             super::capture::frame(record);
         } else {
@@ -251,7 +253,7 @@ fn query_counter(name: &[u8]) -> Option<CounterSample> {
 /// Sample the processor time counters, the processor statistics, and the
 /// memory statistics into the stream (stock 0x91f56810).
 pub(super) fn sample_counters() {
-    let time = kernel::timebase();
+    let time = Timebase::now().ticks();
     let mut record = [0u32; XBDM_WORDS];
     record[0] = 0x101;
     record[1] = (time >> 32) as u32;
@@ -280,7 +282,8 @@ pub(super) fn sample_counters() {
 
 /// Sums of the per-processor statistics as `Cntn` and `Cnt2` records.
 fn write_processor_statistics(time: u64) {
-    let mut processor = kernel::pcr() - (u32::from(super::read_u8(kernel::pcr() + 0x10c)) << 12);
+    let mut processor =
+        processor::pcr() - (u32::from(super::read_u8(processor::pcr() + 0x10c)) << 12);
     let mut cycles = 0u64;
     let mut waits = 0u64;
     let mut title = 0u32;
@@ -343,13 +346,13 @@ const MEMORY_FIELDS: [u8; 20] = [
 const FIRST_MEMORY_WORD: usize = 3;
 const MEMORY_STATISTICS_LENGTH: u32 = 0x68;
 const DEBUG_STATISTICS_LENGTH: u32 = 0x90;
-const DEBUG_MEMORY_STATISTICS: u32 = 8;
 const LEGACY_MEMORY_RECORD: u32 = 0x20;
 
 fn write_memory_statistics(record: &mut [u32; XBDM_WORDS]) {
     let mut statistics = [0u32; DEBUG_STATISTICS_LENGTH as usize / 4];
     statistics[0] = MEMORY_STATISTICS_LENGTH;
-    if (kernel::MmQueryStatistics(statistics.as_mut_ptr()) as i32) >= 0 {
+    // SAFETY: the buffer is 0x90 bytes and its length word says 0x68.
+    if (unsafe { xboxkrnl::MmQueryStatistics(statistics.as_mut_ptr()) }.0 as i32) >= 0 {
         for (index, &field) in MEMORY_FIELDS.iter().enumerate() {
             let value = statistics[usize::from(field)];
             record[FIRST_MEMORY_WORD + index] = value;
@@ -364,13 +367,16 @@ fn write_memory_statistics(record: &mut [u32; XBDM_WORDS]) {
     statistics = [0; DEBUG_STATISTICS_LENGTH as usize / 4];
     statistics[0] = DEBUG_STATISTICS_LENGTH;
     statistics[1] = MEMORY_STATISTICS_LENGTH;
-    let status = kernel::ExDebugMonitorService(
-        DEBUG_MEMORY_STATISTICS,
-        statistics.as_mut_ptr() as usize as u32,
-        0,
-        0,
-    );
-    record[0x20] = if (status as i32) >= 0 && statistics[0] >= DEBUG_STATISTICS_LENGTH {
+    // SAFETY: the buffer is 0x90 bytes, as its length word says.
+    let status = unsafe {
+        xboxkrnl::ExDebugMonitorService(
+            DebugMonitorService::MemoryStatistics,
+            statistics.as_mut_ptr() as usize as u32,
+            0,
+            0,
+        )
+    };
+    record[0x20] = if (status.0 as i32) >= 0 && statistics[0] >= DEBUG_STATISTICS_LENGTH {
         statistics[0x1b]
     } else {
         0
@@ -413,7 +419,7 @@ fn pmc_flag_index(counter: usize) -> u32 {
 /// Read the counters of the previous frame as a `PMCP` record and program
 /// the next set (stock 0x91f55620).
 fn sample_pmc() {
-    let time = kernel::timebase();
+    let time = Timebase::now().ticks();
     let set = PMC_SET.load(Ordering::Acquire);
     if PMC_ACTIVE.load(Ordering::Acquire) {
         let mut record = [0u32; 0x14];

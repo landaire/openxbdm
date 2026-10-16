@@ -25,11 +25,12 @@ use openxbdm_server::commands::performance::pix;
 use openxbdm_server::reply;
 use openxbdm_server::reply::Reply;
 use openxbdm_server::text::ResponseText;
+use xbox360::time::Timebase;
+use xbox360_sys::xboxkrnl;
 
 use crate::backend::Console;
 use crate::backend::dispatcher;
 use crate::kernel;
-use crate::kernel::pcr;
 use crate::net::XamNetwork;
 
 /// Code 0x3f flag (stock 0x91fa2a50): capture file writes are discarded
@@ -69,7 +70,7 @@ const HDD_TAG: u32 = 0x4844_4420;
 /// +8 sectors}` of a starting disk transfer, as an `HDD ` record with
 /// time bit 0 clear.
 pub(crate) fn service_disk_start(argument: u32) -> u32 {
-    let time = kernel::timebase();
+    let time = Timebase::now().ticks();
     if stream_active() {
         write_tagged_words(
             HDD_TAG,
@@ -88,7 +89,7 @@ pub(crate) fn service_disk_start(argument: u32) -> u32 {
 /// Monitor control code 0x80 (stock 0x91f565c0): completion status of a
 /// disk transfer, as an `HDD ` record with time bit 0 set.
 pub(crate) fn service_disk_complete(status: u32) -> u32 {
-    let time = kernel::timebase();
+    let time = Timebase::now().ticks();
     if stream_active() {
         write_tagged_words(HDD_TAG, &[(time >> 32) as u32, time as u32 | 1, status]);
     }
@@ -245,7 +246,8 @@ fn gpu_capture_requested() -> bool {
 
 /// Module initialization part (stock 0x91f56758).
 pub(crate) fn initialize() {
-    let audio = kernel::XAudioGetRenderDriverThread();
+    // SAFETY: takes no arguments; returns the thread object address or null.
+    let audio = unsafe { xboxkrnl::XAudioGetRenderDriverThread() } as usize as u32;
     if audio != 0 {
         let id = openxbdm_server::commands::debugger::ThreadId(read_u32(audio + 0x14c));
         crate::backend::debugger::name_thread(Some(id), c"Audio Driver".as_ptr() as usize as u32);
@@ -294,10 +296,11 @@ pub(crate) fn set_trace(enabled: bool) {
     if enabled {
         frame::reset_history();
     }
-    crate::backend::debugger::KeIpiGenericCall(
-        trace_hook as *const () as usize as u32,
-        u32::from(enabled),
-    );
+    // SAFETY: `trace_hook` is an IPI routine that only touches the PCR of
+    // its processor.
+    unsafe {
+        xboxkrnl::KeIpiGenericCall(trace_hook as *const () as usize as u32, u32::from(enabled))
+    };
     if enabled { ring::start() } else { ring::stop() }
 }
 

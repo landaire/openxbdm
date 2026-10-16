@@ -4,11 +4,13 @@
 //! frame's fence (code 0x5d, 0x91f5d718; 0x91f5f838), and the queues
 //! that order them in the streams (0x91f5f558, 0x91f5f6a0, 0x91f60060).
 
+use xbox360::time::TickCount;
+use xbox360_sys::xboxkrnl;
+
 use super::S;
 use super::buffers;
 use super::rd;
 use super::wr;
-use crate::kernel;
 
 /// Four fence slots `{flags | frame << 3, 0, count u16, id, data}`.
 const SLOTS: u32 = 0x150;
@@ -62,8 +64,10 @@ pub(super) fn close_frame_buffer(s: S) {
 
 /// Wait up to 2000 ms while the GPU is busy (stock 0x91f5cf38).
 pub(super) fn wait_for_idle() {
-    let start = kernel::tick_count();
-    while rd(GPU_STATUS) & 0x8000_0000 != 0 && kernel::tick_count().wrapping_sub(start) <= 2000 {
+    let start = TickCount::now().milliseconds();
+    while rd(GPU_STATUS) & 0x8000_0000 != 0
+        && TickCount::now().milliseconds().wrapping_sub(start) <= 2000
+    {
         // SAFETY: thread priority hints; no register changes.
         unsafe {
             core::arch::asm!(
@@ -195,7 +199,8 @@ pub(super) fn service(s: S, check: bool) {
             if check && !buffers::available(s, 1) {
                 break;
             }
-            let irql = kernel::KfAcquireSpinLock(s.at(0x1b4));
+            // SAFETY: the spin lock word lies in the session block.
+            let irql = unsafe { xboxkrnl::KfAcquireSpinLock(s.at(0x1b4).cast()) };
             let mut queued = None;
             if s.word(0x29c) != s.word(0x298) {
                 let index = s.word(0x29c);
@@ -209,7 +214,8 @@ pub(super) fn service(s: S, check: bool) {
                 ));
                 s.set_word(0x29c, wrap(index + 1, 10));
             }
-            kernel::KfReleaseSpinLock(s.at(0x1b4), irql);
+            // SAFETY: as above; the lock is held.
+            unsafe { xboxkrnl::KfReleaseSpinLock(s.at(0x1b4).cast(), irql) };
             let Some((entry, with_record, frame, mut record)) =
                 queued.filter(|queued| queued.0 != 0)
             else {
@@ -236,10 +242,12 @@ pub(super) fn service(s: S, check: bool) {
             return;
         }
         let entry = buffers::take(s, 0x11, 0);
-        let irql = kernel::KfAcquireSpinLock(s.at(0x1b4));
+        // SAFETY: the spin lock word lies in the session block.
+        let irql = unsafe { xboxkrnl::KfAcquireSpinLock(s.at(0x1b4).cast()) };
         s.set_word(0x1b8 + index * 4, entry);
         s.set_word(0x1c8, next);
-        kernel::KfReleaseSpinLock(s.at(0x1b4), irql);
+        // SAFETY: as above; the lock is held.
+        unsafe { xboxkrnl::KfReleaseSpinLock(s.at(0x1b4).cast(), irql) };
     }
 }
 

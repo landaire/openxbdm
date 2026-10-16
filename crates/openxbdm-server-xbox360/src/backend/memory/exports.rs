@@ -9,13 +9,19 @@ use core::sync::atomic::Ordering;
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
-use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::XbdmHresult;
+use openxbdm_core::status::xbdm_error;
 use openxbdm_server::commands::console;
 use openxbdm_server::commands::memory;
 use openxbdm_server::commands::memory::Backend as _;
 use openxbdm_server::reply;
 use openxbdm_server::reply::CommandResult;
 use openxbdm_server::reply::Reply;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::DebugMonitorService;
+use xbox360_sys::xboxkrnl::PoolTag;
+use xbox360_sys::xboxkrnl::RtlImageDirectoryEntryToData;
+use xbox360_sys::xboxkrnl::RtlImageXexHeaderField;
 
 use super::ENTRY_BASE;
 use super::ENTRY_FLAG_REPORTED;
@@ -28,8 +34,6 @@ use super::IMAGE_DIRECTORY_EXCEPTION;
 use super::IMAGE_FILE_DLL;
 use super::LoaderLock;
 use super::REGISTERED_TYPE_NAMES;
-use super::RtlImageDirectoryEntryToData;
-use super::RtlImageXexHeaderField;
 use super::SECTION_HEADER_SIZE;
 use super::TRACKING;
 use super::TRACKING_TYPE_COUNT;
@@ -53,15 +57,14 @@ use super::untrack_allocation;
 use super::write_debug_byte;
 use crate::backend::dispatcher;
 use crate::exports::export;
-use crate::kernel;
 
 /// Result of an export whose server part could not run (on the server
 /// thread or above passive level).
 const SERVER_UNAVAILABLE: Hresult = Hresult::FAIL;
-const BAD_PARAMETER: Hresult = Hresult::error(0x17);
-const NO_SUCH_MODULE: Hresult = Hresult::error(3);
-const NO_SUCH_FIELD: Hresult = Hresult::error(0x25);
-const BUFFER_TOO_SMALL: Hresult = Hresult::error(0x105);
+const BAD_PARAMETER: Hresult = xbdm_error(0x17);
+const NO_SUCH_MODULE: Hresult = xbdm_error(3);
+const NO_SUCH_FIELD: Hresult = xbdm_error(0x25);
+const BUFFER_TOO_SMALL: Hresult = xbdm_error(0x105);
 /// HRESULT_FROM_WIN32(ERROR_NOT_FOUND).
 const NOT_FOUND: u32 = 0x8007_0490;
 /// HRESULT_FROM_WIN32(ERROR_INVALID_FUNCTION)-style limit of 0x10000 names.
@@ -70,17 +73,16 @@ const TOO_MANY_NAMES: u32 = 0x8007_03fb;
 const MODULE_RECORD_SIZE: u32 = 0x12c;
 /// Export 51's record: the export 142 record without its size dword.
 pub(crate) const MODULE_RECORD_SHORT_SIZE: usize = 0x124;
-const MODULE_SNAPSHOT_TAG: u32 = u32::from_be_bytes(*b"dmwm");
+const MODULE_SNAPSHOT_TAG: PoolTag = PoolTag::new(*b"dmwm");
 const MODULE_SNAPSHOT_CAPACITY: u32 = 10;
 /// Section snapshot record of export 52 (DMN_SECTIONLOAD).
 const SECTION_RECORD_SIZE: u32 = 0x110;
-const SECTION_SNAPSHOT_TAG: u32 = u32::from_be_bytes(*b"dmws");
+const SECTION_SNAPSHOT_TAG: PoolTag = PoolTag::new(*b"dmws");
 const SECTION_SNAPSHOT_CAPACITY: u16 = 5;
 const MODULE_FLAG_DLL: u32 = 4;
 const XEX_FIELD_INLINE_REPORTED: u32 = 0x10100;
 const XEX_FIELD_ADDITIONAL_TITLE_MEMORY: u32 = 0x40801;
 const WALK_LIMIT: u32 = 0xa000_0000;
-const DEBUG_MONITOR_MEMORY_STATISTICS: u32 = 8;
 const MEMORY_STATISTICS_LENGTH: u32 = 0x68;
 const MEMORY_STATISTICS_REPLY_LENGTH: u32 = 0x90;
 const MONITOR_STATISTICS_LENGTH: u32 = 0x30;
@@ -156,7 +158,7 @@ fn copy_bytes(request: &Transfer, mut step: impl FnMut(u32, u32) -> bool) -> Com
         }
         if (page ^ current) & !0xfff != 0 {
             page = current & !0xfff;
-            valid = kernel::MmIsAddressValid(current) != 0;
+            valid = xboxkrnl::MmIsAddressValid(current).get();
         }
         if valid {
             valid = step(current, count);
@@ -247,8 +249,12 @@ extern "C" fn get_proc_address(module: u32, ordinal: u32, address: u32) -> u32 {
     if ordinal == 0 || address == 0 {
         return Hresult::INVALID_ARGUMENT.0;
     }
-    if (kernel::XexGetProcedureAddress(module, ordinal, address as usize as *mut u32) as i32) < 0 {
-        return Hresult::error(2).0;
+    // SAFETY: the caller supplies a writable dword at `address`, which the
+    // check above requires to be nonzero.
+    let status =
+        unsafe { xboxkrnl::XexGetProcedureAddress(module, ordinal, address as usize as *mut u32) };
+    if (status.0 as i32) < 0 {
+        return xbdm_error(2).0;
     }
     Hresult::OK.0
 }
@@ -307,7 +313,11 @@ fn fill_module_record(record: u32, entry: u32, header: u32) {
     write_u32(record + 0x110, read_le32(header + 8));
     write_u32(record + 0x128, read_le32(header + 0x50));
     let mut pdata_size = 0u32;
-    let pdata = RtlImageDirectoryEntryToData(base, 1, IMAGE_DIRECTORY_EXCEPTION, &mut pdata_size);
+    // SAFETY: `base` is the image of a loaded entry, held by the caller's
+    // loader lock.
+    let pdata = unsafe {
+        RtlImageDirectoryEntryToData(base, true, IMAGE_DIRECTORY_EXCEPTION, &mut pdata_size)
+    };
     write_u32(record + 0x11c, pdata);
     write_u32(record + 0x120, pdata_size);
     let dll = read_le16(header + 0x16) & IMAGE_FILE_DLL != 0;
@@ -322,10 +332,12 @@ fn module_snapshot() -> Option<u32> {
     loop {
         if snapshot != 0 {
             capacity = read_u32(snapshot);
-            kernel::ExFreePool(snapshot);
+            // SAFETY: `snapshot` is the pool block allocated on the previous pass.
+            unsafe { xboxkrnl::ExFreePool(snapshot) };
         }
         let size = capacity.wrapping_mul(MODULE_RECORD_SIZE).wrapping_add(8);
-        snapshot = kernel::ExAllocatePoolWithTag(size, MODULE_SNAPSHOT_TAG);
+        // SAFETY: pool allocation has no pointer arguments.
+        snapshot = unsafe { xboxkrnl::ExAllocatePoolWithTag(size, MODULE_SNAPSHOT_TAG) };
         if snapshot == 0 {
             return None;
         }
@@ -489,10 +501,12 @@ extern "C" fn walk_module_sections(walk: u32, name: u32, record: u32) -> u32 {
             let mut found = false;
             if snapshot != 0 {
                 capacity = read_u16(snapshot);
-                kernel::ExFreePool(snapshot);
+                // SAFETY: `snapshot` is the pool block allocated on the previous pass.
+                unsafe { xboxkrnl::ExFreePool(snapshot) };
             }
             let size = u32::from(capacity) * SECTION_RECORD_SIZE + 4;
-            snapshot = kernel::ExAllocatePoolWithTag(size, SECTION_SNAPSHOT_TAG);
+            // SAFETY: pool allocation has no pointer arguments.
+            snapshot = unsafe { xboxkrnl::ExAllocatePoolWithTag(size, SECTION_SNAPSHOT_TAG) };
             if snapshot == 0 {
                 return Hresult::OUT_OF_MEMORY.0;
             }
@@ -523,7 +537,8 @@ extern "C" fn walk_module_sections(walk: u32, name: u32, record: u32) -> u32 {
                 }
             }
             if !found {
-                kernel::ExFreePool(snapshot);
+                // SAFETY: `snapshot` was allocated above and is not returned.
+                unsafe { xboxkrnl::ExFreePool(snapshot) };
                 return NO_SUCH_MODULE.0;
             }
             if read_u16(snapshot) <= capacity {
@@ -573,19 +588,23 @@ fn kernel_memory_statistics(
     let mut reply = [0u32; MEMORY_STATISTICS_REPLY_LENGTH as usize / 4];
     reply[0] = MEMORY_STATISTICS_REPLY_LENGTH;
     reply[1] = MEMORY_STATISTICS_LENGTH;
-    let status = kernel::ExDebugMonitorService(
-        DEBUG_MONITOR_MEMORY_STATISTICS,
-        reply.as_mut_ptr() as usize as u32,
-        0,
-        0,
-    );
-    if (status as i32) >= 0 && reply[0] >= MEMORY_STATISTICS_REPLY_LENGTH {
+    // SAFETY: `reply` is a live local of the length stored in its first word.
+    let status = unsafe {
+        xboxkrnl::ExDebugMonitorService(
+            DebugMonitorService::MemoryStatistics,
+            reply.as_mut_ptr() as usize as u32,
+            0,
+            0,
+        )
+    };
+    if (status.0 as i32) >= 0 && reply[0] >= MEMORY_STATISTICS_REPLY_LENGTH {
         let length = output.len();
         output.copy_from_slice(&reply[1..1 + length]);
-        return NtStatus(status).result();
+        return status.result();
     }
     output[0] = MEMORY_STATISTICS_LENGTH;
-    NtStatus(kernel::MmQueryStatistics(output.as_mut_ptr())).result()
+    // SAFETY: `output` is a live statistics block whose first word holds its length.
+    unsafe { xboxkrnl::MmQueryStatistics(output.as_mut_ptr()) }.result()
 }
 
 /// Stock export 165 (0x91f33318): `(statistics) -> HRESULT`; page counts
@@ -646,7 +665,8 @@ extern "C" fn register_tracking_type(name: u32, kind: u32) -> u32 {
     }
     let source = caller_string(name);
     let length = source.len() as u32 + 1;
-    let copy = kernel::ExAllocatePoolWithTag(length, u32::from_be_bytes(*b"xbdm"));
+    // SAFETY: pool allocation has no pointer arguments.
+    let copy = unsafe { xboxkrnl::ExAllocatePoolWithTag(length, PoolTag::new(*b"xbdm")) };
     if copy == 0 {
         return Hresult::OUT_OF_MEMORY.0;
     }
@@ -657,7 +677,8 @@ extern "C" fn register_tracking_type(name: u32, kind: u32) -> u32 {
         None => {
             // The registered table is full: undo the registration.
             TRACKING_TYPE_COUNT.fetch_sub(1, Ordering::AcqRel);
-            kernel::ExFreePool(copy);
+            // SAFETY: `copy` was allocated above and was not published.
+            unsafe { xboxkrnl::ExFreePool(copy) };
             return TOO_MANY_NAMES;
         }
     }
@@ -702,13 +723,13 @@ extern "C" fn walk_committed_memory(cursor: u32, region: u32) -> u32 {
             return Hresult::END_OF_DATA.0;
         }
         let mut end = start;
-        if kernel::MmIsAddressValid(start) != 0 {
+        if xboxkrnl::MmIsAddressValid(start).get() {
             loop {
                 if memory::is_device_address(end) {
                     break;
                 }
                 end = memory::next_page(end);
-                if kernel::MmIsAddressValid(end) == 0 {
+                if !xboxkrnl::MmIsAddressValid(end).get() {
                     break;
                 }
             }
@@ -748,7 +769,8 @@ extern "C" fn get_xex_header_field(
     let Some(entry) = find_entry(caller_string(module)) else {
         return NO_SUCH_MODULE.0;
     };
-    let field = RtlImageXexHeaderField(read_u32(entry + ENTRY_XEX_HEADER as u32), key);
+    // SAFETY: the entry's XEX header stays mapped under the loader lock.
+    let field = unsafe { RtlImageXexHeaderField(read_u32(entry + ENTRY_XEX_HEADER as u32), key) };
     if field == 0 {
         return NO_SUCH_FIELD.0;
     }

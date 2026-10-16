@@ -5,6 +5,7 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::Access;
 use openxbdm_server::Server;
 use openxbdm_server::commands::security;
@@ -13,23 +14,26 @@ use openxbdm_server::commands::security::User;
 use openxbdm_server::commands::security::UserCreationFailed;
 use openxbdm_server::commands::security::UserName;
 use openxbdm_server::reply::CommandError;
+use xbox360::module::Ordinal;
+use xbox360::module::SystemModule;
+use xbox360::module::resolve_export;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::ObCreateObject;
+use xbox360_sys::xboxkrnl::ObInsertObject;
+use xbox360_sys::xboxkrnl::ObMakeTemporaryObject;
+use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
+use xbox360_sys::xboxkrnl::ObjectAttributes;
 
 use super::Console;
 use super::dispatcher;
 use super::dispatcher::ServerService;
 use crate::exports::export;
 use crate::kernel;
-use crate::kernel::AnsiString;
-use crate::kernel::ObCreateObject;
-use crate::kernel::ObInsertObject;
-use crate::kernel::ObMakeTemporaryObject;
-use crate::kernel::ObjectAttributes;
 
 /// Kernel export ordinals of the pool routines the object type uses.
-const EX_ALLOCATE_POOL_TYPE_WITH_TAG: u32 = 11;
-const EX_FREE_POOL: u32 = 15;
-/// Object attribute: the object stays after its last handle closes.
-const OBJ_PERMANENT: u32 = 0x10;
+const EX_ALLOCATE_POOL_TYPE_WITH_TAG: Ordinal = Ordinal::new(11).unwrap();
+const EX_FREE_POOL: Ordinal = Ordinal::new(15).unwrap();
 /// Body: password high, password low, privileges, password-set flag.
 const USER_BODY_SIZE: u32 = 0x10;
 /// Directory query buffer: counted name, type, then the name bytes.
@@ -94,26 +98,27 @@ impl Data {
     /// Referenced user object reached by `name`.
     fn open(&mut self, name: &[u8]) -> Option<u32> {
         let directory = self.directory()?;
-        let string = AnsiString::new(name);
+        let string = kernel::ansi_string(name);
         let attributes = ObjectAttributes {
-            root_directory: directory,
+            root_directory: Handle::from_raw(directory),
             object_name: &string,
-            attributes: 0,
+            attributes: ObjectAttributeFlags::empty(),
         };
-        let mut handle = 0;
+        let mut handle = Handle::NULL;
         let object_type = core::ptr::from_ref(&USER_OBJECT_TYPE) as u32;
-        if failed(kernel::ObOpenObjectByName(
-            &attributes,
-            object_type,
-            0,
-            &mut handle,
-        )) {
+        // SAFETY: `attributes`, its name and `handle` are live locals; the
+        // object type is a static descriptor.
+        if failed(
+            unsafe { xboxkrnl::ObOpenObjectByName(&attributes, object_type, 0, &mut handle) }.0,
+        ) {
             return None;
         }
         let mut object = 0;
-        let status = kernel::ObReferenceObjectByHandle(handle, 0, &mut object);
-        kernel::NtClose(handle);
-        (!failed(status)).then_some(object)
+        // SAFETY: `handle` was opened above and is closed only here.
+        let status = unsafe { xboxkrnl::ObReferenceObjectByHandle(handle, 0, &mut object) };
+        // SAFETY: as above.
+        unsafe { xboxkrnl::NtClose(handle) };
+        (!failed(status.0)).then_some(object)
     }
 }
 
@@ -122,21 +127,22 @@ fn failed(status: u32) -> bool {
 }
 
 fn create_directory() -> Option<u32> {
-    let module = kernel::module_handle(c"xboxkrnl.exe").ok()?;
-    let allocate = kernel::resolve_export(module, EX_ALLOCATE_POOL_TYPE_WITH_TAG).ok()?;
-    let free = kernel::resolve_export(module, EX_FREE_POOL).ok()?;
+    let module = SystemModule::Kernel.handle().ok()?;
+    let allocate = resolve_export(module, EX_ALLOCATE_POOL_TYPE_WITH_TAG)
+        .ok()?
+        .raw();
+    let free = resolve_export(module, EX_FREE_POOL).ok()?.raw();
     USER_OBJECT_TYPE.allocate.store(allocate, Ordering::Relaxed);
     USER_OBJECT_TYPE.free.store(free, Ordering::Relaxed);
     USER_OBJECT_TYPE.default_object.store(
         core::ptr::from_ref(&DEFAULT_OBJECT) as u32,
         Ordering::Relaxed,
     );
-    let mut handle = 0;
-    (!failed(kernel::NtCreateDirectoryObject(
-        &mut handle,
-        core::ptr::null(),
-    )))
-    .then_some(handle)
+    let mut handle = Handle::NULL;
+    // SAFETY: `handle` is a live local; a null name creates an unnamed
+    // directory.
+    (!failed(unsafe { xboxkrnl::NtCreateDirectoryObject(&mut handle, core::ptr::null()) }.0))
+        .then_some(handle.raw())
 }
 
 fn body(object: u32) -> *mut [u32; 4] {
@@ -177,7 +183,8 @@ impl security::Backend for Console {
     fn find_user(&mut self, name: &[u8]) -> Option<User> {
         let object = self.security.open(name)?;
         let user = read_user(object);
-        kernel::ObDereferenceObject(object);
+        // SAFETY: `open` returned a referenced object.
+        unsafe { xboxkrnl::ObDereferenceObject(object) };
         Some(user)
     }
 
@@ -186,39 +193,50 @@ impl security::Backend for Console {
             return false;
         };
         write_user(object, user);
-        kernel::ObDereferenceObject(object);
+        // SAFETY: `open` returned a referenced object.
+        unsafe { xboxkrnl::ObDereferenceObject(object) };
         true
     }
 
     fn create_user(&mut self, name: &[u8], user: User) -> Result<(), UserCreationFailed> {
         let directory = self.security.directory().ok_or(UserCreationFailed)?;
-        let string = AnsiString::new(name);
+        let string = kernel::ansi_string(name);
         let attributes = ObjectAttributes {
-            root_directory: directory,
+            root_directory: Handle::from_raw(directory),
             object_name: &string,
-            attributes: OBJ_PERMANENT,
+            attributes: ObjectAttributeFlags::PERMANENT,
         };
         let mut object = 0;
-        if failed(ObCreateObject(
-            core::ptr::from_ref(&USER_OBJECT_TYPE) as u32,
-            &attributes,
-            USER_BODY_SIZE,
-            &mut object,
-        )) {
+        // SAFETY: `attributes`, its name and `object` are live locals; the
+        // object type is a static descriptor.
+        if failed(
+            unsafe {
+                ObCreateObject(
+                    core::ptr::from_ref(&USER_OBJECT_TYPE) as u32,
+                    &attributes,
+                    USER_BODY_SIZE,
+                    &mut object,
+                )
+            }
+            .0,
+        ) {
             return Err(UserCreationFailed);
         }
-        let mut handle = 0;
-        let status = ObInsertObject(object, &attributes, 1, &mut handle);
+        let mut handle = Handle::NULL;
+        // SAFETY: `object` was created above with these attributes.
+        let status = unsafe { ObInsertObject(object, &attributes, 1, &mut handle) };
         // A failed insertion already released the creation reference.
         // Stock dereferences again here (0x91f40764), a double release.
-        if failed(status) {
+        if failed(status.0) {
             return Err(UserCreationFailed);
         }
         // Drops the pointer bias; the handle and the permanent directory
         // entry keep the object until the body is written.
-        kernel::ObDereferenceObject(object);
+        // SAFETY: the creation reference is held after a successful insert.
+        unsafe { xboxkrnl::ObDereferenceObject(object) };
         write_user(object, user);
-        kernel::NtClose(handle);
+        // SAFETY: `handle` came from the insertion and is closed only here.
+        unsafe { xboxkrnl::NtClose(handle) };
         Ok(())
     }
 
@@ -226,10 +244,14 @@ impl security::Backend for Console {
         let Some(object) = self.security.open(name) else {
             return false;
         };
-        ObMakeTemporaryObject(object);
-        // The reference from the open and the one the permanent object held.
-        kernel::ObDereferenceObject(object);
-        kernel::ObDereferenceObject(object);
+        // SAFETY: `open` returned a referenced permanent object, so it holds
+        // both references released here.
+        unsafe {
+            ObMakeTemporaryObject(object);
+            // The reference from the open and the one the permanent object held.
+            xboxkrnl::ObDereferenceObject(object);
+            xboxkrnl::ObDereferenceObject(object);
+        }
         true
     }
 
@@ -240,15 +262,19 @@ impl security::Backend for Console {
         let directory = self.security.directory()?;
         let mut buffer = Buffer([0; QUERY_LENGTH]);
         let mut context = index;
-        let status = kernel::NtQueryDirectoryObject(
-            directory,
-            buffer.0.as_mut_ptr(),
-            QUERY_LENGTH as u32,
-            u32::from(index == 0),
-            &mut context,
-            core::ptr::null_mut(),
-        );
-        if failed(status) {
+        // SAFETY: `buffer` holds QUERY_LENGTH bytes and `context` is a live
+        // local.
+        let status = unsafe {
+            xboxkrnl::NtQueryDirectoryObject(
+                Handle::from_raw(directory),
+                buffer.0.as_mut_ptr(),
+                QUERY_LENGTH as u32,
+                index == 0,
+                &mut context,
+                core::ptr::null_mut(),
+            )
+        };
+        if failed(status.0) {
             return None;
         }
         let bytes = &buffer.0;

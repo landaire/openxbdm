@@ -9,7 +9,7 @@ SECTIONS {
         *(.text .text.*)
     }
     . = ALIGN(4);
-    .xthunks : { *(.xthunks) }
+    .xthunks : { *(.xthunks .xthunks.*) }
 
     . = ALIGN(0x1000);
     .rodata : { *(.rodata .rodata.*) }
@@ -17,7 +17,7 @@ SECTIONS {
     . = ALIGN(0x1000);
     .data : { *(.data .data.*) *(.sdata .sdata.*) }
     . = ALIGN(4);
-    .xvars : { *(.xvars) }
+    .xvars : { *(.xvars .xvars.*) }
 
     . = ALIGN(0x1000);
     .bss : { *(.bss .bss.*) *(.sbss .sbss.*) *(COMMON) }

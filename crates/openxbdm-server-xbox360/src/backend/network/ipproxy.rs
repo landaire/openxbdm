@@ -15,14 +15,25 @@ use openxbdm_server::commands::network::ipproxy::tunnel::Inbound;
 use openxbdm_server::commands::network::ipproxy::tunnel::Tunnel;
 use openxbdm_server::network::Endpoint;
 use openxbdm_server::network::Ipv4Address;
+use xbox360::time::TickCount;
+use xbox360_sys::xam;
+use xbox360_sys::xam::AddressFamily;
+use xbox360_sys::xam::MessageFlags;
+use xbox360_sys::xam::Protocol;
+use xbox360_sys::xam::Socket;
+use xbox360_sys::xam::SocketLevel;
+use xbox360_sys::xam::SocketOption;
+use xbox360_sys::xam::SocketType;
+use xbox360_sys::xam::XnCaller;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::ProcessorMode;
+use xbox360_sys::xboxkrnl::ThreadCreationFlags;
 
 use super::XNCALLER_SYSAPP;
 use super::xam_procedure;
 use crate::backend::Console;
 use crate::kernel;
-use crate::kernel::tick_count;
-use crate::net;
-use crate::net::XNCALLER_XBDM;
 
 /// XAM export that registers (or, with no record, unregisters) the
 /// outbound IP packet hook: `register(caller, record, 1)`.
@@ -42,8 +53,7 @@ const HOOK_INJECT_FLAGS: u32 = 1;
 const RECEIVE_INJECT_FLAGS: u32 = 0;
 const RECEIVE_STACK_SIZE: u32 = 0x4000;
 /// `ExCreateThread` creation flags of the receive thread.
-const RECEIVE_THREAD_FLAGS: u32 = 0x0400_0426;
-const SO_RCVTIMEO: i32 = 0x1006;
+const RECEIVE_THREAD_FLAGS: ThreadCreationFlags = ThreadCreationFlags::from_bits_retain(0x4000426);
 const WSAETIMEDOUT: i32 = 10060;
 /// Bytes of an IPv4 `sockaddr`.
 const SOCKADDR_LENGTH: usize = 16;
@@ -105,7 +115,7 @@ impl Shared {
 
 static SHARED: Shared = Shared {
     inject: AtomicU32::new(0),
-    socket: AtomicU32::new(net::INVALID_SOCKET),
+    socket: AtomicU32::new(Socket::INVALID.raw()),
     host_address: AtomicU32::new(0),
     host_port: AtomicU32::new(0),
     local_address: AtomicU32::new(0),
@@ -167,8 +177,10 @@ extern "C" fn outbound_hook(context: u32, packet: *mut u8, length: *const u32) -
         Piece::of(outbound.message()),
         Piece::of(&packet[outbound.payload.clone()]),
     ];
-    shared.inject(XNCALLER_XBDM, &pieces, HOOK_INJECT_FLAGS);
-    shared.last_send.store(tick_count(), Ordering::Relaxed);
+    shared.inject(XnCaller::DebugMonitor.raw(), &pieces, HOOK_INJECT_FLAGS);
+    shared
+        .last_send
+        .store(TickCount::now().milliseconds(), Ordering::Relaxed);
     1
 }
 
@@ -178,42 +190,51 @@ extern "C" fn receive_thread(context: u32) -> u32 {
     // SAFETY: the context is `SHARED`, given at thread creation.
     let shared = unsafe { &*(context as usize as *const Shared) };
     let timeout = tunnel::RECEIVE_TIMEOUT.as_millis() as u32;
-    net::NetDll_setsockopt(
-        XNCALLER_XBDM,
-        shared.socket.load(Ordering::Relaxed),
-        net::SOL_SOCKET,
-        SO_RCVTIMEO,
-        (&timeout as *const u32).cast(),
-        size_of::<u32>() as i32,
-    );
+    // SAFETY: `timeout` is a live u32 option value of the stated size.
+    unsafe {
+        xam::NetDll_setsockopt(
+            XnCaller::DebugMonitor,
+            Socket::from_raw(shared.socket.load(Ordering::Relaxed)),
+            SocketLevel::Socket,
+            SocketOption::SO_RCVTIMEO,
+            (&timeout as *const u32).cast(),
+            size_of::<u32>() as i32,
+        )
+    };
     let keepalive_interval = tunnel::KEEPALIVE_INTERVAL.as_millis() as u32;
     let mut buffer = [0u8; tunnel::MESSAGE_LIMIT];
     loop {
         let socket = shared.socket.load(Ordering::Relaxed);
-        let received = net::NetDll_recv(
-            XNCALLER_XBDM,
-            socket,
-            buffer.as_mut_ptr(),
-            buffer.len() as i32,
-            0,
-        );
-        let length = if received == net::SOCKET_ERROR {
-            if net::NetDll_WSAGetLastError(XNCALLER_XBDM) != WSAETIMEDOUT {
+        // SAFETY: `buffer` is a live stack buffer of the stated length.
+        let received = unsafe {
+            xam::NetDll_recv(
+                XnCaller::DebugMonitor,
+                Socket::from_raw(socket),
+                buffer.as_mut_ptr(),
+                buffer.len() as i32,
+                MessageFlags::empty(),
+            )
+        };
+        let length = if received == xam::SOCKET_ERROR {
+            if xam::NetDll_WSAGetLastError(XnCaller::DebugMonitor).0 != WSAETIMEDOUT as u32 {
                 return 0;
             }
             0
         } else {
             received as u32 as usize
         };
-        let now = tick_count();
+        let now = TickCount::now().milliseconds();
         if now.wrapping_sub(shared.last_send.load(Ordering::Relaxed)) >= keepalive_interval {
-            net::NetDll_send(
-                XNCALLER_XBDM,
-                socket,
-                tunnel::KEEPALIVE.as_ptr(),
-                tunnel::KEEPALIVE.len() as i32,
-                0,
-            );
+            // SAFETY: KEEPALIVE is a static message of the stated length.
+            unsafe {
+                xam::NetDll_send(
+                    XnCaller::DebugMonitor,
+                    Socket::from_raw(socket),
+                    tunnel::KEEPALIVE.as_ptr(),
+                    tunnel::KEEPALIVE.len() as i32,
+                    MessageFlags::empty(),
+                )
+            };
             shared.last_send.store(now, Ordering::Relaxed);
         }
         match buffer.get(..length).and_then(tunnel::decapsulate) {
@@ -233,7 +254,7 @@ extern "C" fn receive_thread(context: u32) -> u32 {
                         Piece::EMPTY,
                     ],
                 };
-                shared.inject(XNCALLER_SYSAPP, &pieces, RECEIVE_INJECT_FLAGS);
+                shared.inject(XNCALLER_SYSAPP.raw(), &pieces, RECEIVE_INJECT_FLAGS);
             }
         }
     }
@@ -269,23 +290,29 @@ impl Data {
             return Ok(());
         };
         // SAFETY: the register routine takes (caller, record, flags).
-        let status =
-            unsafe { kernel::call_export(register, XNCALLER_SYSAPP, record, REGISTER_FLAGS, 0) };
+        let status = unsafe {
+            kernel::call_export(register, XNCALLER_SYSAPP.raw(), record, REGISTER_FLAGS, 0)
+        };
         RegisterStatus::new(status).map_or(Ok(()), Err)
     }
 
     fn close_socket(&mut self) {
         if let Some(socket) = self.socket.take() {
-            net::NetDll_closesocket(XNCALLER_XBDM, socket);
+            // SAFETY: the socket was opened by `open_proxy_socket` and is owned here.
+            unsafe { xam::NetDll_closesocket(XnCaller::DebugMonitor, Socket::from_raw(socket)) };
         }
-        SHARED.socket.store(net::INVALID_SOCKET, Ordering::Relaxed);
+        SHARED
+            .socket
+            .store(Socket::INVALID.raw(), Ordering::Relaxed);
     }
 }
 
 /// The socket failure with the thread's last Winsock error, which may be
 /// unset.
 fn socket_failed() -> SocketFailed {
-    SocketFailed(WsaError::new(net::NetDll_WSAGetLastError(XNCALLER_XBDM)))
+    SocketFailed(WsaError::new(
+        xam::NetDll_WSAGetLastError(XnCaller::DebugMonitor).0 as i32,
+    ))
 }
 
 impl ipproxy::Backend for Console {
@@ -315,46 +342,60 @@ impl ipproxy::Backend for Console {
         SHARED
             .host_port
             .store(u32::from(host.port), Ordering::Relaxed);
-        let now = tick_count();
+        let now = TickCount::now().milliseconds();
         SHARED.last_send.store(now, Ordering::Relaxed);
         SHARED.last_receive.store(now, Ordering::Relaxed);
-        let socket = net::NetDll_socket(
-            XNCALLER_XBDM,
-            net::AF_INET,
-            net::SOCK_DGRAM,
-            net::IPPROTO_UDP,
-        );
-        if socket == net::INVALID_SOCKET {
+        // SAFETY: no pointer arguments; the result is checked below.
+        let socket = unsafe {
+            xam::NetDll_socket(
+                XnCaller::DebugMonitor,
+                AddressFamily::Inet,
+                SocketType::Datagram,
+                Protocol::Udp,
+            )
+        };
+        if socket == Socket::INVALID {
             return Err(socket_failed());
         }
         let data = &mut self.network.ipproxy;
-        data.socket = Some(socket);
-        SHARED.socket.store(socket, Ordering::Relaxed);
+        data.socket = Some(socket.raw());
+        SHARED.socket.store(socket.raw(), Ordering::Relaxed);
         let mut address = [0u8; SOCKADDR_LENGTH];
-        address[..2].copy_from_slice(&(net::AF_INET as u16).to_be_bytes());
+        address[..2].copy_from_slice(&(AddressFamily::Inet.raw() as u16).to_be_bytes());
         address[2..4].copy_from_slice(&host.port.to_be_bytes());
         address[4..8].copy_from_slice(&host.address.octets());
-        if net::NetDll_connect(
-            XNCALLER_XBDM,
-            socket,
-            address.as_ptr(),
-            SOCKADDR_LENGTH as i32,
-        ) != 0
+        // SAFETY: `address` is a live sockaddr of SOCKADDR_LENGTH bytes.
+        if unsafe {
+            xam::NetDll_connect(
+                XnCaller::DebugMonitor,
+                socket,
+                address.as_ptr(),
+                SOCKADDR_LENGTH as i32,
+            )
+        } != 0
         {
             let error = socket_failed();
             data.close_socket();
             return Err(error);
         }
         let mut length = SOCKADDR_LENGTH as i32;
-        let named =
-            net::NetDll_getsockname(XNCALLER_XBDM, socket, address.as_mut_ptr(), &mut length);
+        // SAFETY: `address` and `length` are live and describe SOCKADDR_LENGTH bytes.
+        let named = unsafe {
+            xam::NetDll_getsockname(
+                XnCaller::DebugMonitor,
+                socket,
+                address.as_mut_ptr(),
+                &mut length,
+            )
+        };
         // Recorded before the result is checked, as stock does.
         SHARED.local_port.store(
             u32::from(u16::from_be_bytes([address[2], address[3]])),
             Ordering::Relaxed,
         );
         let mut xnaddr = [0u8; XNADDR_LENGTH];
-        kernel::NetDll_XNetGetDebugXnAddr(XNCALLER_XBDM, xnaddr.as_mut_ptr());
+        // SAFETY: `xnaddr` is a live XNADDR_LENGTH-byte buffer.
+        unsafe { xam::NetDll_XNetGetDebugXnAddr(XnCaller::DebugMonitor, xnaddr.as_mut_ptr()) };
         SHARED.local_address.store(
             u32::from_be_bytes([xnaddr[0], xnaddr[1], xnaddr[2], xnaddr[3]]),
             Ordering::Relaxed,
@@ -397,16 +438,20 @@ impl ipproxy::Backend for Console {
 
     fn start_proxy_thread(&mut self) -> Result<(), ThreadFailed> {
         let mut handle = 0u32;
-        let status = kernel::ExCreateThread(
-            &mut handle,
-            RECEIVE_STACK_SIZE,
-            core::ptr::null_mut(),
-            0,
-            receive_thread as *const () as usize as u32,
-            SHARED.context(),
-            RECEIVE_THREAD_FLAGS,
-        );
-        if (status as i32) < 0 {
+        // SAFETY: `handle` is a live u32; `receive_thread` takes the static
+        // `SHARED` context, which outlives the thread.
+        let status = unsafe {
+            xboxkrnl::ExCreateThread(
+                &mut handle,
+                RECEIVE_STACK_SIZE,
+                core::ptr::null_mut(),
+                0,
+                receive_thread as *const () as usize as u32,
+                SHARED.context(),
+                RECEIVE_THREAD_FLAGS,
+            )
+        };
+        if (status.0 as i32) < 0 {
             return Err(ThreadFailed);
         }
         self.network.ipproxy.thread = Some(handle);
@@ -419,8 +464,17 @@ impl ipproxy::Backend for Console {
         // thread.
         data.close_socket();
         if let Some(thread) = data.thread.take() {
-            kernel::NtWaitForSingleObjectEx(thread, 0, 0, core::ptr::null());
-            kernel::NtClose(thread);
+            // SAFETY: `thread` is the owned handle from `start_proxy_thread`,
+            // closed once after the wait.
+            unsafe {
+                xboxkrnl::NtWaitForSingleObjectEx(
+                    Handle::from_raw(thread),
+                    ProcessorMode::Kernel,
+                    false,
+                    core::ptr::null(),
+                );
+                xboxkrnl::NtClose(Handle::from_raw(thread));
+            }
         }
     }
 }

@@ -10,6 +10,7 @@ use core::fmt::Write as _;
 use openxbdm_core::line::CommandLine;
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::XbdmHresult;
 
 use crate::access::Access;
 use crate::backend::Backend;

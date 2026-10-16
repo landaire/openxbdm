@@ -8,21 +8,25 @@
 use core::cell::UnsafeCell;
 
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::XbdmHresult;
+use xbox360::time::Timebase;
+use xbox360_sys::processor::pcr;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::Irql;
+use xbox360_sys::xboxkrnl::KeAcquireSpinLockAtRaisedIrql;
+use xbox360_sys::xboxkrnl::KeInsertQueueDpc;
+use xbox360_sys::xboxkrnl::KeRaiseIrqlToDpcLevel;
+use xbox360_sys::xboxkrnl::KeReleaseSpinLockFromRaisedIrql;
+use xbox360_sys::xboxkrnl::KeTryToAcquireSpinLockAtRaisedIrql;
+use xbox360_sys::xboxkrnl::PoolTag;
+use xbox360_sys::xboxkrnl::PoolType;
 
-use crate::backend::dispatcher;
-use crate::kernel;
-use crate::kernel::KeAcquireSpinLockAtRaisedIrql;
-use crate::kernel::KeInsertQueueDpc;
-use crate::kernel::KeRaiseIrqlToDpcLevel;
-use crate::kernel::KeReleaseSpinLockFromRaisedIrql;
-use crate::kernel::KeTryToAcquireSpinLockAtRaisedIrql;
-
-use super::pcr;
 use super::status;
+use crate::backend::dispatcher;
 
 /// Ring size and pool tag `PIXs`.
 const RING_BYTES: u32 = 0x1_0000;
-const RING_TAG: u32 = 0x5049_5873;
+const RING_TAG: PoolTag = PoolTag::new(*b"PIXs");
 /// Queued bytes that make the ring report `CounterDataAvailable`.
 const NOTIFY_BYTES: u32 = 0x8000;
 /// Dropped tags kept for the drop record; the last slot becomes `....`
@@ -167,7 +171,7 @@ struct Dpc(UnsafeCell<[u8; 0x20]>);
 
 struct Locked {
     lock: UnsafeCell<u32>,
-    irql: UnsafeCell<u32>,
+    irql: UnsafeCell<Irql>,
     dpc: Dpc,
     ring: UnsafeCell<Ring>,
 }
@@ -178,7 +182,7 @@ unsafe impl Sync for Locked {}
 
 static RING: Locked = Locked {
     lock: UnsafeCell::new(0),
-    irql: UnsafeCell::new(0),
+    irql: UnsafeCell::new(Irql::PASSIVE),
     dpc: Dpc(UnsafeCell::new([0; 0x20])),
     ring: UnsafeCell::new(Ring {
         buffer: None,
@@ -216,17 +220,25 @@ static RING: Locked = Locked {
 
 /// Raise to DISPATCH and take the ring lock (stock 0x91f625c8).
 fn acquire() {
-    let irql = KeRaiseIrqlToDpcLevel();
-    KeAcquireSpinLockAtRaisedIrql(RING.lock.get());
+    // SAFETY: `RING.lock` is a static spin lock word; the IRQL is restored
+    // in `release`.
+    let irql = unsafe {
+        let irql = KeRaiseIrqlToDpcLevel();
+        KeAcquireSpinLockAtRaisedIrql(RING.lock.get().cast());
+        irql
+    };
     // SAFETY: the lock is held.
     unsafe { *RING.irql.get() = irql };
 }
 
 /// Like [`acquire`] but give up when another processor holds the lock.
 fn try_acquire() -> bool {
-    let irql = KeRaiseIrqlToDpcLevel();
-    if KeTryToAcquireSpinLockAtRaisedIrql(RING.lock.get()) & 0xff == 0 {
-        kernel::KfLowerIrql(irql);
+    // SAFETY: `RING.lock` is a static spin lock word; the IRQL is lowered
+    // on failure and in `release` otherwise.
+    let irql = unsafe { KeRaiseIrqlToDpcLevel() };
+    if !unsafe { KeTryToAcquireSpinLockAtRaisedIrql(RING.lock.get().cast()) }.get() {
+        // SAFETY: returns to the IRQL raised from above.
+        unsafe { xboxkrnl::KfLowerIrql(irql) };
         return false;
     }
     // SAFETY: the lock is held.
@@ -238,8 +250,11 @@ fn try_acquire() -> bool {
 fn release() {
     // SAFETY: the lock is held.
     let irql = unsafe { *RING.irql.get() };
-    KeReleaseSpinLockFromRaisedIrql(RING.lock.get());
-    kernel::KfLowerIrql(irql);
+    // SAFETY: the lock is held by this processor at the raised IRQL.
+    unsafe {
+        KeReleaseSpinLockFromRaisedIrql(RING.lock.get().cast());
+        xboxkrnl::KfLowerIrql(irql);
+    }
 }
 
 /// The ring while the lock is held.
@@ -343,7 +358,7 @@ impl Ring {
             return;
         }
         if self.dropped_count == 0 {
-            self.first_drop_time = kernel::timebase();
+            self.first_drop_time = Timebase::now().ticks();
             self.accepting = false;
         }
         if self.dropped_count < DROPPED_TAGS {
@@ -373,7 +388,8 @@ impl Ring {
             return;
         }
         self.dpc_queued = true;
-        KeInsertQueueDpc(RING.dpc.0.get().cast(), 0, 0);
+        // SAFETY: the static DPC object `initialize` set up.
+        unsafe { KeInsertQueueDpc(RING.dpc.0.get().cast(), 0, 0) };
     }
 
     /// Feed one dword of a packet to the value and capture state (stock
@@ -426,7 +442,7 @@ impl Ring {
 
     /// Write the capture record and end the capture (stock 0x91f63718).
     fn write_capture(&mut self) {
-        let time = kernel::timebase();
+        let time = Timebase::now().ticks();
         let count = self.captured_index.map_or(u32::MAX, |index| index as u32);
         let header = (count.wrapping_add(4) << 24) & 0x7fff_ff9a | 0x65;
         let stored = self.captured_index.unwrap_or(0).min(CAPTURED_DWORDS);
@@ -452,7 +468,7 @@ impl Ring {
     /// Write the timing and drop records that end an `r` transfer and
     /// accept writes again (stock 0x91f62ee0).
     fn write_drop_record(&mut self) {
-        let time = kernel::timebase();
+        let time = Timebase::now().ticks();
         if self.capture_start != 0 && self.capture_end == 0 {
             return;
         }
@@ -540,7 +556,7 @@ impl Ring {
         if self.legacy || count == 0 {
             return;
         }
-        let time = kernel::timebase();
+        let time = Timebase::now().ticks();
         let header = ((count as u32 + 5) << 24) & 0x7fff_ff9d | KIND_TAGGED;
         if self.put_words(&[
             header,
@@ -624,7 +640,9 @@ pub(super) fn start() {
     let ring = unsafe { ring() };
     let fresh = ring.buffer.is_none();
     if fresh {
-        let block = kernel::ExAllocatePoolTypeWithTag(RING_BYTES, RING_TAG, 2);
+        // SAFETY: allocates from the system pool; no pointer arguments.
+        let block =
+            unsafe { xboxkrnl::ExAllocatePoolTypeWithTag(RING_BYTES, RING_TAG, PoolType::System) };
         ring.buffer = (block != 0).then_some(block);
     }
     if let Some(base) = ring.buffer {
@@ -671,14 +689,16 @@ pub(super) fn stop() {
     }
     release();
     if let Some(block) = block {
-        kernel::ExFreePool(block);
+        // SAFETY: the ring block from `start`, detached from the ring under
+        // the lock.
+        unsafe { xboxkrnl::ExFreePool(block) };
     }
 }
 
 /// Context swap routine: a `CxSw` record with the time and the processor
 /// (stock 0x91f63b40). Skipped when another processor holds the ring.
 extern "C" fn context_switch(_old: u32, _frame: u32, _new: u32) {
-    let time = kernel::timebase();
+    let time = Timebase::now().ticks();
     let processor = super::read_u8(pcr() + 0x10c);
     let record = [
         0x0600_0062,
@@ -706,7 +726,7 @@ pub(super) fn write_block(words: u32, dwords: u32, wait: bool) {
 
 /// Frame marker `{0x04000063, frame, time}` (stock 0x91f63af0).
 pub(super) fn write_frame_marker(frame: u32) {
-    let time = kernel::timebase();
+    let time = Timebase::now().ticks();
     let record = [0x0400_0063, frame, (time >> 32) as u32, time as u32];
     write_block(record.as_ptr() as usize as u32, 4, true);
 }
@@ -761,7 +781,7 @@ extern "C" fn consumer_write(tag: u32, data: u32, length: u32, extra: u32) {
     if !ring.legacy {
         if length == COUNTER_BLOCK && tag == D3D_COUNTERS {
             // The current protocol adds the time base and marks version 1.
-            let time = kernel::timebase();
+            let time = Timebase::now().ticks();
             let mut block = [0u32; 0xc];
             for (index, word) in block[..10].iter_mut().enumerate() {
                 *word = super::read_u32(data + index as u32 * 4);
@@ -1114,15 +1134,19 @@ pub(super) fn poll() {
 pub(super) fn initialize() {
     // SAFETY: runs before any other ring user.
     unsafe { *RING.lock.get() = 0 };
-    kernel::KeInitializeDpc(
-        RING.dpc.0.get().cast(),
-        data_available_entry as *const () as usize,
-        0,
-    );
+    // SAFETY: the static DPC storage, 0x20 bytes, not yet queued.
+    unsafe {
+        xboxkrnl::KeInitializeDpc(
+            RING.dpc.0.get().cast(),
+            data_available_entry as *const () as usize,
+            0,
+        )
+    };
 }
 
 /// Remove the DPC and the context switch routine and free the ring.
 pub(super) fn shut_down() {
-    kernel::KeRemoveQueueDpc(RING.dpc.0.get().cast());
+    // SAFETY: the static DPC object `initialize` set up.
+    unsafe { xboxkrnl::KeRemoveQueueDpc(RING.dpc.0.get().cast()) };
     stop();
 }

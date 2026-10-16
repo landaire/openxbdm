@@ -9,6 +9,8 @@
 //! A record is `{time << 7 | kind, dwords << 24 | id, data}`; `kind` 1 is
 //! a data record, 0x19 a formatted event, 0x1d a named begin, 0 an end.
 
+use xbox360_sys::xboxkrnl::_vsnprintf;
+
 use super::super::backend::EVENT_NAME_BYTES;
 use super::S;
 use super::buffers;
@@ -16,7 +18,6 @@ use super::engine::PCR_CURSOR;
 use super::engine::PCR_LIMIT;
 use super::rd;
 use super::wr;
-use crate::kernel::_vsnprintf;
 
 const TEMPORARY_BYTES: u32 = 0x800;
 /// Room a raised-level writer gets in the temporary block per request.
@@ -457,7 +458,9 @@ pub(super) fn timing_request(argument: u32) -> u32 {
     } else if kind != 3 {
         let mut name = [0u8; EVENT_NAME_BYTES];
         if (kind == 0 || kind == 2) && text != 0 {
-            _vsnprintf(name.as_mut_ptr(), 0x23, text, arguments);
+            // SAFETY: `name` holds more than 0x23 bytes; `text` and
+            // `arguments` are the caller's format string and argument list.
+            unsafe { _vsnprintf(name.as_mut_ptr(), 0x23, text, arguments) };
         }
         name[0x23] = 0;
         if kind < 3 && s.word(super::CURRENT_MESSAGE) == 5 {

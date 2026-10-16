@@ -14,6 +14,7 @@ pub(crate) use self::exports::apply_pending_stop_on;
 
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
+use core::time::Duration;
 
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
@@ -51,47 +52,43 @@ use openxbdm_server::commands::debugger::dispatch_direct;
 use openxbdm_server::commands::debugger::module_flags;
 use openxbdm_server::commands::services::ThreadHandle;
 use openxbdm_server::notify::ExecutionState;
+use xbox360::console::hardware_flags;
+use xbox360::console::kernel_version;
+use xbox360::time::sleep;
+use xbox360_sys::processor;
+use xbox360_sys::processor::current_irql;
+use xbox360_sys::processor::current_thread;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::DumpWriteDump;
+use xbox360_sys::xboxkrnl::ExRegisterThreadNotification;
+use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::ImageFlags;
+use xbox360_sys::xboxkrnl::ImageVersion;
+use xbox360_sys::xboxkrnl::Irql;
+use xbox360_sys::xboxkrnl::KeContextFromKframes;
+use xbox360_sys::xboxkrnl::KeIpiGenericCall;
+use xbox360_sys::xboxkrnl::KeResumeThread;
+use xbox360_sys::xboxkrnl::KeSetSpecialPurposeRegister;
+use xbox360_sys::xboxkrnl::KeSuspendThread;
+use xbox360_sys::xboxkrnl::KspinLock;
+use xbox360_sys::xboxkrnl::Kthread;
+use xbox360_sys::xboxkrnl::ObLookupAnyThreadByThreadId;
+use xbox360_sys::xboxkrnl::PoolTag;
+use xbox360_sys::xboxkrnl::PoolType;
+use xbox360_sys::xboxkrnl::ProcessorMode;
+use xbox360_sys::xboxkrnl::RtlCaptureContext;
+use xbox360_sys::xboxkrnl::RtlImageDirectoryEntryToData;
+use xbox360_sys::xboxkrnl::RtlImageNtHeader;
+use xbox360_sys::xboxkrnl::WaitReason;
+use xbox360_sys::xboxkrnl::XexUnloadImage;
 
 use super::Console;
-use super::memory::RtlImageDirectoryEntryToData;
-use super::memory::RtlImageNtHeader;
 use crate::kernel;
-use crate::kernel::KeSetSpecialPurposeRegister;
-use crate::kernel::LIB_KERNEL;
-use crate::kernel::current_irql;
-use crate::kernel::current_thread;
-use crate::kernel::import_thunk;
-
-import_thunk!(pub(crate) ObLookupAnyThreadByThreadId(thread_id: u32, thread: *mut u32) -> u32, lib = LIB_KERNEL, ordinal = 0x10a);
-import_thunk!(pub(crate) KeSuspendThread(thread: u32) -> u32, lib = LIB_KERNEL, ordinal = 0xa9);
-import_thunk!(pub(crate) KeResumeThread(thread: u32) -> u32, lib = LIB_KERNEL, ordinal = 0x92);
-import_thunk!(
-    ExRegisterThreadNotification(registration: *mut u32, register: u32) -> u32,
-    lib = LIB_KERNEL,
-    ordinal = 0x14
-);
-import_thunk!(pub(crate) KeIpiGenericCall(routine: u32, context: u32) -> u32, lib = LIB_KERNEL, ordinal = 0x7c);
-import_thunk!(
-    DumpWriteDump(record: u32, context: u32, flags: u32) -> u32,
-    lib = LIB_KERNEL,
-    ordinal = 0x6
-);
-import_thunk!(
-    RtlCaptureContext(context: *mut u8) -> u32,
-    lib = LIB_KERNEL,
-    ordinal = 0x119
-);
-import_thunk!(
-    KeContextFromKframes(frame: u32, context: *mut u8) -> u32,
-    lib = LIB_KERNEL,
-    ordinal = 0x56
-);
-use crate::kernel::XexUnloadImage;
 
 /// Data address breakpoint register.
 const SPR_DABR: u32 = 0x3f5;
 /// Pool tag of monitor thread records ('Dmtd').
-const RECORD_TAG: u32 = 0x6474_6d44;
+const RECORD_TAG: PoolTag = PoolTag::new(*b"dtmD");
 /// Monitor record flag: the thread is under debugger control.
 const RECORD_DEBUGGABLE: u32 = 0x2000;
 /// Monitor record flag: execution stops do not suspend the thread.
@@ -193,15 +190,18 @@ fn create_record(thread_object: u32) -> Option<u32> {
         return Some(record);
     }
     let pool_type = if read_u8(thread_object + thread::PROCESS_TYPE) == 2 {
-        2
+        PoolType::System
     } else {
-        1
+        PoolType::Title
     };
-    let record = kernel::ExAllocatePoolTypeWithTag(
-        core::mem::size_of::<MonitorRecord>() as u32,
-        RECORD_TAG,
-        pool_type,
-    );
+    // SAFETY: pool allocation has no pointer arguments.
+    let record = unsafe {
+        xboxkrnl::ExAllocatePoolTypeWithTag(
+            core::mem::size_of::<MonitorRecord>() as u32,
+            RECORD_TAG,
+            pool_type,
+        )
+    };
     if record == 0 {
         return None;
     }
@@ -247,7 +247,8 @@ fn for_each_thread(kind: ProcessKind, mut visit: impl FnMut(u32)) {
     if process == 0 {
         return;
     }
-    let irql = kernel::KfAcquireSpinLock(process as usize as *mut u32);
+    // SAFETY: the process object starts with its thread list spin lock.
+    let irql = unsafe { xboxkrnl::KfAcquireSpinLock(process as usize as *mut KspinLock) };
     let head = process + 4;
     let mut entry = read_u32(head);
     while entry != head && entry != 0 {
@@ -255,7 +256,8 @@ fn for_each_thread(kind: ProcessKind, mut visit: impl FnMut(u32)) {
         visit(entry - thread::LIST_ENTRY);
         entry = next;
     }
-    kernel::KfReleaseSpinLock(process as usize as *mut u32, irql);
+    // SAFETY: the lock was acquired above at `irql`.
+    unsafe { xboxkrnl::KfReleaseSpinLock(process as usize as *mut KspinLock, irql) };
 }
 
 /// A referenced thread object.
@@ -264,7 +266,9 @@ struct ThreadRef(u32);
 impl ThreadRef {
     fn lookup(id: ThreadId) -> Result<Self, NoSuchThread> {
         let mut object = 0u32;
-        if (ObLookupAnyThreadByThreadId(id.0, &mut object) as i32) < 0 {
+        // SAFETY: `object` is a live local that receives the thread pointer.
+        let status = unsafe { ObLookupAnyThreadByThreadId(id.0, (&raw mut object).cast()) };
+        if (status.0 as i32) < 0 {
             return Err(NoSuchThread);
         }
         Ok(Self(object))
@@ -273,7 +277,8 @@ impl ThreadRef {
 
 impl Drop for ThreadRef {
     fn drop(&mut self) {
-        kernel::ObDereferenceObject(self.0);
+        // SAFETY: `lookup` took the reference this releases.
+        unsafe { xboxkrnl::ObDereferenceObject(self.0) };
     }
 }
 
@@ -419,7 +424,7 @@ pub(crate) fn end_event_service() {
 /// [`end_event_service`] before the image unloads.
 pub(crate) fn wait_for_event_waiters() {
     while WAITERS.load(Ordering::Acquire) != 0 {
-        kernel::sleep_milliseconds(10);
+        sleep(Duration::from_millis(10));
     }
 }
 
@@ -488,16 +493,29 @@ fn post_and_wait_served(
         {
             break None;
         }
-        kernel::KeWaitForSingleObject(slot.event(), 3, 1, 0, &STOP_CHECK_INTERVAL);
+        // SAFETY: `reset_event` built the slot event before the slot was posted.
+        unsafe {
+            xboxkrnl::KeWaitForSingleObject(
+                slot.event().cast(),
+                WaitReason::UserRequest,
+                ProcessorMode::User,
+                false,
+                &STOP_CHECK_INTERVAL,
+            )
+        };
     };
     if let Some(thread_record) = record_of(thread_object) {
         // Context services of other threads follow the slot under this
         // lock; once it is cleared the context on this stack is no longer
         // reachable.
-        let process = read_u32(thread_object + thread::PROCESS) as usize as *mut u32;
-        let irql = kernel::KfAcquireSpinLock(process);
-        write_u32(thread_record + 12, 0);
-        kernel::KfReleaseSpinLock(process, irql);
+        let process = read_u32(thread_object + thread::PROCESS) as usize as *mut KspinLock;
+        // SAFETY: the process object of a live thread starts with its
+        // thread list spin lock.
+        unsafe {
+            let irql = xboxkrnl::KfAcquireSpinLock(process);
+            write_u32(thread_record + 12, 0);
+            xboxkrnl::KfReleaseSpinLock(process, irql);
+        }
     }
     slot.state.store(SLOT_FREE, Ordering::Release);
     disposition
@@ -521,7 +539,7 @@ fn claim_slot() -> Option<(usize, &'static Slot)> {
         }) {
             return Some((index, &SLOTS[index]));
         }
-        kernel::sleep_milliseconds(1);
+        sleep(Duration::from_millis(1));
     }
 }
 
@@ -590,7 +608,9 @@ fn mark_dump() -> u32 {
 /// by a bug check, selects the dump kind.
 fn write_dump(record: u32, context: u32) {
     let flags = mark_dump();
-    DumpWriteDump(record, context, (flags & 4) >> 2);
+    // SAFETY: `record` and `context` are the exception record and context
+    // the kernel passed to the debug routine.
+    unsafe { DumpWriteDump(record, context, (flags & 4) >> 2) };
 }
 
 crate::exports::bridged!(debug_routine_entry, debug_routine);
@@ -614,18 +634,20 @@ extern "C" fn debug_routine(trap_frame: u32, record: u32, context: u32, second_c
     let irql = current_irql();
     let server = thread_object == SERVER_THREAD.load(Ordering::Relaxed);
     if server
-        && irql == 0
+        && irql == Irql::PASSIVE
         && NtStatus(read_u32(record)) == ExceptionRecord::BREAKPOINT
         && BREAK_NOW_ARMED.swap(false, Ordering::AcqRel)
     {
         capture_break_now(record, context);
         return 1;
     }
-    if irql != 0 || server {
-        let delivery = match irql {
-            0 => Delivery::Inline,
-            1 | 2 => Delivery::Deferred,
-            _ => Delivery::Discarded,
+    if irql != Irql::PASSIVE || server {
+        let delivery = if irql == Irql::PASSIVE {
+            Delivery::Inline
+        } else if irql == Irql::APC || irql == Irql::DISPATCH {
+            Delivery::Deferred
+        } else {
+            Delivery::Discarded
         };
         return dispatch_in_place(
             thread_object,
@@ -711,14 +733,14 @@ extern "C" fn stack_overflow(frame: u32) -> u32 {
         unsafe { AtomicU32::from_ptr(variable as usize as *mut u32) }.swap(0, Ordering::AcqRel);
     let policy = load_policy();
     if hooked == 0
-        || (policy.kernel_debugger && kernel::hardware_flags() & HARDWARE_KERNEL_DEBUGGER != 0)
+        || (policy.kernel_debugger && hardware_flags().bits() & HARDWARE_KERNEL_DEBUGGER != 0)
     {
         return address;
     }
     let thread_object = current_thread();
     let can_stop = record_of(thread_object)
         .is_some_and(|record| record_flags(record) & RECORD_DEBUGGABLE != 0)
-        && current_irql() == 0
+        && current_irql() == Irql::PASSIVE
         && read_u32(frame + trap_frame::MSR_LOW) != 0
         && (policy.dump_mode != DumpMode::Enabled || policy.attached);
     if !can_stop && policy.dump_mode == DumpMode::Disabled {
@@ -726,7 +748,9 @@ extern "C" fn stack_overflow(frame: u32) -> u32 {
     }
     let mut context = KernelContext([0; context::SIZE]);
     context.0[..4].copy_from_slice(&ContextFlags::FULL.0.to_be_bytes());
-    KeContextFromKframes(frame, context.0.as_mut_ptr());
+    // SAFETY: `frame` is the trap frame the kernel passed; `context` is a
+    // live local of the full context size.
+    unsafe { KeContextFromKframes(frame, context.0.as_mut_ptr()) };
     let mut record = [0u32; 0x14];
     record[0] = ExceptionRecord::STACK_OVERFLOW.0;
     record[1] = ExceptionFlags::NONCONTINUABLE.0;
@@ -734,11 +758,9 @@ extern "C" fn stack_overflow(frame: u32) -> u32 {
     let record_address = record.as_mut_ptr() as usize as u32;
     let context_address = context.0.as_mut_ptr() as usize as u32;
     let dump = if can_stop {
-        // SAFETY: mtmsrd r11, 1 with r11 = 0x8000 sets the interrupt enable
-        // bit; the kernel calls with interrupts off and the thread must wait.
-        unsafe {
-            core::arch::asm!("lis 11, 0", "ori 11, 11, 0x8000", ".long 0x7d610164", out("r11") _)
-        };
+        // SAFETY: the kernel calls with interrupts off and the thread must
+        // wait.
+        unsafe { processor::enable_interrupts() };
         loop {
             let Some(disposition) = post_and_wait(
                 KIND_STACK_OVERFLOW,
@@ -760,7 +782,8 @@ extern "C" fn stack_overflow(frame: u32) -> u32 {
     if dump {
         // Stock passes dump kind 0 here, whatever the data block flags.
         mark_dump();
-        DumpWriteDump(record_address, context_address, 0);
+        // SAFETY: both addresses refer to the live locals filled above.
+        unsafe { DumpWriteDump(record_address, context_address, 0) };
     }
     address
 }
@@ -800,7 +823,7 @@ fn dispatch_in_place(
         record: read_exception_record(record),
         second_chance,
         has_record: record_of(thread_object).is_some(),
-        hardware_flags: kernel::hardware_flags(),
+        hardware_flags: hardware_flags().bits(),
         delivery,
     };
     let instruction = readable(iar).then(|| read_u32(iar));
@@ -820,10 +843,14 @@ fn dispatch_in_place(
     write_u64(gpr(3), registers.gpr3);
     write_u64(gpr(4), registers.gpr4);
     if let Some(value) = outcome.data_breakpoint_register {
-        KeIpiGenericCall(
-            set_data_breakpoint_entry as *const () as usize as u32,
-            value,
-        );
+        // SAFETY: the routine is this module's IPI entry, which takes the
+        // register value as its argument.
+        unsafe {
+            KeIpiGenericCall(
+                set_data_breakpoint_entry as *const () as usize as u32,
+                value,
+            )
+        };
     }
     if let Some(request) = outcome.thread_name {
         name_thread(Some(request.thread), request.address);
@@ -849,30 +876,35 @@ crate::exports::bridged!(thread_notification_entry, thread_notification);
 extern "C" fn thread_notification(_registration: u32, thread_object: u32, create: u32) -> u32 {
     if create == 0 {
         let process = read_u32(thread_object + thread::PROCESS);
-        kernel::KeEnterCriticalRegion();
-        let irql = kernel::KfAcquireSpinLock(process as usize as *mut u32);
-        let record = record_of(thread_object);
-        let mut debuggable = false;
-        if let Some(record) = record {
-            write_u32(thread_object + thread::MONITOR_RECORD, 0);
-            debuggable = record_flags(record) & RECORD_DEBUGGABLE != 0;
-            if read_u32(record + 4) != 0 {
-                KeResumeThread(thread_object);
+        // SAFETY: the kernel passes a live thread object whose process
+        // object starts with its thread list spin lock; the record and its
+        // name are pool blocks this module allocated and detaches here.
+        unsafe {
+            xboxkrnl::KeEnterCriticalRegion();
+            let irql = xboxkrnl::KfAcquireSpinLock(process as usize as *mut KspinLock);
+            let record = record_of(thread_object);
+            let mut debuggable = false;
+            if let Some(record) = record {
+                write_u32(thread_object + thread::MONITOR_RECORD, 0);
+                debuggable = record_flags(record) & RECORD_DEBUGGABLE != 0;
+                if read_u32(record + 4) != 0 {
+                    KeResumeThread(thread_object as usize as *mut Kthread);
+                }
             }
-        }
-        kernel::KfReleaseSpinLock(process as usize as *mut u32, irql);
-        if debuggable && thread_object != SERVER_THREAD.load(Ordering::Relaxed) {
-            post_detached(KIND_TERMINATE, thread_object);
-        }
-        if let Some(record) = record {
-            let name = read_u32(record + 8);
-            if name != 0 {
-                kernel::ExFreePool(name);
+            xboxkrnl::KfReleaseSpinLock(process as usize as *mut KspinLock, irql);
+            if debuggable && thread_object != SERVER_THREAD.load(Ordering::Relaxed) {
+                post_detached(KIND_TERMINATE, thread_object);
             }
-            kernel::ExFreePool(record);
+            if let Some(record) = record {
+                let name = read_u32(record + 8);
+                if name != 0 {
+                    xboxkrnl::ExFreePool(name);
+                }
+                xboxkrnl::ExFreePool(record);
+            }
+            crate::backend::performance::pix::thread_terminated();
+            xboxkrnl::KeLeaveCriticalRegion();
         }
-        crate::backend::performance::pix::thread_terminated();
-        kernel::KeLeaveCriticalRegion();
         return 0;
     }
     match create_record(thread_object) {
@@ -923,13 +955,16 @@ pub(crate) fn install() {
         thread_notification_entry as *const () as usize as u32,
         Ordering::Relaxed,
     );
-    ExRegisterThreadNotification(THREAD_NOTIFICATION.as_ptr() as *mut u32, 1);
+    // SAFETY: the registration block is static and stays registered until
+    // `uninstall`.
+    unsafe { ExRegisterThreadNotification(THREAD_NOTIFICATION.as_ptr() as *mut u32, true) };
 }
 
 /// Undo [`install`] before the image unloads.
 pub(crate) fn uninstall() {
     if THREAD_NOTIFICATION[0].load(Ordering::Relaxed) != 0 {
-        ExRegisterThreadNotification(THREAD_NOTIFICATION.as_ptr() as *mut u32, 0);
+        // SAFETY: `install` registered this static block.
+        unsafe { ExRegisterThreadNotification(THREAD_NOTIFICATION.as_ptr() as *mut u32, false) };
         THREAD_NOTIFICATION[0].store(0, Ordering::Relaxed);
     }
     let data = kernel::debug_monitor_data();
@@ -1068,7 +1103,7 @@ fn store_policy(policy: &DirectPolicy) {
 }
 
 /// Pool tag of queued direct notifications ('Ddfn').
-const DIRECT_TAG: u32 = 0x6e66_6444;
+const DIRECT_TAG: PoolTag = PoolTag::new(*b"nfdD");
 
 /// A queued direct notification; the captured text follows it.
 #[repr(C)]
@@ -1099,7 +1134,14 @@ fn queue_direct(thread: ThreadId, iar: u32, record: ExceptionRecord, notice: Dir
         _ => None,
     };
     let header = core::mem::size_of::<DirectNode>();
-    let node = kernel::ExAllocatePoolTypeWithTag((header + text_length) as u32, DIRECT_TAG, 2);
+    // SAFETY: pool allocation has no pointer arguments.
+    let node = unsafe {
+        xboxkrnl::ExAllocatePoolTypeWithTag(
+            (header + text_length) as u32,
+            DIRECT_TAG,
+            PoolType::System,
+        )
+    };
     if node == 0 {
         return;
     }
@@ -1126,12 +1168,14 @@ fn queue_direct(thread: ThreadId, iar: u32, record: ExceptionRecord, notice: Dir
         }
     }
     let lock = DIRECT_LOCK.as_ptr();
-    let irql = kernel::KfAcquireSpinLock(lock);
+    // SAFETY: `lock` is the static direct notification spin lock.
+    let irql = unsafe { xboxkrnl::KfAcquireSpinLock(lock.cast()) };
     match DIRECT_TAIL.swap(node, Ordering::Relaxed) {
         0 => DIRECT_HEAD.store(node, Ordering::Relaxed),
         tail => write_u32(tail, node),
     }
-    kernel::KfReleaseSpinLock(lock, irql);
+    // SAFETY: the lock was acquired above at `irql`.
+    unsafe { xboxkrnl::KfReleaseSpinLock(lock.cast(), irql) };
 }
 
 /// Bytes of `length` at `address` that can be read without a fault.
@@ -1182,7 +1226,7 @@ fn capture_break_now(record: u32, context: u32) {
 
 fn caller_can_wait() -> Option<u32> {
     let thread_object = current_thread();
-    (thread_object != SERVER_THREAD.load(Ordering::Relaxed) && current_irql() == 0)
+    (thread_object != SERVER_THREAD.load(Ordering::Relaxed) && current_irql() == Irql::PASSIVE)
         .then_some(thread_object)
 }
 
@@ -1344,15 +1388,17 @@ pub(crate) fn name_thread(thread: Option<ThreadId>, address: u32) {
         length += 1;
     }
     let pool_type = if read_u8(thread_object + thread::PROCESS_TYPE) == 2 {
-        2
+        PoolType::System
     } else {
-        1
+        PoolType::Title
     };
     let old = read_u32(record + 8);
     if old != 0 {
-        kernel::ExFreePool(old);
+        // SAFETY: the old name is a pool block this module allocated.
+        unsafe { xboxkrnl::ExFreePool(old) };
     }
-    let copy = kernel::ExAllocatePoolTypeWithTag(length + 1, RECORD_TAG, pool_type);
+    // SAFETY: pool allocation has no pointer arguments.
+    let copy = unsafe { xboxkrnl::ExAllocatePoolTypeWithTag(length + 1, RECORD_TAG, pool_type) };
     write_u32(record + 8, copy);
     if copy != 0 {
         for offset in 0..=length {
@@ -1370,7 +1416,8 @@ pub(crate) fn name_thread(thread: Option<ThreadId>, address: u32) {
 crate::exports::bridged!(set_data_breakpoint_entry, set_data_breakpoint_on_processor);
 
 extern "C" fn set_data_breakpoint_on_processor(value: u32) -> u32 {
-    KeSetSpecialPurposeRegister(SPR_DABR, value);
+    // SAFETY: writing DABR on this processor only arms a data breakpoint.
+    unsafe { KeSetSpecialPurposeRegister(SPR_DABR, u64::from(value)) };
     value
 }
 
@@ -1391,7 +1438,8 @@ fn is_excluded(address: u32) -> bool {
 }
 
 fn readable(address: u32) -> bool {
-    let mapped = kernel::MmDbgReadCheck(address);
+    // SAFETY: the kernel validates the address before it maps it.
+    let mapped = unsafe { xboxkrnl::MmDbgReadCheck(address) };
     mapped != 0 && !is_excluded(mapped)
 }
 
@@ -1500,7 +1548,8 @@ fn describe_module(name_string: u32, entry: u32) -> Option<ModuleEvent> {
     module.name_length = length;
     module.base = read_u32(entry);
     module.size = read_u32(entry + 0xc);
-    let header = RtlImageNtHeader(module.base);
+    // SAFETY: `module.base` is the image base from the loader's module entry.
+    let header = unsafe { RtlImageNtHeader(module.base) };
     if header != 0 {
         module.has_header = true;
         module.checksum = read_u32(header + 0x58).swap_bytes();
@@ -1511,7 +1560,8 @@ fn describe_module(name_string: u32, entry: u32) -> Option<ModuleEvent> {
             module.flags |= module_flags::DLL;
         }
         let mut size = 0u32;
-        module.pdata = RtlImageDirectoryEntryToData(module.base, 1, 3, &mut size);
+        // SAFETY: the image has the NT header found above; `size` is a live local.
+        module.pdata = unsafe { RtlImageDirectoryEntryToData(module.base, true, 3, &mut size) };
         module.pdata_size = size;
     }
     Some(module)
@@ -1523,7 +1573,9 @@ pub(crate) fn thread_information(id: ThreadId) -> Result<ThreadInfo, NoSuchThrea
     let reference = ThreadRef::lookup(id)?;
     let object = reference.0;
     let process = read_u32(object + thread::PROCESS);
-    let irql = kernel::KfAcquireSpinLock(process as usize as *mut u32);
+    // SAFETY: the referenced thread's process object starts with its thread
+    // list spin lock.
+    let irql = unsafe { xboxkrnl::KfAcquireSpinLock(process as usize as *mut KspinLock) };
     let record = record_of(object);
     let name = record
         .map(|record| read_u32(record + 8))
@@ -1551,21 +1603,24 @@ pub(crate) fn thread_information(id: ThreadId) -> Result<ThreadInfo, NoSuchThrea
         processor: read_u8(object + thread::PROCESSOR),
         last_error: read_u32(object + thread::LAST_ERROR),
     };
-    kernel::KfReleaseSpinLock(process as usize as *mut u32, irql);
+    // SAFETY: the lock was acquired above at `irql`.
+    unsafe { xboxkrnl::KfReleaseSpinLock(process as usize as *mut KspinLock, irql) };
     Ok(info)
 }
 
 /// `suspend` and stock export 48 (0x91f267e8).
 pub(crate) fn suspend(thread: ThreadId) -> Result<(), NoSuchThread> {
     let reference = ThreadRef::lookup(thread)?;
-    KeSuspendThread(reference.0);
+    // SAFETY: `reference` holds a reference to the thread object.
+    unsafe { KeSuspendThread(reference.0 as usize as *mut Kthread) };
     Ok(())
 }
 
 /// `resume` and stock export 35 (0x91f26838).
 pub(crate) fn resume(thread: ThreadId) -> Result<(), NoSuchThread> {
     let reference = ThreadRef::lookup(thread)?;
-    KeResumeThread(reference.0);
+    // SAFETY: `reference` holds a reference to the thread object.
+    unsafe { KeResumeThread(reference.0 as usize as *mut Kthread) };
     Ok(())
 }
 
@@ -1577,7 +1632,9 @@ pub(crate) fn read_thread_context(thread: ThreadId, out: &mut Context) -> Result
     let reference = ThreadRef::lookup(thread)?;
     let object = reference.0;
     let process = read_u32(object + thread::PROCESS);
-    let irql = kernel::KfAcquireSpinLock(process as usize as *mut u32);
+    // SAFETY: the referenced thread's process object starts with its thread
+    // list spin lock.
+    let irql = unsafe { xboxkrnl::KfAcquireSpinLock(process as usize as *mut KspinLock) };
     let requested = out.flags.intersection(ContextFlags::FULL);
     let result = if record_of(object).is_none() {
         Err(NoSuchThread)
@@ -1609,7 +1666,8 @@ pub(crate) fn read_thread_context(thread: ThreadId, out: &mut Context) -> Result
         out.flags = flags;
         Ok(())
     };
-    kernel::KfReleaseSpinLock(process as usize as *mut u32, irql);
+    // SAFETY: the lock was acquired above at `irql`.
+    unsafe { xboxkrnl::KfReleaseSpinLock(process as usize as *mut KspinLock, irql) };
     result
 }
 
@@ -1622,7 +1680,9 @@ pub(crate) fn write_thread_context(
     let reference = ThreadRef::lookup(thread)?;
     let object = reference.0;
     let process = read_u32(object + thread::PROCESS);
-    let irql = kernel::KfAcquireSpinLock(process as usize as *mut u32);
+    // SAFETY: the referenced thread's process object starts with its thread
+    // list spin lock.
+    let irql = unsafe { xboxkrnl::KfAcquireSpinLock(process as usize as *mut KspinLock) };
     let result = if record_of(object).is_none() {
         Err(StoppedThreadError::NoSuchThread)
     } else if let Some(address) = slot_context(object) {
@@ -1631,7 +1691,8 @@ pub(crate) fn write_thread_context(
     } else {
         Err(StoppedThreadError::NotStopped)
     };
-    kernel::KfReleaseSpinLock(process as usize as *mut u32, irql);
+    // SAFETY: the lock was acquired above at `irql`.
+    unsafe { xboxkrnl::KfReleaseSpinLock(process as usize as *mut KspinLock, irql) };
     result
 }
 
@@ -1639,8 +1700,11 @@ pub(crate) fn write_thread_context(
 /// (`crashdump`, stock export 83).
 pub(crate) fn dump_calling_thread(flags: u32) {
     let mut context = KernelContext([0; context::SIZE]);
-    RtlCaptureContext(context.0.as_mut_ptr());
-    DumpWriteDump(0, context.0.as_ptr() as usize as u32, flags);
+    // SAFETY: `context` is a live local of the full context size.
+    unsafe {
+        RtlCaptureContext(context.0.as_mut_ptr());
+        DumpWriteDump(0, context.0.as_ptr() as usize as u32, flags);
+    }
 }
 
 /// The groups in `flags` of the kernel context at `address`.
@@ -1701,7 +1765,9 @@ impl debugger::Backend for Console {
                 && read_u32(record + 4) == 0
             {
                 write_u32(record + 4, 1);
-                KeSuspendThread(thread_object);
+                // SAFETY: `for_each_thread` visits live thread objects under
+                // the process lock.
+                unsafe { KeSuspendThread(thread_object as usize as *mut Kthread) };
             }
         });
     }
@@ -1717,7 +1783,9 @@ impl debugger::Backend for Console {
                 && read_u32(record + 4) != 0
             {
                 write_u32(record + 4, 0);
-                KeResumeThread(thread_object);
+                // SAFETY: `for_each_thread` visits live thread objects under
+                // the process lock.
+                unsafe { KeResumeThread(thread_object as usize as *mut Kthread) };
             }
         });
     }
@@ -1729,7 +1797,8 @@ impl debugger::Backend for Console {
         if let Some(record) = record_of(reference.0)
             && read_u32(record + 4) == 0
         {
-            KeSuspendThread(reference.0);
+            // SAFETY: `reference` holds a reference to the thread object.
+            unsafe { KeSuspendThread(reference.0 as usize as *mut Kthread) };
             write_u32(record + 4, 1);
         }
     }
@@ -1772,37 +1841,48 @@ impl debugger::Backend for Console {
     }
 
     fn thread_exit_status(&mut self, handle: ThreadHandle) -> Result<ExitStatus, KernelError> {
-        let object_type = kernel::EX_THREAD_OBJECT_TYPE.load(Ordering::Relaxed);
+        let object_type = xboxkrnl::ExThreadObjectType.address();
         let mut object = 0u32;
-        NtStatus(kernel::ObReferenceObjectByHandle(
-            handle.0,
-            object_type,
-            &mut object,
-        ))
-        .result()?;
+        // SAFETY: `object` is a live local; the kernel validates the handle
+        // against the thread object type.
+        let status = unsafe {
+            xboxkrnl::ObReferenceObjectByHandle(
+                Handle::from_raw(handle.0),
+                object_type,
+                &mut object,
+            )
+        };
+        status.result()?;
         let code = if read_u32(object + 4) & 0xff == 0 {
             ExitStatus::STILL_ACTIVE
         } else {
             ExitStatus(read_u32(object + thread::EXIT_STATUS))
         };
-        kernel::ObDereferenceObject(object);
+        // SAFETY: releases the reference taken above.
+        unsafe { xboxkrnl::ObDereferenceObject(object) };
         Ok(code)
     }
 
     fn replace_code_word(&mut self, address: u32, value: u32) -> Option<u32> {
         let mut mapping = [0u32; 14];
-        let mapped = kernel::MmDbgWriteCheck(address, mapping.as_mut_ptr());
+        // SAFETY: `mapping` is a live local of the size the kernel fills.
+        let mapped = unsafe { xboxkrnl::MmDbgWriteCheck(address, mapping.as_mut_ptr()) };
         if mapped == 0 {
             return None;
         }
         if is_excluded(mapped) {
-            kernel::MmDbgReleaseAddress(mapped, mapping.as_mut_ptr());
+            // SAFETY: `mapped` and `mapping` come from `MmDbgWriteCheck` above.
+            unsafe { xboxkrnl::MmDbgReleaseAddress(mapped, mapping.as_mut_ptr()) };
             return None;
         }
         let previous = read_u32(mapped);
         write_u32(mapped, value);
-        kernel::KeSweepIcacheRange(mapped as usize as *mut u8, 4);
-        kernel::MmDbgReleaseAddress(mapped, mapping.as_mut_ptr());
+        // SAFETY: `mapped` is the writable word mapped above; `mapped` and
+        // `mapping` come from `MmDbgWriteCheck`.
+        unsafe {
+            xboxkrnl::KeSweepIcacheRange(mapped as usize as *mut u8, 4);
+            xboxkrnl::MmDbgReleaseAddress(mapped, mapping.as_mut_ptr());
+        }
         Some(previous)
     }
 
@@ -1821,10 +1901,14 @@ impl debugger::Backend for Console {
     }
 
     fn set_data_breakpoint_register(&mut self, value: u32) {
-        KeIpiGenericCall(
-            set_data_breakpoint_entry as *const () as usize as u32,
-            value,
-        );
+        // SAFETY: the routine is this module's IPI entry, which takes the
+        // register value as its argument.
+        unsafe {
+            KeIpiGenericCall(
+                set_data_breakpoint_entry as *const () as usize as u32,
+                value,
+            )
+        };
     }
 
     fn module_event(
@@ -1967,7 +2051,8 @@ impl debugger::Backend for Console {
         }
         slot.disposition.store(bits, Ordering::Relaxed);
         slot.state.store(SLOT_COMPLETED, Ordering::Release);
-        kernel::KeSetEvent(slot.event(), 1, 0);
+        // SAFETY: `reset_event` built the slot event before the slot was posted.
+        unsafe { xboxkrnl::KeSetEvent(slot.event().cast(), 1, false) };
     }
 
     fn publish_direct_policy(&mut self, policy: &DirectPolicy) {
@@ -1979,7 +2064,8 @@ impl debugger::Backend for Console {
         text: &mut [u8; NOTICE_TEXT_CAPACITY],
     ) -> Option<DirectNotification> {
         let lock = DIRECT_LOCK.as_ptr();
-        let irql = kernel::KfAcquireSpinLock(lock);
+        // SAFETY: `lock` is the static direct notification spin lock.
+        let irql = unsafe { xboxkrnl::KfAcquireSpinLock(lock.cast()) };
         let node = DIRECT_HEAD.load(Ordering::Relaxed);
         if node != 0 {
             let next = read_u32(node);
@@ -1988,7 +2074,8 @@ impl debugger::Backend for Console {
                 DIRECT_TAIL.store(0, Ordering::Relaxed);
             }
         }
-        kernel::KfReleaseSpinLock(lock, irql);
+        // SAFETY: the lock was acquired above at `irql`.
+        unsafe { xboxkrnl::KfReleaseSpinLock(lock.cast(), irql) };
         if node == 0 {
             return None;
         }
@@ -2001,12 +2088,14 @@ impl debugger::Backend for Console {
             *byte = read_u8(node + header + offset as u32);
         }
         notification.text_length = length;
-        kernel::ExFreePool(node);
+        // SAFETY: the node is a pool block `queue_direct` allocated and this
+        // call unlinked.
+        unsafe { xboxkrnl::ExFreePool(node) };
         Some(notification)
     }
 
     fn break_now(&mut self) -> Option<DebugEvent> {
-        kernel::sleep_milliseconds(250);
+        sleep(Duration::from_millis(250));
         BREAK_NOW_ARMED.store(true, Ordering::Release);
         // SAFETY: executes the breakpoint trap; the debug routine records it
         // and resumes after it.
@@ -2027,12 +2116,12 @@ impl debugger::Backend for Console {
     }
 
     fn crash_dump(&mut self) {
-        kernel::sleep_milliseconds(200);
+        sleep(Duration::from_millis(200));
         dump_calling_thread(0);
     }
 
     fn kernel_build(&mut self) -> u16 {
-        kernel::kernel_version()[2]
+        kernel_version().build
     }
 
     fn load_extension(&mut self, path: &[u8]) -> Result<ExtensionHandle, KernelError> {
@@ -2040,16 +2129,29 @@ impl debugger::Backend for Console {
         let length = path.len().min(name.len() - 1);
         name[..length].copy_from_slice(&path[..length]);
         let mut handle = 0u32;
-        NtStatus(kernel::XexLoadImage(name.as_ptr(), 0xc, 0, &mut handle)).result()?;
+        // SAFETY: `name` is NUL-terminated and `handle` is a live local.
+        let status = unsafe {
+            xboxkrnl::XexLoadImage(
+                name.as_ptr(),
+                ImageFlags::SYSTEM_DEBUGGER | ImageFlags::DLL,
+                ImageVersion::ANY,
+                &mut handle,
+            )
+        };
+        status.result()?;
         let export = |export_name: &core::ffi::CStr| {
             let mut address = 0u32;
             // Extensions export by name; the loader takes the name pointer
             // in place of an ordinal.
-            kernel::XexGetProcedureAddress(
-                handle,
-                export_name.as_ptr() as usize as u32,
-                &mut address,
-            );
+            // SAFETY: `handle` is the image loaded above, the name is
+            // NUL-terminated, and `address` is a live local.
+            unsafe {
+                xboxkrnl::XexGetProcedureAddress(
+                    handle,
+                    export_name.as_ptr() as usize as u32,
+                    &mut address,
+                )
+            };
             address
         };
         let on_load = export(c"OnLoad");
@@ -2067,7 +2169,7 @@ impl debugger::Backend for Console {
     fn unload_extension(&mut self, handle: ExtensionHandle) -> Result<(), KernelError> {
         EXTENSION_TELL_DEBUGGER.store(0, Ordering::Release);
         while EXTENSION_CALLS.load(Ordering::Acquire) != 0 {
-            kernel::sleep_milliseconds(1);
+            sleep(Duration::from_millis(1));
         }
         let prepare = EXTENSION_PREPARE_TO_UNLOAD.swap(0, Ordering::AcqRel);
         if prepare != 0 {
@@ -2075,6 +2177,7 @@ impl debugger::Backend for Console {
             // takes no arguments.
             unsafe { kernel::call_export(prepare, 0, 0, 0, 0) };
         }
-        NtStatus(XexUnloadImage(handle.0)).result()
+        // SAFETY: `handle` is the image `load_extension` loaded.
+        unsafe { XexUnloadImage(handle.0) }.result()
     }
 }

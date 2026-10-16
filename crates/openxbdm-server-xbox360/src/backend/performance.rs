@@ -36,26 +36,19 @@ use openxbdm_server::commands::performance::counters::Evaluation;
 use openxbdm_server::commands::performance::profiler::ProfilerError;
 use openxbdm_server::commands::performance::profiler::ProfilerFlags;
 use openxbdm_server::commands::performance::studio::StudioError;
+use xbox360::console::hardware_flags;
+use xbox360::module::Ordinal;
+use xbox360::module::SystemModule;
+use xbox360::module::module_handle;
+use xbox360::module::resolve_export;
+use xbox360::time::TickCount;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::VdGetCurrentDisplayInformation;
+use xbox360_sys::xboxkrnl::VdReadDVERegisterUlong;
+use xbox360_sys::xboxkrnl::VdWriteDVERegisterUlong;
 
 use super::Console;
 use crate::kernel;
-use crate::kernel::import_thunk;
-
-import_thunk!(
-    VdGetCurrentDisplayInformation(information: *mut u32) -> u32,
-    lib = kernel::LIB_KERNEL,
-    ordinal = 0x1ba
-);
-import_thunk!(
-    VdReadDVERegisterUlong(register: u32) -> u32,
-    lib = kernel::LIB_KERNEL,
-    ordinal = 0x1cb
-);
-import_thunk!(
-    VdWriteDVERegisterUlong(register: u32, value: u32) -> u32,
-    lib = kernel::LIB_KERNEL,
-    ordinal = 0x1e0
-);
 
 /// GPU register block.
 const GPU_REGISTERS: usize = 0x7fc8_0000;
@@ -72,7 +65,7 @@ const FLIP_WAIT_MS: u32 = 500;
 const ENCODER_ID_REGISTER: u32 = 0xfe;
 const ENCODER_EXTENDED_ID: u32 = 0x1_0000;
 /// Kernel export that reads an EDID block.
-const EDID_EXPORT: u32 = 623;
+const EDID_EXPORT: Ordinal = Ordinal::new(623).unwrap();
 /// SMC message that carries an I2C transfer.
 const SMC_I2C: u8 = 0x11;
 /// Extended registers whose writes are bracketed by bus requests.
@@ -106,13 +99,15 @@ pub(crate) fn initialize() {
             0,
         ]
     };
-    kernel::ExRegisterTitleTerminateNotification(TITLE_ENDED.0.get().cast(), 1);
+    // SAFETY: TITLE_ENDED is a static registration filled in above.
+    unsafe { xboxkrnl::ExRegisterTitleTerminateNotification(TITLE_ENDED.0.get().cast(), true) };
 }
 
 /// Stop every timer, DPC, thread, and hook that calls into this image;
 /// runs before the image unloads.
 pub(crate) fn shut_down() {
-    kernel::ExRegisterTitleTerminateNotification(TITLE_ENDED.0.get().cast(), 0);
+    // SAFETY: TITLE_ENDED is the static registration added by `initialize`.
+    unsafe { xboxkrnl::ExRegisterTitleTerminateNotification(TITLE_ENDED.0.get().cast(), false) };
     counters::shut_down();
     capture::shut_down();
     profiler::shut_down();
@@ -221,7 +216,9 @@ fn c_string<'a>(address: u32, limit: usize) -> &'a [u8] {
 impl Console {
     fn encoder_extended(&mut self) -> bool {
         *self.performance.encoder_extended.get_or_insert_with(|| {
-            VdReadDVERegisterUlong(ENCODER_ID_REGISTER) >= ENCODER_EXTENDED_ID
+            // SAFETY: reads a video encoder register; no memory is involved.
+            let id = unsafe { VdReadDVERegisterUlong(ENCODER_ID_REGISTER) };
+            id >= ENCODER_EXTENDED_ID
         })
     }
 }
@@ -232,7 +229,8 @@ fn send_i2c_request(flags: u8) {
     let mut reply = [0u8; 16];
     message[0] = SMC_I2C;
     message[1] = flags;
-    kernel::HalSendSMCMessage(message.as_ptr(), reply.as_mut_ptr());
+    // SAFETY: `message` and `reply` are live 16-byte SMC buffers.
+    unsafe { xboxkrnl::HalSendSMCMessage(message.as_ptr(), reply.as_mut_ptr()) };
 }
 
 impl performance::Backend for Console {
@@ -268,14 +266,15 @@ impl performance::Backend for Console {
 
     fn capture_display(&mut self) -> DisplayCapture {
         if read_register(GPU_FLIP_PENDING) & 0x8000_0000 != 0 {
-            let start = kernel::tick_count();
-            while kernel::tick_count().wrapping_sub(start) <= FLIP_WAIT_MS
+            let start = TickCount::now().milliseconds();
+            while TickCount::now().milliseconds().wrapping_sub(start) <= FLIP_WAIT_MS
                 && read_register(GPU_FLIP_PENDING) & 0x8000_0000 != 0
             {}
         }
         let front_buffer = read_register(DISPLAY_FRONT_BUFFER);
         let mut information = [0u32; 0x18];
-        VdGetCurrentDisplayInformation(information.as_mut_ptr());
+        // SAFETY: `information` is a live 0x60-byte display information block.
+        unsafe { VdGetCurrentDisplayInformation(information.as_mut_ptr()) };
         let gamma = (read_register(DISPLAY_GAMMA) >> 8) & 7 != 0;
         DisplayCapture {
             display: DisplayInformation {
@@ -294,22 +293,26 @@ impl performance::Backend for Console {
     }
 
     fn read_framebuffer_page(&mut self, address: u32, page: &mut [u8]) {
-        kernel::KeFlushCacheRange(address, TILE_SIZE);
+        // SAFETY: the page lies in the mapped front buffer.
+        unsafe { xboxkrnl::KeFlushCacheRange(address, TILE_SIZE) };
         // SAFETY: the page lies in the front buffer the display controller
         // scans out.
         let source = unsafe {
             core::slice::from_raw_parts(address as usize as *const u8, TILE_SIZE as usize)
         };
         page.copy_from_slice(source);
-        kernel::KeFlushCacheRange(address, TILE_SIZE);
+        // SAFETY: as above.
+        unsafe { xboxkrnl::KeFlushCacheRange(address, TILE_SIZE) };
     }
 
     fn read_video_encoder(&mut self, register: u32) -> u32 {
-        VdReadDVERegisterUlong(register)
+        // SAFETY: reads a video encoder register; no memory is involved.
+        unsafe { VdReadDVERegisterUlong(register) }
     }
 
     fn write_video_encoder(&mut self, register: u32, value: u32) {
-        VdWriteDVERegisterUlong(register, value);
+        // SAFETY: writes a video encoder register; no memory is involved.
+        unsafe { VdWriteDVERegisterUlong(register, value) };
     }
 
     fn video_encoder_extended(&mut self) -> bool {
@@ -327,14 +330,15 @@ impl performance::Backend for Console {
         message[6] = register as u8;
         message[7] = value;
         let bracketed = BRACKETED_REGISTERS.contains(&register);
-        let bus_requests = kernel::hardware_flags() & 0xf000_0000 != 0;
+        let bus_requests = hardware_flags().bits() & 0xf000_0000 != 0;
         if bracketed {
             message[1] |= 1;
             if bus_requests {
                 send_i2c_request(3);
             }
         }
-        kernel::HalSendSMCMessage(message.as_ptr(), reply.as_mut_ptr());
+        // SAFETY: `message` and `reply` are live 16-byte SMC buffers.
+        unsafe { xboxkrnl::HalSendSMCMessage(message.as_ptr(), reply.as_mut_ptr()) };
         if bracketed && bus_requests {
             send_i2c_request(5);
         }
@@ -358,15 +362,16 @@ impl performance::Backend for Console {
     }
 
     fn read_edid(&mut self, block: u8, output: &mut [u8; EDID_BLOCK_SIZE]) -> EdidRead {
-        let Ok(function) = kernel::module_handle(c"xboxkrnl.exe")
-            .and_then(|module| kernel::resolve_export(module, EDID_EXPORT))
+        let Ok(function) = SystemModule::Kernel
+            .handle()
+            .and_then(|module| resolve_export(module, EDID_EXPORT))
         else {
             return EdidRead::Unsupported;
         };
         // SAFETY: the export takes (block, 128-byte buffer).
         let read = unsafe {
             kernel::call_export(
-                function,
+                function.raw(),
                 u32::from(block),
                 output.as_mut_ptr() as usize as u32,
                 0,
@@ -496,7 +501,8 @@ impl performance::Backend for Console {
     }
 
     fn pix_boot_animation_loaded(&mut self) -> bool {
-        kernel::module_handle(c"bootanim.xex").is_ok()
+        // SAFETY: only the result is used, not the handle.
+        unsafe { module_handle(c"bootanim.xex") }.is_ok()
     }
 
     fn pix_capture_ready(&mut self) -> bool {

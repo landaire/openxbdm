@@ -7,10 +7,11 @@
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
+use xbox360::sync::SpinLock;
+
 use super::read_u32;
 use super::write_u32;
 use crate::kernel;
-use crate::kernel::SpinLocked;
 
 const SWAP_SLOTS: usize = 8;
 /// Debug monitor data word holding the address of the kernel's swap
@@ -19,7 +20,7 @@ const SWAP_SLOT_WORD: usize = 0x1c / 4;
 
 /// Read by the dispatcher without the lock, as stock does.
 static ROUTINES: [AtomicU32; SWAP_SLOTS] = [const { AtomicU32::new(0) }; SWAP_SLOTS];
-static CHAIN: SpinLocked<Chain> = SpinLocked::new(Chain {
+static CHAIN: SpinLock<Chain> = SpinLock::new(Chain {
     flags: [0; SWAP_SLOTS],
     installed: false,
     replaced: 0,
@@ -45,43 +46,41 @@ impl Chain {
 /// Add `routine(old_thread, frame, new_thread)` in the first free slot
 /// (nothing when all are taken) and install the dispatcher.
 pub(crate) fn register_swap_routine(routine: u32, flag: u32) {
-    CHAIN.with(|chain| {
-        if let Some(slot) = ROUTINES
-            .iter()
-            .position(|slot| slot.load(Ordering::Relaxed) == 0)
-        {
-            ROUTINES[slot].store(routine, Ordering::Release);
-            chain.flags[slot] = flag;
-        }
-        if !chain.installed {
-            chain.install();
-        }
-    });
+    let mut chain = CHAIN.lock();
+    if let Some(slot) = ROUTINES
+        .iter()
+        .position(|slot| slot.load(Ordering::Relaxed) == 0)
+    {
+        ROUTINES[slot].store(routine, Ordering::Release);
+        chain.flags[slot] = flag;
+    }
+    if !chain.installed {
+        chain.install();
+    }
 }
 
 /// Remove every slot holding `routine`; with no routine left the kernel's
 /// own swap routine is restored.
 pub(crate) fn unregister_swap_routine(routine: u32) {
-    CHAIN.with(|chain| {
-        let mut remaining = 0;
-        for (slot, flag) in ROUTINES.iter().zip(&mut chain.flags) {
-            match slot.load(Ordering::Relaxed) {
-                0 => {}
-                current if current == routine => {
-                    slot.store(0, Ordering::Release);
-                    *flag = 0;
-                }
-                _ => remaining += 1,
+    let mut chain = CHAIN.lock();
+    let mut remaining = 0;
+    for (slot, flag) in ROUTINES.iter().zip(&mut chain.flags) {
+        match slot.load(Ordering::Relaxed) {
+            0 => {}
+            current if current == routine => {
+                slot.store(0, Ordering::Release);
+                *flag = 0;
             }
+            _ => remaining += 1,
         }
-        if remaining == 0 && chain.installed {
-            write_u32(
-                kernel::debug_monitor_data().words[SWAP_SLOT_WORD],
-                chain.replaced,
-            );
-            chain.installed = false;
-        }
-    });
+    }
+    if remaining == 0 && chain.installed {
+        write_u32(
+            kernel::debug_monitor_data().words[SWAP_SLOT_WORD],
+            chain.replaced,
+        );
+        chain.installed = false;
+    }
 }
 
 /// Title termination part (stock 0x91f64128, from 0x91f566f0): remove the
@@ -90,24 +89,23 @@ pub(crate) fn unregister_swap_routine(routine: u32) {
 /// then (possibly the dispatcher itself); with none left it stays in the
 /// kernel slot with an empty chain.
 pub(crate) fn remove_unflagged_swap_routines() {
-    CHAIN.with(|chain| {
-        let mut remaining = 0;
-        for (slot, flag) in ROUTINES.iter().zip(&mut chain.flags) {
-            if slot.load(Ordering::Relaxed) == 0 {
-                continue;
-            }
-            if *flag != 0 {
-                remaining += 1;
-            } else {
-                slot.store(0, Ordering::Release);
-            }
+    let mut chain = CHAIN.lock();
+    let mut remaining = 0;
+    for (slot, flag) in ROUTINES.iter().zip(&mut chain.flags) {
+        if slot.load(Ordering::Relaxed) == 0 {
+            continue;
         }
-        if remaining > 0 {
-            chain.install();
+        if *flag != 0 {
+            remaining += 1;
         } else {
-            chain.installed = false;
+            slot.store(0, Ordering::Release);
         }
-    });
+    }
+    if remaining > 0 {
+        chain.install();
+    } else {
+        chain.installed = false;
+    }
 }
 
 /// Kernel swap routine. Like stock, it saves its return address below the

@@ -9,12 +9,13 @@ use openxbdm_server::Platform;
 use openxbdm_server::Server;
 use openxbdm_server::SocketId;
 use openxbdm_server::smb::SmbService;
+use xbox360_sys::xam::FdSet;
+use xbox360_sys::xam::Socket;
 
 use crate::backend::Console;
 use crate::kernel;
 use crate::net;
-use crate::net::FdSet;
-use crate::net::INVALID_SOCKET;
+use crate::net::FdSetExt as _;
 use crate::net::XamNetwork;
 
 const SMB_PORT: u16 = 445;
@@ -43,7 +44,7 @@ static LOCAL: LocalCell = LocalCell(UnsafeCell::new(Local {
     listen_at: None,
 }));
 /// The listener; unload closes it from another thread.
-static LISTENER: AtomicU32 = AtomicU32::new(INVALID_SOCKET);
+static LISTENER: AtomicU32 = AtomicU32::new(Socket::INVALID.raw());
 
 /// The service state.
 ///
@@ -89,8 +90,8 @@ fn listen(local: &mut Local, console: &mut Console) {
 
 /// Close the listener; safe on any thread.
 pub(crate) fn close_listener() {
-    let socket = LISTENER.swap(INVALID_SOCKET, Ordering::SeqCst);
-    if socket != INVALID_SOCKET {
+    let socket = LISTENER.swap(Socket::INVALID.raw(), Ordering::SeqCst);
+    if socket != Socket::INVALID.raw() {
         net::close(socket);
     }
 }
@@ -122,7 +123,8 @@ pub(crate) fn poll(server: &Server, console: &mut Console, network: &mut XamNetw
 /// Add the service's sockets to the select sets.
 #[inline(never)]
 pub(crate) fn select_sockets(read: &mut FdSet, write: &mut FdSet) -> Sockets {
-    let listener = Some(LISTENER.load(Ordering::SeqCst)).filter(|&socket| socket != INVALID_SOCKET);
+    let listener =
+        Some(LISTENER.load(Ordering::SeqCst)).filter(|&socket| socket != Socket::INVALID.raw());
     if let Some(listener) = listener {
         read.insert(listener);
     }

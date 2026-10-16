@@ -17,13 +17,14 @@ use openxbdm_server::commands::network::xhttpproxy::ProxyError;
 use openxbdm_server::commands::network::xhttpproxy::ProxyFlags;
 use openxbdm_server::commands::network::xhttpproxy::ProxyId;
 use openxbdm_server::commands::network::xhttpproxy::ProxyOutcome;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::PoolTag;
 
 use crate::backend::Console;
-use crate::kernel;
 use crate::kernel::CriticalSection;
 
 /// Pool tag of proxy entries (`HPXY`).
-const PROXY_TAG: u32 = 0x4850_5859;
+const PROXY_TAG: PoolTag = PoolTag::new(*b"HPXY");
 
 /// Entry header; name and certificate storage follow it.
 #[repr(C)]
@@ -125,7 +126,7 @@ impl Guard {
         unsafe {
             if (*entry).references == 0 && (*entry).consumers == 0 {
                 self.unlink(entry);
-                kernel::ExFreePool(entry as usize as u32);
+                xboxkrnl::ExFreePool(entry as usize as u32);
             }
         }
     }
@@ -165,7 +166,9 @@ impl xhttpproxy::Backend for Console {
         let size = certificate_size
             .wrapping_add(name_size)
             .wrapping_add(size_of::<Entry>() as u32);
-        let entry = kernel::ExAllocatePoolWithTag(size, PROXY_TAG) as usize as *mut Entry;
+        // SAFETY: pool allocation of the computed size; the result is checked below.
+        let entry =
+            unsafe { xboxkrnl::ExAllocatePoolWithTag(size, PROXY_TAG) } as usize as *mut Entry;
         if entry.is_null() {
             return ProxyOutcome {
                 cleared,
@@ -210,7 +213,7 @@ impl xhttpproxy::Backend for Console {
                         Some(count) if count == size as usize => Ok(Inserted::Applied),
                         _ => {
                             guard.unlink(entry);
-                            kernel::ExFreePool(entry as usize as u32);
+                            xboxkrnl::ExFreePool(entry as usize as u32);
                             Err(ProxyError::BadCertificate)
                         }
                     }
@@ -344,7 +347,7 @@ impl xhttpproxy::Backend for Console {
                 }
                 if (*entry).references == 0 {
                     guard.unlink(entry);
-                    kernel::ExFreePool(entry as usize as u32);
+                    xboxkrnl::ExFreePool(entry as usize as u32);
                 }
             }
         }

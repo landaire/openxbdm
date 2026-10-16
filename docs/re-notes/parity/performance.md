@@ -66,6 +66,9 @@ routine clears the frame pointers and the second one (0x91f32418) the
 title's directory handle. `querypc` raises the IRQL only around the
 history and copied-sample reads, as export 27 does. The sampler DPC and
 both title terminate routines enter through the export bridge.
+0x91f2b110 initializes the sampler timer with `KeInitializeTimerEx` and
+r5 = 2 (`li r5,2` before the call that initializes the timer at r28), the
+system process type; the console backend passes `ProcessType::SYSTEM`.
 
 Unload (no stock counterpart; stock never unloads): runs after the server
 thread has exited. The sampler timer is cancelled, its DPC dequeued, one

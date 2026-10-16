@@ -8,9 +8,18 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
+use core::time::Duration;
 
 use openxbdm_server::Server;
 use openxbdm_server::commands::debugger;
+use xbox360::console::hardware_flags;
+use xbox360::time::sleep;
+use xbox360_sys::processor;
+use xbox360_sys::processor::current_thread;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::Irql;
+use xbox360_sys::xboxkrnl::ProcessorMode;
+use xbox360_sys::xboxkrnl::WaitReason;
 
 use super::Console;
 use super::console;
@@ -22,7 +31,6 @@ use super::network;
 use super::session;
 use super::system;
 use crate::kernel;
-use crate::kernel::current_thread;
 use crate::net::XamNetwork;
 
 /// Settings must be written (stock signals the server thread to run
@@ -68,7 +76,7 @@ pub(crate) fn published_debugger() -> PublishedDebugger {
 }
 
 fn passive() -> bool {
-    kernel::current_irql() == 0
+    processor::current_irql() == Irql::PASSIVE
 }
 
 /// A service run on the server thread with the server's state. The result
@@ -251,7 +259,7 @@ fn call_on_server_counted(service: ServerService, argument: u32) -> Option<u32> 
             if waited_ms >= STARTUP_WAIT_MS {
                 return None;
             }
-            kernel::sleep_milliseconds(STARTUP_POLL_MS);
+            sleep(Duration::from_millis(u64::from(STARTUP_POLL_MS)));
             waited_ms += STARTUP_POLL_MS;
         }
     }
@@ -272,7 +280,7 @@ fn call_on_server_counted(service: ServerService, argument: u32) -> Option<u32> 
         }) {
             break request;
         }
-        kernel::sleep_milliseconds(1);
+        sleep(Duration::from_millis(1));
     };
     request.done.initialize();
     request
@@ -281,7 +289,16 @@ fn call_on_server_counted(service: ServerService, argument: u32) -> Option<u32> 
     request.argument.store(argument, Ordering::Relaxed);
     request.state.store(REQUEST_POSTED, Ordering::Release);
     while request.state.load(Ordering::Acquire) != REQUEST_COMPLETED {
-        kernel::KeWaitForSingleObject(request.done.pointer(), 0, 0, 0, &STOP_CHECK_INTERVAL);
+        // SAFETY: `done` was initialized above and lives in a static slot.
+        unsafe {
+            xboxkrnl::KeWaitForSingleObject(
+                request.done.pointer().cast(),
+                WaitReason::Executive,
+                ProcessorMode::Kernel,
+                false,
+                &STOP_CHECK_INTERVAL,
+            )
+        };
         let released = STOPPED.load(Ordering::Acquire);
         if released
             && request
@@ -311,7 +328,7 @@ pub(crate) fn stop_serving() {
 /// [`stop_serving`] before the image unloads.
 pub(crate) fn wait_for_callers() {
     while CALLERS.load(Ordering::Acquire) != 0 {
-        kernel::sleep_milliseconds(10);
+        sleep(Duration::from_millis(10));
     }
 }
 
@@ -399,7 +416,7 @@ extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: u32) ->
         0x18 => memory::service_get_module_proc_address(argument),
         0x19 => {
             let kd = KERNEL_DEBUGGER.load(Ordering::Relaxed)
-                && kernel::hardware_flags() & HARDWARE_KERNEL_DEBUGGER != 0;
+                && hardware_flags().bits() & HARDWARE_KERNEL_DEBUGGER != 0;
             u32::from(passive() || kd)
         }
         0x1c => session::service_register_pix_processor(argument),
@@ -445,7 +462,7 @@ extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: u32) ->
         0xa8 => session::service_rpc_drain(argument),
         0xa9 => session::service_send_notification(argument),
         0x63 => {
-            if kernel::hardware_flags() & debugger::HARDWARE_KD_LITE != 0 {
+            if hardware_flags().bits() & debugger::HARDWARE_KD_LITE != 0 {
                 KD_LITE_REFRESH.store(true, Ordering::Release);
             }
             0
@@ -490,7 +507,7 @@ pub(crate) fn drain(server: &mut Server, console: &mut Console, network: &mut Xa
         debugger::refresh_kd_lite(&mut server.state, console);
     }
     if BREAK_IN.swap(false, Ordering::AcqRel) {
-        kernel::set_hardware_flags(kernel::hardware_flags() | HARDWARE_KERNEL_DEBUGGER);
+        kernel::set_hardware_flags(hardware_flags().bits() | HARDWARE_KERNEL_DEBUGGER);
         debugger::break_in(&mut server.state, console, network);
     }
     // The server's timer pass writes dirty settings.
@@ -508,7 +525,7 @@ pub(crate) fn drain(server: &mut Server, console: &mut Console, network: &mut Xa
     let state = &server.state.debugger;
     let kd = state
         .kernel_debugger
-        .unwrap_or(kernel::hardware_flags() & debugger::HARDWARE_KD_ENABLED != 0);
+        .unwrap_or(hardware_flags().bits() & debugger::HARDWARE_KD_ENABLED != 0);
     KERNEL_DEBUGGER.store(kd, Ordering::Relaxed);
     DEBUGGER_ADDRESS.store(state.debugger.address, Ordering::Relaxed);
     DEBUGGER_PORT.store(state.debugger.port, Ordering::Relaxed);

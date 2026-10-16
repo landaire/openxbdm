@@ -4,6 +4,8 @@
 //! buffer data of those frames to a writer, by default the capture file
 //! writer (0x91f5ea90 with 0x91f5e9a8 and 0x91f5d1b8).
 
+use xbox360_sys::xboxkrnl;
+
 use super::S;
 use super::buffers;
 use super::rd;
@@ -518,9 +520,10 @@ fn thread_names(file: super::super::files::CaptureFile) {
     };
     for id in &ids[..count] {
         let mut thread = 0u32;
-        if (crate::backend::debugger::ObLookupAnyThreadByThreadId(id.0, &mut thread) as i32) >= 0
-            && !thread_name(file, thread)
-        {
+        // SAFETY: `thread` is a live word receiving the object address.
+        let status =
+            unsafe { xboxkrnl::ObLookupAnyThreadByThreadId(id.0, (&raw mut thread).cast()) };
+        if (status.0 as i32) >= 0 && !thread_name(file, thread) {
             return;
         }
     }

@@ -7,7 +7,6 @@ use std::io::Write;
 use common::RawSession;
 use common::TestServer;
 use openxbdm_core::status::ErrorCode;
-use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
 use openxbdm_server::commands::console::ConfigSetting;
 use openxbdm_server::commands::hardware::AvatarError;
@@ -352,9 +351,7 @@ fn avatar_runs_test_hooks() {
         failures.insert(8, AvatarError::Lookup(XamError::InvalidArgument));
         failures.insert(
             7,
-            AvatarError::Hook(
-                XamError::check(Hresult::from_error_code(ErrorCode::NotStopped)).unwrap_err(),
-            ),
+            AvatarError::Hook(XamError::check(ErrorCode::NotStopped.hresult()).unwrap_err()),
         );
     }
     assert_eq!(

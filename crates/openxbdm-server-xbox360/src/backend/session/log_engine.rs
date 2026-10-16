@@ -21,6 +21,7 @@
 use core::fmt::Write as _;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
+use core::time::Duration;
 
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
@@ -30,6 +31,22 @@ use openxbdm_server::commands::session::LogEngineError;
 use openxbdm_server::commands::session::TellLogConfig;
 use openxbdm_server::commands::session::TellLogCounters;
 use openxbdm_server::text::Text;
+use xbox360::status::last_error;
+use xbox360::status::set_last_error;
+use xbox360::time::sleep;
+use xbox360_sys::export_raw;
+use xbox360_sys::xam::CreateFileA;
+use xbox360_sys::xam::CreationDisposition;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::FileAttributes;
+use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::IoStatusBlock;
+use xbox360_sys::xboxkrnl::ProcessorMode;
+use xbox360_sys::xboxkrnl::ShareAccess;
+use xbox360_sys::xboxkrnl::ThreadCreationFlags;
+use xbox360_sys::xboxkrnl::WaitReason;
+use xbox360_sys::xboxkrnl::WaitType;
 
 use super::THREAD_ID;
 use super::THREAD_PROCESS_TYPE;
@@ -38,27 +55,9 @@ use super::TITLE_PROCESS;
 use super::current_thread;
 use super::read_u8;
 use crate::exports::export;
-use crate::exports::export_raw;
 use crate::kernel;
-use crate::kernel::IoStatusBlock;
-use crate::kernel::LIB_XAM;
-use crate::kernel::import_thunk;
 use crate::lockfree;
 use crate::lockfree::queue;
-
-import_thunk!(
-    CreateFileA(
-        name: u32,
-        access: u32,
-        share: u32,
-        security: u32,
-        disposition: u32,
-        flags: u32,
-        template: u32,
-    ) -> u32,
-    lib = LIB_XAM,
-    ordinal = 0x447
-);
 
 const ENTRY_SIZE: u32 = 0x00;
 const FILE: u32 = 0x04;
@@ -107,13 +106,6 @@ const WORKER_FAILED: u32 = u32::MAX;
 const QUIT_REQUESTED: u32 = 0x8007_0001;
 const STATUS_PENDING: u32 = 0x103;
 const STATUS_TIMEOUT: u32 = 0x102;
-const WAIT_ANY: u32 = 1;
-const WAIT_USER_REQUEST: u32 = 3;
-const KERNEL_MODE: u32 = 0;
-const USER_MODE: u32 = 1;
-const GENERIC_WRITE: u32 = 0x4000_0000;
-const CREATE_ALWAYS: u32 = 2;
-const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 
 fn load(address: u32) -> u32 {
     // SAFETY: see the module documentation.
@@ -208,7 +200,10 @@ impl Engine {
     }
 
     fn set_event(self, offset: u32) {
-        kernel::KeSetEvent(self.get(offset) as usize as *mut u32, 1, 0);
+        // SAFETY: the engine cell at `offset` holds an event `initialize_event` set up.
+        unsafe {
+            xboxkrnl::KeSetEvent(self.get(offset) as usize as *mut xboxkrnl::Kevent, 1, false)
+        };
     }
 
     fn worker_running(self) -> bool {
@@ -375,16 +370,20 @@ fn build(
         || u32::from(read_u8(current_thread() + THREAD_PROCESS_TYPE)) != TITLE_PROCESS;
     let flags =
         ((1 << processor) << 24) | WORKER_FLAGS | if system { THREAD_SYSTEM_PROCESS } else { 0 };
-    let status = kernel::ExCreateThread(
-        engine.pointer(WORKER),
-        WORKER_STACK,
-        engine.pointer(WORKER_ID),
-        0,
-        worker as *const () as usize as u32,
-        engine.0,
-        flags,
-    );
-    NtStatus(status).result().map_err(LogEngineError::Thread)
+    // SAFETY: the handle and id outputs are words of the engine object;
+    // `worker` takes the engine as its context.
+    let status = unsafe {
+        xboxkrnl::ExCreateThread(
+            engine.pointer(WORKER),
+            WORKER_STACK,
+            engine.pointer(WORKER_ID),
+            0,
+            worker as *const () as usize as u32,
+            engine.0,
+            ThreadCreationFlags::from_bits_retain(flags),
+        )
+    };
+    status.result().map_err(LogEngineError::Thread)
 }
 
 /// Seed a zeroed queue descriptor from the caller options, with the node
@@ -476,23 +475,28 @@ extern "C" fn wait_for_item_or_quit(
     };
     let objects = [semaphore, load(context)];
     let mut wait_blocks = [0u32; 16];
-    kernel::KeWaitForMultipleObjects(
-        2,
-        objects.as_ptr(),
-        WAIT_ANY,
-        WAIT_USER_REQUEST,
-        KERNEL_MODE,
-        alertable & 0xff,
-        pointer,
-        wait_blocks.as_mut_ptr(),
-    )
+    // SAFETY: both objects are dispatcher objects of the queue and engine;
+    // `interval` and `wait_blocks` outlive the wait.
+    unsafe {
+        xboxkrnl::KeWaitForMultipleObjects(
+            2,
+            objects.as_ptr().cast(),
+            WaitType::Any,
+            WaitReason::UserRequest,
+            ProcessorMode::Kernel,
+            alertable & 0xff != 0,
+            pointer,
+            wait_blocks.as_mut_ptr(),
+        )
+    }
+    .0
 }
 
 /// Worker thread (stock 0x91f78d48).
 extern "C" fn worker(engine: u32) -> u32 {
     let code = run(Engine(engine));
-    kernel::ExTerminateThread(code);
-    code
+    // SAFETY: the worker owns no resources once `run` returns.
+    unsafe { xboxkrnl::ExTerminateThread(code) }
 }
 
 fn run(engine: Engine) -> u32 {
@@ -504,17 +508,20 @@ fn run(engine: Engine) -> u32 {
         return WORKER_FAILED;
     }
     if engine.get(CALLBACK) == 0 {
-        let file = CreateFileA(
-            engine.field(NAME),
-            GENERIC_WRITE,
-            0,
-            0,
-            CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
-            0,
-        );
-        engine.set(FILE, file);
-        if file == NO_FILE {
+        // SAFETY: the engine's NAME field holds a NUL-terminated name.
+        let file = unsafe {
+            CreateFileA(
+                engine.field(NAME),
+                AccessMask::GENERIC_WRITE,
+                ShareAccess::empty(),
+                0,
+                CreationDisposition::CreateAlways,
+                FileAttributes::NORMAL,
+                Handle::NULL,
+            )
+        };
+        engine.set(FILE, file.raw());
+        if file == Handle::from_raw(NO_FILE) {
             engine.fail(WorkerError::NoFile);
             return WORKER_FAILED;
         }
@@ -590,7 +597,7 @@ fn deliver(engine: Engine, entry: u32) -> Result<(), WorkerError> {
     if write_file(engine.get(FILE), &bytes[..length]) {
         Ok(())
     } else {
-        Err(WorkerError::Write(kernel::last_error()))
+        Err(WorkerError::Write(last_error()))
     }
 }
 
@@ -617,24 +624,36 @@ fn write_summary(engine: Engine) {
 /// records the thread's last error.
 fn write_file(file: u32, bytes: &[u8]) -> bool {
     let mut io_status = IoStatusBlock::default();
-    let mut status = kernel::NtWriteFile(
-        file,
-        0,
-        0,
-        0,
-        &mut io_status,
-        bytes.as_ptr(),
-        bytes.len() as u32,
-        core::ptr::null(),
-    );
-    if status == STATUS_PENDING {
-        status = kernel::NtWaitForSingleObjectEx(file, USER_MODE, 0, core::ptr::null());
-        if (status as i32) >= 0 {
+    // SAFETY: `bytes` is valid for its length; `io_status` outlives the
+    // request, which is waited for below when pending.
+    let mut status = unsafe {
+        xboxkrnl::NtWriteFile(
+            Handle::from_raw(file),
+            Handle::NULL,
+            0,
+            0,
+            &mut io_status,
+            bytes.as_ptr(),
+            bytes.len() as u32,
+            core::ptr::null(),
+        )
+    };
+    if status.0 == STATUS_PENDING {
+        // SAFETY: `file` is the engine's open log file.
+        status = unsafe {
+            xboxkrnl::NtWaitForSingleObjectEx(
+                Handle::from_raw(file),
+                ProcessorMode::User,
+                false,
+                core::ptr::null(),
+            )
+        };
+        if (status.0 as i32) >= 0 {
             status = io_status.status;
         }
     }
-    if let Err(error) = NtStatus(status).result() {
-        kernel::set_last_error(error);
+    if let Err(error) = status.result() {
+        set_last_error(error);
         return false;
     }
     true
@@ -642,8 +661,9 @@ fn write_file(file: u32, bytes: &[u8]) -> bool {
 
 /// `CloseHandle` (stock 0x91f738f8).
 fn close_handle(handle: u32) {
-    if let Err(error) = NtStatus(kernel::NtClose(handle)).result() {
-        kernel::set_last_error(error);
+    // SAFETY: callers pass a handle the engine owns and close once.
+    if let Err(error) = unsafe { xboxkrnl::NtClose(Handle::from_raw(handle)) }.result() {
+        set_last_error(error);
     }
 }
 
@@ -676,7 +696,8 @@ fn destroy(engine: Engine) {
 
 fn release(engine: Engine, free_routine: u32, address: u32) {
     if free_routine == 0 {
-        lockfree::free(address);
+        // SAFETY: `address` is a pool block of the engine, released once.
+        unsafe { lockfree::free(address) };
     } else {
         call(free_routine, engine.get(FREE_CONTEXT), address, 0);
     }
@@ -707,8 +728,16 @@ pub(super) fn create_for_callback(
 /// callback failure never signals; this waits for the worker thread.
 pub(super) fn close_after_worker(engine: Engine) {
     engine.set_event(QUIT);
-    kernel::NtWaitForSingleObjectEx(engine.get(WORKER), KERNEL_MODE, 0, core::ptr::null());
-    kernel::sleep_milliseconds(1);
+    // SAFETY: WORKER holds the worker thread handle until `destroy`.
+    unsafe {
+        xboxkrnl::NtWaitForSingleObjectEx(
+            Handle::from_raw(engine.get(WORKER)),
+            ProcessorMode::Kernel,
+            false,
+            core::ptr::null(),
+        )
+    };
+    sleep(Duration::from_millis(1));
     destroy(engine);
 }
 
@@ -757,7 +786,10 @@ fn print(engine: Engine, format: u32, arguments: u32) {
         return;
     };
     let entry_size = engine.get(ENTRY_SIZE);
-    let length = kernel::_vsnprintf(entry as usize as *mut u8, entry_size, format, arguments);
+    // SAFETY: the free entry holds `entry_size` bytes; the format and
+    // va_list come from the export's caller.
+    let length =
+        unsafe { xboxkrnl::_vsnprintf(entry as usize as *mut u8, entry_size, format, arguments) };
     if length < 0 || length as u32 >= entry_size {
         store_byte(entry + entry_size - 1, 0);
     }
@@ -855,13 +887,22 @@ extern "C" fn close(engine: u32) {
         return;
     };
     engine.set_event(QUIT);
-    let done = engine.get(DONE) as usize as *mut u32;
-    if kernel::KeWaitForSingleObject(done, WAIT_USER_REQUEST, KERNEL_MODE, 0, core::ptr::null())
-        != 0
+    let done = engine.get(DONE) as usize as *mut xboxkrnl::DispatcherObject;
+    // SAFETY: DONE holds the engine's initialized notification event.
+    if unsafe {
+        xboxkrnl::KeWaitForSingleObject(
+            done,
+            WaitReason::UserRequest,
+            ProcessorMode::Kernel,
+            false,
+            core::ptr::null(),
+        )
+    }
+    .0 != 0
     {
         return;
     }
-    kernel::sleep_milliseconds(1);
+    sleep(Duration::from_millis(1));
     destroy(engine);
 }
 export!(360, close);

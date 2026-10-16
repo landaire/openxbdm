@@ -32,7 +32,7 @@ pub struct BadModulePath;
 /// Result of export 107: `0x82da000c`.
 impl From<BadModulePath> for Hresult {
     fn from(BadModulePath: BadModulePath) -> Self {
-        Hresult::from_error_code(ErrorCode::FilenameInvalid)
+        ErrorCode::FilenameInvalid.hresult()
     }
 }
 

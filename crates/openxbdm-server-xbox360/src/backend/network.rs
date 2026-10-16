@@ -29,21 +29,28 @@ use openxbdm_server::commands::network::XnAddr;
 use openxbdm_server::commands::network::Xnkid;
 use openxbdm_server::network::Ipv4Address;
 use openxbdm_server::server::MAX_CONNECTIONS;
+use xbox360::module::SystemModule;
+use xbox360_sys::xam;
+use xbox360_sys::xam::NetDll_XNetGetEthernetLinkStatus;
+use xbox360_sys::xam::NetDll_XNetSetOpt;
+use xbox360_sys::xam::NetDll_XnpConfig;
+use xbox360_sys::xam::NetDll_XnpGetActiveSocketList;
+use xbox360_sys::xam::NetDll_XnpGetConfigStatus;
+use xbox360_sys::xam::XnCaller;
+use xbox360_sys::xam::XnetOption;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::NicGetStats;
+use xbox360_sys::xboxkrnl::PoolTag;
 
 use super::Console;
 use crate::kernel;
-use crate::kernel::LIB_KERNEL;
-use crate::kernel::LIB_XAM;
-use crate::kernel::import_thunk;
 
 /// Caller identifier the monitor passes to XNet configuration functions.
-pub(crate) const XNCALLER_SYSAPP: u32 = 2;
+pub(crate) const XNCALLER_SYSAPP: XnCaller = XnCaller::SystemApp;
 /// Caller identifier the monitor passes to the table queries.
-const XNCALLER_XBDM: u32 = 3;
-/// `XNetSetOpt` option that forces Ethernet link state bits.
-const XNET_OPT_LINK_FLAGS: u32 = 0x1395;
-/// Pool tag of monitor allocations (`mdbx`).
-pub(crate) const POOL_TAG: u32 = 0x7862_646d;
+const XNCALLER_XBDM: XnCaller = XnCaller::DebugMonitor;
+/// Pool tag of monitor allocations.
+pub(crate) const POOL_TAG: PoolTag = PoolTag::new(*b"xbdm");
 /// QoS lookup query result for a too-small buffer (`WSAEMSGSIZE`).
 const WSAEMSGSIZE: u32 = 0x2747;
 /// Bytes of the adapter counter block: stock passes an 8-aligned 0x60-byte
@@ -52,38 +59,6 @@ const NIC_STATS_SIZE: usize = 0x60;
 
 #[repr(C, align(8))]
 struct NicStatsBlock([u8; NIC_STATS_SIZE]);
-
-import_thunk!(
-    pub(crate) NetDll_XNetSetOpt(caller: u32, option: u32, value: *const u8, length: u32) -> i32,
-    lib = LIB_XAM,
-    ordinal = 0x4f
-);
-import_thunk!(pub(crate) NetDll_XNetGetEthernetLinkStatus(caller: u32) -> u32, lib = LIB_XAM, ordinal = 0x4b);
-import_thunk!(
-    pub(crate) NetDll_XnpEthernetInterceptSetCallbacks(caller: u32, transmit: usize, receive: usize, context: usize, flags: u32) -> i32,
-    lib = LIB_XAM,
-    ordinal = 0x6d
-);
-import_thunk!(
-    NetDll_XnpGetActiveSocketList(caller: u32, buffer: *mut u8, count: *mut u32) -> u32,
-    lib = LIB_XAM,
-    ordinal = 0x7a
-);
-import_thunk!(
-    NicGetStats(device_flags: u32, stats: *mut u8) -> u32,
-    lib = LIB_KERNEL,
-    ordinal = 0x209
-);
-import_thunk!(
-    NetDll_XnpConfig(caller: u32, config: *const u8, flags: u32) -> i32,
-    lib = LIB_XAM,
-    ordinal = 0x68
-);
-import_thunk!(
-    NetDll_XnpGetConfigStatus(caller: u32, status: *mut u8) -> i32,
-    lib = LIB_XAM,
-    ordinal = 0x69
-);
 
 /// Static address configuration (stock 0x91faddbc use, 0x91faddb8 address,
 /// 0x91faddb4 subnet, 0x91faddb0 gateway). Debug-monitor control codes
@@ -141,7 +116,8 @@ pub(crate) fn service_apply_xnet_config(_argument: u32) -> u32 {
     let name = name.as_bytes();
     config[0x68..0x68 + name.len()].copy_from_slice(name);
     // The dispatcher case discards the result (0x91f3bb10).
-    NetDll_XnpConfig(XNCALLER_XBDM, config.as_ptr(), 0);
+    // SAFETY: `config` is a live CONFIG_SIZE-byte configuration block.
+    unsafe { NetDll_XnpConfig(XnCaller::DebugMonitor, config.as_ptr(), 0) };
     0
 }
 
@@ -185,7 +161,7 @@ fn config_status_dword(offset: usize) -> u32 {
     // SAFETY: as in stock, concurrent queries share the status buffer.
     unsafe {
         let status = &raw mut CONFIG_STATUS;
-        NetDll_XnpGetConfigStatus(XNCALLER_XBDM, status.cast());
+        NetDll_XnpGetConfigStatus(XnCaller::DebugMonitor, status.cast());
         dword(&*status, offset)
     }
 }
@@ -217,10 +193,11 @@ pub(crate) struct FrameHook {
 /// Address of a `xam.xex` export (stock 0x91f31010 handle and
 /// `XexGetProcedureAddress`; any success status counts).
 pub(crate) fn xam_procedure(ordinal: u32) -> Option<u32> {
-    let module = kernel::module_handle(c"xam.xex").ok()?;
+    let module = SystemModule::Xam.handle().ok()?;
     let mut address = 0u32;
-    ((kernel::XexGetProcedureAddress(module.raw(), ordinal, &mut address) as i32) >= 0)
-        .then_some(address)
+    // SAFETY: `module` is the loaded xam.xex handle and `address` is a live u32.
+    let status = unsafe { xboxkrnl::XexGetProcedureAddress(module.raw(), ordinal, &mut address) };
+    ((status.0 as i32) >= 0).then_some(address)
 }
 
 /// A pool allocation holding raw table records.
@@ -371,13 +348,16 @@ fn query(function: Option<u32>, buffer: u32, count: &mut u32) -> u32 {
         Some(function) => unsafe {
             kernel::call_export(
                 function,
-                XNCALLER_XBDM,
+                XNCALLER_XBDM.raw(),
                 buffer,
                 count as *mut u32 as usize as u32,
                 0,
             )
         },
-        None => NetDll_XnpGetActiveSocketList(XNCALLER_XBDM, buffer as usize as *mut u8, count),
+        // SAFETY: `buffer` holds `count` socket records; `count` is a live u32.
+        None => unsafe {
+            NetDll_XnpGetActiveSocketList(XNCALLER_XBDM, buffer as usize as *mut u8, count)
+        },
     }
 }
 
@@ -401,13 +381,16 @@ fn take_snapshot(table: Table) -> Result<Snapshot, TableError> {
             count.wrapping_add(1)
         }
     };
-    let buffer =
-        kernel::ExAllocatePoolWithTag(count.wrapping_mul(Snapshot::record_size(table)), POOL_TAG);
+    // SAFETY: pool allocation of a computed size; the result is checked below.
+    let buffer = unsafe {
+        xboxkrnl::ExAllocatePoolWithTag(count.wrapping_mul(Snapshot::record_size(table)), POOL_TAG)
+    };
     if buffer == 0 {
         return Err(TableError::OutOfMemory);
     }
     if query(function, buffer, &mut count) != 0 {
-        kernel::ExFreePool(buffer);
+        // SAFETY: `buffer` was allocated above and is not used afterwards.
+        unsafe { xboxkrnl::ExFreePool(buffer) };
         return Err(TableError::Unavailable);
     }
     Ok(Snapshot {
@@ -439,14 +422,15 @@ impl Data {
             .get_mut(usize::from(connection.0))
             .and_then(Option::take)
         {
-            kernel::ExFreePool(snapshot.buffer);
+            // SAFETY: the snapshot owned its pool buffer and was taken out of its slot.
+            unsafe { xboxkrnl::ExFreePool(snapshot.buffer) };
         }
     }
 }
 
 /// Ethernet link state (`XNetGetEthernetLinkStatus`); any thread.
 pub(crate) fn link_status() -> LinkStatus {
-    LinkStatus(NetDll_XNetGetEthernetLinkStatus(XNCALLER_SYSAPP))
+    LinkStatus(NetDll_XNetGetEthernetLinkStatus(XNCALLER_SYSAPP).bits())
 }
 
 /// Force link state bits through `XNetSetOpt`; any thread.
@@ -454,18 +438,21 @@ pub(crate) fn set_link_flags(flags: LinkFlags) -> Result<(), WsaError> {
     let mut value = [0u8; 8];
     value[..4].copy_from_slice(&flags.and.to_be_bytes());
     value[4..].copy_from_slice(&flags.or.to_be_bytes());
-    let error = NetDll_XNetSetOpt(
-        XNCALLER_SYSAPP,
-        XNET_OPT_LINK_FLAGS,
-        value.as_ptr(),
-        value.len() as u32,
-    );
+    // SAFETY: `value` is a live 8-byte option buffer of the stated length.
+    let error = unsafe {
+        NetDll_XNetSetOpt(
+            XNCALLER_SYSAPP,
+            XnetOption::LINK_FLAGS,
+            value.as_ptr(),
+            value.len() as u32,
+        )
+    };
     WsaError::new(error).map_or(Ok(()), Err)
 }
 
 impl network::Backend for Console {
     fn system_version(&mut self) -> SystemVersion {
-        SystemVersion(kernel::XamGetSystemVersion())
+        SystemVersion(xam::XamGetSystemVersion())
     }
 
     fn open_table(&mut self, connection: ConnectionIndex, table: Table) -> Result<u32, TableError> {
@@ -477,7 +464,8 @@ impl network::Backend for Console {
                 Ok(snapshot.count)
             }
             None => {
-                kernel::ExFreePool(snapshot.buffer);
+                // SAFETY: the snapshot owns its pool buffer and was not stored.
+                unsafe { xboxkrnl::ExFreePool(snapshot.buffer) };
                 Err(TableError::OutOfMemory)
             }
         }
@@ -508,7 +496,8 @@ impl network::Backend for Console {
     /// zeros where stock reports stale stack contents.
     fn nic_stats(&mut self, device_flags: u32) -> NicStats {
         let mut block = NicStatsBlock([0; NIC_STATS_SIZE]);
-        NicGetStats(device_flags, block.0.as_mut_ptr());
+        // SAFETY: `block` is a live NIC_STATS_SIZE-byte buffer.
+        unsafe { NicGetStats(device_flags, block.0.as_mut_ptr()) };
         let raw = &block.0;
         let qword = |offset: usize| u64::from_be_bytes(array(raw, offset));
         NicStats {

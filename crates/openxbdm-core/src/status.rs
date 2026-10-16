@@ -1,5 +1,11 @@
 //! Status codes, monitor result codes, and their default reply text.
 
+pub use xbox360_sys::status::Hresult;
+pub use xbox360_sys::status::KernelError;
+pub use xbox360_sys::status::NtStatus;
+pub use xbox360_sys::status::UnlistedStatus;
+pub use xbox360_sys::status::Win32Error;
+
 /// A three-digit XBDM status code appearing at the head of every response.
 ///
 /// The raw value is preserved verbatim so unknown-but-valid codes can be
@@ -221,215 +227,62 @@ impl core::fmt::Display for ErrorCode {
 /// Facility code of monitor results.
 const FACILITY_XBDM: u32 = 0x02da_0000;
 
-/// A kernel status code as the kernel ABI and wire formats carry it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct NtStatus(pub u32);
+/// Facility 0x2da success with status `200 + code`.
+pub const fn xbdm_success(code: u16) -> Hresult {
+    Hresult(FACILITY_XBDM | code as u32)
+}
 
-impl NtStatus {
-    pub const SUCCESS: Self = Self(0);
+/// Facility 0x2da failure with status `400 + code`.
+pub const fn xbdm_error(code: u16) -> Hresult {
+    Hresult(0x8000_0000 | FACILITY_XBDM | code as u32)
+}
 
-    pub const fn is_success(self) -> bool {
-        (self.0 as i32) >= 0
-    }
-
-    /// `Ok` for a success or informational status, the failure otherwise.
-    pub const fn result(self) -> Result<(), KernelError> {
-        if self.is_success() {
-            Ok(())
-        } else {
-            Err(KernelError::from_status(self))
-        }
+impl ErrorCode {
+    /// The failure result for this status.
+    pub const fn hresult(self) -> Hresult {
+        xbdm_error(self.raw() - 400)
     }
 }
 
-/// Generates [`KernelError`] with one variant per listed status.
-macro_rules! kernel_errors {
-    ($($(#[$meta:meta])* $name:ident = $value:literal,)*) => {
-        /// A failed kernel call. A status without a variant keeps its value
-        /// for exact passthrough.
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-        pub enum KernelError {
-            $($(#[$meta])* $name,)*
-            Unlisted(UnlistedStatus),
-        }
-
-        impl KernelError {
-            /// The error for a failure status.
-            pub const fn from_status(status: NtStatus) -> Self {
-                match status.0 {
-                    $($value => Self::$name,)*
-                    _ => Self::Unlisted(UnlistedStatus(status)),
-                }
-            }
-
-            pub const fn status(self) -> NtStatus {
-                match self {
-                    $(Self::$name => NtStatus($value),)*
-                    Self::Unlisted(UnlistedStatus(status)) => status,
-                }
-            }
-        }
-    };
-}
-
-kernel_errors! {
-    BufferOverflow = 0x8000_0005,
-    NoMoreFiles = 0x8000_0006,
-    NoMoreEntries = 0x8000_001a,
-    Unsuccessful = 0xc000_0001,
-    NotImplemented = 0xc000_0002,
-    InvalidHandle = 0xc000_0008,
-    InvalidParameter = 0xc000_000d,
-    NoSuchDevice = 0xc000_000e,
-    NoSuchFile = 0xc000_000f,
-    EndOfFile = 0xc000_0011,
-    NoMediaInDevice = 0xc000_0013,
-    NoMemory = 0xc000_0017,
-    AccessDenied = 0xc000_0022,
-    BufferTooSmall = 0xc000_0023,
-    ObjectNameInvalid = 0xc000_0033,
-    ObjectNameNotFound = 0xc000_0034,
-    ObjectNameCollision = 0xc000_0035,
-    ObjectPathInvalid = 0xc000_0039,
-    ObjectPathNotFound = 0xc000_003a,
-    CrcError = 0xc000_003f,
-    SectionTooBig = 0xc000_0040,
-    DiskFull = 0xc000_007f,
-    InsufficientResources = 0xc000_009a,
-    DeviceNotConnected = 0xc000_009d,
-    FileIsADirectory = 0xc000_00ba,
-    NotSameDevice = 0xc000_00d4,
-    DirectoryNotEmpty = 0xc000_0101,
-    NotADirectory = 0xc000_0103,
-    CannotDelete = 0xc000_0121,
-    OrdinalNotFound = 0xc000_0138,
-    UnrecognizedVolume = 0xc000_014f,
-    MappedAlignment = 0xc000_0220,
-    EntryPointNotFound = 0xc000_0263,
-}
-
-/// A failure status without a [`KernelError`] variant. Only
-/// [`KernelError::from_status`] creates it, so equal errors have equal
-/// variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct UnlistedStatus(NtStatus);
-
-impl From<NtStatus> for KernelError {
-    fn from(status: NtStatus) -> Self {
-        Self::from_status(status)
-    }
-}
-
-impl From<KernelError> for NtStatus {
-    fn from(error: KernelError) -> Self {
-        error.status()
-    }
-}
-
-impl core::fmt::Display for KernelError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "kernel status {:#010x}", self.status().0)
-    }
-}
-
-impl core::error::Error for KernelError {}
-
-/// A Win32 error code, as the kernel's status translation and last-error
-/// value report it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Win32Error(core::num::NonZeroU32);
-
-impl Win32Error {
-    /// `None` for `ERROR_SUCCESS`.
-    pub const fn new(code: u32) -> Option<Self> {
-        match core::num::NonZeroU32::new(code) {
-            Some(code) => Some(Self(code)),
-            None => None,
-        }
-    }
-
-    pub const fn code(self) -> u32 {
-        self.0.get()
-    }
-}
-
-impl core::fmt::Display for Win32Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "win32 error {}", self.code())
-    }
-}
-
-impl core::error::Error for Win32Error {}
-
-/// A kernel status as a result: the status with the NT facility bit set.
-impl From<KernelError> for Hresult {
-    fn from(error: KernelError) -> Self {
-        Self(error.status().0 | 0x1000_0000)
-    }
-}
-
-/// A Win32 error as a result: positive codes move to the Win32 facility,
-/// others pass unchanged.
-impl From<Win32Error> for Hresult {
-    fn from(error: Win32Error) -> Self {
-        let code = error.code();
-        if (code as i32) <= 0 {
-            Self(code)
-        } else {
-            Self(0x8007_0000 | (code & 0xffff))
-        }
-    }
-}
-
-/// A result value as the wire and the title ABI carry it: facility 0x2da
-/// results carry the status code in the low word; other values are
-/// generic success or failure codes. Code away from those boundaries uses
-/// typed results that convert into this one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Hresult(pub u32);
-
-impl Hresult {
+/// The monitor's results and reply text on [`Hresult`]: facility 0x2da
+/// results carry the status code in the low word; other values are generic
+/// success or failure codes.
+pub trait XbdmHresult: Sized {
     /// The handler sent its own reply or closed the connection.
-    pub const NO_REPLY: Self = Self(0);
-    pub const OK: Self = Self::success(0);
-    pub const CONNECTED: Self = Self::success(1);
-    pub const MULTILINE: Self = Self::success(2);
-    pub const BINARY: Self = Self::success(3);
-    pub const SEND_BINARY: Self = Self::success(4);
-    pub const DEDICATED: Self = Self::success(5);
-    pub const FAST_PIPE: Self = Self::success(9);
+    const NO_REPLY: Self;
+    const OK: Self;
+    const CONNECTED: Self;
+    const MULTILINE: Self;
+    const BINARY: Self;
+    const SEND_BINARY: Self;
+    const DEDICATED: Self;
+    const FAST_PIPE: Self;
     /// End of a transfer or of a list.
-    pub const END_OF_DATA: Self = Self::error(0x104);
-    pub const FAIL: Self = Self(0x8000_4005);
-    pub const UNEXPECTED: Self = Self(0x8000_ffff);
-    pub const OUT_OF_MEMORY: Self = Self(0x8007_000e);
-    pub const INVALID_ARGUMENT: Self = Self(0x8007_0057);
-
-    /// Facility 0x2da success with status `200 + code`.
-    pub const fn success(code: u16) -> Self {
-        Self(FACILITY_XBDM | code as u32)
-    }
-
-    /// Facility 0x2da failure with status `400 + code`.
-    pub const fn error(code: u16) -> Self {
-        Self(0x8000_0000 | FACILITY_XBDM | code as u32)
-    }
-
-    /// The failure result for an error status.
-    pub const fn from_error_code(code: ErrorCode) -> Self {
-        Self::error(code.raw() - 400)
-    }
-
-    pub const fn is_failure(self) -> bool {
-        self.0 & 0x8000_0000 != 0
-    }
+    const END_OF_DATA: Self;
 
     /// The three status digits of the monitor's line builder: the first
     /// from the sign, the others `'0' + low / 10` and `'0' + low % 10` of
     /// a monitor result's low word. A low word above 0xff becomes failure
     /// 0 and another facility counts as low word 0. Low words 100..=255
     /// yield non-digit characters, as in the builder.
-    pub const fn status_digits(self) -> [u8; 3] {
+    fn status_digits(self) -> [u8; 3];
+
+    /// Text sent when the handler supplies none.
+    fn default_message(self) -> &'static str;
+}
+
+impl XbdmHresult for Hresult {
+    const NO_REPLY: Self = Self(0);
+    const OK: Self = xbdm_success(0);
+    const CONNECTED: Self = xbdm_success(1);
+    const MULTILINE: Self = xbdm_success(2);
+    const BINARY: Self = xbdm_success(3);
+    const SEND_BINARY: Self = xbdm_success(4);
+    const DEDICATED: Self = xbdm_success(5);
+    const FAST_PIPE: Self = xbdm_success(9);
+    const END_OF_DATA: Self = xbdm_error(0x104);
+
+    fn status_digits(self) -> [u8; 3] {
         let monitor = self.0 & 0x7fff_0000 == FACILITY_XBDM;
         let (failure, low) = if monitor && self.0 & 0xffff > 0xff {
             (true, 0)
@@ -445,8 +298,7 @@ impl Hresult {
         ]
     }
 
-    /// Text sent when the handler supplies none.
-    pub const fn default_message(self) -> &'static str {
+    fn default_message(self) -> &'static str {
         match self.0 {
             0x02da_0000 => "OK",
             0x02da_0002 => "multiline response follows",
@@ -474,30 +326,27 @@ mod tests {
     fn status_follows_the_line_builder() {
         assert_eq!(&Hresult::OK.status_digits(), b"200");
         assert_eq!(&Hresult::MULTILINE.status_digits(), b"202");
-        assert_eq!(
-            &Hresult::from_error_code(ErrorCode::AccessDenied).status_digits(),
-            b"414"
-        );
+        assert_eq!(&ErrorCode::AccessDenied.hresult().status_digits(), b"414");
         assert_eq!(&Hresult::END_OF_DATA.status_digits(), b"400");
         assert_eq!(&Hresult::FAIL.status_digits(), b"400");
         assert_eq!(&Hresult(0x0000_0001).status_digits(), b"200");
         assert_eq!(&Hresult(0x02da_0100).status_digits(), b"400");
-        assert_eq!(&Hresult::success(0x64).status_digits(), b"2:0");
-        assert_eq!(&Hresult::success(0xc8).status_digits(), b"2D0");
-        assert_eq!(&Hresult::error(0x96).status_digits(), b"4?0");
+        assert_eq!(&xbdm_success(0x64).status_digits(), b"2:0");
+        assert_eq!(&xbdm_success(0xc8).status_digits(), b"2D0");
+        assert_eq!(&xbdm_error(0x96).status_digits(), b"4?0");
     }
 
     #[test]
     fn default_messages_match_the_result_table() {
         assert_eq!(
-            Hresult::from_error_code(ErrorCode::FileMustBeCopied).default_message(),
+            ErrorCode::FileMustBeCopied.hresult().default_message(),
             "file must be copied"
         );
         assert_eq!(
-            Hresult::from_error_code(ErrorCode::LineTooLong).default_message(),
+            ErrorCode::LineTooLong.hresult().default_message(),
             "line too long"
         );
-        assert_eq!(Hresult::error(0x13).default_message(), "");
+        assert_eq!(xbdm_error(0x13).default_message(), "");
         assert_eq!(Hresult::INVALID_ARGUMENT.default_message(), "bad parameter");
         assert_eq!(Hresult::FAIL.default_message(), "");
         assert_eq!(Hresult::END_OF_DATA.default_message(), "");

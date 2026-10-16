@@ -9,15 +9,32 @@
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
+use xbox360::module::ExportAddress;
+use xbox360::module::Ordinal;
+use xbox360::module::SystemModule;
+use xbox360::module::resolve_export;
+use xbox360_sys::processor;
+use xbox360_sys::xam;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::FileAttributes;
+use xbox360_sys::xboxkrnl::FsInformationClass;
+use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::IoStatusBlock;
+use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
+use xbox360_sys::xboxkrnl::ObjectAttributes;
+use xbox360_sys::xboxkrnl::PoolTag;
+use xbox360_sys::xboxkrnl::PoolType;
+use xbox360_sys::xboxkrnl::ShareAccess;
+
 use super::events;
 use crate::kernel;
-use crate::kernel::AnsiString;
-use crate::kernel::IoStatusBlock;
-use crate::kernel::ObjectAttributes;
 
 /// Block size and pool tag `PSTR`.
 pub(super) const BLOCK_SIZE: u32 = 0x1_2380;
-pub(super) const BLOCK_TAG: u32 = 0x5053_5452;
+pub(super) const BLOCK_TAG: PoolTag = PoolTag::new(*b"PSTR");
 /// XAM feature that enables PIX streaming.
 const STREAMING_FEATURE: u32 = 0x22;
 
@@ -66,6 +83,11 @@ const STATUS_WORD_10: u32 = 0x2b4;
 /// Kernel export 0x2d4 used by the engine.
 pub(super) const KERNEL_ROUTINE: u32 = 0x1_2294;
 
+/// XAM export of the capture size routine.
+const CAPTURE_SIZE_EXPORT: Ordinal = Ordinal::new(0x1f0).unwrap();
+/// Kernel export of the engine's kernel routine.
+const KERNEL_ROUTINE_EXPORT: Ordinal = Ordinal::new(0x2d4).unwrap();
+
 /// Status words: version and field count, then the engine's values.
 const STATUS_VERSION: u32 = 0x5308;
 const MIN_STATUS_FLAGS: u32 = 3;
@@ -112,20 +134,21 @@ pub(super) fn session() -> Option<Session> {
 /// outside 0x2029dc00..=0x202af700 and older than 0x202ff100 have every
 /// feature; others ask XAM export 0x200.
 pub(super) fn xam_feature_enabled(feature: u32) -> bool {
-    const FEATURE_QUERY: u32 = 0x200;
+    const FEATURE_QUERY: Ordinal = Ordinal::new(0x200).unwrap();
     static QUERY: AtomicU32 = AtomicU32::new(0);
-    let version = kernel::XamGetSystemVersion();
+    let version = xam::XamGetSystemVersion();
     if !(0x2029_dc00..0x202a_f701).contains(&version) && version < 0x202f_f100 {
         return true;
     }
     let mut query = QUERY.load(Ordering::Acquire);
     if query == 0 {
-        let Ok(address) = kernel::module_handle(c"xam.xex")
-            .and_then(|xam| kernel::resolve_export(xam, FEATURE_QUERY))
+        let Ok(address) = SystemModule::Xam
+            .handle()
+            .and_then(|xam| resolve_export(xam, FEATURE_QUERY))
         else {
             return true;
         };
-        query = address;
+        query = address.raw();
         QUERY.store(query, Ordering::Release);
     }
     // SAFETY: XAM export 0x200 takes one argument, a feature number.
@@ -135,7 +158,7 @@ pub(super) fn xam_feature_enabled(feature: u32) -> bool {
 /// Capture buffer size the title's D3D version calls for (stock
 /// 0x91f5c4e0); `pixcmd q` reports it.
 pub(super) fn capture_buffer_size() -> u32 {
-    let version = (kernel::XamGetSystemVersion() & 0x1fff_ff00) >> 8;
+    let version = (xam::XamGetSystemVersion() & 0x1fff_ff00) >> 8;
     // Stock queries the feature for these versions although every version
     // from 0x211f gets the same size.
     if version >= 0x2f7d {
@@ -154,7 +177,6 @@ pub(super) fn capture_buffer_size() -> u32 {
 
 const PIX_STREAM: &[u8] = b"\\Device\\Harddisk0\\PixStream";
 const PIX_DUMP: &[u8] = b"\\Device\\Harddisk0\\PixDump";
-const FILE_FS_SIZE_INFORMATION: u32 = 3;
 /// Dump partitions are used in 128 KiB units.
 const DUMP_UNIT: i64 = 0x2_0000;
 /// Device flag set on the dump partition device.
@@ -166,15 +188,20 @@ pub(super) fn create() -> bool {
     if !xam_feature_enabled(STREAMING_FEATURE) {
         return false;
     }
-    let block = kernel::ExAllocatePoolTypeWithTag(BLOCK_SIZE, BLOCK_TAG, 2);
+    // SAFETY: allocates from the system pool; no pointer arguments.
+    let block =
+        unsafe { xboxkrnl::ExAllocatePoolTypeWithTag(BLOCK_SIZE, BLOCK_TAG, PoolType::System) };
     if block == 0 {
         return false;
     }
     let session = Session(block);
     // SAFETY: a fresh pool block of `BLOCK_SIZE` bytes.
     unsafe { core::ptr::write_bytes(block as usize as *mut u8, 0, BLOCK_SIZE as usize) };
-    kernel::RtlInitializeCriticalSectionAndSpinCount(session.at(LOCK), 10);
-    kernel::RtlInitializeCriticalSectionAndSpinCount(session.at(ENGINE_LOCK), 10);
+    // SAFETY: both sections lie in the fresh, zeroed block.
+    unsafe {
+        xboxkrnl::RtlInitializeCriticalSectionAndSpinCount(session.at(LOCK).cast(), 10);
+        xboxkrnl::RtlInitializeCriticalSectionAndSpinCount(session.at(ENGINE_LOCK).cast(), 10);
+    }
     let mut path = PIX_STREAM;
     let mut device = 0u32;
     let mut status = reference_device(path, &mut device);
@@ -183,26 +210,34 @@ pub(super) fn create() -> bool {
         status = reference_device(path, &mut device);
     }
     if (status as i32) >= 0 {
-        let irql = kernel::IoAcquireDeviceObjectLock();
-        super::write_u32(
-            device + 0x14,
-            super::read_u32(device + 0x14) | DEVICE_FLAG_DUMP,
-        );
-        kernel::IoReleaseDeviceObjectLock(irql);
-        kernel::ObDereferenceObject(device);
+        // SAFETY: `device` is the device object referenced above; the lock
+        // is released before the reference is dropped.
+        unsafe {
+            let irql = xboxkrnl::IoAcquireDeviceObjectLock();
+            super::write_u32(
+                device + 0x14,
+                super::read_u32(device + 0x14) | DEVICE_FLAG_DUMP,
+            );
+            xboxkrnl::IoReleaseDeviceObjectLock(irql);
+            xboxkrnl::ObDereferenceObject(device);
+        }
     }
     let mut handle = 0u32;
     if open_device(path, &mut handle) {
         session.set_word(DUMP_FILE, handle);
         let mut io_status = IoStatusBlock::default();
         let mut size = [0u8; 0x18];
-        kernel::NtQueryVolumeInformationFile(
-            handle,
-            &mut io_status,
-            size.as_mut_ptr(),
-            0x18,
-            FILE_FS_SIZE_INFORMATION,
-        );
+        // SAFETY: `handle` is the open partition; the output buffer is
+        // 0x18 bytes, as passed.
+        unsafe {
+            xboxkrnl::NtQueryVolumeInformationFile(
+                Handle::from_raw(handle),
+                &mut io_status,
+                size.as_mut_ptr(),
+                0x18,
+                FsInformationClass::Size,
+            )
+        };
         let units = u64::from_be_bytes(size[..8].try_into().unwrap_or_default());
         let sector = u32::from_be_bytes(size[0x14..0x18].try_into().unwrap_or_default());
         let bytes = units.wrapping_mul(u64::from(sector)) as i64;
@@ -225,14 +260,16 @@ pub(super) fn create() -> bool {
         unsafe { core::ptr::write_volatile((block + 0x68c + index * 8) as usize as *mut u8, 0xcc) };
     }
     if capture_buffer_size() != 0 {
-        let routine = kernel::module_handle(c"xam.xex")
-            .and_then(|xam| kernel::resolve_export(xam, 0x1f0))
-            .unwrap_or(0);
+        let routine = SystemModule::Xam
+            .handle()
+            .and_then(|xam| resolve_export(xam, CAPTURE_SIZE_EXPORT))
+            .map_or(0, ExportAddress::raw);
         session.set_word(CAPTURE_SIZE_ROUTINE, routine);
     }
-    let routine = kernel::module_handle(c"xboxkrnl.exe")
-        .and_then(|kernel| kernel::resolve_export(kernel, 0x2d4))
-        .unwrap_or(0);
+    let routine = SystemModule::Kernel
+        .handle()
+        .and_then(|kernel| resolve_export(kernel, KERNEL_ROUTINE_EXPORT))
+        .map_or(0, ExportAddress::raw);
     session.set_word(KERNEL_ROUTINE, routine);
     session.set_word(REVISION, if routine != 0 { 0x5d } else { 0x55 });
     reset_budget(session);
@@ -251,35 +288,43 @@ pub(super) fn reset_budget(session: Session) {
 }
 
 fn reference_device(path: &[u8], device: &mut u32) -> u32 {
-    kernel::ObReferenceObjectByName(
-        &AnsiString::new(path),
-        0x40,
-        kernel::IO_DEVICE_OBJECT_TYPE.load(Ordering::Relaxed),
-        0,
-        device,
-    )
+    // SAFETY: the name string and `device` are live for the call.
+    unsafe {
+        xboxkrnl::ObReferenceObjectByName(
+            &kernel::ansi_string(path),
+            ObjectAttributeFlags::CASE_INSENSITIVE,
+            xboxkrnl::IoDeviceObjectType.address(),
+            0,
+            device,
+        )
+    }
+    .0
 }
 
 /// Open the partition device `path` for capture writes.
 fn open_device(path: &[u8], handle: &mut u32) -> bool {
-    let name = AnsiString::new(path);
+    let name = kernel::ansi_string(path);
     let attributes = ObjectAttributes {
-        root_directory: 0,
+        root_directory: Handle::NULL,
         object_name: &name,
-        attributes: kernel::OBJ_CASE_INSENSITIVE,
+        attributes: ObjectAttributeFlags::CASE_INSENSITIVE,
     };
     let mut io_status = IoStatusBlock::default();
-    (kernel::NtCreateFile(
-        handle,
-        0xc010_0000,
-        &attributes,
-        &mut io_status,
-        core::ptr::null(),
-        4,
-        3,
-        1,
-        8,
-    ) as i32)
+    // SAFETY: all pointers refer to live locals or the caller's `handle`.
+    (unsafe {
+        xboxkrnl::NtCreateFile(
+            (handle as *mut u32).cast(),
+            AccessMask::GENERIC_READ | AccessMask::GENERIC_WRITE | AccessMask::SYNCHRONIZE,
+            &attributes,
+            &mut io_status,
+            core::ptr::null(),
+            FileAttributes::SYSTEM,
+            ShareAccess::READ | ShareAccess::WRITE,
+            CreateDisposition::Open,
+            CreateOptions::NO_INTERMEDIATE_BUFFERING,
+        )
+    }
+    .0 as i32)
         >= 0
 }
 
@@ -308,39 +353,50 @@ fn thread_byte(thread: u32, offset: u32) -> u32 {
 /// Raise the caller's base priority unless it is already high, then
 /// enter `section` (stock 0x91f5c2b0); returns the increment to restore.
 pub(super) fn enter(section: *mut u32) -> u32 {
-    let thread = kernel::current_thread();
-    kernel::KeEnterCriticalRegion();
+    let thread = processor::current_thread();
+    let object = thread as usize as *mut xboxkrnl::Kthread;
+    // SAFETY: `thread` is the current thread object; `section` is an
+    // initialized critical section of the session block.
+    unsafe { xboxkrnl::KeEnterCriticalRegion() };
     let saved = if thread_byte(thread, THREAD_PRIORITY) < 0x12
         && thread_byte(thread, THREAD_BASE_PRIORITY) < 0x11
         && thread_byte(thread, THREAD_SATURATION) == 0
     {
-        kernel::KeSetBasePriorityThread(thread, LOCK_INCREMENT)
+        // SAFETY: as above.
+        unsafe { xboxkrnl::KeSetBasePriorityThread(object, LOCK_INCREMENT) }
     } else {
         PRIORITY_UNCHANGED
     };
-    kernel::RtlEnterCriticalSection(section);
+    // SAFETY: as above.
+    unsafe { xboxkrnl::RtlEnterCriticalSection(section.cast()) };
     saved
 }
 
 /// Leave `section` and restore the priority from [`enter`] (stock
 /// 0x91f5c350); a priority changed meanwhile is put back.
 pub(super) fn leave(section: *mut u32, saved: u32) {
-    let thread = kernel::current_thread();
-    kernel::RtlLeaveCriticalSection(section);
+    let thread = processor::current_thread();
+    let object = thread as usize as *mut xboxkrnl::Kthread;
+    // SAFETY: `section` is the session critical section [`enter`] took;
+    // `thread` is the current thread object.
+    unsafe { xboxkrnl::RtlLeaveCriticalSection(section.cast()) };
     if saved != PRIORITY_UNCHANGED {
         let expected = (thread_byte(thread, THREAD_BASE) + LOCK_INCREMENT)
             .min(thread_byte(thread, THREAD_LIMIT));
         if thread_byte(thread, THREAD_BASE_PRIORITY) == expected
             && thread_byte(thread, THREAD_PRIORITY_BOOST) == 0
         {
-            let previous = kernel::KeSetBasePriorityThread(thread, saved);
+            // SAFETY: as above.
+            let previous = unsafe { xboxkrnl::KeSetBasePriorityThread(object, saved) };
             if previous != expected - thread_byte(thread, THREAD_BASE) {
                 kernel::debug_print(c"WRN[PIX]: Undoing thread base priority restore.\n");
-                kernel::KeSetBasePriorityThread(thread, previous);
+                // SAFETY: as above.
+                unsafe { xboxkrnl::KeSetBasePriorityThread(object, previous) };
             }
         }
     }
-    kernel::KeLeaveCriticalRegion();
+    // SAFETY: pairs with the `KeEnterCriticalRegion` of [`enter`].
+    unsafe { xboxkrnl::KeLeaveCriticalRegion() };
 }
 
 /// The locked session (stock 0x91f5a7f0); unlocks on drop (0x91f5c350).
@@ -441,7 +497,7 @@ pub(super) fn status(version: u32, flags: u32) -> Option<[u32; 12]> {
         session.word(FRAME_RECORD + 4),
         session.word(FRAME_RECORD + 0xc),
         session.word(FRAME_RECORD + 8),
-        (kernel::XamGetSystemVersion() & 0x1fff_ff00) >> 8,
+        (xam::XamGetSystemVersion() & 0x1fff_ff00) >> 8,
         capture_buffer_size(),
         (dump / 0x10_0000) as u32,
         session.word(FLAGS) >> 31,

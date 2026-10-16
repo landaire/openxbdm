@@ -14,31 +14,36 @@ use openxbdm_server::commands::network::netcap::capture_file;
 use openxbdm_server::commands::network::netcap::capture_file::CaptureFileError;
 use openxbdm_server::commands::network::netcap::capture_file::CaptureIo;
 use openxbdm_server::commands::network::netcap::capture_file::Recorder;
+use xbox360::sync::SpinLock;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::FileAttributes;
+use xbox360_sys::xboxkrnl::FileInformationClass;
+use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::IoStatusBlock;
+use xbox360_sys::xboxkrnl::Kevent;
+use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
+use xbox360_sys::xboxkrnl::ObjectAttributes;
+use xbox360_sys::xboxkrnl::PoolTag;
+use xbox360_sys::xboxkrnl::PoolType;
+use xbox360_sys::xboxkrnl::ProcessType;
+use xbox360_sys::xboxkrnl::ProcessorMode;
+use xbox360_sys::xboxkrnl::ShareAccess;
+use xbox360_sys::xboxkrnl::ThreadCreationFlags;
+use xbox360_sys::xboxkrnl::WaitReason;
 
 use crate::kernel;
-use crate::kernel::AnsiString;
-use crate::kernel::IoStatusBlock;
-use crate::kernel::ObjectAttributes;
-use crate::kernel::SpinLocked;
 
-const GENERIC_READ_WRITE: u32 = 0xc000_0000;
-const FILE_SHARE_READ: u32 = 1;
-/// The capture file must not exist yet (mode bit 1).
-const FILE_CREATE: u32 = 2;
-const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
+const GENERIC_READ_WRITE: AccessMask = AccessMask::GENERIC_WRITE.union(AccessMask::GENERIC_READ);
 /// Root directory handle for names that do not start with a backslash.
 const RELATIVE_ROOT: u32 = 0xffff_fffd;
-const FILE_END_OF_FILE_INFORMATION: u32 = 0x14;
-const FILE_ALLOCATION_INFORMATION: u32 = 0x13;
 /// Writer thread creation flags for mode bit 2, which `netcap` sets; the
 /// 0x80 bit returns a referenced thread object instead of a handle.
 const THREAD_FLAGS: u32 = 0x0400_04a4;
-/// Added when the caller is not in the system process type.
+/// Added when the caller is not in the title process type.
 const THREAD_FLAG_FOREIGN_PROCESS: u32 = 0x2;
-const SYSTEM_PROCESS_TYPE: u32 = 1;
-const EXECUTIVE: u32 = 3;
-const KERNEL_MODE: u32 = 0;
-const WAIT_KERNEL_MODE: u32 = 1;
 /// Writer thread exit status when it is asked to stop
 /// (`HRESULT_FROM_WIN32(ERROR_CANCELLED)`).
 const WRITER_STOPPED: Hresult = Hresult(0x8007_04c7);
@@ -78,12 +83,34 @@ impl FileIo {
         length: u32,
     ) -> Result<(), CaptureFileError> {
         let mut io = IoStatusBlock::default();
-        let status = if write {
-            kernel::NtWriteFile(self.0, 0, 0, 0, &mut io, buffer, length, &offset)
-        } else {
-            kernel::NtReadFile(self.0, 0, 0, 0, &mut io, buffer, length, &offset)
+        // SAFETY: `self.0` is the open capture file; `io`, `offset` and the
+        // `length` bytes at `buffer` are live for the synchronous call.
+        let status = unsafe {
+            if write {
+                xboxkrnl::NtWriteFile(
+                    Handle::from_raw(self.0),
+                    Handle::NULL,
+                    0,
+                    0,
+                    &mut io,
+                    buffer,
+                    length,
+                    &offset,
+                )
+            } else {
+                xboxkrnl::NtReadFile(
+                    Handle::from_raw(self.0),
+                    Handle::NULL,
+                    0,
+                    0,
+                    &mut io,
+                    buffer,
+                    length,
+                    &offset,
+                )
+            }
         };
-        NtStatus(status).result()?;
+        status.result()?;
         if io.information != length {
             Err(CaptureFileError::BadLength)
         } else {
@@ -102,11 +129,23 @@ impl CaptureIo for FileIo {
     }
 
     fn truncate(&mut self, length: u64) -> Result<(), CaptureFileError> {
-        for class in [FILE_END_OF_FILE_INFORMATION, FILE_ALLOCATION_INFORMATION] {
+        for class in [
+            FileInformationClass::EndOfFile,
+            FileInformationClass::Allocation,
+        ] {
             let mut io = IoStatusBlock::default();
-            let status =
-                kernel::NtSetInformationFile(self.0, &mut io, (&raw const length).cast(), 8, class);
-            NtStatus(status).result()?;
+            // SAFETY: `self.0` is the open capture file; `io` and the 8-byte
+            // `length` are live.
+            let status = unsafe {
+                xboxkrnl::NtSetInformationFile(
+                    Handle::from_raw(self.0),
+                    &mut io,
+                    (&raw const length).cast(),
+                    8,
+                    class,
+                )
+            };
+            status.result()?;
         }
         Ok(())
     }
@@ -136,7 +175,7 @@ struct Progress {
 
 pub(super) struct Writer {
     config: UnsafeCell<Config>,
-    progress: SpinLocked<Progress>,
+    progress: SpinLock<Progress>,
     /// Synchronization event that wakes the writer thread.
     event: UnsafeCell<[u32; 4]>,
     /// Referenced writer thread object; 0 once asked to stop.
@@ -152,7 +191,7 @@ impl Writer {
                 size: 0,
                 chunk: 0,
             }),
-            progress: SpinLocked::new(Progress {
+            progress: SpinLock::new(Progress {
                 fill: 0,
                 position: 0,
                 record_end: None,
@@ -169,7 +208,7 @@ impl Writer {
         unsafe { &*self.config.get() }
     }
 
-    fn event(&self) -> *mut u32 {
+    fn event(&self) -> *mut Kevent {
         self.event.get().cast()
     }
 
@@ -181,33 +220,37 @@ impl Writer {
         path: &[u8],
         sizes: BufferSizes,
         header: &[u8; capture_file::HEADER_SIZE],
-        pool: u32,
-        tag: u32,
+        pool: PoolType,
+        tag: PoolTag,
     ) -> Result<(), CaptureFileError> {
-        let name = AnsiString::new(path);
+        let name = kernel::ansi_string(path);
         let attributes = ObjectAttributes {
             root_directory: if path.first() == Some(&b'\\') {
-                0
+                Handle::NULL
             } else {
-                RELATIVE_ROOT
+                Handle::from_raw(RELATIVE_ROOT)
             },
             object_name: &name,
-            attributes: kernel::OBJ_CASE_INSENSITIVE,
+            attributes: ObjectAttributeFlags::CASE_INSENSITIVE,
         };
         let mut handle = 0u32;
         let mut io = IoStatusBlock::default();
-        let status = kernel::NtCreateFile(
-            &mut handle,
-            GENERIC_READ_WRITE,
-            &attributes,
-            &mut io,
-            core::ptr::null(),
-            0,
-            FILE_SHARE_READ,
-            FILE_CREATE,
-            FILE_SYNCHRONOUS_IO_NONALERT,
-        );
-        NtStatus(status).result()?;
+        // SAFETY: `handle`, `attributes`, the name it refers to, and `io`
+        // are live for the call.
+        let status = unsafe {
+            xboxkrnl::NtCreateFile(
+                (&raw mut handle).cast(),
+                GENERIC_READ_WRITE,
+                &attributes,
+                &mut io,
+                core::ptr::null(),
+                FileAttributes::empty(),
+                ShareAccess::READ,
+                CreateDisposition::Create,
+                CreateOptions::SYNCHRONOUS_IO_NONALERT,
+            )
+        };
+        status.result()?;
         let result = self.prepare(handle, sizes, header, pool, tag);
         if result.is_err() {
             self.release();
@@ -220,23 +263,22 @@ impl Writer {
         handle: u32,
         sizes: BufferSizes,
         header: &[u8; capture_file::HEADER_SIZE],
-        pool: u32,
-        tag: u32,
+        pool: PoolType,
+        tag: PoolTag,
     ) -> Result<(), CaptureFileError> {
         // SAFETY: no other user exists during `open`.
         let config = unsafe { &mut *self.config.get() };
         config.handle = handle;
         FileIo(handle).write_at(0, header)?;
         let end = capture_file::HEADER_SIZE as u64;
-        self.progress.with(|progress| {
-            *progress = Progress {
-                fill: 0,
-                position: end,
-                record_end: Some(end),
-                flushed_record_end: end,
-            };
-        });
-        let buffer = kernel::ExAllocatePoolTypeWithTag(sizes.buffer, tag, pool);
+        *self.progress.lock() = Progress {
+            fill: 0,
+            position: end,
+            record_end: Some(end),
+            flushed_record_end: end,
+        };
+        // SAFETY: pool allocation of the requested size; the result is checked below.
+        let buffer = unsafe { xboxkrnl::ExAllocatePoolTypeWithTag(sizes.buffer, tag, pool) };
         if buffer == 0 {
             return Err(CaptureFileError::OutOfMemory);
         }
@@ -244,26 +286,30 @@ impl Writer {
         config.size = sizes.buffer;
         config.chunk = sizes.chunk;
 
-        let list = self.event().wrapping_add(2) as usize as u32;
+        let list = self.event.get().cast::<u32>().wrapping_add(2) as usize as u32;
         // SAFETY: as above. Synchronization event, not signaled, empty wait
         // list.
         unsafe { *self.event.get() = [0x0100_0000, 0, list, list] };
         let mut flags = THREAD_FLAGS;
-        if kernel::KeGetCurrentProcessType() != SYSTEM_PROCESS_TYPE {
+        if xboxkrnl::KeGetCurrentProcessType() != ProcessType::TITLE {
             flags |= THREAD_FLAG_FOREIGN_PROCESS;
         }
         let mut object = 0u32;
         let mut thread_id = 0u32;
-        let status = kernel::ExCreateThread(
-            &mut object,
-            0,
-            &mut thread_id,
-            0,
-            writer_thread as *const () as usize as u32,
-            self as *const Self as usize as u32,
-            flags,
-        );
-        NtStatus(status).result()?;
+        // SAFETY: `object` and `thread_id` are live; the thread receives this
+        // writer, which `release` keeps alive until the thread has exited.
+        let status = unsafe {
+            xboxkrnl::ExCreateThread(
+                &mut object,
+                0,
+                &mut thread_id,
+                0,
+                writer_thread as *const () as usize as u32,
+                self as *const Self as usize as u32,
+                ThreadCreationFlags::from_bits_retain(flags),
+            )
+        };
+        status.result()?;
         self.thread.store(object, Ordering::Release);
         Ok(())
     }
@@ -272,35 +318,40 @@ impl Writer {
     /// the frame callbacks, so a full buffer cannot be waited for.
     pub(super) fn put(&self, data: &[u8], completes_record: bool) -> Result<(), CaptureFileError> {
         let config = self.config();
-        let outcome = self.progress.with(|progress| {
-            progress.record_end?;
-            let count = data.len().min((config.size - progress.fill) as usize);
-            // SAFETY: `fill + count` stays within the buffer of `size` bytes.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    data.as_ptr(),
-                    config.buffer.add(progress.fill as usize),
-                    count,
-                );
+        let outcome = {
+            let mut progress = self.progress.lock();
+            if progress.record_end.is_some() {
+                let count = data.len().min((config.size - progress.fill) as usize);
+                // SAFETY: `fill + count` stays within the buffer of `size` bytes.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        config.buffer.add(progress.fill as usize),
+                        count,
+                    );
+                }
+                progress.fill += count as u32;
+                progress.position += count as u64;
+                let complete = count == data.len();
+                if complete && completes_record {
+                    progress.record_end = Some(progress.position);
+                }
+                Some((complete, progress.fill >= config.chunk))
+            } else {
+                None
             }
-            progress.fill += count as u32;
-            progress.position += count as u64;
-            let complete = count == data.len();
-            if complete && completes_record {
-                progress.record_end = Some(progress.position);
-            }
-            Some((complete, progress.fill >= config.chunk))
-        });
+        };
         let Some((complete, wake)) = outcome else {
             return Err(CaptureFileError::WriteFault);
         };
         if wake {
-            kernel::KeSetEvent(self.event(), 1, 0);
+            // SAFETY: the event was initialized by `prepare` and lives in the writer.
+            unsafe { xboxkrnl::KeSetEvent(self.event(), 1, false) };
         }
         if complete {
             return Ok(());
         }
-        self.progress.with(|progress| progress.record_end = None);
+        self.progress.lock().record_end = None;
         Err(CaptureFileError::WriteFault)
     }
 
@@ -309,13 +360,14 @@ impl Writer {
     fn drain(&self) -> Result<(), CaptureFileError> {
         let config = self.config();
         loop {
-            let (fill, offset, committed) = self.progress.with(|progress| {
+            let (fill, offset, committed) = {
+                let progress = self.progress.lock();
                 (
                     progress.fill,
                     progress.position - u64::from(progress.fill),
                     progress.record_end,
                 )
-            });
+            };
             if fill == 0 {
                 return Ok(());
             }
@@ -324,39 +376,42 @@ impl Writer {
             // thread moves them; producers append after them.
             let bytes = unsafe { core::slice::from_raw_parts(config.buffer, count as usize) };
             FileIo(config.handle).write_at(offset, bytes)?;
-            self.progress.with(|progress| {
-                if let Some(end) = committed {
-                    progress.flushed_record_end = end;
-                }
-                // SAFETY: the bytes after `count` up to `fill` are buffered.
-                unsafe {
-                    core::ptr::copy(
-                        config.buffer.add(count as usize),
-                        config.buffer,
-                        (progress.fill - count) as usize,
-                    );
-                }
-                progress.fill -= count;
-            });
+            let mut progress = self.progress.lock();
+            if let Some(end) = committed {
+                progress.flushed_record_end = end;
+            }
+            // SAFETY: the bytes after `count` up to `fill` are buffered.
+            unsafe {
+                core::ptr::copy(
+                    config.buffer.add(count as usize),
+                    config.buffer,
+                    (progress.fill - count) as usize,
+                );
+            }
+            progress.fill -= count;
         }
     }
 
     /// Writer thread loop (0x91f6b2a0).
     fn run(&self) -> WriterExit {
         loop {
-            let status = kernel::KeWaitForSingleObject(
-                self.event(),
-                EXECUTIVE,
-                KERNEL_MODE,
-                0,
-                core::ptr::null(),
-            );
-            if let Err(error) = NtStatus(status).result() {
+            // SAFETY: the event was initialized by `prepare` and lives in the writer.
+            let status = unsafe {
+                xboxkrnl::KeWaitForSingleObject(
+                    self.event().cast(),
+                    WaitReason::UserRequest,
+                    ProcessorMode::Kernel,
+                    false,
+                    core::ptr::null(),
+                )
+            };
+            if let Err(error) = status.result() {
                 return WriterExit::Wait(error);
             }
-            let (running, fill) = self
-                .progress
-                .with(|progress| (self.thread.load(Ordering::Acquire) != 0, progress.fill));
+            let (running, fill) = {
+                let progress = self.progress.lock();
+                (self.thread.load(Ordering::Acquire) != 0, progress.fill)
+            };
             if !running {
                 return WriterExit::Stopped;
             }
@@ -370,21 +425,26 @@ impl Writer {
 
     /// Stop the writer thread and wait for it to exit (0x91f6a460).
     fn stop_thread(&self) {
-        let object = self
-            .progress
-            .with(|_| self.thread.swap(0, Ordering::AcqRel));
+        let object = {
+            let _guard = self.progress.lock();
+            self.thread.swap(0, Ordering::AcqRel)
+        };
         if object == 0 {
             return;
         }
-        kernel::KeSetEvent(self.event(), 1, 1);
-        kernel::KeWaitForSingleObject(
-            object as usize as *mut u32,
-            EXECUTIVE,
-            WAIT_KERNEL_MODE,
-            0,
-            core::ptr::null(),
-        );
-        kernel::ObDereferenceObject(object);
+        // SAFETY: the event was initialized by `prepare`; `object` is the
+        // referenced writer thread, released once here.
+        unsafe {
+            xboxkrnl::KeSetEvent(self.event(), 1, true);
+            xboxkrnl::KeWaitForSingleObject(
+                object as usize as *mut _,
+                WaitReason::UserRequest,
+                ProcessorMode::User,
+                false,
+                core::ptr::null(),
+            );
+            xboxkrnl::ObDereferenceObject(object);
+        }
     }
 
     /// Stop the thread, write the buffer, and finish the file (0x91f69d18).
@@ -393,10 +453,13 @@ impl Writer {
     pub(super) fn finish(&self, recorder: &mut Recorder) -> Result<(), CaptureFileError> {
         self.stop_thread();
         self.drain()?;
-        let end = self.progress.with(|progress| match progress.record_end {
-            None if recorder.frames() > 0 => progress.flushed_record_end,
-            _ => progress.position,
-        });
+        let end = {
+            let progress = self.progress.lock();
+            match progress.record_end {
+                None if recorder.frames() > 0 => progress.flushed_record_end,
+                _ => progress.position,
+            }
+        };
         recorder.finish(&mut FileIo(self.config().handle), end)
     }
 
@@ -406,11 +469,13 @@ impl Writer {
         // SAFETY: the thread has exited and no callback is attached.
         let config = unsafe { &mut *self.config.get() };
         if !config.buffer.is_null() {
-            kernel::ExFreePool(config.buffer as usize as u32);
+            // SAFETY: the buffer was allocated by `prepare` and the thread has exited.
+            unsafe { xboxkrnl::ExFreePool(config.buffer as usize as u32) };
             config.buffer = core::ptr::null_mut();
         }
         if config.handle != 0 {
-            kernel::NtClose(config.handle);
+            // SAFETY: the file handle was opened by `open` and is closed once.
+            unsafe { xboxkrnl::NtClose(Handle::from_raw(config.handle)) };
             config.handle = 0;
         }
     }
@@ -422,6 +487,6 @@ extern "C" fn writer_thread(context: u32) -> u32 {
     // `stop_thread` waits for it to exit before the writer is freed.
     let writer = unsafe { &*(context as usize as *const Writer) };
     let status = writer.run().code();
-    kernel::ExTerminateThread(status);
-    status
+    // SAFETY: ends the writer thread; it holds no resources that need unwinding.
+    unsafe { xboxkrnl::ExTerminateThread(status) }
 }

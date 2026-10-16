@@ -10,10 +10,11 @@ use core::cell::UnsafeCell;
 use core::ffi::CStr;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
+use core::time::Duration;
 
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
-use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::commands::performance::CounterEntry;
 use openxbdm_server::commands::performance::CounterSample;
 use openxbdm_server::commands::performance::counters;
@@ -23,30 +24,37 @@ use openxbdm_server::commands::performance::counters::CounterQuery;
 use openxbdm_server::commands::performance::counters::CounterRegistration;
 use openxbdm_server::commands::performance::counters::Evaluation;
 use openxbdm_server::reply::CommandError;
+use xbox360::module::Ordinal;
+use xbox360::module::SystemModule;
+use xbox360::module::resolve_export;
+use xbox360::time::TickCount;
+use xbox360::time::sleep;
+use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::DebugMonitorService;
+use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::Irql;
+use xbox360_sys::xboxkrnl::KeCancelTimer;
+use xbox360_sys::xboxkrnl::KeInitializeDpc;
+use xbox360_sys::xboxkrnl::KeInitializeTimerEx;
+use xbox360_sys::xboxkrnl::KeRemoveQueueDpc;
+use xbox360_sys::xboxkrnl::KeSetTimerEx;
+use xbox360_sys::xboxkrnl::MmQueryStatistics;
+use xbox360_sys::xboxkrnl::NtOpenDirectoryObject;
+use xbox360_sys::xboxkrnl::ObCreateObject;
+use xbox360_sys::xboxkrnl::ObInsertObject;
+use xbox360_sys::xboxkrnl::ObMakeTemporaryObject;
+use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
+use xbox360_sys::xboxkrnl::ObjectAttributes;
+use xbox360_sys::xboxkrnl::ProcessType;
+use xbox360_sys::xboxkrnl::TimerType;
 
 use crate::exports::bridged;
 use crate::exports::export;
 use crate::kernel;
-use crate::kernel::AnsiString;
-use crate::kernel::KeCancelTimer;
-use crate::kernel::KeInitializeDpc;
-use crate::kernel::KeInitializeTimerEx;
-use crate::kernel::KeRemoveQueueDpc;
-use crate::kernel::KeSetTimerEx;
-use crate::kernel::MmQueryStatistics;
-use crate::kernel::NtOpenDirectoryObject;
-use crate::kernel::ObCreateObject;
-use crate::kernel::ObInsertObject;
-use crate::kernel::ObMakeTemporaryObject;
-use crate::kernel::ObjectAttributes;
 
 const COUNTER_DIRECTORY: &[u8] = b"\\DmCounters";
-const OBJ_PERMANENT: u32 = 0x10;
-/// `KeGetCurrentProcessType` values.
-const SYSTEM_PROCESS: u32 = 2;
-const TITLE_PROCESS: u32 = 1;
 /// IRQL that excludes the sampler and the clock.
-const SAMPLER_IRQL: u32 = 0x7c;
+const SAMPLER_IRQL: Irql = Irql::new(0x7c);
 const BUCKETS: usize = counters::MAX_PERIOD as usize;
 /// Registration flag: the source is a query routine.
 const HAS_HANDLER: u32 = 0x10_0000;
@@ -54,10 +62,10 @@ const STATUS_NO_MORE_ENTRIES: u32 = 0x8000_001a;
 /// Directory query buffer of the monitor.
 const DIRECTORY_BUFFER: usize = 0x10c;
 /// Kernel export ordinals of the pool routines the object type uses.
-const EX_ALLOCATE_POOL_TYPE_WITH_TAG: u32 = 11;
-const EX_FREE_POOL: u32 = 15;
-/// `ExDebugMonitorService` 8: debug-adjusted memory statistics.
-const DEBUG_MONITOR_MEMORY_STATISTICS: u32 = 8;
+const EX_ALLOCATE_POOL_TYPE_WITH_TAG: Ordinal = Ordinal::new(11).unwrap();
+const EX_FREE_POOL: Ordinal = Ordinal::new(15).unwrap();
+/// Lengths of the debug-adjusted memory statistics of
+/// `ExDebugMonitorService` 8 and of their reply.
 const MEMORY_STATISTICS_LENGTH: u32 = 0x68;
 const MEMORY_STATISTICS_REPLY_LENGTH: u32 = 0x90;
 /// Length word of the monitor's memory statistics block.
@@ -181,28 +189,32 @@ pub(super) fn directory() -> Option<u32> {
     if CLOSED.load(Ordering::Acquire) {
         return None;
     }
-    let (slot, system) = match kernel::KeGetCurrentProcessType() {
-        SYSTEM_PROCESS => (&SYSTEM_DIRECTORY, true),
-        TITLE_PROCESS => (&TITLE_DIRECTORY, false),
+    let (slot, system) = match xboxkrnl::KeGetCurrentProcessType() {
+        ProcessType::SYSTEM => (&SYSTEM_DIRECTORY, true),
+        ProcessType::TITLE => (&TITLE_DIRECTORY, false),
         _ => return None,
     };
     match slot.load(Ordering::Acquire) {
         0 => {}
         handle => return Some(handle),
     }
-    let name = AnsiString::new(COUNTER_DIRECTORY);
+    let name = kernel::ansi_string(COUNTER_DIRECTORY);
     let attributes = ObjectAttributes {
-        root_directory: 0,
+        root_directory: Handle::NULL,
         object_name: &name,
-        attributes: OBJ_PERMANENT,
+        attributes: ObjectAttributeFlags::PERMANENT,
     };
     let mut handle = 0u32;
-    let status = if system {
-        kernel::NtCreateDirectoryObject(&mut handle, &attributes)
-    } else {
-        NtOpenDirectoryObject(&mut handle, &attributes)
+    // SAFETY: `handle`, `attributes`, and the name it refers to are live
+    // for the call.
+    let status = unsafe {
+        if system {
+            xboxkrnl::NtCreateDirectoryObject((&raw mut handle).cast(), &attributes)
+        } else {
+            NtOpenDirectoryObject((&raw mut handle).cast(), &attributes)
+        }
     };
-    if failed(status) {
+    if failed(status.0) {
         kernel::debug_print(if system {
             c"Failed to create system counter object directory.\n"
         } else {
@@ -221,7 +233,8 @@ pub(super) struct CounterHandle(u32);
 
 impl CounterHandle {
     pub(super) fn close(self) {
-        kernel::NtClose(self.0);
+        // SAFETY: the handle was opened by `open` and is closed once.
+        unsafe { xboxkrnl::NtClose(Handle::from_raw(self.0)) };
     }
 }
 
@@ -231,19 +244,19 @@ pub(super) fn open(name: &[u8]) -> Result<CounterHandle, CounterError> {
 }
 
 fn open_in(directory: u32, name: &[u8]) -> Result<CounterHandle, CounterError> {
-    let name = AnsiString::new(name);
+    let name = kernel::ansi_string(name);
     let attributes = ObjectAttributes {
-        root_directory: directory,
+        root_directory: Handle::from_raw(directory),
         object_name: &name,
-        attributes: kernel::OBJ_CASE_INSENSITIVE,
+        attributes: ObjectAttributeFlags::CASE_INSENSITIVE,
     };
     let mut handle = 0u32;
-    if failed(kernel::ObOpenObjectByName(
-        &attributes,
-        counter_type(),
-        0,
-        &mut handle,
-    )) {
+    // SAFETY: `attributes`, the name it refers to, and `handle` are live;
+    // the type is the registered counter object type.
+    let status = unsafe {
+        xboxkrnl::ObOpenObjectByName(&attributes, counter_type(), 0, (&raw mut handle).cast())
+    };
+    if failed(status.0) {
         return Err(CounterError::NotFound);
     }
     Ok(CounterHandle(handle))
@@ -252,12 +265,12 @@ fn open_in(directory: u32, name: &[u8]) -> Result<CounterHandle, CounterError> {
 /// Referenced counter object of an open handle.
 pub(super) fn reference(handle: CounterHandle) -> Result<KernelCounter, KernelError> {
     let mut object = 0u32;
-    NtStatus(kernel::ObReferenceObjectByHandle(
-        handle.0,
-        counter_type(),
-        &mut object,
-    ))
-    .result()?;
+    // SAFETY: `object` is a live u32; the type is the registered counter
+    // object type.
+    let status = unsafe {
+        xboxkrnl::ObReferenceObjectByHandle(Handle::from_raw(handle.0), counter_type(), &mut object)
+    };
+    status.result()?;
     Ok(KernelCounter::new(object))
 }
 
@@ -275,17 +288,20 @@ pub(super) fn query(
 pub(super) fn next(context: &mut u32, name: &mut [u8]) -> Result<CounterEntry, CounterError> {
     let directory = directory().ok_or(CounterError::End)?;
     let mut buffer = [0u32; DIRECTORY_BUFFER / 4];
-    let restart = u32::from(*context == 0);
-    NtStatus(kernel::NtQueryDirectoryObject(
-        directory,
-        buffer.as_mut_ptr().cast(),
-        DIRECTORY_BUFFER as u32,
-        restart,
-        context,
-        core::ptr::null_mut(),
-    ))
-    .result()
-    .map_err(|error| match error {
+    let restart = *context == 0;
+    // SAFETY: `directory` is the open counter directory; `buffer` holds
+    // DIRECTORY_BUFFER bytes and `context` is a live u32.
+    let status = unsafe {
+        xboxkrnl::NtQueryDirectoryObject(
+            Handle::from_raw(directory),
+            buffer.as_mut_ptr().cast(),
+            DIRECTORY_BUFFER as u32,
+            restart,
+            context,
+            core::ptr::null_mut(),
+        )
+    };
+    status.result().map_err(|error| match error {
         KernelError::NoMoreEntries => CounterError::End,
         KernelError::BufferTooSmall => CounterError::NameTooLong,
         error => CounterError::Kernel(error),
@@ -314,12 +330,15 @@ pub(super) fn next(context: &mut u32, name: &mut [u8]) -> Result<CounterEntry, C
 /// sampler is excluded.
 pub(super) struct KernelCounter {
     object: u32,
-    irql: u32,
+    irql: Irql,
 }
 
 impl KernelCounter {
     fn new(object: u32) -> Self {
-        Self { object, irql: 0 }
+        Self {
+            object,
+            irql: Irql::PASSIVE,
+        }
     }
 
     fn at<T>(&self, offset: i32) -> *mut T {
@@ -333,7 +352,8 @@ impl KernelCounter {
 
     /// Drop the reference taken by [`reference`].
     pub(super) fn release(self) {
-        kernel::ObDereferenceObject(self.object);
+        // SAFETY: `object` holds the reference taken by `reference`.
+        unsafe { xboxkrnl::ObDereferenceObject(self.object) };
     }
 }
 
@@ -413,11 +433,13 @@ impl CounterObject for KernelCounter {
     }
 
     fn exclude_sampler(&mut self) {
-        self.irql = kernel::KfRaiseIrql(SAMPLER_IRQL);
+        // SAFETY: `allow_sampler` restores the previous IRQL.
+        self.irql = unsafe { xboxkrnl::KfRaiseIrql(SAMPLER_IRQL) };
     }
 
     fn allow_sampler(&mut self) {
-        kernel::KfLowerIrql(self.irql);
+        // SAFETY: returns to the IRQL saved by `exclude_sampler`.
+        unsafe { xboxkrnl::KfLowerIrql(self.irql) };
     }
 }
 
@@ -600,27 +622,6 @@ fn schedule(object: u32, period: u32) {
     write(head + 4, object);
 }
 
-/// `KeSetTimerEx(timer, due, period, dpc)`: the console takes the due time
-/// in one 64-bit register; this joins the two halves the 32-bit ABI passes.
-#[unsafe(naked)]
-pub(super) extern "C" fn set_timer(
-    timer: *mut u8,
-    due_high: u32,
-    due_low: u32,
-    period: u32,
-    dpc: *mut u8,
-) -> u32 {
-    core::arch::naked_asm!(
-        // rldimi 5, 4, 32, 0: the high half into the upper word of r5.
-        ".long 0x7885000e",
-        "mr 4, 5",
-        "mr 5, 6",
-        "mr 6, 7",
-        "b {set}",
-        set = sym KeSetTimerEx,
-    )
-}
-
 /// Register counter `name` (stock export 33): `word` is the registration
 /// word, `source` the data or routine it reads.
 fn register(name: &[u8], word: u32, source: u32) -> Result<(), RegisterError> {
@@ -629,36 +630,42 @@ fn register(name: &[u8], word: u32, source: u32) -> Result<(), RegisterError> {
     if period > counters::MAX_PERIOD {
         return Err(RegisterError::PeriodTooLong);
     }
-    let name = AnsiString::new(name);
+    let name = kernel::ansi_string(name);
     let attributes = ObjectAttributes {
-        root_directory: directory,
+        root_directory: Handle::from_raw(directory),
         object_name: &name,
-        attributes: OBJ_PERMANENT | kernel::OBJ_CASE_INSENSITIVE,
+        attributes: ObjectAttributeFlags::PERMANENT | ObjectAttributeFlags::CASE_INSENSITIVE,
     };
     let mut object = 0u32;
-    NtStatus(ObCreateObject(
-        counter_type(),
-        &attributes,
-        counters::OBJECT_SIZE as u32,
-        &mut object,
-    ))
-    .result()
-    .map_err(RegisterError::Kernel)?;
+    // SAFETY: `attributes`, the name it refers to, and `object` are live;
+    // the type is the registered counter object type.
+    let status = unsafe {
+        ObCreateObject(
+            counter_type(),
+            &attributes,
+            counters::OBJECT_SIZE as u32,
+            &mut object,
+        )
+    };
+    status.result().map_err(RegisterError::Kernel)?;
     // SAFETY: the object body holds OBJECT_SIZE bytes.
     unsafe { core::ptr::write_bytes(object as usize as *mut u8, 0, counters::OBJECT_SIZE) };
     let mut handle = 0u32;
-    NtStatus(ObInsertObject(object, &attributes, 0, &mut handle))
-        .result()
-        .map_err(RegisterError::Kernel)?;
+    // SAFETY: `object` was created above; `attributes` and `handle` are live.
+    let status = unsafe { ObInsertObject(object, &attributes, 0, (&raw mut handle).cast()) };
+    status.result().map_err(RegisterError::Kernel)?;
     let mut counter = KernelCounter::new(object);
     counter.write_u32(0xc, source);
     counters::initialize(&mut counter, CounterRegistration(word));
     if period != 0 {
-        let irql = kernel::KfRaiseIrql(SAMPLER_IRQL);
+        // SAFETY: the IRQL is restored below.
+        let irql = unsafe { xboxkrnl::KfRaiseIrql(SAMPLER_IRQL) };
         schedule(object, period);
-        kernel::KfLowerIrql(irql);
+        // SAFETY: returns to the IRQL raised from above.
+        unsafe { xboxkrnl::KfLowerIrql(irql) };
     }
-    kernel::NtClose(handle);
+    // SAFETY: `handle` was opened by `ObInsertObject` and is closed once.
+    unsafe { xboxkrnl::NtClose(Handle::from_raw(handle)) };
     Ok(())
 }
 
@@ -686,15 +693,19 @@ extern "C" fn open_counter(name: *const u8, handle: *mut u32) -> u32 {
         return export_result(Err(CounterError::NoDirectory));
     }
     // SAFETY: the caller passes a NUL-terminated name.
-    let name = AnsiString::new(unsafe { CStr::from_ptr(name.cast()) }.to_bytes());
+    let name = kernel::ansi_string(unsafe { CStr::from_ptr(name.cast()) }.to_bytes());
     let attributes = ObjectAttributes {
-        root_directory: directory,
+        root_directory: Handle::from_raw(directory),
         object_name: &name,
-        attributes: kernel::OBJ_CASE_INSENSITIVE,
+        attributes: ObjectAttributeFlags::CASE_INSENSITIVE,
     };
     // The kernel stores the handle through the caller's pointer.
-    let result = match kernel::ObOpenObjectByName(&attributes, counter_type(), 0, handle) {
-        status if failed(status) => Err(CounterError::NotFound),
+    // SAFETY: `attributes` and the name it refers to are live; the caller
+    // passes a writable handle dword.
+    let status =
+        unsafe { xboxkrnl::ObOpenObjectByName(&attributes, counter_type(), 0, handle.cast()) };
+    let result = match status {
+        status if failed(status.0) => Err(CounterError::NotFound),
         _ => Ok(()),
     };
     export_result(result)
@@ -773,20 +784,24 @@ pub(crate) fn memory_statistics(out: &mut [u32; 12]) -> Result<(), StatisticsErr
     reply[0] = MEMORY_STATISTICS_REPLY_LENGTH;
     reply[1] = MEMORY_STATISTICS_LENGTH;
     let mut statistics = [0u32; MEMORY_STATISTICS_LENGTH as usize / 4];
-    let mut status = kernel::ExDebugMonitorService(
-        DEBUG_MONITOR_MEMORY_STATISTICS,
-        reply.as_mut_ptr() as usize as u32,
-        0,
-        0,
-    );
-    let s: &[u32] = if !failed(status) && reply[0] >= MEMORY_STATISTICS_REPLY_LENGTH {
+    // SAFETY: `reply` is a live block whose first words give its length.
+    let mut status = unsafe {
+        xboxkrnl::ExDebugMonitorService(
+            DebugMonitorService::MemoryStatistics,
+            reply.as_mut_ptr() as usize as u32,
+            0,
+            0,
+        )
+    };
+    let s: &[u32] = if !failed(status.0) && reply[0] >= MEMORY_STATISTICS_REPLY_LENGTH {
         &reply[1..]
     } else {
         statistics[0] = MEMORY_STATISTICS_LENGTH;
-        status = MmQueryStatistics(statistics.as_mut_ptr());
+        // SAFETY: `statistics` is a live block with its length word set.
+        status = unsafe { MmQueryStatistics(statistics.as_mut_ptr()) };
         &statistics
     };
-    NtStatus(status).result().map_err(StatisticsError::Kernel)?;
+    status.result().map_err(StatisticsError::Kernel)?;
     out[1] = s[1];
     out[2] = s[0xe].wrapping_add(s[3]);
     out[3] = s[0x13].wrapping_add(s[8]);
@@ -815,12 +830,14 @@ fn sample_processors() {
         if block == 0 {
             continue;
         }
-        let irql = kernel::KfRaiseIrql(SAMPLER_IRQL);
+        // SAFETY: the IRQL is restored before the loop body ends.
+        let irql = unsafe { xboxkrnl::KfRaiseIrql(SAMPLER_IRQL) };
         let interrupt = read(block + 0x18);
         let dpc = read(block + 0x14);
         let idle = read(read(block + 8) + 0x58);
-        let tick = kernel::tick_count();
-        kernel::KfLowerIrql(irql);
+        let tick = TickCount::now().milliseconds();
+        // SAFETY: returns to the IRQL raised from above.
+        unsafe { xboxkrnl::KfLowerIrql(irql) };
         for (word, value) in words.iter().zip(&[idle, tick, dpc, tick, interrupt, tick]) {
             word.store(*value, Ordering::Relaxed);
         }
@@ -854,11 +871,13 @@ extern "C" fn sampler_dpc(_dpc: usize, _context: usize, _argument1: usize, _argu
             let next = read(entry);
             let word = read(entry + 8);
             if word & HAS_HANDLER == 0 {
-                let irql = kernel::KfRaiseIrql(SAMPLER_IRQL);
-                let tick = kernel::tick_count();
+                // SAFETY: the IRQL is restored after the sample.
+                let irql = unsafe { xboxkrnl::KfRaiseIrql(SAMPLER_IRQL) };
+                let tick = TickCount::now().milliseconds();
                 let frame = frame_number();
                 counters::sample(&mut KernelCounter::new(entry), tick, frame);
-                kernel::KfLowerIrql(irql);
+                // SAFETY: returns to the IRQL raised from above.
+                unsafe { xboxkrnl::KfLowerIrql(irql) };
             } else {
                 // SAFETY: handler counters register a routine taking
                 // (query, object, sample).
@@ -887,13 +906,15 @@ fn register_c(name: &CStr, word: u32, source: u32) {
 /// Create the object type, the sampler, and the built-in counters (stock
 /// 0x91f2b110).
 pub(super) fn initialize() {
-    if let Ok(module) = kernel::module_handle(c"xboxkrnl.exe") {
+    if let Ok(module) = SystemModule::Kernel.handle() {
         if let (Ok(allocate), Ok(free)) = (
-            kernel::resolve_export(module, EX_ALLOCATE_POOL_TYPE_WITH_TAG),
-            kernel::resolve_export(module, EX_FREE_POOL),
+            resolve_export(module, EX_ALLOCATE_POOL_TYPE_WITH_TAG),
+            resolve_export(module, EX_FREE_POOL),
         ) {
-            COUNTER_TYPE.allocate.store(allocate, Ordering::Relaxed);
-            COUNTER_TYPE.free.store(free, Ordering::Relaxed);
+            COUNTER_TYPE
+                .allocate
+                .store(allocate.raw(), Ordering::Relaxed);
+            COUNTER_TYPE.free.store(free.raw(), Ordering::Relaxed);
         }
     }
     let wait_list = DEFAULT_OBJECT[2].as_ptr() as usize as u32;
@@ -917,20 +938,27 @@ pub(super) fn initialize() {
         write(head, head);
         write(head + 4, head);
     }
-    KeInitializeDpc(
-        SAMPLER.dpc.as_ptr(),
-        sampler_dpc_entry as *const () as usize,
-        0,
-    );
-    KeInitializeTimerEx(SAMPLER.timer.as_ptr(), 0);
-    // Due time -1: the first expiry is immediate, then every 100 ms.
-    set_timer(
-        SAMPLER.timer.as_ptr(),
-        u32::MAX,
-        u32::MAX,
-        counters::SAMPLER_INTERVAL_MS,
-        SAMPLER.dpc.as_ptr(),
-    );
+    // SAFETY: the static sampler storage is zeroed, sized for a KDPC and a
+    // KTIMER, and stays in place until `shut_down` cancels both.
+    unsafe {
+        KeInitializeDpc(
+            SAMPLER.dpc.as_ptr().cast(),
+            sampler_dpc_entry as *const () as usize,
+            0,
+        );
+        KeInitializeTimerEx(
+            SAMPLER.timer.as_ptr().cast(),
+            TimerType::Notification,
+            ProcessType::SYSTEM,
+        );
+        // Due time -1: the first expiry is immediate, then every 100 ms.
+        KeSetTimerEx(
+            SAMPLER.timer.as_ptr().cast(),
+            -1,
+            counters::SAMPLER_INTERVAL_MS,
+            SAMPLER.dpc.as_ptr().cast(),
+        );
+    }
 
     if directory.is_none() {
         return;
@@ -960,12 +988,17 @@ pub(super) fn initialize() {
 /// handles but leave the directory.
 pub(super) fn shut_down() {
     CLOSED.store(true, Ordering::Release);
-    KeCancelTimer(SAMPLER.timer.as_ptr());
-    KeRemoveQueueDpc(SAMPLER.dpc.as_ptr());
+    // SAFETY: the sampler timer and DPC were initialized by `initialize`.
+    unsafe {
+        KeCancelTimer(SAMPLER.timer.as_ptr().cast());
+        KeRemoveQueueDpc(SAMPLER.dpc.as_ptr().cast());
+    }
     // A DPC the kernel dequeued just before the cancel may not have entered
     // the sampler yet; it runs at dispatch level, so it starts well within
     // one period.
-    kernel::sleep_milliseconds(counters::SAMPLER_INTERVAL_MS);
+    sleep(Duration::from_millis(u64::from(
+        counters::SAMPLER_INTERVAL_MS,
+    )));
     while SAMPLER.active.load(Ordering::Acquire) != 0 {
         core::hint::spin_loop();
     }
@@ -984,11 +1017,20 @@ pub(super) fn shut_down() {
         previous = remaining;
     }
     let mut object = 0u32;
-    if !failed(kernel::ObReferenceObjectByHandle(directory, 0, &mut object)) {
-        ObMakeTemporaryObject(object);
-        kernel::ObDereferenceObject(object);
+    // SAFETY: `directory` is the owned system directory handle and `object`
+    // a live u32.
+    let status =
+        unsafe { xboxkrnl::ObReferenceObjectByHandle(Handle::from_raw(directory), 0, &mut object) };
+    if !failed(status.0) {
+        // SAFETY: `object` holds the reference taken above, released here.
+        unsafe {
+            ObMakeTemporaryObject(object);
+            xboxkrnl::ObDereferenceObject(object);
+        }
     }
-    kernel::NtClose(directory);
+    // SAFETY: the directory handle was taken out of SYSTEM_DIRECTORY and is
+    // closed once.
+    unsafe { xboxkrnl::NtClose(Handle::from_raw(directory)) };
 }
 
 /// Make every counter object of `directory` temporary; returns the number
@@ -998,16 +1040,20 @@ fn retire_counters(directory: u32) -> usize {
     let mut seen = 0usize;
     loop {
         let mut buffer = [0u32; DIRECTORY_BUFFER / 4];
-        let restart = u32::from(context == 0);
-        let status = kernel::NtQueryDirectoryObject(
-            directory,
-            buffer.as_mut_ptr().cast(),
-            DIRECTORY_BUFFER as u32,
-            restart,
-            &mut context,
-            core::ptr::null_mut(),
-        );
-        if failed(status) || status == STATUS_NO_MORE_ENTRIES {
+        let restart = context == 0;
+        // SAFETY: `directory` is the open system directory; `buffer` holds
+        // DIRECTORY_BUFFER bytes and `context` is a live u32.
+        let status = unsafe {
+            xboxkrnl::NtQueryDirectoryObject(
+                Handle::from_raw(directory),
+                buffer.as_mut_ptr().cast(),
+                DIRECTORY_BUFFER as u32,
+                restart,
+                &mut context,
+                core::ptr::null_mut(),
+            )
+        };
+        if failed(status.0) || status.0 == STATUS_NO_MORE_ENTRIES {
             return seen;
         }
         seen += 1;
@@ -1018,7 +1064,8 @@ fn retire_counters(directory: u32) -> usize {
             continue;
         };
         if let Ok(counter) = reference(handle) {
-            ObMakeTemporaryObject(counter.object);
+            // SAFETY: `counter` holds a reference to the object.
+            unsafe { ObMakeTemporaryObject(counter.object) };
             counter.release();
         }
         handle.close();
@@ -1027,10 +1074,12 @@ fn retire_counters(directory: u32) -> usize {
 
 /// Forget the title's frame counters (stock 0x91f32398).
 pub(super) fn title_terminated() {
-    let irql = kernel::KfRaiseIrql(SAMPLER_IRQL);
+    // SAFETY: the IRQL is restored below.
+    let irql = unsafe { xboxkrnl::KfRaiseIrql(SAMPLER_IRQL) };
     TITLE_INTERFACE[FRAME_COUNT].store(0, Ordering::Release);
     TITLE_INTERFACE[FRAME_TICKS_COUNT].store(0, Ordering::Release);
-    kernel::KfLowerIrql(irql);
+    // SAFETY: returns to the IRQL raised from above.
+    unsafe { xboxkrnl::KfLowerIrql(irql) };
 }
 
 /// Forget the title's directory handle, which closed with the title

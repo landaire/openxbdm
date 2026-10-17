@@ -5,6 +5,10 @@
 //! handler registers the `PIX!` prefix and drives the video capture
 //! hardware on the console).
 
+use crate::commands::error::report_argument;
+use crate::commands::error::report_parse;
+use crate::commands::kv::parse_kv_line;
+use crate::commands::kv::value_u32;
 use crate::error::ArgumentError;
 use crate::error::Error;
 use crate::protocol::ArgBuilder;
@@ -12,9 +16,8 @@ use crate::protocol::Command;
 use crate::protocol::ExpectedBody;
 use crate::protocol::Response;
 
-fn report_argument(err: ArgumentError) -> rootcause::Report<Error> {
-    rootcause::Report::new(Error::from(err))
-}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtensionHandle(pub u32);
 
 /// `dbgextld unload module=0x<handle>`: release one reference to the loaded
 /// debugger extension; the module is unloaded when the count reaches zero.
@@ -40,6 +43,7 @@ impl Command for UnloadDebuggerExtension {
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         response.expect_ok().map_err(rootcause::Report::new)?;
+
         Ok(())
     }
 }
@@ -53,9 +57,6 @@ pub struct LoadDebuggerExtension {
     pub module_name: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExtensionHandle(pub u32);
-
 impl Command for LoadDebuggerExtension {
     type Output = ExtensionHandle;
 
@@ -63,6 +64,7 @@ impl Command for LoadDebuggerExtension {
         if self.module_name.is_empty() {
             return Err(report_argument(ArgumentError::EmptyFilename));
         }
+
         ArgBuilder::new("dbgextld")
             .quoted("name", &self.module_name)
             .map_err(report_argument)
@@ -75,10 +77,11 @@ impl Command for LoadDebuggerExtension {
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         let head = response.expect_ok().map_err(rootcause::Report::new)?;
-        let kv = crate::commands::kv::parse_kv_line(&head);
+        let kv = parse_kv_line(&head);
+
         kv.require("module")
-            .and_then(|value| crate::commands::kv::value_u32(value, "module"))
+            .and_then(|value| value_u32(value, "module"))
             .map(ExtensionHandle)
-            .map_err(|e| rootcause::Report::new(Error::from(e)))
+            .map_err(report_parse)
     }
 }

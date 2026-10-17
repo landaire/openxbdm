@@ -1,5 +1,6 @@
 //! Memory reads and virtual-memory map enumeration.
 
+use crate::commands::error::report_parse;
 use crate::commands::kv::KvLine;
 use crate::commands::kv::parse_kv_line;
 use crate::commands::kv::value_u32;
@@ -12,14 +13,6 @@ use crate::protocol::ExpectedBody;
 use crate::protocol::RemoteStatus;
 use crate::protocol::Response;
 
-fn report_parse(err: ParseError) -> rootcause::Report<Error> {
-    rootcause::Report::new(Error::from(err))
-}
-
-fn require_u32(kv: &KvLine<'_>, key: &'static str) -> Result<u32, ParseError> {
-    value_u32(kv.require(key)?, key)
-}
-
 /// `getmem ADDR=<va> LENGTH=<n>`: read `n` bytes from virtual address `va`.
 ///
 /// The response is a `202` multiline body of hex lines of up to 32 bytes.
@@ -30,16 +23,6 @@ fn require_u32(kv: &KvLine<'_>, key: &'static str) -> Result<u32, ParseError> {
 pub struct GetMem {
     pub address: u32,
     pub length: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemorySnapshot {
-    pub address: u32,
-    pub data: Vec<u8>,
-    /// Byte offsets (relative to `address`) that the kernel reported as
-    /// unmapped via `??` markers. The corresponding bytes in `data` are
-    /// zero so callers can still hex-dump the full range.
-    pub unmapped_offsets: Vec<u32>,
 }
 
 impl Command for GetMem {
@@ -61,6 +44,7 @@ impl Command for GetMem {
             .expect_multiline()
             .map_err(rootcause::Report::new)?;
         let expected = self.length as usize;
+
         let mut actual = 0usize;
         for line in &lines {
             let bytes = line.as_bytes();
@@ -71,6 +55,7 @@ impl Command for GetMem {
             }
             actual = actual.saturating_add(bytes.len() / 2);
         }
+
         if actual != expected {
             return Err(report_parse(ParseError::MemoryLengthMismatch {
                 expected,
@@ -87,6 +72,7 @@ impl Command for GetMem {
                     data.push(0);
                     continue;
                 }
+
                 let pair = core::str::from_utf8(chunk).map_err(|_| {
                     report_parse(ParseError::InvalidHexDigits { key: "memory-hex" })
                 })?;
@@ -96,12 +82,23 @@ impl Command for GetMem {
                 data.push(byte);
             }
         }
+
         Ok(MemorySnapshot {
             address: self.address,
             data,
             unmapped_offsets: unmapped,
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemorySnapshot {
+    pub address: u32,
+    pub data: Vec<u8>,
+    /// Byte offsets (relative to `address`) that the kernel reported as
+    /// unmapped via `??` markers. The corresponding bytes in `data` are
+    /// zero so callers can still hex-dump the full range.
+    pub unmapped_offsets: Vec<u32>,
 }
 
 /// `setmem ADDR=<va> DATA=<hex>`: write bytes to the console's virtual
@@ -114,23 +111,40 @@ pub struct SetMem {
     pub data: Vec<u8>,
 }
 
-/// Result of a [`SetMem`] command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BytesWritten {
-    pub requested: u32,
-    pub written: u32,
+impl SetMem {
+    /// Parse `set N bytes`, N decimal.
+    fn bytes_written(&self, text: &str) -> Result<BytesWritten, rootcause::Report<Error>> {
+        let written = text
+            .strip_prefix("set ")
+            .and_then(|rest| rest.strip_suffix(" bytes"))
+            .and_then(|count| count.parse::<u32>().ok())
+            .ok_or_else(|| {
+                report_parse(ParseError::InvalidDecimalU32 {
+                    key: "setmem-count",
+                })
+            })?;
+
+        Ok(BytesWritten {
+            requested: self.data.len() as u32,
+            written,
+        })
+    }
 }
 
 impl Command for SetMem {
     type Output = BytesWritten;
 
     fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
-        let mut hex = String::with_capacity(self.data.len() * 2);
         use core::fmt::Write as _;
+
+        let mut hex = String::with_capacity(self.data.len() * 2);
         for byte in &self.data {
-            let _ = write!(hex, "{:02X}", byte);
+            let _ = write!(hex, "{byte:02X}");
         }
-        Ok(format!("setmem addr=0x{:08x} data={}", self.address, hex))
+
+        let address = self.address;
+
+        Ok(format!("setmem addr=0x{address:08x} data={hex}"))
     }
 
     fn expected(&self) -> ExpectedBody {
@@ -151,35 +165,16 @@ impl Command for SetMem {
     }
 }
 
-impl SetMem {
-    /// Parse `set N bytes`, N decimal.
-    fn bytes_written(&self, text: &str) -> Result<BytesWritten, rootcause::Report<Error>> {
-        let written = text
-            .strip_prefix("set ")
-            .and_then(|rest| rest.strip_suffix(" bytes"))
-            .and_then(|count| count.parse::<u32>().ok())
-            .ok_or_else(|| {
-                report_parse(ParseError::InvalidDecimalU32 {
-                    key: "setmem-count",
-                })
-            })?;
-        Ok(BytesWritten {
-            requested: self.data.len() as u32,
-            written,
-        })
-    }
+/// Result of a [`SetMem`] command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BytesWritten {
+    pub requested: u32,
+    pub written: u32,
 }
 
 /// `walkmem`: enumerate all currently-valid virtual-address ranges.
 #[derive(Debug, Clone, Copy)]
 pub struct WalkMem;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VirtualRegion {
-    pub base: u32,
-    pub size: u32,
-    pub protect: u32,
-}
 
 impl Command for WalkMem {
     type Output = Vec<VirtualRegion>;
@@ -196,17 +191,30 @@ impl Command for WalkMem {
         let lines = response
             .expect_multiline()
             .map_err(rootcause::Report::new)?;
-        let mut out = Vec::with_capacity(lines.len());
+        let mut regions = Vec::with_capacity(lines.len());
+
         for line in lines {
             let kv = parse_kv_line(&line);
-            out.push(VirtualRegion {
+            regions.push(VirtualRegion {
                 base: require_u32(&kv, "base").map_err(report_parse)?,
                 size: require_u32(&kv, "size").map_err(report_parse)?,
                 protect: require_u32(&kv, "protect").map_err(report_parse)?,
             });
         }
-        Ok(out)
+
+        Ok(regions)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtualRegion {
+    pub base: u32,
+    pub size: u32,
+    pub protect: u32,
+}
+
+fn require_u32(kv: &KvLine<'_>, key: &'static str) -> Result<u32, ParseError> {
+    value_u32(kv.require(key)?, key)
 }
 
 #[cfg(test)]

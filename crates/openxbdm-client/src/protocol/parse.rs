@@ -1,11 +1,12 @@
 //! Shared winnow parser combinators for XBDM wire text.
 
+use winnow::Parser;
 use winnow::ascii::digit1;
+use winnow::ascii::space0;
 use winnow::combinator::alt;
 use winnow::combinator::opt;
 use winnow::error::ContextError;
 use winnow::error::ErrMode;
-use winnow::prelude::*;
 use winnow::token::rest;
 use winnow::token::take_until;
 use winnow::token::take_while;
@@ -15,10 +16,32 @@ use crate::error::ParseError;
 
 pub type Input<'a> = &'a str;
 
+/// Output of [`kv_tokens`]: the `KEY=VALUE` pairs and the bare flag tokens,
+/// each preserved in source order within their respective lists.
+#[derive(Debug, Default)]
+pub struct KvTokens<'a> {
+    pub pairs: Vec<(&'a str, KvValue<'a>)>,
+    pub flags: Vec<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum KvValue<'a> {
+    Bare(&'a str),
+    Quoted(&'a str),
+}
+
+impl<'a> KvValue<'a> {
+    pub fn as_str(self) -> &'a str {
+        match self {
+            Self::Bare(text) | Self::Quoted(text) => text,
+        }
+    }
+}
+
 pub fn three_digit_code(input: &mut Input<'_>) -> Result<u16, ErrMode<ContextError>> {
     digit1
-        .verify(|s: &str| s.len() == 3)
-        .try_map(|s: &str| s.parse::<u16>())
+        .verify(|digits: &str| digits.len() == 3)
+        .try_map(|digits: &str| digits.parse::<u16>())
         .parse_next(input)
 }
 
@@ -26,8 +49,9 @@ pub fn three_digit_code(input: &mut Input<'_>) -> Result<u16, ErrMode<ContextErr
 /// ` `, or empty. The head text runs to end-of-input.
 pub fn response_head<'a>(input: &mut Input<'a>) -> Result<(u16, &'a str), ErrMode<ContextError>> {
     let code = three_digit_code.parse_next(input)?;
-    let _ = opt(alt(("- ", "-", " "))).parse_next(input)?;
+    opt(alt(("- ", "-", " "))).parse_next(input)?;
     let tail = rest.parse_next(input)?;
+
     Ok((code, tail))
 }
 
@@ -35,8 +59,9 @@ pub fn response_head<'a>(input: &mut Input<'a>) -> Result<(u16, &'a str), ErrMod
 #[allow(dead_code)]
 pub fn hex_u64_prefixed(input: &mut Input<'_>) -> Result<u64, ErrMode<ContextError>> {
     alt(("0x", "0X")).parse_next(input)?;
+
     take_while(1..=16, |c: char| c.is_ascii_hexdigit())
-        .try_map(|s: &str| u64::from_str_radix(s, 16))
+        .try_map(|digits: &str| u64::from_str_radix(digits, 16))
         .parse_next(input)
 }
 
@@ -44,8 +69,9 @@ pub fn hex_u64_prefixed(input: &mut Input<'_>) -> Result<u64, ErrMode<ContextErr
 #[allow(dead_code)]
 pub fn qword_literal(input: &mut Input<'_>) -> Result<u64, ErrMode<ContextError>> {
     alt(("0q", "0Q")).parse_next(input)?;
+
     take_while(16..=16, |c: char| c.is_ascii_hexdigit())
-        .try_map(|s: &str| u64::from_str_radix(s, 16))
+        .try_map(|digits: &str| u64::from_str_radix(digits, 16))
         .parse_next(input)
 }
 
@@ -73,47 +99,28 @@ where
     parser(&mut cursor).map_err(|_| on_fail)
 }
 
-/// Output of [`kv_tokens`]: the `KEY=VALUE` pairs and the bare flag tokens,
-/// each preserved in source order within their respective lists.
-#[derive(Debug, Default)]
-pub struct KvTokens<'a> {
-    pub pairs: Vec<(&'a str, KvValue<'a>)>,
-    pub flags: Vec<&'a str>,
-}
-
 /// Consume whitespace-separated `KEY=VALUE` pairs and bare flag tokens.
 pub fn kv_tokens<'a>(input: &mut Input<'a>) -> Result<KvTokens<'a>, ErrMode<ContextError>> {
-    let mut out = KvTokens::default();
+    let mut tokens = KvTokens::default();
+
     loop {
-        let _ = winnow::ascii::space0.parse_next(input)?;
+        space0.parse_next(input)?;
         if input.is_empty() {
             break;
         }
+
         let key =
             take_while(1.., |c: char| c != '=' && !c.is_ascii_whitespace()).parse_next(input)?;
         match opt('=').parse_next(input)? {
             Some(_) => {
                 let value = kv_value.parse_next(input)?;
-                out.pairs.push((key, value));
+                tokens.pairs.push((key, value));
             }
-            None => out.flags.push(key),
+            None => tokens.flags.push(key),
         }
     }
-    Ok(out)
-}
 
-#[derive(Debug, Clone, Copy)]
-pub enum KvValue<'a> {
-    Bare(&'a str),
-    Quoted(&'a str),
-}
-
-impl<'a> KvValue<'a> {
-    pub fn as_str(self) -> &'a str {
-        match self {
-            KvValue::Bare(s) | KvValue::Quoted(s) => s,
-        }
-    }
+    Ok(tokens)
 }
 
 pub fn kv_value<'a>(input: &mut Input<'a>) -> Result<KvValue<'a>, ErrMode<ContextError>> {
@@ -130,6 +137,7 @@ fn quoted_value<'a>(input: &mut Input<'a>) -> Result<KvValue<'a>, ErrMode<Contex
     '"'.parse_next(input)?;
     let inner = take_until(0.., '"').parse_next(input)?;
     '"'.parse_next(input)?;
+
     Ok(KvValue::Quoted(inner))
 }
 

@@ -31,6 +31,7 @@ pub struct MockTransport {
     /// Byte offset within the current frame when the client is only
     /// reading/writing a partial chunk.
     offset: usize,
+
     /// If true, unexpected client bytes are ignored instead of erroring.
     /// Useful when a test wants to drive a short command against a capture
     /// that only contains the server side.
@@ -62,9 +63,8 @@ impl MockTransport {
         for chunk in chunks {
             log.push(Direction::ServerToClient, &chunk.into());
         }
-        let mut mock = Self::from_log(log);
-        mock.lax_writes = true;
-        mock
+
+        Self::from_log(log).with_lax_writes()
     }
 
     pub fn with_lax_writes(mut self) -> Self {
@@ -86,6 +86,16 @@ impl MockTransport {
         self.frames.get(self.cursor)
     }
 
+    fn frame_view(&self) -> Option<FrameView> {
+        let frame = self.current_frame()?;
+
+        Some(FrameView {
+            direction: frame.direction,
+            remaining: frame.data.len().saturating_sub(self.offset),
+            total: frame.data.len(),
+        })
+    }
+
     fn advance_frame(&mut self) {
         self.cursor += 1;
         self.offset = 0;
@@ -99,13 +109,14 @@ impl AsyncRead for MockTransport {
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         loop {
-            let Some((direction, remaining_in_frame, frame_total)) = self.frame_view() else {
+            let Some(view) = self.frame_view() else {
                 if self.reads_pend_on_end {
                     return Poll::Pending;
                 }
                 return Poll::Ready(Ok(0));
             };
-            if direction != Direction::ServerToClient {
+
+            if view.direction != Direction::ServerToClient {
                 if self.lax_writes {
                     self.advance_frame();
                     continue;
@@ -115,32 +126,25 @@ impl AsyncRead for MockTransport {
                     "mock transport: client attempted to read while the script expects client->server bytes",
                 )));
             }
-            if remaining_in_frame == 0 {
+
+            if view.remaining == 0 {
                 self.advance_frame();
                 continue;
             }
-            let to_copy = remaining_in_frame.min(buf.len());
+
+            let to_copy = view.remaining.min(buf.len());
             {
                 let frame = self.current_frame().expect("frame_view returned Some");
                 buf[..to_copy].copy_from_slice(&frame.data[self.offset..self.offset + to_copy]);
             }
+
             self.offset += to_copy;
-            if self.offset >= frame_total {
+            if self.offset >= view.total {
                 self.advance_frame();
             }
+
             return Poll::Ready(Ok(to_copy));
         }
-    }
-}
-
-impl MockTransport {
-    fn frame_view(&self) -> Option<(Direction, usize, usize)> {
-        let frame = self.frames.get(self.cursor)?;
-        Some((
-            frame.direction,
-            frame.data.len().saturating_sub(self.offset),
-            frame.data.len(),
-        ))
     }
 }
 
@@ -153,22 +157,26 @@ impl AsyncWrite for MockTransport {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
+
         if self.lax_writes {
             return Poll::Ready(Ok(buf.len()));
         }
-        let Some((direction, remaining, frame_total)) = self.frame_view() else {
+
+        let Some(view) = self.frame_view() else {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "mock transport: client wrote bytes past the end of the script",
             )));
         };
-        if direction != Direction::ClientToServer {
+
+        if view.direction != Direction::ClientToServer {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "mock transport: client wrote bytes when the script expected a server reply",
             )));
         }
-        let to_check = remaining.min(buf.len());
+
+        let to_check = view.remaining.min(buf.len());
         let cursor = self.cursor;
         let offset = self.offset;
         {
@@ -182,10 +190,12 @@ impl AsyncWrite for MockTransport {
                 )));
             }
         }
+
         self.offset += to_check;
-        if self.offset >= frame_total {
+        if self.offset >= view.total {
             self.advance_frame();
         }
+
         Poll::Ready(Ok(to_check))
     }
 
@@ -198,6 +208,14 @@ impl AsyncWrite for MockTransport {
     }
 }
 
+/// Position of the transport within the current script frame.
+struct FrameView {
+    direction: Direction,
+    /// Bytes of the frame not yet read or written.
+    remaining: usize,
+    total: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use futures_util::io::AsyncReadExt;
@@ -207,9 +225,10 @@ mod tests {
 
     fn log_of(frames: &[(Direction, &[u8])]) -> CaptureLog {
         let mut log = CaptureLog::new();
-        for (dir, data) in frames {
-            log.push(*dir, data);
+        for (direction, data) in frames {
+            log.push(*direction, data);
         }
+
         log
     }
 
@@ -218,8 +237,8 @@ mod tests {
         let log = log_of(&[(Direction::ServerToClient, b"201- connected\r\n")]);
         let mut mock = MockTransport::from_log(log);
         let mut buf = [0u8; 64];
-        let n = futures::executor::block_on(mock.read(&mut buf)).unwrap();
-        assert_eq!(&buf[..n], b"201- connected\r\n");
+        let len = futures::executor::block_on(mock.read(&mut buf)).unwrap();
+        assert_eq!(&buf[..len], b"201- connected\r\n");
     }
 
     #[test]
@@ -232,8 +251,7 @@ mod tests {
 
     #[test]
     fn lax_writes_accept_anything() {
-        let mock = MockTransport::from_server_script(vec![b"200- OK\r\n".to_vec()]);
-        let mut mock = mock;
+        let mut mock = MockTransport::from_server_script(vec![b"200- OK\r\n".to_vec()]);
         futures::executor::block_on(mock.write_all(b"anything\r\n")).unwrap();
     }
 }

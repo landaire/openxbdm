@@ -26,10 +26,15 @@
 //! here eventually, but not until we observe it on a console that
 //! accepts it.
 
+mod capture_path;
+mod error;
 pub mod profile;
 pub mod session;
 pub mod xbm;
 
+pub use capture_path::CaptureRemotePath;
+pub use error::PixError;
+pub use error::XbmError;
 pub use profile::CaptureProfile;
 pub use profile::HdmiFrameRate;
 pub use profile::Resolution;
@@ -38,11 +43,9 @@ pub use session::ConnectOutcome;
 pub use session::Notification;
 pub use session::PIX_VERSION;
 pub use session::PixCmd;
-pub use session::PixError;
 pub use xbm::FrameCursor;
 pub use xbm::FrameHeader;
 pub use xbm::FrameRef;
 pub use xbm::MagicVariant;
-pub use xbm::XbmError;
 pub use xbm::XbmHeader;
 pub use xbm::detile_frame;

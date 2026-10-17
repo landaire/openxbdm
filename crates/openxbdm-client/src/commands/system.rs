@@ -1,17 +1,13 @@
 //! System-level control: reboot, title, notification registration,
 //! stop-on condition toggling.
 
-use crate::error::ArgumentError;
+use crate::commands::error::report_argument;
 use crate::error::Error;
 use crate::error::ParseError;
 use crate::protocol::ArgBuilder;
 use crate::protocol::Command;
 use crate::protocol::ExpectedBody;
 use crate::protocol::Response;
-
-fn report_argument(err: ArgumentError) -> rootcause::Report<Error> {
-    rootcause::Report::new(Error::from(err))
-}
 
 /// `reboot [STOP] [WAIT] [SMCRESET]`: reboot the console. The console
 /// replies `200- OK` before it restarts.
@@ -34,12 +30,15 @@ impl Command for Reboot {
         if self.stop {
             builder = builder.flag("STOP");
         }
+
         if self.wait {
             builder = builder.flag("WAIT");
         }
+
         if self.smc_reset {
             builder = builder.flag("SMCRESET");
         }
+
         Ok(builder.finish())
     }
 
@@ -49,6 +48,7 @@ impl Command for Reboot {
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         response.expect_ok().map_err(rootcause::Report::new)?;
+
         Ok(())
     }
 }
@@ -80,21 +80,31 @@ impl Command for MagicBoot {
         if let Some(title) = &self.title {
             builder = builder.quoted("TITLE", title).map_err(report_argument)?;
         }
-        if let Some(dir) = &self.directory {
-            builder = builder.quoted("DIRECTORY", dir).map_err(report_argument)?;
+
+        if let Some(directory) = &self.directory {
+            builder = builder
+                .quoted("DIRECTORY", directory)
+                .map_err(report_argument)?;
         }
-        if let Some(cmd) = &self.cmd_line {
-            builder = builder.quoted("CMDLINE", cmd).map_err(report_argument)?;
+
+        if let Some(cmd_line) = &self.cmd_line {
+            builder = builder
+                .quoted("CMDLINE", cmd_line)
+                .map_err(report_argument)?;
         }
+
         if self.cold {
             builder = builder.flag("COLD");
         }
+
         if self.wait {
             builder = builder.flag("WAIT");
         }
+
         if self.stop {
             builder = builder.flag("STOP");
         }
+
         Ok(builder.finish())
     }
 
@@ -104,6 +114,7 @@ impl Command for MagicBoot {
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         response.expect_ok().map_err(rootcause::Report::new)?;
+
         Ok(())
     }
 }
@@ -120,11 +131,11 @@ impl Command for Title {
 
     fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
         match self {
-            Title::Set { name } => ArgBuilder::new("title")
+            Self::Set { name } => ArgBuilder::new("title")
                 .quoted("NAME", name)
                 .map_err(report_argument)
                 .map(ArgBuilder::finish),
-            Title::NoPersist => Ok(ArgBuilder::new("title").flag("NOPERSIST").finish()),
+            Self::NoPersist => Ok(ArgBuilder::new("title").flag("NOPERSIST").finish()),
         }
     }
 
@@ -134,6 +145,7 @@ impl Command for Title {
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         response.expect_ok().map_err(rootcause::Report::new)?;
+
         Ok(())
     }
 }
@@ -163,6 +175,7 @@ impl StopOnFlags {
         if self.all {
             return vec!["all"];
         }
+
         [
             (self.create_thread, "createthread"),
             (self.first_chance_exception, "fce"),
@@ -190,6 +203,7 @@ impl Command for StopOn {
         for token in self.0.tokens() {
             builder = builder.flag(token);
         }
+
         Ok(builder.finish())
     }
 
@@ -199,6 +213,7 @@ impl Command for StopOn {
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         response.expect_ok().map_err(rootcause::Report::new)?;
+
         Ok(())
     }
 }
@@ -217,6 +232,7 @@ impl Command for NoStopOn {
         for token in self.0.tokens() {
             builder = builder.flag(token);
         }
+
         Ok(builder.finish())
     }
 
@@ -226,6 +242,7 @@ impl Command for NoStopOn {
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         response.expect_ok().map_err(rootcause::Report::new)?;
+
         Ok(())
     }
 }
@@ -254,12 +271,15 @@ impl Notify {
         if let Some(port) = self.reconnect_port {
             builder = builder.dec("reconnectport", u64::from(port));
         }
+
         if self.debug {
             builder = builder.flag("debug");
         }
+
         if self.reverse {
             builder = builder.flag("reverse");
         }
+
         builder.finish()
     }
 }
@@ -276,15 +296,6 @@ pub enum ExecutionState {
 }
 
 impl ExecutionState {
-    const ALL: [Self; 6] = [
-        Self::Stopped,
-        Self::Started,
-        Self::Rebooting,
-        Self::Pending,
-        Self::RebootTitle,
-        Self::PendingTitle,
-    ];
-
     /// The state's name in notification lines.
     pub const fn name(self) -> &'static str {
         match self {
@@ -299,11 +310,20 @@ impl ExecutionState {
 
     /// Parse an `execution <state>` notification line.
     pub fn parse_line(line: &str) -> Result<Self, ParseError> {
+        const ALL: [ExecutionState; 6] = [
+            ExecutionState::Stopped,
+            ExecutionState::Started,
+            ExecutionState::Rebooting,
+            ExecutionState::Pending,
+            ExecutionState::RebootTitle,
+            ExecutionState::PendingTitle,
+        ];
+
         let name = line
             .strip_prefix("execution ")
             .ok_or(ParseError::UnrecognizedShape)?;
-        Self::ALL
-            .into_iter()
+
+        ALL.into_iter()
             .find(|state| state.name() == name)
             .ok_or(ParseError::UnrecognizedShape)
     }

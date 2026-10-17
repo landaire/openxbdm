@@ -2,11 +2,13 @@
 
 use std::net::SocketAddr;
 
+use winnow::Parser;
 use winnow::error::ContextError;
 use winnow::error::ErrMode;
-use winnow::prelude::*;
 use winnow::token::any;
 use winnow::token::take;
+
+use crate::discovery::error::NapError;
 
 /// UDP port on which XBDM listens for name-resolution packets (730, same
 /// as the command port but on UDP instead of TCP).
@@ -15,6 +17,9 @@ pub const NAP_PORT: u16 = crate::XBDM_PORT;
 /// Maximum console name length supported by the protocol: `namelen` is a
 /// single unsigned byte.
 pub const MAX_NAME_LEN: usize = 255;
+
+/// Response opcode emitted by XBDM. The parser rejects any other value.
+pub const RESPONSE_OPCODE: u8 = 0x02;
 
 /// Request opcode. The low seven bits select the operation; with the high
 /// bit (0x80) set the console sends its reply to the broadcast address
@@ -29,48 +34,16 @@ pub enum RequestOpcode {
     WhatIsYourName = 0x03,
 }
 
-/// Response opcode emitted by XBDM. The parser rejects any other value.
-pub const RESPONSE_OPCODE: u8 = 0x02;
+impl RequestOpcode {
+    pub fn as_byte(self) -> u8 {
+        self as u8
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NapRequest {
     pub opcode: RequestOpcode,
     pub name: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NapResponse {
-    pub name: String,
-}
-
-/// Result of a single observed reply: the console's name, and the UDP
-/// socket address we received it from.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DiscoveredConsole {
-    pub name: String,
-    pub addr: SocketAddr,
-}
-
-#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
-pub enum NapError {
-    #[error("name is longer than {MAX_NAME_LEN} bytes and cannot fit in a NAP packet")]
-    NameTooLong,
-    #[error("name contains NUL, CR, or LF; the console compares names only up to a NUL")]
-    NameContainsControlChar,
-    #[error("response packet was empty")]
-    EmptyPacket,
-    #[error("response opcode was {got:#04x}; expected {expected:#04x}")]
-    UnexpectedOpcode { expected: u8, got: u8 },
-    #[error("response packet was truncated (header says {expected} name bytes, got {got})")]
-    Truncated { expected: usize, got: usize },
-    #[error("response name contained non-UTF-8 bytes")]
-    NonUtf8Name,
-}
-
-impl RequestOpcode {
-    pub fn as_byte(self) -> u8 {
-        self as u8
-    }
 }
 
 impl NapRequest {
@@ -89,60 +62,83 @@ impl NapRequest {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NapResponse {
+    pub name: String,
+}
+
+/// Result of a single observed reply: the console's name, and the UDP
+/// socket address we received it from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredConsole {
+    pub name: String,
+    pub addr: SocketAddr,
+}
+
 pub fn encode_request(request: &NapRequest) -> Result<Vec<u8>, NapError> {
-    let bytes = request.name.as_bytes();
-    if bytes.len() > MAX_NAME_LEN {
+    let name = request.name.as_bytes();
+    if name.len() > MAX_NAME_LEN {
         return Err(NapError::NameTooLong);
     }
-    if bytes.iter().any(|&b| matches!(b, 0 | b'\r' | b'\n')) {
+
+    if name.iter().any(|&byte| matches!(byte, 0 | b'\r' | b'\n')) {
         return Err(NapError::NameContainsControlChar);
     }
-    let mut buf = Vec::with_capacity(2 + bytes.len());
-    buf.push(request.opcode.as_byte());
-    buf.push(bytes.len() as u8);
-    buf.extend_from_slice(bytes);
-    Ok(buf)
+
+    let mut packet = Vec::with_capacity(2 + name.len());
+    packet.push(request.opcode.as_byte());
+    packet.push(name.len() as u8);
+    packet.extend_from_slice(name);
+
+    Ok(packet)
 }
 
 pub fn parse_response(packet: &[u8]) -> Result<NapResponse, NapError> {
     let mut input = packet;
+
     parser_response
         .parse_next(&mut input)
         .map_err(|_| classify_parse_failure(packet))
 }
 
 fn classify_parse_failure(packet: &[u8]) -> NapError {
-    if packet.is_empty() {
+    let [opcode, rest @ ..] = packet else {
         return NapError::EmptyPacket;
-    }
-    if packet[0] != RESPONSE_OPCODE {
+    };
+
+    if *opcode != RESPONSE_OPCODE {
         return NapError::UnexpectedOpcode {
             expected: RESPONSE_OPCODE,
-            got: packet[0],
+            got: *opcode,
         };
     }
-    if packet.len() < 2 {
+
+    let [name_len, name @ ..] = rest else {
         return NapError::Truncated {
             expected: 0,
             got: 0,
         };
-    }
-    let expected = packet[1] as usize;
-    let got = packet.len().saturating_sub(2);
+    };
+
+    let expected = *name_len as usize;
+    let got = name.len();
     if got < expected {
         return NapError::Truncated { expected, got };
     }
+
     NapError::NonUtf8Name
 }
 
 fn parser_response(input: &mut &[u8]) -> Result<NapResponse, ErrMode<ContextError>> {
-    any.verify(|b: &u8| *b == RESPONSE_OPCODE)
+    any.verify(|opcode: &u8| *opcode == RESPONSE_OPCODE)
         .parse_next(input)?;
-    let namelen = any.parse_next(input)? as usize;
-    let raw = take(namelen).parse_next(input)?;
+    let name_len = any.parse_next(input)? as usize;
+    let raw = take(name_len).parse_next(input)?;
+
     let name = core::str::from_utf8(raw)
-        .map(|s| s.to_owned())
+        .map(str::to_owned)
         .map_err(|_| ErrMode::Backtrack(ContextError::new()))?;
+
     Ok(NapResponse { name })
 }
 

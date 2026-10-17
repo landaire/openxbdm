@@ -23,45 +23,35 @@ pub enum Response {
     SendBinary { head: String },
 }
 
-/// Parse a `NNN[- ]rest` header appearing at the start of every response.
-pub fn parse_response_head(line: &str) -> Result<ResponseHead, Error> {
-    let _ = parse_status(line)?;
-    let (code, rest) = run_framing(response_head, line, FramingError::TrailingGarbageInHead)?;
-    let code = StatusCode::new(code).ok_or(FramingError::StatusOutOfRange)?;
-    Ok(ResponseHead {
-        code,
-        rest: rest.to_owned(),
-    })
-}
-
 impl Response {
     pub fn head(&self) -> &str {
         match self {
-            Response::Line { head, .. }
-            | Response::Multiline { head, .. }
-            | Response::Binary { head, .. }
-            | Response::SendBinary { head } => head,
+            Self::Line { head, .. }
+            | Self::Multiline { head, .. }
+            | Self::Binary { head, .. }
+            | Self::SendBinary { head } => head,
         }
     }
 
     /// Status code the console sent for this response.
     pub fn status(&self) -> StatusCode {
         let raw = match self {
-            Response::Line { code, .. } => code.raw(),
-            Response::Multiline { .. } => 202,
-            Response::Binary { .. } => 203,
-            Response::SendBinary { .. } => 204,
+            Self::Line { code, .. } => code.raw(),
+            Self::Multiline { .. } => 202,
+            Self::Binary { .. } => 203,
+            Self::SendBinary { .. } => 204,
         };
+
         StatusCode::new(raw).expect("success codes are status codes")
     }
 
     pub fn expect_ok(self) -> Result<String, Error> {
         match self {
-            Response::Line {
+            Self::Line {
                 code: SuccessCode::Ok,
                 head,
             } => Ok(head),
-            Response::Line { code, .. } => Err(Error::UnexpectedSuccessCode {
+            Self::Line { code, .. } => Err(Error::UnexpectedSuccessCode {
                 expected: SuccessCode::Ok,
                 got: code,
             }),
@@ -74,7 +64,7 @@ impl Response {
 
     pub fn expect_multiline(self) -> Result<Vec<String>, Error> {
         match self {
-            Response::Multiline { lines, .. } => Ok(lines),
+            Self::Multiline { lines, .. } => Ok(lines),
             other => Err(Error::UnexpectedStatus {
                 expected: ExpectedShape::Multiline202,
                 got: other.status(),
@@ -84,13 +74,28 @@ impl Response {
 
     pub fn expect_binary(self) -> Result<Vec<u8>, Error> {
         match self {
-            Response::Binary { data, .. } => Ok(data),
+            Self::Binary { data, .. } => Ok(data),
             other => Err(Error::UnexpectedStatus {
                 expected: ExpectedShape::Binary203,
                 got: other.status(),
             }),
         }
     }
+}
+
+/// Parse a `NNN[- ]rest` header appearing at the start of every response.
+pub fn parse_response_head(line: &str) -> Result<ResponseHead, Error> {
+    // Validate the status digits first so a malformed code reports the
+    // specific framing error rather than trailing garbage.
+    parse_status(line)?;
+
+    let (code, rest) = run_framing(response_head, line, FramingError::TrailingGarbageInHead)?;
+    let code = StatusCode::new(code).ok_or(FramingError::StatusOutOfRange)?;
+
+    Ok(ResponseHead {
+        code,
+        rest: rest.to_owned(),
+    })
 }
 
 #[cfg(test)]

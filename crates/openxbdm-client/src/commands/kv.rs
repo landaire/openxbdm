@@ -18,20 +18,20 @@ use crate::protocol::parse::KvValue;
 use crate::protocol::parse::kv_tokens;
 use crate::protocol::parse::run_parse;
 
+pub type Value<'a> = KvValue<'a>;
+
 #[derive(Debug)]
 pub struct KvLine<'a> {
     pairs: Vec<(&'a str, KvValue<'a>)>,
     flags: Vec<&'a str>,
 }
 
-pub type Value<'a> = KvValue<'a>;
-
 impl<'a> KvLine<'a> {
     pub fn get(&self, key: &str) -> Option<Value<'a>> {
         self.pairs
             .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(key))
-            .map(|(_, v)| *v)
+            .find(|(name, _)| name.eq_ignore_ascii_case(key))
+            .map(|(_, value)| *value)
     }
 
     pub fn require(&self, key: &'static str) -> Result<Value<'a>, ParseError> {
@@ -39,7 +39,9 @@ impl<'a> KvLine<'a> {
     }
 
     pub fn has_flag(&self, name: &str) -> bool {
-        self.flags.iter().any(|f| f.eq_ignore_ascii_case(name))
+        self.flags
+            .iter()
+            .any(|flag| flag.eq_ignore_ascii_case(name))
     }
 
     pub fn pairs(&self) -> impl Iterator<Item = (&'a str, Value<'a>)> + '_ {
@@ -67,36 +69,40 @@ pub fn parse_kv_line(line: &str) -> KvLine<'_> {
 /// Parse a `u32` from a bare or `0x`-prefixed value.
 pub fn value_u32(value: Value<'_>, key: &'static str) -> Result<u32, ParseError> {
     let raw = value.as_str();
-    if let Some(stripped) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
-        u32::from_str_radix(stripped, 16).map_err(|_| ParseError::InvalidHexDigits { key })
-    } else {
-        raw.parse::<u32>()
-            .map_err(|_| ParseError::InvalidDecimalU32 { key })
-    }
+    let Some(digits) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) else {
+        return raw
+            .parse::<u32>()
+            .map_err(|_| ParseError::InvalidDecimalU32 { key });
+    };
+
+    u32::from_str_radix(digits, 16).map_err(|_| ParseError::InvalidHexDigits { key })
 }
 
 /// Parse a `u64` from a bare or `0x`-prefixed value.
 pub fn value_u64(value: Value<'_>, key: &'static str) -> Result<u64, ParseError> {
     let raw = value.as_str();
-    if let Some(stripped) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
-        u64::from_str_radix(stripped, 16).map_err(|_| ParseError::InvalidHexDigits { key })
-    } else {
-        raw.parse::<u64>()
-            .map_err(|_| ParseError::InvalidDecimalU64 { key })
-    }
+    let Some(digits) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) else {
+        return raw
+            .parse::<u64>()
+            .map_err(|_| ParseError::InvalidDecimalU64 { key });
+    };
+
+    u64::from_str_radix(digits, 16).map_err(|_| ParseError::InvalidHexDigits { key })
 }
 
 /// Parse a quadword value (`0q` + 16 hex digits).
 pub fn value_qword(value: Value<'_>, key: &'static str) -> Result<u64, ParseError> {
     let raw = value.as_str();
-    let stripped = raw
+    let digits = raw
         .strip_prefix("0q")
         .or_else(|| raw.strip_prefix("0Q"))
         .ok_or(ParseError::MissingQuadwordPrefix { key })?;
-    if stripped.len() != 16 {
+
+    if digits.len() != 16 {
         return Err(ParseError::QuadwordWrongLength { key });
     }
-    u64::from_str_radix(stripped, 16).map_err(|_| ParseError::InvalidQuadwordHex { key })
+
+    u64::from_str_radix(digits, 16).map_err(|_| ParseError::InvalidQuadwordHex { key })
 }
 
 #[cfg(test)]

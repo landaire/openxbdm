@@ -22,7 +22,11 @@
 //! two characters before it may be the escape sequence `\r\n` denoting
 //! a literal CRLF in the captured stream.
 
+mod error;
+
 use std::fmt::Write as _;
+
+pub use error::CaptureParseError;
 
 /// Which side of the connection the bytes travelled on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -36,15 +40,15 @@ pub enum Direction {
 impl Direction {
     pub fn tag(self) -> &'static str {
         match self {
-            Direction::ServerToClient => "S>",
-            Direction::ClientToServer => "C>",
+            Self::ServerToClient => "S>",
+            Self::ClientToServer => "C>",
         }
     }
 
-    pub fn from_tag(s: &str) -> Option<Self> {
-        match s {
-            "S>" => Some(Direction::ServerToClient),
-            "C>" => Some(Direction::ClientToServer),
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "S>" => Some(Self::ServerToClient),
+            "C>" => Some(Self::ClientToServer),
             _ => None,
         }
     }
@@ -65,14 +69,48 @@ impl CaptureEntry {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct CaptureLog {
     entries: Vec<CaptureEntry>,
 }
 
 impl CaptureLog {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Parse a capture log from its text form. Lines beginning with `#`
+    /// are comments. Empty lines are skipped.
+    pub fn from_text(input: &str) -> Result<Self, CaptureParseError> {
+        let mut entries: Vec<CaptureEntry> = Vec::new();
+
+        for (idx, raw_line) in input.lines().enumerate() {
+            let line_no = idx + 1;
+            let line = raw_line.trim_end_matches('\n').trim_end_matches('\r');
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let Some((tag, rest)) = line.split_once(' ') else {
+                return Err(CaptureParseError::MissingTag { line_no });
+            };
+            let direction =
+                Direction::from_tag(tag).ok_or(CaptureParseError::UnknownTag { line_no })?;
+            let data = unescape(rest).ok_or(CaptureParseError::BadEscape { line_no })?;
+
+            if let Some(last) = entries.last_mut()
+                && last.direction == direction
+            {
+                last.data.extend_from_slice(&data);
+                continue;
+            }
+
+            entries.push(CaptureEntry { direction, data });
+        }
+
+        Ok(Self { entries })
     }
 
     pub fn entries(&self) -> &[CaptureEntry] {
@@ -91,12 +129,14 @@ impl CaptureLog {
         if bytes.is_empty() {
             return;
         }
+
         if let Some(last) = self.entries.last_mut()
             && last.direction == direction
         {
             last.data.extend_from_slice(bytes);
             return;
         }
+
         self.entries.push(CaptureEntry {
             direction,
             data: bytes.to_vec(),
@@ -106,6 +146,7 @@ impl CaptureLog {
     /// Render the capture to the canonical text format.
     pub fn to_text(&self) -> String {
         let mut out = String::from("# xbdm capture v1\n");
+
         for entry in &self.entries {
             let _ = writeln!(
                 &mut out,
@@ -114,95 +155,72 @@ impl CaptureLog {
                 escape(&entry.data)
             );
         }
-        out
-    }
 
-    /// Parse a capture log from its text form. Lines beginning with `#`
-    /// are comments. Empty lines are skipped.
-    pub fn from_text(input: &str) -> Result<Self, CaptureParseError> {
-        let mut entries: Vec<CaptureEntry> = Vec::new();
-        for (idx, raw_line) in input.lines().enumerate() {
-            let line = raw_line.trim_end_matches('\n').trim_end_matches('\r');
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let Some((tag, rest)) = line.split_once(' ') else {
-                return Err(CaptureParseError::MissingTag { line_no: idx + 1 });
-            };
-            let direction = Direction::from_tag(tag)
-                .ok_or(CaptureParseError::UnknownTag { line_no: idx + 1 })?;
-            let data = unescape(rest).ok_or(CaptureParseError::BadEscape { line_no: idx + 1 })?;
-            if let Some(last) = entries.last_mut()
-                && last.direction == direction
-            {
-                last.data.extend_from_slice(&data);
-                continue;
-            }
-            entries.push(CaptureEntry { direction, data });
-        }
-        Ok(Self { entries })
+        out
     }
 }
 
-#[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
-pub enum CaptureParseError {
-    #[error("capture line {line_no} is missing a direction tag")]
-    MissingTag { line_no: usize },
-    #[error("capture line {line_no} has an unknown direction tag")]
-    UnknownTag { line_no: usize },
-    #[error("capture line {line_no} contains an invalid escape sequence")]
-    BadEscape { line_no: usize },
+impl Default for CaptureLog {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn escape(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len());
-    for &b in bytes {
-        match b {
+
+    for &byte in bytes {
+        match byte {
             b'\\' => out.push_str(r"\\"),
             b'\r' => out.push_str(r"\r"),
             b'\n' => out.push_str(r"\n"),
             b'\t' => out.push_str(r"\t"),
-            0x20..=0x7e => out.push(b as char),
+            0x20..=0x7e => out.push(byte as char),
             _ => {
-                let _ = write!(out, r"\x{:02x}", b);
+                let _ = write!(out, r"\x{byte:02x}");
             }
         }
     }
+
     out
 }
 
 fn unescape(input: &str) -> Option<Vec<u8>> {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'\\' {
-            out.push(bytes[i]);
-            i += 1;
+    let mut idx = 0;
+
+    while idx < bytes.len() {
+        if bytes[idx] != b'\\' {
+            out.push(bytes[idx]);
+            idx += 1;
             continue;
         }
-        i += 1;
-        if i >= bytes.len() {
+
+        idx += 1;
+        if idx >= bytes.len() {
             return None;
         }
-        match bytes[i] {
+
+        match bytes[idx] {
             b'\\' => out.push(b'\\'),
             b'r' => out.push(b'\r'),
             b'n' => out.push(b'\n'),
             b't' => out.push(b'\t'),
             b'x' => {
-                if i + 2 >= bytes.len() {
+                if idx + 2 >= bytes.len() {
                     return None;
                 }
-                let hex = core::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
+                let hex = core::str::from_utf8(&bytes[idx + 1..idx + 3]).ok()?;
                 let byte = u8::from_str_radix(hex, 16).ok()?;
                 out.push(byte);
-                i += 2;
+                idx += 2;
             }
             _ => return None,
         }
-        i += 1;
+        idx += 1;
     }
+
     Some(out)
 }
 
@@ -219,19 +237,16 @@ mod tests {
         let text = log.to_text();
         let parsed = CaptureLog::from_text(&text).unwrap();
         assert_eq!(parsed.entries.len(), log.entries.len());
-        for (a, b) in parsed.entries.iter().zip(log.entries.iter()) {
-            assert_eq!(a.direction, b.direction);
-            assert_eq!(a.data, b.data);
+        for (parsed_entry, original) in parsed.entries.iter().zip(log.entries.iter()) {
+            assert_eq!(parsed_entry.direction, original.direction);
+            assert_eq!(parsed_entry.data, original.data);
         }
     }
 
     #[test]
     fn escapes_non_printable_bytes() {
-        let log = {
-            let mut l = CaptureLog::new();
-            l.push(Direction::ServerToClient, &[0x00, 0x1f, 0x80, b'a']);
-            l
-        };
+        let mut log = CaptureLog::new();
+        log.push(Direction::ServerToClient, &[0x00, 0x1f, 0x80, b'a']);
         let text = log.to_text();
         assert!(text.contains(r"\x00"));
         assert!(text.contains(r"\x1f"));

@@ -5,9 +5,10 @@
 //! Passwords travel only after a key exchange
 //! ([`crate::Client::key_exchange`]), XORed with the [`SessionKey`].
 
+use crate::commands::error::report_argument;
+use crate::commands::error::report_parse;
 use crate::commands::kv::parse_kv_line;
 use crate::commands::kv::value_qword;
-use crate::error::ArgumentError;
 use crate::error::Error;
 use crate::error::ParseError;
 use crate::protocol::ArgBuilder;
@@ -25,19 +26,6 @@ pub use openxbdm_core::auth::Password;
 pub use openxbdm_core::auth::SessionKey;
 pub use openxbdm_core::auth::dh_mod_exp;
 pub use openxbdm_core::auth::response;
-
-fn report_argument(err: ArgumentError) -> rootcause::Report<Error> {
-    rootcause::Report::new(Error::from(err))
-}
-
-fn report_parse(err: ParseError) -> rootcause::Report<Error> {
-    rootcause::Report::new(Error::from(err))
-}
-
-fn expect_ok(response: Response) -> Result<(), rootcause::Report<Error>> {
-    response.expect_ok().map_err(rootcause::Report::new)?;
-    Ok(())
-}
 
 /// Privilege bits of a user or connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -74,6 +62,7 @@ impl Privileges {
                 builder = builder.flag(word);
             }
         }
+
         builder
     }
 
@@ -106,8 +95,10 @@ impl LockChallenge {
         if kv.get("boxid").is_none() && kv.get("nonce").is_none() {
             return Ok(None);
         }
+
         let box_id = value_qword(kv.require("boxid")?, "boxid")?;
         let nonce = value_qword(kv.require("nonce")?, "nonce")?;
+
         Ok(Some(Self {
             box_id: BoxIdentifier(box_id),
             nonce: Nonce(nonce),
@@ -133,8 +124,10 @@ impl Command for BoxId {
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         let head = response.expect_ok().map_err(rootcause::Report::new)?;
+
         let kv = parse_kv_line(&head);
         let value = kv.require("boxid").map_err(report_parse)?;
+
         value_qword(value, "boxid")
             .map(BoxIdentifier)
             .map_err(report_parse)
@@ -158,8 +151,8 @@ impl Command for LockMode {
 
     fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
         let builder = ArgBuilder::new("lockmode");
-        Ok(match *self {
-            LockMode::Lock { box_id, encrypt } => {
+        let builder = match *self {
+            Self::Lock { box_id, encrypt } => {
                 let builder = builder.qword("boxid", Qword(box_id.0));
                 if encrypt {
                     builder.flag("encrypt")
@@ -167,9 +160,10 @@ impl Command for LockMode {
                     builder
                 }
             }
-            LockMode::Unlock => builder.flag("unlock"),
-        }
-        .finish())
+            Self::Unlock => builder.flag("unlock"),
+        };
+
+        Ok(builder.finish())
     }
 
     fn expected(&self) -> ExpectedBody {
@@ -210,19 +204,21 @@ impl Command for AuthUser {
 
     fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
         let builder = ArgBuilder::new("authuser");
-        Ok(match self {
-            AuthUser::Admin { response } => builder.qword("resp", Qword(response.0)).flag("admin"),
-            AuthUser::User { name, credential } => {
+        let builder = match self {
+            Self::Admin { response } => builder.qword("resp", Qword(response.0)).flag("admin"),
+            Self::User { name, credential } => {
                 let builder = match *credential {
                     Credential::Response(response) => builder.qword("resp", Qword(response.0)),
                     Credential::NewPassword { password, key } => {
                         builder.qword("passwd", Qword(key.encrypt(password)))
                     }
                 };
+
                 builder.quoted("name", name).map_err(report_argument)?
             }
-        }
-        .finish())
+        };
+
+        Ok(builder.finish())
     }
 
     fn expected(&self) -> ExpectedBody {
@@ -247,13 +243,12 @@ impl Command for AdminPassword {
 
     fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
         let builder = ArgBuilder::new("adminpw");
-        Ok(match *self {
-            AdminPassword::Clear => builder.flag("none"),
-            AdminPassword::Set { password, key } => {
-                builder.qword("passwd", Qword(key.encrypt(password)))
-            }
-        }
-        .finish())
+        let builder = match *self {
+            Self::Clear => builder.flag("none"),
+            Self::Set { password, key } => builder.qword("passwd", Qword(key.encrypt(password))),
+        };
+
+        Ok(builder.finish())
     }
 
     fn expected(&self) -> ExpectedBody {
@@ -280,6 +275,7 @@ impl Command for AddUser {
         let builder = ArgBuilder::new("user")
             .quoted("name", &self.name)
             .map_err(report_argument)?;
+
         Ok(self.privileges.append_flags(builder).finish())
     }
 
@@ -332,6 +328,7 @@ impl UserEntry {
         let mut rest = line
             .strip_prefix("name=\"")
             .ok_or(ParseError::UnrecognizedShape)?;
+
         let mut privileges = Privileges::NONE;
         for (bit, word) in Privileges::WORDS.iter().rev() {
             if let Some(stripped) = rest
@@ -342,9 +339,11 @@ impl UserEntry {
                 privileges = privileges.union(*bit);
             }
         }
+
         let name = rest
             .strip_suffix('"')
             .ok_or(ParseError::UnrecognizedShape)?;
+
         Ok(Self {
             name: name.to_owned(),
             privileges,
@@ -371,6 +370,7 @@ impl Command for UserList {
         let lines = response
             .expect_multiline()
             .map_err(rootcause::Report::new)?;
+
         lines
             .iter()
             .map(|line| UserEntry::parse(line).map_err(report_parse))
@@ -391,13 +391,12 @@ impl Command for GetUserPrivileges {
 
     fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
         let builder = ArgBuilder::new("getuserpriv");
-        Ok(match self {
-            GetUserPrivileges::Me => builder.flag("me"),
-            GetUserPrivileges::User(name) => {
-                builder.quoted("name", name).map_err(report_argument)?
-            }
-        }
-        .finish())
+        let builder = match self {
+            Self::Me => builder.flag("me"),
+            Self::User(name) => builder.quoted("name", name).map_err(report_argument)?,
+        };
+
+        Ok(builder.finish())
     }
 
     fn expected(&self) -> ExpectedBody {
@@ -409,6 +408,7 @@ impl Command for GetUserPrivileges {
         if head == "none" {
             return Ok(Privileges::NONE);
         }
+
         Privileges::parse_words(&head).map_err(report_parse)
     }
 }
@@ -428,6 +428,7 @@ impl Command for SetUserPrivileges {
         let builder = ArgBuilder::new("setuserpriv")
             .quoted("name", &self.name)
             .map_err(report_argument)?;
+
         Ok(self.privileges.append_flags(builder).finish())
     }
 
@@ -438,6 +439,12 @@ impl Command for SetUserPrivileges {
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         expect_ok(response)
     }
+}
+
+fn expect_ok(response: Response) -> Result<(), rootcause::Report<Error>> {
+    response.expect_ok().map_err(rootcause::Report::new)?;
+
+    Ok(())
 }
 
 #[cfg(test)]

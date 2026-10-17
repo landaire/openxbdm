@@ -45,20 +45,20 @@ impl ArgBuilder {
 
     /// Append `KEY=decimal`.
     pub fn dec(mut self, key: &str, value: impl Into<u64>) -> Self {
-        let _ = write!(self.buf, " {}={}", key, value.into());
+        let _ = write!(self.buf, " {key}={}", value.into());
         self
     }
 
     /// Append `KEY=signed-decimal`.
     pub fn int(mut self, key: &str, value: i64) -> Self {
-        let _ = write!(self.buf, " {}={}", key, value);
+        let _ = write!(self.buf, " {key}={value}");
         self
     }
 
     /// Append `KEY=0x<8 hex digits>`, the form used by most addresses,
     /// handles, and flag bitmasks.
     pub fn hex32(mut self, key: &str, value: u32) -> Self {
-        let _ = write!(self.buf, " {}=0x{:08x}", key, value);
+        let _ = write!(self.buf, " {key}=0x{value:08x}");
         self
     }
 
@@ -66,13 +66,13 @@ impl ArgBuilder {
     /// commands (e.g. `addtitlemem`, `SENDFILE LENGTH=0x%x`) that accept a
     /// plain hex literal rather than a fixed-width one.
     pub fn hex(mut self, key: &str, value: u64) -> Self {
-        let _ = write!(self.buf, " {}=0x{:x}", key, value);
+        let _ = write!(self.buf, " {key}=0x{value:x}");
         self
     }
 
     /// Append `KEY=0q<quad>` (64-bit quadword).
     pub fn qword(mut self, key: &str, value: Qword) -> Self {
-        let _ = write!(self.buf, " {}={}", key, value);
+        let _ = write!(self.buf, " {key}={value}");
         self
     }
 
@@ -83,10 +83,13 @@ impl ArgBuilder {
         if value.contains('"') {
             return Err(ArgumentError::QuotedContainsDoubleQuote);
         }
+
         if value.contains(['\r', '\n']) {
             return Err(ArgumentError::QuotedContainsCrlf);
         }
-        let _ = write!(self.buf, " {}=\"{}\"", key, value);
+
+        let _ = write!(self.buf, " {key}=\"{value}\"");
+
         Ok(self)
     }
 
@@ -102,8 +105,8 @@ mod tests {
 
     #[test]
     fn qword_formats_as_paired_halves() {
-        let q = Qword(0x1122_3344_5566_7788);
-        assert_eq!(q.to_string(), "0q1122334455667788");
+        let qword = Qword(0x1122_3344_5566_7788);
+        assert_eq!(qword.to_string(), "0q1122334455667788");
     }
 
     #[test]

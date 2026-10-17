@@ -27,17 +27,19 @@ where
 {
     let mut out = Vec::with_capacity(length as usize);
     let mut cursor = 0u32;
+
     while cursor < length {
         let take = core::cmp::min(CHUNK, length - cursor);
-        let snap = client
+        let snapshot = client
             .run(GetMem {
                 address: address.wrapping_add(cursor),
                 length: take,
             })
             .await?;
-        out.extend_from_slice(&snap.data);
+        out.extend_from_slice(&snapshot.data);
         cursor = cursor.wrapping_add(take);
     }
+
     Ok(out)
 }
 
@@ -50,6 +52,7 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     let bytes = read(client, address, 4).await?;
+
     Ok(u32::from_be_bytes(
         bytes.try_into().expect("asked for 4 bytes"),
     ))
@@ -65,12 +68,14 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     use crate::commands::memory::SetMem;
+
     client
         .run(SetMem {
             address,
             data: value.to_be_bytes().to_vec(),
         })
         .await?;
+
     Ok(())
 }
 
@@ -80,10 +85,11 @@ where
 /// search base. The null terminator is included in the match to avoid
 /// substring false positives.
 pub fn find_cstr(haystack: &[u8], needle: &str) -> Option<usize> {
-    let mut pat = Vec::with_capacity(needle.len() + 1);
-    pat.extend_from_slice(needle.as_bytes());
-    pat.push(0);
-    find_bytes(haystack, &pat, 1)
+    let mut pattern = Vec::with_capacity(needle.len() + 1);
+    pattern.extend_from_slice(needle.as_bytes());
+    pattern.push(0);
+
+    find_bytes(haystack, &pattern, 1)
 }
 
 /// Search `haystack` for `needle`, stepping by `align` bytes at a time
@@ -92,14 +98,17 @@ pub fn find_bytes(haystack: &[u8], needle: &[u8], align: usize) -> Option<usize>
     if needle.is_empty() || needle.len() > haystack.len() {
         return None;
     }
+
     let last = haystack.len() - needle.len();
-    let mut i = 0;
-    while i <= last {
-        if haystack[i..i + needle.len()] == *needle {
-            return Some(i);
+    let mut offset = 0;
+
+    while offset <= last {
+        if haystack[offset..offset + needle.len()] == *needle {
+            return Some(offset);
         }
-        i += align;
+        offset += align;
     }
+
     None
 }
 
@@ -111,14 +120,17 @@ pub fn find_bytes_all(haystack: &[u8], needle: &[u8], align: usize) -> Vec<usize
     if needle.is_empty() || needle.len() > haystack.len() {
         return out;
     }
+
     let last = haystack.len() - needle.len();
-    let mut i = 0;
-    while i <= last {
-        if haystack[i..i + needle.len()] == *needle {
-            out.push(i);
+    let mut offset = 0;
+
+    while offset <= last {
+        if haystack[offset..offset + needle.len()] == *needle {
+            out.push(offset);
         }
-        i += align;
+        offset += align;
     }
+
     out
 }
 

@@ -9,6 +9,7 @@ pub mod dangerous;
 pub mod debug;
 pub mod debug_ext;
 pub mod debugger;
+mod error;
 pub mod file;
 pub mod fs;
 pub mod info;
@@ -19,6 +20,7 @@ pub mod perf;
 #[cfg(feature = "capture")]
 pub mod pix;
 pub mod process;
+pub mod remote_path;
 pub mod screenshot;
 pub mod security;
 pub mod system;

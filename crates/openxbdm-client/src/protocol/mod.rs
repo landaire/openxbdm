@@ -22,10 +22,9 @@
 //! converts well-known error statuses into [`crate::error::Error::Remote`]
 //! before returning.
 
-pub(crate) mod parse;
-
 mod args;
 mod command;
+pub(crate) mod parse;
 pub mod response;
 mod status;
 

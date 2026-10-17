@@ -22,11 +22,21 @@ use powerpc::Uimm;
 /// compensate.
 pub fn address_halves(addr: u32) -> (u16, i16) {
     let lo = addr as i16;
-    let mut hi = (addr >> 16) as u16;
-    if (addr & 0xFFFF) >= 0x8000 {
-        hi = hi.wrapping_add(1);
-    }
+    let hi = if (addr & 0xFFFF) >= 0x8000 {
+        ((addr >> 16) as u16).wrapping_add(1)
+    } else {
+        (addr >> 16) as u16
+    };
+
     (hi, lo)
+}
+
+/// Inverse of [`address_halves`]: the address a `lis` / `addi` pair
+/// produces from its two immediates.
+pub(crate) fn combine_halves(hi: u16, lo: i16) -> u32 {
+    let hi_part = (hi as u32) << 16;
+
+    hi_part.wrapping_add(lo as i32 as u32)
 }
 
 /// PPC extensions flag set for the Xbox 360 PPC variant (Xenon is a
@@ -48,43 +58,75 @@ pub fn iter<'a>(bytes: &'a [u8], base_va: u32) -> InsIter<'a> {
     InsIter::new(bytes, base_va, xenon_extensions())
 }
 
-/// Match `lis rT, imm16`. Returns `Some(rT)` when the instruction is
-/// `addis rT, 0, imm16` with the given immediate.
-pub fn as_lis(ins: &Ins, imm16: u16) -> Option<u8> {
-    let parsed = ins.basic();
+/// Operands `(rT, imm16)` of any `lis rT, imm16`, i.e. `addis rT, 0,
+/// imm16`.
+pub(crate) fn lis_operands(ins: &Ins) -> Option<(u8, u16)> {
     if ins.op != Opcode::Addis {
         return None;
     }
+
+    let parsed = ins.basic();
     let args = parsed.args_iter().collect::<Vec<_>>();
     if args.len() < 3 {
         return None;
     }
+
     let rt = gpr(args[0])?;
     let ra = gpr(args[1])?;
-    let simm = uimm(args[2])? as u16;
-    if ra != 0 || simm != imm16 {
+    let imm = uimm(args[2])? as u16;
+    if ra != 0 {
         return None;
     }
+
+    Some((rt, imm))
+}
+
+/// Match `lis rT, imm16`. Returns `Some(rT)` when the instruction is
+/// `addis rT, 0, imm16` with the given immediate.
+pub fn as_lis(ins: &Ins, imm16: u16) -> Option<u8> {
+    let (rt, imm) = lis_operands(ins)?;
+    if imm != imm16 {
+        return None;
+    }
+
     Some(rt)
+}
+
+/// Operands `(rA, simm16)` of any `addi rT, rA, simm16`.
+pub(crate) fn addi_operands(ins: &Ins) -> Option<(u8, i16)> {
+    if ins.op != Opcode::Addi {
+        return None;
+    }
+
+    let parsed = ins.basic();
+    let args = parsed.args_iter().collect::<Vec<_>>();
+    if args.len() < 3 {
+        return None;
+    }
+
+    Some((gpr(args[1])?, simm(args[2])?))
 }
 
 /// Match `addi rT, rA, simm16` with the given immediate. Returns
 /// `Some((rT, rA))` on match.
 pub fn as_addi(ins: &Ins, imm16: i16) -> Option<(u8, u8)> {
-    let parsed = ins.basic();
     if ins.op != Opcode::Addi {
         return None;
     }
+
+    let parsed = ins.basic();
     let args = parsed.args_iter().collect::<Vec<_>>();
     if args.len() < 3 {
         return None;
     }
+
     let rt = gpr(args[0])?;
     let ra = gpr(args[1])?;
-    let simm = simm(args[2])?;
-    if simm != imm16 {
+    let imm = simm(args[2])?;
+    if imm != imm16 {
         return None;
     }
+
     Some((rt, ra))
 }
 
@@ -96,6 +138,7 @@ pub fn as_li(ins: &Ins, imm16: i16) -> Option<u8> {
     if ra != 0 {
         return None;
     }
+
     Some(rt)
 }
 
@@ -107,20 +150,21 @@ pub fn is_mflr_r12(ins: &Ins) -> bool {
     if ins.op != Opcode::Mfspr {
         return false;
     }
+
     let parsed = ins.basic();
     let args = parsed.args_iter().collect::<Vec<_>>();
     if args.len() < 2 {
         return false;
     }
-    let rt = match gpr(args[0]) {
-        Some(r) => r,
-        None => return false,
+
+    let Some(rt) = gpr(args[0]) else {
+        return false;
     };
-    let spr = match args[1] {
-        Argument::SPR(s) => s.0,
-        _ => return false,
+    let Argument::SPR(spr) = args[1] else {
+        return false;
     };
-    rt == 12 && spr == 8
+
+    rt == 12 && spr.0 == 8
 }
 
 /// Extract the absolute branch target for a `bl` instruction at
@@ -129,31 +173,33 @@ pub fn bl_target(ins: &Ins, address: u32) -> Option<u32> {
     if ins.op != Opcode::B {
         return None;
     }
-    // `B` covers b / ba / bl / bla; "is_direct_branch" plus the LK
-    // bit in the raw word gives us the `bl` discriminator.
+
+    // `B` covers b / ba / bl / bla; the LK bit in the raw word selects
+    // the linking forms.
     if ins.code & 1 == 0 {
         return None;
     }
+
     ins.branch_dest(address)
 }
 
 fn gpr(arg: &Argument) -> Option<u8> {
     match arg {
-        Argument::GPR(g) => Some(g.0),
+        Argument::GPR(gpr) => Some(gpr.0),
         _ => None,
     }
 }
 
 fn uimm(arg: &Argument) -> Option<u32> {
     match arg {
-        Argument::Uimm(Uimm(v)) => Some(*v as u32),
+        Argument::Uimm(Uimm(value)) => Some(*value as u32),
         _ => None,
     }
 }
 
 fn simm(arg: &Argument) -> Option<i16> {
     match arg {
-        Argument::Simm(s) => Some(s.0),
+        Argument::Simm(simm) => Some(simm.0),
         _ => None,
     }
 }

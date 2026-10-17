@@ -27,12 +27,14 @@
 //!    on with the console in an inconsistent state.
 
 pub mod drivemap;
+mod error;
 pub mod pe;
 pub mod ppc;
 pub mod sigscan;
 
 pub use drivemap::DrivemapEnableReport;
-pub use drivemap::DrivemapError;
 pub use drivemap::DrivemapPersistReport;
 pub use drivemap::DrivemapStatus;
 pub use drivemap::XbdmLayout;
+pub use error::DrivemapError;
+pub use error::PeError;

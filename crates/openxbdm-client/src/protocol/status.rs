@@ -56,7 +56,9 @@ pub fn parse_status(text: &str) -> Result<StatusCode, FramingError> {
     if text.len() < 3 {
         return Err(FramingError::HeadTooShort);
     }
+
     let code = run_framing(three_digit_code, &text[..3], FramingError::NonDigitInStatus)?;
+
     StatusCode::new(code).ok_or(FramingError::StatusOutOfRange)
 }
 

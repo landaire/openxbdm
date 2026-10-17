@@ -3,6 +3,7 @@
 use core::fmt::Write as _;
 use core::net::Ipv4Addr;
 
+use crate::commands::error::report_parse;
 use crate::error::Error;
 use crate::error::ParseError;
 use crate::protocol::ArgBuilder;
@@ -11,10 +12,6 @@ use crate::protocol::ExpectedBody;
 use crate::protocol::Response;
 
 pub use openxbdm_core::status::Hresult;
-
-fn report_parse(err: ParseError) -> rootcause::Report<Error> {
-    rootcause::Report::new(Error::from(err))
-}
 
 /// `kd <subcommand>`: route debug exceptions to the kernel debugger or to
 /// the debug monitor.
@@ -39,11 +36,12 @@ impl Command for Kd {
 
     fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
         let token = match self {
-            Kd::Enable => "enable",
-            Kd::Disable => "disable",
-            Kd::Except => "except",
-            Kd::ExceptIf => "exceptif",
+            Self::Enable => "enable",
+            Self::Disable => "disable",
+            Self::Except => "except",
+            Self::ExceptIf => "exceptif",
         };
+
         Ok(ArgBuilder::new("kd").flag(token).finish())
     }
 
@@ -53,6 +51,7 @@ impl Command for Kd {
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         response.expect_ok().map_err(rootcause::Report::new)?;
+
         Ok(())
     }
 }
@@ -72,9 +71,10 @@ impl Command for KdLite {
 
     fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
         let token = match self {
-            KdLite::Enable => "enable",
-            KdLite::Disable => "disable",
+            Self::Enable => "enable",
+            Self::Disable => "disable",
         };
+
         Ok(ArgBuilder::new("kdlite").flag(token).finish())
     }
 
@@ -84,6 +84,7 @@ impl Command for KdLite {
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         response.expect_ok().map_err(rootcause::Report::new)?;
+
         Ok(())
     }
 }
@@ -94,8 +95,11 @@ pub struct MacAddress(pub [u8; 6]);
 
 impl core::fmt::Display for MacAddress {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let [a, b, c, d, e, g] = self.0;
-        write!(f, "{a:02X}-{b:02X}-{c:02X}-{d:02X}-{e:02X}-{g:02X}")
+        let [octet0, octet1, octet2, octet3, octet4, octet5] = self.0;
+        write!(
+            f,
+            "{octet0:02X}-{octet1:02X}-{octet2:02X}-{octet3:02X}-{octet4:02X}-{octet5:02X}"
+        )
     }
 }
 
@@ -105,14 +109,17 @@ impl core::str::FromStr for MacAddress {
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         let mut octets = [0u8; 6];
         let mut parts = text.split('-');
+
         for octet in &mut octets {
             let part = parts.next().ok_or(ParseError::UnrecognizedShape)?;
             *octet = u8::from_str_radix(part, 16)
                 .map_err(|_| ParseError::InvalidHexDigits { key: "Target MAC" })?;
         }
+
         if parts.next().is_some() {
             return Err(ParseError::UnrecognizedShape);
         }
+
         Ok(Self(octets))
     }
 }
@@ -125,25 +132,6 @@ pub enum KdNetUpdate {
     Saved(Hresult),
     /// `kdnet: unable to load current kdnet settings: 0x%08x`.
     LoadFailed(Hresult),
-}
-
-fn parse_status_hex(text: &str, key: &'static str) -> Result<Hresult, ParseError> {
-    let digits = text
-        .strip_prefix("0x")
-        .ok_or(ParseError::InvalidHexDigits { key })?;
-    u32::from_str_radix(digits, 16)
-        .map(Hresult)
-        .map_err(|_| ParseError::InvalidHexDigits { key })
-}
-
-fn parse_update(head: &str, saved_prefix: &str) -> Result<KdNetUpdate, ParseError> {
-    if let Some(status) = head.strip_prefix(saved_prefix) {
-        return parse_status_hex(status, "status").map(KdNetUpdate::Saved);
-    }
-    if let Some(status) = head.strip_prefix("kdnet: unable to load current kdnet settings: ") {
-        return parse_status_hex(status, "status").map(KdNetUpdate::LoadFailed);
-    }
-    Err(ParseError::UnrecognizedShape)
 }
 
 /// `kdnet enable`: set the enable field of the network kernel debugger
@@ -218,54 +206,6 @@ pub enum KdNetQuery {
 #[derive(Debug, Clone, Copy)]
 pub struct KdNetShow;
 
-/// Fields of the `kdnet show` line, separated by byte 0x1e and each
-/// introduced by a tab.
-fn parse_settings(head: &str) -> Result<KdNetQuery, ParseError> {
-    if let Some(status) = head.strip_prefix("kdnet: failed to load current settings: ") {
-        return parse_status_hex(status, "status").map(KdNetQuery::LoadFailed);
-    }
-    let body = head
-        .strip_prefix("kdnet settings:\u{1e}")
-        .ok_or(ParseError::UnrecognizedShape)?;
-    let mut fields = body.split('\u{1e}');
-    let mut field = |prefix: &str, key: &'static str| {
-        fields
-            .next()
-            .and_then(|text| text.strip_prefix('\t'))
-            .and_then(|text| text.strip_prefix(prefix))
-            .ok_or(ParseError::MissingKey { key })
-    };
-    // `%d` of an unsigned field.
-    let signed = |text: &str, key: &'static str| {
-        text.parse::<i32>()
-            .map(|value| value as u32)
-            .map_err(|_| ParseError::InvalidDecimalU32 { key })
-    };
-    let ip = |text: &str| {
-        text.parse::<Ipv4Addr>()
-            .map_err(|_| ParseError::UnrecognizedShape)
-    };
-    let enable = signed(field("Enable=", "Enable")?, "Enable")?;
-    let target_ip = ip(field("Target IP: ", "Target IP")?)?;
-    let target_mac = field("Target MAC: ", "Target MAC")?.parse::<MacAddress>()?;
-    let host_ip = ip(field("Host IP: ", "Host IP")?)?;
-    let host_port = field("Host Port: ", "Host Port")?
-        .parse::<u16>()
-        .map_err(|_| ParseError::InvalidDecimalU32 { key: "Host Port" })?;
-    let encrypted = signed(field("Encrypted: ", "Encrypted")?, "Encrypted")?;
-    if fields.next() != Some("") || fields.next().is_some() {
-        return Err(ParseError::UnrecognizedShape);
-    }
-    Ok(KdNetQuery::Settings(KdNetSettings {
-        enable,
-        target_ip,
-        target_mac,
-        host_ip,
-        host_port,
-        encrypted,
-    }))
-}
-
 impl Command for KdNetShow {
     type Output = KdNetQuery;
 
@@ -310,19 +250,24 @@ impl Command for KdNetSet {
 
     fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
         let mut line = String::from("kdnet set");
+
         if let Some(ip) = self.host_ip {
             let _ = write!(line, " IP={ip}");
         }
+
         if let Some(port) = self.host_port {
             let _ = write!(line, " Port={port}");
         }
+
         match self.target_mac {
             Some(KdNetMac::ConsoleDerived) => line.push_str(" Mac="),
             Some(KdNetMac::Address(mac)) => {
                 let _ = write!(line, " Mac={mac}");
             }
+            // Omitted fields keep their flash values.
             None => {}
         }
+
         Ok(line)
     }
 
@@ -332,8 +277,85 @@ impl Command for KdNetSet {
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         response.expect_ok().map_err(rootcause::Report::new)?;
+
         Ok(())
     }
+}
+
+fn parse_status_hex(text: &str, key: &'static str) -> Result<Hresult, ParseError> {
+    let digits = text
+        .strip_prefix("0x")
+        .ok_or(ParseError::InvalidHexDigits { key })?;
+
+    u32::from_str_radix(digits, 16)
+        .map(Hresult)
+        .map_err(|_| ParseError::InvalidHexDigits { key })
+}
+
+fn parse_update(head: &str, saved_prefix: &str) -> Result<KdNetUpdate, ParseError> {
+    if let Some(status) = head.strip_prefix(saved_prefix) {
+        return parse_status_hex(status, "status").map(KdNetUpdate::Saved);
+    }
+
+    if let Some(status) = head.strip_prefix("kdnet: unable to load current kdnet settings: ") {
+        return parse_status_hex(status, "status").map(KdNetUpdate::LoadFailed);
+    }
+
+    Err(ParseError::UnrecognizedShape)
+}
+
+/// Fields of the `kdnet show` line, separated by byte 0x1e and each
+/// introduced by a tab.
+fn parse_settings(head: &str) -> Result<KdNetQuery, ParseError> {
+    if let Some(status) = head.strip_prefix("kdnet: failed to load current settings: ") {
+        return parse_status_hex(status, "status").map(KdNetQuery::LoadFailed);
+    }
+
+    let body = head
+        .strip_prefix("kdnet settings:\u{1e}")
+        .ok_or(ParseError::UnrecognizedShape)?;
+
+    let mut fields = body.split('\u{1e}');
+    let mut field = |prefix: &str, key: &'static str| {
+        fields
+            .next()
+            .and_then(|text| text.strip_prefix('\t'))
+            .and_then(|text| text.strip_prefix(prefix))
+            .ok_or(ParseError::MissingKey { key })
+    };
+
+    // `%d` of an unsigned field.
+    let signed = |text: &str, key: &'static str| {
+        text.parse::<i32>()
+            .map(|value| value as u32)
+            .map_err(|_| ParseError::InvalidDecimalU32 { key })
+    };
+    let ip = |text: &str| {
+        text.parse::<Ipv4Addr>()
+            .map_err(|_| ParseError::UnrecognizedShape)
+    };
+
+    let enable = signed(field("Enable=", "Enable")?, "Enable")?;
+    let target_ip = ip(field("Target IP: ", "Target IP")?)?;
+    let target_mac = field("Target MAC: ", "Target MAC")?.parse::<MacAddress>()?;
+    let host_ip = ip(field("Host IP: ", "Host IP")?)?;
+    let host_port = field("Host Port: ", "Host Port")?
+        .parse::<u16>()
+        .map_err(|_| ParseError::InvalidDecimalU32 { key: "Host Port" })?;
+    let encrypted = signed(field("Encrypted: ", "Encrypted")?, "Encrypted")?;
+
+    if fields.next() != Some("") || fields.next().is_some() {
+        return Err(ParseError::UnrecognizedShape);
+    }
+
+    Ok(KdNetQuery::Settings(KdNetSettings {
+        enable,
+        target_ip,
+        target_mac,
+        host_ip,
+        host_port,
+        encrypted,
+    }))
 }
 
 #[cfg(test)]

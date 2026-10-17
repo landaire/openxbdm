@@ -1,6 +1,7 @@
 //! Debug execution control: stop, go, halt, continue, suspend, resume,
 //! breakpoint management, stop-reason queries, and crash dumps.
 
+use crate::commands::error::report_parse;
 use crate::commands::kv::KvLine;
 use crate::commands::kv::parse_kv_line;
 use crate::commands::kv::value_u32;
@@ -15,18 +16,6 @@ use crate::protocol::RemoteStatus;
 use crate::protocol::Response;
 
 pub use openxbdm_core::status::NtStatus;
-
-fn report_parse(err: ParseError) -> rootcause::Report<Error> {
-    rootcause::Report::new(Error::from(err))
-}
-
-fn require_u32(kv: &KvLine<'_>, key: &'static str) -> Result<u32, ParseError> {
-    value_u32(kv.require(key)?, key)
-}
-
-fn require_thread(kv: &KvLine<'_>) -> Result<ThreadId, ParseError> {
-    require_u32(kv, "thread").map(ThreadId)
-}
 
 /// `stop`: suspend every title and system thread under debugger control.
 /// The console replies `426- already stopped` when execution is already
@@ -47,6 +36,7 @@ impl Command for Stop {
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         response.expect_ok().map_err(rootcause::Report::new)?;
+
         Ok(())
     }
 }
@@ -69,6 +59,7 @@ impl Command for Go {
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         response.expect_ok().map_err(rootcause::Report::new)?;
+
         Ok(())
     }
 }
@@ -97,6 +88,7 @@ impl Command for Halt {
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         response.expect_ok().map_err(rootcause::Report::new)?;
+
         Ok(())
     }
 }
@@ -119,9 +111,11 @@ impl Command for Continue {
 
     fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
         let mut builder = ArgBuilder::new("continue").hex32("THREAD", self.thread.as_u32());
+
         if self.pass_exception {
             builder = builder.flag("EXCEPTION");
         }
+
         Ok(builder.finish())
     }
 
@@ -131,6 +125,7 @@ impl Command for Continue {
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         response.expect_ok().map_err(rootcause::Report::new)?;
+
         Ok(())
     }
 }
@@ -156,6 +151,7 @@ impl Command for Suspend {
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         response.expect_ok().map_err(rootcause::Report::new)?;
+
         Ok(())
     }
 }
@@ -181,6 +177,7 @@ impl Command for Resume {
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         response.expect_ok().map_err(rootcause::Report::new)?;
+
         Ok(())
     }
 }
@@ -190,6 +187,36 @@ impl Command for Resume {
 #[derive(Debug, Clone, Copy)]
 pub struct IsStopped {
     pub thread: ThreadId,
+}
+
+impl Command for IsStopped {
+    type Output = StopState;
+
+    fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
+        Ok(ArgBuilder::new("isstopped")
+            .hex32("THREAD", self.thread.as_u32())
+            .finish())
+    }
+
+    fn expected(&self) -> ExpectedBody {
+        ExpectedBody::Line
+    }
+
+    fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
+        let head = response.expect_ok().map_err(rootcause::Report::new)?;
+
+        parse_stop_reason(&head)
+            .map(StopState::Halted)
+            .map_err(report_parse)
+    }
+
+    fn handle_remote(
+        &self,
+        code: RemoteStatus,
+        _message: &str,
+    ) -> Option<Result<Self::Output, rootcause::Report<Error>>> {
+        (code == ErrorCode::NotStopped).then_some(Ok(StopState::Running))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,12 +309,211 @@ pub enum AccessViolationKind {
     Write,
 }
 
-impl Command for IsStopped {
-    type Output = StopState;
+/// `break ADDR=<va>` / `break ADDR=<va> CLEAR`: set or clear a single
+/// execution breakpoint. The address must be 4-byte aligned.
+#[derive(Debug, Clone, Copy)]
+pub struct Breakpoint {
+    pub address: u32,
+    pub clear: bool,
+}
+
+impl Command for Breakpoint {
+    type Output = ();
 
     fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
-        Ok(ArgBuilder::new("isstopped")
-            .hex32("THREAD", self.thread.as_u32())
+        let mut builder = ArgBuilder::new("break").hex32("ADDR", self.address);
+
+        if self.clear {
+            builder = builder.flag("CLEAR");
+        }
+
+        Ok(builder.finish())
+    }
+
+    fn expected(&self) -> ExpectedBody {
+        ExpectedBody::Line
+    }
+
+    fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
+        response.expect_ok().map_err(rootcause::Report::new)?;
+
+        Ok(())
+    }
+}
+
+/// `break start`: place a one-shot breakpoint at the title's entry point
+/// so a pending `go` halts the moment the title begins executing. The
+/// console replies `400- execution not pending` unless execution is pending.
+#[derive(Debug, Clone, Copy)]
+pub struct SetInitialBreakpoint;
+
+impl Command for SetInitialBreakpoint {
+    type Output = ();
+
+    fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
+        Ok("break start".to_owned())
+    }
+
+    fn expected(&self) -> ExpectedBody {
+        ExpectedBody::Line
+    }
+
+    fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
+        response.expect_ok().map_err(rootcause::Report::new)?;
+
+        Ok(())
+    }
+}
+
+/// `break now`: the console waits 250 ms, then executes a debug trap in
+/// the command thread.
+#[derive(Debug, Clone, Copy)]
+pub struct BreakNow;
+
+impl Command for BreakNow {
+    type Output = ();
+
+    fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
+        Ok("break now".to_owned())
+    }
+
+    fn expected(&self) -> ExpectedBody {
+        ExpectedBody::Line
+    }
+
+    fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
+        response.expect_ok().map_err(rootcause::Report::new)?;
+
+        Ok(())
+    }
+}
+
+/// Access class monitored by the hardware data breakpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataBreakKind {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+impl DataBreakKind {
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Read => "READ",
+            Self::Write => "WRITE",
+            Self::ReadWrite => "READWRITE",
+        }
+    }
+}
+
+/// `break READ=<va> SIZE=<n>` / `break WRITE=<va> SIZE=<n> CLEAR` etc:
+/// set (or clear) the single hardware data breakpoint. The watched range
+/// must lie within one aligned doubleword; a second, different data
+/// breakpoint gives `400- out of memory`.
+#[derive(Debug, Clone, Copy)]
+pub struct DataBreakpoint {
+    pub address: u32,
+    pub size: u32,
+    pub kind: DataBreakKind,
+    pub clear: bool,
+}
+
+impl Command for DataBreakpoint {
+    type Output = ();
+
+    fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
+        let mut builder = ArgBuilder::new("break")
+            .hex32(self.kind.token(), self.address)
+            .dec("SIZE", u64::from(self.size));
+
+        if self.clear {
+            builder = builder.flag("CLEAR");
+        }
+
+        Ok(builder.finish())
+    }
+
+    fn expected(&self) -> ExpectedBody {
+        ExpectedBody::Line
+    }
+
+    fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
+        response.expect_ok().map_err(rootcause::Report::new)?;
+
+        Ok(())
+    }
+}
+
+/// `break clearall`: remove every execution breakpoint and the data
+/// breakpoint.
+#[derive(Debug, Clone, Copy)]
+pub struct ClearAllBreakpoints;
+
+impl Command for ClearAllBreakpoints {
+    type Output = ();
+
+    fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
+        Ok("break clearall".to_owned())
+    }
+
+    fn expected(&self) -> ExpectedBody {
+        ExpectedBody::Line
+    }
+
+    fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
+        response.expect_ok().map_err(rootcause::Report::new)?;
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakpointKind {
+    /// `type=0`.
+    None,
+    /// `type=4`: software execution breakpoint.
+    Execution,
+    /// `type=1` write, `type=2` read/write, `type=5` read.
+    Data(DataBreakKind),
+}
+
+impl BreakpointKind {
+    /// The `type=` value of the `isbreak` reply.
+    pub fn code(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Execution => 4,
+            Self::Data(DataBreakKind::Write) => 1,
+            Self::Data(DataBreakKind::ReadWrite) => 2,
+            Self::Data(DataBreakKind::Read) => 5,
+        }
+    }
+
+    pub fn from_code(code: u32) -> Option<Self> {
+        match code {
+            0 => Some(Self::None),
+            4 => Some(Self::Execution),
+            1 => Some(Self::Data(DataBreakKind::Write)),
+            2 => Some(Self::Data(DataBreakKind::ReadWrite)),
+            5 => Some(Self::Data(DataBreakKind::Read)),
+            _ => None,
+        }
+    }
+}
+
+/// `isbreak ADDR=<va>`: query whether an address has a breakpoint (and of
+/// what kind). Only exact address equality is tested.
+#[derive(Debug, Clone, Copy)]
+pub struct IsBreak {
+    pub address: u32,
+}
+
+impl Command for IsBreak {
+    type Output = BreakpointKind;
+
+    fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
+        Ok(ArgBuilder::new("isbreak")
+            .hex32("ADDR", self.address)
             .finish())
     }
 
@@ -297,22 +523,45 @@ impl Command for IsStopped {
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         let head = response.expect_ok().map_err(rootcause::Report::new)?;
-        parse_stop_reason(&head)
-            .map(StopState::Halted)
-            .map_err(report_parse)
+        let kv = parse_kv_line(&head);
+        let code = require_u32(&kv, "type").map_err(report_parse)?;
+
+        BreakpointKind::from_code(code).ok_or_else(|| {
+            report_parse(ParseError::UnknownCode {
+                key: "type",
+                value: code,
+            })
+        })
+    }
+}
+
+/// `crashdump`: the console replies `200- OK`, waits 200 ms, then writes a
+/// full system crash dump. Nothing further is sent on the connection.
+#[derive(Debug, Clone, Copy)]
+pub struct CrashDump;
+
+impl Command for CrashDump {
+    type Output = ();
+
+    fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
+        Ok("crashdump".to_owned())
     }
 
-    fn handle_remote(
-        &self,
-        code: RemoteStatus,
-        _message: &str,
-    ) -> Option<Result<Self::Output, rootcause::Report<Error>>> {
-        (code == ErrorCode::NotStopped).then_some(Ok(StopState::Running))
+    fn expected(&self) -> ExpectedBody {
+        ExpectedBody::Line
+    }
+
+    fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
+        response.expect_ok().map_err(rootcause::Report::new)?;
+
+        Ok(())
     }
 }
 
 fn parse_stop_reason(head: &str) -> Result<StopReason, ParseError> {
+    // A stop line may consist of the reason word alone.
     let (word, rest) = head.split_once(' ').unwrap_or((head, ""));
+
     if word == "rip" {
         // The string runs to end of line and may contain spaces.
         let (thread_part, message) = match rest.split_once(" string=") {
@@ -320,9 +569,12 @@ fn parse_stop_reason(head: &str) -> Result<StopReason, ParseError> {
             None => (rest, None),
         };
         let thread = require_thread(&parse_kv_line(thread_part))?;
+
         return Ok(StopReason::Rip { thread, message });
     }
+
     let kv = parse_kv_line(rest);
+
     match word {
         "stopped" if rest.is_empty() => Ok(StopReason::Stopped),
         "debugstr" if kv.has_flag("stop") => Ok(StopReason::DebugString {
@@ -354,6 +606,7 @@ fn parse_stop_reason(head: &str) -> Result<StopReason, ParseError> {
             .into_iter()
             .find(|(_, key)| kv.get(key).is_some())
             .ok_or(ParseError::MissingKey { key: "write" })?;
+
             Ok(StopReason::DataBreakpoint {
                 access,
                 data_address: require_u32(&kv, key)?,
@@ -378,6 +631,7 @@ fn parse_stop_reason(head: &str) -> Result<StopReason, ParseError> {
                     address: require_u32(&kv, "params")?,
                 }
             };
+
             Ok(StopReason::Exception(ExceptionStop {
                 code: NtStatus(require_u32(&kv, "code")?),
                 thread: require_thread(&kv)?,
@@ -391,242 +645,12 @@ fn parse_stop_reason(head: &str) -> Result<StopReason, ParseError> {
     }
 }
 
-/// `break ADDR=<va>` / `break ADDR=<va> CLEAR`: set or clear a single
-/// execution breakpoint. The address must be 4-byte aligned.
-#[derive(Debug, Clone, Copy)]
-pub struct Breakpoint {
-    pub address: u32,
-    pub clear: bool,
+fn require_u32(kv: &KvLine<'_>, key: &'static str) -> Result<u32, ParseError> {
+    value_u32(kv.require(key)?, key)
 }
 
-impl Command for Breakpoint {
-    type Output = ();
-
-    fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
-        let mut builder = ArgBuilder::new("break").hex32("ADDR", self.address);
-        if self.clear {
-            builder = builder.flag("CLEAR");
-        }
-        Ok(builder.finish())
-    }
-
-    fn expected(&self) -> ExpectedBody {
-        ExpectedBody::Line
-    }
-
-    fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
-        response.expect_ok().map_err(rootcause::Report::new)?;
-        Ok(())
-    }
-}
-
-/// `break start`: place a one-shot breakpoint at the title's entry point
-/// so a pending `go` halts the moment the title begins executing. The
-/// console replies `400- execution not pending` unless execution is pending.
-#[derive(Debug, Clone, Copy)]
-pub struct SetInitialBreakpoint;
-
-impl Command for SetInitialBreakpoint {
-    type Output = ();
-
-    fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
-        Ok("break start".to_owned())
-    }
-
-    fn expected(&self) -> ExpectedBody {
-        ExpectedBody::Line
-    }
-
-    fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
-        response.expect_ok().map_err(rootcause::Report::new)?;
-        Ok(())
-    }
-}
-
-/// `break now`: the console waits 250 ms, then executes a debug trap in
-/// the command thread.
-#[derive(Debug, Clone, Copy)]
-pub struct BreakNow;
-
-impl Command for BreakNow {
-    type Output = ();
-
-    fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
-        Ok("break now".to_owned())
-    }
-
-    fn expected(&self) -> ExpectedBody {
-        ExpectedBody::Line
-    }
-
-    fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
-        response.expect_ok().map_err(rootcause::Report::new)?;
-        Ok(())
-    }
-}
-
-/// Access class monitored by the hardware data breakpoint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DataBreakKind {
-    Read,
-    Write,
-    ReadWrite,
-}
-
-impl DataBreakKind {
-    pub fn token(self) -> &'static str {
-        match self {
-            DataBreakKind::Read => "READ",
-            DataBreakKind::Write => "WRITE",
-            DataBreakKind::ReadWrite => "READWRITE",
-        }
-    }
-}
-
-/// `break READ=<va> SIZE=<n>` / `break WRITE=<va> SIZE=<n> CLEAR` etc:
-/// set (or clear) the single hardware data breakpoint. The watched range
-/// must lie within one aligned doubleword; a second, different data
-/// breakpoint gives `400- out of memory`.
-#[derive(Debug, Clone, Copy)]
-pub struct DataBreakpoint {
-    pub address: u32,
-    pub size: u32,
-    pub kind: DataBreakKind,
-    pub clear: bool,
-}
-
-impl Command for DataBreakpoint {
-    type Output = ();
-
-    fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
-        let mut builder = ArgBuilder::new("break")
-            .hex32(self.kind.token(), self.address)
-            .dec("SIZE", self.size as u64);
-        if self.clear {
-            builder = builder.flag("CLEAR");
-        }
-        Ok(builder.finish())
-    }
-
-    fn expected(&self) -> ExpectedBody {
-        ExpectedBody::Line
-    }
-
-    fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
-        response.expect_ok().map_err(rootcause::Report::new)?;
-        Ok(())
-    }
-}
-
-/// `break clearall`: remove every execution breakpoint and the data
-/// breakpoint.
-#[derive(Debug, Clone, Copy)]
-pub struct ClearAllBreakpoints;
-
-impl Command for ClearAllBreakpoints {
-    type Output = ();
-
-    fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
-        Ok("break clearall".to_owned())
-    }
-
-    fn expected(&self) -> ExpectedBody {
-        ExpectedBody::Line
-    }
-
-    fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
-        response.expect_ok().map_err(rootcause::Report::new)?;
-        Ok(())
-    }
-}
-
-/// `isbreak ADDR=<va>`: query whether an address has a breakpoint (and of
-/// what kind). Only exact address equality is tested.
-#[derive(Debug, Clone, Copy)]
-pub struct IsBreak {
-    pub address: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BreakpointKind {
-    /// `type=0`.
-    None,
-    /// `type=4`: software execution breakpoint.
-    Execution,
-    /// `type=1` write, `type=2` read/write, `type=5` read.
-    Data(DataBreakKind),
-}
-
-impl BreakpointKind {
-    /// The `type=` value of the `isbreak` reply.
-    pub fn code(self) -> u32 {
-        match self {
-            BreakpointKind::None => 0,
-            BreakpointKind::Execution => 4,
-            BreakpointKind::Data(DataBreakKind::Write) => 1,
-            BreakpointKind::Data(DataBreakKind::ReadWrite) => 2,
-            BreakpointKind::Data(DataBreakKind::Read) => 5,
-        }
-    }
-
-    pub fn from_code(code: u32) -> Option<Self> {
-        match code {
-            0 => Some(BreakpointKind::None),
-            4 => Some(BreakpointKind::Execution),
-            1 => Some(BreakpointKind::Data(DataBreakKind::Write)),
-            2 => Some(BreakpointKind::Data(DataBreakKind::ReadWrite)),
-            5 => Some(BreakpointKind::Data(DataBreakKind::Read)),
-            _ => None,
-        }
-    }
-}
-
-impl Command for IsBreak {
-    type Output = BreakpointKind;
-
-    fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
-        Ok(ArgBuilder::new("isbreak")
-            .hex32("ADDR", self.address)
-            .finish())
-    }
-
-    fn expected(&self) -> ExpectedBody {
-        ExpectedBody::Line
-    }
-
-    fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
-        let head = response.expect_ok().map_err(rootcause::Report::new)?;
-        let kv = parse_kv_line(&head);
-        let code = require_u32(&kv, "type").map_err(report_parse)?;
-        BreakpointKind::from_code(code).ok_or_else(|| {
-            report_parse(ParseError::UnknownCode {
-                key: "type",
-                value: code,
-            })
-        })
-    }
-}
-
-/// `crashdump`: the console replies `200- OK`, waits 200 ms, then writes a
-/// full system crash dump. Nothing further is sent on the connection.
-#[derive(Debug, Clone, Copy)]
-pub struct CrashDump;
-
-impl Command for CrashDump {
-    type Output = ();
-
-    fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
-        Ok("crashdump".to_owned())
-    }
-
-    fn expected(&self) -> ExpectedBody {
-        ExpectedBody::Line
-    }
-
-    fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
-        response.expect_ok().map_err(rootcause::Report::new)?;
-        Ok(())
-    }
+fn require_thread(kv: &KvLine<'_>) -> Result<ThreadId, ParseError> {
+    require_u32(kv, "thread").map(ThreadId)
 }
 
 #[cfg(test)]
@@ -681,7 +705,7 @@ mod tests {
     fn isbreak_maps_stock_type_codes() {
         let kinds: Vec<BreakpointKind> = ["type=0", "type=4", "type=1", "type=2", "type=5"]
             .iter()
-            .map(|h| IsBreak { address: 0 }.parse(ok(h)).unwrap())
+            .map(|head| IsBreak { address: 0 }.parse(ok(head)).unwrap())
             .collect();
         insta::assert_debug_snapshot!(kinds, @r###"
         [

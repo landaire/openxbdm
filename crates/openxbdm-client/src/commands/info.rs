@@ -2,8 +2,9 @@
 
 use std::net::Ipv4Addr;
 
-use rootcause::prelude::*;
+use rootcause::prelude::ResultExt;
 
+use crate::commands::error::report_parse;
 use crate::commands::kv::parse_kv_line;
 use crate::commands::kv::value_u32;
 use crate::error::ArgumentError;
@@ -28,13 +29,14 @@ impl Command for DbgName {
 
     fn wire_line(&self) -> Result<String, rootcause::Report<Error>> {
         match self {
-            DbgName::Get => Ok(ArgBuilder::new("dbgname").finish()),
-            DbgName::Set(name) => {
+            Self::Get => Ok(ArgBuilder::new("dbgname").finish()),
+            Self::Set(name) => {
                 if name.contains(['\r', '\n', '"']) {
                     return Err(rootcause::Report::new(Error::from(
                         ArgumentError::InvalidDbgNameChar,
                     )));
                 }
+
                 // The monitor ends an unquoted value at the first space.
                 Ok(ArgBuilder::new("dbgname")
                     .quoted("name", name)
@@ -62,11 +64,6 @@ impl Command for DbgName {
 #[derive(Debug, Clone, Copy)]
 pub struct SysTime;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SysTimeResult {
-    pub file_time: FileTime,
-}
-
 impl Command for SysTime {
     type Output = SysTimeResult;
 
@@ -81,18 +78,20 @@ impl Command for SysTime {
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         let head = response.expect_ok().map_err(rootcause::Report::new)?;
         let kv = parse_kv_line(&head);
-        let hi_value = kv
-            .require("high")
-            .map_err(|e| rootcause::Report::new(Error::from(e)))?;
-        let lo_value = kv
-            .require("low")
-            .map_err(|e| rootcause::Report::new(Error::from(e)))?;
-        let hi = value_u32(hi_value, "high").map_err(|e| rootcause::Report::new(Error::from(e)))?;
-        let lo = value_u32(lo_value, "low").map_err(|e| rootcause::Report::new(Error::from(e)))?;
+        let hi_value = kv.require("high").map_err(report_parse)?;
+        let lo_value = kv.require("low").map_err(report_parse)?;
+        let hi = value_u32(hi_value, "high").map_err(report_parse)?;
+        let lo = value_u32(lo_value, "low").map_err(report_parse)?;
+
         Ok(SysTimeResult {
             file_time: FileTime::from_halves(hi, lo),
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SysTimeResult {
+    pub file_time: FileTime,
 }
 
 /// `setsystime clockhi= clocklo= [tz=]`: set the console clock. With
@@ -114,6 +113,7 @@ impl Command for SetSysTime {
         if self.time_zone_defaults {
             builder = builder.hex32("tz", 1);
         }
+
         Ok(builder.finish())
     }
 
@@ -123,6 +123,7 @@ impl Command for SetSysTime {
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         response.expect_ok().map_err(rootcause::Report::new)?;
+
         Ok(())
     }
 }
@@ -152,12 +153,6 @@ impl Command for DmVersion {
 #[derive(Debug, Clone, Copy)]
 pub struct GetConsoleType;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConsoleType {
-    DevKit,
-    TestKit,
-}
-
 impl Command for GetConsoleType {
     type Output = ConsoleType;
 
@@ -181,15 +176,16 @@ impl Command for GetConsoleType {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleType {
+    DevKit,
+    TestKit,
+}
+
 /// `consolefeatures`: returns a space-separated list of feature flags the
 /// current kernel advertises.
 #[derive(Debug, Clone, Copy)]
 pub struct GetConsoleFeatures;
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ConsoleFeatures {
-    pub flags: Vec<String>,
-}
 
 impl Command for GetConsoleFeatures {
     type Output = ConsoleFeatures;
@@ -206,10 +202,16 @@ impl Command for GetConsoleFeatures {
         let head = response.expect_ok().map_err(rootcause::Report::new)?;
         let flags = head
             .split_ascii_whitespace()
-            .map(|s| s.to_owned())
+            .map(|flag| flag.to_owned())
             .collect();
+
         Ok(ConsoleFeatures { flags })
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConsoleFeatures {
+    pub flags: Vec<String>,
 }
 
 /// `altaddr`: the IPv4 address of the title network stack.
@@ -230,12 +232,9 @@ impl Command for AltAddr {
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         let head = response.expect_ok().map_err(rootcause::Report::new)?;
         let kv = parse_kv_line(&head);
-        let raw = value_u32(
-            kv.require("addr")
-                .map_err(|e| rootcause::Report::new(Error::from(e)))?,
-            "addr",
-        )
-        .map_err(|e| rootcause::Report::new(Error::from(e)))?;
+        let raw =
+            value_u32(kv.require("addr").map_err(report_parse)?, "addr").map_err(report_parse)?;
+
         Ok(Ipv4Addr::from(raw))
     }
 }
@@ -258,29 +257,13 @@ impl Command for GetPid {
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         let head = response.expect_ok().map_err(rootcause::Report::new)?;
         let kv = parse_kv_line(&head);
-        value_u32(
-            kv.require("pid")
-                .map_err(|e| rootcause::Report::new(Error::from(e)))?,
-            "pid",
-        )
-        .map_err(|e| rootcause::Report::new(Error::from(e)))
+        value_u32(kv.require("pid").map_err(report_parse)?, "pid").map_err(report_parse)
     }
 }
 
 /// `consolemem`: memory configuration class.
 #[derive(Debug, Clone, Copy)]
 pub struct GetConsoleMem;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConsoleMem {
-    /// No additional memory is installed (value 0).
-    Standard,
-    /// Additional memory is installed but the kernel manages no more than
-    /// 0x20000 pages (value 1).
-    ExtraMemoryUnused,
-    /// The kernel manages more than 0x20000 pages (value 2).
-    ExtraMemoryInUse,
-}
 
 impl Command for GetConsoleMem {
     type Output = ConsoleMem;
@@ -297,11 +280,11 @@ impl Command for GetConsoleMem {
         let head = response.expect_ok().map_err(rootcause::Report::new)?;
         let kv = parse_kv_line(&head);
         let raw = value_u32(
-            kv.require("consolemem")
-                .map_err(|e| rootcause::Report::new(Error::from(e)))?,
+            kv.require("consolemem").map_err(report_parse)?,
             "consolemem",
         )
-        .map_err(|e| rootcause::Report::new(Error::from(e)))?;
+        .map_err(report_parse)?;
+
         match raw {
             0 => Ok(ConsoleMem::Standard),
             1 => Ok(ConsoleMem::ExtraMemoryUnused),
@@ -316,34 +299,22 @@ impl Command for GetConsoleMem {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleMem {
+    /// No additional memory is installed (value 0).
+    Standard,
+    /// Additional memory is installed but the kernel manages no more than
+    /// 0x20000 pages (value 1).
+    ExtraMemoryUnused,
+    /// The kernel manages more than 0x20000 pages (value 2).
+    ExtraMemoryInUse,
+}
+
 /// `getnetaddrs`: the debug name and the debug and title network address
 /// records (36 bytes each, sent as 72 hex digits). The name is not quoted
 /// and may contain spaces.
 #[derive(Debug, Clone, Copy)]
 pub struct GetNetAddrs;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NetAddrs {
-    pub name: String,
-    pub debug: Vec<u8>,
-    pub title: Vec<u8>,
-}
-
-fn hex_string_to_bytes(s: &str) -> Result<Vec<u8>, ParseError> {
-    if !s.len().is_multiple_of(2) {
-        return Err(ParseError::InvalidHexDigits { key: "net-blob" });
-    }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    for chunk in s.as_bytes().chunks(2) {
-        let pair = core::str::from_utf8(chunk)
-            .map_err(|_| ParseError::InvalidHexDigits { key: "net-blob" })?;
-        out.push(
-            u8::from_str_radix(pair, 16)
-                .map_err(|_| ParseError::InvalidHexDigits { key: "net-blob" })?,
-        );
-    }
-    Ok(out)
-}
 
 impl Command for GetNetAddrs {
     type Output = NetAddrs;
@@ -362,14 +333,20 @@ impl Command for GetNetAddrs {
         let rest = head.strip_prefix("name=").ok_or_else(shape)?;
         let (rest, title) = rest.rsplit_once(" title=").ok_or_else(shape)?;
         let (name, debug) = rest.rsplit_once(" debug=").ok_or_else(shape)?;
+
         Ok(NetAddrs {
             name: name.to_owned(),
-            debug: hex_string_to_bytes(debug)
-                .map_err(|e| rootcause::Report::new(Error::from(e)))?,
-            title: hex_string_to_bytes(title)
-                .map_err(|e| rootcause::Report::new(Error::from(e)))?,
+            debug: hex_string_to_bytes(debug).map_err(report_parse)?,
+            title: hex_string_to_bytes(title).map_err(report_parse)?,
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetAddrs {
+    pub name: String,
+    pub debug: Vec<u8>,
+    pub title: Vec<u8>,
 }
 
 /// `drivelist`: returns a multiline body of `drivename="<label>"` entries.
@@ -396,12 +373,33 @@ impl Command for DriveList {
             .expect_multiline()
             .map_err(rootcause::Report::new)?;
         let mut drives = Vec::with_capacity(lines.len());
+
         for line in lines {
             let kv = parse_kv_line(&line);
             if let Some(value) = kv.get("drivename") {
                 drives.push(value.as_str().to_owned());
             }
         }
+
         Ok(drives)
     }
+}
+
+fn hex_string_to_bytes(text: &str) -> Result<Vec<u8>, ParseError> {
+    if !text.len().is_multiple_of(2) {
+        return Err(ParseError::InvalidHexDigits { key: "net-blob" });
+    }
+
+    let mut bytes = Vec::with_capacity(text.len() / 2);
+
+    for chunk in text.as_bytes().chunks(2) {
+        let pair = core::str::from_utf8(chunk)
+            .map_err(|_| ParseError::InvalidHexDigits { key: "net-blob" })?;
+        bytes.push(
+            u8::from_str_radix(pair, 16)
+                .map_err(|_| ParseError::InvalidHexDigits { key: "net-blob" })?,
+        );
+    }
+
+    Ok(bytes)
 }

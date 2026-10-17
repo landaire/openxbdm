@@ -38,7 +38,7 @@ impl<T> RecordingTransport<T> {
     /// transport is consumed; the log itself implements `Clone` for
     /// snapshotting.
     pub fn log_handle(&self) -> Arc<Mutex<CaptureLog>> {
-        self.log.clone()
+        Arc::clone(&self.log)
     }
 
     /// Snapshot the log as of right now.
@@ -51,7 +51,10 @@ impl<T> RecordingTransport<T> {
     }
 }
 
-impl<T: AsyncRead + Unpin> AsyncRead for RecordingTransport<T> {
+impl<T> AsyncRead for RecordingTransport<T>
+where
+    T: AsyncRead + Unpin,
+{
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -59,17 +62,21 @@ impl<T: AsyncRead + Unpin> AsyncRead for RecordingTransport<T> {
     ) -> Poll<io::Result<usize>> {
         let this = &mut *self;
         let poll = Pin::new(&mut this.inner).poll_read(cx, buf);
-        if let Poll::Ready(Ok(n)) = &poll
-            && *n > 0
+        if let Poll::Ready(Ok(len)) = &poll
+            && *len > 0
             && let Ok(mut log) = this.log.lock()
         {
-            log.push(Direction::ServerToClient, &buf[..*n]);
+            log.push(Direction::ServerToClient, &buf[..*len]);
         }
+
         poll
     }
 }
 
-impl<T: AsyncWrite + Unpin> AsyncWrite for RecordingTransport<T> {
+impl<T> AsyncWrite for RecordingTransport<T>
+where
+    T: AsyncWrite + Unpin,
+{
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -77,12 +84,13 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for RecordingTransport<T> {
     ) -> Poll<io::Result<usize>> {
         let this = &mut *self;
         let poll = Pin::new(&mut this.inner).poll_write(cx, buf);
-        if let Poll::Ready(Ok(n)) = &poll
-            && *n > 0
+        if let Poll::Ready(Ok(len)) = &poll
+            && *len > 0
             && let Ok(mut log) = this.log.lock()
         {
-            log.push(Direction::ClientToServer, &buf[..*n]);
+            log.push(Direction::ClientToServer, &buf[..*len]);
         }
+
         poll
     }
 
@@ -109,8 +117,8 @@ mod tests {
         let mut recording = RecordingTransport::new(inner);
         let mut buf = [0u8; 64];
 
-        let n = futures::executor::block_on(recording.read(&mut buf)).unwrap();
-        assert_eq!(&buf[..n], b"201- connected\r\n");
+        let len = futures::executor::block_on(recording.read(&mut buf)).unwrap();
+        assert_eq!(&buf[..len], b"201- connected\r\n");
 
         let inner_cursor: &mut Cursor<Vec<u8>> = &mut recording.inner;
         inner_cursor.set_position(0);

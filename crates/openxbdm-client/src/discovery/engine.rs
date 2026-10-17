@@ -19,9 +19,9 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::discovery::error::NapError;
 use crate::discovery::wire::DiscoveredConsole;
 use crate::discovery::wire::NAP_PORT;
-use crate::discovery::wire::NapError;
 use crate::discovery::wire::NapRequest;
 use crate::discovery::wire::encode_request;
 use crate::discovery::wire::parse_response;
@@ -40,6 +40,7 @@ pub struct DiscoveryConfig {
     /// [`DiscoveryAction::Done`] fires once `now` reaches
     /// `start + listen_for`, returning whatever has accumulated so far.
     pub listen_for: Duration,
+
     /// Number of *additional* sends after the initial one. `0` sends
     /// the request once; `3` sends it four times total. XBDM
     /// occasionally drops a UDP packet on a busy kit, so a couple of
@@ -49,6 +50,7 @@ pub struct DiscoveryConfig {
     /// `start`, and each retransmit follows `retransmit_interval` after
     /// the previous one.
     pub retransmit_interval: Duration,
+
     /// Whether the caller plans to set `SO_BROADCAST` before sending.
     /// The state machine itself doesn't touch the socket -- this flag
     /// is carried so the I/O wrapper can configure the socket
@@ -101,17 +103,6 @@ pub enum DiscoveryAction {
     Done(Vec<DiscoveredConsole>),
 }
 
-/// Reply-acceptance policy. Constructed indirectly via
-/// [`Discovery::broadcast`] / [`Discovery::lookup`].
-#[derive(Debug, Clone)]
-enum DiscoveryFilter {
-    /// Keep every successful parse. Used by `discover_all`-style runs.
-    All,
-    /// Only keep replies whose name matches; complete on the first
-    /// match. Used by `find_by_name`-style runs.
-    StopOnName(String),
-}
-
 /// Sans-io NAP discovery state machine. See module docs for the I/O
 /// loop pattern. The machine never panics on duplicate inbound bytes,
 /// malformed packets, or out-of-order calls -- the worst it does is
@@ -121,10 +112,9 @@ pub struct Discovery {
     /// Cached encoded request packet -- the same bytes go out for every
     /// send (initial + retransmits).
     encoded_request: Vec<u8>,
-    /// Where each send should go. Carried separately from the action so
-    /// the encoded payload can stay borrowable from the engine if a
-    /// future API change wants that.
+    /// Where each send should go.
     destination: SocketAddr,
+
     /// Wall-clock instant after which `poll` returns `Done` with
     /// whatever has accumulated.
     deadline: Instant,
@@ -135,12 +125,14 @@ pub struct Discovery {
     sends_left: u32,
     /// Spacing applied between consecutive sends.
     retransmit_interval: Duration,
+
     /// Source addresses we've already processed -- the first reply per
     /// address wins, including for replies the filter would have
     /// rejected (saves redoing the parse on retransmit echoes).
     seen: HashSet<SocketAddr>,
     /// Replies the filter accepted, in arrival order.
     discovered: Vec<DiscoveredConsole>,
+
     /// Acceptance policy. Drives both per-reply keep-or-drop and the
     /// "stop early on first match" behavior used by `find_by_name`.
     filter: DiscoveryFilter,
@@ -154,10 +146,10 @@ impl Discovery {
     /// (`0x03`) packet, then collects replies until the deadline.
     pub fn broadcast(config: DiscoveryConfig, start: Instant) -> Self {
         let request = NapRequest::what_is_your_name();
-        Self::new(request, config, DiscoveryFilter::All, start)
-            // `what_is_your_name` carries an empty name so encoding
-            // never errors; unwrap is safe by construction.
-            .expect("broadcast request encodes")
+
+        // `what_is_your_name` carries an empty name, so encoding cannot
+        // fail.
+        Self::new(request, config, DiscoveryFilter::All, start).expect("broadcast request encodes")
     }
 
     /// Resolve a specific name to its `DiscoveredConsole`. Stops on the
@@ -173,6 +165,7 @@ impl Discovery {
     ) -> Result<Self, NapError> {
         let name = name.into();
         let request = NapRequest::lookup(name.clone());
+
         Self::new(request, config, DiscoveryFilter::StopOnName(name), start)
     }
 
@@ -182,14 +175,15 @@ impl Discovery {
         filter: DiscoveryFilter,
         start: Instant,
     ) -> Result<Self, NapError> {
-        let encoded = encode_request(&request)?;
-        let total_sends = config.retransmits.saturating_add(1);
+        let encoded_request = encode_request(&request)?;
+
         Ok(Self {
-            encoded_request: encoded,
+            encoded_request,
             destination: config.destination,
             deadline: start + config.listen_for,
-            next_send_at: if total_sends > 0 { Some(start) } else { None },
-            sends_left: total_sends,
+            // The initial send always fires at `start`.
+            next_send_at: Some(start),
+            sends_left: config.retransmits.saturating_add(1),
             retransmit_interval: config.retransmit_interval,
             seen: HashSet::new(),
             discovered: Vec::new(),
@@ -207,11 +201,12 @@ impl Discovery {
         if self.completed || now >= self.deadline {
             return DiscoveryAction::Done(std::mem::take(&mut self.discovered));
         }
+
         // Send branch fires first so a tied `now == next_send_at` time
         // value doesn't accidentally schedule a Wait that's already
         // past.
-        if let Some(at) = self.next_send_at
-            && at <= now
+        if let Some(send_at) = self.next_send_at
+            && send_at <= now
         {
             self.sends_left = self.sends_left.saturating_sub(1);
             self.next_send_at = if self.sends_left > 0 {
@@ -224,10 +219,12 @@ impl Discovery {
                 payload: self.encoded_request.clone(),
             };
         }
+
         let until = match self.next_send_at {
-            Some(t) => self.deadline.min(t),
+            Some(send_at) => self.deadline.min(send_at),
             None => self.deadline,
         };
+
         DiscoveryAction::Wait { until }
     }
 
@@ -241,9 +238,11 @@ impl Discovery {
         if !self.seen.insert(src) {
             return;
         }
+
         let Ok(reply) = parse_response(payload) else {
             return;
         };
+
         let console = DiscoveredConsole {
             name: reply.name,
             addr: src,
@@ -257,13 +256,25 @@ impl Discovery {
         if !keep {
             return;
         }
+
+        // First match wins; any further poll gets the early Done.
         if matches!(&self.filter, DiscoveryFilter::StopOnName(_)) {
-            // First match wins; any further replies to a future poll
-            // get the early Done.
             self.completed = true;
         }
+
         self.discovered.push(console);
     }
+}
+
+/// Reply-acceptance policy. Constructed indirectly via
+/// [`Discovery::broadcast`] / [`Discovery::lookup`].
+#[derive(Debug, Clone)]
+enum DiscoveryFilter {
+    /// Keep every successful parse. Used by `discover_all`-style runs.
+    All,
+    /// Only keep replies whose name matches; complete on the first
+    /// match. Used by `find_by_name`-style runs.
+    StopOnName(String),
 }
 
 #[cfg(test)]
@@ -271,11 +282,12 @@ mod tests {
     use super::*;
 
     fn config_with(retransmits: u32, interval_ms: u64, listen_ms: u64) -> DiscoveryConfig {
-        let mut c = DiscoveryConfig::broadcast();
-        c.retransmits = retransmits;
-        c.retransmit_interval = Duration::from_millis(interval_ms);
-        c.listen_for = Duration::from_millis(listen_ms);
-        c
+        let mut config = DiscoveryConfig::broadcast();
+        config.retransmits = retransmits;
+        config.retransmit_interval = Duration::from_millis(interval_ms);
+        config.listen_for = Duration::from_millis(listen_ms);
+
+        config
     }
 
     fn t0() -> Instant {
@@ -283,16 +295,17 @@ mod tests {
     }
 
     fn xbox_reply(name: &str) -> Vec<u8> {
-        let mut p = vec![0x02, name.len() as u8];
-        p.extend_from_slice(name.as_bytes());
-        p
+        let mut packet = vec![0x02, name.len() as u8];
+        packet.extend_from_slice(name.as_bytes());
+
+        packet
     }
 
     #[test]
     fn first_poll_sends_initial_packet() {
         let start = t0();
-        let mut d = Discovery::broadcast(config_with(0, 0, 100), start);
-        let action = d.poll(start);
+        let mut discovery = Discovery::broadcast(config_with(0, 0, 100), start);
+        let action = discovery.poll(start);
         match action {
             DiscoveryAction::SendDatagram { dest, payload } => {
                 assert_eq!(dest, DiscoveryConfig::broadcast().destination);
@@ -305,10 +318,10 @@ mod tests {
     #[test]
     fn after_initial_send_with_no_retransmits_waits_until_deadline() {
         let start = t0();
-        let mut d = Discovery::broadcast(config_with(0, 0, 1500), start);
+        let mut discovery = Discovery::broadcast(config_with(0, 0, 1500), start);
         // Drain the initial send.
-        d.poll(start);
-        match d.poll(start) {
+        discovery.poll(start);
+        match discovery.poll(start) {
             DiscoveryAction::Wait { until } => {
                 assert_eq!(until, start + Duration::from_millis(1500));
             }
@@ -319,14 +332,14 @@ mod tests {
     #[test]
     fn retransmit_fires_when_interval_elapses() {
         let start = t0();
-        let mut d = Discovery::broadcast(config_with(2, 400, 1500), start);
+        let mut discovery = Discovery::broadcast(config_with(2, 400, 1500), start);
         // Initial send.
         assert!(matches!(
-            d.poll(start),
+            discovery.poll(start),
             DiscoveryAction::SendDatagram { .. }
         ));
         // Before interval elapses: Wait.
-        match d.poll(start + Duration::from_millis(200)) {
+        match discovery.poll(start + Duration::from_millis(200)) {
             DiscoveryAction::Wait { until } => {
                 assert_eq!(until, start + Duration::from_millis(400));
             }
@@ -334,16 +347,16 @@ mod tests {
         }
         // After interval: send #2.
         assert!(matches!(
-            d.poll(start + Duration::from_millis(400)),
+            discovery.poll(start + Duration::from_millis(400)),
             DiscoveryAction::SendDatagram { .. }
         ));
         // Then send #3 at +800ms.
         assert!(matches!(
-            d.poll(start + Duration::from_millis(800)),
+            discovery.poll(start + Duration::from_millis(800)),
             DiscoveryAction::SendDatagram { .. }
         ));
         // No more sends -- next event is the deadline.
-        match d.poll(start + Duration::from_millis(900)) {
+        match discovery.poll(start + Duration::from_millis(900)) {
             DiscoveryAction::Wait { until } => {
                 assert_eq!(until, start + Duration::from_millis(1500));
             }
@@ -354,11 +367,11 @@ mod tests {
     #[test]
     fn deadline_returns_done_with_collected_replies() {
         let start = t0();
-        let mut d = Discovery::broadcast(config_with(0, 0, 500), start);
-        d.poll(start);
+        let mut discovery = Discovery::broadcast(config_with(0, 0, 500), start);
+        discovery.poll(start);
         let src: SocketAddr = "192.168.1.50:730".parse().unwrap();
-        d.handle_inbound(src, &xbox_reply("deanxbox"));
-        match d.poll(start + Duration::from_millis(500)) {
+        discovery.handle_inbound(src, &xbox_reply("deanxbox"));
+        match discovery.poll(start + Duration::from_millis(500)) {
             DiscoveryAction::Done(consoles) => {
                 assert_eq!(consoles.len(), 1);
                 assert_eq!(consoles[0].name, "deanxbox");
@@ -371,12 +384,13 @@ mod tests {
     #[test]
     fn dedup_drops_repeated_addr() {
         let start = t0();
-        let mut d = Discovery::broadcast(config_with(0, 0, 500), start);
-        d.poll(start);
+        let mut discovery = Discovery::broadcast(config_with(0, 0, 500), start);
+        discovery.poll(start);
         let src: SocketAddr = "10.0.0.5:730".parse().unwrap();
-        d.handle_inbound(src, &xbox_reply("dean"));
-        d.handle_inbound(src, &xbox_reply("dean")); // retransmit echo
-        let DiscoveryAction::Done(consoles) = d.poll(start + Duration::from_millis(500)) else {
+        discovery.handle_inbound(src, &xbox_reply("dean"));
+        discovery.handle_inbound(src, &xbox_reply("dean")); // retransmit echo
+        let DiscoveryAction::Done(consoles) = discovery.poll(start + Duration::from_millis(500))
+        else {
             panic!("expected Done")
         };
         assert_eq!(consoles.len(), 1);
@@ -385,12 +399,13 @@ mod tests {
     #[test]
     fn malformed_packets_are_silently_ignored() {
         let start = t0();
-        let mut d = Discovery::broadcast(config_with(0, 0, 500), start);
-        d.poll(start);
+        let mut discovery = Discovery::broadcast(config_with(0, 0, 500), start);
+        discovery.poll(start);
         let src: SocketAddr = "10.0.0.5:730".parse().unwrap();
-        d.handle_inbound(src, &[]); // empty
-        d.handle_inbound("10.0.0.6:730".parse().unwrap(), &[0x42, 0x00]); // bad opcode
-        let DiscoveryAction::Done(consoles) = d.poll(start + Duration::from_millis(500)) else {
+        discovery.handle_inbound(src, &[]); // empty
+        discovery.handle_inbound("10.0.0.6:730".parse().unwrap(), &[0x42, 0x00]); // bad opcode
+        let DiscoveryAction::Done(consoles) = discovery.poll(start + Duration::from_millis(500))
+        else {
             panic!("expected Done")
         };
         assert!(consoles.is_empty());
@@ -399,12 +414,12 @@ mod tests {
     #[test]
     fn lookup_completes_on_first_match() {
         let start = t0();
-        let mut d = Discovery::lookup("deanxbox", config_with(0, 0, 1500), start).unwrap();
-        d.poll(start);
-        d.handle_inbound("10.0.0.5:730".parse().unwrap(), &xbox_reply("otherxbox"));
-        d.handle_inbound("10.0.0.6:730".parse().unwrap(), &xbox_reply("deanxbox"));
+        let mut discovery = Discovery::lookup("deanxbox", config_with(0, 0, 1500), start).unwrap();
+        discovery.poll(start);
+        discovery.handle_inbound("10.0.0.5:730".parse().unwrap(), &xbox_reply("otherxbox"));
+        discovery.handle_inbound("10.0.0.6:730".parse().unwrap(), &xbox_reply("deanxbox"));
         // Even though deadline is 1500ms out, we should be Done now.
-        let DiscoveryAction::Done(consoles) = d.poll(start) else {
+        let DiscoveryAction::Done(consoles) = discovery.poll(start) else {
             panic!("expected early Done")
         };
         assert_eq!(consoles.len(), 1);
@@ -414,10 +429,11 @@ mod tests {
     #[test]
     fn lookup_filter_drops_non_matching_names() {
         let start = t0();
-        let mut d = Discovery::lookup("deanxbox", config_with(0, 0, 500), start).unwrap();
-        d.poll(start);
-        d.handle_inbound("10.0.0.5:730".parse().unwrap(), &xbox_reply("notdean"));
-        let DiscoveryAction::Done(consoles) = d.poll(start + Duration::from_millis(500)) else {
+        let mut discovery = Discovery::lookup("deanxbox", config_with(0, 0, 500), start).unwrap();
+        discovery.poll(start);
+        discovery.handle_inbound("10.0.0.5:730".parse().unwrap(), &xbox_reply("notdean"));
+        let DiscoveryAction::Done(consoles) = discovery.poll(start + Duration::from_millis(500))
+        else {
             panic!("expected Done")
         };
         assert!(consoles.is_empty());
@@ -438,11 +454,11 @@ mod tests {
         // semantics and prevents callers from accidentally double-
         // processing the same list.
         let start = t0();
-        let mut d = Discovery::broadcast(config_with(0, 0, 100), start);
-        d.poll(start);
-        d.handle_inbound("10.0.0.5:730".parse().unwrap(), &xbox_reply("dean"));
-        let first = d.poll(start + Duration::from_millis(100));
-        let second = d.poll(start + Duration::from_millis(100));
+        let mut discovery = Discovery::broadcast(config_with(0, 0, 100), start);
+        discovery.poll(start);
+        discovery.handle_inbound("10.0.0.5:730".parse().unwrap(), &xbox_reply("dean"));
+        let first = discovery.poll(start + Duration::from_millis(100));
+        let second = discovery.poll(start + Duration::from_millis(100));
         match (first, second) {
             (DiscoveryAction::Done(a), DiscoveryAction::Done(b)) => {
                 assert_eq!(a.len(), 1);

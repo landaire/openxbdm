@@ -37,11 +37,11 @@ pub enum Error {
 
     #[cfg(feature = "dangerous")]
     #[error(transparent)]
-    Drivemap(#[from] crate::commands::dangerous::drivemap::DrivemapError),
+    Drivemap(#[from] crate::commands::dangerous::DrivemapError),
 
     #[cfg(feature = "dangerous")]
     #[error(transparent)]
-    Pe(#[from] crate::commands::dangerous::pe::PeError),
+    Pe(#[from] crate::commands::dangerous::PeError),
 
     #[error("remote reported error {code} ({message:?})")]
     Remote { code: RemoteStatus, message: String },

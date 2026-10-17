@@ -51,14 +51,16 @@
 //! audio_count*0x1800` when flags=0.
 //!
 //! This module only implements the pieces needed for `xbm info` and
-//! `xbm extract`; the encoding path is in [`super::encode`].
+//! `xbm extract`.
 
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 
-use rootcause::prelude::*;
+use rootcause::prelude::ResultExt;
 
+use crate::commands::pix::PIX_VERSION;
+pub use crate::commands::pix::XbmError;
 use crate::error::Error;
 
 /// Size of the top-level file header in bytes.
@@ -70,21 +72,6 @@ pub const HEADER_SIZE: u64 = 0x800;
 pub const MAGIC_STANDARD: u32 = 0x53A722B4;
 pub const MAGIC_THUMBNAIL: u32 = 0x53A722B5;
 pub const MAGIC_ALTERNATE: u32 = 0x53A722B6;
-
-#[derive(Debug, thiserror::Error)]
-pub enum XbmError {
-    #[error("not an .xbm file: expected magic 0x53A722B[4-6], got {got:#010x}")]
-    BadMagic { got: u32 },
-    #[error(
-        "unsupported .xbm version {got:#010x}; only {expected:#010x} \
-         (matching xbmovie + PIX_VERSION) is known"
-    )]
-    UnsupportedVersion { got: u32, expected: u32 },
-    #[error("header size {got:#x} is not the expected {expected:#x}")]
-    UnexpectedHeaderSize { got: u32, expected: u32 },
-    #[error("frame record at {offset:#x} has implausible size {size}")]
-    ImplausibleFrameSize { offset: u64, size: u32 },
-}
 
 #[derive(Debug, Clone, Copy)]
 pub enum MagicVariant {
@@ -114,7 +101,7 @@ impl MagicVariant {
 
 /// The top-level file header. Only the fields we've actually
 /// identified from xbmovie.exe are exposed; the rest of the 0x800
-/// bytes are preserved as `trailing_raw` for debugging + later RE.
+/// bytes are preserved as `raw_tail` for debugging + later RE.
 #[derive(Debug, Clone)]
 pub struct XbmHeader {
     pub variant: MagicVariant,
@@ -137,34 +124,43 @@ pub struct XbmHeader {
 
 impl XbmHeader {
     /// Read and validate the 0x800-byte top-level header from a seekable reader.
-    pub fn read<R: Read + Seek>(r: &mut R) -> Result<Self, rootcause::Report<Error>> {
-        r.seek(SeekFrom::Start(0))
+    pub fn read<R>(reader: &mut R) -> Result<Self, rootcause::Report<Error>>
+    where
+        R: Read + Seek,
+    {
+        reader
+            .seek(SeekFrom::Start(0))
             .map_err(Error::from)
             .into_report()
             .attach("seeking xbm to offset 0")?;
-        let mut buf = [0u8; HEADER_SIZE as usize];
-        r.read_exact(&mut buf)
+
+        let mut block = [0u8; HEADER_SIZE as usize];
+        reader
+            .read_exact(&mut block)
             .map_err(Error::from)
             .into_report()
             .attach("reading xbm header block")?;
 
-        let read_u32 = |off: usize| u32::from_be_bytes(buf[off..off + 4].try_into().unwrap());
+        let read_u32 =
+            |offset: usize| u32::from_be_bytes(block[offset..offset + 4].try_into().unwrap());
 
         let magic = read_u32(0x000);
         let variant = MagicVariant::from_u32(magic).ok_or_else(|| {
             rootcause::Report::new(Error::from(XbmError::BadMagic { got: magic }))
         })?;
+
         let version = read_u32(0x004);
-        if version != crate::commands::pix::PIX_VERSION {
+        if version != PIX_VERSION {
             return Err(rootcause::Report::new(Error::from(
                 XbmError::UnsupportedVersion {
                     got: version,
-                    expected: crate::commands::pix::PIX_VERSION,
+                    expected: PIX_VERSION,
                 },
             )));
         }
+
         let header_size = read_u32(0x008);
-        if header_size as u64 != HEADER_SIZE {
+        if u64::from(header_size) != HEADER_SIZE {
             return Err(rootcause::Report::new(Error::from(
                 XbmError::UnexpectedHeaderSize {
                     got: header_size,
@@ -173,7 +169,7 @@ impl XbmHeader {
             )));
         }
 
-        Ok(XbmHeader {
+        Ok(Self {
             variant,
             version,
             header_size,
@@ -184,7 +180,7 @@ impl XbmHeader {
             timestamp_rate: read_u32(0x020),
             display_width: read_u32(0x038),
             display_height: read_u32(0x03C),
-            raw_tail: buf[0x040..].to_vec(),
+            raw_tail: block[0x040..].to_vec(),
         })
     }
 
@@ -200,10 +196,10 @@ impl XbmHeader {
 
     /// Raw YUV 4:2:0 byte count per frame for the `Standard` variant.
     pub fn frame_pixel_bytes(&self) -> u32 {
-        let w = self.aligned_frame_width();
-        let h = self.aligned_frame_height();
-        // w * h * 1.5 (planar 4:2:0)
-        w.wrapping_mul(h).wrapping_mul(3) / 2
+        let width = self.aligned_frame_width();
+        let height = self.aligned_frame_height();
+
+        width.wrapping_mul(height).wrapping_mul(3) / 2
     }
 
     /// Byte count of the plain (detiled) NV12 representation of one
@@ -211,6 +207,171 @@ impl XbmHeader {
     /// `aligned_w` stride and `aligned_h` / `aligned_h/2` height.
     pub fn nv12_bytes(&self) -> u32 {
         self.frame_pixel_bytes()
+    }
+}
+
+/// The 16-byte big-endian frame-record header.
+#[derive(Debug, Clone, Copy)]
+pub struct FrameHeader {
+    /// Per-stream sentinel (constant for all frames of one capture).
+    /// xbmovie scans the file for this value to locate the first
+    /// valid frame; we validate it against the sentinel recovered
+    /// during the initial scan.
+    pub frame_magic: u32,
+    /// Bit 0 set -> 0x38 bytes of metadata follow. Bit 1 set -> 0x600
+    /// bytes of palette-ish block follow.
+    pub flags: u32,
+    /// Timestamp in the file header's `timestamp_rate` ticks (absolute).
+    pub timestamp: u32,
+    /// Audio sample multiplier. Byte count = `audio_count * 0x1800`.
+    pub audio_count: u32,
+}
+
+impl FrameHeader {
+    pub const SIZE: u64 = 16;
+
+    pub fn parse(buf: &[u8; 16]) -> Self {
+        let read_u32 =
+            |offset: usize| u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap());
+
+        Self {
+            frame_magic: read_u32(0),
+            flags: read_u32(4),
+            timestamp: read_u32(8),
+            audio_count: read_u32(12),
+        }
+    }
+
+    pub fn has_metadata_struct(&self) -> bool {
+        self.flags & 1 != 0
+    }
+
+    pub fn has_palette_block(&self) -> bool {
+        self.flags & 2 != 0
+    }
+
+    /// Offset from the start of the frame record to the pixel data.
+    pub fn pixels_offset_within_record(&self) -> u64 {
+        let mut offset = 16u64;
+        if self.has_metadata_struct() {
+            offset += 0x38;
+        }
+        if self.has_palette_block() {
+            offset += 0x600;
+        }
+
+        (offset + 0x1FF) & !0x1FF
+    }
+
+    /// Size in bytes of the PCM audio payload tailing the frame.
+    pub fn audio_bytes(&self) -> u32 {
+        self.audio_count.wrapping_mul(0x1800)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FrameRef {
+    pub record_offset: u64,
+    pub pixels_offset: u64,
+    pub audio_offset: u64,
+    pub record_size: u64,
+    pub header: FrameHeader,
+}
+
+/// Iterate frame records in a file. Each yielded `FrameRef` carries
+/// the parsed `FrameHeader` plus the absolute file offset of its
+/// pixel payload (512-byte aligned, past any per-frame metadata).
+#[derive(Debug)]
+pub struct FrameCursor<'a, R> {
+    reader: &'a mut R,
+    file_size: u64,
+    next_offset: u64,
+    /// Sentinel from the first frame; subsequent frames must match.
+    expected_magic: Option<u32>,
+}
+
+impl<'a, R> FrameCursor<'a, R>
+where
+    R: Read + Seek,
+{
+    pub fn new(reader: &'a mut R) -> Result<Self, rootcause::Report<Error>> {
+        let file_size = reader
+            .seek(SeekFrom::End(0))
+            .map_err(Error::from)
+            .into_report()
+            .attach("stat-ing xbm file size")?;
+
+        Ok(Self {
+            reader,
+            file_size,
+            next_offset: HEADER_SIZE,
+            expected_magic: None,
+        })
+    }
+
+    /// Advance to the next frame record. Returns `Ok(None)` at EOF.
+    pub fn next_frame(
+        &mut self,
+        file_header: &XbmHeader,
+    ) -> Result<Option<FrameRef>, rootcause::Report<Error>> {
+        let offset = self.next_offset;
+        if offset + FrameHeader::SIZE > self.file_size {
+            return Ok(None);
+        }
+
+        self.reader
+            .seek(SeekFrom::Start(offset))
+            .map_err(Error::from)
+            .into_report()
+            .attach_with(|| format!("seek to frame at {offset:#x}"))?;
+
+        let mut header_bytes = [0u8; 16];
+        self.reader
+            .read_exact(&mut header_bytes)
+            .map_err(Error::from)
+            .into_report()
+            .attach("reading frame header")?;
+        let header = FrameHeader::parse(&header_bytes);
+
+        // First frame sets the sentinel we expect subsequent frames to
+        // carry. That catches a mis-computed record_size walking us
+        // off into audio data partway through the file.
+        let expected_magic = *self.expected_magic.get_or_insert(header.frame_magic);
+        if expected_magic != header.frame_magic {
+            return Err(
+                rootcause::Report::new(Error::from(XbmError::ImplausibleFrameSize {
+                    offset,
+                    size: 0,
+                }))
+                .attach(format!(
+                    "frame magic at {offset:#x} does not match the first frame's sentinel"
+                )),
+            );
+        }
+
+        let pixel_bytes = u64::from(file_header.frame_pixel_bytes());
+        let pixels_relative = header.pixels_offset_within_record();
+        let pixels_offset = offset + pixels_relative;
+        let audio_offset = pixels_offset + pixel_bytes;
+        let record_size = pixels_relative + pixel_bytes + u64::from(header.audio_bytes());
+        if offset + record_size > self.file_size {
+            return Err(rootcause::Report::new(Error::from(
+                XbmError::ImplausibleFrameSize {
+                    offset,
+                    size: record_size as u32,
+                },
+            )));
+        }
+
+        self.next_offset += record_size;
+
+        Ok(Some(FrameRef {
+            record_offset: offset,
+            pixels_offset,
+            audio_offset,
+            record_size,
+            header,
+        }))
     }
 }
 
@@ -229,19 +390,12 @@ impl XbmHeader {
 ///   16-wide half top-to-bottom, iters 16..31 fill the right half).
 ///
 /// Per-iter bytes: 32 Y (one per pixel in the 16x2 patch, in the
-/// permutation spelled out in [`Y_MAP`]) followed by 16 chroma
+/// permutation spelled out in `Y_MAP`) followed by 16 chroma
 /// bytes (1 NV12 chroma row of 8 UV pairs).
 ///
 /// Input and output buffers must both equal
 /// [`XbmHeader::frame_pixel_bytes`] in size.
 pub fn detile_frame(input: &[u8], output: &mut [u8], header: &XbmHeader) {
-    let aligned_w = header.aligned_frame_width() as usize;
-    let aligned_h = header.aligned_frame_height() as usize;
-    let y_plane_len = aligned_w * aligned_h;
-    let uv_plane_len = aligned_w * aligned_h / 2;
-    assert_eq!(input.len(), y_plane_len + uv_plane_len);
-    assert_eq!(output.len(), y_plane_len + uv_plane_len);
-
     // Each 4-byte group of Y bytes fills either the even-x or
     // odd-x columns of one patch row in reverse x order.
     const Y_MAP: [(usize, usize); 32] = [
@@ -278,197 +432,44 @@ pub fn detile_frame(input: &[u8], output: &mut [u8], header: &XbmHeader) {
         (11, 1),
         (9, 1),
     ];
-
     const ITER_BYTES: usize = 48;
-    const MACRO: usize = 32;
-    const ITERS_PER_SUPER: usize = 32;
-    let supers_x = aligned_w / MACRO;
-    let supers_y = aligned_h / MACRO;
+    const SUPER_BLOCK_SIZE: usize = 32;
+    const ITERS_PER_SUPER_BLOCK: usize = 32;
+
+    let aligned_w = header.aligned_frame_width() as usize;
+    let aligned_h = header.aligned_frame_height() as usize;
+    let y_plane_len = aligned_w * aligned_h;
+    let uv_plane_len = aligned_w * aligned_h / 2;
+    assert_eq!(input.len(), y_plane_len + uv_plane_len);
+    assert_eq!(output.len(), y_plane_len + uv_plane_len);
+
+    let super_columns = aligned_w / SUPER_BLOCK_SIZE;
+    let super_rows = aligned_h / SUPER_BLOCK_SIZE;
     let (y_out, uv_out) = output.split_at_mut(y_plane_len);
 
-    for sy in 0..supers_y {
-        for sx in 0..supers_x {
-            let sb_base_byte = (sy * supers_x + sx) * ITERS_PER_SUPER * ITER_BYTES;
-            let sb_x = sx * MACRO;
-            let sb_y = sy * MACRO;
+    for super_row in 0..super_rows {
+        for super_column in 0..super_columns {
+            let super_base =
+                (super_row * super_columns + super_column) * ITERS_PER_SUPER_BLOCK * ITER_BYTES;
+            let super_left = super_column * SUPER_BLOCK_SIZE;
+            let super_top = super_row * SUPER_BLOCK_SIZE;
 
-            for i in 0..ITERS_PER_SUPER {
-                let src = sb_base_byte + i * ITER_BYTES;
-                let y_offset = 2 * (i & 15);
-                let x_offset = 16 * ((i >> 4) & 1);
-                let patch_x = sb_x + x_offset;
-                let patch_y = sb_y + y_offset;
+            for iter in 0..ITERS_PER_SUPER_BLOCK {
+                let source = super_base + iter * ITER_BYTES;
+                let patch_x = super_left + 16 * ((iter >> 4) & 1);
+                let patch_y = super_top + 2 * (iter & 15);
 
-                for (byte_i, &(lx, ly)) in Y_MAP.iter().enumerate() {
-                    y_out[(patch_y + ly) * aligned_w + patch_x + lx] = input[src + byte_i];
+                for (byte_idx, &(column, row)) in Y_MAP.iter().enumerate() {
+                    y_out[(patch_y + row) * aligned_w + patch_x + column] =
+                        input[source + byte_idx];
                 }
 
                 // Chroma: 16 bytes = 1 chroma row of 8 UV pairs.
-                let cy = patch_y / 2;
-                let c_dst = cy * aligned_w + patch_x;
-                uv_out[c_dst..c_dst + 16].copy_from_slice(&input[src + 32..src + 48]);
+                let chroma_offset = patch_y / 2 * aligned_w + patch_x;
+                uv_out[chroma_offset..chroma_offset + 16]
+                    .copy_from_slice(&input[source + 32..source + 48]);
             }
         }
-    }
-}
-
-/// The 16-byte big-endian frame-record header.
-#[derive(Debug, Clone, Copy)]
-pub struct FrameHeader {
-    /// Per-stream sentinel (constant for all frames of one capture).
-    /// xbmovie scans the file for this value to locate the first
-    /// valid frame; we validate it against the sentinel recovered
-    /// during the initial scan.
-    pub frame_magic: u32,
-    /// Bit 0 set -> 0x38 bytes of metadata follow. Bit 1 set -> 0x600
-    /// bytes of palette-ish block follow.
-    pub flags: u32,
-    /// Timestamp in the file header's `timestamp_rate` ticks (absolute).
-    pub timestamp: u32,
-    /// Audio sample multiplier. Byte count = `audio_count * 0x1800`.
-    pub audio_count: u32,
-}
-
-impl FrameHeader {
-    pub const SIZE: u64 = 16;
-
-    pub fn parse(buf: &[u8; 16]) -> Self {
-        let u = |o: usize| u32::from_be_bytes(buf[o..o + 4].try_into().unwrap());
-        FrameHeader {
-            frame_magic: u(0),
-            flags: u(4),
-            timestamp: u(8),
-            audio_count: u(12),
-        }
-    }
-
-    pub fn has_metadata_struct(&self) -> bool {
-        self.flags & 1 != 0
-    }
-
-    pub fn has_palette_block(&self) -> bool {
-        self.flags & 2 != 0
-    }
-
-    /// Offset from the start of the frame record to the pixel data.
-    pub fn pixels_offset_within_record(&self) -> u64 {
-        let mut cur = 16u64;
-        if self.has_metadata_struct() {
-            cur += 0x38;
-        }
-        if self.has_palette_block() {
-            cur += 0x600;
-        }
-        (cur + 0x1FF) & !0x1FF
-    }
-
-    /// Size in bytes of the PCM audio payload tailing the frame.
-    pub fn audio_bytes(&self) -> u32 {
-        self.audio_count.wrapping_mul(0x1800)
-    }
-}
-
-/// Iterate frame records in a file. Each yielded `FrameRef` carries
-/// the parsed `FrameHeader` plus the absolute file offset of its
-/// pixel payload (512-byte aligned, past any per-frame metadata).
-#[derive(Debug)]
-pub struct FrameCursor<'a, R> {
-    reader: &'a mut R,
-    file_size: u64,
-    next_offset: u64,
-    /// Sentinel from the first frame; subsequent frames must match.
-    expected_magic: Option<u32>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct FrameRef {
-    pub record_offset: u64,
-    pub pixels_offset: u64,
-    pub audio_offset: u64,
-    pub record_size: u64,
-    pub header: FrameHeader,
-}
-
-impl<'a, R: Read + Seek> FrameCursor<'a, R> {
-    pub fn new(reader: &'a mut R) -> Result<Self, rootcause::Report<Error>> {
-        let file_size = reader
-            .seek(SeekFrom::End(0))
-            .map_err(Error::from)
-            .into_report()
-            .attach("stat-ing xbm file size")?;
-        Ok(FrameCursor {
-            reader,
-            file_size,
-            next_offset: HEADER_SIZE,
-            expected_magic: None,
-        })
-    }
-
-    /// Advance to the next frame record. Returns `Ok(None)` at EOF.
-    pub fn next_frame(
-        &mut self,
-        file_header: &XbmHeader,
-    ) -> Result<Option<FrameRef>, rootcause::Report<Error>> {
-        if self.next_offset + FrameHeader::SIZE > self.file_size {
-            return Ok(None);
-        }
-        self.reader
-            .seek(SeekFrom::Start(self.next_offset))
-            .map_err(Error::from)
-            .into_report()
-            .attach_with(|| format!("seek to frame at {:#x}", self.next_offset))?;
-        let mut fh_buf = [0u8; 16];
-        self.reader
-            .read_exact(&mut fh_buf)
-            .map_err(Error::from)
-            .into_report()
-            .attach("reading frame header")?;
-        let header = FrameHeader::parse(&fh_buf);
-
-        // First frame sets the sentinel we expect subsequent frames to
-        // carry. That catches a mis-computed record_size walking us
-        // off into audio data partway through the file.
-        match self.expected_magic {
-            None => self.expected_magic = Some(header.frame_magic),
-            Some(expected) if expected == header.frame_magic => {}
-            Some(_expected) => {
-                return Err(
-                    rootcause::Report::new(Error::from(XbmError::ImplausibleFrameSize {
-                        offset: self.next_offset,
-                        size: 0,
-                    }))
-                    .attach(format!(
-                        "frame magic at {:#x} does not match the first frame's sentinel",
-                        self.next_offset
-                    )),
-                );
-            }
-        }
-
-        let pixels_relative = header.pixels_offset_within_record();
-        let pixels_offset = self.next_offset + pixels_relative;
-        let audio_offset = pixels_offset + file_header.frame_pixel_bytes() as u64;
-        let record_size =
-            pixels_relative + file_header.frame_pixel_bytes() as u64 + header.audio_bytes() as u64;
-
-        if self.next_offset + record_size > self.file_size {
-            return Err(rootcause::Report::new(Error::from(
-                XbmError::ImplausibleFrameSize {
-                    offset: self.next_offset,
-                    size: record_size as u32,
-                },
-            )));
-        }
-
-        let record = FrameRef {
-            record_offset: self.next_offset,
-            pixels_offset,
-            audio_offset,
-            record_size,
-            header,
-        };
-        self.next_offset += record_size;
-        Ok(Some(record))
     }
 }
 
@@ -478,14 +479,14 @@ mod tests {
 
     #[test]
     fn magic_variants_round_trip() {
-        for v in [
+        for variant in [
             MagicVariant::Standard,
             MagicVariant::Thumbnail,
             MagicVariant::Alternate,
         ] {
-            let round = MagicVariant::from_u32(v.as_u32()).unwrap();
+            let round_trip = MagicVariant::from_u32(variant.as_u32()).unwrap();
             assert!(matches!(
-                (v, round),
+                (variant, round_trip),
                 (MagicVariant::Standard, MagicVariant::Standard)
                     | (MagicVariant::Thumbnail, MagicVariant::Thumbnail)
                     | (MagicVariant::Alternate, MagicVariant::Alternate)
@@ -495,7 +496,7 @@ mod tests {
 
     #[test]
     fn frame_pixel_bytes_960x720() {
-        let h = XbmHeader {
+        let header = XbmHeader {
             variant: MagicVariant::Standard,
             version: 0x0001_0001,
             header_size: 0x800,
@@ -509,10 +510,10 @@ mod tests {
             raw_tail: Vec::new(),
         };
         // 720 rounds up to 736 (32-aligned), 960 is already 32-aligned.
-        assert_eq!(h.aligned_frame_width(), 960);
-        assert_eq!(h.aligned_frame_height(), 736);
+        assert_eq!(header.aligned_frame_width(), 960);
+        assert_eq!(header.aligned_frame_height(), 736);
         // 960 * 736 * 1.5 = 1,059,840
-        assert_eq!(h.frame_pixel_bytes(), 1_059_840);
+        assert_eq!(header.frame_pixel_bytes(), 1_059_840);
     }
 
     #[test]
@@ -523,16 +524,16 @@ mod tests {
             0x00, 0x0F, 0x42, 0x40, // timestamp = 1_000_000
             0x00, 0x00, 0x00, 0x03, // audio_count = 3
         ];
-        let fh = FrameHeader::parse(&raw);
-        assert_eq!(fh.frame_magic, 0x9b58e71a);
-        assert_eq!(fh.flags, 3);
-        assert!(fh.has_metadata_struct());
-        assert!(fh.has_palette_block());
-        assert_eq!(fh.timestamp, 1_000_000);
-        assert_eq!(fh.audio_count, 3);
-        assert_eq!(fh.audio_bytes(), 3 * 0x1800);
+        let frame_header = FrameHeader::parse(&raw);
+        assert_eq!(frame_header.frame_magic, 0x9b58e71a);
+        assert_eq!(frame_header.flags, 3);
+        assert!(frame_header.has_metadata_struct());
+        assert!(frame_header.has_palette_block());
+        assert_eq!(frame_header.timestamp, 1_000_000);
+        assert_eq!(frame_header.audio_count, 3);
+        assert_eq!(frame_header.audio_bytes(), 3 * 0x1800);
         // 16 base + 0x38 metadata + 0x600 palette = 0x648, rounded up to 512 = 0x800 = 2048
-        assert_eq!(fh.pixels_offset_within_record(), 2048);
+        assert_eq!(frame_header.pixels_offset_within_record(), 2048);
     }
 
     #[test]

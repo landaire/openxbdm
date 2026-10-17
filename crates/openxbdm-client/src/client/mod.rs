@@ -10,21 +10,33 @@
 //! [`Client::into_notification_channel`].
 //!
 //! The async [`Client`] in this module is a thin driver over the sans-io
-//! [`engine::ClientEngine`]: it pumps bytes between an
-//! `AsyncRead`/`AsyncWrite` transport and the engine, surfacing typed
-//! events as either parsed [`Response`]s or errors. Callers that don't
-//! want to pull in tokio (or any async runtime) can use
-//! [`engine::ClientEngine`] directly.
+//! [`ClientEngine`]: it pumps bytes between an `AsyncRead`/`AsyncWrite`
+//! transport and the engine, surfacing typed events as either parsed
+//! [`Response`]s or errors. Callers that don't want to pull in tokio (or
+//! any async runtime) can use [`ClientEngine`] directly.
+
+mod engine;
+mod error;
+mod state;
+
+use core::marker::PhantomData;
 
 use futures_util::io::AsyncRead;
 use futures_util::io::AsyncReadExt;
 use futures_util::io::AsyncWrite;
 use futures_util::io::AsyncWriteExt;
-use rootcause::prelude::*;
+use openxbdm_core::auth::DH_LENGTH;
+use openxbdm_core::auth::DhValue;
+use openxbdm_core::auth::SessionKey;
+use openxbdm_core::auth::dh_mod_exp;
+use rootcause::Report;
+use rootcause::prelude::ResultExt;
 
 use crate::commands::ExecutionState;
 use crate::commands::Notify;
+use crate::commands::security::LockChallenge;
 use crate::error::Error;
+use crate::error::ExpectedShape;
 use crate::error::FramingError;
 use crate::error::ParseError;
 use crate::error::TransportError;
@@ -33,20 +45,12 @@ use crate::protocol::ExpectedBody;
 use crate::protocol::SuccessCode;
 use crate::protocol::response::Response;
 
-pub mod engine;
-mod state;
-
 pub use engine::ClientEngine;
 pub use engine::ClientEvent;
-pub use engine::SubmitError;
+pub use error::SubmitError;
 pub use state::Connected;
 pub use state::Fresh;
 pub use state::Notifications;
-
-/// Read-side scratch buffer used by [`Client::pump_until`] when copying
-/// transport bytes into the engine. 8 KiB is plenty for line responses
-/// while still being a small stack allocation per call.
-const READ_CHUNK: usize = 8 * 1024;
 
 /// A typed XBDM client.
 ///
@@ -56,7 +60,7 @@ const READ_CHUNK: usize = 8 * 1024;
 pub struct Client<T, S = Fresh> {
     transport: T,
     engine: ClientEngine,
-    _state: core::marker::PhantomData<S>,
+    _state: PhantomData<S>,
 }
 
 impl<T> Client<T, Fresh>
@@ -69,26 +73,28 @@ where
         Self {
             transport,
             engine: ClientEngine::new(),
-            _state: core::marker::PhantomData,
+            _state: PhantomData,
         }
     }
 
     /// Read the initial `201 connected` banner and transition to
     /// [`Connected`]. Any non-201 response is reported as a framing
     /// error.
-    pub async fn read_banner(mut self) -> Result<Client<T, Connected>, rootcause::Report<Error>> {
+    pub async fn read_banner(mut self) -> Result<Client<T, Connected>, Report<Error>> {
         let event = self
-            .pump_until(|ev| matches!(ev, ClientEvent::Connected))
+            .pump_until(|event| matches!(event, ClientEvent::Connected))
             .await?;
-        match event {
-            ClientEvent::Connected => Ok(Client {
-                transport: self.transport,
-                engine: self.engine,
-                _state: core::marker::PhantomData,
-            }),
-            // pump_until guarantees the predicate matched or it returned Err.
-            other => unreachable!("unexpected event after banner pump: {other:?}"),
-        }
+
+        // pump_until returns only events its predicate accepted.
+        let ClientEvent::Connected = event else {
+            unreachable!("unexpected event after banner pump: {event:?}");
+        };
+
+        Ok(Client {
+            transport: self.transport,
+            engine: self.engine,
+            _state: PhantomData,
+        })
     }
 }
 
@@ -98,38 +104,28 @@ where
 {
     /// Text of the connect banner after `201- `.
     pub fn banner(&self) -> &str {
+        // The engine records the banner before it reports `Connected`, so
+        // the empty default is never observed in this state.
         self.engine.banner().unwrap_or_default()
     }
 
     /// Box id and challenge of a locked console, from the banner. `None`
     /// for an unlocked console.
-    pub fn lock_challenge(
-        &self,
-    ) -> Result<Option<crate::commands::security::LockChallenge>, rootcause::Report<Error>> {
-        crate::commands::security::LockChallenge::from_banner(self.banner())
-            .map_err(|e| rootcause::Report::new(Error::from(e)))
+    pub fn lock_challenge(&self) -> Result<Option<LockChallenge>, Report<Error>> {
+        LockChallenge::from_banner(self.banner()).map_err(|e| Report::new(Error::from(e)))
     }
 
     /// `keyxchg`: send `generator ^ exponent`, receive the console's
     /// public value, and return the session key both sides derive.
-    pub async fn key_exchange(
-        &mut self,
-        exponent: &openxbdm_core::auth::DhValue,
-    ) -> Result<openxbdm_core::auth::SessionKey, rootcause::Report<Error>> {
-        use openxbdm_core::auth::DH_LENGTH;
-        use openxbdm_core::auth::DhValue;
-        use openxbdm_core::auth::SessionKey;
-        use openxbdm_core::auth::dh_mod_exp;
+    pub async fn key_exchange(&mut self, exponent: &DhValue) -> Result<SessionKey, Report<Error>> {
+        let response = self.send_raw("keyxchg").await?;
+        let Response::SendBinary { .. } = response else {
+            return Err(Report::new(Error::UnexpectedStatus {
+                expected: ExpectedShape::SendBinary204,
+                got: response.status(),
+            }));
+        };
 
-        match self.send_raw("keyxchg").await? {
-            Response::SendBinary { .. } => {}
-            other => {
-                return Err(rootcause::Report::new(Error::UnexpectedStatus {
-                    expected: crate::error::ExpectedShape::SendBinary204,
-                    got: other.status(),
-                }));
-            }
-        }
         let public = dh_mod_exp(None, exponent);
         self.transport
             .write_all(&public.0)
@@ -137,39 +133,41 @@ where
             .map_err(Error::from)
             .into_report()
             .attach("sending keyxchg value")?;
+
         self.engine
             .expect_binary_response(DH_LENGTH)
             .map_err(|e| submit_to_report(e, "<keyxchg response>"))?;
-        let event = self
-            .pump_until(|ev| {
-                matches!(
-                    ev,
-                    ClientEvent::Response(_) | ClientEvent::RemoteError { .. }
-                )
-            })
-            .await?;
+        let event = self.pump_until(is_reply).await?;
         let data = match event {
             ClientEvent::Response(response) => response.expect_binary().into_report()?,
             ClientEvent::RemoteError { code, message } => {
-                return Err(rootcause::Report::new(Error::Remote { code, message }));
+                return Err(Report::new(Error::Remote { code, message }));
             }
             other => unreachable!("unexpected event after keyxchg pump: {other:?}"),
         };
+
         let mut server = DhValue([0; DH_LENGTH]);
         server.0.copy_from_slice(&data);
+
         Ok(SessionKey::derive(&dh_mod_exp(Some(&server), exponent)))
     }
 
     /// Execute a typed [`Command`], running it through the request/response
     /// pipeline and returning the command's parsed output.
-    pub async fn run<C: Command>(&mut self, cmd: C) -> Result<C::Output, rootcause::Report<Error>> {
+    pub async fn run<C>(&mut self, cmd: C) -> Result<C::Output, Report<Error>>
+    where
+        C: Command,
+    {
         let line = cmd.wire_line()?;
         tracing::debug!(wire = %line, "xbdm send");
 
         let binary_len = match cmd.expected() {
-            ExpectedBody::Binary => Some(cmd.binary_len().ok_or_else(|| {
-                rootcause::Report::new(Error::from(TransportError::MissingBinaryLen))
-            })?),
+            ExpectedBody::Binary => {
+                let Some(len) = cmd.binary_len() else {
+                    return Err(Report::new(Error::from(TransportError::MissingBinaryLen)));
+                };
+                Some(len)
+            }
             _ => None,
         };
 
@@ -177,19 +175,7 @@ where
             .submit(&line, binary_len)
             .map_err(|e| submit_to_report(e, &line))?;
 
-        let event = match self
-            .pump_until(|ev| {
-                matches!(
-                    ev,
-                    ClientEvent::Response(_) | ClientEvent::RemoteError { .. }
-                )
-            })
-            .await
-        {
-            Ok(ev) => ev,
-            Err(report) => return Err(report),
-        };
-
+        let event = self.pump_until(is_reply).await?;
         match event {
             ClientEvent::Response(response) => {
                 tracing::debug!(?response, "xbdm recv");
@@ -199,7 +185,8 @@ where
                 if let Some(mapped) = cmd.handle_remote(code, &message) {
                     return mapped;
                 }
-                Err(rootcause::Report::new(Error::Remote { code, message }))
+
+                Err(Report::new(Error::Remote { code, message }))
             }
             other => unreachable!("unexpected event after run pump: {other:?}"),
         }
@@ -208,22 +195,16 @@ where
     /// Send a raw command line. Useful for REPL-style exploration and
     /// commands we haven't modelled yet. Returns the raw parsed response
     /// so callers can decide what to do with it.
-    pub async fn send_raw(&mut self, line: &str) -> Result<Response, rootcause::Report<Error>> {
+    pub async fn send_raw(&mut self, line: &str) -> Result<Response, Report<Error>> {
         self.engine
             .submit(line, None)
             .map_err(|e| submit_to_report(e, line))?;
-        let event = self
-            .pump_until(|ev| {
-                matches!(
-                    ev,
-                    ClientEvent::Response(_) | ClientEvent::RemoteError { .. }
-                )
-            })
-            .await?;
+
+        let event = self.pump_until(is_reply).await?;
         match event {
             ClientEvent::Response(response) => Ok(response),
             ClientEvent::RemoteError { code, message } => {
-                Err(rootcause::Report::new(Error::Remote { code, message }))
+                Err(Report::new(Error::Remote { code, message }))
             }
             other => unreachable!("unexpected event after send_raw pump: {other:?}"),
         }
@@ -231,21 +212,15 @@ where
 
     /// Politely close the session with the XBDM `bye` command. The server
     /// replies with a status line and drops the socket.
-    pub async fn bye(mut self) -> Result<(), rootcause::Report<Error>> {
+    pub async fn bye(mut self) -> Result<(), Report<Error>> {
         self.engine
             .submit("bye", None)
             .map_err(|e| submit_to_report(e, "bye"))?;
+
         // Either a normal response or a clean close are both fine -- some
         // kits drop the socket before flushing the reply.
         let event = self
-            .pump_until(|ev| {
-                matches!(
-                    ev,
-                    ClientEvent::Response(_)
-                        | ClientEvent::RemoteError { .. }
-                        | ClientEvent::Closed
-                )
-            })
+            .pump_until(|event| is_reply(event) || matches!(event, ClientEvent::Closed))
             .await;
         match event {
             Ok(_) => Ok(()),
@@ -265,39 +240,39 @@ where
     pub async fn into_notification_channel(
         mut self,
         request: Notify,
-    ) -> Result<(Client<T, Notifications>, ExecutionState), rootcause::Report<Error>> {
+    ) -> Result<(Client<T, Notifications>, ExecutionState), Report<Error>> {
         let line = request.wire_line();
         let response = self.send_raw(&line).await?;
-        match response {
-            Response::Line {
-                code: SuccessCode::Dedicated,
-                ..
-            } => {}
-            Response::Line { code, .. } => {
-                return Err(rootcause::Report::new(Error::UnexpectedSuccessCode {
-                    expected: SuccessCode::Dedicated,
-                    got: code,
-                }));
-            }
+        let code = match response {
+            Response::Line { code, .. } => code,
             other => {
                 return Err(
-                    rootcause::Report::new(Error::from(ParseError::UnrecognizedShape)).attach(
-                        format!("expected the 205 notification channel line, got {other:?}"),
-                    ),
+                    Report::new(Error::from(ParseError::UnrecognizedShape)).attach(format!(
+                        "expected the 205 notification channel line, got {other:?}"
+                    )),
                 );
             }
+        };
+        if code != SuccessCode::Dedicated {
+            return Err(Report::new(Error::UnexpectedSuccessCode {
+                expected: SuccessCode::Dedicated,
+                got: code,
+            }));
         }
+
         self.engine
             .enter_notification_mode()
             .map_err(|e| submit_to_report(e, &line))?;
         let mut channel = Client {
             transport: self.transport,
             engine: self.engine,
-            _state: core::marker::PhantomData,
+            _state: PhantomData,
         };
+
         let state_line = channel.next_notification().await?;
         let state = ExecutionState::parse_line(&state_line)
-            .map_err(|error| rootcause::Report::new(Error::from(error)).attach(state_line))?;
+            .map_err(|error| Report::new(Error::from(error)).attach(state_line))?;
+
         Ok((channel, state))
     }
 
@@ -305,38 +280,29 @@ where
     /// engine is left in `StreamingBody`; the caller drains
     /// [`ClientEngine::take_inbox`] for any prefix bytes captured with
     /// the head, reads the rest of the body off
-    /// [`Self::transport_mut`], then calls [`Self::end_stream`] to
-    /// release the engine.
+    /// [`Self::transport_mut`], then calls [`ClientEngine::end_stream`]
+    /// to release the engine.
     ///
     /// A 4xx remote error is reported as a typed `Error::Remote`; a
     /// non-203 success (line / multiline / 204) is reported as a
     /// framing error since the caller asked for a streaming body.
-    pub(crate) async fn submit_streaming(
-        &mut self,
-        line: &str,
-    ) -> Result<String, rootcause::Report<Error>> {
+    pub(crate) async fn submit_streaming(&mut self, line: &str) -> Result<String, Report<Error>> {
         self.engine
             .submit_streaming(line)
             .map_err(|e| submit_to_report(e, line))?;
+
         let event = self
-            .pump_until(|ev| {
-                matches!(
-                    ev,
-                    ClientEvent::BinaryHead { .. }
-                        | ClientEvent::Response(_)
-                        | ClientEvent::RemoteError { .. }
-                )
-            })
+            .pump_until(|event| is_reply(event) || matches!(event, ClientEvent::BinaryHead { .. }))
             .await?;
         match event {
             ClientEvent::BinaryHead { head } => Ok(head),
             ClientEvent::RemoteError { code, message } => {
-                Err(rootcause::Report::new(Error::Remote { code, message }))
+                Err(Report::new(Error::Remote { code, message }))
             }
-            ClientEvent::Response(response) => Err(rootcause::Report::new(Error::from(
-                FramingError::HeadTooShort,
-            ))
-            .attach(format!("expected 203 streaming head, got {response:?}"))),
+            ClientEvent::Response(response) => {
+                Err(Report::new(Error::from(FramingError::HeadTooShort))
+                    .attach(format!("expected 203 streaming head, got {response:?}")))
+            }
             other => unreachable!("unexpected event after streaming pump: {other:?}"),
         }
     }
@@ -359,24 +325,16 @@ where
     /// After an out-of-band write (e.g. a `sendfile` upload body), arm
     /// the engine to read the kit's follow-up response and pump until
     /// it arrives. Returns the response or surfaces a remote 4xx.
-    pub(crate) async fn read_post_upload_response(
-        &mut self,
-    ) -> Result<Response, rootcause::Report<Error>> {
+    pub(crate) async fn read_post_upload_response(&mut self) -> Result<Response, Report<Error>> {
         self.engine
             .expect_response()
             .map_err(|e| submit_to_report(e, "<post-upload response>"))?;
-        let event = self
-            .pump_until(|ev| {
-                matches!(
-                    ev,
-                    ClientEvent::Response(_) | ClientEvent::RemoteError { .. }
-                )
-            })
-            .await?;
+
+        let event = self.pump_until(is_reply).await?;
         match event {
             ClientEvent::Response(response) => Ok(response),
             ClientEvent::RemoteError { code, message } => {
-                Err(rootcause::Report::new(Error::Remote { code, message }))
+                Err(Report::new(Error::Remote { code, message }))
             }
             other => unreachable!("unexpected event after upload response pump: {other:?}"),
         }
@@ -388,11 +346,11 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     /// Wait for the next notification line.
-    pub async fn next_notification(&mut self) -> Result<String, rootcause::Report<Error>> {
-        match self
-            .pump_until(|ev| matches!(ev, ClientEvent::Notification(_)))
-            .await?
-        {
+    pub async fn next_notification(&mut self) -> Result<String, Report<Error>> {
+        let event = self
+            .pump_until(|event| matches!(event, ClientEvent::Notification(_)))
+            .await?;
+        match event {
             ClientEvent::Notification(line) => Ok(line),
             other => unreachable!("unexpected event after notification pump: {other:?}"),
         }
@@ -407,25 +365,27 @@ where
     /// fail with the underlying transport / framing error. `Closed` and
     /// `Failed` are surfaced as `Err` unless the predicate explicitly
     /// accepts them (e.g. `bye` accepts `Closed` as success).
-    async fn pump_until<F>(
-        &mut self,
-        mut predicate: F,
-    ) -> Result<ClientEvent, rootcause::Report<Error>>
+    async fn pump_until<F>(&mut self, mut predicate: F) -> Result<ClientEvent, Report<Error>>
     where
         F: FnMut(&ClientEvent) -> bool,
     {
+        // Large enough for line responses while staying a small stack
+        // buffer per call.
+        const READ_CHUNK: usize = 8 * 1024;
+
         let mut buf = [0u8; READ_CHUNK];
+
         loop {
-            // Drain anything the engine has queued for transmission.
             while self.engine.pending_send() > 0 {
-                let n = self.engine.send(&mut buf);
+                let len = self.engine.send(&mut buf);
                 self.transport
-                    .write_all(&buf[..n])
+                    .write_all(&buf[..len])
                     .await
                     .map_err(Error::from)
                     .into_report()
                     .attach("flushing engine outbox")?;
             }
+
             self.transport
                 .flush()
                 .await
@@ -433,15 +393,15 @@ where
                 .into_report()
                 .attach("flushing transport")?;
 
-            // Surface any pending events.
-            while let Some(ev) = self.engine.poll() {
-                if predicate(&ev) {
-                    return Ok(ev);
+            while let Some(event) = self.engine.poll() {
+                if predicate(&event) {
+                    return Ok(event);
                 }
-                match ev {
-                    ClientEvent::Failed(err) => return Err(rootcause::Report::new(*err)),
+
+                match event {
+                    ClientEvent::Failed(err) => return Err(Report::new(*err)),
                     ClientEvent::Closed => {
-                        return Err(rootcause::Report::new(Error::ConnectionClosed));
+                        return Err(Report::new(Error::ConnectionClosed));
                     }
                     // Other events the predicate didn't want -- keep pumping.
                     _ => {}
@@ -449,31 +409,41 @@ where
             }
 
             if self.engine.is_terminal() {
-                return Err(rootcause::Report::new(Error::ConnectionClosed));
+                return Err(Report::new(Error::ConnectionClosed));
             }
 
-            let n = self
+            let len = self
                 .transport
                 .read(&mut buf)
                 .await
                 .map_err(Error::from)
                 .into_report()
                 .attach("reading from transport for engine pump")?;
-            if n == 0 {
+            if len == 0 {
                 self.engine.close_read();
                 continue;
             }
-            self.engine.recv(&buf[..n]);
+
+            self.engine.recv(&buf[..len]);
         }
     }
 }
 
-fn submit_to_report(err: SubmitError, line: &str) -> rootcause::Report<Error> {
+/// Whether `event` completes an ordinary command exchange.
+fn is_reply(event: &ClientEvent) -> bool {
+    matches!(
+        event,
+        ClientEvent::Response(_) | ClientEvent::RemoteError { .. }
+    )
+}
+
+fn submit_to_report(err: SubmitError, line: &str) -> Report<Error> {
     // `Unusable` is the peer being gone; the rest are caller misuse and
     // keep their own variant so callers can tell them apart.
     let mapped = match err {
         SubmitError::Unusable => Error::ConnectionClosed,
         misuse => Error::EngineMisuse(misuse),
     };
-    rootcause::Report::new(mapped).attach(format!("submit({line:?}) rejected"))
+
+    Report::new(mapped).attach(format!("submit({line:?}) rejected"))
 }

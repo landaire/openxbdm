@@ -3,7 +3,7 @@
 use core::fmt::Write as _;
 use core::net::Ipv4Addr;
 
-use crate::error::ArgumentError;
+use crate::commands::error::report_argument;
 use crate::error::Error;
 use crate::protocol::ArgBuilder;
 use crate::protocol::Command;
@@ -11,10 +11,6 @@ use crate::protocol::ErrorCode;
 use crate::protocol::ExpectedBody;
 use crate::protocol::RemoteStatus;
 use crate::protocol::Response;
-
-fn report_argument(err: ArgumentError) -> rootcause::Report<Error> {
-    rootcause::Report::new(Error::from(err))
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DebuggerAction {
@@ -56,6 +52,7 @@ impl Command for Debugger {
             DebuggerAction::Init => "init",
         };
         let mut builder = ArgBuilder::new("debugger").flag(action);
+
         if let Some(address) = self.address {
             let mut token = String::new();
             let _ = write!(token, "addr={address}");
@@ -73,6 +70,7 @@ impl Command for Debugger {
         if self.override_existing {
             builder = builder.flag("override");
         }
+
         Ok(builder.finish())
     }
 
@@ -82,13 +80,10 @@ impl Command for Debugger {
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         response.expect_ok().map_err(rootcause::Report::new)?;
+
         Ok(())
     }
 }
-
-/// `isdebugger`: report the attached debugger.
-#[derive(Debug, Clone, Copy)]
-pub struct IsDebugger;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DebuggerAttachment {
@@ -104,23 +99,9 @@ pub enum DebuggerAttachment {
     },
 }
 
-fn parse_attachment(message: &str) -> DebuggerAttachment {
-    if message == ErrorCode::FileAlreadyExists.message() {
-        return DebuggerAttachment::Attached {
-            name: None,
-            user: None,
-        };
-    }
-    let (name, rest) = match message.strip_prefix("name=\"") {
-        Some(quoted) => match quoted.split_once("\" ") {
-            Some((name, rest)) => (Some(name.to_owned()), rest),
-            None => (Some(quoted.trim_end_matches('"').to_owned()), ""),
-        },
-        None => (None, message),
-    };
-    let user = rest.strip_prefix("user=").map(str::to_owned);
-    DebuggerAttachment::Attached { name, user }
-}
+/// `isdebugger`: report the attached debugger.
+#[derive(Debug, Clone, Copy)]
+pub struct IsDebugger;
 
 impl Command for IsDebugger {
     type Output = DebuggerAttachment;
@@ -135,6 +116,7 @@ impl Command for IsDebugger {
 
     fn parse(&self, response: Response) -> Result<Self::Output, rootcause::Report<Error>> {
         response.expect_ok().map_err(rootcause::Report::new)?;
+
         Ok(DebuggerAttachment::None)
     }
 
@@ -145,6 +127,26 @@ impl Command for IsDebugger {
     ) -> Option<Result<Self::Output, rootcause::Report<Error>>> {
         (code == ErrorCode::FileAlreadyExists).then(|| Ok(parse_attachment(message)))
     }
+}
+
+fn parse_attachment(message: &str) -> DebuggerAttachment {
+    if message == ErrorCode::FileAlreadyExists.message() {
+        return DebuggerAttachment::Attached {
+            name: None,
+            user: None,
+        };
+    }
+
+    let (name, rest) = match message.strip_prefix("name=\"") {
+        Some(quoted) => match quoted.split_once("\" ") {
+            Some((name, rest)) => (Some(name.to_owned()), rest),
+            None => (Some(quoted.trim_end_matches('"').to_owned()), ""),
+        },
+        None => (None, message),
+    };
+    let user = rest.strip_prefix("user=").map(str::to_owned);
+
+    DebuggerAttachment::Attached { name, user }
 }
 
 #[cfg(test)]

@@ -20,19 +20,24 @@
 //! `PixelFormat::Unknown(u32)` so callers can still access the raw bytes
 //! and decide how to interpret them.
 
+mod error;
+
 use bytes::BytesMut;
 use futures_io::AsyncRead;
 use futures_io::AsyncWrite;
 use futures_util::io::AsyncReadExt;
-use rootcause::prelude::*;
+use rootcause::prelude::ResultExt;
 
 use crate::client::Client;
 use crate::client::Connected;
+use crate::commands::error::report_parse;
 use crate::commands::kv::parse_kv_line;
 use crate::commands::kv::value_u32;
 use crate::error::Error;
 use crate::error::FramingError;
 use crate::error::ParseError;
+
+pub use error::DecodeError;
 
 /// Metadata XBDM emits before the framebuffer bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,12 +51,14 @@ pub struct ScreenshotMetadata {
     /// Raw XBDM format enum. High bit `0x80000000` is an internal marker
     /// we preserve so round-trips are faithful.
     pub format: PixelFormat,
+
     /// Column of the first displayed pixel inside the first tile.
     pub offset_x: u32,
     /// Row of the first displayed pixel inside the first tile.
     pub offset_y: u32,
     /// Body size: the tiles covering the displayed rectangle, 4 KiB each.
     pub framebuffer_size: u32,
+
     /// "Shown" width reported separately from tile-aligned width.
     pub shown_width: u32,
     /// "Shown" height reported separately from tile-aligned height.
@@ -75,39 +82,31 @@ pub enum PixelFormat {
 }
 
 impl PixelFormat {
-    /// Raw 32-bit value the kernel reported, high bit stripped.
-    pub fn raw(self) -> u32 {
-        match self {
-            PixelFormat::LeX8R8G8B8 => 0x1828_0186,
-            PixelFormat::LeX8R8G8B8Gamma => 0x1828_01B6,
-            PixelFormat::Unknown(raw) => raw,
-        }
-    }
-
     fn from_u32(raw: u32) -> Self {
         // XBDM ORs 0x80000000 with the base format as a "ready" marker.
         let base = raw & 0x7FFF_FFFF;
+
         match base {
-            0x1828_0186 => PixelFormat::LeX8R8G8B8,
-            0x1828_01B6 => PixelFormat::LeX8R8G8B8Gamma,
-            _ => PixelFormat::Unknown(base),
+            0x1828_0186 => Self::LeX8R8G8B8,
+            0x1828_01B6 => Self::LeX8R8G8B8Gamma,
+            _ => Self::Unknown(base),
+        }
+    }
+
+    /// Raw 32-bit value the kernel reported, high bit stripped.
+    pub fn raw(self) -> u32 {
+        match self {
+            Self::LeX8R8G8B8 => 0x1828_0186,
+            Self::LeX8R8G8B8Gamma => 0x1828_01B6,
+            Self::Unknown(raw) => raw,
         }
     }
 
     /// Whether the format is a known linear 32-bit XRGB layout we can
     /// convert to an RGB / RGBA image without further de-tiling.
     pub fn is_linear_xrgb8888(self) -> bool {
-        matches!(self, PixelFormat::LeX8R8G8B8 | PixelFormat::LeX8R8G8B8Gamma)
+        matches!(self, Self::LeX8R8G8B8 | Self::LeX8R8G8B8Gamma)
     }
-}
-
-/// Why [`Screenshot::to_rgba8`] cannot decode a screenshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum DecodeError {
-    #[error("no RGBA conversion for pixel format {format:?}")]
-    UnsupportedFormat { format: PixelFormat },
-    #[error("body of {length:#x} bytes does not hold every tile of the displayed rectangle")]
-    BodyTooShort { length: usize },
 }
 
 /// Collected screenshot, holding both the parsed metadata and the raw
@@ -124,103 +123,31 @@ impl Screenshot {
     /// `stride == width * 4`, converting from the in-memory `B G R X` byte
     /// order with opaque alpha.
     pub fn to_rgba8(&self) -> Result<Vec<u8>, DecodeError> {
-        let m = &self.metadata;
-        if !m.format.is_linear_xrgb8888() {
-            return Err(DecodeError::UnsupportedFormat { format: m.format });
+        let metadata = &self.metadata;
+        if !metadata.format.is_linear_xrgb8888() {
+            return Err(DecodeError::UnsupportedFormat {
+                format: metadata.format,
+            });
         }
-        let linear = detile_32bpp(&self.data, m.width, m.height, m.offset_x, m.offset_y).ok_or(
-            DecodeError::BodyTooShort {
-                length: self.data.len(),
-            },
-        )?;
+
+        let linear = detile_32bpp(
+            &self.data,
+            metadata.width,
+            metadata.height,
+            metadata.offset_x,
+            metadata.offset_y,
+        )
+        .ok_or(DecodeError::BodyTooShort {
+            length: self.data.len(),
+        })?;
+
         let mut rgba = Vec::with_capacity(linear.len());
-        for chunk in linear.as_chunks::<4>().0 {
-            let (b, g, r, _x) = (chunk[0], chunk[1], chunk[2], chunk[3]);
-            rgba.extend_from_slice(&[r, g, b, 0xFF]);
+        for &[blue, green, red, _] in linear.as_chunks::<4>().0 {
+            rgba.extend_from_slice(&[red, green, blue, 0xFF]);
         }
+
         Ok(rgba)
     }
-}
-
-/// Linearize a screenshot body: `width * height` pixels of 4 bytes,
-/// starting at (`offset_x`, `offset_y`) of the first tile. `None` when the
-/// body does not hold every tile of the rectangle.
-pub fn detile_32bpp(
-    tiled: &[u8],
-    width: u32,
-    height: u32,
-    offset_x: u32,
-    offset_y: u32,
-) -> Option<Vec<u8>> {
-    const BPP_BYTES: usize = 4;
-    let tiles_per_row = offset_x.checked_add(width)?.div_ceil(32);
-    let tile_rows = offset_y.checked_add(height)?.div_ceil(32);
-    let surface_width = tiles_per_row.checked_mul(32)?;
-    // Tile offsets are computed in u32, so the whole surface must fit in it.
-    let surface_bytes = tiles_per_row.checked_mul(tile_rows)?.checked_mul(0x1000)?;
-    if surface_bytes as usize > tiled.len() {
-        return None;
-    }
-    let mut out = vec![0u8; (width as usize) * (height as usize) * BPP_BYTES];
-    for y in 0..height {
-        for x in 0..width {
-            let src = tile_offset_32bpp_bytes(x + offset_x, y + offset_y, surface_width) as usize;
-            let dst = ((y as usize) * (width as usize) + (x as usize)) * BPP_BYTES;
-            out[dst..dst + BPP_BYTES].copy_from_slice(&tiled[src..src + BPP_BYTES]);
-        }
-    }
-    Some(out)
-}
-
-/// Byte offset of pixel `(x, y)` inside a 32-bpp tiled surface `width`
-/// pixels wide: the tile index times 4 KiB plus the position inside the
-/// tile.
-pub fn tile_offset_32bpp_bytes(x: u32, y: u32, width: u32) -> u32 {
-    const LOG_BPP: u32 = 2;
-    let aligned_width = (width + 31) & !31;
-    let macro_ = ((x >> 5) + (y >> 5) * (aligned_width >> 5)) << (LOG_BPP + 7);
-    let micro = ((x & 7) + ((y & 6) << 2)) << LOG_BPP;
-    let offset = macro_
-        + ((micro & !0xF) << 1)
-        + (micro & 0xF)
-        + ((y & 8) << (3 + LOG_BPP))
-        + ((y & 1) << 4);
-    ((offset & !0x1FF) << 3)
-        + ((y & 16) << 7)
-        + ((offset & 0x1C0) << 2)
-        + ((((y & 8) >> 2) + (x >> 3)) & 3) * 64
-        + (offset & 0x3F)
-}
-
-/// Parse the ASCII metadata line emitted right after `203- binary
-/// response follows`.
-pub fn parse_metadata_line(line: &str) -> Result<ScreenshotMetadata, ParseError> {
-    // The kernel emits a stray comma after `offsety`; strip it so our
-    // KV tokenizer accepts the line cleanly.
-    let cleaned = line.replace(',', "");
-    let kv = parse_kv_line(&cleaned);
-    let pitch = value_u32(kv.require("pitch")?, "pitch")?;
-    let width = value_u32(kv.require("width")?, "width")?;
-    let height = value_u32(kv.require("height")?, "height")?;
-    let format = value_u32(kv.require("format")?, "format")?;
-    let offsetx = value_u32(kv.require("offsetx")?, "offsetx")?;
-    let offsety = value_u32(kv.require("offsety")?, "offsety")?;
-    let framebuffer_size = value_u32(kv.require("framebuffersize")?, "framebuffersize")?;
-    let sw = value_u32(kv.require("sw")?, "sw")?;
-    let sh = value_u32(kv.require("sh")?, "sh")?;
-    let colorspace = value_u32(kv.require("colorspace")?, "colorspace")?;
-    Ok(ScreenshotMetadata {
-        pitch,
-        width,
-        height,
-        format: PixelFormat::from_u32(format),
-        offset_x: offsetx,
-        offset_y: offsety,
-        framebuffer_size,
-        shown_width: sw,
-        shown_height: sh,
-        colorspace,
-    })
 }
 
 impl<T> Client<T, Connected>
@@ -249,10 +176,10 @@ where
             }
         };
         let metadata = match parse_metadata_line(&metadata_line) {
-            Ok(m) => m,
+            Ok(metadata) => metadata,
             Err(e) => {
                 engine.abort_stream(None);
-                return Err(rootcause::Report::new(Error::from(e)));
+                return Err(report_parse(e));
             }
         };
 
@@ -274,6 +201,95 @@ where
     }
 }
 
+/// Linearize a screenshot body: `width * height` pixels of 4 bytes,
+/// starting at (`offset_x`, `offset_y`) of the first tile. `None` when the
+/// body does not hold every tile of the rectangle.
+pub fn detile_32bpp(
+    tiled: &[u8],
+    width: u32,
+    height: u32,
+    offset_x: u32,
+    offset_y: u32,
+) -> Option<Vec<u8>> {
+    const BPP_BYTES: usize = 4;
+
+    let tiles_per_row = offset_x.checked_add(width)?.div_ceil(32);
+    let tile_rows = offset_y.checked_add(height)?.div_ceil(32);
+    let surface_width = tiles_per_row.checked_mul(32)?;
+
+    // Tile offsets are computed in u32, so the whole surface must fit in it.
+    let surface_bytes = tiles_per_row.checked_mul(tile_rows)?.checked_mul(0x1000)?;
+    if surface_bytes as usize > tiled.len() {
+        return None;
+    }
+
+    let mut out = vec![0u8; (width as usize) * (height as usize) * BPP_BYTES];
+    for y in 0..height {
+        for x in 0..width {
+            let src = tile_offset_32bpp_bytes(x + offset_x, y + offset_y, surface_width) as usize;
+            let dst = ((y as usize) * (width as usize) + (x as usize)) * BPP_BYTES;
+            out[dst..dst + BPP_BYTES].copy_from_slice(&tiled[src..src + BPP_BYTES]);
+        }
+    }
+
+    Some(out)
+}
+
+/// Byte offset of pixel `(x, y)` inside a 32-bpp tiled surface `width`
+/// pixels wide: the tile index times 4 KiB plus the position inside the
+/// tile.
+pub fn tile_offset_32bpp_bytes(x: u32, y: u32, width: u32) -> u32 {
+    const LOG_BPP: u32 = 2;
+
+    let aligned_width = (width + 31) & !31;
+    let macro_offset = ((x >> 5) + (y >> 5) * (aligned_width >> 5)) << (LOG_BPP + 7);
+    let micro_offset = ((x & 7) + ((y & 6) << 2)) << LOG_BPP;
+    let offset = macro_offset
+        + ((micro_offset & !0xF) << 1)
+        + (micro_offset & 0xF)
+        + ((y & 8) << (3 + LOG_BPP))
+        + ((y & 1) << 4);
+
+    ((offset & !0x1FF) << 3)
+        + ((y & 16) << 7)
+        + ((offset & 0x1C0) << 2)
+        + ((((y & 8) >> 2) + (x >> 3)) & 3) * 64
+        + (offset & 0x3F)
+}
+
+/// Parse the ASCII metadata line emitted right after `203- binary
+/// response follows`.
+pub fn parse_metadata_line(line: &str) -> Result<ScreenshotMetadata, ParseError> {
+    // The kernel emits a stray comma after `offsety`; strip it so our
+    // KV tokenizer accepts the line cleanly.
+    let cleaned = line.replace(',', "");
+    let kv = parse_kv_line(&cleaned);
+
+    let pitch = value_u32(kv.require("pitch")?, "pitch")?;
+    let width = value_u32(kv.require("width")?, "width")?;
+    let height = value_u32(kv.require("height")?, "height")?;
+    let format = value_u32(kv.require("format")?, "format")?;
+    let offset_x = value_u32(kv.require("offsetx")?, "offsetx")?;
+    let offset_y = value_u32(kv.require("offsety")?, "offsety")?;
+    let framebuffer_size = value_u32(kv.require("framebuffersize")?, "framebuffersize")?;
+    let shown_width = value_u32(kv.require("sw")?, "sw")?;
+    let shown_height = value_u32(kv.require("sh")?, "sh")?;
+    let colorspace = value_u32(kv.require("colorspace")?, "colorspace")?;
+
+    Ok(ScreenshotMetadata {
+        pitch,
+        width,
+        height,
+        format: PixelFormat::from_u32(format),
+        offset_x,
+        offset_y,
+        framebuffer_size,
+        shown_width,
+        shown_height,
+        colorspace,
+    })
+}
+
 async fn read_line_buffered<R>(
     reader: &mut R,
     leftover: &mut BytesMut,
@@ -281,7 +297,8 @@ async fn read_line_buffered<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let mut tmp = [0u8; 512];
+    let mut scratch = [0u8; 512];
+
     loop {
         if let Some(pos) = memchr::memchr(b'\n', leftover) {
             let end = if pos > 0 && leftover[pos - 1] == b'\r' {
@@ -292,18 +309,21 @@ where
             let line = String::from_utf8(leftover[..end].to_vec())
                 .map_err(|_| rootcause::Report::new(Error::from(FramingError::NonUtf8Line)))?;
             let _ = leftover.split_to(pos + 1);
+
             return Ok(line);
         }
-        let n = reader
-            .read(&mut tmp)
+
+        let read_len = reader
+            .read(&mut scratch)
             .await
             .map_err(Error::from)
             .into_report()
             .attach("reading screenshot metadata line")?;
-        if n == 0 {
+        if read_len == 0 {
             return Err(rootcause::Report::new(Error::ConnectionClosed));
         }
-        leftover.extend_from_slice(&tmp[..n]);
+
+        leftover.extend_from_slice(&scratch[..read_len]);
     }
 }
 
@@ -315,25 +335,24 @@ async fn read_framebuffer<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let mut filled = 0usize;
-    if !leftover.is_empty() {
-        let take = core::cmp::min(leftover.len(), dest.len());
-        dest[..take].copy_from_slice(&leftover[..take]);
-        let _ = leftover.split_to(take);
-        filled = take;
-    }
+    let mut filled = core::cmp::min(leftover.len(), dest.len());
+    dest[..filled].copy_from_slice(&leftover[..filled]);
+    let _ = leftover.split_to(filled);
+
     while filled < dest.len() {
-        let n = reader
+        let read_len = reader
             .read(&mut dest[filled..])
             .await
             .map_err(Error::from)
             .into_report()
             .attach("reading screenshot framebuffer")?;
-        if n == 0 {
+        if read_len == 0 {
             return Err(rootcause::Report::new(Error::ConnectionClosed));
         }
-        filled += n;
+
+        filled += read_len;
     }
+
     Ok(())
 }
 

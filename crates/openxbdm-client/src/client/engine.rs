@@ -53,6 +53,7 @@ use std::collections::VecDeque;
 use bytes::BytesMut;
 use memchr::memchr;
 
+use crate::client::error::SubmitError;
 use crate::error::Error;
 use crate::error::FramingError;
 use crate::error::TransportError;
@@ -61,11 +62,6 @@ use crate::protocol::RemoteStatus;
 use crate::protocol::SuccessCode;
 use crate::protocol::response::Response;
 use crate::protocol::response::parse_response_head;
-
-/// Maximum length of a single protocol line we'll accept. XBDM text
-/// lines are short in practice; anything longer is almost certainly a
-/// desynced stream.
-const MAX_LINE_LEN: usize = 16 * 1024;
 
 /// Output of [`ClientEngine::poll`]. Each variant maps to a single
 /// protocol-level event the I/O loop should react to.
@@ -107,34 +103,491 @@ pub enum ClientEvent {
     Failed(Box<Error>),
 }
 
-/// Why [`ClientEngine::submit`] was rejected. Returned synchronously so
-/// the caller learns the misuse without waiting for the next `poll`.
-#[derive(Debug, thiserror::Error)]
-pub enum SubmitError {
-    /// A previous command's response hasn't been pulled yet -- the
-    /// engine doesn't pipeline.
-    #[error("a command is already in flight; pull its response first")]
-    CommandInFlight,
-    /// Banner has not been read yet.
-    #[error("banner not yet received; cannot submit commands")]
-    NotConnected,
-    /// Engine has terminally failed or the peer has closed.
-    #[error("engine is no longer usable (closed or failed)")]
-    Unusable,
-    /// The connection is a notification channel and carries no commands.
-    #[error("connection is a notification channel; commands are not accepted")]
-    NotificationChannel,
-}
-
 /// Sans-io XBDM client. See module docs for the I/O loop pattern.
 #[derive(Debug)]
 pub struct ClientEngine {
     state: State,
+
     inbox: BytesMut,
     outbox: BytesMut,
     events: VecDeque<ClientEvent>,
+
     /// Text of the `201` banner after the status code.
     banner: Option<String>,
+}
+
+impl ClientEngine {
+    /// Construct a fresh engine. Initial state expects a `201` banner
+    /// before any command may be submitted.
+    pub fn new() -> Self {
+        Self {
+            state: State::NeedBanner,
+            inbox: BytesMut::new(),
+            outbox: BytesMut::new(),
+            events: VecDeque::new(),
+            banner: None,
+        }
+    }
+
+    /// Text of the `201` banner after the status code: `connected`, or
+    /// the box id and challenge of a locked console.
+    pub fn banner(&self) -> Option<&str> {
+        self.banner.as_deref()
+    }
+
+    /// Hand bytes received from the peer to the engine. Bytes are
+    /// appended to an internal buffer and the state machine is
+    /// advanced as far as possible. Calling with an empty slice is a
+    /// no-op.
+    ///
+    /// While in `StreamingBody` the engine is not framing; the caller
+    /// owns the wire. `recv` is a no-op there. Use
+    /// [`Self::end_stream`] to push any over-read bytes back into the
+    /// engine before calling `recv` again.
+    pub fn recv(&mut self, bytes: &[u8]) {
+        if matches!(
+            self.state,
+            State::Closed | State::Failed | State::StreamingBody
+        ) {
+            return;
+        }
+
+        if !bytes.is_empty() {
+            self.inbox.extend_from_slice(bytes);
+        }
+
+        self.advance();
+    }
+
+    /// Drain up to `dst.len()` bytes of pending outbound data into
+    /// `dst`. Returns the number of bytes written. The caller is
+    /// expected to feed those bytes to the actual transport.
+    pub fn send(&mut self, dst: &mut [u8]) -> usize {
+        let len = self.outbox.len().min(dst.len());
+        if len == 0 {
+            return 0;
+        }
+
+        let chunk = self.outbox.split_to(len);
+        dst[..len].copy_from_slice(&chunk);
+
+        len
+    }
+
+    /// Number of bytes currently queued for outbound delivery. Useful
+    /// when the I/O loop wants to know whether to schedule a write.
+    pub fn pending_send(&self) -> usize {
+        self.outbox.len()
+    }
+
+    /// Tell the engine the peer closed the read side. Subsequent
+    /// `recv` calls are ignored. A `ClientEvent::Closed` is emitted
+    /// (unless the engine had already failed).
+    pub fn close_read(&mut self) {
+        if self.is_terminal() {
+            return;
+        }
+
+        self.state = State::Closed;
+        self.events.push_back(ClientEvent::Closed);
+    }
+
+    /// Queue a command for transmission. The command line is framed
+    /// with `\r\n` and pushed into the outbox; the engine transitions
+    /// to "awaiting head" so the response of `line` is parsed when
+    /// it arrives.
+    ///
+    /// `binary_len` should be `Some(N)` when the command's expected
+    /// reply is `203 Binary` with `N` bytes of body. For other
+    /// response shapes (line, multiline, upload-binary handshake)
+    /// pass `None`; the engine reads them based on the wire status
+    /// code. Use [`Self::submit_streaming`] for binary responses
+    /// whose size isn't known up front (e.g. `getfile`, `screenshot`).
+    pub fn submit(&mut self, line: &str, binary_len: Option<usize>) -> Result<(), SubmitError> {
+        let expect = match binary_len {
+            Some(len) => HeadExpect::EagerBinary(len),
+            None => HeadExpect::NoBinary,
+        };
+
+        self.queue_submit(line, expect)
+    }
+
+    /// Submit a command whose 203 binary body the caller will stream
+    /// itself. When the head arrives the engine emits
+    /// [`ClientEvent::BinaryHead`] and parks in a `StreamingBody`
+    /// state; the caller drains [`Self::take_inbox`], reads the rest
+    /// of the body off the transport, and calls [`Self::end_stream`]
+    /// to release the engine.
+    ///
+    /// A non-203 head (Line/Multiline/204/4xx) on a streaming submit
+    /// flows through normally: the engine emits the corresponding
+    /// `Response`/`RemoteError` event and transitions back to `Idle`.
+    pub fn submit_streaming(&mut self, line: &str) -> Result<(), SubmitError> {
+        self.queue_submit(line, HeadExpect::StreamBinary)
+    }
+
+    /// Drain any inbox bytes already buffered by the engine. Only
+    /// meaningful right after a [`ClientEvent::BinaryHead`]: the
+    /// returned bytes are the start of the streaming body, captured by
+    /// the same read that pulled in the head line. In any other state
+    /// returns whatever happens to be buffered (typically empty).
+    pub fn take_inbox(&mut self) -> BytesMut {
+        std::mem::take(&mut self.inbox)
+    }
+
+    /// Arm the engine to read the next response without sending any
+    /// command line. Used after manual transport writes (e.g. an
+    /// `sendfile` upload body) where the kit will respond with a
+    /// status line that isn't tied to a normal `submit`. Transitions
+    /// `Idle` -> `AwaitingHead(NoBinary)` so the next `recv` parses a
+    /// fresh response head.
+    pub fn expect_response(&mut self) -> Result<(), SubmitError> {
+        self.arm_response(HeadExpect::NoBinary)
+    }
+
+    /// As [`Self::expect_response`], for a reply that is `203` with
+    /// `len` bytes of body.
+    pub fn expect_binary_response(&mut self, len: usize) -> Result<(), SubmitError> {
+        self.arm_response(HeadExpect::EagerBinary(len))
+    }
+
+    /// Treat every following line as a notification. Called after the
+    /// console accepted `notify` with `205- now a notification channel`.
+    pub fn enter_notification_mode(&mut self) -> Result<(), SubmitError> {
+        self.ensure_idle()?;
+
+        self.state = State::Notifications;
+
+        Ok(())
+    }
+
+    /// Return the engine to `Idle` after a streaming body has been
+    /// fully read off the transport. Any bytes the caller over-read
+    /// past the body end can be passed in `leftover`; they're folded
+    /// back into the inbox so the next command's response can pick
+    /// them up.
+    ///
+    /// No-op if the engine isn't in `StreamingBody`.
+    pub fn end_stream(&mut self, leftover: &[u8]) {
+        if !matches!(self.state, State::StreamingBody) {
+            return;
+        }
+
+        self.state = State::Idle;
+        if !leftover.is_empty() {
+            self.inbox.extend_from_slice(leftover);
+        }
+    }
+
+    /// Abandon a streaming body without having read it to the end.
+    /// The unread bytes are still queued on the wire, so the framing
+    /// position is lost: the engine is failed rather than returned to
+    /// `Idle`, which would let the next command parse body bytes as a
+    /// response head.
+    pub fn abort_stream(&mut self, unread: Option<u64>) {
+        if !matches!(self.state, State::StreamingBody) {
+            return;
+        }
+
+        self.fail(Error::StreamAbandoned { unread });
+    }
+
+    /// Pull the next protocol event, advancing the state machine if
+    /// needed. Returns `None` when no event is queued and the engine
+    /// can't make further progress with the buffered input.
+    pub fn poll(&mut self) -> Option<ClientEvent> {
+        self.advance();
+
+        self.events.pop_front()
+    }
+
+    /// Whether the engine is in a terminal state. Once true, no new
+    /// commands can be submitted and no further events will fire.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.state, State::Closed | State::Failed)
+    }
+
+    fn queue_submit(&mut self, line: &str, expect: HeadExpect) -> Result<(), SubmitError> {
+        self.ensure_idle()?;
+
+        self.outbox.extend_from_slice(line.as_bytes());
+        self.outbox.extend_from_slice(b"\r\n");
+        self.state = State::AwaitingHead(expect);
+
+        Ok(())
+    }
+
+    fn arm_response(&mut self, expect: HeadExpect) -> Result<(), SubmitError> {
+        self.ensure_idle()?;
+
+        self.state = State::AwaitingHead(expect);
+
+        Ok(())
+    }
+
+    /// Reject a new exchange unless the engine is idle on a command
+    /// connection.
+    fn ensure_idle(&self) -> Result<(), SubmitError> {
+        match self.state {
+            State::Idle => Ok(()),
+            State::NeedBanner => Err(SubmitError::NotConnected),
+            State::AwaitingHead(_)
+            | State::ReadingMultiline { .. }
+            | State::ReadingBinary { .. }
+            | State::StreamingBody => Err(SubmitError::CommandInFlight),
+            State::Notifications => Err(SubmitError::NotificationChannel),
+            State::Closed | State::Failed => Err(SubmitError::Unusable),
+        }
+    }
+
+    /// Drive the state machine forward until no more progress can be
+    /// made on the current inbox / state. Idempotent.
+    fn advance(&mut self) {
+        while self.step() {}
+    }
+
+    /// One transition of the state machine. Returns `true` if
+    /// something changed (so [`Self::advance`] should re-check) or
+    /// `false` if we're stuck waiting for input.
+    fn step(&mut self) -> bool {
+        match &self.state {
+            State::NeedBanner => self.step_banner(),
+            // Unsolicited bytes (e.g. async notifications) sit in the
+            // inbox until the next command consumes them.
+            State::Idle => false,
+            State::AwaitingHead(expect) => self.step_head(*expect),
+            State::ReadingMultiline { .. } => self.step_multiline(),
+            State::ReadingBinary { .. } => self.step_binary(),
+            State::Notifications => self.step_notification(),
+            State::StreamingBody | State::Closed | State::Failed => false,
+        }
+    }
+
+    fn step_banner(&mut self) -> bool {
+        let Some(line) = self.try_take_line() else {
+            return false;
+        };
+
+        let head = match parse_response_head(&line) {
+            Ok(head) => head,
+            Err(e) => {
+                self.fail(e);
+                return true;
+            }
+        };
+
+        let Classified::Success(SuccessCode::Connected) = head.code.try_classify() else {
+            self.fail(Error::Framing(FramingError::MissingBanner));
+            return true;
+        };
+
+        self.state = State::Idle;
+        self.banner = Some(head.rest);
+        self.events.push_back(ClientEvent::Connected);
+
+        true
+    }
+
+    fn step_head(&mut self, expect: HeadExpect) -> bool {
+        let Some(line) = self.try_take_line() else {
+            return false;
+        };
+
+        let head = match parse_response_head(&line) {
+            Ok(head) => head,
+            Err(e) => {
+                self.fail(e);
+                return true;
+            }
+        };
+
+        match head.code.try_classify() {
+            Classified::Error(code) => self.remote_error(RemoteStatus::Listed(code), head.rest),
+            Classified::UnlistedError(code) => {
+                self.remote_error(RemoteStatus::Unlisted(code), head.rest)
+            }
+            Classified::Unknown(code) => {
+                self.fail(Error::UnknownStatusCode { code });
+                true
+            }
+            Classified::Success(SuccessCode::MultilineFollows) => {
+                self.state = State::ReadingMultiline {
+                    head: head.rest,
+                    lines: Vec::new(),
+                };
+                true
+            }
+            Classified::Success(SuccessCode::BinaryFollows) => match expect {
+                HeadExpect::NoBinary => {
+                    self.fail(Error::Transport(TransportError::MissingBinaryLen));
+                    true
+                }
+                HeadExpect::EagerBinary(len) => {
+                    self.state = State::ReadingBinary {
+                        head: head.rest,
+                        remaining: len,
+                        data: Vec::with_capacity(len),
+                    };
+                    true
+                }
+                HeadExpect::StreamBinary => {
+                    self.state = State::StreamingBody;
+                    self.events
+                        .push_back(ClientEvent::BinaryHead { head: head.rest });
+                    true
+                }
+            },
+            // 204 hands the conversation to the caller: it owns the
+            // upload bytes and pushes them into the outbox; the engine
+            // just returns to Idle.
+            Classified::Success(SuccessCode::SendBinary) => {
+                self.events
+                    .push_back(ClientEvent::Response(Response::SendBinary {
+                        head: head.rest,
+                    }));
+                self.state = State::Idle;
+                true
+            }
+            Classified::Success(
+                code @ (SuccessCode::Ok
+                | SuccessCode::Connected
+                | SuccessCode::Dedicated
+                | SuccessCode::Reserved206
+                | SuccessCode::FastPipe),
+            ) => {
+                self.events.push_back(ClientEvent::Response(Response::Line {
+                    code,
+                    head: head.rest,
+                }));
+                self.state = State::Idle;
+                true
+            }
+        }
+    }
+
+    fn step_multiline(&mut self) -> bool {
+        let Some(line) = self.try_take_line() else {
+            return false;
+        };
+
+        let State::ReadingMultiline { head, lines } = &mut self.state else {
+            unreachable!("step dispatched on ReadingMultiline");
+        };
+
+        if line != "." {
+            lines.push(line);
+            return true;
+        }
+
+        let head = std::mem::take(head);
+        let lines = std::mem::take(lines);
+        self.state = State::Idle;
+        self.events
+            .push_back(ClientEvent::Response(Response::Multiline { head, lines }));
+
+        true
+    }
+
+    fn step_binary(&mut self) -> bool {
+        let State::ReadingBinary {
+            remaining, data, ..
+        } = &mut self.state
+        else {
+            unreachable!("step dispatched on ReadingBinary");
+        };
+
+        if *remaining == 0 {
+            let State::ReadingBinary { head, data, .. } =
+                std::mem::replace(&mut self.state, State::Idle)
+            else {
+                unreachable!("step dispatched on ReadingBinary");
+            };
+            self.events
+                .push_back(ClientEvent::Response(Response::Binary { head, data }));
+            return true;
+        }
+
+        if self.inbox.is_empty() {
+            return false;
+        }
+
+        let take = (*remaining).min(self.inbox.len());
+        let chunk = self.inbox.split_to(take);
+        data.extend_from_slice(&chunk);
+        *remaining -= take;
+
+        true
+    }
+
+    fn step_notification(&mut self) -> bool {
+        let Some(line) = self.try_take_line() else {
+            return false;
+        };
+
+        self.events.push_back(ClientEvent::Notification(line));
+
+        true
+    }
+
+    /// Try to extract a single CRLF-terminated line from the inbox.
+    /// Returns `None` if no full line is available yet. On a non-UTF-8
+    /// or oversize line the engine transitions to Failed and `None`
+    /// is returned so the outer loop notices via the queued event.
+    fn try_take_line(&mut self) -> Option<String> {
+        // XBDM text lines are short in practice; anything longer is
+        // almost certainly a desynced stream.
+        const MAX_LINE_LEN: usize = 16 * 1024;
+
+        let Some(pos) = memchr(b'\n', &self.inbox) else {
+            // An unterminated line must be capped here: without this the
+            // peer can grow the inbox without bound by never sending LF.
+            if self.inbox.len() > MAX_LINE_LEN {
+                self.fail(Error::Framing(FramingError::LineTooLong));
+            }
+            return None;
+        };
+
+        let end = if pos > 0 && self.inbox[pos - 1] == b'\r' {
+            pos - 1
+        } else {
+            pos
+        };
+        if end > MAX_LINE_LEN {
+            self.fail(Error::Framing(FramingError::LineTooLong));
+            return None;
+        }
+
+        // The taken span includes the LF.
+        let line_bytes = self.inbox.split_to(pos + 1);
+        match std::str::from_utf8(&line_bytes[..end]) {
+            Ok(text) => Some(text.to_owned()),
+            Err(_) => {
+                self.fail(Error::Framing(FramingError::NonUtf8Line));
+                None
+            }
+        }
+    }
+
+    /// A 4xx is a per-command failure, not a session teardown: back to
+    /// `Idle` so the caller can submit again.
+    fn remote_error(&mut self, code: RemoteStatus, message: String) -> bool {
+        self.events
+            .push_back(ClientEvent::RemoteError { code, message });
+        self.state = State::Idle;
+
+        true
+    }
+
+    fn fail(&mut self, e: Error) {
+        self.state = State::Failed;
+        self.events.push_back(ClientEvent::Failed(Box::new(e)));
+    }
+}
+
+impl Default for ClientEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug)]
@@ -182,451 +635,6 @@ enum HeadExpect {
     StreamBinary,
 }
 
-impl Default for ClientEngine {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ClientEngine {
-    /// Construct a fresh engine. Initial state expects a `201` banner
-    /// before any command may be submitted.
-    pub fn new() -> Self {
-        Self {
-            state: State::NeedBanner,
-            inbox: BytesMut::new(),
-            outbox: BytesMut::new(),
-            events: VecDeque::new(),
-            banner: None,
-        }
-    }
-
-    /// Text of the `201` banner after the status code: `connected`, or
-    /// the box id and challenge of a locked console.
-    pub fn banner(&self) -> Option<&str> {
-        self.banner.as_deref()
-    }
-
-    /// Hand bytes received from the peer to the engine. Bytes are
-    /// appended to an internal buffer and the state machine is
-    /// advanced as far as possible. Calling with an empty slice is a
-    /// no-op.
-    ///
-    /// While in `StreamingBody` the engine is not framing; the caller
-    /// owns the wire. `recv` is a no-op there. Use
-    /// [`Self::end_stream`] to push any over-read bytes back into the
-    /// engine before calling `recv` again.
-    pub fn recv(&mut self, bytes: &[u8]) {
-        if matches!(
-            self.state,
-            State::Closed | State::Failed | State::StreamingBody
-        ) {
-            return;
-        }
-        if !bytes.is_empty() {
-            self.inbox.extend_from_slice(bytes);
-        }
-        self.advance();
-    }
-
-    /// Drain up to `dst.len()` bytes of pending outbound data into
-    /// `dst`. Returns the number of bytes written. The caller is
-    /// expected to feed those bytes to the actual transport.
-    pub fn send(&mut self, dst: &mut [u8]) -> usize {
-        let n = self.outbox.len().min(dst.len());
-        if n == 0 {
-            return 0;
-        }
-        let chunk = self.outbox.split_to(n);
-        dst[..n].copy_from_slice(&chunk);
-        n
-    }
-
-    /// Number of bytes currently queued for outbound delivery. Useful
-    /// when the I/O loop wants to know whether to schedule a write.
-    pub fn pending_send(&self) -> usize {
-        self.outbox.len()
-    }
-
-    /// Tell the engine the peer closed the read side. Subsequent
-    /// `recv` calls are ignored. A `ClientEvent::Closed` is emitted
-    /// (unless the engine had already failed).
-    pub fn close_read(&mut self) {
-        if matches!(self.state, State::Closed | State::Failed) {
-            return;
-        }
-        self.state = State::Closed;
-        self.events.push_back(ClientEvent::Closed);
-    }
-
-    /// Queue a command for transmission. The command line is framed
-    /// with `\r\n` and pushed into the outbox; the engine transitions
-    /// to "awaiting head" so the response of `line` is parsed when
-    /// it arrives.
-    ///
-    /// `binary_len` should be `Some(N)` when the command's expected
-    /// reply is `203 Binary` with `N` bytes of body. For other
-    /// response shapes (line, multiline, upload-binary handshake)
-    /// pass `None`; the engine reads them based on the wire status
-    /// code. Use [`Self::submit_streaming`] for binary responses
-    /// whose size isn't known up front (e.g. `getfile`, `screenshot`).
-    pub fn submit(&mut self, line: &str, binary_len: Option<usize>) -> Result<(), SubmitError> {
-        let expect = match binary_len {
-            Some(n) => HeadExpect::EagerBinary(n),
-            None => HeadExpect::NoBinary,
-        };
-        self.queue_submit(line, expect)
-    }
-
-    /// Submit a command whose 203 binary body the caller will stream
-    /// itself. When the head arrives the engine emits
-    /// [`ClientEvent::BinaryHead`] and parks in a `StreamingBody`
-    /// state; the caller drains [`Self::take_inbox`], reads the rest
-    /// of the body off the transport, and calls [`Self::end_stream`]
-    /// to release the engine.
-    ///
-    /// A non-203 head (Line/Multiline/204/4xx) on a streaming submit
-    /// flows through normally: the engine emits the corresponding
-    /// `Response`/`RemoteError` event and transitions back to `Idle`.
-    pub fn submit_streaming(&mut self, line: &str) -> Result<(), SubmitError> {
-        self.queue_submit(line, HeadExpect::StreamBinary)
-    }
-
-    fn queue_submit(&mut self, line: &str, expect: HeadExpect) -> Result<(), SubmitError> {
-        match self.state {
-            State::NeedBanner => return Err(SubmitError::NotConnected),
-            State::Idle => {}
-            State::AwaitingHead(_)
-            | State::ReadingMultiline { .. }
-            | State::ReadingBinary { .. }
-            | State::StreamingBody => return Err(SubmitError::CommandInFlight),
-            State::Notifications => return Err(SubmitError::NotificationChannel),
-            State::Closed | State::Failed => return Err(SubmitError::Unusable),
-        }
-        self.outbox.extend_from_slice(line.as_bytes());
-        self.outbox.extend_from_slice(b"\r\n");
-        self.state = State::AwaitingHead(expect);
-        Ok(())
-    }
-
-    /// Drain any inbox bytes already buffered by the engine. Only
-    /// meaningful right after a [`ClientEvent::BinaryHead`]: the
-    /// returned bytes are the start of the streaming body, captured by
-    /// the same read that pulled in the head line. In any other state
-    /// returns whatever happens to be buffered (typically empty).
-    pub fn take_inbox(&mut self) -> BytesMut {
-        std::mem::take(&mut self.inbox)
-    }
-
-    /// Arm the engine to read the next response without sending any
-    /// command line. Used after manual transport writes (e.g. an
-    /// `sendfile` upload body) where the kit will respond with a
-    /// status line that isn't tied to a normal `submit`. Transitions
-    /// `Idle` -> `AwaitingHead(NoBinary)` so the next `recv` parses a
-    /// fresh response head.
-    pub fn expect_response(&mut self) -> Result<(), SubmitError> {
-        self.arm_response(HeadExpect::NoBinary)
-    }
-
-    /// As [`Self::expect_response`], for a reply that is `203` with
-    /// `len` bytes of body.
-    pub fn expect_binary_response(&mut self, len: usize) -> Result<(), SubmitError> {
-        self.arm_response(HeadExpect::EagerBinary(len))
-    }
-
-    fn arm_response(&mut self, expect: HeadExpect) -> Result<(), SubmitError> {
-        match self.state {
-            State::NeedBanner => Err(SubmitError::NotConnected),
-            State::Idle => {
-                self.state = State::AwaitingHead(expect);
-                Ok(())
-            }
-            State::AwaitingHead(_)
-            | State::ReadingMultiline { .. }
-            | State::ReadingBinary { .. }
-            | State::StreamingBody => Err(SubmitError::CommandInFlight),
-            State::Notifications => Err(SubmitError::NotificationChannel),
-            State::Closed | State::Failed => Err(SubmitError::Unusable),
-        }
-    }
-
-    /// Treat every following line as a notification. Called after the
-    /// console accepted `notify` with `205- now a notification channel`.
-    pub fn enter_notification_mode(&mut self) -> Result<(), SubmitError> {
-        match self.state {
-            State::Idle => {
-                self.state = State::Notifications;
-                Ok(())
-            }
-            State::NeedBanner => Err(SubmitError::NotConnected),
-            State::AwaitingHead(_)
-            | State::ReadingMultiline { .. }
-            | State::ReadingBinary { .. }
-            | State::StreamingBody => Err(SubmitError::CommandInFlight),
-            State::Notifications => Err(SubmitError::NotificationChannel),
-            State::Closed | State::Failed => Err(SubmitError::Unusable),
-        }
-    }
-
-    /// Return the engine to `Idle` after a streaming body has been
-    /// fully read off the transport. Any bytes the caller over-read
-    /// past the body end can be passed in `leftover`; they're folded
-    /// back into the inbox so the next command's response can pick
-    /// them up.
-    ///
-    /// No-op if the engine isn't in `StreamingBody`.
-    pub fn end_stream(&mut self, leftover: &[u8]) {
-        if !matches!(self.state, State::StreamingBody) {
-            return;
-        }
-        self.state = State::Idle;
-        if !leftover.is_empty() {
-            self.inbox.extend_from_slice(leftover);
-        }
-    }
-
-    /// Abandon a streaming body without having read it to the end.
-    /// The unread bytes are still queued on the wire, so the framing
-    /// position is lost: the engine is failed rather than returned to
-    /// `Idle`, which would let the next command parse body bytes as a
-    /// response head.
-    pub fn abort_stream(&mut self, unread: Option<u64>) {
-        if !matches!(self.state, State::StreamingBody) {
-            return;
-        }
-        self.fail(Error::StreamAbandoned { unread });
-    }
-
-    /// Pull the next protocol event, advancing the state machine if
-    /// needed. Returns `None` when no event is queued and the engine
-    /// can't make further progress with the buffered input.
-    pub fn poll(&mut self) -> Option<ClientEvent> {
-        self.advance();
-        self.events.pop_front()
-    }
-
-    /// Whether the engine is in a terminal state. Once true, no new
-    /// commands can be submitted and no further events will fire.
-    pub fn is_terminal(&self) -> bool {
-        matches!(self.state, State::Closed | State::Failed)
-    }
-
-    /// Drive the state machine forward until no more progress can be
-    /// made on the current inbox / state. Idempotent.
-    fn advance(&mut self) {
-        while self.step() {}
-    }
-
-    /// One transition of the state machine. Returns `true` if
-    /// something changed (so [`Self::advance`] should re-check) or
-    /// `false` if we're stuck waiting for input.
-    fn step(&mut self) -> bool {
-        match &mut self.state {
-            State::NeedBanner => {
-                let Some(line) = self.try_take_line() else {
-                    return false;
-                };
-                let head = match parse_response_head(&line) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        self.fail(e);
-                        return true;
-                    }
-                };
-                match head.code.try_classify() {
-                    Classified::Success(SuccessCode::Connected) => {
-                        self.state = State::Idle;
-                        self.banner = Some(head.rest);
-                        self.events.push_back(ClientEvent::Connected);
-                        true
-                    }
-                    _ => {
-                        self.fail(Error::Framing(FramingError::MissingBanner));
-                        true
-                    }
-                }
-            }
-            State::Idle => {
-                // Unsolicited bytes (e.g. async notifications) sit in
-                // the inbox until the next command consumes them.
-                false
-            }
-            State::AwaitingHead(expect) => {
-                let expect = *expect;
-                let Some(line) = self.try_take_line() else {
-                    return false;
-                };
-                let head = match parse_response_head(&line) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        self.fail(e);
-                        return true;
-                    }
-                };
-                match head.code.try_classify() {
-                    Classified::Error(code) => {
-                        self.remote_error(RemoteStatus::Listed(code), head.rest)
-                    }
-                    Classified::UnlistedError(code) => {
-                        self.remote_error(RemoteStatus::Unlisted(code), head.rest)
-                    }
-                    Classified::Unknown(code) => {
-                        self.fail(Error::UnknownStatusCode { code });
-                        true
-                    }
-                    Classified::Success(SuccessCode::MultilineFollows) => {
-                        self.state = State::ReadingMultiline {
-                            head: head.rest,
-                            lines: Vec::new(),
-                        };
-                        true
-                    }
-                    Classified::Success(SuccessCode::BinaryFollows) => match expect {
-                        HeadExpect::NoBinary => {
-                            self.fail(Error::Transport(TransportError::MissingBinaryLen));
-                            true
-                        }
-                        HeadExpect::EagerBinary(len) => {
-                            self.state = State::ReadingBinary {
-                                head: head.rest,
-                                remaining: len,
-                                data: Vec::with_capacity(len),
-                            };
-                            true
-                        }
-                        HeadExpect::StreamBinary => {
-                            self.state = State::StreamingBody;
-                            self.events
-                                .push_back(ClientEvent::BinaryHead { head: head.rest });
-                            true
-                        }
-                    },
-                    Classified::Success(SuccessCode::SendBinary) => {
-                        // 204 hands the conversation to the caller: it
-                        // owns the upload bytes and pushes them into
-                        // the outbox; the engine just returns to Idle.
-                        self.events
-                            .push_back(ClientEvent::Response(Response::SendBinary {
-                                head: head.rest,
-                            }));
-                        self.state = State::Idle;
-                        true
-                    }
-                    Classified::Success(
-                        code @ (SuccessCode::Ok
-                        | SuccessCode::Connected
-                        | SuccessCode::Dedicated
-                        | SuccessCode::Reserved206
-                        | SuccessCode::FastPipe),
-                    ) => {
-                        self.events.push_back(ClientEvent::Response(Response::Line {
-                            code,
-                            head: head.rest,
-                        }));
-                        self.state = State::Idle;
-                        true
-                    }
-                }
-            }
-            State::ReadingMultiline { .. } => {
-                let Some(line) = self.try_take_line() else {
-                    return false;
-                };
-                let State::ReadingMultiline { head, lines } = &mut self.state else {
-                    unreachable!("we just matched ReadingMultiline");
-                };
-                if line == "." {
-                    let head = std::mem::take(head);
-                    let lines = std::mem::take(lines);
-                    self.state = State::Idle;
-                    self.events
-                        .push_back(ClientEvent::Response(Response::Multiline { head, lines }));
-                } else {
-                    lines.push(line);
-                }
-                true
-            }
-            State::ReadingBinary {
-                remaining, data, ..
-            } => {
-                if *remaining == 0 {
-                    let State::ReadingBinary { head, data, .. } =
-                        std::mem::replace(&mut self.state, State::Idle)
-                    else {
-                        unreachable!();
-                    };
-                    self.events
-                        .push_back(ClientEvent::Response(Response::Binary { head, data }));
-                    return true;
-                }
-                if self.inbox.is_empty() {
-                    return false;
-                }
-                let take = (*remaining).min(self.inbox.len());
-                let chunk = self.inbox.split_to(take);
-                data.extend_from_slice(&chunk);
-                *remaining -= take;
-                true
-            }
-            State::Notifications => {
-                let Some(line) = self.try_take_line() else {
-                    return false;
-                };
-                self.events.push_back(ClientEvent::Notification(line));
-                true
-            }
-            State::StreamingBody | State::Closed | State::Failed => false,
-        }
-    }
-
-    /// Try to extract a single CRLF-terminated line from the inbox.
-    /// Returns `None` if no full line is available yet. On a non-UTF-8
-    /// or oversize line the engine transitions to Failed and `None`
-    /// is returned so the outer loop notices via the queued event.
-    fn try_take_line(&mut self) -> Option<String> {
-        let Some(pos) = memchr(b'\n', &self.inbox) else {
-            // An unterminated line must be capped here: without this the
-            // peer can grow the inbox without bound by never sending LF.
-            if self.inbox.len() > MAX_LINE_LEN {
-                self.fail(Error::Framing(FramingError::LineTooLong));
-            }
-            return None;
-        };
-        let end = if pos > 0 && self.inbox[pos - 1] == b'\r' {
-            pos - 1
-        } else {
-            pos
-        };
-        let take = pos + 1; // include the LF
-        if end > MAX_LINE_LEN {
-            self.fail(Error::Framing(FramingError::LineTooLong));
-            return None;
-        }
-        let line_bytes = self.inbox.split_to(take);
-        match std::str::from_utf8(&line_bytes[..end]) {
-            Ok(s) => Some(s.to_owned()),
-            Err(_) => {
-                self.fail(Error::Framing(FramingError::NonUtf8Line));
-                None
-            }
-        }
-    }
-
-    /// A 4xx is a per-command failure, not a session teardown: back to
-    /// `Idle` so the caller can submit again.
-    fn remote_error(&mut self, code: RemoteStatus, message: String) -> bool {
-        self.events
-            .push_back(ClientEvent::RemoteError { code, message });
-        self.state = State::Idle;
-        true
-    }
-
-    fn fail(&mut self, e: Error) {
-        self.state = State::Failed;
-        self.events.push_back(ClientEvent::Failed(Box::new(e)));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,23 +642,25 @@ mod tests {
     use crate::protocol::StatusCode;
 
     fn drive(engine: &mut ClientEngine) -> Vec<ClientEvent> {
-        let mut out = Vec::new();
-        while let Some(ev) = engine.poll() {
-            out.push(ev);
+        let mut events = Vec::new();
+        while let Some(event) = engine.poll() {
+            events.push(event);
         }
-        out
+
+        events
     }
 
     fn drain_send(engine: &mut ClientEngine) -> Vec<u8> {
         let mut out = Vec::new();
         let mut buf = [0u8; 1024];
         loop {
-            let n = engine.send(&mut buf);
-            if n == 0 {
+            let len = engine.send(&mut buf);
+            if len == 0 {
                 break;
             }
-            out.extend_from_slice(&buf[..n]);
+            out.extend_from_slice(&buf[..len]);
         }
+
         out
     }
 
@@ -662,9 +672,9 @@ mod tests {
             Err(SubmitError::NotConnected)
         ));
         e.recv(b"201- connected\r\n");
-        let evs = drive(&mut e);
-        assert_eq!(evs.len(), 1);
-        assert!(matches!(evs[0], ClientEvent::Connected));
+        let events = drive(&mut e);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], ClientEvent::Connected));
         // Now submit works.
         e.submit("ping", None).unwrap();
         assert_eq!(drain_send(&mut e), b"ping\r\n");
@@ -678,9 +688,9 @@ mod tests {
         e.submit("ping", None).unwrap();
         let _ = drain_send(&mut e);
         e.recv(b"200- pong\r\n");
-        let evs = drive(&mut e);
-        assert_eq!(evs.len(), 1);
-        match &evs[0] {
+        let events = drive(&mut e);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
             ClientEvent::Response(Response::Line { code, head }) => {
                 assert_eq!(*code, SuccessCode::Ok);
                 assert_eq!(head, "pong");
@@ -699,9 +709,9 @@ mod tests {
         e.submit("modules", None).unwrap();
         let _ = drain_send(&mut e);
         e.recv(b"202- multiline follows\r\nname=\"a\"\r\nname=\"b\"\r\n.\r\n");
-        let evs = drive(&mut e);
-        assert_eq!(evs.len(), 1);
-        match &evs[0] {
+        let events = drive(&mut e);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
             ClientEvent::Response(Response::Multiline { head, lines }) => {
                 assert_eq!(head, "multiline follows");
                 assert_eq!(
@@ -722,8 +732,8 @@ mod tests {
         let _ = drain_send(&mut e);
         e.recv(b"203- binary follows\r\n");
         e.recv(&[1, 2, 3, 4, 5, 6, 7, 8]);
-        let evs = drive(&mut e);
-        match &evs[0] {
+        let events = drive(&mut e);
+        match &events[0] {
             ClientEvent::Response(Response::Binary { head, data }) => {
                 assert_eq!(head, "binary follows");
                 assert_eq!(data, &vec![1u8, 2, 3, 4, 5, 6, 7, 8]);
@@ -762,9 +772,9 @@ mod tests {
         e.submit("badcmd", None).unwrap();
         let _ = drain_send(&mut e);
         e.recv(b"407- unknown command\r\n");
-        let evs = drive(&mut e);
-        assert_eq!(evs.len(), 1);
-        match &evs[0] {
+        let events = drive(&mut e);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
             ClientEvent::RemoteError { code, message } => {
                 assert_eq!(*code, ErrorCode::UnknownCommand);
                 assert_eq!(message, "unknown command");
@@ -790,8 +800,8 @@ mod tests {
         e.submit("cmd", None).unwrap();
         let _ = drain_send(&mut e);
         e.recv(b"425- \r\n");
-        let evs = drive(&mut e);
-        match &evs[..] {
+        let events = drive(&mut e);
+        match &events[..] {
             [ClientEvent::RemoteError { code, message }] => {
                 assert_eq!(*code, RemoteStatus::Unlisted(StatusCode::new(425).unwrap()));
                 assert_eq!(code.raw(), 425);
@@ -821,9 +831,9 @@ mod tests {
         e.recv(b"201- connected\r\n");
         let _ = drive(&mut e);
         e.close_read();
-        let evs = drive(&mut e);
-        assert_eq!(evs.len(), 1);
-        assert!(matches!(evs[0], ClientEvent::Closed));
+        let events = drive(&mut e);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], ClientEvent::Closed));
         assert!(matches!(e.submit("ping", None), Err(SubmitError::Unusable)));
     }
 
@@ -831,9 +841,9 @@ mod tests {
     fn non_201_banner_fails_engine() {
         let mut e = ClientEngine::new();
         e.recv(b"200- OK\r\n");
-        let evs = drive(&mut e);
-        assert_eq!(evs.len(), 1);
-        match &evs[0] {
+        let events = drive(&mut e);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
             ClientEvent::Failed(err) => assert!(matches!(
                 err.as_ref(),
                 Error::Framing(FramingError::MissingBanner)
@@ -846,9 +856,9 @@ mod tests {
     fn malformed_head_fails_engine() {
         let mut e = ClientEngine::new();
         e.recv(b"abc bogus\r\n");
-        let evs = drive(&mut e);
-        assert_eq!(evs.len(), 1);
-        assert!(matches!(evs[0], ClientEvent::Failed(_)));
+        let events = drive(&mut e);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], ClientEvent::Failed(_)));
     }
 
     #[test]
@@ -859,9 +869,9 @@ mod tests {
         e.submit("getmem", None).unwrap();
         let _ = drain_send(&mut e);
         e.recv(b"203- binary follows\r\n");
-        let evs = drive(&mut e);
-        assert_eq!(evs.len(), 1);
-        match &evs[0] {
+        let events = drive(&mut e);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
             ClientEvent::Failed(err) => {
                 assert!(matches!(
                     err.as_ref(),
@@ -901,9 +911,9 @@ mod tests {
         e.submit_streaming("getfile NAME=\"x\"").unwrap();
         let _ = drain_send(&mut e);
         e.recv(b"203- binary response follows\r\n\x04\x00\x00\x00DATA");
-        let evs = drive(&mut e);
-        assert_eq!(evs.len(), 1);
-        match &evs[0] {
+        let events = drive(&mut e);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
             ClientEvent::BinaryHead { head } => assert_eq!(head, "binary response follows"),
             other => panic!("got {other:?}"),
         }
@@ -940,8 +950,8 @@ mod tests {
         e.submit_streaming("getfile NAME=\"missing\"").unwrap();
         let _ = drain_send(&mut e);
         e.recv(b"402- file not found\r\n");
-        let evs = drive(&mut e);
-        match &evs[0] {
+        let events = drive(&mut e);
+        match &events[0] {
             ClientEvent::RemoteError { code, message } => {
                 assert_eq!(*code, ErrorCode::FileNotFound);
                 assert_eq!(message, "file not found");
@@ -963,9 +973,9 @@ mod tests {
         e.submit("sendfile NAME=\"a\" LENGTH=0x4", None).unwrap();
         let _ = drain_send(&mut e);
         e.recv(b"204- send binary\r\n");
-        let evs = drive(&mut e);
+        let events = drive(&mut e);
         assert!(matches!(
-            evs[0],
+            events[0],
             ClientEvent::Response(Response::SendBinary { .. })
         ));
         e.expect_response().unwrap();
@@ -1085,15 +1095,15 @@ mod tests {
         let _ = drive(&mut e);
         e.submit("dbgname", None).unwrap();
         let mut buf = [0u8; 4];
-        let n1 = e.send(&mut buf);
-        assert_eq!(n1, 4);
-        assert_eq!(&buf[..n1], b"dbgn");
-        let n2 = e.send(&mut buf);
-        assert_eq!(n2, 4);
-        assert_eq!(&buf[..n2], b"ame\r");
-        let n3 = e.send(&mut buf);
-        assert_eq!(n3, 1);
-        assert_eq!(&buf[..n3], b"\n");
+        let first = e.send(&mut buf);
+        assert_eq!(first, 4);
+        assert_eq!(&buf[..first], b"dbgn");
+        let second = e.send(&mut buf);
+        assert_eq!(second, 4);
+        assert_eq!(&buf[..second], b"ame\r");
+        let third = e.send(&mut buf);
+        assert_eq!(third, 1);
+        assert_eq!(&buf[..third], b"\n");
         assert_eq!(e.send(&mut buf), 0);
     }
 }

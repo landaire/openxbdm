@@ -55,8 +55,10 @@ fn fixture(name: &str) -> CaptureLog {
     let mut path = PathBuf::from(manifest_dir);
     path.push("tests/fixtures");
     path.push(format!("{name}.capture"));
+
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("reading fixture {}: {e}", path.display()));
+
     CaptureLog::from_text(&text).expect("parsing capture fixture")
 }
 
@@ -70,6 +72,7 @@ where
         .enable_all()
         .build()
         .unwrap();
+
     runtime.block_on(async move {
         let mut client = Client::new(mock).read_banner().await.unwrap();
         client.run(command).await.unwrap()
@@ -297,7 +300,10 @@ fn modsections_parses_every_section_with_flags() {
     assert_eq!(sections[0].size, 0xf33c);
     assert_eq!(sections[0].index, 1);
     // `flags` is bare decimal on the wire, unlike the 0x-prefixed fields.
-    let text = sections.iter().find(|s| s.name == ".text").unwrap();
+    let text = sections
+        .iter()
+        .find(|section| section.name == ".text")
+        .unwrap();
     assert_eq!(text.flags.0, 10);
     assert_eq!(sections[7].name, ".reloc");
 }
@@ -362,7 +368,7 @@ fn sockets_parses_tracked_socket_entries() {
     let sockets = run_command("sockets", GetSocketInfo);
     assert!(!sockets.is_empty());
     // The XBDM command port itself is always in the list.
-    assert!(sockets.iter().any(|s| s.local_port == 730));
+    assert!(sockets.iter().any(|socket| socket.local_port == 730));
 }
 
 #[test]
@@ -371,11 +377,11 @@ fn pclist_parses_type_and_name_pairs() {
     assert!(!counters.is_empty());
     let pages = counters
         .iter()
-        .find(|c| c.name == "Debugger Pages")
+        .find(|counter| counter.name == "Debugger Pages")
         .expect("Debugger Pages counter present");
     assert_eq!(pages.kind, 0x01);
     // Names may contain spaces; the parser must not split on them.
-    assert!(counters.iter().any(|c| c.name.contains(' ')));
+    assert!(counters.iter().any(|counter| counter.name.contains(' ')));
 }
 
 #[test]
@@ -400,8 +406,8 @@ fn altaddr_parses_ipv4() {
 
 #[test]
 fn modules_parse_flags_and_sizes() {
-    let mods = run_command("modules_small", Modules);
-    insta::assert_debug_snapshot!(mods, @r###"
+    let modules = run_command("modules_small", Modules);
+    insta::assert_debug_snapshot!(modules, @r###"
     [
         ModuleInfo {
             name: "xboxkrnl.exe",

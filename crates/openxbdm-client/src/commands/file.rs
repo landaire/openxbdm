@@ -22,11 +22,12 @@ use futures_io::AsyncRead;
 use futures_io::AsyncWrite;
 use futures_util::io::AsyncReadExt;
 use futures_util::io::AsyncWriteExt;
-use rootcause::prelude::*;
+use rootcause::prelude::ResultExt;
 
 use crate::client::Client;
 use crate::client::ClientEngine;
 use crate::client::Connected;
+use crate::commands::error::report_argument;
 use crate::error::Error;
 use crate::error::FramingError;
 use crate::protocol::ArgBuilder;
@@ -51,6 +52,7 @@ pub struct FileDownload<'a, T> {
     /// 203 head, plus any additional bytes the length-prefix probe
     /// over-read. Drained before any transport read.
     leftover: BytesMut,
+
     total: u64,
     read_so_far: u64,
 }
@@ -73,13 +75,14 @@ where
 
     /// Drain the rest of the payload into a `Vec`.
     pub async fn into_vec(mut self) -> Result<Vec<u8>, rootcause::Report<Error>> {
-        let mut buf = Vec::with_capacity(self.total as usize);
-        self.read_to_end(&mut buf)
+        let mut payload = Vec::with_capacity(self.total as usize);
+        self.read_to_end(&mut payload)
             .await
             .map_err(Error::from)
             .into_report()
             .attach("draining getfile payload into memory")?;
-        Ok(buf)
+
+        Ok(payload)
     }
 
     /// Drain the rest of the payload into any `AsyncWrite`. Returns the
@@ -88,32 +91,36 @@ where
     where
         W: AsyncWrite + Unpin,
     {
-        let mut buf = [0u8; 64 * 1024];
+        let mut chunk = [0u8; 64 * 1024];
         let mut total = 0u64;
+
         while !self.is_exhausted() {
-            let n = self
-                .read(&mut buf)
+            let read_len = self
+                .read(&mut chunk)
                 .await
                 .map_err(Error::from)
                 .into_report()
                 .attach("reading getfile payload chunk")?;
-            if n == 0 {
+            if read_len == 0 {
                 break;
             }
+
             writer
-                .write_all(&buf[..n])
+                .write_all(&chunk[..read_len])
                 .await
                 .map_err(Error::from)
                 .into_report()
                 .attach("writing getfile payload chunk to sink")?;
-            total += n as u64;
+            total += read_len as u64;
         }
+
         writer
             .flush()
             .await
             .map_err(Error::from)
             .into_report()
             .attach("flushing getfile sink")?;
+
         Ok(total)
     }
 }
@@ -128,13 +135,17 @@ impl<T> Drop for FileDownload<'_, T> {
             self.engine.abort_stream(Some(remaining));
             return;
         }
-        // Body fully consumed. `leftover` past the body belongs to the
-        // next response, so hand it back to the engine.
+
+        // `leftover` past the body belongs to the next response, so hand
+        // it back to the engine.
         self.engine.end_stream(&self.leftover);
     }
 }
 
-impl<T: AsyncRead + Unpin> AsyncRead for FileDownload<'_, T> {
+impl<T> AsyncRead for FileDownload<'_, T>
+where
+    T: AsyncRead + Unpin,
+{
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -144,10 +155,11 @@ impl<T: AsyncRead + Unpin> AsyncRead for FileDownload<'_, T> {
         if remaining == 0 {
             return Poll::Ready(Ok(0));
         }
+
         let cap = core::cmp::min(buf.len() as u64, remaining) as usize;
         let slice = &mut buf[..cap];
-
         let this = &mut *self;
+
         // Drain captured leftover bytes ahead of any new transport read.
         if !this.leftover.is_empty() {
             let take = core::cmp::min(this.leftover.len(), slice.len());
@@ -156,6 +168,7 @@ impl<T: AsyncRead + Unpin> AsyncRead for FileDownload<'_, T> {
             this.read_so_far += take as u64;
             return Poll::Ready(Ok(take));
         }
+
         let pinned = Pin::new(&mut *this.transport);
         match pinned.poll_read(cx, slice) {
             Poll::Pending => Poll::Pending,
@@ -164,9 +177,9 @@ impl<T: AsyncRead + Unpin> AsyncRead for FileDownload<'_, T> {
                 io::ErrorKind::UnexpectedEof,
                 "connection closed mid-getfile payload",
             ))),
-            Poll::Ready(Ok(n)) => {
-                this.read_so_far += n as u64;
-                Poll::Ready(Ok(n))
+            Poll::Ready(Ok(read_len)) => {
+                this.read_so_far += read_len as u64;
+                Poll::Ready(Ok(read_len))
             }
         }
     }
@@ -208,31 +221,34 @@ where
     where
         R: AsyncRead + Unpin,
     {
-        let mut buf = [0u8; 64 * 1024];
+        let mut chunk = [0u8; 64 * 1024];
+
         while self.remaining() > 0 {
-            let cap = core::cmp::min(buf.len() as u64, self.remaining()) as usize;
-            let n = reader
-                .read(&mut buf[..cap])
+            let cap = core::cmp::min(chunk.len() as u64, self.remaining()) as usize;
+            let read_len = reader
+                .read(&mut chunk[..cap])
                 .await
                 .map_err(Error::from)
                 .into_report()
                 .attach("reading source for sendfile")?;
-            if n == 0 {
-                let msg = format!(
-                    "source ran out after {} bytes but {} were declared",
-                    self.sent_so_far, self.declared
-                );
+            if read_len == 0 {
+                let sent = self.sent_so_far;
+                let declared = self.declared;
                 return Err(rootcause::Report::new(Error::from(
                     FramingError::TrailingGarbageInHead,
                 ))
-                .attach(msg));
+                .attach(format!(
+                    "source ran out after {sent} bytes but {declared} were declared"
+                )));
             }
-            self.write_all(&buf[..n])
+
+            self.write_all(&chunk[..read_len])
                 .await
                 .map_err(Error::from)
                 .into_report()
                 .attach("sending binary chunk to console")?;
         }
+
         self.finish().await
     }
 
@@ -240,21 +256,21 @@ where
     /// match `declared()`.
     pub async fn send_all(mut self, payload: &[u8]) -> Result<(), rootcause::Report<Error>> {
         if payload.len() as u64 != self.declared {
-            let msg = format!(
-                "payload length {} != declared {}",
-                payload.len(),
-                self.declared
-            );
+            let payload_len = payload.len();
+            let declared = self.declared;
             return Err(
-                rootcause::Report::new(Error::from(FramingError::TrailingGarbageInHead))
-                    .attach(msg),
+                rootcause::Report::new(Error::from(FramingError::TrailingGarbageInHead)).attach(
+                    format!("payload length {payload_len} != declared {declared}"),
+                ),
             );
         }
+
         self.write_all(payload)
             .await
             .map_err(Error::from)
             .into_report()
             .attach("writing send_all payload")?;
+
         self.finish().await
     }
 
@@ -262,16 +278,15 @@ where
     /// Call after having pushed exactly `declared()` bytes via
     /// [`AsyncWrite`].
     pub async fn finish(self) -> Result<(), rootcause::Report<Error>> {
-        if self.remaining() != 0 {
-            let msg = format!(
-                "upload finish called with {} bytes still to send",
-                self.remaining()
-            );
+        let remaining = self.remaining();
+        if remaining != 0 {
             return Err(
-                rootcause::Report::new(Error::from(FramingError::TrailingGarbageInHead))
-                    .attach(msg),
+                rootcause::Report::new(Error::from(FramingError::TrailingGarbageInHead)).attach(
+                    format!("upload finish called with {remaining} bytes still to send"),
+                ),
             );
         }
+
         let response = self.client.read_post_upload_response().await?;
         match response {
             Response::Line {
@@ -286,7 +301,10 @@ where
     }
 }
 
-impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for FileUpload<'_, T> {
+impl<T> AsyncWrite for FileUpload<'_, T>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -300,15 +318,16 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for FileUpload<'_, T> {
                 "FileUpload declared length fully satisfied",
             )));
         }
+
         let cap = core::cmp::min(buf.len() as u64, remaining) as usize;
         let slice = &buf[..cap];
         let pinned = Pin::new(this.client.transport_mut());
         match pinned.poll_write(cx, slice) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Ready(Ok(n)) => {
-                this.sent_so_far += n as u64;
-                Poll::Ready(Ok(n))
+            Poll::Ready(Ok(written)) => {
+                this.sent_so_far += written as u64;
+                Poll::Ready(Ok(written))
             }
         }
     }
@@ -334,6 +353,24 @@ pub enum GetFileRange {
     },
 }
 
+/// Mode for an outbound file upload. `Create` (sendfile) wipes any
+/// existing file and writes the full `size` from offset 0. `WriteAt`
+/// (writefile) writes exactly `size` bytes starting at `offset` within an
+/// existing file. The server takes 32-bit offsets and sizes.
+#[derive(Debug, Clone, Copy)]
+pub enum FileUploadKind {
+    Create { size: u32 },
+    WriteAt { offset: u32, size: u32 },
+}
+
+impl FileUploadKind {
+    pub fn size(&self) -> u32 {
+        match self {
+            Self::Create { size } | Self::WriteAt { size, .. } => *size,
+        }
+    }
+}
+
 impl<T> Client<T, Connected>
 where
     T: AsyncRead + AsyncWrite + Unpin,
@@ -348,7 +385,7 @@ where
     ) -> Result<FileDownload<'a, T>, rootcause::Report<Error>> {
         let mut line = ArgBuilder::new("getfile")
             .quoted("NAME", path)
-            .map_err(|e| rootcause::Report::new(Error::from(e)))?;
+            .map_err(report_argument)?;
         if let GetFileRange::Range { offset, size } = range {
             // The monitor reads to the end of the file for `SIZE=0`.
             let size = size.map_or(0, core::num::NonZeroU32::get);
@@ -366,12 +403,13 @@ where
         // The prefix gives the byte count actually sent, which for a range
         // is clamped to the bytes available.
         let advertised = match read_length_prefix(transport, &mut leftover).await {
-            Ok(n) => n,
+            Ok(length) => length,
             Err(e) => {
                 engine.end_stream(&[]);
                 return Err(e);
             }
         };
+
         Ok(FileDownload {
             transport,
             engine,
@@ -380,30 +418,7 @@ where
             read_so_far: 0,
         })
     }
-}
 
-/// Mode for an outbound file upload. `Create` (sendfile) wipes any
-/// existing file and writes the full `size` from offset 0. `WriteAt`
-/// (writefile) writes exactly `size` bytes starting at `offset` within an
-/// existing file. The server takes 32-bit offsets and sizes.
-#[derive(Debug, Clone, Copy)]
-pub enum FileUploadKind {
-    Create { size: u32 },
-    WriteAt { offset: u32, size: u32 },
-}
-
-impl FileUploadKind {
-    pub fn size(&self) -> u32 {
-        match self {
-            FileUploadKind::Create { size } | FileUploadKind::WriteAt { size, .. } => *size,
-        }
-    }
-}
-
-impl<T> Client<T, Connected>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
     /// Begin a streaming upload to the console. The returned
     /// [`FileUpload`] is an `AsyncWrite` that accepts exactly `size` (or
     /// `size_at_offset`) bytes before being finalized via `.finish()`.
@@ -415,12 +430,12 @@ where
         let line = match kind {
             FileUploadKind::Create { size } => ArgBuilder::new("sendfile")
                 .quoted("NAME", path)
-                .map_err(|e| rootcause::Report::new(Error::from(e)))?
+                .map_err(report_argument)?
                 .hex("LENGTH", u64::from(size))
                 .finish(),
             FileUploadKind::WriteAt { offset, size } => ArgBuilder::new("writefile")
                 .quoted("NAME", path)
-                .map_err(|e| rootcause::Report::new(Error::from(e)))?
+                .map_err(report_argument)?
                 .dec("OFFSET", u64::from(offset))
                 .dec("LENGTH", u64::from(size))
                 .finish(),
@@ -474,18 +489,21 @@ where
         let _ = leftover.split_to(take);
         filled = take;
     }
+
     while filled < prefix.len() {
-        let n = reader
+        let read_len = reader
             .read(&mut prefix[filled..])
             .await
             .map_err(Error::from)
             .into_report()
             .attach("reading getfile length prefix")?;
-        if n == 0 {
+        if read_len == 0 {
             return Err(rootcause::Report::new(Error::ConnectionClosed));
         }
-        filled += n;
+
+        filled += read_len;
     }
+
     let length = u32::from_le_bytes(prefix) as u64;
     if length > MAX_PREFIX_LENGTH {
         return Err(
@@ -493,5 +511,6 @@ where
                 .attach(format!("refusing {length}-byte getfile payload")),
         );
     }
+
     Ok(length)
 }

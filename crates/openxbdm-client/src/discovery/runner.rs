@@ -12,7 +12,8 @@ use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use rootcause::prelude::*;
+use rootcause::Report;
+use rootcause::prelude::ResultExt;
 use tokio::net::UdpSocket;
 
 use crate::discovery::engine::Discovery;
@@ -20,18 +21,21 @@ use crate::discovery::engine::DiscoveryAction;
 use crate::discovery::engine::DiscoveryConfig;
 use crate::discovery::wire::DiscoveredConsole;
 use crate::error::Error;
+use crate::error::TransportError;
 
 /// Look up a specific name. Returns the first matching reply, or `None`
 /// if no console answers within `config.listen_for`.
 pub async fn find_by_name(
     name: &str,
     config: DiscoveryConfig,
-) -> Result<Option<DiscoveredConsole>, rootcause::Report<Error>> {
+) -> Result<Option<DiscoveredConsole>, Report<Error>> {
     let engine = Discovery::lookup(name, config.clone(), Instant::now()).map_err(|e| {
-        rootcause::Report::new(Error::from(crate::error::TransportError::ConnectTimeout))
+        Report::new(Error::from(TransportError::ConnectTimeout))
             .attach(format!("nap encode error: {e}"))
     })?;
+
     let results = drive(engine, config).await?;
+
     Ok(results.into_iter().next())
 }
 
@@ -40,15 +44,16 @@ pub async fn find_by_name(
 /// dropped.
 pub async fn discover_all(
     config: DiscoveryConfig,
-) -> Result<Vec<DiscoveredConsole>, rootcause::Report<Error>> {
+) -> Result<Vec<DiscoveredConsole>, Report<Error>> {
     let engine = Discovery::broadcast(config.clone(), Instant::now());
+
     drive(engine, config).await
 }
 
 async fn drive(
     mut engine: Discovery,
     config: DiscoveryConfig,
-) -> Result<Vec<DiscoveredConsole>, rootcause::Report<Error>> {
+) -> Result<Vec<DiscoveredConsole>, Report<Error>> {
     let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
         .await
         .map_err(Error::from)
@@ -68,6 +73,7 @@ async fn drive(
     );
 
     let mut buf = [0u8; 1024];
+
     loop {
         match engine.poll(Instant::now()) {
             DiscoveryAction::Done(consoles) => return Ok(consoles),
@@ -81,17 +87,14 @@ async fn drive(
                 }
             }
             DiscoveryAction::Wait { until } => {
-                let until_tokio = tokio::time::Instant::from_std(until);
-                let recv = tokio::time::timeout_at(until_tokio, socket.recv_from(&mut buf)).await;
-                match recv {
-                    Err(_) => continue, // timer fired -- loop and re-poll
+                let until = tokio::time::Instant::from_std(until);
+                match tokio::time::timeout_at(until, socket.recv_from(&mut buf)).await {
+                    // The timer fired; poll the engine again.
+                    Err(_) => {}
                     Ok(Err(e)) => {
                         tracing::debug!(error = %e, "nap recv_from error (continuing)");
-                        continue;
                     }
-                    Ok(Ok((len, src))) => {
-                        engine.handle_inbound(src, &buf[..len]);
-                    }
+                    Ok(Ok((len, src))) => engine.handle_inbound(src, &buf[..len]),
                 }
             }
         }

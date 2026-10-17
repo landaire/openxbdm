@@ -47,11 +47,9 @@
 //! registered a PIX handler) the commands still reach xbdm but there
 //! is nobody to handle them; xbdm replies with an empty/ambiguous
 //! response and nothing happens. On a fresh devkit the dashboard
-//! (xshell.xex) normally registers itself and video capture Just
-//! Works; on a halted or no-title state the session will appear to
-//! succeed with zero segments emitted.
-
-use core::fmt::Write as _;
+//! (xshell.xex) normally registers itself and video capture works; on
+//! a halted or no-title state the session will appear to succeed with
+//! zero segments emitted.
 
 use futures_util::io::AsyncRead;
 use futures_util::io::AsyncWrite;
@@ -59,6 +57,7 @@ use openxbdm_core::status::Hresult;
 
 use crate::client::Client;
 use crate::client::Connected;
+pub use crate::commands::pix::PixError;
 use crate::error::Error;
 use crate::error::ParseError;
 use crate::protocol::Response;
@@ -67,31 +66,6 @@ use crate::protocol::SuccessCode;
 /// Protocol version xbmovie sends on `{Version}`. Split low/high
 /// halves give `major = 1`, `minor = 1`, encoded as `0x0001_0001`.
 pub const PIX_VERSION: u32 = 0x0001_0001;
-
-/// Typed error for both pixcmd and `PIX!{...}` interactions. Some
-/// variants are shared; callers can discriminate with matches.
-#[derive(Debug, thiserror::Error)]
-pub enum PixError {
-    /// xbdm / title replied with a non-2xx (or 2xx with unexpected shape).
-    #[error("pix wire replied unexpectedly: {response:?}")]
-    UnexpectedResponse { response: Response },
-    /// Well-known "Cannot execute - previous command still pending" body.
-    #[error("pix runtime reported busy: {message:?}")]
-    Busy { message: String },
-    /// xbmovie restricts visible filenames to 38 bytes.
-    #[error("pix capture filename exceeds xbmovie's 38-byte visible-name limit")]
-    CaptureNameTooLong,
-    /// `PIX!{CaptureFileCreationEnded}` reported a failure result.
-    #[error("capture file creation failed on the console with result {:#010x}", .result.0)]
-    CaptureFileCreationFailed { result: Hresult },
-    /// No `PIX!{CaptureFileCreationEnded}` arrived in time.
-    #[error("no capture file creation result within {}s", .timeout.as_secs())]
-    CaptureFileCreationTimedOut { timeout: core::time::Duration },
-    /// The notification channel closed while a capture notification was
-    /// awaited.
-    #[error("notification channel closed")]
-    NotificationChannelClosed,
-}
 
 /// One line off the notification channel, parsed into the PIX event
 /// taxonomy we've catalogued. Both xbdm-emitted profiler notifications
@@ -129,33 +103,6 @@ impl Notification {
     }
 
     fn parse_body(body: &str) -> Result<Self, ParseError> {
-        // Capture notifications first -- they're brace-wrapped so they
-        // can't collide with the profiler token names.
-        if let Some(rest) = body.strip_prefix("{CaptureFileCreationEnded}") {
-            let result = parse_result(rest)?;
-            return Ok(Notification::CaptureFileCreationEnded { result });
-        }
-        if body.starts_with("{CaptureEnded}") {
-            return Ok(Notification::CaptureEnded);
-        }
-        if let Some(rest) = body.strip_prefix("MovieData") {
-            return Ok(Notification::MovieData(rest.trim_start().to_owned()));
-        }
-        if let Some(rest) = body.strip_prefix("VideoOpError") {
-            return Ok(Notification::VideoOp {
-                error: true,
-                detail: rest.trim_start().to_owned(),
-            });
-        }
-        if let Some(rest) = body.strip_prefix("VideoOp") {
-            return Ok(Notification::VideoOp {
-                error: false,
-                detail: rest.trim_start().to_owned(),
-            });
-        }
-        if let Some(rest) = body.strip_prefix("Resource") {
-            return Ok(Notification::Resource(rest.trim_start().to_owned()));
-        }
         const STATUS_TOKENS: &[&str] = &[
             "NotActive ResourceCapture",
             "StartFailed ResourceCapture",
@@ -171,25 +118,51 @@ impl Notification {
             "StreamEngineOutOfMemory",
             "CounterDataAvailable",
         ];
-        for tok in STATUS_TOKENS {
-            if body == *tok || body.starts_with(&format!("{tok} ")) {
-                return Ok(Notification::Status(body.to_owned()));
+
+        // Capture notifications first -- they're brace-wrapped so they
+        // can't collide with the profiler token names.
+        if let Some(rest) = body.strip_prefix("{CaptureFileCreationEnded}") {
+            let result = parse_result(rest)?;
+            return Ok(Self::CaptureFileCreationEnded { result });
+        }
+
+        if body.starts_with("{CaptureEnded}") {
+            return Ok(Self::CaptureEnded);
+        }
+
+        if let Some(rest) = body.strip_prefix("MovieData") {
+            return Ok(Self::MovieData(rest.trim_start().to_owned()));
+        }
+
+        if let Some(rest) = body.strip_prefix("VideoOpError") {
+            return Ok(Self::VideoOp {
+                error: true,
+                detail: rest.trim_start().to_owned(),
+            });
+        }
+
+        if let Some(rest) = body.strip_prefix("VideoOp") {
+            return Ok(Self::VideoOp {
+                error: false,
+                detail: rest.trim_start().to_owned(),
+            });
+        }
+
+        if let Some(rest) = body.strip_prefix("Resource") {
+            return Ok(Self::Resource(rest.trim_start().to_owned()));
+        }
+
+        for token in STATUS_TOKENS {
+            let matches_token = body
+                .strip_prefix(token)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '));
+            if matches_token {
+                return Ok(Self::Status(body.to_owned()));
             }
         }
-        Ok(Notification::Other(body.to_owned()))
-    }
-}
 
-/// The hex result word after `{CaptureFileCreationEnded}`, with or
-/// without a `0x` prefix.
-fn parse_result(text: &str) -> Result<Hresult, ParseError> {
-    let text = text.trim();
-    let digits = text.strip_prefix("0x").unwrap_or(text);
-    u32::from_str_radix(digits, 16)
-        .map(Hresult)
-        .map_err(|_| ParseError::InvalidHexDigits {
-            key: "CaptureFileCreationEnded",
-        })
+        Ok(Self::Other(body.to_owned()))
+    }
 }
 
 /// Thin wrapper over `pixcmd <subcommand>` for driving the PIX
@@ -221,6 +194,7 @@ where
             wire.push(' ');
             wire.push_str(subcommand);
         }
+
         self.client.send_raw(&wire).await
     }
 }
@@ -237,16 +211,6 @@ impl<'a, T> core::fmt::Debug for CaptureSession<'a, T> {
     }
 }
 
-/// Outcome of [`CaptureSession::connect`]: a session plus whether the
-/// `{Connect}` reply looked like a real PIX handler (`head` contained
-/// `PIX`) or a plain xbdm no-op (`200- OK`). Callers can inspect
-/// `handler_detected` and decide whether to proceed.
-#[derive(Debug)]
-pub struct ConnectOutcome<'a, T> {
-    pub session: CaptureSession<'a, T>,
-    pub handler_detected: bool,
-}
-
 impl<'a, T> CaptureSession<'a, T>
 where
     T: AsyncRead + AsyncWrite + Unpin,
@@ -259,15 +223,18 @@ where
     pub async fn connect(
         client: &'a mut Client<T, Connected>,
     ) -> Result<ConnectOutcome<'a, T>, rootcause::Report<Error>> {
-        let mut session = CaptureSession { client };
-        let resp = session.send_raw("{Connect}").await?;
+        let mut session = Self { client };
+
+        let response = session.send_raw("{Connect}").await?;
         let handler_detected = matches!(
-            &resp,
+            &response,
             Response::Line { head, .. } if head.contains("PIX")
         );
+
         session
-            .send_raw(&format!("{{Version}} {}", PIX_VERSION))
+            .send_raw(&format!("{{Version}} {PIX_VERSION}"))
             .await?;
+
         Ok(ConnectOutcome {
             session,
             handler_detected,
@@ -280,7 +247,7 @@ where
         &mut self,
         megabytes: u32,
     ) -> Result<(), rootcause::Report<Error>> {
-        self.send_ok(&format!("{{LimitCaptureSize}} {}", megabytes))
+        self.send_ok(&format!("{{LimitCaptureSize}} {megabytes}"))
             .await
     }
 
@@ -295,7 +262,7 @@ where
         &mut self,
         path: &str,
     ) -> Result<(), rootcause::Report<Error>> {
-        self.send_ok(&format!("{{BeginCaptureFileCreation}} {}", path))
+        self.send_ok(&format!("{{BeginCaptureFileCreation}} {path}"))
             .await
     }
 
@@ -332,21 +299,22 @@ where
                         message: head,
                     })));
                 }
+
                 if head.contains("PIX") {
                     tracing::debug!(target: "openxbdm_client::pix", command = %body, %head, "pix ok");
                 } else {
                     tracing::debug!(target: "openxbdm_client::pix", command = %body, %head, "pix no-op (no title handler?)");
                 }
+
                 Ok(())
             }
             other => {
-                let mut msg = String::new();
-                let _ = write!(msg, "expected 200 PIX!OK, got {other:?}");
+                let message = format!("expected 200 PIX!OK, got {other:?}");
                 Err(
                     rootcause::Report::new(Error::from(PixError::UnexpectedResponse {
                         response: other,
                     }))
-                    .attach(msg),
+                    .attach(message),
                 )
             }
         }
@@ -358,11 +326,35 @@ where
     /// wire traffic against the registered PIX handler); dropping
     /// either one silently falls through to a no-op `200- OK`.
     async fn send_raw(&mut self, body: &str) -> Result<Response, rootcause::Report<Error>> {
-        let mut wire = String::with_capacity(body.len() + 6);
+        let mut wire = String::with_capacity("PIX!m ".len() + body.len());
         wire.push_str("PIX!m ");
         wire.push_str(body);
+
         self.client.send_raw(&wire).await
     }
+}
+
+/// Outcome of [`CaptureSession::connect`]: a session plus whether the
+/// `{Connect}` reply looked like a real PIX handler (`head` contained
+/// `PIX`) or a plain xbdm no-op (`200- OK`). Callers can inspect
+/// `handler_detected` and decide whether to proceed.
+#[derive(Debug)]
+pub struct ConnectOutcome<'a, T> {
+    pub session: CaptureSession<'a, T>,
+    pub handler_detected: bool,
+}
+
+/// The hex result word after `{CaptureFileCreationEnded}`, with or
+/// without a `0x` prefix.
+fn parse_result(text: &str) -> Result<Hresult, ParseError> {
+    let text = text.trim();
+    let digits = text.strip_prefix("0x").unwrap_or(text);
+
+    u32::from_str_radix(digits, 16)
+        .map(Hresult)
+        .map_err(|_| ParseError::InvalidHexDigits {
+            key: "CaptureFileCreationEnded",
+        })
 }
 
 #[cfg(test)]
@@ -435,7 +427,7 @@ mod tests {
 
     #[test]
     fn parses_status_tokens() {
-        for tok in [
+        for line in [
             "PIX!Trace",
             "PIX!Pause",
             "PIX!NoFrame",
@@ -451,7 +443,7 @@ mod tests {
             "PIX!StartFailed ResourceCapture",
         ] {
             assert!(matches!(
-                Notification::parse(tok),
+                Notification::parse(line),
                 Ok(Some(Notification::Status(_)))
             ));
         }

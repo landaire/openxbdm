@@ -16,6 +16,8 @@ use openxbdm_kd_core::file_io::HostPath;
 use openxbdm_kd_core::file_io::OpenRequest;
 use openxbdm_kd_core::file_io::OpenedFile;
 
+use crate::error::ValueError;
+
 /// A console path, as the kernel requests it, served from a local file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileMapping {
@@ -24,26 +26,41 @@ pub struct FileMapping {
 }
 
 impl FileMapping {
+    /// Parses `CONSOLE_PATH=LOCAL_PATH`.
+    pub fn parse(text: &str) -> Result<Self, ValueError> {
+        let Some((console_path, local_path)) = text.split_once('=') else {
+            return Err(ValueError::NotFileMapping {
+                text: text.to_owned(),
+            });
+        };
+
+        if console_path.is_empty() || local_path.is_empty() {
+            return Err(ValueError::EmptyMappingPath {
+                text: text.to_owned(),
+            });
+        }
+
+        Ok(Self {
+            console_path: console_path.to_owned(),
+            local_path: PathBuf::from(local_path),
+        })
+    }
+
     /// Compares case-insensitively. A path with an unpaired surrogate
     /// matches nothing.
     fn matches(&self, path: &HostPath<'_>) -> bool {
         let mut requested = path.chars();
         let mut mapped = self.console_path.chars();
+
         loop {
             match (requested.next(), mapped.next()) {
                 (None, None) => return true,
-                (Some(Ok(a)), Some(b)) if a.to_lowercase().eq(b.to_lowercase()) => {}
+                (Some(Ok(requested_char)), Some(mapped_char))
+                    if requested_char.to_lowercase().eq(mapped_char.to_lowercase()) => {}
                 _ => return false,
             }
         }
     }
-}
-
-struct OpenFile {
-    file: File,
-    /// The path as the kernel requested it.
-    console_path: String,
-    bytes_served: u64,
 }
 
 #[derive(Default)]
@@ -51,13 +68,6 @@ pub struct HostFiles {
     mappings: Vec<FileMapping>,
     open: HashMap<HostFileHandle, OpenFile>,
     last_handle: u64,
-}
-
-/// An open file, for reporting.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServedFile<'a> {
-    pub console_path: &'a str,
-    pub bytes_served: u64,
 }
 
 impl HostFiles {
@@ -76,6 +86,7 @@ impl HostFiles {
     /// Details of an open handle, for reporting before it is closed.
     pub fn describe(&self, handle: HostFileHandle) -> Option<ServedFile<'_>> {
         let open = self.open.get(&handle)?;
+
         Some(ServedFile {
             console_path: &open.console_path,
             bytes_served: open.bytes_served,
@@ -85,11 +96,13 @@ impl HostFiles {
     fn open_mapping(&mut self, mapping: usize, console_path: String) -> io::Result<OpenedFile> {
         let file = File::open(&self.mappings[mapping].local_path)?;
         let size = file.metadata()?.len();
+
         self.last_handle += 1;
         let Some(raw) = NonZeroU64::new(self.last_handle) else {
             unreachable!("incremented from zero or more")
         };
         let handle = HostFileHandle(raw);
+
         self.open.insert(
             handle,
             OpenFile {
@@ -98,22 +111,9 @@ impl HostFiles {
                 bytes_served: 0,
             },
         );
+
         Ok(OpenedFile { handle, size })
     }
-}
-
-fn read_at(file: &mut File, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
-    file.seek(SeekFrom::Start(offset))?;
-    let mut filled = 0;
-    while filled < buffer.len() {
-        match file.read(&mut buffer[filled..]) {
-            Ok(0) => break,
-            Ok(count) => filled += count,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(filled)
 }
 
 impl HostFileSystem for HostFiles {
@@ -123,6 +123,7 @@ impl HostFileSystem for HostFiles {
             .iter()
             .position(|mapping| mapping.matches(&request.path))
             .ok_or(HostFileError::NotMapped)?;
+
         self.open_mapping(mapping, request.path.to_string()).map_err(|error| {
             tracing::warn!(%error, local = %self.mappings[mapping].local_path.display(), "host file open failed");
             HostFileError::OpenFailed
@@ -139,6 +140,7 @@ impl HostFileSystem for HostFiles {
             .open
             .get_mut(&handle)
             .ok_or(HostFileError::UnknownHandle)?;
+
         match read_at(&mut open.file, offset, buffer) {
             Ok(count) => {
                 open.bytes_served += count as u64;
@@ -159,6 +161,37 @@ impl HostFileSystem for HostFiles {
     }
 }
 
+/// An open file, for reporting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServedFile<'a> {
+    pub console_path: &'a str,
+    pub bytes_served: u64,
+}
+
+struct OpenFile {
+    file: File,
+    /// The path as the kernel requested it.
+    console_path: String,
+    bytes_served: u64,
+}
+
+fn read_at(file: &mut File, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
+    file.seek(SeekFrom::Start(offset))?;
+
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match file.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(count) => filled += count,
+            // Retried; the read was interrupted before transferring data.
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(filled)
+}
+
 #[cfg(test)]
 mod tests {
     use openxbdm_kd_core::file_io::FileIoRequest;
@@ -168,9 +201,11 @@ mod tests {
     fn open_request(path: &str) -> Vec<u8> {
         let mut payload = vec![0u8; 0x40];
         payload[..4].copy_from_slice(&0x3430u32.to_le_bytes());
+
         for unit in path.encode_utf16().chain([0]) {
             payload.extend_from_slice(&unit.to_le_bytes());
         }
+
         payload
     }
 
@@ -185,6 +220,7 @@ mod tests {
             r"host:\Device\Flash\xbdm.xex2",
             r"\Device\Flash\xbdm.xex",
         ];
+
         let results: Vec<bool> = cases
             .iter()
             .map(|path| {
@@ -195,6 +231,7 @@ mod tests {
                 mapping.matches(&open.path)
             })
             .collect();
+
         assert_eq!(results, [true, false, false]);
     }
 }

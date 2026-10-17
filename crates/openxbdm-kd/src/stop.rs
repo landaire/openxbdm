@@ -14,23 +14,11 @@ pub struct StopReport {
     pub number_processors: u32,
     pub thread: u64,
     pub program_counter: u64,
+
     pub exception: Option<StopException>,
     /// The image of a held load-symbols stop.
     pub image: Option<StopImage>,
     pub control_report: ControlReport,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StopImage {
-    pub name: Vec<u8>,
-    pub base: u64,
-    pub size: u32,
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct StopException {
-    pub record: ExceptionRecord,
-    pub first_chance: bool,
 }
 
 impl StopReport {
@@ -45,6 +33,7 @@ impl StopReport {
             }),
             StateBody::LoadSymbols(_) | StateBody::Other => None,
         };
+
         let image = match change.body {
             StateBody::LoadSymbols(symbols) => Some(StopImage {
                 name: change.path.to_vec(),
@@ -53,6 +42,7 @@ impl StopReport {
             }),
             StateBody::Exception { .. } | StateBody::Other => None,
         };
+
         Self {
             new_state: change.new_state,
             processor: change.processor,
@@ -70,4 +60,17 @@ impl StopReport {
         // The kernel sign-extends 32-bit addresses.
         self.program_counter as u32
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopImage {
+    pub name: Vec<u8>,
+    pub base: u64,
+    pub size: u32,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct StopException {
+    pub record: ExceptionRecord,
+    pub first_chance: bool,
 }

@@ -1,4 +1,8 @@
-//! Client errors.
+//! Client and command errors.
+
+use std::net::AddrParseError;
+use std::num::ParseIntError;
+use std::num::TryFromIntError;
 
 use openxbdm_kd_core::DecodeError;
 use openxbdm_kd_core::NtStatus;
@@ -37,4 +41,39 @@ pub enum KdError {
     UnalignedBreakpoint { address: u64 },
     #[error("the kernel rejected a breakpoint at {address:#x}")]
     BreakpointRejected { address: u64 },
+}
+
+/// A command-line or interactive command value that does not parse.
+#[derive(Debug, thiserror::Error)]
+pub enum ValueError {
+    #[error("{text:?} is not an address: {error}")]
+    Address { text: String, error: AddrParseError },
+    #[error("{text:?}: {error}")]
+    Integer { text: String, error: ParseIntError },
+    #[error("{error}")]
+    Length { error: TryFromIntError },
+    #[error("{text:?} is not an even number of hex digits")]
+    OddHexLength { text: String },
+    #[error("{text:?} is not hex")]
+    NotHex { text: String },
+    #[error("{text:?} is not CONSOLE_PATH=LOCAL_PATH")]
+    NotFileMapping { text: String },
+    #[error("{text:?} has an empty path")]
+    EmptyMappingPath { text: String },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CliError {
+    #[error("kernel debugger")]
+    Kd(#[from] KdError),
+    #[error("I/O")]
+    Io(#[from] std::io::Error),
+    #[error("the kernel did not stop within {seconds} s")]
+    NoStop { seconds: u64 },
+    #[error("GDB session failed: {message}")]
+    Gdb { message: String },
+    #[error(transparent)]
+    InvalidValue(#[from] ValueError),
+    #[error("unrecognized command {line:?}")]
+    UnrecognizedCommand { line: String },
 }

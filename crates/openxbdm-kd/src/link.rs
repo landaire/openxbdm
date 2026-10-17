@@ -1,5 +1,5 @@
-//! I/O-free connection state shared by the blocking and asynchronous
-//! clients. Handling a datagram yields an [`Outbox`] the caller transmits.
+//! I/O-free connection state. Handling a datagram yields an [`Outbox`]
+//! the caller transmits.
 
 use std::path::Path;
 
@@ -27,6 +27,8 @@ use openxbdm_kd_core::state_change::StateChange;
 use crate::error::KdError;
 use crate::host_files::HostFiles;
 use crate::stop::StopReport;
+
+pub type NotifyFn = Box<dyn FnMut(Notification<'_>) + Send>;
 
 /// Traffic the clients handle without a caller request.
 #[derive(Debug)]
@@ -68,8 +70,6 @@ pub enum FileOpenAnswer<'a> {
     },
 }
 
-pub type NotifyFn = Box<dyn FnMut(Notification<'_>) + Send>;
-
 /// A manipulate reply copied out of the receive buffer.
 #[derive(Debug, Clone)]
 pub struct OwnedReply {
@@ -79,6 +79,7 @@ pub struct OwnedReply {
 impl OwnedReply {
     fn new(payload: &[u8]) -> Result<Self, KdError> {
         Reply::decode(payload)?;
+
         Ok(Self {
             payload: payload.to_vec(),
         })
@@ -109,18 +110,14 @@ pub(crate) struct Link {
     pub(crate) session: Session,
     pub(crate) stop: Option<StopReport>,
     pub(crate) synchronized: bool,
+
     pub(crate) notify: Option<NotifyFn>,
+
     pub(crate) files: HostFiles,
     /// Image names whose load-symbols stop is reported as a stop instead
     /// of being continued. Compared case-insensitively.
     pub(crate) hold_loads: Vec<String>,
     file_data: Box<[u8; MAX_READ_LEN]>,
-}
-
-fn emit(notify: &mut Option<NotifyFn>, notification: Notification<'_>) {
-    if let Some(notify) = notify.as_mut() {
-        notify(notification);
-    }
 }
 
 impl Link {
@@ -144,6 +141,7 @@ impl Link {
     ) -> Result<(), KdError> {
         self.session.send(packet_type, parts)?;
         outbox.outstanding = true;
+
         Ok(())
     }
 
@@ -155,6 +153,7 @@ impl Link {
         outbox: &mut Outbox,
     ) -> Result<(), KdError> {
         let header = request.encode(processor);
+
         self.send_data(PacketType::MANIPULATE, &[&header, data], outbox)
     }
 
@@ -174,7 +173,9 @@ impl Link {
                 return Ok(None);
             }
         };
+
         outbox.control = received.reply;
+
         match received.event {
             Event::Data(packet) => match Message::decode(&packet) {
                 Ok(Message::Manipulate(_)) => {
@@ -260,35 +261,41 @@ impl Link {
         change: StateChange<'_>,
         outbox: &mut Outbox,
     ) -> Result<Option<Incoming>, KdError> {
-        if let StateBody::LoadSymbols(symbols) = change.body {
-            let held = !symbols.unload && self.holds(change.path);
-            let report = held.then(|| StopReport::from_state_change(&change));
-            // The kernel repeats its stop after the reset that synchronizes
-            // a session; the repeat is not a new load.
-            if report.is_none() || self.stop != report {
-                self.notify(Notification::LoadSymbols {
-                    path: change.path,
-                    base: symbols.base,
-                    size: symbols.size_of_image,
-                    unload: symbols.unload,
-                });
+        let StateBody::LoadSymbols(symbols) = change.body else {
+            if change.new_state != NewState::EXCEPTION {
+                tracing::warn!(state = ?change.new_state, "unknown state change");
             }
-            if let Some(report) = report {
-                self.stop = Some(report);
-                return Ok(Some(Incoming::Stopped));
-            }
-            self.stop = None;
-            let request = Request::Continue {
-                disposition: ContinueDisposition::Handled,
-            };
-            self.send_request(change.processor, request, &[], outbox)?;
-            return Ok(None);
+
+            self.stop = Some(StopReport::from_state_change(&change));
+            return Ok(Some(Incoming::Stopped));
+        };
+
+        let held = !symbols.unload && self.holds(change.path);
+        let report = held.then(|| StopReport::from_state_change(&change));
+
+        // The kernel repeats its stop after the reset that synchronizes
+        // a session; the repeat is not a new load.
+        if report.is_none() || self.stop != report {
+            self.notify(Notification::LoadSymbols {
+                path: change.path,
+                base: symbols.base,
+                size: symbols.size_of_image,
+                unload: symbols.unload,
+            });
         }
-        if change.new_state != NewState::EXCEPTION {
-            tracing::warn!(state = ?change.new_state, "unknown state change");
+
+        if let Some(report) = report {
+            self.stop = Some(report);
+            return Ok(Some(Incoming::Stopped));
         }
-        self.stop = Some(StopReport::from_state_change(&change));
-        Ok(Some(Incoming::Stopped))
+
+        self.stop = None;
+        let request = Request::Continue {
+            disposition: ContinueDisposition::Handled,
+        };
+        self.send_request(change.processor, request, &[], outbox)?;
+
+        Ok(None)
     }
 
     fn holds(&self, path: &[u8]) -> bool {
@@ -309,6 +316,7 @@ impl Link {
             tracing::debug!(?id, "outstanding packet consumed without acknowledgement");
             self.session.abandon();
         }
+
         let closing = match &request {
             FileIoRequest::Close(close) => self
                 .files
@@ -316,7 +324,9 @@ impl Link {
                 .map(|file| (file.console_path.to_owned(), file.bytes_served)),
             _ => None,
         };
+
         let (reply, length) = file_io::respond(&request, &mut self.files, &mut self.file_data);
+
         match &request {
             FileIoRequest::Open(open) => {
                 let answer = match (self.files.mapping(&open.path), reply) {
@@ -366,10 +376,18 @@ impl Link {
                 tracing::warn!(?api, length = payload.len(), "unknown host file request");
             }
         }
+
         let header = reply.encode();
         self.session
             .send(PacketType::FILE_IO, &[&header, &self.file_data[..length]])?;
         outbox.outstanding = true;
+
         Ok(None)
+    }
+}
+
+fn emit(notify: &mut Option<NotifyFn>, notification: Notification<'_>) {
+    if let Some(notify) = notify.as_mut() {
+        notify(notification);
     }
 }

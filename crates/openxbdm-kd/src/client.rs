@@ -29,8 +29,9 @@ use crate::transport::DatagramTransport;
 
 /// Kernel retransmission interval; the host uses the same.
 pub const RETRANSMIT_INTERVAL: Duration = Duration::from_millis(500);
-pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-pub(crate) const RESET_TIMEOUT: Duration = Duration::from_secs(3);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub type TraceFn = Box<dyn FnMut(Direction, &[u8]) + Send>;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Direction {
@@ -38,16 +39,20 @@ pub enum Direction {
     Received,
 }
 
-pub type TraceFn = Box<dyn FnMut(Direction, &[u8]) + Send>;
-
-pub struct KdClient<T: DatagramTransport> {
+pub struct KdClient<T>
+where
+    T: DatagramTransport,
+{
     transport: T,
     link: Link,
     trace: Option<TraceFn>,
     buffer: Box<[u8; MAX_DATAGRAM_LEN]>,
 }
 
-impl<T: DatagramTransport> KdClient<T> {
+impl<T> KdClient<T>
+where
+    T: DatagramTransport,
+{
     pub fn new(transport: T) -> Self {
         Self {
             transport,
@@ -90,7 +95,9 @@ impl<T: DatagramTransport> KdClient<T> {
         if let Some(trace) = self.trace.as_mut() {
             trace(Direction::Sent, datagram);
         }
+
         self.transport.send(datagram)?;
+
         Ok(())
     }
 
@@ -98,9 +105,11 @@ impl<T: DatagramTransport> KdClient<T> {
         if let Some(control) = outbox.control {
             self.transmit(&control)?;
         }
+
         if outbox.outstanding {
             self.retransmit()?;
         }
+
         Ok(())
     }
 
@@ -111,12 +120,16 @@ impl<T: DatagramTransport> KdClient<T> {
             trace,
             ..
         } = self;
-        if let Some(datagram) = link.session.retransmission() {
-            if let Some(trace) = trace.as_mut() {
-                trace(Direction::Sent, datagram);
-            }
-            transport.send(datagram)?;
+
+        let Some(datagram) = link.session.retransmission() else {
+            return Ok(());
+        };
+
+        if let Some(trace) = trace.as_mut() {
+            trace(Direction::Sent, datagram);
         }
+        transport.send(datagram)?;
+
         Ok(())
     }
 
@@ -131,14 +144,17 @@ impl<T: DatagramTransport> KdClient<T> {
         let Some(length) = self.transport.recv(&mut self.buffer[..], timeout)? else {
             return Ok(None);
         };
+
         if let Some(trace) = self.trace.as_mut() {
             trace(Direction::Received, &self.buffer[..length]);
         }
+
         let mut outbox = Outbox::default();
         let incoming = self
             .link
             .handle_datagram(&self.buffer[..length], &mut outbox)?;
         self.flush(outbox)?;
+
         Ok(incoming)
     }
 
@@ -153,10 +169,12 @@ impl<T: DatagramTransport> KdClient<T> {
             .saturating_duration_since(Instant::now())
             .min(RETRANSMIT_INTERVAL);
         let incoming = self.pump(slice)?;
+
         if self.link.session.outstanding().is_some() && last_send.elapsed() >= RETRANSMIT_INTERVAL {
             self.retransmit()?;
             *last_send = Instant::now();
         }
+
         Ok(incoming)
     }
 
@@ -165,15 +183,19 @@ impl<T: DatagramTransport> KdClient<T> {
     pub fn wait_for_stop(&mut self, timeout: Duration) -> Result<bool, KdError> {
         let deadline = Instant::now() + timeout;
         let mut last_send = Instant::now();
+
         while self.link.stop.is_none() {
             if Instant::now() >= deadline {
                 return Ok(false);
             }
+
             self.pump_retransmitting(deadline, &mut last_send)?;
         }
+
         if !self.link.synchronized {
             self.synchronize()?;
         }
+
         Ok(true)
     }
 
@@ -182,19 +204,24 @@ impl<T: DatagramTransport> KdClient<T> {
     pub fn service(&mut self, timeout: Duration) -> Result<(), KdError> {
         let deadline = Instant::now() + timeout;
         let mut last_send = Instant::now();
+
         while Instant::now() < deadline {
             self.pump_retransmitting(deadline, &mut last_send)?;
         }
+
         Ok(())
     }
 
     /// Resets packet numbering so the kernel's expected id matches the
     /// session. The kernel answers with a reset and repeats its stop.
     fn synchronize(&mut self) -> Result<(), KdError> {
+        const RESET_TIMEOUT: Duration = Duration::from_secs(3);
+
         let deadline = Instant::now() + RESET_TIMEOUT;
         let reset = self.link.session.reset();
         self.transmit(&reset)?;
         let mut last_send = Instant::now();
+
         while !self.link.synchronized {
             if Instant::now() >= deadline {
                 return Err(KdError::Timeout {
@@ -202,12 +229,15 @@ impl<T: DatagramTransport> KdClient<T> {
                     seconds: RESET_TIMEOUT.as_secs(),
                 });
             }
+
             self.pump(RETRANSMIT_INTERVAL)?;
+
             if !self.link.synchronized && last_send.elapsed() >= RETRANSMIT_INTERVAL {
                 self.transmit(&reset)?;
                 last_send = Instant::now();
             }
         }
+
         Ok(())
     }
 
@@ -220,6 +250,7 @@ impl<T: DatagramTransport> KdClient<T> {
             .as_ref()
             .ok_or(KdError::NotStopped)?
             .processor;
+
         self.request_on(processor, request, data)
     }
 
@@ -232,12 +263,15 @@ impl<T: DatagramTransport> KdClient<T> {
         if self.link.stop.is_none() {
             return Err(KdError::NotStopped);
         }
+
         let mut outbox = Outbox::default();
         self.link
             .send_request(processor, request, data, &mut outbox)?;
         self.flush(outbox)?;
+
         let deadline = Instant::now() + REQUEST_TIMEOUT;
         let mut last_send = Instant::now();
+
         loop {
             if Instant::now() >= deadline {
                 self.link.session.abandon();
@@ -246,6 +280,7 @@ impl<T: DatagramTransport> KdClient<T> {
                     seconds: REQUEST_TIMEOUT.as_secs(),
                 });
             }
+
             if let Some(Incoming::Reply(reply)) =
                 self.pump_retransmitting(deadline, &mut last_send)?
             {
@@ -257,6 +292,7 @@ impl<T: DatagramTransport> KdClient<T> {
     fn await_acknowledge(&mut self, waiting_for: &'static str) -> Result<(), KdError> {
         let deadline = Instant::now() + REQUEST_TIMEOUT;
         let mut last_send = Instant::now();
+
         while self.link.session.outstanding().is_some() {
             if Instant::now() >= deadline {
                 self.link.session.abandon();
@@ -265,14 +301,17 @@ impl<T: DatagramTransport> KdClient<T> {
                     seconds: REQUEST_TIMEOUT.as_secs(),
                 });
             }
+
             self.pump_retransmitting(deadline, &mut last_send)?;
         }
+
         Ok(())
     }
 
     /// Ends the stop and lets the kernel run.
     pub fn resume(&mut self, disposition: ContinueDisposition) -> Result<(), KdError> {
         let stop = self.link.stop.take().ok_or(KdError::NotStopped)?;
+
         let mut outbox = Outbox::default();
         self.link.send_request(
             stop.processor,
@@ -281,6 +320,7 @@ impl<T: DatagramTransport> KdClient<T> {
             &mut outbox,
         )?;
         self.flush(outbox)?;
+
         self.await_acknowledge("continue acknowledgement")
     }
 
@@ -292,34 +332,41 @@ impl<T: DatagramTransport> KdClient<T> {
         let processor = stop.processor;
         let pc = stop.pc();
         let code = stop.exception.map(|exception| exception.record.code);
+
         let disposition = match code {
             Some(NtStatus::BREAKPOINT) => {
                 let mut word = [0u8; 4];
                 let read = self.read_memory(u64::from(pc), &mut word)?;
+
                 if read == 4 && step::is_unconditional_trap(u32::from_be_bytes(word)) {
                     let mut context = self.read_context(processor)?;
                     context.set_iar(pc.wrapping_add(4));
                     self.write_context(processor, &context)?;
                 }
+
                 ContinueDisposition::Handled
             }
             Some(NtStatus::SINGLE_STEP) | None => ContinueDisposition::Handled,
             Some(_) => ContinueDisposition::NotHandled,
         };
+
         self.resume(disposition)
     }
 
     pub fn reboot(&mut self) -> Result<(), KdError> {
         let stop = self.link.stop.take().ok_or(KdError::NotStopped)?;
+
         let mut outbox = Outbox::default();
         self.link
             .send_request(stop.processor, Request::Reboot, &[], &mut outbox)?;
         self.flush(outbox)?;
+
         self.await_acknowledge("reboot acknowledgement")
     }
 
     pub fn version(&mut self) -> Result<Version, KdError> {
         let reply = self.request(Request::GetVersion, &[])?;
+
         ops::version(&reply)
     }
 
@@ -327,14 +374,17 @@ impl<T: DatagramTransport> KdClient<T> {
     /// short when the range reaches unmapped memory.
     pub fn read_memory(&mut self, address: u64, buffer: &mut [u8]) -> Result<usize, KdError> {
         let mut done = 0;
+
         while let Some(request) = ops::read_memory_request(address, buffer.len(), done) {
             let reply = self.request(request, &[])?;
             let copied = ops::copy_read_memory(&reply, request, &mut buffer[done..])?;
             done += copied;
+
             if !ops::read_complete(request, copied) {
                 break;
             }
         }
+
         Ok(done)
     }
 
@@ -343,11 +393,13 @@ impl<T: DatagramTransport> KdClient<T> {
             let reply = self.request(request, chunk)?;
             ops::check_write_memory(&reply, chunk.len())?;
         }
+
         Ok(())
     }
 
     pub fn read_context(&mut self, processor: Processor) -> Result<Context, KdError> {
         let mut bytes = [0u8; CONTEXT_LEN];
+
         for chunk in context_chunks() {
             let request = Request::ReadContextRange {
                 offset: chunk.offset,
@@ -356,6 +408,7 @@ impl<T: DatagramTransport> KdClient<T> {
             let reply = self.request_on(processor, request, &[])?;
             ops::copy_context_range(&reply, chunk, &mut bytes)?;
         }
+
         Ok(Context::from_bytes(bytes))
     }
 
@@ -371,17 +424,21 @@ impl<T: DatagramTransport> KdClient<T> {
             let reply = self.request_on(processor, request, data)?;
             ops::check_status(&reply.reply())?;
         }
+
         Ok(())
     }
 
     pub fn add_breakpoint(&mut self, address: u64) -> Result<BreakpointHandle, KdError> {
         ops::check_breakpoint_address(address)?;
+
         let reply = self.request(Request::WriteBreakpoint { address }, &[])?;
+
         ops::breakpoint_handle(&reply, address)
     }
 
     pub fn remove_breakpoint(&mut self, handle: BreakpointHandle) -> Result<(), KdError> {
         let reply = self.request(Request::RestoreBreakpoint { handle }, &[])?;
+
         ops::check_status(&reply.reply())
     }
 }

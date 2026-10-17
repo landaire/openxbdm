@@ -24,56 +24,46 @@ impl StepPlan {
     }
 }
 
-const OPCODE_TWI: u32 = 3;
-const OPCODE_BC: u32 = 16;
-const OPCODE_B: u32 = 18;
-const OPCODE_XL: u32 = 19;
-const OPCODE_X: u32 = 31;
-const XL_BCLR: u32 = 16;
-const XL_BCCTR: u32 = 528;
-const X_TW: u32 = 4;
-const TO_ALWAYS: u32 = 31;
-
-fn sign_extend(value: u32, bits: u32) -> u32 {
-    let shift = 32 - bits;
-    (((value << shift) as i32) >> shift) as u32
-}
-
 /// True for a trap instruction that always traps.
 pub fn is_unconditional_trap(instruction: u32) -> bool {
+    const OPCODE_TWI: u32 = 3;
+    const OPCODE_X: u32 = 31;
+    const X_TW: u32 = 4;
+    const TO_ALWAYS: u32 = 31;
+
     let opcode = instruction >> 26;
     let to = (instruction >> 21) & 0x1f;
     let extended = (instruction >> 1) & 0x3ff;
+
     to == TO_ALWAYS && (opcode == OPCODE_TWI || (opcode == OPCODE_X && extended == X_TW))
 }
 
-/// BO bits that make a conditional branch unconditional: the condition
-/// is ignored (BO[0] in IBM numbering, value 0x10) and CTR is not
-/// decremented (BO[2], value 0x04).
-fn branch_always(bo: u32) -> bool {
-    bo & 0x14 == 0x14
-}
-
 pub fn plan(pc: u32, instruction: u32, lr: u32, ctr: u32) -> StepPlan {
+    const OPCODE_BC: u32 = 16;
+    const OPCODE_B: u32 = 18;
+    const OPCODE_XL: u32 = 19;
+    const XL_BCLR: u32 = 16;
+    const XL_BCCTR: u32 = 528;
+
     if is_unconditional_trap(instruction) {
         return StepPlan::SkipTrap {
             next: pc.wrapping_add(4),
         };
     }
+
     let fallthrough = pc.wrapping_add(4);
     let absolute = instruction & 2 != 0;
     let bo = (instruction >> 21) & 0x1f;
+
     let (target, conditional) = match instruction >> 26 {
         OPCODE_B => {
             let displacement = sign_extend(instruction & 0x03ff_fffc, 26);
-            (
-                Some(if absolute {
-                    displacement
-                } else {
-                    pc.wrapping_add(displacement)
-                }),
-                false,
-            )
+            let target = if absolute {
+                displacement
+            } else {
+                pc.wrapping_add(displacement)
+            };
+            (Some(target), false)
         }
         OPCODE_BC => {
             let displacement = sign_extend(instruction & 0xfffc, 16);
@@ -91,6 +81,7 @@ pub fn plan(pc: u32, instruction: u32, lr: u32, ctr: u32) -> StepPlan {
         },
         _ => (None, false),
     };
+
     match target {
         None => StepPlan::Run {
             successors: [fallthrough, 0],
@@ -105,6 +96,19 @@ pub fn plan(pc: u32, instruction: u32, lr: u32, ctr: u32) -> StepPlan {
             count: 2,
         },
     }
+}
+
+fn sign_extend(value: u32, bits: u32) -> u32 {
+    let shift = 32 - bits;
+
+    (((value << shift) as i32) >> shift) as u32
+}
+
+/// BO bits that make a conditional branch unconditional: the condition
+/// is ignored (BO[0] in IBM numbering, value 0x10) and CTR is not
+/// decremented (BO[2], value 0x04).
+fn branch_always(bo: u32) -> bool {
+    bo & 0x14 == 0x14
 }
 
 #[cfg(test)]

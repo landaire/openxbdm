@@ -1,4 +1,4 @@
-//! Request construction and reply interpretation shared by the clients.
+//! Request construction and reply interpretation.
 
 use openxbdm_kd_core::context::CONTEXT_LEN;
 use openxbdm_kd_core::context::Context;
@@ -21,14 +21,8 @@ pub(crate) fn check_status(reply: &Reply<'_>) -> Result<(), KdError> {
             status: reply.status,
         });
     }
-    Ok(())
-}
 
-fn unexpected(request: Request, reply: &Reply<'_>) -> KdError {
-    KdError::UnexpectedReply {
-        expected: request.api(),
-        actual: reply.api,
-    }
+    Ok(())
 }
 
 pub(crate) fn matching_reply(request: Request, reply: OwnedReply) -> Result<OwnedReply, KdError> {
@@ -39,12 +33,14 @@ pub(crate) fn matching_reply(request: Request, reply: OwnedReply) -> Result<Owne
             actual,
         });
     }
+
     Ok(reply)
 }
 
 pub(crate) fn version(reply: &OwnedReply) -> Result<Version, KdError> {
     let reply = reply.reply();
     check_status(&reply)?;
+
     match reply.body {
         ReplyBody::Version(version) => Ok(version),
         _ => Err(KdError::UnexpectedReply {
@@ -70,10 +66,15 @@ pub(crate) fn copy_read_memory(
 ) -> Result<usize, KdError> {
     let reply = reply.reply();
     let ReplyBody::ReadMemory { data, .. } = reply.body else {
-        return Err(unexpected(request, &reply));
+        return Err(KdError::UnexpectedReply {
+            expected: request.api(),
+            actual: reply.api,
+        });
     };
+
     let copied = data.len().min(out.len());
     out[..copied].copy_from_slice(&data[..copied]);
+
     Ok(copied)
 }
 
@@ -91,9 +92,9 @@ pub(crate) fn write_memory_requests(
     bytes
         .chunks(MAX_TRANSFER_LEN)
         .enumerate()
-        .map(move |(index, chunk)| {
+        .map(move |(idx, chunk)| {
             let request = Request::WriteVirtualMemory {
-                address: address + (index * MAX_TRANSFER_LEN) as u64,
+                address: address + (idx * MAX_TRANSFER_LEN) as u64,
                 // Bounded by MAX_TRANSFER_LEN.
                 length: chunk.len() as u32,
             };
@@ -109,6 +110,7 @@ pub(crate) fn check_write_memory(reply: &OwnedReply, requested: usize) -> Result
             actual: reply.api,
         });
     };
+
     if actual as usize != requested {
         return Err(KdError::ShortTransfer {
             api: reply.api,
@@ -116,6 +118,7 @@ pub(crate) fn check_write_memory(reply: &OwnedReply, requested: usize) -> Result
             actual: actual as usize,
         });
     }
+
     Ok(())
 }
 
@@ -126,12 +129,14 @@ pub(crate) fn copy_context_range(
 ) -> Result<(), KdError> {
     let reply = reply.reply();
     check_status(&reply)?;
+
     let ReplyBody::ReadContextRange { data, .. } = reply.body else {
         return Err(KdError::UnexpectedReply {
             expected: ApiNumber::READ_CONTEXT_RANGE,
             actual: reply.api,
         });
     };
+
     let length = chunk.length as usize;
     if data.len() != length {
         return Err(KdError::ShortTransfer {
@@ -140,27 +145,29 @@ pub(crate) fn copy_context_range(
             actual: data.len(),
         });
     }
+
     let offset = chunk.offset as usize;
     out[offset..offset + length].copy_from_slice(data);
+
     Ok(())
 }
 
 pub(crate) fn write_context_request(context: &Context, chunk: ContextChunk) -> (Request, &[u8]) {
     let offset = chunk.offset as usize;
     let data = &context.as_bytes()[offset..offset + chunk.length as usize];
-    (
-        Request::WriteContextRange {
-            offset: chunk.offset,
-            length: chunk.length,
-        },
-        data,
-    )
+    let request = Request::WriteContextRange {
+        offset: chunk.offset,
+        length: chunk.length,
+    };
+
+    (request, data)
 }
 
 pub(crate) fn check_breakpoint_address(address: u64) -> Result<(), KdError> {
     if !address.is_multiple_of(4) {
         return Err(KdError::UnalignedBreakpoint { address });
     }
+
     Ok(())
 }
 
@@ -169,6 +176,7 @@ pub(crate) fn breakpoint_handle(
     address: u64,
 ) -> Result<BreakpointHandle, KdError> {
     let reply = reply.reply();
+
     match reply.body {
         ReplyBody::WriteBreakpoint {
             handle: Some(handle),

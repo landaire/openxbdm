@@ -32,16 +32,19 @@ pub fn describe(datagram: &[u8], direction: Direction) -> String {
         Ok(Datagram::BreakIn) => return "break-in request".to_owned(),
         Err(error) => return format!("undecodable ({error})"),
     };
+
     let mut line = format!(
         "data {:?} {:?} {} bytes",
         packet.packet_type(),
         packet.id(),
         packet.payload().len()
     );
+
     if let Err(error) = packet.verify() {
         let _ = write!(line, " ({error})");
         return line;
     }
+
     if direction == Direction::Sent && packet.packet_type() == PacketType::FILE_IO {
         let _ = match FileIoReply::decode(packet.payload()) {
             Ok((reply, data)) => write!(line, ": file reply {reply:?} data {:#x}", data.len()),
@@ -49,6 +52,7 @@ pub fn describe(datagram: &[u8], direction: Direction) -> String {
         };
         return line;
     }
+
     let message = match Message::decode(&packet) {
         Ok(message) => message,
         Err(error) => {
@@ -56,13 +60,10 @@ pub fn describe(datagram: &[u8], direction: Direction) -> String {
             return line;
         }
     };
+
     let _ = match message {
         Message::StateChange(change) => write!(line, ": {}", describe_state_change(&change)),
-        Message::Manipulate(reply) => write!(
-            line,
-            ": {}",
-            describe_manipulate(&reply, packet.packet_type())
-        ),
+        Message::Manipulate(reply) => write!(line, ": {}", describe_manipulate(&reply)),
         Message::DebugIo(DebugIo::Print { text, .. }) => {
             write!(
                 line,
@@ -92,6 +93,7 @@ pub fn describe(datagram: &[u8], direction: Direction) -> String {
         Message::FileIo(FileIoRequest::Other { api, .. }) => write!(line, ": file {api:?}"),
         Message::Other { .. } => Ok(()),
     };
+
     line
 }
 
@@ -104,6 +106,7 @@ fn describe_state_change(change: &StateChange<'_>) -> String {
         change.thread,
         change.program_counter
     );
+
     let _ = match change.body {
         StateBody::Exception {
             record,
@@ -123,11 +126,13 @@ fn describe_state_change(change: &StateChange<'_>) -> String {
         ),
         StateBody::Other => Ok(()),
     };
+
     line
 }
 
-fn describe_manipulate(reply: &Reply<'_>, _packet_type: PacketType) -> String {
+fn describe_manipulate(reply: &Reply<'_>) -> String {
     let mut line = format!("{:?} status {}", reply.api, reply.status);
+
     let _ = match reply.body {
         ReplyBody::ReadMemory {
             address, actual, ..
@@ -154,5 +159,6 @@ fn describe_manipulate(reply: &Reply<'_>, _packet_type: PacketType) -> String {
         ),
         ReplyBody::Other { .. } => Ok(()),
     };
+
     line
 }

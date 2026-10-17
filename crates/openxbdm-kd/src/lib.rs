@@ -2,12 +2,17 @@
 //! remote serial protocol server.
 
 pub mod client;
+pub mod commands;
+pub mod connection;
+mod datagram_log;
 pub mod describe;
 pub mod error;
 pub mod gdb;
 pub mod host_files;
 pub mod link;
 mod ops;
+pub mod parse;
+mod print;
 pub mod step;
 pub mod stop;
 pub mod transport;

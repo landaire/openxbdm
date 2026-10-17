@@ -1,6 +1,8 @@
 //! Memory a transfer holds from its command to its last continuation call.
 //! Stock allocates these blocks from pool memory; a static spare serves one
 //! holder at a time so a single client does not depend on pool memory.
+// Pool blocks are freed through the unsafe `Backend::free_pool`.
+#![allow(unsafe_code)]
 
 use crate::backend::Backend;
 use crate::commands::filesystem::PoolBuffer;
@@ -11,9 +13,12 @@ use crate::server::MAX_CONNECTIONS;
 /// copy).
 pub const SPARE_SIZE: usize = 0xa50;
 
-/// A held block.
+/// A held block, from [`TransferBlocks::acquire`] until it is released.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransferBlock {
+pub struct TransferBlock(Held);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
     Spare,
     Pool(PoolBuffer),
 }
@@ -56,11 +61,11 @@ impl TransferBlocks {
             .holders
             .iter()
             .flatten()
-            .any(|holder| holder.block == TransferBlock::Spare);
+            .any(|holder| holder.block == TransferBlock(Held::Spare));
         let block = if size as usize <= SPARE_SIZE && !spare_held {
-            TransferBlock::Spare
+            TransferBlock(Held::Spare)
         } else {
-            TransferBlock::Pool(backend.allocate_pool(size)?)
+            TransferBlock(Held::Pool(backend.allocate_pool(size)?))
         };
         self.holders[free] = Some(Holder {
             socket,
@@ -83,19 +88,25 @@ impl TransferBlocks {
     }
 
     /// The bytes of a held block; the spare is longer than requested.
+    // Out of line, the backend call is not repeated in every continuation.
+    #[inline(never)]
     pub fn bytes<'a>(
         &'a mut self,
         backend: &'a mut dyn Backend,
         block: TransferBlock,
     ) -> &'a mut [u8] {
-        match block {
-            TransferBlock::Spare => &mut self.spare,
-            TransferBlock::Pool(buffer) => backend.pool(buffer),
+        match block.0 {
+            Held::Spare => &mut self.spare,
+            Held::Pool(buffer) => backend.pool(buffer),
         }
     }
 
     /// The transfer ended.
-    pub fn release(&mut self, backend: &mut dyn Backend, block: TransferBlock) {
+    ///
+    /// # Safety
+    ///
+    /// No copy of `block` is used afterwards.
+    pub unsafe fn release(&mut self, backend: &mut dyn Backend, block: TransferBlock) {
         if let Some(slot) = self
             .holders
             .iter_mut()
@@ -103,22 +114,28 @@ impl TransferBlocks {
         {
             *slot = None;
         }
-        if let TransferBlock::Pool(buffer) = block {
-            backend.free_pool(buffer);
+        if let Held::Pool(buffer) = block.0 {
+            // SAFETY: the caller's contract; the holder is gone.
+            unsafe { backend.free_pool(buffer) };
         }
     }
 
     /// The transfers of `socket` ended without their last call: the
     /// connection closed, or it runs a new command. The spare is free at
     /// once; pool blocks are freed at the next event pass.
-    pub fn abandon(&mut self, socket: SocketId) {
+    ///
+    /// # Safety
+    ///
+    /// Every continuation of `socket` that holds a block is dropped and
+    /// never resumed.
+    pub unsafe fn abandon(&mut self, socket: SocketId) {
         for slot in &mut self.holders {
             if let Some(holder) = slot
                 && holder.socket == socket
             {
-                match holder.block {
-                    TransferBlock::Spare => *slot = None,
-                    TransferBlock::Pool(_) => holder.abandoned = true,
+                match holder.block.0 {
+                    Held::Spare => *slot = None,
+                    Held::Pool(_) => holder.abandoned = true,
                 }
             }
         }
@@ -128,11 +145,13 @@ impl TransferBlocks {
     pub fn release_abandoned(&mut self, backend: &mut dyn Backend) {
         for slot in &mut self.holders {
             if let Some(Holder {
-                block: TransferBlock::Pool(buffer),
+                block: TransferBlock(Held::Pool(buffer)),
                 ..
             }) = slot.take_if(|holder| holder.abandoned)
             {
-                backend.free_pool(buffer);
+                // SAFETY: the other copies were in the abandoned transfer's
+                // continuation, which the contract of `abandon` drops.
+                unsafe { backend.free_pool(buffer) };
             }
         }
     }

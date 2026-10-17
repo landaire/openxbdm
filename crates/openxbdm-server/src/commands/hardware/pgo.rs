@@ -3,21 +3,23 @@
 //! runtime's text conversions, and `pogo.ini` handling. The Xbox backend
 //! applies the results to the instrumented modules; see
 //! `docs/re-notes/pgo.md`.
+// Pool blocks are freed through the unsafe `Backend::free_pool`.
+#![allow(unsafe_code)]
 
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 
 use crate::backend::Backend as AnyBackend;
 use crate::commands::filesystem;
-use crate::commands::filesystem::CreateDisposition;
-use crate::commands::filesystem::CreateOptions;
 use crate::commands::filesystem::CreateRequest;
-use crate::commands::filesystem::FileAccess;
-use crate::commands::filesystem::FileAttributes;
 use crate::commands::filesystem::PoolRange;
-use crate::commands::filesystem::ShareAccess;
 use crate::commands::memory::PAGE_SIZE;
 use crate::state::ServerState;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::FileAttributes;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
 /// Capacity in UTF-16 units of every path and phase buffer.
 pub const PATH_UNITS: usize = 0x104;
@@ -1188,10 +1190,10 @@ pub fn load_ini(
     ini_path[separator + 1..separator + 9].copy_from_slice(b"pogo.ini");
     let ini_path = &ini_path[..separator + 9];
     let request = CreateRequest {
-        access: FileAccess::GENERIC_READ.union(FileAccess::SYNCHRONIZE),
+        access: AccessMask::GENERIC_READ.union(AccessMask::SYNCHRONIZE),
         allocation_size: None,
-        attributes: FileAttributes::NONE,
-        share: ShareAccess::NONE,
+        attributes: FileAttributes::empty(),
+        share: ShareAccess::empty(),
         disposition: CreateDisposition::Open,
         options: CreateOptions::SYNCHRONOUS_IO_NONALERT,
     };
@@ -1261,7 +1263,8 @@ pub fn load_ini(
                 break;
             }
         }
-        backend.free_pool(buffer);
+        // SAFETY: the block is local to this command and not used after.
+        unsafe { backend.free_pool(buffer) };
     }
     backend.close_file(handle);
     Ok(())

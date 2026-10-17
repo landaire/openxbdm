@@ -7,6 +7,9 @@
 //! its result. Socket calls never block: progress is made whenever the
 //! caller queues a request or asks for a result.
 
+// Stream and Transport::submit take raw caller buffers.
+#![allow(unsafe_code)]
+
 use openxbdm_core::status::Hresult;
 
 /// Request slots of one transport.
@@ -98,13 +101,28 @@ pub enum Incoming<'a> {
 /// The socket and event of a transport.
 pub trait Stream {
     /// Bytes sent; `None` is a socket error.
-    fn send(&mut self, data: Outgoing<'_>) -> Option<u32>;
+    ///
+    /// # Safety
+    ///
+    /// For [`Outgoing::Caller`], the `length` bytes at `address` must be
+    /// readable for the duration of the call.
+    unsafe fn send(&mut self, data: Outgoing<'_>) -> Option<u32>;
     /// Bytes received, 0 at the end of the stream; `None` is a socket error.
-    fn receive(&mut self, into: Incoming<'_>) -> Option<u32>;
+    ///
+    /// # Safety
+    ///
+    /// For [`Incoming::Caller`], the `length` bytes at `address` must be
+    /// writable for the duration of the call.
+    unsafe fn receive(&mut self, into: Incoming<'_>) -> Option<u32>;
     /// The last socket error only reports that the call would block.
     fn would_block(&mut self) -> bool;
     /// The big-endian length at `address` in the caller's memory.
-    fn read_length(&mut self, address: u32) -> u32;
+    ///
+    /// # Safety
+    ///
+    /// The 4 bytes at `address` must be readable for the duration of the
+    /// call; they need not be aligned.
+    unsafe fn read_length(&mut self, address: u32) -> u32;
     /// Signal the event the caller waits on for completions.
     fn signal(&mut self);
     /// Stock assertion trap for a receive buffer shorter than a length.
@@ -199,7 +217,16 @@ impl Transport {
     }
 
     /// Queue a request in the slot from [`Self::reserve`] and make progress.
-    pub fn submit(
+    ///
+    /// # Safety
+    ///
+    /// The caller's memory at `buffer.address` must stay valid until the
+    /// request finishes ([`Self::is_pending`] returns false): for a send,
+    /// `buffer.length` readable bytes; for a receive, `buffer.length` or 4
+    /// bytes, whichever is more, readable and writable. A receive takes
+    /// the whole 4-byte length prefix into its buffer, after
+    /// [`Stream::short_buffer`] when the buffer is shorter, as stock does.
+    pub unsafe fn submit(
         &mut self,
         slot: Slot,
         direction: Direction,
@@ -267,15 +294,23 @@ impl Transport {
             let request = self.requests[slot.index()];
             let sent = if request.framed {
                 let remaining = request.length.wrapping_sub(request.progress);
-                stream.send(Outgoing::Caller(CallerBuffer {
-                    address: request.buffer.wrapping_add(request.progress),
-                    length: remaining,
-                }))
+                // SAFETY: a queued send keeps its `length` bytes readable
+                // (`submit`), and `progress` is below `length` or both are
+                // 0, so the rest lies in the buffer.
+                unsafe {
+                    stream.send(Outgoing::Caller(CallerBuffer {
+                        address: request.buffer.wrapping_add(request.progress),
+                        length: remaining,
+                    }))
+                }
             } else {
                 let prefix = request.length.to_be_bytes();
-                stream.send(Outgoing::Local(
-                    &prefix[(request.progress as usize).min(prefix.len())..],
-                ))
+                // SAFETY: a local slice.
+                unsafe {
+                    stream.send(Outgoing::Local(
+                        &prefix[(request.progress as usize).min(prefix.len())..],
+                    ))
+                }
             };
             let Some(count) = sent else {
                 self.socket_error(stream);
@@ -309,10 +344,16 @@ impl Transport {
             } else {
                 LENGTH_SIZE
             };
-            let received = stream.receive(Incoming::Caller(CallerBuffer {
-                address: request.buffer.wrapping_add(request.progress),
-                length: end.wrapping_sub(request.progress),
-            }));
+            // SAFETY: a queued receive keeps `length` or 4 bytes, whichever
+            // is more, valid (`submit`). Before framing `end` is 4; after,
+            // it is a message length no larger than the buffer. `progress`
+            // is below `end` or both are 0.
+            let received = unsafe {
+                stream.receive(Incoming::Caller(CallerBuffer {
+                    address: request.buffer.wrapping_add(request.progress),
+                    length: end.wrapping_sub(request.progress),
+                }))
+            };
             match received {
                 None => {
                     self.socket_error(stream);
@@ -334,7 +375,9 @@ impl Transport {
                         self.finish(slot, Ok(()), stream);
                         continue;
                     }
-                    let length = stream.read_length(request.buffer);
+                    // SAFETY: the 4 prefix bytes just received lie in the
+                    // valid part of the buffer (`submit`).
+                    let length = unsafe { stream.read_length(request.buffer) };
                     if length <= request.length {
                         request.framed = true;
                         request.length = length;
@@ -357,7 +400,8 @@ impl Transport {
         let mut scratch = [0u8; DISCARD_CHUNK];
         while self.discard > 0 {
             let count = (self.discard as usize).min(DISCARD_CHUNK);
-            match stream.receive(Incoming::Local(&mut scratch[..count])) {
+            // SAFETY: a local slice.
+            match unsafe { stream.receive(Incoming::Local(&mut scratch[..count])) } {
                 None => {
                     self.socket_error(stream);
                     return;
@@ -421,7 +465,7 @@ mod tests {
     }
 
     impl Stream for FakeStream {
-        fn send(&mut self, data: Outgoing<'_>) -> Option<u32> {
+        unsafe fn send(&mut self, data: Outgoing<'_>) -> Option<u32> {
             let bytes = match data {
                 Outgoing::Local(bytes) => bytes.to_vec(),
                 Outgoing::Caller(buffer) => self.memory
@@ -433,7 +477,7 @@ mod tests {
             Some(count as u32)
         }
 
-        fn receive(&mut self, into: Incoming<'_>) -> Option<u32> {
+        unsafe fn receive(&mut self, into: Incoming<'_>) -> Option<u32> {
             let limit = match &into {
                 Incoming::Local(bytes) => bytes.len(),
                 Incoming::Caller(buffer) => buffer.length as usize,
@@ -455,7 +499,7 @@ mod tests {
             !self.closed
         }
 
-        fn read_length(&mut self, address: u32) -> u32 {
+        unsafe fn read_length(&mut self, address: u32) -> u32 {
             let start = address as usize;
             u32::from_be_bytes(self.memory[start..start + 4].try_into().unwrap())
         }
@@ -477,7 +521,8 @@ mod tests {
         stream: &mut FakeStream,
     ) -> Slot {
         let slot = transport.reserve().unwrap();
-        transport.submit(slot, direction, CallerBuffer { address, length }, stream);
+        // SAFETY: `FakeStream` checks every access against its memory.
+        unsafe { transport.submit(slot, direction, CallerBuffer { address, length }, stream) };
         slot
     }
 

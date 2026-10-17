@@ -6,7 +6,9 @@
 //! `continue` (or a state change that releases stopped threads) supplies
 //! what the monitor's exception path does after its wait returns.
 
-use crate::commands::system::hardware_flags;
+// Backend::module_event takes raw trap registers.
+#![allow(unsafe_code)]
+
 use core::fmt::Write as _;
 use xbox360_sys::xboxkrnl::HardwareFlags;
 
@@ -510,7 +512,9 @@ fn stack_overflow(
     record_address: u32,
     can_stop: bool,
 ) {
-    let hardware_kd = hardware_flags(backend).contains(HardwareFlags::KERNEL_DEBUGGER);
+    let hardware_kd = backend
+        .hardware_flags()
+        .contains(HardwareFlags::KERNEL_DEBUGGER);
     if kernel_debugger_enabled(state, backend) && hardware_kd {
         backend.complete_event(thread, Disposition::default());
         return;
@@ -671,7 +675,9 @@ fn exception(
     if !second_chance {
         rewrite_trap(&mut record);
     }
-    let hardware_kd = hardware_flags(backend).contains(HardwareFlags::KERNEL_DEBUGGER);
+    let hardware_kd = backend
+        .hardware_flags()
+        .contains(HardwareFlags::KERNEL_DEBUGGER);
     if !second_chance && state.debugger.trap_passthrough && !hardware_kd {
         let passes = match record.code {
             NtStatus::BREAKPOINT => record.trap_code() == trap::BREAKPOINT,
@@ -733,7 +739,10 @@ fn exception(
             trap::MODULE_LOAD => {
                 dump = false;
                 let stop = !kd && can_stop && stop_on.contains(StopOn::MODULE_LOAD);
-                module = backend.module_event(gpr3 as u32, context.gpr4 as u32, thread);
+                // SAFETY: the event is a module load trap of `thread`, which
+                // stays stopped in the monitor until the event completes;
+                // `gpr3` and `gpr4` are its r3 and r4 from that context.
+                module = unsafe { backend.module_event(gpr3 as u32, context.gpr4 as u32, thread) };
                 match &module {
                     Some(module) if module.has_header => {
                         Plan::notify(Notice::ModuleLoad(module), stop, Resolution::Final)
@@ -746,7 +755,11 @@ fn exception(
                 if gpr3 == 0 {
                     Plan::silent(Resolution::Final)
                 } else {
-                    module = backend.module_event(gpr3 as u32, context.gpr4 as u32, thread);
+                    // SAFETY: the event is a module unload trap of `thread`,
+                    // which stays stopped in the monitor until the event
+                    // completes; `gpr3` and `gpr4` are its r3 and r4.
+                    module =
+                        unsafe { backend.module_event(gpr3 as u32, context.gpr4 as u32, thread) };
                     match &module {
                         Some(module) => {
                             state.debugger.breakpoints.remove_range(
@@ -841,7 +854,10 @@ fn exception(
                     u32::MAX => thread,
                     other => ThreadId(other),
                 };
-                backend.set_thread_name(target, record.parameters[1]);
+                // SAFETY: the record is a type 0x1000 thread-name exception
+                // raised by `thread`, which stays stopped in the monitor
+                // until the event completes; parameter 1 is its name.
+                unsafe { backend.set_thread_name(target, record.parameters[1]) };
             }
             dump &= second_chance;
             let stop = !kd
@@ -1321,7 +1337,9 @@ fn finish(
             // goes on to the crash dump unless the kernel debugger has it.
             let again = continued && !entry.released;
             let kd = kernel_debugger_enabled(state, backend)
-                && hardware_flags(backend).contains(HardwareFlags::KERNEL_DEBUGGER);
+                && backend
+                    .hardware_flags()
+                    .contains(HardwareFlags::KERNEL_DEBUGGER);
             let write_dump = !again && entry.dump && !kd;
             state.debugger.events.dump_in_progress |= write_dump;
             backend.complete_event(

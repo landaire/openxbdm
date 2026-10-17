@@ -10,6 +10,7 @@
 - `openxbdm-core` takes `NtStatus`, `KernelError`, `Win32Error` and `Hresult` from `xbox360-sys`; the monitor's result codes and default reply texts are the `XbdmHresult` trait, `xbdm_success`, `xbdm_error` and `ErrorCode::hresult`.
 - Keep status integers at the wire and the kernel/title ABI: handlers and continuations return `Result<Reply, CommandError>`, converted to the reply line's result in `send_status`; backend traits fail with `KernelError` (a kernel status with named variants and exact passthrough of others) or per-domain error enums; exports, control codes, and reply texts that print a code convert typed errors at that point. `ErrorCode` is an enum of the result-table codes, and `Win32Error` carries Win32 codes.
 - Add the `smb` feature (default): every drive whose device exists, from the drive table and the internal drive mapping, is an SMB share served through `smb2-server`, with share identifiers common to all connections; logons need no password while security is off; while the console is locked, logons, opens, renames, and deletes fail. Optical drives and read-only volumes are read-only shares, and volume information comes from FileFsAttributeInformation. Change notifications report changes made by titles and XBDM through a scan of the watched directory every 2 seconds. Connections close without a logon after 30 seconds, when stalled for 30 seconds, and when idle without open files for 15 minutes; a full table replaces the oldest connection without a session, or else the one silent longest if silent for 5 minutes; a logon naming a previous session ends that session. File reads take a byte slice or a pool range (`ReadTarget`).
+- Backend trait methods that access memory by address are `unsafe fn` with stated contracts, and pool, device and RPC handles can only be made by the backend. `openxbdm-server` denies unsafe code except in the modules that call those methods.
 
 ### SMB server
 
@@ -49,6 +50,7 @@
 - The module does not load when the loader leaves a kernel data import unresolved (as Xenia does for some), so later reads need no check.
 - PIX stream writes and reads use the stream's file handle; the handle address added the session address twice.
 - Register the thread notification with a 16-byte record; the kernel writes its list link at +0xC, past the 12 bytes registered before.
+- `rpc` uploads stop at the end of the call buffer, `rpc` creation and xhttpproxy certificate sizes fail on overflow, and XEX header field reads stop at the field's size, where stock overruns memory.
 
 ### Kernel debugger
 

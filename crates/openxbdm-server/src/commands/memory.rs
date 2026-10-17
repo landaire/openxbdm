@@ -1,4 +1,6 @@
 //! Memory, module, and image inspection commands.
+// `Backend::read_memory` copies from addresses the debugger checked.
+#![allow(unsafe_code)]
 
 pub mod detour;
 
@@ -34,6 +36,11 @@ use crate::reply::Reply;
 use crate::state::ServerState;
 use crate::text::Text;
 use crate::transfer_blocks::TransferBlock;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::FileAttributes;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
 /// Size of a small page in bytes.
 pub const PAGE_SIZE: u32 = 0x1000;
@@ -446,30 +453,20 @@ impl From<detour::DetourError> for CommandError {
     }
 }
 
-/// XEX optional header field key: the high bits identify the field and the
-/// low byte encodes its size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct XexFieldKey(pub u32);
-
-impl XexFieldKey {
-    /// Bytes `xexfield` reports for a field whose header lookup returned
-    /// `value`; `data` reads the field's leading dword.
-    fn size(
-        self,
-        data_length: impl FnOnce() -> Result<u32, XexFieldError>,
-    ) -> Result<u32, XexFieldError> {
-        match self.0 & 0xff {
-            // The entry point is reported with its inline value as data.
-            0 if self.0 == XexHeaderKey::ENTRY_POINT.0 => Ok(4),
-            0 => Ok(0),
-            1 => Ok(4),
-            0xff => data_length(),
-            count => Ok(count << 2),
-        }
-    }
-
-    fn is_inline(self) -> bool {
-        self.0 & 0xff == 0
+/// Bytes `xexfield` reports for `field`; `data_length` reads the leading
+/// size word of its data. The key's low byte gives the form of the data:
+/// 0 a value in the key entry, 0xff a leading size word, else that many
+/// words.
+fn xex_field_size(
+    field: XexHeaderKey,
+    data_length: impl FnOnce() -> Result<u32, XexFieldError>,
+) -> Result<u32, XexFieldError> {
+    match field.0 & 0xff {
+        // The entry point is reported with its inline value as data.
+        0 if field == XexHeaderKey::ENTRY_POINT => Ok(4),
+        0 => Ok(0),
+        0xff => data_length(),
+        words => Ok(words << 2),
     }
 }
 
@@ -487,7 +484,14 @@ pub trait Backend {
     /// Whether the debugger may read the page containing `address`.
     fn is_readable(&mut self, address: u32) -> bool;
     /// Copy memory whose pages [`Backend::is_readable`] accepted.
-    fn read_memory(&mut self, address: u32, output: &mut [u8]);
+    ///
+    /// # Safety
+    ///
+    /// [`Backend::is_readable`] accepted every page of the `output.len()`
+    /// bytes at `address` (wrapping past 0xffffffff to 0) on this thread
+    /// just before the call. A title may still unmap a page in between, as
+    /// with stock.
+    unsafe fn read_memory(&mut self, address: u32, output: &mut [u8]);
 
     /// The `index`th loaded module with an NT header, walking the loader's
     /// module list and then its second list.
@@ -502,20 +506,24 @@ pub trait Backend {
     /// The CodeView record of the module loaded at `base`.
     fn code_view(&mut self, base: u32) -> Option<CodeView>;
     /// `RtlImageXexHeaderField` of the exactly named module: the field
-    /// value for keys whose low byte is 0, else the field address.
-    fn xex_header_field(&mut self, module: &[u8], field: XexFieldKey)
-    -> Result<u32, XexFieldError>;
+    /// value for inline keys, else the field address.
+    fn xex_header_field(
+        &mut self,
+        module: &[u8],
+        field: XexHeaderKey,
+    ) -> Result<u32, XexFieldError>;
     /// Copy bytes at `offset` of the data of a non-inline XEX header field.
+    /// Fails with [`XexFieldError::FieldAbsent`] for bytes past the data.
     fn read_xex_header_field(
         &mut self,
         module: &[u8],
-        field: XexFieldKey,
+        field: XexHeaderKey,
         offset: u32,
         output: &mut [u8],
     ) -> Result<(), XexFieldError>;
-    /// First dword of the running title's XEX header field 0x40801;
-    /// `Ok(None)` when the field is absent.
-    fn title_xex_dword(&mut self, field: XexFieldKey) -> Result<Option<u32>, NoSuchModule>;
+    /// The running title's additional title memory (XEX header field
+    /// 0x40801); `Ok(None)` when the field is absent.
+    fn title_additional_memory(&mut self) -> Result<Option<u32>, NoSuchModule>;
     /// Object path of the running executable; returns its length.
     fn running_executable_path(&mut self, output: &mut [u8]) -> usize;
 
@@ -584,7 +592,7 @@ pub enum Continuation {
     /// The module name is held in `module`.
     XexField {
         module: TransferBlock,
-        field: XexFieldKey,
+        field: XexHeaderKey,
         value: u32,
         size: u32,
         remaining: u32,
@@ -867,7 +875,8 @@ fn get_memory_chunk(
             0
         };
     let data = &mut cx.binary[2..2 + count as usize];
-    cx.backend.read_memory(start, data);
+    // SAFETY: the loop above accepted every page of the `count` bytes.
+    unsafe { cx.backend.read_memory(start, data) };
     cx.state.debugger.restore_saved(start, data);
     cx.binary[..2].copy_from_slice(&header.to_le_bytes());
     cx.binary_len = count as usize + 2;
@@ -1064,7 +1073,9 @@ fn section_line(
 ) -> CommandResult {
     let name = held_name(cx, held);
     let Ok(Some(section)) = cx.backend.module_section(c_string(&name), *next) else {
-        cx.state.transfer_blocks.release(cx.backend, held);
+        // SAFETY: the transfer ends with this result, so the server drops the
+        // continuation, the only other holder.
+        unsafe { cx.state.transfer_blocks.release(cx.backend, held) };
         return Err(CommandError::EndOfData);
     };
     let index = next.0;
@@ -1130,11 +1141,11 @@ fn xex_field(invocation: &mut Invocation<'_>) -> CommandResult {
         invocation.set_text(format_args!("missing field"));
         return Err(CommandError::Fail);
     };
-    let field = XexFieldKey(field);
+    let field = XexHeaderKey(field);
     let name = c_string(&module);
     let backend = &mut *invocation.backend;
     let size = backend.xex_header_field(name, field).and_then(|value| {
-        let size = field.size(|| {
+        let size = xex_field_size(field, || {
             let mut length = [0u8; 4];
             backend
                 .read_xex_header_field(name, field, 0, &mut length)
@@ -1163,7 +1174,7 @@ fn xex_field(invocation: &mut Invocation<'_>) -> CommandResult {
 
 fn xex_field_line(
     held: TransferBlock,
-    field: XexFieldKey,
+    field: XexHeaderKey,
     value: u32,
     size: u32,
     remaining: &mut u32,
@@ -1175,14 +1186,16 @@ fn xex_field_line(
         return Ok(Reply::Ok);
     }
     if *remaining == 0 {
-        cx.state.transfer_blocks.release(cx.backend, held);
+        // SAFETY: the transfer ends with this result, so the server drops the
+        // continuation, the only other holder.
+        unsafe { cx.state.transfer_blocks.release(cx.backend, held) };
         return Err(CommandError::EndOfData);
     }
     let offset = size - *remaining;
     let count = (*remaining).min(XEX_FIELD_BYTES_PER_LINE);
     let mut data = [0u8; XEX_FIELD_BYTES_PER_LINE as usize];
     let data = &mut data[..count as usize];
-    if field.is_inline() {
+    if field.0 & 0xff == 0 {
         let inline = value.to_be_bytes();
         data.copy_from_slice(&inline[offset as usize..(offset + count) as usize]);
     } else {
@@ -1232,12 +1245,12 @@ fn executable_info(invocation: &mut Invocation<'_>) -> CommandResult {
         // Stock leaves the handle open and reports the file missing
         // whatever the open returned.
         let request = filesystem::CreateRequest {
-            access: filesystem::FileAccess::GENERIC_READ.union(filesystem::FileAccess::SYNCHRONIZE),
+            access: AccessMask::GENERIC_READ.union(AccessMask::SYNCHRONIZE),
             allocation_size: None,
-            attributes: filesystem::FileAttributes::NONE,
-            share: filesystem::ShareAccess::NONE,
-            disposition: filesystem::CreateDisposition::Open,
-            options: filesystem::CreateOptions::SYNCHRONOUS_IO_NONALERT,
+            attributes: FileAttributes::empty(),
+            share: ShareAccess::empty(),
+            disposition: CreateDisposition::Open,
+            options: CreateOptions::SYNCHRONOUS_IO_NONALERT,
         };
         let _ = filesystem::open_translated(
             invocation.state,
@@ -1245,10 +1258,14 @@ fn executable_info(invocation: &mut Invocation<'_>) -> CommandResult {
             c_string(&name),
             &request,
         );
-        invocation
-            .state
-            .transfer_blocks
-            .release(invocation.backend, held);
+        // SAFETY: the transfer was not started, so this command holds the only
+        // copy.
+        unsafe {
+            invocation
+                .state
+                .transfer_blocks
+                .release(invocation.backend, held)
+        };
         return Err(ErrorCode::FileNotFound.into());
     }
     let mut object_path = [0u8; EXECUTABLE_PATH_CAPACITY];
@@ -1299,7 +1316,9 @@ fn executable_info_line(
             *line = ExecutableInfoLine::End;
         }
         ExecutableInfoLine::End => {
-            cx.state.transfer_blocks.release(cx.backend, held);
+            // SAFETY: the transfer ends with this result, so the server drops
+            // the continuation, the only other holder.
+            unsafe { cx.state.transfer_blocks.release(cx.backend, held) };
             return Err(CommandError::EndOfData);
         }
     }
@@ -1311,10 +1330,7 @@ fn executable_info_line(
 fn additional_title_memory(invocation: &mut Invocation<'_>) -> CommandResult {
     let mut value = 0;
     if console::console_memory(invocation.backend).value() & 0x2 != 0 {
-        match invocation
-            .backend
-            .title_xex_dword(XexFieldKey(XexHeaderKey::ADDITIONAL_TITLE_MEMORY.0))
-        {
+        match invocation.backend.title_additional_memory() {
             Ok(field) => value = field.unwrap_or(0),
             Err(NoSuchModule) => return Err(ErrorCode::NoSuchModule.into()),
         }
@@ -1520,7 +1536,10 @@ impl DetourOperation<'_> {
                 }))
             }
             Self::Configure(id, settings) => {
-                DetourReply::of(engine.configure(platform, id, settings))
+                // SAFETY: the settings come from the debugger client's
+                // `detour entry setinfo`, which stock trusts to describe the
+                // hooked function (docs/re-notes/nuances.md, Memory).
+                DetourReply::of(unsafe { engine.configure(platform, id, settings) })
             }
             Self::BeginStart => DetourReply::of_running(engine.begin_start()),
             Self::CancelStart => {
@@ -1850,14 +1869,14 @@ fn save_tracking_records(invocation: &mut Invocation<'_>, filename: &[u8]) -> Co
         return Err(CommandError::Win32(Win32Error::SERVICE_NOT_ACTIVE));
     }
     let request = filesystem::CreateRequest {
-        access: filesystem::FileAccess::GENERIC_WRITE
-            .union(filesystem::FileAccess::DELETE)
-            .union(filesystem::FileAccess::SYNCHRONIZE),
+        access: AccessMask::GENERIC_WRITE
+            .union(AccessMask::DELETE)
+            .union(AccessMask::SYNCHRONIZE),
         allocation_size: None,
-        attributes: filesystem::FileAttributes::NORMAL,
-        share: filesystem::ShareAccess::READ,
-        disposition: filesystem::CreateDisposition::OverwriteIf,
-        options: filesystem::CreateOptions::SYNCHRONOUS_IO_NONALERT,
+        attributes: FileAttributes::NORMAL,
+        share: ShareAccess::READ,
+        disposition: CreateDisposition::OverwriteIf,
+        options: CreateOptions::SYNCHRONOUS_IO_NONALERT,
     };
     let written =
         filesystem::open_translated(invocation.state, invocation.backend, filename, &request)
@@ -1966,10 +1985,10 @@ mod tests {
     #[test]
     fn xex_field_sizes_follow_the_key_low_byte() {
         let no_data = || -> Result<u32, XexFieldError> { unreachable!() };
-        assert_eq!(XexFieldKey(0x10100).size(no_data), Ok(4));
-        assert_eq!(XexFieldKey(0x20000).size(no_data), Ok(0));
-        assert_eq!(XexFieldKey(0x10001).size(no_data), Ok(4));
-        assert_eq!(XexFieldKey(0x40006).size(no_data), Ok(0x18));
-        assert_eq!(XexFieldKey(0x103ff).size(|| Ok(0x2c)), Ok(0x2c));
+        assert_eq!(xex_field_size(XexHeaderKey(0x10100), no_data), Ok(4));
+        assert_eq!(xex_field_size(XexHeaderKey(0x20000), no_data), Ok(0));
+        assert_eq!(xex_field_size(XexHeaderKey(0x10001), no_data), Ok(4));
+        assert_eq!(xex_field_size(XexHeaderKey(0x40006), no_data), Ok(0x18));
+        assert_eq!(xex_field_size(XexHeaderKey(0x103ff), || Ok(0x2c)), Ok(0x2c));
     }
 }

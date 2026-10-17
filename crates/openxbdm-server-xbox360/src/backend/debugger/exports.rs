@@ -12,7 +12,6 @@ use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::commands::debugger;
 use openxbdm_server::commands::debugger::ContextFlags;
 use openxbdm_server::commands::debugger::DataTarget;
-use openxbdm_server::commands::debugger::ExtensionHandle;
 use openxbdm_server::commands::debugger::NoSuchThread;
 use openxbdm_server::commands::debugger::StopOn;
 use openxbdm_server::commands::debugger::ThreadId;
@@ -700,7 +699,7 @@ extern "C" fn load_extension(name: u32, handle: u32) -> Hresult {
             };
             match debugger::load_extension(&mut server.state, console, name) {
                 Ok(loaded) => {
-                    request.words[0] = loaded.0;
+                    request.words[0] = loaded;
                     request.count = 1;
                     Hresult::OK
                 }
@@ -724,7 +723,7 @@ extern "C" fn release_extension(handle: u32) -> Hresult {
             command_result(debugger::release_extension(
                 &mut server.state,
                 console,
-                ExtensionHandle(request.first),
+                request.first,
             ))
         },
         handle,

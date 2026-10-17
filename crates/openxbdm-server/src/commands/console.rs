@@ -634,7 +634,7 @@ pub struct HttpRegistration {
     pub port: u16,
     /// Random identifier sent with the request; 0 when none was sent.
     pub transaction: u64,
-    response: [u8; REGISTRATION_RESPONSE_CAPACITY],
+    /// Length of the last accepted response, which the backend holds.
     response_len: u16,
 }
 
@@ -647,7 +647,6 @@ impl HttpRegistration {
         object_len: 0,
         port: 0,
         transaction: 0,
-        response: [0; REGISTRATION_RESPONSE_CAPACITY],
         response_len: 0,
     };
 
@@ -659,19 +658,9 @@ impl HttpRegistration {
         &self.object[..usize::from(self.object_len)]
     }
 
-    /// Body of the last accepted registration response.
-    pub fn response(&self) -> &[u8] {
-        &self.response[..usize::from(self.response_len)]
-    }
-
-    /// The part export 194 reads.
-    pub const fn result(&self) -> RegistrationResult {
-        RegistrationResult {
-            state: self.state,
-            transaction: self.transaction,
-            response: self.response,
-            response_len: self.response_len,
-        }
+    /// Length of the last accepted registration response.
+    pub const fn response_len(&self) -> usize {
+        self.response_len as usize
     }
 }
 
@@ -686,7 +675,26 @@ pub struct RegistrationResult {
 }
 
 impl RegistrationResult {
-    pub const EMPTY: Self = HttpRegistration::EMPTY.result();
+    pub const EMPTY: Self = Self {
+        state: RegistrationState::Pending,
+        transaction: 0,
+        response: [0; REGISTRATION_RESPONSE_CAPACITY],
+        response_len: 0,
+    };
+
+    /// The view of `registration`, whose response body the backend keeps
+    /// in `body`. Bytes past the response length are never reported.
+    pub fn new(
+        registration: &HttpRegistration,
+        body: &[u8; REGISTRATION_RESPONSE_CAPACITY],
+    ) -> Self {
+        Self {
+            state: registration.state,
+            transaction: registration.transaction,
+            response: *body,
+            response_len: registration.response_len,
+        }
+    }
 
     /// Export 194 (stock 0x91f30b48) after its argument checks: copy the
     /// response of a registered console into `output`, the caller's buffer
@@ -998,7 +1006,7 @@ pub struct SystemInformation {
     pub base_kernel: Version,
     pub kernel: Version,
     /// First dword of the kernel hardware information export.
-    pub hardware_flags: u32,
+    pub hardware_flags: HardwareFlags,
 }
 
 /// A network address record and the status of the query.
@@ -1176,8 +1184,10 @@ pub trait Backend {
     fn xam_version(&mut self) -> u32;
     /// Start a registration request.
     fn http_begin(&mut self, request: &HttpRequest<'_>) -> Result<(), HttpStartFailure>;
-    /// Advance the request; on completion the body is in `body`.
-    fn http_poll(&mut self, body: &mut [u8; REGISTRATION_RESPONSE_CAPACITY]) -> HttpProgress;
+    /// Advance the request. On completion the backend keeps the body until
+    /// the next request starts and publishes it with
+    /// [`Published::Registration`] through [`RegistrationResult::new`].
+    fn http_poll(&mut self) -> HttpProgress;
     /// Release the request and the HTTP client.
     fn http_close(&mut self);
     /// Make server state readable by other threads (control codes 0x0b
@@ -1287,9 +1297,7 @@ pub(crate) fn trinity_or_later(flags: HardwareFlags) -> bool {
 /// is a test kit. When the dword at +0x10 of the flash block at 0x80 is
 /// nonzero, it is cleared and the console restarts.
 pub(crate) fn check_settings_block(state: &mut ServerState, backend: &mut dyn AnyBackend) {
-    if settings_block_readable(backend)
-        || !trinity_or_later(crate::commands::system::hardware_flags(backend))
-    {
+    if settings_block_readable(backend) || !trinity_or_later(backend.hardware_flags()) {
         return;
     }
     backend.mark_test_kit();
@@ -2048,7 +2056,7 @@ fn start_registration(
 /// Advance an in-progress request (stock 0x91f30580 states 1 to 7).
 fn advance_registration(state: &mut ServerState, backend: &mut dyn AnyBackend) -> u32 {
     let registration = &mut state.console.http_registration;
-    let failure = match backend.http_poll(&mut registration.response) {
+    let failure = match backend.http_poll() {
         HttpProgress::Pending => return REGISTRATION_RETRY_MS,
         HttpProgress::Complete(length) => {
             registration.response_len = length as u16;
@@ -2363,7 +2371,7 @@ fn system_info_line(
     line: &mut LineText,
 ) -> CommandResult {
     line.clear();
-    let flags = HardwareFlags::from_bits_retain(info.hardware_flags);
+    let flags = info.hardware_flags;
     let _ = match *next {
         SystemInfoLine::Disk => {
             *next = SystemInfoLine::KitType;

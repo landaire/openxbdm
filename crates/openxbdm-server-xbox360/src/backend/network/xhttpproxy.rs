@@ -175,12 +175,18 @@ impl xhttpproxy::Backend for Console {
             Certificate::None => 0,
             Certificate::Hex { size, .. } | Certificate::Upload { size } => size,
         };
+        // Stock adds with wrapping, so a large `certsize` yields a small
+        // block that the certificate then overruns. A size past 4 GiB is
+        // refused as the failed allocation it would be without the wrap.
         let size = certificate_size
-            .wrapping_add(name_size)
-            .wrapping_add(size_of::<Entry>() as u32);
-        // SAFETY: pool allocation of the computed size; the result is checked below.
-        let entry =
-            unsafe { xboxkrnl::ExAllocatePoolWithTag(size, PROXY_TAG) } as usize as *mut Entry;
+            .checked_add(name_size)
+            .and_then(|size| size.checked_add(size_of::<Entry>() as u32));
+        let entry = match size {
+            // SAFETY: pool allocation of the computed size; the result is
+            // checked below.
+            Some(size) => unsafe { xboxkrnl::ExAllocatePoolWithTag(size, PROXY_TAG) },
+            None => 0,
+        } as usize as *mut Entry;
         if entry.is_null() {
             return ProxyOutcome {
                 cleared,
@@ -246,12 +252,18 @@ impl xhttpproxy::Backend for Console {
     fn proxy_write_certificate(&mut self, id: ProxyId, offset: u32, bytes: &[u8]) {
         let guard = Guard::acquire();
         if let Some(entry) = guard.find(id) {
-            // SAFETY: the caller stays within the certificate size.
+            // The entry may be a new one at the address of a released
+            // pending entry, so the copy stops at its own certificate size.
+            // SAFETY: the guard keeps the listed entry allocated.
+            let size = unsafe { (*entry).certificate_size };
+            let count = bytes.len().min(size.saturating_sub(offset) as usize);
+            // SAFETY: the `count` bytes at `offset` lie in the entry's
+            // certificate storage.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     bytes.as_ptr(),
                     (*entry).certificate.add(offset as usize),
-                    bytes.len(),
+                    count,
                 )
             };
         }
@@ -331,12 +343,16 @@ impl xhttpproxy::Backend for Console {
     fn proxy_read_certificate(&mut self, id: ProxyId, offset: u32, output: &mut [u8]) {
         let guard = Guard::acquire();
         if let Some(entry) = guard.find(id) {
-            // SAFETY: the caller stays within the certificate size.
+            // SAFETY: the guard keeps the listed entry allocated.
+            let size = unsafe { (*entry).certificate_size };
+            let count = output.len().min(size.saturating_sub(offset) as usize);
+            // SAFETY: the `count` bytes at `offset` lie in the entry's
+            // certificate storage.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     (*entry).certificate.add(offset as usize),
                     output.as_mut_ptr(),
-                    output.len(),
+                    count,
                 )
             };
         }

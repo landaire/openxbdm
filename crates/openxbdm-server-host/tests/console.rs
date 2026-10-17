@@ -25,6 +25,7 @@ use openxbdm_server::commands::console::RegistrationState;
 use openxbdm_server::commands::filesystem::DriveTarget;
 use openxbdm_server::commands::system::RebootKind;
 use openxbdm_server_host::Host;
+use xbox360_sys::xboxkrnl::HardwareFlags;
 
 fn session(server: &TestServer) -> RawSession {
     let mut session = server.raw();
@@ -621,10 +622,8 @@ fn http_registration_exchange() {
     wait_for_registration(&server, RegistrationState::Registered);
 
     let host = server.host.lock();
-    assert_eq!(
-        host.server.state.console.http_registration.response(),
-        b"hello"
-    );
+    let length = host.server.state.console.http_registration.response_len();
+    assert_eq!(&host.backend.console.http.body[..length], b"hello");
     assert_eq!(host.backend.console.http.closes, 1);
     drop(host);
     let output = debug_output(&server);
@@ -741,7 +740,7 @@ fn unreadable_settings_block_makes_a_test_kit() {
         (|host: &mut Host| host.backend.system.settings = Some(b"drivemap internal=1\r\n".to_vec()))
             as fn(&mut Host),
         |host| host.backend.console.i2c_failure = false,
-        |host| host.backend.system.hardware_flags = 0x3000_0013,
+        |host| host.backend.system.hardware_flags = HardwareFlags::from_bits_retain(0x3000_0013),
     ] {
         let server = server_with(|host| {
             failing(host);
@@ -852,7 +851,8 @@ fn system_info() {
 
     let server = server_with(|host| {
         host.backend.test_kit = true;
-        host.backend.console.system_information.hardware_flags = 0x7000_0001;
+        host.backend.console.system_information.hardware_flags =
+            HardwareFlags::from_bits_retain(0x7000_0001);
     });
     let mut session = self::session(&server);
     session.command("systeminfo");

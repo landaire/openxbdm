@@ -859,7 +859,7 @@ fn fastpipe_receives_inline_and_block_files() {
         let entry = host.backend.filesystem.entry(&block_path).unwrap();
         assert_eq!(entry.data.len(), 0x10001);
         assert_eq!(entry.data[0x10000], b'!');
-        assert_eq!(entry.attributes.0, 0x20);
+        assert_eq!(entry.attributes.bits(), 0x20);
         assert_eq!(entry.creation_time.0, 0x01d0_0000_0000_0001);
         assert_eq!(entry.last_write_time.0, 0x01d0_0000_0000_0002);
     }

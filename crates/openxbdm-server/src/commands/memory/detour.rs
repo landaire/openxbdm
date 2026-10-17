@@ -6,6 +6,8 @@
 //! thread, the writer and completion workers, and title threads that enter
 //! through a trampoline. Entry list changes happen on the server thread
 //! only; the logger reads entries without a lock, as stock does.
+// `Platform` reads and writes title memory by address.
+#![allow(unsafe_code)]
 
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicU32;
@@ -478,6 +480,12 @@ fn record_in(storage: &'static [AtomicU32], index: RecordIndex) -> Record {
 
 /// Services the engine needs from the platform. Implementations are
 /// callable from any thread.
+///
+/// The title memory the engine passes to the access methods is the stub
+/// locals, stack parameters and register save areas of a hooked call
+/// while that call is in the logger, and the XOVERLAPPED of a discarded
+/// overlapped call, which the title keeps until its completion is
+/// written. Stock does not align these accesses.
 pub trait Platform {
     /// Address of trampoline 0.
     fn trampolines(&self) -> u32;
@@ -499,13 +507,35 @@ pub trait Platform {
     fn record_queued(&self);
     /// The writer returned a record to the pool.
     fn record_freed(&self);
-    fn read_u32(&self, address: u32) -> u32;
-    fn read_u64(&self, address: u32) -> u64;
-    fn read_block(&self, address: u32, output: &mut [u8; BLOCK_SIZE]);
-    fn write_u32(&self, address: u32, value: u32);
+    /// # Safety
+    ///
+    /// The 4 bytes at `address` are title memory that stays readable for
+    /// the call.
+    unsafe fn read_u32(&self, address: u32) -> u32;
+    /// # Safety
+    ///
+    /// The 8 bytes at `address` are title memory that stays readable for
+    /// the call.
+    unsafe fn read_u64(&self, address: u32) -> u64;
+    /// # Safety
+    ///
+    /// The [`BLOCK_SIZE`] bytes at `address` are title memory that stays
+    /// readable for the call.
+    unsafe fn read_block(&self, address: u32, output: &mut [u8; BLOCK_SIZE]);
+    /// Store a word that title threads may read concurrently.
+    ///
+    /// # Safety
+    ///
+    /// `address` is an aligned word of title memory that stays writable
+    /// for the call.
+    unsafe fn write_u32(&self, address: u32, value: u32);
     /// `ObReferenceObjectByHandle` with any object type.
     fn reference_event(&self, handle: u32) -> Option<u32>;
-    fn signal_event(&self, event: u32);
+    /// # Safety
+    ///
+    /// `event` is an event object [`Platform::reference_event`] returned
+    /// whose reference is still held.
+    unsafe fn signal_event(&self, event: u32);
     /// Serialize completion slot changes (stock critical section at
     /// 0x91f9e4e8).
     fn lock_completions(&self);
@@ -758,7 +788,15 @@ impl Engine {
 
     /// `entry setinfo` (0x91f2cf30): log a setinfo record and configure the
     /// entry.
-    pub fn configure(
+    ///
+    /// # Safety
+    ///
+    /// `settings` describes the parameters of the function hooked at `id`:
+    /// for each call of it, the memory [`Engine::enter`] requires from the
+    /// overlapped offset and parameter size is readable, and an overlapped
+    /// parameter is 0 or the call's XOVERLAPPED, whose event handle names an
+    /// event. Stock trusts the debugger client for this.
+    pub unsafe fn configure(
         &self,
         platform: &dyn Platform,
         id: EntryId,
@@ -991,14 +1029,25 @@ impl Engine {
     }
 
     /// Log `BLOCK_SIZE` bytes of title memory at `source` (0x91f2c0f8).
-    fn log_block(&self, platform: &dyn Platform, sequence: u32, kind: RecordType, source: u32) {
+    ///
+    /// # Safety
+    ///
+    /// As [`Platform::read_block`] for `source`.
+    unsafe fn log_block(
+        &self,
+        platform: &dyn Platform,
+        sequence: u32,
+        kind: RecordType,
+        source: u32,
+    ) {
         let Some(record) = self.allocate(platform) else {
             return;
         };
         self.log.set_u32(record, 4, sequence);
         self.log.set_u32(record, 0, kind as u32);
         let mut block = [0u8; BLOCK_SIZE];
-        platform.read_block(source, &mut block);
+        // SAFETY: the caller's contract.
+        unsafe { platform.read_block(source, &mut block) };
         self.log.set_bytes(record, 8, &block);
         self.submit(platform, record);
     }
@@ -1011,7 +1060,17 @@ impl Engine {
 
     /// Notification 0, before the call (0x91f2c8fc). `frame` is the entry
     /// stack pointer + 0x10, where stack parameters start.
-    pub fn enter(&self, platform: &dyn Platform, call: &mut CallContext, frame: u32) {
+    ///
+    /// # Safety
+    ///
+    /// `call.address` is the stub locals and `frame` the stack parameters
+    /// of a hooked call in the logger. The memory the entry of `call.hook`
+    /// describes is readable for the call: with an overlapped offset, the
+    /// 8 bytes at `frame` + offset, or at `call.address` + (offset + 3) * 8
+    /// for a register index past r10; with stack logging, [`BLOCK_SIZE`]
+    /// bytes at each multiple of [`BLOCK_SIZE`] from `frame` below the
+    /// parameter size, and at least the first.
+    pub unsafe fn enter(&self, platform: &dyn Platform, call: &mut CallContext, frame: u32) {
         // Stock asserts on a bad id and then indexes past the table.
         let Some(entry) = self.entry_of(call) else {
             return;
@@ -1043,13 +1102,18 @@ impl Engine {
             let value = if flags.contains(HookFlags::OVERLAPPED_IN_REGISTER) {
                 match call.registers.get(offset as usize) {
                     Some(&register) => register,
-                    None => platform.read_u64(
-                        call.address
-                            .wrapping_add(offset.wrapping_add(3).wrapping_shl(3)),
-                    ),
+                    // SAFETY: the caller's contract for a register index
+                    // past r10.
+                    None => unsafe {
+                        platform.read_u64(
+                            call.address
+                                .wrapping_add(offset.wrapping_add(3).wrapping_shl(3)),
+                        )
+                    },
                 }
             } else {
-                platform.read_u64(frame.wrapping_add(offset))
+                // SAFETY: the caller's contract for the overlapped offset.
+                unsafe { platform.read_u64(frame.wrapping_add(offset)) }
             };
             value as u32
         } else {
@@ -1093,12 +1157,16 @@ impl Engine {
                 {
                     let mut offset = 0u32;
                     loop {
-                        self.log_block(
-                            platform,
-                            call.sequence,
-                            RecordType::Stack,
-                            frame.wrapping_add(offset),
-                        );
+                        // SAFETY: a block of the stack parameters the
+                        // caller's contract covers.
+                        unsafe {
+                            self.log_block(
+                                platform,
+                                call.sequence,
+                                RecordType::Stack,
+                                frame.wrapping_add(offset),
+                            )
+                        };
                         offset = offset.wrapping_add(BLOCK_SIZE as u32);
                         if offset >= call.param_size {
                             break;
@@ -1119,33 +1187,57 @@ impl Engine {
     }
 
     /// Notification 1: log f1-f13, saved at `area` (0x91f2c8d0).
-    pub fn floating_point(&self, platform: &dyn Platform, call: &CallContext, area: u32) {
+    ///
+    /// # Safety
+    ///
+    /// `area` is the floating point save area of the hooked call in the
+    /// logger: [`BLOCK_SIZE`] readable bytes.
+    pub unsafe fn floating_point(&self, platform: &dyn Platform, call: &CallContext, area: u32) {
         if let Some(entry) = self.entry_of(call)
             && self.logs_parameters(call, entry)
         {
-            self.log_block(platform, call.sequence, RecordType::FloatingPoint, area);
+            // SAFETY: the caller's contract.
+            unsafe { self.log_block(platform, call.sequence, RecordType::FloatingPoint, area) };
         }
     }
 
     /// Notification 2: log the vector save area at `area` as two records
     /// (0x91f2c89c).
-    pub fn vector(&self, platform: &dyn Platform, call: &CallContext, area: u32) {
+    ///
+    /// # Safety
+    ///
+    /// `area` is the vector save area of the hooked call in the logger:
+    /// twice [`BLOCK_SIZE`] readable bytes.
+    pub unsafe fn vector(&self, platform: &dyn Platform, call: &CallContext, area: u32) {
         if let Some(entry) = self.entry_of(call)
             && self.logs_parameters(call, entry)
         {
-            self.log_block(platform, call.sequence, RecordType::Vector, area);
-            self.log_block(
-                platform,
-                call.sequence,
-                RecordType::Vector,
-                area.wrapping_add(BLOCK_SIZE as u32),
-            );
+            // SAFETY: both blocks lie in the save area of the caller's
+            // contract.
+            unsafe {
+                self.log_block(platform, call.sequence, RecordType::Vector, area);
+                self.log_block(
+                    platform,
+                    call.sequence,
+                    RecordType::Vector,
+                    area.wrapping_add(BLOCK_SIZE as u32),
+                );
+            }
         }
     }
 
     /// Notification 3, after the call (0x91f2c768). `call.return_value`
     /// holds the original's result when it ran.
-    pub fn exit(&self, platform: &dyn Platform, call: &mut CallContext) {
+    ///
+    /// # Safety
+    ///
+    /// `call` is the context [`Engine::enter`] produced for a hooked call
+    /// in the logger. A set `call.overlapped` of a discarded call is the
+    /// call's XOVERLAPPED: the words at +0 and +0xc are aligned, writable
+    /// and readable now, and the words at +0, +4 and +0x18 stay writable
+    /// until [`Engine::service_completions`] has completed the request. Its
+    /// event handle at +0xc is 0 or names an event.
+    pub unsafe fn exit(&self, platform: &dyn Platform, call: &mut CallContext) {
         let Some(entry) = self.entry_of(call) else {
             return;
         };
@@ -1158,8 +1250,12 @@ impl Engine {
                         0
                     };
                     call.return_value = ReturnValue::IO_PENDING;
-                    platform.write_u32(overlapped, ReturnValue::IO_PENDING.0);
-                    let handle = platform.read_u32(overlapped.wrapping_add(0xc));
+                    // SAFETY: words of the XOVERLAPPED of the caller's
+                    // contract.
+                    let handle = unsafe {
+                        platform.write_u32(overlapped, ReturnValue::IO_PENDING.0);
+                        platform.read_u32(overlapped.wrapping_add(0xc))
+                    };
                     let event = if handle != 0 {
                         platform.reference_event(handle)
                     } else {
@@ -1255,13 +1351,20 @@ impl Engine {
             let extended_error = slot.extended_error.load(Ordering::Relaxed);
             // 0x91f2b8b8: the extended error and InternalHigh first, the
             // status last, then the event.
-            platform.write_u32(overlapped.wrapping_add(0x18), extended_error);
-            platform.write_u32(overlapped.wrapping_add(4), 0);
-            fence(Ordering::SeqCst);
-            platform.write_u32(overlapped, status);
-            let event = slot.event.load(Ordering::Relaxed);
-            if event != 0 {
-                platform.signal_event(event);
+            // SAFETY: only `exit` queues completions; its contract keeps
+            // these words of the XOVERLAPPED writable until this pass
+            // completes the request, and `event` is a reference it took
+            // with `reference_event` of the XOVERLAPPED's event handle,
+            // which that contract makes an event, and still holds.
+            unsafe {
+                platform.write_u32(overlapped.wrapping_add(0x18), extended_error);
+                platform.write_u32(overlapped.wrapping_add(4), 0);
+                fence(Ordering::SeqCst);
+                platform.write_u32(overlapped, status);
+                let event = slot.event.load(Ordering::Relaxed);
+                if event != 0 {
+                    platform.signal_event(event);
+                }
             }
             // Stock reuses the previous record of this pass for an unlogged
             // call and queues it a second time; no record is written here.

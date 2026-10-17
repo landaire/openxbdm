@@ -1148,6 +1148,7 @@ dependencies = [
  "openxbdm-core",
  "openxbdm-server",
  "tokio",
+ "xbox360-sys",
 ]
 
 [[package]]

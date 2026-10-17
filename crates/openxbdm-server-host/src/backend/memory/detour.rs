@@ -12,16 +12,11 @@ use openxbdm_core::status::KernelError;
 use openxbdm_server::backend::Platform as _;
 use openxbdm_server::commands::console::Backend as _;
 use openxbdm_server::commands::filesystem::Backend as _;
-use openxbdm_server::commands::filesystem::CreateDisposition;
-use openxbdm_server::commands::filesystem::CreateOptions;
 use openxbdm_server::commands::filesystem::CreateRequest;
-use openxbdm_server::commands::filesystem::FileAccess;
-use openxbdm_server::commands::filesystem::FileAttributes;
 use openxbdm_server::commands::filesystem::FileData;
 use openxbdm_server::commands::filesystem::FileHandle;
 use openxbdm_server::commands::filesystem::PoolRange;
 use openxbdm_server::commands::filesystem::ReadTarget;
-use openxbdm_server::commands::filesystem::ShareAccess;
 use openxbdm_server::commands::memory::Backend as _;
 use openxbdm_server::commands::memory::detour;
 use openxbdm_server::commands::memory::detour::BLOCK_SIZE;
@@ -32,6 +27,11 @@ use openxbdm_server::commands::memory::detour::ReturnValue;
 
 use super::Region;
 use crate::backend::MockBackend;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::FileAttributes;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
 /// Address of trampoline 0, as in the stock image.
 pub const TRAMPOLINE_BASE: u32 = 0x91f1_3230;
@@ -203,25 +203,25 @@ impl detour::Platform for HostPlatform<'_> {
         true
     }
 
-    fn read_u32(&self, address: u32) -> u32 {
+    unsafe fn read_u32(&self, address: u32) -> u32 {
         u32::from_be_bytes(std::array::from_fn(|index| {
             self.read_byte(address.wrapping_add(index as u32))
         }))
     }
 
-    fn read_u64(&self, address: u32) -> u64 {
+    unsafe fn read_u64(&self, address: u32) -> u64 {
         u64::from_be_bytes(std::array::from_fn(|index| {
             self.read_byte(address.wrapping_add(index as u32))
         }))
     }
 
-    fn read_block(&self, address: u32, output: &mut [u8; BLOCK_SIZE]) {
+    unsafe fn read_block(&self, address: u32, output: &mut [u8; BLOCK_SIZE]) {
         for (index, byte) in output.iter_mut().enumerate() {
             *byte = self.read_byte(address.wrapping_add(index as u32));
         }
     }
 
-    fn write_u32(&self, address: u32, value: u32) {
+    unsafe fn write_u32(&self, address: u32, value: u32) {
         let mut backend = self.backend.borrow_mut();
         for (index, byte) in value.to_be_bytes().into_iter().enumerate() {
             backend.write_byte(address.wrapping_add(index as u32), byte);
@@ -233,7 +233,7 @@ impl detour::Platform for HostPlatform<'_> {
         Some(handle)
     }
 
-    fn signal_event(&self, event: u32) {
+    unsafe fn signal_event(&self, event: u32) {
         self.backend
             .borrow_mut()
             .memory
@@ -292,16 +292,16 @@ impl MockBackend {
     fn open_detour_log(&mut self, log: Option<&[u8]>) -> Result<(), KernelError> {
         let path = log.ok_or(KernelError::NoSuchFile)?;
         let write = CreateRequest {
-            access: FileAccess::GENERIC_WRITE,
+            access: AccessMask::GENERIC_WRITE,
             allocation_size: None,
             attributes: FileAttributes::NORMAL,
-            share: ShareAccess::ALL,
+            share: ShareAccess::all(),
             disposition: CreateDisposition::OverwriteIf,
             options: LOG_OPTIONS,
         };
         self.memory.detour.write_handle = Some(self.create_file(path, &write)?);
         let read = CreateRequest {
-            access: FileAccess::GENERIC_READ.union(FileAccess::SYNCHRONIZE),
+            access: AccessMask::GENERIC_READ.union(AccessMask::SYNCHRONIZE),
             disposition: CreateDisposition::Open,
             ..write
         };
@@ -336,8 +336,8 @@ impl MockBackend {
     /// `NtDeleteFile`.
     fn delete_detour_log(&mut self, path: &[u8]) {
         let request = CreateRequest::open(
-            FileAccess::DELETE.union(FileAccess::SYNCHRONIZE),
-            ShareAccess::ALL,
+            AccessMask::DELETE.union(AccessMask::SYNCHRONIZE),
+            ShareAccess::all(),
             CreateOptions::NON_DIRECTORY_FILE,
         );
         if let Ok(handle) = self.create_file(path, &request) {
@@ -370,7 +370,8 @@ impl MockBackend {
             }),
         );
         output.copy_from_slice(&self.pool(buffer)[..RECORD_SIZE]);
-        self.free_pool(buffer);
+        // SAFETY: the block is local to this read and not used after.
+        unsafe { self.free_pool(buffer) };
         if read.is_err() {
             return false;
         }
@@ -389,18 +390,23 @@ impl MockBackend {
                 registers: call.registers,
                 ..CallContext::default()
             };
-            engine.enter(platform, &mut context, call.frame);
+            // SAFETY: the host platform reads and writes simulated memory,
+            // where every address is valid.
+            unsafe { engine.enter(platform, &mut context, call.frame) };
             if context.flags.contains(detour::HookFlags::FLOATING_POINT) {
-                engine.floating_point(platform, &context, call.floating_point);
+                // SAFETY: as above.
+                unsafe { engine.floating_point(platform, &context, call.floating_point) };
             }
             if context.flags.contains(detour::HookFlags::VECTOR) {
-                engine.vector(platform, &context, call.vector);
+                // SAFETY: as above.
+                unsafe { engine.vector(platform, &context, call.vector) };
             }
             let called = context.function.is_some();
             if called {
                 context.return_value = call.original_result;
             }
-            engine.exit(platform, &mut context);
+            // SAFETY: as above.
+            unsafe { engine.exit(platform, &mut context) };
             CallOutcome {
                 called,
                 returned: context.return_value,

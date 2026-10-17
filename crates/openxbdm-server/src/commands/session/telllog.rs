@@ -14,19 +14,19 @@ use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
 
 use crate::backend::Backend as AnyBackend;
-use crate::commands::filesystem::CreateDisposition;
-use crate::commands::filesystem::CreateOptions;
 use crate::commands::filesystem::CreateRequest;
-use crate::commands::filesystem::FileAccess;
-use crate::commands::filesystem::FileAttributes;
 use crate::commands::filesystem::FileHandle;
-use crate::commands::filesystem::ShareAccess;
 use crate::invocation::Invocation;
 use crate::reply;
 use crate::reply::CommandError;
 use crate::reply::CommandResult;
 use crate::reply::Reply;
 use crate::text::Text;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::FileAttributes;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
 /// Bytes the writer collects before writing to the file.
 pub const TELL_LOG_BUFFER_SIZE: usize = 0x2000;
@@ -354,10 +354,10 @@ fn start(
     let _ = message.push_bytes(b"\n");
     backend.debug_print(message.as_bytes());
     let request = CreateRequest {
-        access: FileAccess::GENERIC_WRITE.union(FileAccess::SYNCHRONIZE),
+        access: AccessMask::GENERIC_WRITE.union(AccessMask::SYNCHRONIZE),
         allocation_size: None,
         attributes: FileAttributes::NORMAL,
-        share: ShareAccess::READ_WRITE,
+        share: ShareAccess::READ.union(ShareAccess::WRITE),
         disposition: CreateDisposition::OverwriteIf,
         options: CreateOptions::SYNCHRONOUS_IO_NONALERT.union(CreateOptions::NON_DIRECTORY_FILE),
     };

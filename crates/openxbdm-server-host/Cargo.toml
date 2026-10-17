@@ -22,6 +22,7 @@ smb = ["openxbdm-server/smb"]
 [dependencies]
 openxbdm-core = { path = "../openxbdm-core" }
 openxbdm-server = { path = "../openxbdm-server", default-features = false }
+xbox360-sys = "0.2"
 
 [dev-dependencies]
 openxbdm-client = { path = "../openxbdm-client" }

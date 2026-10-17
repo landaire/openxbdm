@@ -15,8 +15,8 @@ use openxbdm_server::commands::memory::SectionIndex;
 use openxbdm_server::commands::memory::SectionInfo;
 use openxbdm_server::commands::memory::TrackingFlags;
 use openxbdm_server::commands::memory::XexFieldError;
-use openxbdm_server::commands::memory::XexFieldKey;
 use openxbdm_server::commands::memory::detour as engine;
+use xbox360_sys::image::XexHeaderKey;
 
 use super::MockBackend;
 
@@ -81,7 +81,7 @@ pub struct Module {
     pub image_size: u32,
     pub sections: Vec<SectionInfo>,
     pub code_view: Option<CodeView>,
-    pub xex_fields: Vec<(u32, XexField)>,
+    pub xex_fields: Vec<(XexHeaderKey, XexField)>,
 }
 
 impl Module {
@@ -89,10 +89,10 @@ impl Module {
         self.name.encode_utf16()
     }
 
-    fn field(&self, key: XexFieldKey) -> Option<&XexField> {
+    fn field(&self, key: XexHeaderKey) -> Option<&XexField> {
         self.xex_fields
             .iter()
-            .find(|(field, _)| *field == key.0)
+            .find(|(field, _)| *field == key)
             .map(|(_, value)| value)
     }
 }
@@ -211,22 +211,25 @@ impl Default for Mock {
                         b"e:\\build\\xam.pdb",
                     )),
                     xex_fields: vec![
-                        (0x10100, XexField::Inline(0x0000_1234)),
-                        (0x10001, XexField::Data(vec![0xde, 0xad, 0xbe, 0xef])),
+                        (XexHeaderKey::ENTRY_POINT, XexField::Inline(0x0000_1234)),
                         (
-                            0x18002,
+                            XexHeaderKey(0x10001),
+                            XexField::Data(vec![0xde, 0xad, 0xbe, 0xef]),
+                        ),
+                        (
+                            XexHeaderKey(0x18002),
                             XexField::Data(vec![0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]),
                         ),
                         (
-                            0x183ff,
+                            XexHeaderKey(0x183ff),
                             XexField::Data({
                                 let mut blob = 0x28u32.to_be_bytes().to_vec();
                                 blob.extend((0..0x24).map(|offset| 0xa0 + offset as u8));
                                 blob
                             }),
                         ),
-                        (0x30000, XexField::Inline(0)),
-                        (0x20000, XexField::Inline(7)),
+                        (XexHeaderKey(0x30000), XexField::Inline(0)),
+                        (XexHeaderKey(0x20000), XexField::Inline(7)),
                     ],
                 },
                 Module {
@@ -249,7 +252,7 @@ impl Default for Mock {
                         b"d:\\title\\default.pdb",
                     )),
                     xex_fields: vec![(
-                        0x40801,
+                        XexHeaderKey::ADDITIONAL_TITLE_MEMORY,
                         XexField::Data(0x0400_0000u32.to_be_bytes().to_vec()),
                     )],
                 },
@@ -338,7 +341,7 @@ impl memory::Backend for MockBackend {
         !memory::is_device_address(address) && self.memory.page_mapped(address)
     }
 
-    fn read_memory(&mut self, address: u32, output: &mut [u8]) {
+    unsafe fn read_memory(&mut self, address: u32, output: &mut [u8]) {
         for (offset, byte) in output.iter_mut().enumerate() {
             *byte = *self
                 .memory
@@ -392,7 +395,7 @@ impl memory::Backend for MockBackend {
     fn xex_header_field(
         &mut self,
         module: &[u8],
-        field: XexFieldKey,
+        field: XexHeaderKey,
     ) -> Result<u32, XexFieldError> {
         let module = self
             .memory
@@ -409,7 +412,7 @@ impl memory::Backend for MockBackend {
     fn read_xex_header_field(
         &mut self,
         module: &[u8],
-        field: XexFieldKey,
+        field: XexHeaderKey,
         offset: u32,
         output: &mut [u8],
     ) -> Result<(), XexFieldError> {
@@ -420,17 +423,17 @@ impl memory::Backend for MockBackend {
         let Some(XexField::Data(data)) = module.field(field) else {
             return Err(XexFieldError::FieldAbsent);
         };
-        // Bytes past the stored data read as the zeros that follow it.
-        for (index, byte) in output.iter_mut().enumerate() {
-            *byte = data.get(offset as usize + index).copied().unwrap_or(0);
-        }
+        let bytes = data
+            .get(offset as usize..offset as usize + output.len())
+            .ok_or(XexFieldError::FieldAbsent)?;
+        output.copy_from_slice(bytes);
         Ok(())
     }
 
-    fn title_xex_dword(&mut self, field: XexFieldKey) -> Result<Option<u32>, NoSuchModule> {
+    fn title_additional_memory(&mut self) -> Result<Option<u32>, NoSuchModule> {
         let name = self.memory.title_module.clone().ok_or(NoSuchModule)?;
         let module = self.memory.find(name.as_bytes()).ok_or(NoSuchModule)?;
-        Ok(match module.field(field) {
+        Ok(match module.field(XexHeaderKey::ADDITIONAL_TITLE_MEMORY) {
             Some(XexField::Data(data)) => Some(u32::from_be_bytes(
                 data[..4].try_into().expect("field data holds a dword"),
             )),

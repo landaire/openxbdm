@@ -1,6 +1,7 @@
 //! Software execution breakpoints and the hardware data breakpoint.
 
 use super::Backend;
+use crate::commands::filesystem::ScratchBlock;
 
 /// `twi 31, r0, 0x16`, the instruction written over a breakpoint.
 pub const TRAP_INSTRUCTION: u32 = 0x0fe0_0016;
@@ -126,7 +127,9 @@ impl<T: crate::backend::Backend + ?Sized> CodeWords for T {
     }
 
     fn allocate_block(&mut self) -> Option<&'static mut [u8]> {
+        // Blocks are never freed.
         self.allocate_scratch(BLOCK_SIZE as u32)
+            .map(ScratchBlock::into_raw)
     }
 }
 

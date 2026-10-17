@@ -3,6 +3,9 @@
 //! Users live in the platform's user directory (the monitor keeps them as
 //! kernel objects in an unnamed object directory); this module applies the
 //! monitor's rules on top of it.
+// The key exchange releases its transfer block through the unsafe
+// `TransferBlocks::release`.
+#![allow(unsafe_code)]
 
 use openxbdm_core::auth;
 use openxbdm_core::auth::DH_LENGTH;
@@ -720,7 +723,9 @@ fn resume_key_exchange(
             Ok(Reply::Ok)
         }
         KeyExchangePhase::Sent => {
-            cx.state.transfer_blocks.release(cx.backend, exchange.value);
+            // SAFETY: the transfer ends with this result, so the server drops
+            // the continuation, the only other holder.
+            unsafe { cx.state.transfer_blocks.release(cx.backend, exchange.value) };
             Err(CommandError::EndOfData)
         }
     }

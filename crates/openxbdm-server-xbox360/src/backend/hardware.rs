@@ -21,14 +21,9 @@ use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::ConnectionIndex;
 use openxbdm_server::Server;
 use openxbdm_server::commands;
-use openxbdm_server::commands::filesystem::CreateDisposition;
-use openxbdm_server::commands::filesystem::CreateOptions;
 use openxbdm_server::commands::filesystem::CreateRequest;
-use openxbdm_server::commands::filesystem::FileAccess;
-use openxbdm_server::commands::filesystem::FileAttributes;
 use openxbdm_server::commands::filesystem::FileHandle;
 use openxbdm_server::commands::filesystem::ObjectPath;
-use openxbdm_server::commands::filesystem::ShareAccess;
 use openxbdm_server::commands::hardware::AvatarError;
 use openxbdm_server::commands::hardware::AvatarHook;
 use openxbdm_server::commands::hardware::ExportMissing;
@@ -45,6 +40,7 @@ use openxbdm_server::commands::hardware::SystemMessage;
 use openxbdm_server::commands::hardware::UsbController;
 use openxbdm_server::commands::hardware::UsbPort;
 use openxbdm_server::commands::hardware::XamError;
+use openxbdm_server::commands::hardware::XamHeapBlock;
 use openxbdm_server::commands::hardware::XamHeapId;
 use openxbdm_server::commands::hardware::XamHeapInfoClass;
 use openxbdm_server::commands::hardware::automation;
@@ -89,6 +85,11 @@ use crate::exports::export_result;
 use crate::kernel;
 use crate::kernel::KernelEvent;
 use crate::net::XamNetwork;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::FileAttributes;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
 /// XAM ordinal: heap information `(id, class, buffer) -> HRESULT`.
 const XAM_HEAP_INFO: Ordinal = Ordinal::new(0x827).unwrap();
@@ -983,7 +984,7 @@ fn odd_log_start(path: Result<&[u8], KernelError>) -> Result<(), OddLogStartErro
 # SSC ,<CurrentSpeed>,<TargetSpeed>,<NTSTATUS>,<Time_100ns>,;for each spindle speed change\r\n\
 # DROP,<DropCount>,;indicates dropped log entries\r\n";
     /// `FILE_SHARE_READ | FILE_SHARE_DELETE`.
-    const SHARE_READ_DELETE: ShareAccess = ShareAccess(5);
+    const SHARE_READ_DELETE: ShareAccess = ShareAccess::from_bits_retain(5);
     const WRITER_STACK: u32 = 0x8000;
     const WRITER_FLAGS: ThreadCreationFlags =
         kernel::SYSTEM_THREAD_FLAGS.union(ThreadCreationFlags::EXEMPT_FROM_STOPS);
@@ -1008,7 +1009,7 @@ fn odd_log_start(path: Result<&[u8], KernelError>) -> Result<(), OddLogStartErro
     log.stopped.store(0, Ordering::Release);
 
     let request = CreateRequest {
-        access: FileAccess::GENERIC_WRITE,
+        access: AccessMask::GENERIC_WRITE,
         allocation_size: None,
         attributes: FileAttributes::NORMAL,
         share: SHARE_READ_DELETE,
@@ -1493,35 +1494,28 @@ impl commands::hardware::Backend for Console {
         XamError::check(Hresult(result))
     }
 
-    fn xam_heap_info(
-        &mut self,
-        id: XamHeapId,
-        class: XamHeapInfoClass,
-        block: &mut [u8],
-    ) -> Result<(), XamError> {
+    fn xam_heap_info(&mut self, id: XamHeapId, block: XamHeapBlock<'_>) -> Result<(), XamError> {
         let Some(function) = HEAP_INFO.xam(XAM_HEAP_INFO) else {
             return Err(XamError::Fail);
         };
-        // SAFETY: the limits and usage classes fill the sized block.
+        let (class, block) = block.sized();
+        // SAFETY: the limits and usage classes fill the block whose first
+        // dword holds its size.
         let result =
             unsafe { kernel::call_export(function, id.0, class.code(), output_address(block), 0) };
         XamError::check(Hresult(result))
     }
 
-    fn system_message(
-        &mut self,
-        app: SystemApp,
-        message: SystemMessage,
-        buffer: &mut [u8],
-    ) -> Result<(), XamError> {
-        // SAFETY: `buffer` is valid for its length; the request is synchronous.
+    fn mock_currency(&mut self, setting: &mut [u8; 0x14]) -> Result<(), XamError> {
+        // SAFETY: the mock currency message reads its 0x14-byte setting in
+        // place; the request is synchronous.
         XamError::check(unsafe {
             xam::XMsgStartIORequest(
-                app.0,
-                message.0,
+                SystemApp::MARKETPLACE.0,
+                SystemMessage::MOCK_CURRENCY.0,
                 core::ptr::null_mut(),
-                buffer.as_mut_ptr(),
-                buffer.len() as u32,
+                setting.as_mut_ptr(),
+                setting.len() as u32,
             )
         })
     }

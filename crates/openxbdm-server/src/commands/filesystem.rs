@@ -1,4 +1,6 @@
 //! File, drive, and storage commands.
+// The pool and device tokens of `Backend` are released by unsafe methods.
+#![allow(unsafe_code)]
 
 use core::fmt::Write as _;
 
@@ -24,6 +26,13 @@ use crate::reply::CommandError;
 use crate::reply::CommandResult;
 use crate::reply::Reply;
 use crate::state::ServerState;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::FileAttributes;
+#[cfg(feature = "smb")]
+use xbox360_sys::xboxkrnl::FileSystemAttributes;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
 /// Most file name parameters are copied into 0x141-byte buffers.
 const NAME_BUFFER: usize = 0x141;
@@ -82,13 +91,79 @@ pub struct FileHandle(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectDirectory(pub u32);
 
-/// Referenced device object.
+/// A device object the backend referenced, until it is passed to
+/// [`Backend::dereference_device`]. Only the backend makes one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DeviceObject(pub u32);
+pub struct DeviceObject(u32);
 
-/// Block of platform memory allocated for a transfer.
+impl DeviceObject {
+    /// # Safety
+    ///
+    /// `value` names a device object that the backend's
+    /// [`Backend::transfer_device`] and [`Backend::dereference_device`]
+    /// accept, with a reference held until it is dereferenced.
+    pub const unsafe fn from_raw(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+/// Block of platform memory allocated for a transfer, until it is passed
+/// to [`Backend::free_pool`]. Only the backend makes one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PoolBuffer(pub u32);
+pub struct PoolBuffer(u32);
+
+impl PoolBuffer {
+    /// # Safety
+    ///
+    /// `value` names a block that the backend's [`Backend::pool`] and
+    /// [`Backend::free_pool`] accept, which stays allocated until it is
+    /// freed.
+    pub const unsafe fn from_raw(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+/// Pool memory the server holds directly, without a borrow of the backend,
+/// until it is passed to [`Backend::free_scratch`].
+#[derive(Debug)]
+pub struct ScratchBlock(&'static mut [u8]);
+
+impl ScratchBlock {
+    /// # Safety
+    ///
+    /// `block` is memory that the backend's [`Backend::free_scratch`]
+    /// accepts, and nothing else refers to it.
+    pub unsafe fn from_raw(block: &'static mut [u8]) -> Self {
+        Self(block)
+    }
+
+    /// The memory, which is not freed through this token again.
+    pub fn into_raw(self) -> &'static mut [u8] {
+        self.0
+    }
+}
+
+impl core::ops::Deref for ScratchBlock {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.0
+    }
+}
+
+impl core::ops::DerefMut for ScratchBlock {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        self.0
+    }
+}
 
 /// Part of a pool block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,99 +200,6 @@ impl ReadTarget<'_> {
     }
 }
 
-/// Kernel access mask.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileAccess(pub u32);
-
-impl FileAccess {
-    pub const LIST_DIRECTORY: Self = Self(0x1);
-    pub const READ_DATA: Self = Self(0x1);
-    pub const WRITE_DATA: Self = Self(0x2);
-    pub const APPEND_DATA: Self = Self(0x4);
-    pub const READ_ATTRIBUTES: Self = Self(0x80);
-    pub const WRITE_ATTRIBUTES: Self = Self(0x100);
-    pub const DELETE: Self = Self(0x1_0000);
-    pub const SYNCHRONIZE: Self = Self(0x10_0000);
-    pub const MAXIMUM_ALLOWED: Self = Self(0x200_0000);
-    pub const GENERIC_ALL: Self = Self(0x1000_0000);
-    pub const GENERIC_WRITE: Self = Self(0x4000_0000);
-    pub const GENERIC_READ: Self = Self(0x8000_0000);
-
-    pub const fn union(self, other: Self) -> Self {
-        Self(self.0 | other.0)
-    }
-
-    pub const fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
-    }
-
-    pub const fn intersects(self, other: Self) -> bool {
-        self.0 & other.0 != 0
-    }
-}
-
-/// Kernel share mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ShareAccess(pub u32);
-
-impl ShareAccess {
-    pub const NONE: Self = Self(0);
-    pub const READ: Self = Self(1);
-    pub const READ_WRITE: Self = Self(3);
-    pub const ALL: Self = Self(7);
-}
-
-/// Kernel create disposition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CreateDisposition {
-    Supersede = 0,
-    Open = 1,
-    Create = 2,
-    OpenIf = 3,
-    Overwrite = 4,
-    OverwriteIf = 5,
-}
-
-/// Kernel create options.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CreateOptions(pub u32);
-
-impl CreateOptions {
-    pub const NONE: Self = Self(0);
-    pub const DIRECTORY_FILE: Self = Self(0x1);
-    pub const SEQUENTIAL_ONLY: Self = Self(0x4);
-    pub const NO_INTERMEDIATE_BUFFERING: Self = Self(0x8);
-    pub const SYNCHRONOUS_IO_ALERT: Self = Self(0x10);
-    pub const SYNCHRONOUS_IO_NONALERT: Self = Self(0x20);
-    pub const NON_DIRECTORY_FILE: Self = Self(0x40);
-    pub const DELETE_ON_CLOSE: Self = Self(0x1000);
-    pub const OPEN_FOR_BACKUP: Self = Self(0x4000);
-
-    pub const fn union(self, other: Self) -> Self {
-        Self(self.0 | other.0)
-    }
-
-    pub const fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
-    }
-}
-
-/// File attribute bits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct FileAttributes(pub u32);
-
-impl FileAttributes {
-    pub const NONE: Self = Self(0);
-    pub const READONLY: Self = Self(0x1);
-    pub const HIDDEN: Self = Self(0x2);
-    pub const DIRECTORY: Self = Self(0x10);
-    pub const NORMAL: Self = Self(0x80);
-
-    pub const fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
-    }
-}
-
 /// A FILETIME value; 0 in a set request leaves the time unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FileTime(pub u64);
@@ -239,7 +221,7 @@ impl FileTime {
 /// Arguments of a file create or open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CreateRequest {
-    pub access: FileAccess,
+    pub access: AccessMask,
     pub allocation_size: Option<u64>,
     pub attributes: FileAttributes,
     pub share: ShareAccess,
@@ -249,11 +231,11 @@ pub struct CreateRequest {
 
 impl CreateRequest {
     /// Open an existing file without an allocation size or attributes.
-    pub const fn open(access: FileAccess, share: ShareAccess, options: CreateOptions) -> Self {
+    pub const fn open(access: AccessMask, share: ShareAccess, options: CreateOptions) -> Self {
         Self {
             access,
             allocation_size: None,
-            attributes: FileAttributes::NONE,
+            attributes: FileAttributes::empty(),
             share,
             disposition: CreateDisposition::Open,
             options,
@@ -299,21 +281,6 @@ pub struct VolumeSize {
     pub bytes_per_sector: u32,
 }
 
-/// File system attribute bits (FILE_FS_ATTRIBUTE_INFORMATION).
-#[cfg(feature = "smb")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct FileSystemFlags(pub u32);
-
-#[cfg(feature = "smb")]
-impl FileSystemFlags {
-    pub const CASE_PRESERVED_NAMES: Self = Self(0x2);
-    pub const READ_ONLY_VOLUME: Self = Self(0x8_0000);
-
-    pub const fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
-    }
-}
-
 /// Bytes of a file system name the backend reports.
 #[cfg(feature = "smb")]
 pub const FILE_SYSTEM_NAME_CAPACITY: usize = 16;
@@ -323,7 +290,7 @@ pub const FILE_SYSTEM_NAME_CAPACITY: usize = 16;
 #[cfg(feature = "smb")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VolumeAttributes {
-    pub flags: FileSystemFlags,
+    pub flags: FileSystemAttributes,
     /// Longest file name component, in characters.
     pub maximum_component_length: u32,
     /// The file system name in ASCII, such as `FATX`.
@@ -365,7 +332,7 @@ pub trait Backend {
         &mut self,
         root: ObjectDirectory,
         name: &[u8],
-        access: FileAccess,
+        access: AccessMask,
         share: ShareAccess,
         options: CreateOptions,
     ) -> Result<FileHandle, KernelError>;
@@ -444,7 +411,10 @@ pub trait Backend {
     ) -> Result<usize, KernelError>;
     fn close_object_directory(&mut self, directory: ObjectDirectory);
     fn reference_device(&mut self, name: &[u8]) -> Result<DeviceObject, KernelError>;
-    fn dereference_device(&mut self, device: DeviceObject);
+    /// # Safety
+    ///
+    /// No copy of `device` is used afterwards.
+    unsafe fn dereference_device(&mut self, device: DeviceObject);
     /// Synchronous transfer of `buffer.length` bytes at byte `offset`.
     fn transfer_device(
         &mut self,
@@ -454,12 +424,13 @@ pub trait Backend {
         buffer: PoolRange,
     ) -> Result<(), KernelError>;
     fn allocate_pool(&mut self, size: u32) -> Option<PoolBuffer>;
-    fn free_pool(&mut self, buffer: PoolBuffer);
+    /// # Safety
+    ///
+    /// No copy of `buffer` is used afterwards.
+    unsafe fn free_pool(&mut self, buffer: PoolBuffer);
     fn pool(&mut self, buffer: PoolBuffer) -> &mut [u8];
-    /// Pool memory the caller holds directly, without a borrow of the
-    /// backend, until [`Backend::free_scratch`].
-    fn allocate_scratch(&mut self, size: u32) -> Option<&'static mut [u8]>;
-    fn free_scratch(&mut self, block: &'static mut [u8]);
+    fn allocate_scratch(&mut self, size: u32) -> Option<ScratchBlock>;
+    fn free_scratch(&mut self, block: ScratchBlock);
     /// Open (nonzero) or close (zero) the optical drive tray.
     fn open_close_tray(&mut self, value: u32);
     /// Format a block device as XTAF.
@@ -1410,8 +1381,8 @@ fn delete(invocation: &mut Invocation<'_>) -> CommandResult {
         CreateOptions::NON_DIRECTORY_FILE.union(SYNCHRONOUS)
     };
     let request = CreateRequest::open(
-        FileAccess::DELETE.union(FileAccess::SYNCHRONIZE),
-        ShareAccess::NONE,
+        AccessMask::DELETE.union(AccessMask::SYNCHRONIZE),
+        ShareAccess::empty(),
         options,
     );
     match open_path(invocation.state, invocation.backend, name, &request) {
@@ -1448,13 +1419,15 @@ fn dirlist(invocation: &mut Invocation<'_>) -> CommandResult {
         return Err(CommandError::OutOfMemory);
     };
     let request = CreateRequest::open(
-        FileAccess::LIST_DIRECTORY.union(FileAccess::SYNCHRONIZE),
-        ShareAccess::READ_WRITE,
+        AccessMask::LIST_DIRECTORY.union(AccessMask::SYNCHRONIZE),
+        ShareAccess::READ.union(ShareAccess::WRITE),
         DIRECTORY,
     );
     match open_path(invocation.state, invocation.backend, name, &request) {
         Err(error) => {
-            invocation.backend.free_pool(line);
+            // SAFETY: the transfer was not started, so this command holds the
+            // only copy.
+            unsafe { invocation.backend.free_pool(line) };
             Err(CommandError::from_kernel(error, ACCESS_DENIED))
         }
         Ok(handle) => {
@@ -1485,7 +1458,9 @@ fn directory_list_line(
         Ok(entry) => entry,
         Err(_) => {
             cx.backend.close_file(handle);
-            cx.backend.free_pool(line);
+            // SAFETY: the transfer ends with this result, so the server drops
+            // the continuation, the only other holder.
+            unsafe { cx.backend.free_pool(line) };
             return Err(CommandError::EndOfData);
         }
     };
@@ -1526,8 +1501,8 @@ fn drive_free_space(invocation: &mut Invocation<'_>) -> CommandResult {
         return Err(CommandError::Fail);
     };
     let request = CreateRequest::open(
-        FileAccess::LIST_DIRECTORY.union(FileAccess::SYNCHRONIZE),
-        ShareAccess::READ_WRITE,
+        AccessMask::LIST_DIRECTORY.union(AccessMask::SYNCHRONIZE),
+        ShareAccess::READ.union(ShareAccess::WRITE),
         DIRECTORY,
     );
     // The image keeps the line buffer allocated when the open fails.
@@ -1557,14 +1532,18 @@ fn drive_free_space_line(
 ) -> CommandResult {
     if !core::mem::take(first) {
         cx.backend.close_file(handle);
-        cx.backend.free_pool(line);
+        // SAFETY: the transfer ends with this result, so the server drops the
+        // continuation, the only other holder.
+        unsafe { cx.backend.free_pool(line) };
         return Err(CommandError::EndOfData);
     }
     let size = match cx.backend.query_volume_size(handle) {
         Ok(size) => size,
         Err(_) => {
             cx.backend.close_file(handle);
-            cx.backend.free_pool(line);
+            // SAFETY: the transfer ends with this result, so the server drops
+            // the continuation, the only other holder.
+            unsafe { cx.backend.free_pool(line) };
             return Err(CommandError::Fail);
         }
     };
@@ -1666,8 +1645,8 @@ fn drive_list_line(list: &mut DriveList, cx: &mut ContinuationContext<'_>) -> Co
             let opened = cx.backend.open_relative(
                 directory,
                 &name[..=colon],
-                FileAccess::SYNCHRONIZE,
-                ShareAccess::ALL,
+                AccessMask::SYNCHRONIZE,
+                ShareAccess::all(),
                 DIRECTORY,
             );
             if let Ok(handle) = opened {
@@ -1693,7 +1672,7 @@ fn drive_list_line(list: &mut DriveList, cx: &mut ContinuationContext<'_>) -> Co
         let length = drive.name.as_bytes().len().min(path.len() - 2);
         path[..length].copy_from_slice(&drive.name.as_bytes()[..length]);
         path[length..length + 2].copy_from_slice(b":\\");
-        let request = CreateRequest::open(FileAccess::SYNCHRONIZE, ShareAccess::ALL, DIRECTORY);
+        let request = CreateRequest::open(AccessMask::SYNCHRONIZE, ShareAccess::all(), DIRECTORY);
         match open_translated(cx.state, cx.backend, &path[..length + 2], &request) {
             Ok(handle) => {
                 cx.backend.close_file(handle);
@@ -1733,12 +1712,12 @@ fn file_eof(invocation: &mut Invocation<'_>) -> CommandResult {
         CreateDisposition::Open
     };
     let request = CreateRequest {
-        access: FileAccess::GENERIC_WRITE
-            .union(FileAccess::DELETE)
-            .union(FileAccess::SYNCHRONIZE),
+        access: AccessMask::GENERIC_WRITE
+            .union(AccessMask::DELETE)
+            .union(AccessMask::SYNCHRONIZE),
         allocation_size: Some(u64::from(size)),
-        attributes: FileAttributes::NONE,
-        share: ShareAccess::NONE,
+        attributes: FileAttributes::empty(),
+        share: ShareAccess::empty(),
         disposition,
         options: SYNCHRONOUS,
     };
@@ -1786,8 +1765,8 @@ fn get_file(invocation: &mut Invocation<'_>) -> CommandResult {
         size = value;
     }
     let request = CreateRequest::open(
-        FileAccess::GENERIC_READ.union(FileAccess::SYNCHRONIZE),
-        ShareAccess::READ_WRITE,
+        AccessMask::GENERIC_READ.union(AccessMask::SYNCHRONIZE),
+        ShareAccess::READ.union(ShareAccess::WRITE),
         SYNCHRONOUS,
     );
     let handle = match open_path(invocation.state, invocation.backend, name, &request) {
@@ -1853,7 +1832,9 @@ fn get_file_data(transfer: &mut GetFile, cx: &mut ContinuationContext<'_>) -> Co
     let refill = transfer.chunk_sent == transfer.chunk_length;
     if cx.aborted || refill && transfer.remaining == 0 {
         cx.backend.close_file(transfer.handle);
-        cx.backend.free_pool(transfer.buffer);
+        // SAFETY: the transfer ends with this result, so the server drops the
+        // continuation, the only other holder.
+        unsafe { cx.backend.free_pool(transfer.buffer) };
         return Err(CommandError::EndOfData);
     }
     if refill {
@@ -1984,7 +1965,9 @@ fn get_vfattr(invocation: &mut Invocation<'_>) -> CommandResult {
 impl VirtualAttributes {
     fn release(&mut self, backend: &mut dyn crate::backend::Backend) {
         if let Some(buffer) = self.buffer.take() {
-            backend.free_pool(buffer);
+            // SAFETY: the continuation held the only copy, taken out above;
+            // `resume` checks for it before any further use.
+            unsafe { backend.free_pool(buffer) };
         }
     }
 
@@ -2059,7 +2042,7 @@ impl VirtualAttributes {
                         information.last_write_time.low(),
                         (information.end_of_file >> 32) as u32,
                         information.end_of_file as u32,
-                        information.attributes.0,
+                        information.attributes.bits(),
                     ],
                     Err(_) => [0, 0, 0, 0, 0, 0, u32::MAX],
                 };
@@ -2120,10 +2103,10 @@ fn make_directory(invocation: &mut Invocation<'_>) -> CommandResult {
         return Err(util::MISSING);
     };
     let request = CreateRequest {
-        access: FileAccess::LIST_DIRECTORY.union(FileAccess::SYNCHRONIZE),
+        access: AccessMask::LIST_DIRECTORY.union(AccessMask::SYNCHRONIZE),
         allocation_size: None,
         attributes: FileAttributes::NORMAL,
-        share: ShareAccess::NONE,
+        share: ShareAccess::empty(),
         disposition: CreateDisposition::Create,
         options: DIRECTORY,
     };
@@ -2169,8 +2152,8 @@ fn rename(invocation: &mut Invocation<'_>) -> CommandResult {
         return Err(util::MISSING);
     };
     let request = CreateRequest::open(
-        FileAccess::GENERIC_WRITE.union(FileAccess::SYNCHRONIZE),
-        ShareAccess::NONE,
+        AccessMask::GENERIC_WRITE.union(AccessMask::SYNCHRONIZE),
+        ShareAccess::empty(),
         SYNCHRONOUS,
     );
     let Ok(handle) = open_translated(invocation.state, invocation.backend, name, &request) else {
@@ -2195,8 +2178,8 @@ fn set_file_attributes(invocation: &mut Invocation<'_>) -> CommandResult {
         return Err(util::MISSING);
     };
     let request = CreateRequest::open(
-        FileAccess::SYNCHRONIZE,
-        ShareAccess::READ_WRITE,
+        AccessMask::SYNCHRONIZE,
+        ShareAccess::READ.union(ShareAccess::WRITE),
         SYNCHRONOUS,
     );
     let handle = match open_translated(invocation.state, invocation.backend, name, &request) {
@@ -2206,8 +2189,8 @@ fn set_file_attributes(invocation: &mut Invocation<'_>) -> CommandResult {
     let mut mask = 0;
     let mut value = 0;
     for (key, bit) in [
-        ("readonly", FileAttributes::READONLY.0),
-        ("hidden", FileAttributes::HIDDEN.0),
+        ("readonly", FileAttributes::READONLY.bits()),
+        ("hidden", FileAttributes::HIDDEN.bits()),
     ] {
         if let Some(flag) = invocation.line.dword(key) {
             mask |= bit;
@@ -2228,16 +2211,16 @@ fn set_file_attributes(invocation: &mut Invocation<'_>) -> CommandResult {
     let result = backend
         .query_file_information(handle)
         .and_then(|information| {
-            let mut attributes = information.attributes.0 & !mask | value & mask;
+            let mut attributes = information.attributes.bits() & !mask | value & mask;
             if attributes == 0 {
-                attributes = FileAttributes::NORMAL.0;
+                attributes = FileAttributes::NORMAL.bits();
             }
             let basic = BasicInformation {
                 creation_time,
                 last_access_time: FileTime(0),
                 last_write_time,
                 change_time: FileTime(0),
-                attributes: FileAttributes(attributes),
+                attributes: FileAttributes::from_bits_retain(attributes),
             };
             backend.set_basic_information(handle, &basic)
         });
@@ -2352,7 +2335,9 @@ impl Upload {
         if cx.received.is_empty() && remaining != 0 {
             cx.session.receive_remaining = Some(0);
             self.writer.abandon(cx.backend);
-            cx.backend.free_pool(self.writer.buffer);
+            // SAFETY: `receive_remaining` is 0, so the server drops the
+            // continuation, the only other holder, after this result.
+            unsafe { cx.backend.free_pool(self.writer.buffer) };
             return Err(CommandError::Unexpected);
         }
         self.writer.receive(cx.backend, cx.received, &mut remaining);
@@ -2363,7 +2348,9 @@ impl Upload {
         if let Some(handle) = self.writer.handle.take() {
             close_changed(cx.backend, handle);
         }
-        cx.backend.free_pool(self.writer.buffer);
+        // SAFETY: `receive_remaining` is 0, so the server drops the
+        // continuation, the only other holder, after this result.
+        unsafe { cx.backend.free_pool(self.writer.buffer) };
         if self.write_at {
             let _ = write!(cx.line, "{} bytes written", self.writer.written);
         }
@@ -2419,16 +2406,16 @@ fn start_upload(
 ) -> CommandResult {
     let (access, disposition, fallback) = match write_at {
         Some(_) => (
-            FileAccess::GENERIC_READ
-                .union(FileAccess::GENERIC_WRITE)
-                .union(FileAccess::SYNCHRONIZE),
+            AccessMask::GENERIC_READ
+                .union(AccessMask::GENERIC_WRITE)
+                .union(AccessMask::SYNCHRONIZE),
             CreateDisposition::Open,
             ACCESS_DENIED,
         ),
         None => (
-            FileAccess::GENERIC_WRITE
-                .union(FileAccess::DELETE)
-                .union(FileAccess::SYNCHRONIZE),
+            AccessMask::GENERIC_WRITE
+                .union(AccessMask::DELETE)
+                .union(AccessMask::SYNCHRONIZE),
             CreateDisposition::OverwriteIf,
             CANNOT_CREATE,
         ),
@@ -2436,10 +2423,10 @@ fn start_upload(
     let request = CreateRequest {
         access,
         allocation_size: Some(u64::from(length)),
-        attributes: FileAttributes::NONE,
-        share: ShareAccess::NONE,
+        attributes: FileAttributes::empty(),
+        share: ShareAccess::empty(),
         disposition,
-        options: CreateOptions::NONE,
+        options: CreateOptions::empty(),
     };
     let handle = match open_path(invocation.state, invocation.backend, name, &request) {
         Ok(handle) => handle,
@@ -2544,7 +2531,10 @@ impl MultiUpload {
     fn release(&mut self, backend: &mut dyn crate::backend::Backend) {
         self.abandon(backend);
         if let Some(buffer) = self.buffer.take() {
-            backend.free_pool(buffer);
+            // SAFETY: the continuation held the only copy outside its writer,
+            // taken out above; `resume` returns before the writer is used
+            // again.
+            unsafe { backend.free_pool(buffer) };
         }
     }
 
@@ -2624,14 +2614,14 @@ impl MultiUpload {
             .min(NAME_BUFFER);
         name[..length].copy_from_slice(&pool[..length]);
         let request = CreateRequest {
-            access: FileAccess::GENERIC_WRITE
-                .union(FileAccess::DELETE)
-                .union(FileAccess::SYNCHRONIZE),
+            access: AccessMask::GENERIC_WRITE
+                .union(AccessMask::DELETE)
+                .union(AccessMask::SYNCHRONIZE),
             allocation_size: Some(self.header.size),
-            attributes: FileAttributes::NONE,
-            share: ShareAccess::NONE,
+            attributes: FileAttributes::empty(),
+            share: ShareAccess::empty(),
             disposition: CreateDisposition::OverwriteIf,
-            options: CreateOptions::NONE,
+            options: CreateOptions::empty(),
         };
         let opened =
             open_path(cx.state, cx.backend, &name[..length], &request).and_then(|handle| match cx
@@ -2671,8 +2661,7 @@ impl MultiUpload {
             };
             let total = self.total * 4;
             if cx.aborted || *sent >= total {
-                cx.backend.free_pool(buffer);
-                self.buffer = None;
+                self.release(cx.backend);
                 return Err(CommandError::EndOfData);
             }
             return send_pool_piece(cx, buffer, VFILE_RESULTS, total, sent);
@@ -2720,7 +2709,7 @@ impl MultiUpload {
                         creation_time: FileTime(qword(4)),
                         last_write_time: FileTime(qword(0xc)),
                         size: qword(0x14),
-                        attributes: FileAttributes(dword(0x1c)),
+                        attributes: FileAttributes::from_bits_retain(dword(0x1c)),
                     };
                     self.staged = 0;
                     remaining = header_length.wrapping_sub(VFILE_HEADER);
@@ -2790,7 +2779,9 @@ pub struct BlockRead {
 impl BlockRead {
     fn resume(&mut self, cx: &mut ContinuationContext<'_>) -> CommandResult {
         if cx.aborted || self.sent >= self.length {
-            cx.backend.free_pool(self.buffer);
+            // SAFETY: the transfer ends with this result, so the server drops
+            // the continuation, the only other holder.
+            unsafe { cx.backend.free_pool(self.buffer) };
             return Err(CommandError::EndOfData);
         }
         send_pool_piece(cx, self.buffer, 0, self.length, &mut self.sent)
@@ -2827,7 +2818,8 @@ fn read_blocks(
         return Err(CommandError::Fail);
     };
     let Some(buffer) = backend.allocate_pool(length) else {
-        backend.dereference_device(object);
+        // SAFETY: the block is local to this command and not used after.
+        unsafe { backend.dereference_device(object) };
         return Err(CommandError::Fail);
     };
     let range = PoolRange {
@@ -2837,9 +2829,11 @@ fn read_blocks(
     };
     let offset = u64::from(block) * u64::from(sector);
     let result = backend.transfer_device(object, TransferDirection::Read, offset, range);
-    backend.dereference_device(object);
+    // SAFETY: the block is local to this command and not used after.
+    unsafe { backend.dereference_device(object) };
     if result.is_err() {
-        backend.free_pool(buffer);
+        // SAFETY: the block is local to this command and not used after.
+        unsafe { backend.free_pool(buffer) };
         return Err(CommandError::Fail);
     }
     begin(
@@ -2900,8 +2894,12 @@ impl BlockWrite {
     fn resume(&mut self, cx: &mut ContinuationContext<'_>) -> CommandResult {
         let remaining = cx.session.receive_remaining.unwrap_or(0);
         if cx.received.is_empty() {
-            cx.backend.free_pool(self.buffer);
-            cx.backend.dereference_device(self.device);
+            // SAFETY: `receive_remaining` is 0, so the server drops the
+            // continuation, the only other holder, after this result.
+            unsafe { cx.backend.free_pool(self.buffer) };
+            // SAFETY: `receive_remaining` is 0, so the server drops the
+            // continuation, the only other holder, after this result.
+            unsafe { cx.backend.dereference_device(self.device) };
             cx.session.receive_remaining = Some(0);
             return Err(CommandError::Fail);
         }
@@ -2922,8 +2920,12 @@ impl BlockWrite {
         let result =
             cx.backend
                 .transfer_device(self.device, TransferDirection::Write, offset, range);
-        cx.backend.dereference_device(self.device);
-        cx.backend.free_pool(self.buffer);
+        // SAFETY: `receive_remaining` is 0, so the server drops the
+        // continuation, the only other holder, after this result.
+        unsafe { cx.backend.dereference_device(self.device) };
+        // SAFETY: `receive_remaining` is 0, so the server drops the
+        // continuation, the only other holder, after this result.
+        unsafe { cx.backend.free_pool(self.buffer) };
         match result {
             Ok(()) => Ok(Reply::Ok),
             Err(_) => Err(CommandError::Unexpected),
@@ -2952,7 +2954,9 @@ fn set_hdd_block(invocation: &mut Invocation<'_>) -> CommandResult {
         return Err(CommandError::Fail);
     };
     let Some(pool) = backend.allocate_pool(length) else {
-        backend.dereference_device(device);
+        // SAFETY: the transfer was not started, so this command holds the only
+        // copy.
+        unsafe { backend.dereference_device(device) };
         return Err(CommandError::Fail);
     };
     begin(
@@ -2998,7 +3002,9 @@ fn dvd_performance(invocation: &mut Invocation<'_>) -> CommandResult {
     let trace = invocation.backend.stop_dvd_trace();
     if !invocation.line.has("report") {
         if let Some(trace) = trace {
-            invocation.backend.free_pool(trace.buffer);
+            // SAFETY: the trace was taken from the backend here and is not
+            // kept.
+            unsafe { invocation.backend.free_pool(trace.buffer) };
         }
         return Ok(Reply::Ok);
     }
@@ -3045,7 +3051,9 @@ impl DvdReport {
             );
             return Ok(Reply::Ok);
         }
-        cx.backend.free_pool(self.trace.buffer);
+        // SAFETY: the transfer ends with this result, so the server drops the
+        // continuation, the only other holder.
+        unsafe { cx.backend.free_pool(self.trace.buffer) };
         Err(CommandError::EndOfData)
     }
 }
@@ -3155,7 +3163,9 @@ fn block_checksum(backend: &mut dyn crate::backend::Backend, address: u32, size:
     let mut offset = 0u32;
     while offset < size {
         let count = (size - offset).min(chunk.len() as u32) as usize;
-        backend.read_memory(address.wrapping_add(offset), &mut chunk[..count]);
+        // SAFETY: the loop above accepted every page from `address` to the
+        // last byte of the block.
+        unsafe { backend.read_memory(address.wrapping_add(offset), &mut chunk[..count]) };
         // CRC-32/MPEG-2 (polynomial 0x04c11db7, most significant bit
         // first) computed bitwise as the image does, without a table.
         for &byte in &chunk[..count] {
@@ -3244,12 +3254,12 @@ pub struct SystemFileUpdate {
 /// Create each missing parent directory of `path` (0x91f64448).
 fn create_parent_directories(backend: &mut dyn crate::backend::Backend, path: &[u8]) {
     let request = CreateRequest {
-        access: FileAccess::LIST_DIRECTORY.union(FileAccess::SYNCHRONIZE),
+        access: AccessMask::LIST_DIRECTORY.union(AccessMask::SYNCHRONIZE),
         allocation_size: None,
         attributes: FileAttributes::NORMAL,
-        share: ShareAccess::READ_WRITE,
+        share: ShareAccess::READ.union(ShareAccess::WRITE),
         disposition: CreateDisposition::Create,
-        options: CreateOptions::OPEN_FOR_BACKUP.union(DIRECTORY),
+        options: CreateOptions::OPEN_FOR_BACKUP_INTENT.union(DIRECTORY),
     };
     for index in 1..path.len() {
         if path[index] == b'\\'
@@ -3281,7 +3291,8 @@ fn system_file_update(invocation: &mut Invocation<'_>) -> CommandResult {
     };
     let started = system_file_update_start(invocation, buffer);
     if !matches!(started, Ok(Reply::SendBinary)) {
-        invocation.backend.free_pool(buffer);
+        // SAFETY: the upload was not started, so no continuation holds a copy.
+        unsafe { invocation.backend.free_pool(buffer) };
     }
     let result = match started {
         Ok(reply) => return Ok(reply),
@@ -3304,7 +3315,7 @@ fn system_file_update_start(
         .is_some_and(|value| value != 0)
     {
         let request = CreateRequest::open(
-            FileAccess::GENERIC_READ.union(FileAccess::SYNCHRONIZE),
+            AccessMask::GENERIC_READ.union(AccessMask::SYNCHRONIZE),
             ShareAccess::READ,
             CreateOptions::NON_DIRECTORY_FILE.union(CreateOptions::SYNCHRONOUS_IO_ALERT),
         );
@@ -3362,14 +3373,14 @@ fn system_file_update_start(
     let backend = &mut *invocation.backend;
     create_parent_directories(backend, temporary);
     let request = CreateRequest {
-        access: FileAccess::GENERIC_WRITE
-            .union(FileAccess::DELETE)
-            .union(FileAccess::SYNCHRONIZE),
+        access: AccessMask::GENERIC_WRITE
+            .union(AccessMask::DELETE)
+            .union(AccessMask::SYNCHRONIZE),
         allocation_size: Some(u64::from(size)),
         attributes: FileAttributes::NORMAL,
-        share: ShareAccess::ALL,
+        share: ShareAccess::all(),
         disposition: CreateDisposition::Create,
-        options: CreateOptions::OPEN_FOR_BACKUP.union(SYNCHRONOUS),
+        options: CreateOptions::OPEN_FOR_BACKUP_INTENT.union(SYNCHRONOUS),
     };
     let handle = backend
         .create_file(temporary, &request)
@@ -3414,17 +3425,17 @@ fn copy_local_file(
     let mut target_handle = None;
     let result = (|| {
         let read = CreateRequest::open(
-            FileAccess::GENERIC_READ.union(FileAccess::SYNCHRONIZE),
+            AccessMask::GENERIC_READ.union(AccessMask::SYNCHRONIZE),
             ShareAccess::READ,
             CreateOptions::NON_DIRECTORY_FILE.union(SYNCHRONOUS),
         );
         let input = *source_handle.insert(backend.create_file(source, &read)?);
         let information = backend.query_file_information(input)?;
         let write = CreateRequest {
-            access: FileAccess::GENERIC_WRITE.union(FileAccess::SYNCHRONIZE),
+            access: AccessMask::GENERIC_WRITE.union(AccessMask::SYNCHRONIZE),
             allocation_size: Some(information.end_of_file),
             attributes: FileAttributes::NORMAL,
-            share: ShareAccess::NONE,
+            share: ShareAccess::empty(),
             disposition: CreateDisposition::OverwriteIf,
             options: CreateOptions::NON_DIRECTORY_FILE
                 .union(SYNCHRONOUS)
@@ -3466,7 +3477,8 @@ fn copy_local_file(
     if let (Err(_), Some(output)) = (result, target_handle) {
         let _ = backend.set_delete_disposition(output, true);
     }
-    backend.free_pool(buffer);
+    // SAFETY: the block is local to this command and not used after.
+    unsafe { backend.free_pool(buffer) };
     if let Some(input) = source_handle {
         backend.close_file(input);
     }
@@ -3499,9 +3511,9 @@ impl SystemFileUpdate {
             .copy_from_slice(&cx.backend.pool(self.buffer)[start..start + self.name_length]);
         let name = &name[..self.name_length];
         let request = CreateRequest::open(
-            FileAccess::SYNCHRONIZE.union(FileAccess::WRITE_ATTRIBUTES),
-            ShareAccess::ALL,
-            CreateOptions::OPEN_FOR_BACKUP.union(SYNCHRONOUS),
+            AccessMask::SYNCHRONIZE.union(AccessMask::WRITE_ATTRIBUTES),
+            ShareAccess::all(),
+            CreateOptions::OPEN_FOR_BACKUP_INTENT.union(SYNCHRONOUS),
         );
         if let Ok(existing) = cx.backend.create_file(name, &request) {
             let basic = BasicInformation {
@@ -3525,7 +3537,9 @@ impl SystemFileUpdate {
     fn resume(&mut self, cx: &mut ContinuationContext<'_>) -> CommandResult {
         let remaining = cx.session.receive_remaining.unwrap_or(0);
         if cx.received.is_empty() && remaining != 0 {
-            cx.backend.free_pool(self.buffer);
+            // SAFETY: `receive_remaining` is 0, so the server drops the
+            // continuation, the only other holder, after this result.
+            unsafe { cx.backend.free_pool(self.buffer) };
             // The image marks the temporary file for deletion but never
             // closes its handle, so the file stays until reboot.
             if let Some(handle) = self.handle {
@@ -3555,7 +3569,9 @@ impl SystemFileUpdate {
         }
         cx.session.receive_remaining = Some(remaining);
         if remaining == 0 {
-            cx.backend.free_pool(self.buffer);
+            // SAFETY: `receive_remaining` is 0, so the server drops the
+            // continuation, the only other holder, after this result.
+            unsafe { cx.backend.free_pool(self.buffer) };
         }
         result
     }

@@ -2320,7 +2320,7 @@ impl debugger::Backend for Console {
         write_thread_context(thread, source)
     }
 
-    fn set_thread_name(&mut self, thread: ThreadId, address: u32) {
+    unsafe fn set_thread_name(&mut self, thread: ThreadId, address: u32) {
         // SAFETY: the server passes the name parameter of the thread-name
         // exception of a thread that waits in its slot for the call. The
         // named thread may be another one that ends during the call; stock
@@ -2396,15 +2396,13 @@ impl debugger::Backend for Console {
         };
     }
 
-    fn module_event(
+    unsafe fn module_event(
         &mut self,
         name_string: u32,
         entry: u32,
         _thread: ThreadId,
     ) -> Option<ModuleEvent> {
-        // SAFETY: the server passes the name string and module entry from
-        // the parameters of a module trap of a thread stopped in the
-        // monitor, which keeps them live.
+        // SAFETY: the caller upholds the same contract.
         unsafe { describe_module(name_string, entry) }
     }
 
@@ -2667,7 +2665,9 @@ impl debugger::Backend for Console {
             unsafe { kernel::call_export(on_load, 0, 0, 0, 0) };
         }
         EXTENSION_TELL_DEBUGGER.store(tell_debugger, Ordering::Release);
-        Ok(ExtensionHandle(handle))
+        // SAFETY: `handle` is the image loaded above, and this call hands
+        // out its only token.
+        Ok(unsafe { ExtensionHandle::from_raw(handle) })
     }
 
     fn unload_extension(&mut self, handle: ExtensionHandle) -> Result<(), KernelError> {
@@ -2681,7 +2681,8 @@ impl debugger::Backend for Console {
             // takes no arguments.
             unsafe { kernel::call_export(prepare, 0, 0, 0, 0) };
         }
-        // SAFETY: `handle` is the image `load_extension` loaded.
-        unsafe { XexUnloadImage(handle.0) }.result()
+        // SAFETY: the token names the loaded extension image and is
+        // consumed here.
+        unsafe { XexUnloadImage(handle.raw()) }.result()
     }
 }

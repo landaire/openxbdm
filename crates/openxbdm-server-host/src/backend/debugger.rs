@@ -25,7 +25,6 @@ use openxbdm_server::commands::debugger::Disposition;
 use openxbdm_server::commands::debugger::ExceptionRecord;
 use openxbdm_server::commands::debugger::ExitStatus;
 use openxbdm_server::commands::debugger::ExtensionHandle;
-use openxbdm_server::commands::debugger::HardwareFlags;
 use openxbdm_server::commands::debugger::ModuleEvent;
 use openxbdm_server::commands::debugger::Msr;
 use openxbdm_server::commands::debugger::NOTICE_TEXT_CAPACITY;
@@ -124,8 +123,8 @@ pub struct Mock {
     pub modules: BTreeMap<(u32, u32), ModuleEvent>,
     /// Extension paths the loader accepts, with their handles.
     pub extension_images: BTreeMap<Vec<u8>, u32>,
-    pub loaded_extensions: Vec<ExtensionHandle>,
-    pub unloaded_extensions: Vec<ExtensionHandle>,
+    pub loaded_extensions: Vec<u32>,
+    pub unloaded_extensions: Vec<u32>,
     /// State the server last published for direct exceptions.
     pub policy: DirectPolicy,
     pub direct_step: Option<DirectStep>,
@@ -329,7 +328,7 @@ impl MockBackend {
             record,
             second_chance: false,
             has_record,
-            hardware_flags: HardwareFlags::from_bits_retain(self.hardware_flags()),
+            hardware_flags: self.hardware_flags(),
             delivery,
         };
         let iar = context.iar;
@@ -546,7 +545,7 @@ impl debugger::Backend for MockBackend {
         Ok(())
     }
 
-    fn set_thread_name(&mut self, thread: ThreadId, address: u32) {
+    unsafe fn set_thread_name(&mut self, thread: ThreadId, address: u32) {
         let mut name = Vec::new();
         let mut cursor = address;
         while let Some((index, offset)) = self.region_offset(cursor, 1) {
@@ -594,7 +593,7 @@ impl debugger::Backend for MockBackend {
         self.debugger.data_breakpoint_register = value;
     }
 
-    fn module_event(
+    unsafe fn module_event(
         &mut self,
         name_string: u32,
         entry: u32,
@@ -670,14 +669,15 @@ impl debugger::Backend for MockBackend {
             .extension_images
             .get(path)
             .copied()
-            .map(ExtensionHandle)
             .ok_or(KernelError::ObjectNameNotFound)?;
         self.debugger.loaded_extensions.push(handle);
-        Ok(handle)
+        // SAFETY: the simulated loader has loaded the image; the server
+        // holds one extension and loads again only after unloading it.
+        Ok(unsafe { ExtensionHandle::from_raw(handle) })
     }
 
     fn unload_extension(&mut self, handle: ExtensionHandle) -> Result<(), KernelError> {
-        self.debugger.unloaded_extensions.push(handle);
+        self.debugger.unloaded_extensions.push(handle.raw());
         Ok(())
     }
 }

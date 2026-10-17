@@ -8,6 +8,9 @@
 //! storage accesses. Branches and traps are deferred until the next traced
 //! address, which is written after the branch word.
 
+// Thread::instruction reads raw code memory.
+#![allow(unsafe_code)]
+
 use core::num::NonZeroU32;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicU32;
@@ -42,7 +45,12 @@ const LEFT_RECORDED_BRANCH: u32 = 0x4800_0001;
 /// The traced thread at a trace exception.
 pub trait Thread {
     /// The instruction word at `address`.
-    fn instruction(&self, address: u32) -> u32;
+    ///
+    /// # Safety
+    ///
+    /// The 4 bytes at `address` must be a readable, 4-byte aligned
+    /// instruction word for the duration of the call.
+    unsafe fn instruction(&self, address: u32) -> u32;
     /// Low word of general register `index`.
     fn gpr(&self, index: u32) -> u32;
     fn xer(&self) -> u32;
@@ -372,7 +380,14 @@ impl Encoder {
     /// 0x91f67de8). The instruction after a system call or trap executes
     /// without a trace exception of its own; it is recorded before the
     /// next traced address unless execution continues there.
-    pub fn record(
+    ///
+    /// # Safety
+    ///
+    /// `iar` must be the address of the instruction `thread` is about to
+    /// execute at this trace exception. When the previous call recorded a
+    /// system call or trap, the instruction word after it must still be
+    /// readable. Both words are read through [`Thread::instruction`].
+    pub unsafe fn record(
         &self,
         iar: u32,
         thread: &impl Thread,
@@ -382,9 +397,13 @@ impl Encoder {
         if let Some(skipped) = self.after_trap.load()
             && skipped != iar
         {
-            self.encode(skipped, thread.instruction(skipped), thread, cache, sink);
+            // SAFETY: `skipped` follows a recorded system call or trap; the
+            // caller keeps its word readable.
+            let word = unsafe { thread.instruction(skipped) };
+            self.encode(skipped, word, thread, cache, sink);
         }
-        let word = thread.instruction(iar);
+        // SAFETY: the caller passes the thread's next instruction address.
+        let word = unsafe { thread.instruction(iar) };
         self.after_trap.store(None);
         self.encode(iar, word, thread, cache, sink);
         if matches!(word >> 26, 0x11 | 3) {
@@ -631,7 +650,7 @@ mod tests {
     }
 
     impl Thread for Program {
-        fn instruction(&self, address: u32) -> u32 {
+        unsafe fn instruction(&self, address: u32) -> u32 {
             // Code outside the program reads as `li r3, 1`.
             self.code
                 .get((address.wrapping_sub(0x1000) / 4) as usize)
@@ -656,7 +675,8 @@ mod tests {
     ) -> Words {
         let mut words = Words::new();
         for &iar in trace {
-            encoder.record(iar, program, cache, &mut words);
+            // SAFETY: `Program` reads any address from its code slice.
+            unsafe { encoder.record(iar, program, cache, &mut words) };
         }
         words
     }

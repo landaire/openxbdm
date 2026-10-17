@@ -18,13 +18,11 @@ use openxbdm_server::commands::hardware::PgoModule;
 use openxbdm_server::commands::hardware::PlayToCommand;
 use openxbdm_server::commands::hardware::PlayToState;
 use openxbdm_server::commands::hardware::StackAddresses;
-use openxbdm_server::commands::hardware::SystemApp;
-use openxbdm_server::commands::hardware::SystemMessage;
 use openxbdm_server::commands::hardware::UsbController;
 use openxbdm_server::commands::hardware::UsbPort;
 use openxbdm_server::commands::hardware::XamError;
+use openxbdm_server::commands::hardware::XamHeapBlock;
 use openxbdm_server::commands::hardware::XamHeapId;
-use openxbdm_server::commands::hardware::XamHeapInfoClass;
 use openxbdm_server::commands::hardware::automation;
 use openxbdm_server::commands::hardware::automation::Automation;
 use openxbdm_server::commands::hardware::automation::AutomationError;
@@ -112,14 +110,6 @@ pub struct XamHeap {
     pub limits: [u8; 0x18],
 }
 
-/// A message sent to a system service.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SentMessage {
-    pub app: SystemApp,
-    pub message: SystemMessage,
-    pub buffer: Vec<u8>,
-}
-
 /// A USB port power request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsbPortRequest {
@@ -195,10 +185,10 @@ pub struct Mock {
     pub xam_heap_counts: (u32, u32),
     pub xam_heaps: Vec<XamHeap>,
 
-    /// Result of every system message.
-    pub system_message_result: Result<(), XamError>,
-    /// Messages sent.
-    pub system_messages: Vec<SentMessage>,
+    /// Result of every mock currency message.
+    pub mock_currency_result: Result<(), XamError>,
+    /// Mock currency settings sent.
+    pub mock_currency_settings: Vec<[u8; 0x14]>,
     pub play_to: Result<PlayToState, XamError>,
     pub play_to_requests: Vec<PlayToCommand>,
     pub addresses: StackAddresses,
@@ -238,8 +228,8 @@ impl Default for Mock {
             }],
             // The marketplace service rejects the mock currency message
             // with E_INVALIDARG, which the monitor treats as success.
-            system_message_result: Err(XamError::InvalidArgument),
-            system_messages: Vec::new(),
+            mock_currency_result: Err(XamError::InvalidArgument),
+            mock_currency_settings: Vec::new(),
             play_to: Ok(PlayToState::default()),
             play_to_requests: Vec::new(),
             addresses: StackAddresses {
@@ -410,35 +400,21 @@ impl hardware::Backend for MockBackend {
         Ok(())
     }
 
-    fn xam_heap_info(
-        &mut self,
-        id: XamHeapId,
-        class: XamHeapInfoClass,
-        block: &mut [u8],
-    ) -> Result<(), XamError> {
+    fn xam_heap_info(&mut self, id: XamHeapId, block: XamHeapBlock<'_>) -> Result<(), XamError> {
         let Some(heap) = self.hardware.xam_heaps.iter().find(|heap| heap.id == id) else {
             return Err(XamError::InvalidArgument);
         };
-        match class {
-            XamHeapInfoClass::Usage => block[4..].copy_from_slice(&heap.usage),
-            XamHeapInfoClass::Limits => block[4..].copy_from_slice(&heap.limits),
-            XamHeapInfoClass::Name => return Err(XamError::InvalidArgument),
-        }
+        let data: &[u8] = match block {
+            XamHeapBlock::Usage(_) => &heap.usage,
+            XamHeapBlock::Limits(_) => &heap.limits,
+        };
+        block.sized().1[4..].copy_from_slice(data);
         Ok(())
     }
 
-    fn system_message(
-        &mut self,
-        app: SystemApp,
-        message: SystemMessage,
-        buffer: &mut [u8],
-    ) -> Result<(), XamError> {
-        self.hardware.system_messages.push(SentMessage {
-            app,
-            message,
-            buffer: buffer.to_vec(),
-        });
-        self.hardware.system_message_result
+    fn mock_currency(&mut self, setting: &mut [u8; 0x14]) -> Result<(), XamError> {
+        self.hardware.mock_currency_settings.push(*setting);
+        self.hardware.mock_currency_result
     }
 
     fn play_to(&mut self, command: PlayToCommand) -> Result<PlayToState, XamError> {

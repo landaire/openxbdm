@@ -23,6 +23,7 @@ use openxbdm_server::commands::services::ThreadHandle;
 use openxbdm_server::notify::ExecutionState;
 use openxbdm_server_host::Host;
 use openxbdm_server_host::backend::memory::MEMORY_BASE;
+use xbox360_sys::xboxkrnl::HardwareFlags;
 
 const TITLE_THREAD: u32 = 0xfb00_0058;
 const OTHER_THREAD: u32 = 0xfb00_0060;
@@ -1206,7 +1207,13 @@ fn kdlite_needs_the_hardware_flag_and_persists() {
     let mut session = server.raw();
     session.line();
     assert_eq!(session.command("kdlite enable"), "400- improper command");
-    server.host.lock().backend.system.hardware_flags |= 0x0200_0000;
+    server
+        .host
+        .lock()
+        .backend
+        .system
+        .hardware_flags
+        .insert(HardwareFlags::TEST_KIT);
     assert_eq!(session.command("kdlite"), "400- improper command");
     assert_eq!(session.command("kdlite disable"), "200- kd lite disabled");
     assert!(!server.host.lock().server.state.debugger.kd_lite);

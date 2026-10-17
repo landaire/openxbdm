@@ -8,6 +8,8 @@
 //! size, +0x10 creation time, +0x18 last write time, +0x20 u64 file size,
 //! +0x28 u32 attributes, and the NUL-terminated path at +0x2c, followed by
 //! the file data when it fits. `AA` data starts at +0xc.
+// Pool blocks are freed through the unsafe `Backend::free_pool`.
+#![allow(unsafe_code)]
 
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
@@ -15,17 +17,12 @@ use openxbdm_core::status::Hresult;
 use crate::backend::Backend as AnyBackend;
 use crate::commands::filesystem;
 use crate::commands::filesystem::BasicInformation;
-use crate::commands::filesystem::CreateDisposition;
-use crate::commands::filesystem::CreateOptions;
 use crate::commands::filesystem::CreateRequest;
-use crate::commands::filesystem::FileAccess;
-use crate::commands::filesystem::FileAttributes;
 use crate::commands::filesystem::FileData;
 use crate::commands::filesystem::FileHandle;
 use crate::commands::filesystem::FileTime;
 use crate::commands::filesystem::PoolBuffer;
 use crate::commands::filesystem::PoolRange;
-use crate::commands::filesystem::ShareAccess;
 use crate::invocation::Invocation;
 use crate::invocation::SessionRequest;
 use crate::network::Network;
@@ -37,6 +34,11 @@ use crate::reply::CommandResult;
 use crate::reply::Reply;
 use crate::state::ServerState;
 use crate::text::Text;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::FileAttributes;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
 xbox360_sys::value_enum! {
     /// First word of a pipe packet.
@@ -70,9 +72,9 @@ const CREATE_FALLBACK: CommandError = CommandError::Status(ErrorCode::FileCannot
 /// `BB` result word of a complete file.
 const PIPE_SUCCESS: u32 = 0;
 /// Access the monitor opens files with.
-const PIPE_FILE_ACCESS: FileAccess = FileAccess::GENERIC_WRITE
-    .union(FileAccess::DELETE)
-    .union(FileAccess::SYNCHRONIZE);
+const PIPE_FILE_ACCESS: AccessMask = AccessMask::GENERIC_WRITE
+    .union(AccessMask::DELETE)
+    .union(AccessMask::SYNCHRONIZE);
 
 /// Platform services of `fastpipe`.
 pub trait FastPipeBackend {
@@ -223,7 +225,8 @@ fn open_pipe(
         format_args!("209- result code {}", group.0 as i32),
     );
     if send_line(network, socket, line.as_bytes()).is_err() {
-        backend.free_pool(block);
+        // SAFETY: the block is local and not used after.
+        unsafe { backend.free_pool(block) };
         return false;
     }
     if open == 0 {
@@ -335,7 +338,7 @@ fn create(
     let last_write_time = FileTime(u64_at(packet, 0x18));
     let full_size = u64_at(packet, 0x20);
     let size = full_size as u32;
-    let attributes = FileAttributes(u32_at(packet, 0x28));
+    let attributes = FileAttributes::from_bits_retain(u32_at(packet, 0x28));
     let path_length = packet[PATH_OFFSET..]
         .iter()
         .position(|&byte| byte == 0)
@@ -356,10 +359,10 @@ fn create(
     let request = CreateRequest {
         access: PIPE_FILE_ACCESS,
         allocation_size: Some(full_size),
-        attributes: FileAttributes::NONE,
-        share: ShareAccess::NONE,
+        attributes: FileAttributes::empty(),
+        share: ShareAccess::empty(),
         disposition: CreateDisposition::OverwriteIf,
-        options: CreateOptions::NONE,
+        options: CreateOptions::empty(),
     };
     let handle = match filesystem::open_path(state, backend, &path[..path_length], &request) {
         Ok(handle) => handle,
@@ -428,7 +431,9 @@ fn create(
         if state.session.fast_pipes.files[free].is_some() {
             write_block(state, backend, network, free, orphan);
         }
-        backend.free_pool(orphan);
+        // SAFETY: the orphan was removed from the list, which held the only
+        // other copy.
+        unsafe { backend.free_pool(orphan) };
     }
     compact_orphans(&mut state.session.fast_pipes);
 }
@@ -594,7 +599,9 @@ fn close_pipe(
         {
             network.close(pipe.socket);
             if let Some(block) = pipe.block {
-                backend.free_pool(block);
+                // SAFETY: the pipe held the block and is removed; its callers
+                // return without using their copies.
+                unsafe { backend.free_pool(block) };
             }
             *entry = None;
         }
@@ -606,7 +613,8 @@ fn close_pipe(
         backend.close_file(file.handle);
     }
     for orphan in pipes.orphans.iter_mut().filter_map(Option::take) {
-        backend.free_pool(orphan);
+        // SAFETY: the orphan list held the only copy, taken out here.
+        unsafe { backend.free_pool(orphan) };
     }
     backend.set_file_cache_elements(pipes.saved_cache_elements);
 }

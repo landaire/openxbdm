@@ -120,6 +120,12 @@ pub struct Data {
     http_connection: u32,
     http_request: u32,
     /// NUL-terminated server name and path of the registration request.
+    /// XAM keeps their addresses from `NetDll_XHttpConnect` and
+    /// `NetDll_XHttpOpenRequest` and reads them during later
+    /// `NetDll_XHttpDoWork` calls until `close_http` closes the handles.
+    /// Only `http_begin` writes them, before the handles exist, so XAM's
+    /// reads never overlap a write; they are module state with a fixed
+    /// address.
     http_server: [u8; 0x100],
     http_path: [u8; 0x400],
 }
@@ -404,7 +410,7 @@ impl commands::console::Backend for Console {
         SystemInformation {
             base_kernel: Version(version_words(kernel::base_kernel_version())),
             kernel: Version(version_words(kernel_version())),
-            hardware_flags: hardware_flags().bits(),
+            hardware_flags: hardware_flags(),
         }
     }
 
@@ -600,8 +606,9 @@ impl commands::console::Backend for Console {
     }
 
     /// Stock 0x91f30580 states 1 to 7; the status callback advances the
-    /// state during `NetDll_XHttpDoWork`.
-    fn http_poll(&mut self, body: &mut [u8; REGISTRATION_RESPONSE_CAPACITY]) -> HttpProgress {
+    /// state during `NetDll_XHttpDoWork`. XAM reads into `HTTP_BODY`, which
+    /// keeps the body for `publish`.
+    fn http_poll(&mut self) -> HttpProgress {
         let data = &mut self.console;
         // SAFETY: the session handle was opened by `http_begin`.
         if unsafe { NetDll_XHttpDoWork(XnCaller::DebugMonitor, data.http_session, 0) } == 0 {
@@ -665,7 +672,9 @@ impl commands::console::Backend for Console {
             if content as usize > REGISTRATION_RESPONSE_CAPACITY {
                 return HttpProgress::Failed(HttpFailure::TooLarge { length: content });
             }
-            body.fill(0);
+            // SAFETY: only this thread accesses `HTTP_BODY`, and no read into
+            // it is outstanding before the content length is known.
+            unsafe { (&raw mut HTTP_BODY).write_bytes(0, 1) };
             HTTP_REMAINING.store(content, Ordering::Relaxed);
             HTTP_RECEIVED.store(0, Ordering::Relaxed);
             HttpState::ReadComplete.store();
@@ -677,9 +686,12 @@ impl commands::console::Backend for Console {
                 return HttpProgress::Complete(received as usize);
             }
             HttpState::Reading.store();
-            let target = body[received as usize..].as_mut_ptr();
-            // SAFETY: `target` has at least `remaining` bytes of `body`, which
-            // the caller keeps for the whole transfer; `read` is not used.
+            let target = (&raw mut HTTP_BODY)
+                .cast::<u8>()
+                .wrapping_add(received as usize);
+            // SAFETY: `target` is `received` bytes into the static
+            // `HTTP_BODY`, and `received + remaining` is the content length,
+            // at most its size; no reference covers it; `read` is not used.
             if unsafe {
                 NetDll_XHttpReadData(
                     XnCaller::DebugMonitor,
@@ -723,7 +735,13 @@ impl commands::console::Backend for Console {
             Published::DumpSettings(settings) => *DUMP_SETTINGS.lock() = settings.to_block(),
             Published::EventDefer(mask) => EVENT_DEFER.store(mask.bits(), Ordering::Release),
             Published::TraceMask(mask) => TRACE_MASK.store(mask.bits(), Ordering::Release),
-            Published::Registration(registration) => *REGISTRATION.lock() = registration.result(),
+            Published::Registration(registration) => {
+                // SAFETY: `publish` runs on the server thread, the only one
+                // that calls into XAM, so no XAM write to `HTTP_BODY` is in
+                // progress and no other reference to it exists.
+                let body = unsafe { &*(&raw const HTTP_BODY) };
+                *REGISTRATION.lock() = RegistrationResult::new(registration, body);
+            }
         }
     }
 
@@ -1312,6 +1330,12 @@ static HTTP_RECEIVED: AtomicU32 = AtomicU32::new(0);
 static HTTP_FAILURE_KIND: AtomicU32 = AtomicU32::new(0);
 static HTTP_FAILURE_STATE: AtomicU32 = AtomicU32::new(0);
 static HTTP_FAILURE_ERROR: AtomicU32 = AtomicU32::new(0);
+/// Registration response body. XAM keeps its address from
+/// `NetDll_XHttpReadData` and fills it during later `NetDll_XHttpDoWork`
+/// calls, so it is accessed only through raw pointers on the server thread.
+/// It holds the body of the last accepted registration, which `publish`
+/// copies into the export 194 view.
+static mut HTTP_BODY: [u8; REGISTRATION_RESPONSE_CAPACITY] = [0; REGISTRATION_RESPONSE_CAPACITY];
 
 bridged!(http_status_entry, http_status);
 

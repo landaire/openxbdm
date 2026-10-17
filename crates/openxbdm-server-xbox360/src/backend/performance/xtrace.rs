@@ -21,13 +21,8 @@ use core::sync::atomic::fence;
 use core::time::Duration;
 
 use openxbdm_server::Server;
-use openxbdm_server::commands::filesystem::CreateDisposition;
-use openxbdm_server::commands::filesystem::CreateOptions;
 use openxbdm_server::commands::filesystem::CreateRequest;
-use openxbdm_server::commands::filesystem::FileAccess;
-use openxbdm_server::commands::filesystem::FileAttributes;
 use openxbdm_server::commands::filesystem::ObjectPath;
-use openxbdm_server::commands::filesystem::ShareAccess;
 use openxbdm_server::commands::performance::xtrace;
 use openxbdm_server::commands::performance::xtrace::AddressSpace;
 use openxbdm_server::commands::performance::xtrace::Encoder;
@@ -47,10 +42,14 @@ use xbox360_sys::processor::Msr;
 use xbox360_sys::status::NtStatus;
 use xbox360_sys::status::Severity;
 use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::AccessMask;
 use xbox360_sys::xboxkrnl::AllocationType;
 use xbox360_sys::xboxkrnl::Context;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
 use xbox360_sys::xboxkrnl::DebugMonitorService;
 use xbox360_sys::xboxkrnl::ExceptionRecord;
+use xbox360_sys::xboxkrnl::FileAttributes;
 use xbox360_sys::xboxkrnl::FileInformationClass;
 use xbox360_sys::xboxkrnl::Handle;
 use xbox360_sys::xboxkrnl::HardwareFlags;
@@ -65,6 +64,7 @@ use xbox360_sys::xboxkrnl::NotificationRegistration;
 use xbox360_sys::xboxkrnl::NtQueryVirtualMemory;
 use xbox360_sys::xboxkrnl::PageProtection;
 use xbox360_sys::xboxkrnl::ProcessorMode;
+use xbox360_sys::xboxkrnl::ShareAccess;
 use xbox360_sys::xboxkrnl::ThreadCreationFlags;
 
 use super::COMMIT_RESERVE_LARGE;
@@ -353,7 +353,7 @@ fn open(name: &[u8], request: &CreateRequest) -> Option<u32> {
 }
 
 fn create_request(
-    access: FileAccess,
+    access: AccessMask,
     share: ShareAccess,
     disposition: CreateDisposition,
     options: CreateOptions,
@@ -373,7 +373,7 @@ fn create_trace_file(name: &[u8]) -> Option<u32> {
     open(
         name,
         &create_request(
-            FileAccess::GENERIC_WRITE.union(FileAccess::SYNCHRONIZE),
+            AccessMask::GENERIC_WRITE.union(AccessMask::SYNCHRONIZE),
             ShareAccess::READ,
             CreateDisposition::OverwriteIf,
             CreateOptions::SYNCHRONOUS_IO_NONALERT,
@@ -387,7 +387,7 @@ fn append(name: &[u8], data: u32, length: u32) -> bool {
     let Some(handle) = open(
         name,
         &create_request(
-            FileAccess::GENERIC_WRITE.union(FileAccess::SYNCHRONIZE),
+            AccessMask::GENERIC_WRITE.union(AccessMask::SYNCHRONIZE),
             ShareAccess::READ,
             CreateDisposition::Open,
             CreateOptions::SYNCHRONOUS_IO_NONALERT,
@@ -536,7 +536,7 @@ impl Sink for Cursor {
 struct TracedThread<'a>(&'a KtrapFrame);
 
 impl Thread for TracedThread<'_> {
-    fn instruction(&self, address: u32) -> u32 {
+    unsafe fn instruction(&self, address: u32) -> u32 {
         // SAFETY: the encoder reads the instruction the thread is about to
         // execute and the one after a system call or trap it executed:
         // code of the traced thread, which is mapped.
@@ -597,9 +597,14 @@ fn record(iar: u32, frame: &KtrapFrame) -> bool {
     let mut cursor = unsafe { Cursor::new(start) };
     // SAFETY: as above.
     let cache = unsafe { cache() };
-    SESSION
-        .encoder
-        .record(iar, &TracedThread(frame), cache, &mut cursor);
+    // SAFETY: `iar` is the traced thread's next instruction at this trace
+    // exception. The encoder's skipped address is the word after a system
+    // call or trap the thread executed: its return address, in the same code.
+    unsafe {
+        SESSION
+            .encoder
+            .record(iar, &TracedThread(frame), cache, &mut cursor)
+    };
     // SAFETY: buffer slots hold null or an element of `BUFFERS`.
     let Some(buffer) = (unsafe { CURRENT.load(Ordering::Acquire).as_ref() }) else {
         SESSION.stop_address.store(iar, Ordering::Relaxed);
@@ -1613,8 +1618,8 @@ pub(crate) fn start_default() -> u32 {
     const DEFAULT_FILE: &core::ffi::CStr = c"e:\\pix\\unnamed.pix2";
 
     let request = create_request(
-        FileAccess::LIST_DIRECTORY.union(FileAccess::SYNCHRONIZE),
-        ShareAccess::NONE,
+        AccessMask::LIST_DIRECTORY.union(AccessMask::SYNCHRONIZE),
+        ShareAccess::empty(),
         CreateDisposition::Create,
         CreateOptions::DIRECTORY_FILE.union(CreateOptions::SYNCHRONOUS_IO_NONALERT),
     );

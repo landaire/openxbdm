@@ -21,7 +21,6 @@ use openxbdm_server::commands::memory::SectionIndex;
 use openxbdm_server::commands::memory::SectionInfo;
 use openxbdm_server::commands::memory::TrackingFlags;
 use openxbdm_server::commands::memory::XexFieldError;
-use openxbdm_server::commands::memory::XexFieldKey;
 use openxbdm_server::text::Text;
 use xbox360::module::Ordinal;
 use xbox360::module::SystemModule;
@@ -793,13 +792,13 @@ impl memory::Backend for Console {
         debug_readable(address)
     }
 
-    fn read_memory(&mut self, address: u32, output: &mut [u8]) {
+    unsafe fn read_memory(&mut self, address: u32, output: &mut [u8]) {
         // A range that wraps past 0xffffffff continues at address 0.
         let before_wrap =
             (u64::from(u32::MAX) + 1 - u64::from(address)).min(output.len() as u64) as usize;
         let (head, tail) = output.split_at_mut(before_wrap);
-        // SAFETY: the caller checked every page of the range with
-        // `is_readable`.
+        // SAFETY: the trait contract: `MmDbgReadCheck` accepted every page
+        // of the range.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 address as usize as *const u8,
@@ -868,12 +867,12 @@ impl memory::Backend for Console {
     fn xex_header_field(
         &mut self,
         module: &[u8],
-        field: XexFieldKey,
+        field: XexHeaderKey,
     ) -> Result<u32, XexFieldError> {
         let lock = LoaderLock::acquire();
         let entry = find_entry(&lock, module).ok_or(XexFieldError::NoSuchModule)?;
         // SAFETY: the entry's XEX header stays mapped under the loader lock.
-        let value = unsafe { RtlImageXexHeaderField(entry.xex_header_base, XexHeaderKey(field.0)) };
+        let value = unsafe { RtlImageXexHeaderField(entry.xex_header_base, field) };
         match value {
             0 => Err(XexFieldError::FieldAbsent),
             value => Ok(value),
@@ -883,23 +882,39 @@ impl memory::Backend for Console {
     fn read_xex_header_field(
         &mut self,
         module: &[u8],
-        field: XexFieldKey,
+        field: XexHeaderKey,
         offset: u32,
         output: &mut [u8],
     ) -> Result<(), XexFieldError> {
         let lock = LoaderLock::acquire();
         let entry = find_entry(&lock, module).ok_or(XexFieldError::NoSuchModule)?;
         // SAFETY: the entry's XEX header stays mapped under the loader lock.
-        let data = unsafe { RtlImageXexHeaderField(entry.xex_header_base, XexHeaderKey(field.0)) };
+        let data = unsafe { RtlImageXexHeaderField(entry.xex_header_base, field) };
         let data = match data {
             0 => return Err(XexFieldError::FieldAbsent),
             data => data,
         };
-        // SAFETY: XEX headers stay mapped while the module is loaded, which
-        // the loader lock guarantees.
+        // The client chooses the key; the copy stays within the data the
+        // key's low byte describes (0: none, 0xff: a leading size word,
+        // else that many words).
+        let length = match field.0 & 0xff {
+            0 => return Err(XexFieldError::FieldAbsent),
+            // SAFETY: the data of such a field starts with its size word,
+            // mapped under the loader lock; the word itself is always data.
+            0xff => {
+                unsafe { core::ptr::with_exposed_provenance::<u32>(data as usize).read_unaligned() }
+                    .max(4)
+            }
+            words => words << 2,
+        };
+        if offset > length || output.len() as u32 > length - offset {
+            return Err(XexFieldError::FieldAbsent);
+        }
+        // SAFETY: the bytes lie in the field's data, checked above, which
+        // stays mapped under the loader lock.
         unsafe {
             core::ptr::copy_nonoverlapping(
-                (data + offset) as usize as *const u8,
+                core::ptr::with_exposed_provenance::<u8>((data + offset) as usize),
                 output.as_mut_ptr(),
                 output.len(),
             )
@@ -907,7 +922,7 @@ impl memory::Backend for Console {
         Ok(())
     }
 
-    fn title_xex_dword(&mut self, field: XexFieldKey) -> Result<Option<u32>, NoSuchModule> {
+    fn title_additional_memory(&mut self) -> Result<Option<u32>, NoSuchModule> {
         // SAFETY: `data_imports_resolved` held at module load.
         let module = unsafe { XexExecutableModuleHandle.get_unchecked() }.load(Ordering::Relaxed);
         if module == 0 {
@@ -918,11 +933,14 @@ impl memory::Backend for Console {
         let entry =
             unsafe { &*core::ptr::with_exposed_provenance::<LdrDataTableEntry>(module as usize) };
         // SAFETY: the running executable's XEX header stays mapped while it runs.
-        let value = unsafe { RtlImageXexHeaderField(entry.xex_header_base, XexHeaderKey(field.0)) };
-        match value {
+        let field = unsafe {
+            RtlImageXexHeaderField(entry.xex_header_base, XexHeaderKey::ADDITIONAL_TITLE_MEMORY)
+        };
+        match field {
             0 => Ok(None),
-            // SAFETY: a nonzero result addresses the field's dword in the
-            // XEX header, which stays mapped while the executable runs.
+            // SAFETY: the key is a one-word field, so the result addresses
+            // that word in the XEX header, which stays mapped while the
+            // executable runs.
             data => Ok(Some(unsafe {
                 core::ptr::with_exposed_provenance::<u32>(data as usize).read()
             })),

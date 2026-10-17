@@ -44,6 +44,7 @@ use crate::commands::filesystem::DriveTarget;
 use crate::commands::filesystem::OBJECT_PATH_LIMIT;
 use crate::commands::security;
 use crate::state::ServerState;
+use xbox360_sys::xboxkrnl;
 
 /// NT one-way function of the empty password.
 const EMPTY_PASSWORD: NtOwf = NtOwf([
@@ -169,7 +170,7 @@ fn information(information: filesystem::FileInformation) -> FileInformation {
         end_of_file: information.end_of_file,
         // A file without attribute bits is reported as NORMAL, as NT file
         // systems do.
-        attributes: match information.attributes.0 {
+        attributes: match information.attributes.bits() {
             0 => FileAttributes::NORMAL,
             bits => FileAttributes(bits),
         },
@@ -178,14 +179,14 @@ fn information(information: filesystem::FileInformation) -> FileInformation {
     }
 }
 
-fn disposition(disposition: CreateDisposition) -> filesystem::CreateDisposition {
+fn disposition(disposition: CreateDisposition) -> xboxkrnl::CreateDisposition {
     match disposition {
-        CreateDisposition::Supersede => filesystem::CreateDisposition::Supersede,
-        CreateDisposition::Open => filesystem::CreateDisposition::Open,
-        CreateDisposition::Create => filesystem::CreateDisposition::Create,
-        CreateDisposition::OpenIf => filesystem::CreateDisposition::OpenIf,
-        CreateDisposition::Overwrite => filesystem::CreateDisposition::Overwrite,
-        CreateDisposition::OverwriteIf => filesystem::CreateDisposition::OverwriteIf,
+        CreateDisposition::Supersede => xboxkrnl::CreateDisposition::Supersede,
+        CreateDisposition::Open => xboxkrnl::CreateDisposition::Open,
+        CreateDisposition::Create => xboxkrnl::CreateDisposition::Create,
+        CreateDisposition::OpenIf => xboxkrnl::CreateDisposition::OpenIf,
+        CreateDisposition::Overwrite => xboxkrnl::CreateDisposition::Overwrite,
+        CreateDisposition::OverwriteIf => xboxkrnl::CreateDisposition::OverwriteIf,
     }
 }
 
@@ -235,9 +236,9 @@ fn probe(
         return Probe::Absent;
     };
     let request = filesystem::CreateRequest::open(
-        filesystem::FileAccess::READ_ATTRIBUTES.union(filesystem::FileAccess::SYNCHRONIZE),
-        filesystem::ShareAccess::ALL,
-        filesystem::CreateOptions::DIRECTORY_FILE,
+        xboxkrnl::AccessMask::READ_ATTRIBUTES.union(xboxkrnl::AccessMask::SYNCHRONIZE),
+        xboxkrnl::ShareAccess::all(),
+        xboxkrnl::CreateOptions::DIRECTORY_FILE,
     );
     let opened = backend.create_file(root.as_bytes(), &request);
     let read_only_volume = match opened {
@@ -247,7 +248,7 @@ fn probe(
             attributes.is_ok_and(|attributes| {
                 attributes
                     .flags
-                    .contains(filesystem::FileSystemFlags::READ_ONLY_VOLUME)
+                    .contains(xboxkrnl::FileSystemAttributes::READ_ONLY_VOLUME)
             })
         }
         Err(_) => false,
@@ -415,14 +416,14 @@ impl FileSystem for Adapter<'_> {
         // Requests complete before the server continues, so the backend
         // performs synchronous I/O on the file.
         let create = filesystem::CreateRequest {
-            access: filesystem::FileAccess(request.access.0)
-                .union(filesystem::FileAccess::SYNCHRONIZE),
+            access: xboxkrnl::AccessMask::from_bits_retain(request.access.0)
+                .union(xboxkrnl::AccessMask::SYNCHRONIZE),
             allocation_size: request.allocation_size,
-            attributes: filesystem::FileAttributes(request.attributes.0),
-            share: filesystem::ShareAccess(request.share_access.0),
+            attributes: xboxkrnl::FileAttributes::from_bits_retain(request.attributes.0),
+            share: xboxkrnl::ShareAccess::from_bits_retain(request.share_access.0),
             disposition: disposition(request.disposition),
-            options: filesystem::CreateOptions(request.options.0)
-                .union(filesystem::CreateOptions::SYNCHRONOUS_IO_NONALERT),
+            options: xboxkrnl::CreateOptions::from_bits_retain(request.options.0)
+                .union(xboxkrnl::CreateOptions::SYNCHRONOUS_IO_NONALERT),
         };
         let handle = self
             .backend
@@ -511,7 +512,7 @@ impl FileSystem for Adapter<'_> {
             last_access_time: time(information.last_access_time),
             last_write_time: time(information.last_write_time),
             change_time: time(information.change_time),
-            attributes: filesystem::FileAttributes(
+            attributes: xboxkrnl::FileAttributes::from_bits_retain(
                 information.attributes.map_or(0, |attributes| attributes.0),
             ),
         };
@@ -590,7 +591,7 @@ impl FileSystem for Adapter<'_> {
         let (attributes, maximum_component_length, file_system_name) =
             match self.backend.query_volume_attributes(handle) {
                 Ok(volume) => (
-                    FileSystemAttributes(volume.flags.0),
+                    FileSystemAttributes(volume.flags.bits()),
                     volume.maximum_component_length,
                     FileSystemName::new(volume.name()).unwrap_or(FALLBACK_FILE_SYSTEM),
                 ),

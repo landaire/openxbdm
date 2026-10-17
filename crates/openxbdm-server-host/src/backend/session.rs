@@ -513,15 +513,18 @@ impl RpcBackend for MockBackend {
                 done: false,
             },
         );
-        Ok(RpcCall(id))
+        // SAFETY: the id names the new call in `rpc_calls`, removed only by
+        // `rpc_abort` and `rpc_release`, after which no copy is used (the
+        // trait contract).
+        Ok(unsafe { RpcCall::from_raw(id) })
     }
 
     fn rpc_buffer_address(&mut self, call: RpcCall) -> u32 {
-        Mock::buffer_address(call.0)
+        Mock::buffer_address(call.raw())
     }
 
-    fn rpc_write(&mut self, call: RpcCall, offset: u32, data: &[u8]) {
-        if let Some(call) = self.session.rpc_calls.get_mut(&call.0) {
+    unsafe fn rpc_write(&mut self, call: RpcCall, offset: u32, data: &[u8]) {
+        if let Some(call) = self.session.rpc_calls.get_mut(&call.raw()) {
             let start = offset as usize;
             call.buffer[start..start + data.len()].copy_from_slice(data);
         }
@@ -529,19 +532,21 @@ impl RpcBackend for MockBackend {
 
     fn rpc_start(&mut self, call: RpcCall) {
         self.run_rpc_drains();
-        let Some(entry) = self.session.rpc_calls.get_mut(&call.0) else {
+        let id = call.raw();
+        let Some(entry) = self.session.rpc_calls.get_mut(&id) else {
             return;
         };
         entry.started = true;
         match entry.runner {
-            RpcRunner::OwnThread { .. } => self.session.execute(call.0),
-            RpcRunner::Named(_) => self.session.rpc_queue.push(call.0),
+            RpcRunner::OwnThread { .. } => self.session.execute(id),
+            RpcRunner::Named(_) => self.session.rpc_queue.push(id),
         }
     }
 
-    fn rpc_abort(&mut self, call: RpcCall) {
-        self.session.rpc_queue.retain(|&id| id != call.0);
-        self.session.rpc_calls.remove(&call.0);
+    unsafe fn rpc_abort(&mut self, call: RpcCall) {
+        let id = call.raw();
+        self.session.rpc_queue.retain(|&queued| queued != id);
+        self.session.rpc_calls.remove(&id);
     }
 
     fn rpc_wait(&mut self, call: RpcCall) -> bool {
@@ -549,7 +554,7 @@ impl RpcBackend for MockBackend {
         let done = self
             .session
             .rpc_calls
-            .get(&call.0)
+            .get(&call.raw())
             .is_some_and(|call| call.done);
         if !done {
             std::thread::sleep(RPC_WAIT);
@@ -557,16 +562,17 @@ impl RpcBackend for MockBackend {
         done
     }
 
-    fn rpc_read(&mut self, call: RpcCall, offset: u32, output: &mut [u8]) {
-        if let Some(call) = self.session.rpc_calls.get(&call.0) {
+    unsafe fn rpc_read(&mut self, call: RpcCall, offset: u32, output: &mut [u8]) {
+        if let Some(call) = self.session.rpc_calls.get(&call.raw()) {
             let start = offset as usize;
             output.copy_from_slice(&call.buffer[start..start + output.len()]);
         }
     }
 
-    fn rpc_release(&mut self, call: RpcCall) {
-        self.session.rpc_queue.retain(|&id| id != call.0);
-        self.session.rpc_calls.remove(&call.0);
+    unsafe fn rpc_release(&mut self, call: RpcCall) {
+        let id = call.raw();
+        self.session.rpc_queue.retain(|&queued| queued != id);
+        self.session.rpc_calls.remove(&id);
     }
 }
 

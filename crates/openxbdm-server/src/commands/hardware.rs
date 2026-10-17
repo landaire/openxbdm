@@ -479,6 +479,30 @@ impl XamHeapInfoClass {
     }
 }
 
+/// Output block of a sized XAM heap information class.
+#[derive(Debug)]
+pub enum XamHeapBlock<'a> {
+    Usage(&'a mut [u8; 0x18]),
+    Limits(&'a mut [u8; 0x1c]),
+}
+
+impl<'a> XamHeapBlock<'a> {
+    /// The information class and the block with its first dword set to
+    /// the block size, as the export expects.
+    pub fn sized(self) -> (XamHeapInfoClass, &'a mut [u8]) {
+        match self {
+            Self::Usage(block) => {
+                block[..4].copy_from_slice(&0x18u32.to_be_bytes());
+                (XamHeapInfoClass::Usage, &mut block[..])
+            }
+            Self::Limits(block) => {
+                block[..4].copy_from_slice(&0x1cu32.to_be_bytes());
+                (XamHeapInfoClass::Limits, &mut block[..])
+            }
+        }
+    }
+}
+
 /// USB host controller number of `usbportctrl`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsbController(pub u32);
@@ -535,21 +559,12 @@ pub trait Backend {
     fn xam_heap_count(&mut self, block: &mut [u8; 12]) -> Result<(), XamError>;
     /// Information class [`XamHeapInfoClass::Name`]: the heap name.
     fn xam_heap_name(&mut self, id: XamHeapId, name: &mut [u8; 0x20]) -> Result<(), XamError>;
-    /// Information class `class` into a block whose size dword is set.
-    fn xam_heap_info(
-        &mut self,
-        id: XamHeapId,
-        class: XamHeapInfoClass,
-        block: &mut [u8],
-    ) -> Result<(), XamError>;
+    /// Information class of `block` into it.
+    fn xam_heap_info(&mut self, id: XamHeapId, block: XamHeapBlock<'_>) -> Result<(), XamError>;
 
-    /// Send a message to a system service without completion notification.
-    fn system_message(
-        &mut self,
-        app: SystemApp,
-        message: SystemMessage,
-        buffer: &mut [u8],
-    ) -> Result<(), XamError>;
+    /// Send the 0x14-byte mock currency setting to the marketplace service
+    /// without completion notification.
+    fn mock_currency(&mut self, setting: &mut [u8; 0x14]) -> Result<(), XamError>;
     /// Media service message 0x900002.
     fn play_to(&mut self, command: PlayToCommand) -> Result<PlayToState, XamError>;
     fn stack_addresses(&mut self) -> StackAddresses;
@@ -1034,9 +1049,7 @@ fn mix_xam_heap(invocation: &mut Invocation<'_>) -> CommandResult {
     }
     let mut name = [0u8; 0x20];
     let mut usage = [0u8; 0x18];
-    usage[0..4].copy_from_slice(&0x18u32.to_be_bytes());
     let mut limits = [0u8; 0x1c];
-    limits[0..4].copy_from_slice(&0x1cu32.to_be_bytes());
     let id = XamHeapId(id);
     for class in [
         XamHeapInfoClass::Name,
@@ -1045,8 +1058,12 @@ fn mix_xam_heap(invocation: &mut Invocation<'_>) -> CommandResult {
     ] {
         let result = match class {
             XamHeapInfoClass::Name => invocation.backend.xam_heap_name(id, &mut name),
-            XamHeapInfoClass::Usage => invocation.backend.xam_heap_info(id, class, &mut usage),
-            XamHeapInfoClass::Limits => invocation.backend.xam_heap_info(id, class, &mut limits),
+            XamHeapInfoClass::Usage => invocation
+                .backend
+                .xam_heap_info(id, XamHeapBlock::Usage(&mut usage)),
+            XamHeapInfoClass::Limits => invocation
+                .backend
+                .xam_heap_info(id, XamHeapBlock::Limits(&mut limits)),
         };
         if let Err(error) = result {
             if error != XamError::Fail {
@@ -1090,11 +1107,7 @@ fn mock_currency_value(invocation: &mut Invocation<'_>) -> CommandResult {
         Some(false) => {}
         None => return Err(BAD_PARAMETER),
     }
-    let result = invocation.backend.system_message(
-        SystemApp::MARKETPLACE,
-        SystemMessage::MOCK_CURRENCY,
-        &mut message,
-    );
+    let result = invocation.backend.mock_currency(&mut message);
     match result {
         Err(XamError::InvalidArgument) => Ok(Reply::Ok),
         Ok(()) | Err(_) => Err(ACCESS_DENIED),

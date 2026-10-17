@@ -12,13 +12,10 @@ use openxbdm_core::status::Win32Error;
 use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::commands;
 use openxbdm_server::commands::filesystem::BasicInformation;
-use openxbdm_server::commands::filesystem::CreateOptions;
 use openxbdm_server::commands::filesystem::CreateRequest;
 use openxbdm_server::commands::filesystem::DeviceObject;
 use openxbdm_server::commands::filesystem::DirectoryEntry;
 use openxbdm_server::commands::filesystem::DvdTrace;
-use openxbdm_server::commands::filesystem::FileAccess;
-use openxbdm_server::commands::filesystem::FileAttributes;
 use openxbdm_server::commands::filesystem::FileData;
 use openxbdm_server::commands::filesystem::FileHandle;
 use openxbdm_server::commands::filesystem::FileInformation;
@@ -27,7 +24,7 @@ use openxbdm_server::commands::filesystem::ObjectDirectory;
 use openxbdm_server::commands::filesystem::PoolBuffer;
 use openxbdm_server::commands::filesystem::PoolRange;
 use openxbdm_server::commands::filesystem::ReadTarget;
-use openxbdm_server::commands::filesystem::ShareAccess;
+use openxbdm_server::commands::filesystem::ScratchBlock;
 use openxbdm_server::commands::filesystem::TransferDirection;
 use openxbdm_server::commands::filesystem::VolumeSize;
 use openxbdm_server::commands::memory::PAGE_SIZE;
@@ -73,6 +70,11 @@ use xbox360_sys::xboxkrnl::ProcessorMode;
 use super::Console;
 use crate::exports::export;
 use crate::kernel;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::FileAttributes;
+use xbox360_sys::xboxkrnl::FileSystemAttributes;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
 const POOL_TAG: PoolTag = PoolTag::new(*b"xdbm");
 /// Directory query buffer of the image.
@@ -102,7 +104,7 @@ fn volume_attributes(
     let mut output = [0u8; commands::filesystem::FILE_SYSTEM_NAME_CAPACITY];
     output[..name.len()].copy_from_slice(name);
     Some(commands::filesystem::VolumeAttributes {
-        flags: commands::filesystem::FileSystemFlags(flags),
+        flags: FileSystemAttributes::from_bits_retain(flags),
         maximum_component_length,
         name: output,
         name_length: name.len(),
@@ -129,7 +131,8 @@ struct PoolHeader {
 }
 
 /// A pool block whose data length is in a [`PoolHeader`] before the data.
-/// The server names a block by the [`PoolBuffer`] handle of its data.
+/// The server holds a block as the [`PoolBuffer`] or [`ScratchBlock`] of
+/// its data.
 struct PoolBlock(NonNull<PoolHeader>);
 
 impl PoolBlock {
@@ -145,26 +148,27 @@ impl PoolBlock {
         Some(Self(header))
     }
 
-    /// The header of the block whose data `buffer` names.
+    /// The header of the block whose data starts at `data`.
     ///
     /// # Safety
     ///
-    /// `buffer` must name a block of [`PoolBlock::into_handle`] or
-    /// [`PoolBlock::leak`] that is not freed.
-    unsafe fn header(buffer: PoolBuffer) -> NonNull<PoolHeader> {
-        let header = (buffer.0 as usize).wrapping_sub(size_of::<PoolHeader>());
+    /// `data` must be the data address of a block of [`PoolBlock::allocate`]
+    /// that is not freed.
+    unsafe fn header_of(data: usize) -> NonNull<PoolHeader> {
+        let header = data.wrapping_sub(size_of::<PoolHeader>());
         // SAFETY: guaranteed by the caller; the header precedes the data.
         unsafe { NonNull::new_unchecked(core::ptr::with_exposed_provenance_mut(header)) }
     }
 
-    /// Take back the ownership a handle carries.
+    /// Take back the ownership a token carries.
     ///
     /// # Safety
     ///
-    /// As for [`PoolBlock::header`]; the handle is not used afterwards.
-    unsafe fn from_handle(buffer: PoolBuffer) -> Self {
+    /// As for [`PoolBlock::header_of`]; the token that carried the block is
+    /// not used afterwards.
+    unsafe fn from_data(data: usize) -> Self {
         // SAFETY: guaranteed by the caller.
-        Self(unsafe { Self::header(buffer) })
+        Self(unsafe { Self::header_of(data) })
     }
 
     /// The data of the block at `header`.
@@ -193,17 +197,21 @@ impl PoolBlock {
 
     /// Hand the block to the server, which frees it with
     /// [`Backend::free_pool`](commands::filesystem::Backend::free_pool).
-    fn into_handle(self) -> PoolBuffer {
-        PoolBuffer(ManuallyDrop::new(self).address())
+    fn into_buffer(self) -> PoolBuffer {
+        let address = ManuallyDrop::new(self).address();
+        // SAFETY: the data address of a block the server holds from here
+        // on; `free_pool` takes it back with `from_data`.
+        unsafe { PoolBuffer::from_raw(address) }
     }
 
     /// Hand the data to the server, which frees it with
     /// [`Backend::free_scratch`](commands::filesystem::Backend::free_scratch).
-    fn leak(self) -> &'static mut [u8] {
+    fn into_scratch(self) -> ScratchBlock {
         let block = ManuallyDrop::new(self);
         // SAFETY: the block is never freed through `self` again, so the
-        // returned slice is the only reference to its data.
-        unsafe { Self::data(block.0) }
+        // slice is the only reference to its data; `free_scratch` takes it
+        // back with `from_data`.
+        unsafe { ScratchBlock::from_raw(Self::data(block.0)) }
     }
 }
 
@@ -218,11 +226,11 @@ impl Drop for PoolBlock {
 ///
 /// # Safety
 ///
-/// As for [`PoolBlock::header`]; no other reference to the block's data may
-/// exist for `'a`.
+/// No other reference to the block's data may exist for `'a`.
 unsafe fn pool_range<'a>(range: PoolRange) -> &'a mut [u8] {
-    // SAFETY: guaranteed by the caller.
-    let data = unsafe { PoolBlock::data(PoolBlock::header(range.buffer)) };
+    // SAFETY: a `PoolBuffer` names the data of a live block of
+    // `into_buffer`; the caller guarantees exclusive use.
+    let data = unsafe { PoolBlock::data(PoolBlock::header_of(range.buffer.raw() as usize)) };
     &mut data[range.offset as usize..(range.offset + range.length) as usize]
 }
 
@@ -294,33 +302,18 @@ pub(crate) fn create_file(path: &[u8], request: &CreateRequest) -> Result<FileHa
     let raw = unsafe {
         xboxkrnl::NtCreateFile(
             (&raw mut handle).cast(),
-            xboxkrnl::AccessMask::from_bits_retain(request.access.0),
+            request.access,
             &object,
             &mut io_status,
             allocation_pointer,
-            xboxkrnl::FileAttributes::from_bits_retain(request.attributes.0),
-            xboxkrnl::ShareAccess::from_bits_retain(request.share.0),
-            kernel_disposition(request.disposition),
-            xboxkrnl::CreateOptions::from_bits_retain(request.options.0),
+            request.attributes,
+            request.share,
+            request.disposition,
+            request.options,
         )
     };
     raw.result()?;
     Ok(FileHandle(handle))
-}
-
-/// The kernel value of a create disposition.
-pub(crate) fn kernel_disposition(
-    disposition: commands::filesystem::CreateDisposition,
-) -> xboxkrnl::CreateDisposition {
-    use commands::filesystem::CreateDisposition;
-    match disposition {
-        CreateDisposition::Supersede => xboxkrnl::CreateDisposition::Supersede,
-        CreateDisposition::Open => xboxkrnl::CreateDisposition::Open,
-        CreateDisposition::Create => xboxkrnl::CreateDisposition::Create,
-        CreateDisposition::OpenIf => xboxkrnl::CreateDisposition::OpenIf,
-        CreateDisposition::Overwrite => xboxkrnl::CreateDisposition::Overwrite,
-        CreateDisposition::OverwriteIf => xboxkrnl::CreateDisposition::OverwriteIf,
-    }
 }
 
 fn set_information(
@@ -373,7 +366,7 @@ fn network_open_information(information: &FileNetworkOpenInformation) -> FileInf
         change_time: FileTime(information.change_time),
         allocation_size: information.allocation_size,
         end_of_file: information.end_of_file,
-        attributes: FileAttributes(information.attributes.bits()),
+        attributes: FileAttributes::from_bits_retain(information.attributes.bits()),
     }
 }
 
@@ -415,12 +408,12 @@ const FAT32_HEAD: [[u8; 4]; 2] = [0xffff_fff8_u32.to_be_bytes(), 0xffff_ffff_u32
 /// Format `device` as XTAF (0x91f72e58): header, FAT, and an empty root
 /// directory cluster.
 fn format_xtaf(device: &[u8], cluster_size: u32) -> Result<(), KernelError> {
-    const ACCESS: FileAccess = FileAccess::SYNCHRONIZE
-        .union(FileAccess::READ_DATA)
-        .union(FileAccess::WRITE_DATA);
+    const ACCESS: AccessMask = AccessMask::SYNCHRONIZE
+        .union(AccessMask::READ_DATA)
+        .union(AccessMask::WRITE_DATA);
     const OPTIONS: CreateOptions =
         CreateOptions::SYNCHRONOUS_IO_ALERT.union(CreateOptions::NO_INTERMEDIATE_BUFFERING);
-    let handle = open_file(None, device, ACCESS, ShareAccess::NONE, OPTIONS)?;
+    let handle = open_file(None, device, ACCESS, ShareAccess::empty(), OPTIONS)?;
     let result = format_open_volume(handle, cluster_size);
     // SAFETY: `handle` was opened above and is closed once.
     unsafe { xboxkrnl::NtClose(Handle::from_raw(handle.0)) };
@@ -432,7 +425,7 @@ fn format_xtaf(device: &[u8], cluster_size: u32) -> Result<(), KernelError> {
 fn open_file(
     root: Option<ObjectDirectory>,
     name: &[u8],
-    access: FileAccess,
+    access: AccessMask,
     share: ShareAccess,
     options: CreateOptions,
 ) -> Result<FileHandle, KernelError> {
@@ -444,11 +437,11 @@ fn open_file(
     let raw = unsafe {
         xboxkrnl::NtOpenFile(
             (&raw mut handle).cast(),
-            xboxkrnl::AccessMask::from_bits_retain(access.0),
+            access,
             &object,
             &mut io_status,
-            xboxkrnl::ShareAccess::from_bits_retain(share.0),
-            xboxkrnl::CreateOptions::from_bits_retain(options.0),
+            share,
+            options,
         )
     };
     raw.result()?;
@@ -647,7 +640,7 @@ impl commands::filesystem::Backend for Console {
         &mut self,
         root: ObjectDirectory,
         name: &[u8],
-        access: FileAccess,
+        access: AccessMask,
         share: ShareAccess,
         options: CreateOptions,
     ) -> Result<FileHandle, KernelError> {
@@ -671,8 +664,9 @@ impl commands::filesystem::Backend for Console {
     ) -> Result<u32, KernelError> {
         let buffer = match target {
             ReadTarget::Bytes(bytes) => bytes,
-            // SAFETY: the server passes a range of a block it holds from
-            // `allocate_pool` and no other slice of it during the call.
+            // SAFETY: a pool range names a live block (the `PoolBuffer`
+            // contract), and `&mut self` excludes any slice of it from
+            // `pool` during the call.
             ReadTarget::Pool(range) => unsafe { pool_range(range) },
         };
         let io_status = PendingStatus::new();
@@ -768,7 +762,7 @@ impl commands::filesystem::Backend for Console {
         basic.last_access_time = information.last_access_time.0;
         basic.last_write_time = information.last_write_time.0;
         basic.change_time = information.change_time.0;
-        basic.attributes = xboxkrnl::FileAttributes::from_bits_retain(information.attributes.0);
+        basic.attributes = information.attributes;
         // SAFETY: the structure is doublewords and words, its last word an
         // explicit padding field.
         let bytes = unsafe { bytes_of(&basic) };
@@ -877,7 +871,7 @@ impl commands::filesystem::Backend for Console {
             change_time: FileTime(entry.change_time),
             end_of_file: entry.end_of_file,
             allocation_size: entry.allocation_size,
-            attributes: FileAttributes(entry.attributes.bits()),
+            attributes: FileAttributes::from_bits_retain(entry.attributes.bits()),
         };
         Ok(DirectoryEntry {
             information,
@@ -1043,12 +1037,14 @@ impl commands::filesystem::Backend for Console {
             )
         };
         raw.result()?;
-        Ok(DeviceObject(object))
+        // SAFETY: the reference taken above, held until it is dereferenced.
+        Ok(unsafe { DeviceObject::from_raw(object) })
     }
 
-    fn dereference_device(&mut self, device: DeviceObject) {
-        // SAFETY: `device` holds the reference taken by `reference_device`.
-        unsafe { xboxkrnl::ObDereferenceObject(device.0) };
+    unsafe fn dereference_device(&mut self, device: DeviceObject) {
+        // SAFETY: `device` holds a reference taken by `reference_device`,
+        // released once (the trait contract).
+        unsafe { xboxkrnl::ObDereferenceObject(device.raw()) };
     }
 
     fn transfer_device(
@@ -1069,7 +1065,7 @@ impl commands::filesystem::Backend for Console {
         let raw = unsafe {
             IoSynchronousFsdRequest(
                 major,
-                core::ptr::with_exposed_provenance_mut(device.0 as usize),
+                core::ptr::with_exposed_provenance_mut(device.raw() as usize),
                 bytes.as_mut_ptr(),
                 buffer.length,
                 &offset,
@@ -1079,30 +1075,33 @@ impl commands::filesystem::Backend for Console {
     }
 
     fn allocate_pool(&mut self, size: u32) -> Option<PoolBuffer> {
-        PoolBlock::allocate(size).map(PoolBlock::into_handle)
+        PoolBlock::allocate(size).map(PoolBlock::into_buffer)
     }
 
-    fn free_pool(&mut self, buffer: PoolBuffer) {
-        // SAFETY: the server passes a block it holds from `allocate_pool`
-        // and does not use the handle afterwards.
-        drop(unsafe { PoolBlock::from_handle(buffer) });
+    unsafe fn free_pool(&mut self, buffer: PoolBuffer) {
+        // SAFETY: a `PoolBuffer` names the data of a live block of
+        // `into_buffer`, and no copy is used after this (the trait
+        // contract).
+        drop(unsafe { PoolBlock::from_data(buffer.raw() as usize) });
     }
 
     fn pool(&mut self, buffer: PoolBuffer) -> &mut [u8] {
-        // SAFETY: the server passes a block it holds from `allocate_pool`
-        // and holds no other slice of it while this borrow lasts.
-        unsafe { PoolBlock::data(PoolBlock::header(buffer)) }
+        // SAFETY: a `PoolBuffer` names the data of a live block of
+        // `into_buffer`, which stays allocated until it is freed; the
+        // slice borrows `self`, so no other slice of a block exists while
+        // it lives.
+        unsafe { PoolBlock::data(PoolBlock::header_of(buffer.raw() as usize)) }
     }
 
-    fn allocate_scratch(&mut self, size: u32) -> Option<&'static mut [u8]> {
-        PoolBlock::allocate(size).map(PoolBlock::leak)
+    fn allocate_scratch(&mut self, size: u32) -> Option<ScratchBlock> {
+        PoolBlock::allocate(size).map(PoolBlock::into_scratch)
     }
 
-    fn free_scratch(&mut self, block: &'static mut [u8]) {
-        // SAFETY: the server returns the data of `allocate_scratch`.
-        drop(unsafe {
-            PoolBlock::from_handle(PoolBuffer(block.as_mut_ptr().expose_provenance() as u32))
-        });
+    fn free_scratch(&mut self, block: ScratchBlock) {
+        let data = block.into_raw();
+        // SAFETY: a `ScratchBlock` holds the data of a block of
+        // `into_scratch` and is consumed here.
+        drop(unsafe { PoolBlock::from_data(data.as_mut_ptr().expose_provenance()) });
     }
 
     fn open_close_tray(&mut self, value: u32) {
@@ -1178,7 +1177,7 @@ impl commands::filesystem::Backend for Console {
             0
         };
         Some(DvdTrace {
-            buffer: buffer.into_handle(),
+            buffer: buffer.into_buffer(),
             length,
         })
     }

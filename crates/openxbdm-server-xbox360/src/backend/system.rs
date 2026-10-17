@@ -16,8 +16,6 @@ use openxbdm_core::status::Win32Error;
 use openxbdm_server::Server;
 use openxbdm_server::commands;
 use openxbdm_server::commands::console::TraceMask;
-use openxbdm_server::commands::filesystem::CreateDisposition;
-use openxbdm_server::commands::filesystem::FileAccess;
 use openxbdm_server::commands::system::BootFlags;
 use openxbdm_server::commands::system::CreateSettingsError;
 use openxbdm_server::commands::system::FlashOptions;
@@ -52,6 +50,7 @@ use xbox360_sys::xboxkrnl::FileNetworkOpenInformation;
 use xbox360_sys::xboxkrnl::FirmwareRequest;
 use xbox360_sys::xboxkrnl::Handle;
 use xbox360_sys::xboxkrnl::HardwareBootFlags;
+use xbox360_sys::xboxkrnl::HardwareFlags;
 use xbox360_sys::xboxkrnl::IoStatusBlock;
 use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
 use xbox360_sys::xboxkrnl::ObjectAttributes;
@@ -69,6 +68,7 @@ use crate::exports::export;
 use crate::kernel;
 use crate::kernel::pool_tag;
 use crate::net::XamNetwork;
+use xbox360_sys::xboxkrnl::CreateDisposition;
 
 /// The settings file the monitor writes.
 const SAVED_SETTINGS_PATH: &[u8] = b"\\SystemRoot\\MobileJ.dat";
@@ -224,7 +224,7 @@ fn allocate_buffer(size: usize) -> Option<*mut u8> {
 
 fn create_file(
     path: &[u8],
-    access: FileAccess,
+    access: AccessMask,
     disposition: CreateDisposition,
 ) -> Result<u32, KernelError> {
     let name = kernel::ansi_string(path);
@@ -240,13 +240,13 @@ fn create_file(
     let status = unsafe {
         xboxkrnl::NtCreateFile(
             (&raw mut handle).cast(),
-            AccessMask::from_bits_retain(access.0),
+            access,
             &attributes,
             &mut status_block,
             core::ptr::null(),
             FileAttributes::empty(),
             ShareAccess::empty(),
-            super::filesystem::kernel_disposition(disposition),
+            disposition,
             CreateOptions::SYNCHRONOUS_IO_NONALERT,
         )
     };
@@ -374,7 +374,7 @@ impl commands::system::Backend for Console {
         let buffer = allocate_buffer(WRITE_BUFFER_SIZE).ok_or(CreateSettingsError::NoBuffer)?;
         let handle = match create_file(
             SAVED_SETTINGS_PATH,
-            FileAccess::GENERIC_WRITE.union(FileAccess::SYNCHRONIZE),
+            AccessMask::GENERIC_WRITE.union(AccessMask::SYNCHRONIZE),
             CreateDisposition::OverwriteIf,
         ) {
             Ok(handle) => handle,
@@ -477,7 +477,7 @@ impl commands::system::Backend for Console {
         };
         create_file(
             path,
-            FileAccess::GENERIC_READ.union(FileAccess::SYNCHRONIZE),
+            AccessMask::GENERIC_READ.union(AccessMask::SYNCHRONIZE),
             CreateDisposition::Open,
         )
         .ok()
@@ -555,8 +555,8 @@ impl commands::system::Backend for Console {
         }
     }
 
-    fn hardware_flags(&mut self) -> u32 {
-        hardware_flags().bits()
+    fn hardware_flags(&mut self) -> HardwareFlags {
+        hardware_flags()
     }
 
     /// A registration without the version dword cannot relaunch.

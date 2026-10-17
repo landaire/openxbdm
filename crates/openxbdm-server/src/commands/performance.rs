@@ -1,5 +1,8 @@
 //! Performance counter, profiling, capture, and graphics commands.
 
+// Backend::read_framebuffer_page and Backend::pix_post take raw console addresses.
+#![allow(unsafe_code)]
+
 pub mod capture;
 pub mod counters;
 pub mod pix;
@@ -8,7 +11,6 @@ pub mod profiler;
 pub mod studio;
 pub mod xtrace;
 
-use crate::commands::system::hardware_flags;
 use core::fmt::Write as _;
 use xbox360_sys::xboxkrnl::HardwareFlags;
 
@@ -19,13 +21,8 @@ use openxbdm_core::status::XbdmHresult;
 use crate::access::Access;
 use crate::commands::console::ConfigSetting;
 use crate::commands::debugger;
-use crate::commands::filesystem::CreateDisposition;
-use crate::commands::filesystem::CreateOptions;
 use crate::commands::filesystem::CreateRequest;
 use crate::commands::filesystem::DriveTable;
-use crate::commands::filesystem::FileAccess;
-use crate::commands::filesystem::FileAttributes;
-use crate::commands::filesystem::ShareAccess;
 use crate::commands::util;
 use crate::continuation::Continuation as AnyContinuation;
 use crate::continuation::ContinuationContext;
@@ -38,6 +35,11 @@ use crate::reply::CommandResult;
 use crate::reply::Reply;
 use crate::server::MAX_CONNECTIONS;
 use crate::text::Text;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::FileAttributes;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
 pub use counters::CounterSample;
 
@@ -285,9 +287,17 @@ pub trait Backend {
     /// Wait up to 500 ms for the GPU to finish the pending flip, then read
     /// the front buffer registers and the display mode.
     fn capture_display(&mut self) -> DisplayCapture;
-    /// Copy one 4 KiB framebuffer page at `address` (cache flushed before
-    /// and after).
-    fn read_framebuffer_page(&mut self, address: u32, page: &mut [u8]);
+    /// Copy one framebuffer tile at `address` (cache flushed before and
+    /// after).
+    ///
+    /// # Safety
+    ///
+    /// `address` must be a tile of the display window of the front buffer
+    /// described by a [`DisplayCapture`] from [`Backend::capture_display`],
+    /// located as [`ScreenshotTransfer`] walks it: the front buffer address
+    /// less 0x4000_0000, plus whole tile rows of the surface pitch and
+    /// whole tiles, inside the window's tile-aligned rows and columns.
+    unsafe fn read_framebuffer_page(&mut self, address: u32, page: &mut [u8; TILE_SIZE as usize]);
 
     /// Video encoder register below 0x300; 0x100 and up are the extended
     /// banks.
@@ -344,7 +354,17 @@ pub trait Backend {
     /// Post message `code` with `payload` (at most 12 words) to the PIX
     /// engine; false without a session or with a full queue. Code 0xc
     /// replaces the payload of a queued code 0xc.
-    fn pix_post(&mut self, code: u32, payload: &[u32]) -> bool;
+    ///
+    /// # Safety
+    ///
+    /// `code` must be 1, 3, 4, 5, 6, 7, 0xa, 0xb, 0xc, 0xe, or 0xf, and
+    /// payload words the engine uses as handles or code addresses must be
+    /// valid: for code 1, word 2 (a file handle) must be 0; for code 5,
+    /// word 1 (a file handle) must be 0 and words 2 to 6 must be 0, or 1
+    /// followed by the `handle`, `procedure_1`, `info`, and `procedure_3`
+    /// of a [`PixDogma`] that [`Backend::pix_dogma`] returned. The engine
+    /// unloads the image of word 3 and calls words 4 and 6.
+    unsafe fn pix_post(&mut self, code: u32, payload: &[u32]) -> bool;
     /// Engine status for a title with D3D `version` and `flags`.
     fn pix_status(&mut self, version: u32, flags: u32) -> Option<[u32; 12]>;
     fn pix_frame_statistics(&mut self, frame: u32) -> Option<[u32; 3]>;
@@ -401,7 +421,9 @@ pub(crate) fn resume(
         Continuation::Screenshot(transfer) => transfer.resume(cx),
         Continuation::Edid { block, sent } => {
             if *sent || cx.aborted {
-                cx.state.transfer_blocks.release(cx.backend, *block);
+                // SAFETY: the transfer ends with this result, so the server
+                // drops the continuation, the only other holder.
+                unsafe { cx.state.transfer_blocks.release(cx.backend, *block) };
                 return Err(CommandError::EndOfData);
             }
             *sent = true;
@@ -431,7 +453,11 @@ fn auto_profile(invocation: &mut Invocation<'_>) -> CommandResult {
         .line
         .param("xuid")
         .and_then(|value| value.qword());
-    if !hardware_flags(invocation.backend).contains(HardwareFlags::AUTO_PROFILE) {
+    if !invocation
+        .backend
+        .hardware_flags()
+        .contains(HardwareFlags::AUTO_PROFILE)
+    {
         return Err(ErrorCode::UnknownCommand.into());
     }
     match xuid {
@@ -531,7 +557,7 @@ fn start_capture(
     buffer: capture::BufferRequest,
 ) -> Result<capture::Started, capture::CaptureError> {
     let request = CreateRequest {
-        access: FileAccess::GENERIC_WRITE.union(FileAccess::SYNCHRONIZE),
+        access: AccessMask::GENERIC_WRITE.union(AccessMask::SYNCHRONIZE),
         allocation_size: None,
         attributes: FileAttributes::NORMAL,
         share: ShareAccess::READ,
@@ -785,10 +811,17 @@ impl ScreenshotTransfer {
             .0
         {
             let column = tiles_per_row - 1 - left % tiles_per_row;
-            cx.backend.read_framebuffer_page(
-                self.source.wrapping_add(column.wrapping_mul(TILE_SIZE)),
-                page,
-            );
+            // SAFETY: `new` starts `source` at the window's first tile row of
+            // the front buffer `capture_display` reported; `column` stays
+            // below the window's tile columns, `source` advances one tile
+            // row after the last column, and `remaining` ends the walk
+            // after the window's tile rows.
+            unsafe {
+                cx.backend.read_framebuffer_page(
+                    self.source.wrapping_add(column.wrapping_mul(TILE_SIZE)),
+                    page,
+                )
+            };
             if (column + 1).is_multiple_of(tiles_per_row) {
                 self.source = self.source.wrapping_add(self.pitch.wrapping_mul(TILE_EDGE));
             }
@@ -900,10 +933,14 @@ fn video_display(invocation: &mut Invocation<'_>) -> CommandResult {
         let mut data = [0u8; EDID_BLOCK_SIZE];
         let read = invocation.backend.read_edid(block as u8, &mut data);
         if read != EdidRead::Read {
-            invocation
-                .state
-                .transfer_blocks
-                .release(invocation.backend, held);
+            // SAFETY: the transfer was not started, so this command holds the
+            // only copy.
+            unsafe {
+                invocation
+                    .state
+                    .transfer_blocks
+                    .release(invocation.backend, held)
+            };
             return vd_failure(
                 invocation,
                 match read {

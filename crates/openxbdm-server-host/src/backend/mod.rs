@@ -112,7 +112,9 @@ impl MockBackend {
     ) -> Result<(), RegisterError> {
         let handle = handler.map(|handler| {
             self.processor_handlers.push(handler);
-            ProcessorHandle(self.processor_handlers.len() as u32 - 1)
+            // SAFETY: host handles are indices that `call_processor` looks up
+            // with a bounds check, so every value is callable or rejected.
+            unsafe { ProcessorHandle::from_raw(self.processor_handlers.len() as u32 - 1) }
         });
         self.processors.register(name, handle, flags)
     }
@@ -194,7 +196,7 @@ impl ProcessorBackend for MockBackend {
             None => line.to_vec(),
         };
         ProcessorProgress::Complete(
-            match self.processor_handlers.get_mut(call.handle.0 as usize) {
+            match self.processor_handlers.get_mut(call.handle.raw() as usize) {
                 Some(processor) => processor(&line, text),
                 None => Hresult::FAIL,
             },

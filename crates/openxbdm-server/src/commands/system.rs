@@ -21,13 +21,8 @@ use crate::commands::console::trace;
 use crate::commands::console::trace_text;
 use crate::commands::debugger::StopOn;
 use crate::commands::filesystem::BasicInformation;
-use crate::commands::filesystem::CreateDisposition;
-use crate::commands::filesystem::CreateOptions;
 use crate::commands::filesystem::CreateRequest;
-use crate::commands::filesystem::FileAccess;
-use crate::commands::filesystem::FileAttributes;
 use crate::commands::filesystem::FileData;
-use crate::commands::filesystem::ShareAccess;
 use crate::commands::util;
 use crate::continuation::ContinuationContext;
 use crate::invocation::Invocation;
@@ -43,7 +38,12 @@ use crate::reply::Reply;
 use crate::server::Server;
 use crate::state::ServerState;
 use xbox360_sys::status::Facility;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::FileAttributes;
 use xbox360_sys::xboxkrnl::HardwareFlags;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
 /// Delay between the `200- OK` of a reboot and the reboot.
 const REBOOT_REPLY_DELAY_MS: u32 = 200;
@@ -346,9 +346,8 @@ pub trait Backend {
     /// Set the system clock (FILETIME) and tell the network stack the
     /// clock changed.
     fn set_system_time(&mut self, file_time: u64);
-    /// The first dword of the kernel hardware information. Callers use
-    /// [`hardware_flags`].
-    fn hardware_flags(&mut self) -> u32;
+    /// The first dword of the kernel hardware information.
+    fn hardware_flags(&mut self) -> HardwareFlags;
     /// The system registered a title launch routine that supports a
     /// relaunch (stock 0x91fa200c nonzero).
     fn title_launch_registered(&mut self) -> bool;
@@ -372,11 +371,6 @@ pub(crate) fn resume(
     match continuation {
         Continuation::Flash(upload) => resume_flash(upload, cx),
     }
-}
-
-/// The kernel hardware flags.
-pub(crate) fn hardware_flags(backend: &mut dyn AnyBackend) -> HardwareFlags {
-    HardwareFlags::from_bits_retain(backend.hardware_flags())
 }
 
 /// Append formatted text and the line terminator to a settings file
@@ -855,7 +849,7 @@ fn load_settings_files(
     backend: &mut dyn AnyBackend,
     network: &mut dyn Network,
 ) {
-    let Some(buffer) = backend.allocate_scratch(SETTINGS_READ_CAPACITY as u32) else {
+    let Some(mut buffer) = backend.allocate_scratch(SETTINGS_READ_CAPACITY as u32) else {
         return;
     };
     if let Some(file) = backend.open_settings(SettingsSource::Saved) {
@@ -867,14 +861,14 @@ fn load_settings_files(
         {
             trace_settings_file(&server.state, backend, file);
         }
-        execute_settings_file(server, backend, network, file, buffer);
+        execute_settings_file(server, backend, network, file, &mut buffer);
         backend.close_settings(file);
     }
     let text = format_args!("XBDM: g_fFinishedLoadingIniFile = TRUE\n");
     trace(&server.state, backend, TraceMask::SETTINGS, text);
     server.state.system.settings_loaded = true;
     if let Some(file) = backend.open_settings(SettingsSource::Recint) {
-        execute_settings_file(server, backend, network, file, buffer);
+        execute_settings_file(server, backend, network, file, &mut buffer);
         trace(
             &server.state,
             backend,
@@ -1325,7 +1319,7 @@ fn title_exists(
         return true;
     }
     let request = CreateRequest::open(
-        FileAccess::SYNCHRONIZE,
+        AccessMask::SYNCHRONIZE,
         ShareAccess::READ,
         CreateOptions::SYNCHRONOUS_IO_NONALERT.union(CreateOptions::NON_DIRECTORY_FILE),
     );
@@ -1615,7 +1609,7 @@ fn begin_launch(
     }
     let mut effective = flags;
     if !state.system.internal_drive_map
-        && commands::console::trinity_or_later(hardware_flags(backend))
+        && commands::console::trinity_or_later(backend.hardware_flags())
         && !backend.is_test_kit()
         && !commands::console::settings_block_readable(backend)
     {
@@ -1798,8 +1792,8 @@ fn default_title(invocation: &mut Invocation<'_>) -> CommandResult {
     let synchronous = CreateOptions::SYNCHRONOUS_IO_NONALERT;
     // Clear attributes such as read-only first; failures do not matter.
     let attributes = CreateRequest::open(
-        FileAccess::WRITE_ATTRIBUTES.union(FileAccess::SYNCHRONIZE),
-        ShareAccess::NONE,
+        AccessMask::WRITE_ATTRIBUTES.union(AccessMask::SYNCHRONIZE),
+        ShareAccess::empty(),
         synchronous,
     );
     if let Ok(handle) = backend.create_file(DEFAULT_TITLE_PATH, &attributes) {
@@ -1812,8 +1806,8 @@ fn default_title(invocation: &mut Invocation<'_>) -> CommandResult {
     }
     if line.has("none") {
         let delete = CreateRequest::open(
-            FileAccess::DELETE.union(FileAccess::SYNCHRONIZE),
-            ShareAccess::NONE,
+            AccessMask::DELETE.union(AccessMask::SYNCHRONIZE),
+            ShareAccess::empty(),
             synchronous,
         );
         let Ok(handle) = backend.create_file(DEFAULT_TITLE_PATH, &delete) else {
@@ -1868,7 +1862,7 @@ fn default_title(invocation: &mut Invocation<'_>) -> CommandResult {
         .position(|&byte| byte == 0)
         .unwrap_or(DEFAULT_TITLE_SIZE);
     let check = CreateRequest::open(
-        FileAccess::SYNCHRONIZE,
+        AccessMask::SYNCHRONIZE,
         ShareAccess::READ,
         synchronous.union(CreateOptions::NON_DIRECTORY_FILE),
     );
@@ -1883,12 +1877,12 @@ fn default_title(invocation: &mut Invocation<'_>) -> CommandResult {
     }
     content[file_start - 1] = b';';
     let create = CreateRequest {
-        access: FileAccess::GENERIC_WRITE
-            .union(FileAccess::DELETE)
-            .union(FileAccess::SYNCHRONIZE),
+        access: AccessMask::GENERIC_WRITE
+            .union(AccessMask::DELETE)
+            .union(AccessMask::SYNCHRONIZE),
         allocation_size: None,
-        attributes: FileAttributes::NONE,
-        share: ShareAccess::NONE,
+        attributes: FileAttributes::empty(),
+        share: ShareAccess::empty(),
         disposition: CreateDisposition::OverwriteIf,
         options: synchronous,
     };
@@ -1941,7 +1935,7 @@ fn flash(invocation: &mut Invocation<'_>) -> CommandResult {
         return Err(CommandError::Fail);
     }
     let line = invocation.line;
-    let selector = invocation.backend.hardware_flags() & FLASH_HARDWARE_MASK;
+    let selector = invocation.backend.hardware_flags().bits() & FLASH_HARDWARE_MASK;
     let Some(&(_, parameter)) = FLASH_HARDWARE.iter().find(|(value, _)| *value == selector) else {
         // Stock formats a null suffix, which the CRT prints as `(null)`.
         invocation.set_text(format_args!("unsupported hardware type, requires (null)"));

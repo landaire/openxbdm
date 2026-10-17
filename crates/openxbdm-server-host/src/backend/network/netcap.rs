@@ -4,14 +4,9 @@
 
 use openxbdm_core::status::KernelError;
 use openxbdm_server::commands::filesystem;
-use openxbdm_server::commands::filesystem::CreateDisposition;
-use openxbdm_server::commands::filesystem::CreateOptions;
 use openxbdm_server::commands::filesystem::CreateRequest;
-use openxbdm_server::commands::filesystem::FileAccess;
-use openxbdm_server::commands::filesystem::FileAttributes;
 use openxbdm_server::commands::filesystem::FileData;
 use openxbdm_server::commands::filesystem::FileHandle;
-use openxbdm_server::commands::filesystem::ShareAccess;
 use openxbdm_server::commands::network::WsaError;
 use openxbdm_server::commands::network::netcap;
 use openxbdm_server::commands::network::netcap::CaptureClose;
@@ -26,6 +21,11 @@ use openxbdm_server::commands::network::netcap::capture_file::LocalTime;
 use openxbdm_server::commands::network::netcap::capture_file::Recorder;
 
 use crate::backend::MockBackend;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::FileAttributes;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
 /// Time base rate of the simulated console.
 pub const TIMEBASE_FREQUENCY: u64 = 50_000_000;
@@ -276,9 +276,9 @@ impl MockBackend {
         }
         name.extend_from_slice(request.path);
         let create = CreateRequest {
-            access: FileAccess::GENERIC_READ.union(FileAccess::GENERIC_WRITE),
+            access: AccessMask::GENERIC_READ.union(AccessMask::GENERIC_WRITE),
             allocation_size: None,
-            attributes: FileAttributes::NONE,
+            attributes: FileAttributes::empty(),
             share: ShareAccess::READ,
             disposition: CreateDisposition::Create,
             options: CreateOptions::SYNCHRONOUS_IO_NONALERT,

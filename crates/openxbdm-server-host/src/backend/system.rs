@@ -11,15 +11,14 @@ use openxbdm_server::commands::system::RebootKind;
 use openxbdm_server::commands::system::SettingsCopy;
 use openxbdm_server::commands::system::SettingsFile;
 use openxbdm_server::commands::system::SettingsSource;
+use xbox360_sys::xboxkrnl::HardwareFlags;
 
 use super::MockBackend;
 
 /// Settings file of a fresh simulated console.
 const INITIAL_SETTINGS: &[u8] = b"[xbdm]\r\ndbgname name=openxbdm-mock\r\n";
 /// Hardware flags of the simulated development kit: revision 4.
-const HARDWARE_FLAGS: u32 = 0x4000_0013;
-/// Hardware flag of a test kit.
-const HARDWARE_TEST_KIT: u32 = 0x0200_0000;
+const HARDWARE_FLAGS: HardwareFlags = HardwareFlags::from_bits_retain(0x4000_0013);
 /// Largest flash image buffer the simulated console can allocate.
 const FLASH_MEMORY: u32 = 0x0400_0000;
 /// Buffer through which a settings copy reaches the caller's file.
@@ -65,7 +64,7 @@ pub struct Mock {
     pub clock_sets: Vec<u64>,
     /// Kernel hardware flags; the test-kit bit comes from
     /// `MockBackend::test_kit`.
-    pub hardware_flags: u32,
+    pub hardware_flags: HardwareFlags,
     /// The system registered a title launch routine.
     pub relaunch_routine: bool,
     /// In-place title relaunches performed.
@@ -250,8 +249,12 @@ impl system::Backend for MockBackend {
         self.system.clock_sets.push(file_time);
     }
 
-    fn hardware_flags(&mut self) -> u32 {
-        self.system.hardware_flags | if self.test_kit { HARDWARE_TEST_KIT } else { 0 }
+    fn hardware_flags(&mut self) -> HardwareFlags {
+        let mut flags = self.system.hardware_flags;
+        if self.test_kit {
+            flags.insert(HardwareFlags::TEST_KIT);
+        }
+        flags
     }
 
     fn title_launch_registered(&mut self) -> bool {

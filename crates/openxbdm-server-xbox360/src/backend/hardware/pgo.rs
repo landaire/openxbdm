@@ -20,12 +20,7 @@ use core::sync::atomic::fence;
 
 use openxbdm_core::status::NtStatus;
 use openxbdm_server::Server;
-use openxbdm_server::commands::filesystem::CreateDisposition;
-use openxbdm_server::commands::filesystem::CreateOptions;
 use openxbdm_server::commands::filesystem::CreateRequest;
-use openxbdm_server::commands::filesystem::FileAccess;
-use openxbdm_server::commands::filesystem::FileAttributes;
-use openxbdm_server::commands::filesystem::ShareAccess;
 use openxbdm_server::commands::hardware::PgoError;
 use openxbdm_server::commands::hardware::PgoModule;
 use openxbdm_server::commands::hardware::pgo;
@@ -92,6 +87,10 @@ use crate::kernel::CriticalSection;
 use crate::kernel::address_of;
 use crate::kernel::object_at;
 use crate::net::XamNetwork;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::FileAttributes;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
 /// Entries of a module's probe dispatch table.
 const DISPATCH_ENTRIES: usize = 24;
@@ -2794,14 +2793,14 @@ fn set_option(module: PgoModule, option: PgoOption, value: u32) -> Result<(), Pg
     Ok(())
 }
 
-fn profile_request(access: FileAccess, disposition: CreateDisposition) -> CreateRequest {
+fn profile_request(access: AccessMask, disposition: CreateDisposition) -> CreateRequest {
     CreateRequest {
         access: access
-            .union(FileAccess::SYNCHRONIZE)
-            .union(FileAccess::READ_ATTRIBUTES),
+            .union(AccessMask::SYNCHRONIZE)
+            .union(AccessMask::READ_ATTRIBUTES),
         allocation_size: None,
         attributes: FileAttributes::NORMAL,
-        share: ShareAccess::NONE,
+        share: ShareAccess::empty(),
         disposition,
         options: CreateOptions::SYNCHRONOUS_IO_NONALERT,
     }
@@ -2819,13 +2818,13 @@ fn create_profile(name: &ProfileName) -> Option<Handle> {
         let path = &bytes[..length];
         if let Ok(handle) = filesystem::create_file(
             path,
-            &profile_request(FileAccess::GENERIC_WRITE, CreateDisposition::Create),
+            &profile_request(AccessMask::GENERIC_WRITE, CreateDisposition::Create),
         ) {
             return Some(Handle::from_raw(handle.0));
         }
         let handle = filesystem::create_file(
             path,
-            &profile_request(FileAccess::GENERIC_READ, CreateDisposition::Open),
+            &profile_request(AccessMask::GENERIC_READ, CreateDisposition::Open),
         )
         .ok()?;
         // SAFETY: `handle` was opened above and is closed once.

@@ -27,6 +27,7 @@ lists.
 - `dmtelllog` sends no reply line when its result is 0 (area added to an open log, file open failure, partial stop).
 - A fastpipe packet consumes max(T, 0x5b4) bytes of the stream; a packet shorter than 0x5b4 bytes must be padded or the start of the next packet is lost.
 - `rpc` with `buf_size=0` ends after the first 8-byte send, which may be a `03 E5` marker while the call is still pending.
+- `rpc` deviations where stock overruns the call block: a `buf_size` within 0x68 bytes of 4 GB (the call block header added without a carry) fails as out of memory, and a 204 piece that runs past the remaining count is written only up to the end of the call buffer; stock allocates a block too small for the upload and writes past it.
 - The fastpipe `BB` reply HRESULT for success is 0, not 0x02da0000.
 - In an `XBDMFE!Begin` path suffix the closing quote appears only when the name fills its room (Length + 7 or the rest of the 0x1fe-byte text); a shorter name ends the text without the quote.
 - File events of a terminating title are suppressed until a different title is current.
@@ -110,6 +111,8 @@ lists.
 - `traceimports` calls kernel ordinal 719 through the address `XexGetProcedureAddress` returned without a check; when the export is absent it branches to address 0 on the server thread (no exception handler), which crashes the monitor. openxbdm prints the "not a valid choice" line and replies `400- `.
 - Memory exports 10 and 40 return 0x82da0004 whenever no count pointer is passed and the copy ran to the end of its length (their down counter ends at 0xffffffff); a byte that fails to read or write ends the copy like an invalid page.
 - Export 78 stores registered allocation type names through a table pointer (0x91faea60) that is never allocated, so registration with tracking enabled faults in stock; the allocation-not-found diagnostic of type lookups reads the same table. openxbdm keeps 0x100 registered names and fails further registrations with 0x800703fb.
+- The console backend bounds reads of XEX header field data to the size the key encodes (or the leading size word for size form 0xff); `xexfield` never asks for more, so nothing changes on the wire.
+- `detour entry setinfo` overlapped offsets and parameter sizes are trusted as in stock: the logger reads the hooked call's parameters, and writes its XOVERLAPPED, where they say without a check.
 
 ## Debugger
 
@@ -139,6 +142,7 @@ lists.
 - Debug-monitor control codes 0xa5/0xa6 identify a proxy by the name pointer and port they handed out, not by an entry handle.
 - Classifier text compiler (exports 216, 224; 0x91f8bdd0): the parser keeps the first syntax error, but lexer and operator builder errors replace the status, and parsing continues after a builder error with the failed rule's operands freed; later rules then pop the wrong nodes, so `UDP[1] == UDP` reports 0x800710d2 (no operand) instead of the 0x80070099 of the second `UDP`. Names are declared as items when the rule is reduced, even in a folded-away `?:` branch, so `0 ? UDP : TCP` serializes both items. `1 && x` keeps the constant operand; `0 && x` folds to false. A constant true program installs no classifier; a constant false one fails with 0x82da0010. Field names bind case-insensitively; keywords and function names are case-sensitive. Decimal literals with more than 10 digits (or hex with more than 8) are 64-bit whatever their value. An address literal scan only stops at a non-digit after every separator, so `1.2.3.4x` is an address followed by a name. The compiler accepts 0x20 items and 0x40 live nodes, more than the 16 items and 32 nodes the stored copy allows, so such programs fail later in `insertq` with 0x82da001c.
 - Classifier compiler deviations where stock faults: after an earlier builder error, `name[...]`/`name(...)` can be reduced over a non-name operand; stock reads its value word as an item position (a string reference's link, stale bytes of a narrow integer, or a node pointer) and faults on an out-of-range position, and after a constant index drops a non-string operand as a string reference and faults; openxbdm returns 0x8007048a or drops nothing. `i64::MIN / -1` (and `%`) traps in stock and fails with 0x80070216 in openxbdm; ignore-case string functions on bytes 0x80..0xfe hit a CRT assertion in stock.
+- `xhttpproxy` with a `certsize` whose sum with the name length and the 0x24-byte entry header wraps past 4 GB fails as out of memory (`428- err=0x82da001c `); stock allocates the wrapped size and the hex decoder writes past the block.
 
 ## Performance counters
 

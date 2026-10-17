@@ -93,11 +93,7 @@ pub enum Continuation {
     /// Lines of a table snapshot held by the backend for this connection.
     Table { table: Table, next: u32, count: u32 },
     /// Certificate upload of a pending `xhttpproxy` entry.
-    ProxyCertificate {
-        id: xhttpproxy::ProxyId,
-        received: u32,
-        size: u32,
-    },
+    ProxyCertificate(xhttpproxy::CertificateUpload),
 }
 
 /// Static address configuration (`staticip`, `subnet`, `gateway` settings
@@ -414,9 +410,7 @@ pub(crate) fn resume(
             next,
             count,
         } => table_line(next, *count, cx),
-        Continuation::ProxyCertificate { id, received, size } => {
-            xhttpproxy::receive_certificate(*id, received, *size, cx)
-        }
+        Continuation::ProxyCertificate(upload) => xhttpproxy::receive_certificate(upload, cx),
     }
 }
 

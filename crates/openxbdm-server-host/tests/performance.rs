@@ -23,6 +23,7 @@ use openxbdm_server_host::backend::performance::CaptureSession;
 use openxbdm_server_host::backend::performance::Display;
 use openxbdm_server_host::backend::performance::PAGES;
 use openxbdm_server_host::backend::performance::THREADS;
+use xbox360_sys::xboxkrnl::HardwareFlags;
 
 fn session(server: &TestServer) -> RawSession {
     let mut session = server.raw();
@@ -257,7 +258,13 @@ fn autoprof_reads_and_writes_the_profile_setting() {
         session.command("autoprof xuid=12"),
         "200- xuid==0q0009000006f1b2c3"
     );
-    server.host.lock().backend.system.hardware_flags &= !0x10;
+    server
+        .host
+        .lock()
+        .backend
+        .system
+        .hardware_flags
+        .remove(HardwareFlags::AUTO_PROFILE);
     assert_eq!(session.command("autoprof"), "407- unknown command");
 }
 

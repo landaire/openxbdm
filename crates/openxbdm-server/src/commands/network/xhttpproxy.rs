@@ -128,9 +128,12 @@ pub trait Backend {
     /// its active reference, freeing it when unreferenced), then insert
     /// `new` at the head as active with one reference. Certificate hex is
     /// decoded with [`super::decode_hex`]; a bad certificate unlinks and
-    /// frees the new entry.
+    /// frees the new entry. The certificate storage of the new entry holds
+    /// exactly the requested size; a size the platform cannot allocate
+    /// gives [`ProxyError::OutOfMemory`].
     fn proxy_update(&mut self, sys: bool, new: Option<&NewProxy<'_>>) -> ProxyOutcome;
-    /// Copy uploaded certificate bytes at `offset`.
+    /// Copy uploaded certificate bytes at `offset`; bytes past the entry's
+    /// certificate size are dropped.
     fn proxy_write_certificate(&mut self, id: ProxyId, offset: u32, bytes: &[u8]);
     /// The upload finished: clear the pending bit and drop the upload
     /// reference. Returns the entry's flags; `None` when title code
@@ -145,11 +148,21 @@ pub trait Backend {
     fn proxy_unlock(&mut self);
     /// Entry `position` counted from the tail (oldest first).
     fn proxy_entry(&mut self, position: usize) -> Option<ProxyEntry>;
-    /// Copy certificate bytes from `offset` into `output`.
+    /// Copy certificate bytes from `offset` into `output`; bytes past the
+    /// entry's certificate size are left unchanged.
     fn proxy_read_certificate(&mut self, id: ProxyId, offset: u32, output: &mut [u8]);
     /// The title process ended: reset consumer counts and deactivate
     /// temporary title entries (stock 0x91f37860).
     fn proxy_title_exited(&mut self);
+}
+
+/// Upload state of a pending entry. The fields are private so that `size`
+/// stays the certificate size of entry `id` and `received` stays within it.
+#[derive(Debug)]
+pub struct CertificateUpload {
+    id: ProxyId,
+    received: u32,
+    size: u32,
 }
 
 /// `xhttpproxy [name=<str> [port=<dword>] [certsize=<dword>] [cert=<hex>]]
@@ -231,11 +244,12 @@ pub(super) fn xhttpproxy(invocation: &mut Invocation<'_>) -> CommandResult {
         Some(Ok(Inserted::Pending(id))) => match invocation.session.as_deref_mut() {
             Some(session) => {
                 session.receive_remaining = Some(certificate_size);
-                session.continuation = AnyContinuation::Network(Continuation::ProxyCertificate {
-                    id,
-                    received: 0,
-                    size: certificate_size,
-                });
+                session.continuation =
+                    AnyContinuation::Network(Continuation::ProxyCertificate(CertificateUpload {
+                        id,
+                        received: 0,
+                        size: certificate_size,
+                    }));
                 (Ok(Reply::SendBinary), " applying")
             }
             // Stock stores the upload state through the missing context;
@@ -266,11 +280,11 @@ pub(super) fn xhttpproxy(invocation: &mut Invocation<'_>) -> CommandResult {
 
 /// Receive the certificate of a pending entry.
 pub(super) fn receive_certificate(
-    id: ProxyId,
-    received: &mut u32,
-    size: u32,
+    upload: &mut CertificateUpload,
     cx: &mut ContinuationContext<'_>,
 ) -> CommandResult {
+    let CertificateUpload { id, received, size } = upload;
+    let (id, size) = (*id, *size);
     if cx.received.is_empty() {
         cx.backend.proxy_upload_aborted(id);
         cx.session.receive_remaining = Some(0);
@@ -307,6 +321,7 @@ pub(crate) fn settings_lines(
     backend.proxy_unlock();
 }
 
+/// The caller holds the list lock.
 fn write_entries(backend: &mut dyn AnyBackend, file: SettingsFile) {
     let mut position = 0;
     while let Some(entry) = backend.proxy_entry(position) {

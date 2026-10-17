@@ -4,6 +4,9 @@
 //! readiness and the engine calls back into [`Network`]. It follows the
 //! monitor's framing: one command line is taken per receive, a line ends at
 //! CR followed by any byte, and the receive buffer holds 0x200 bytes.
+// Abandoned transfer blocks are freed through the unsafe
+// `TransferBlocks::abandon`.
+#![allow(unsafe_code)]
 
 use core::fmt::Write as _;
 
@@ -261,7 +264,9 @@ impl Server {
         {
             let socket = connection.session.socket;
             crate::commands::debugger::connection_closed(&mut self.state, socket);
-            self.state.transfer_blocks.abandon(socket);
+            // SAFETY: the connection, with its continuation, was taken out
+            // of its slot above and is dropped here.
+            unsafe { self.state.transfer_blocks.abandon(socket) };
             network.close(connection.session.socket);
         }
     }
@@ -751,9 +756,12 @@ impl Server {
             return Outcome::Released;
         };
         connection.session.continuation = Continuation::None;
-        self.state
-            .transfer_blocks
-            .abandon(connection.session.socket);
+        // SAFETY: the continuation was cleared above.
+        unsafe {
+            self.state
+                .transfer_blocks
+                .abandon(connection.session.socket)
+        };
         connection.session.receive_remaining = None;
         connection.session.request = None;
         connection.transfer = Transfer::Idle;

@@ -8,17 +8,17 @@ use core::sync::atomic::Ordering;
 
 use openxbdm_server::Server;
 use openxbdm_server::commands::filesystem;
-use openxbdm_server::commands::filesystem::CreateDisposition;
-use openxbdm_server::commands::filesystem::CreateOptions;
 use openxbdm_server::commands::filesystem::CreateRequest;
-use openxbdm_server::commands::filesystem::FileAccess;
-use openxbdm_server::commands::filesystem::FileAttributes;
-use openxbdm_server::commands::filesystem::ShareAccess;
 use xbox360_sys::status::NtStatus;
 use xbox360_sys::xam;
 use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::FileAttributes;
 use xbox360_sys::xboxkrnl::Handle;
 use xbox360_sys::xboxkrnl::IoStatusBlock;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
 use super::session;
 use super::session::EngineMessage;
@@ -209,14 +209,12 @@ fn open_on_server(
                 b"E:\\pix"
             };
         let create = CreateRequest {
-            access: FileAccess(FileAccess::SYNCHRONIZE.0 | FileAccess::LIST_DIRECTORY.0),
+            access: AccessMask::SYNCHRONIZE.union(AccessMask::LIST_DIRECTORY),
             allocation_size: None,
             attributes: FileAttributes::NORMAL,
-            share: ShareAccess::NONE,
+            share: ShareAccess::empty(),
             disposition: CreateDisposition::Create,
-            options: CreateOptions(
-                CreateOptions::DIRECTORY_FILE.0 | CreateOptions::SYNCHRONOUS_IO_NONALERT.0,
-            ),
+            options: CreateOptions::DIRECTORY_FILE.union(CreateOptions::SYNCHRONOUS_IO_NONALERT),
         };
         if let Ok(handle) = filesystem::open_translated(&server.state, console, directory, &create)
         {
@@ -227,23 +225,17 @@ fn open_on_server(
         push(b"\\");
         push(name);
     }
-    /// `FILE_SEQUENTIAL_ONLY`.
-    const SEQUENTIAL_ONLY: u32 = 0x4;
     let create = CreateRequest {
-        access: FileAccess(
-            FileAccess::GENERIC_WRITE.0
-                | FileAccess::SYNCHRONIZE.0
-                | FileAccess::WRITE_ATTRIBUTES.0,
-        ),
+        access: AccessMask::GENERIC_WRITE
+            .union(AccessMask::SYNCHRONIZE)
+            .union(AccessMask::WRITE_ATTRIBUTES),
         allocation_size: None,
         attributes: FileAttributes::NORMAL,
-        share: ShareAccess::NONE,
+        share: ShareAccess::empty(),
         disposition: CreateDisposition::Supersede,
-        options: CreateOptions(
-            CreateOptions::NON_DIRECTORY_FILE.0
-                | CreateOptions::SYNCHRONOUS_IO_NONALERT.0
-                | SEQUENTIAL_ONLY,
-        ),
+        options: CreateOptions::NON_DIRECTORY_FILE
+            .union(CreateOptions::SYNCHRONOUS_IO_NONALERT)
+            .union(CreateOptions::SEQUENTIAL_ONLY),
     };
     match filesystem::open_translated(&server.state, console, &path[..length], &create) {
         Ok(handle) => request.handle = handle.0,

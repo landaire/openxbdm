@@ -19,6 +19,7 @@ use super::limits::Activity;
 use super::limits::Usage;
 use super::shares::Presence;
 use super::shares::ShareBindings;
+use crate::commands::filesystem::ScratchBlock;
 use crate::network::NetError;
 use crate::network::Network;
 use crate::network::SocketId;
@@ -50,8 +51,8 @@ struct Sending {
 /// Pool blocks of a connection: the request, transport header first, and
 /// the response.
 struct Buffers {
-    input: &'static mut [u8],
-    output: &'static mut [u8],
+    input: ScratchBlock,
+    output: ScratchBlock,
 }
 
 /// The connection has ended.
@@ -427,9 +428,12 @@ fn receive(
                 presence: Presence::default(),
             };
             let request = &mut buffers.input[HEADER_LENGTH..HEADER_LENGTH + length];
-            let reply =
-                slot.connection
-                    .handle(&mut shared.server, &mut adapter, request, buffers.output);
+            let reply = slot.connection.handle(
+                &mut shared.server,
+                &mut adapter,
+                request,
+                &mut buffers.output,
+            );
             return start_sending(slot, socket, reply, network, now);
         }
     }
@@ -463,7 +467,7 @@ fn complete(
     };
     let reply = slot
         .connection
-        .poll(&mut shared.server, &mut adapter, buffers.output);
+        .poll(&mut shared.server, &mut adapter, &mut buffers.output);
     start_sending(slot, socket, reply, network, now)
 }
 

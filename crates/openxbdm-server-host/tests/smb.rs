@@ -19,6 +19,10 @@ use openxbdm_server::smb::SmbService;
 use openxbdm_server::state::LockMode;
 use openxbdm_server_host::Host;
 use openxbdm_server_host::backend::filesystem::Volume;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
 const SECOND: u64 = 10_000_000;
 const HEADER: usize = 64;
@@ -577,11 +581,11 @@ fn change_notifications_complete_when_the_service_polls() {
         STATUS_PENDING
     );
     let outside = filesystem::CreateRequest {
-        disposition: filesystem::CreateDisposition::Create,
+        disposition: CreateDisposition::Create,
         ..filesystem::CreateRequest::open(
-            filesystem::FileAccess::WRITE_DATA,
-            filesystem::ShareAccess::ALL,
-            filesystem::CreateOptions::NON_DIRECTORY_FILE,
+            AccessMask::WRITE_DATA,
+            ShareAccess::all(),
+            CreateOptions::NON_DIRECTORY_FILE,
         )
     };
     let mut name = DEVKIT.to_vec();

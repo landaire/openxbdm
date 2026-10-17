@@ -632,7 +632,7 @@ unsafe extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: 
                 && hardware_flags().contains(HardwareFlags::KERNEL_DEBUGGER);
             u32::from(passive() || kd)
         }
-        C::REGISTER_PIX_PROCESSOR => session::service_register_pix_processor(argument),
+        C::REGISTER_PIX_PROCESSOR => unsafe { session::service_register_pix_processor(argument) },
         C::WRITE_SETTINGS_COPY => unsafe { system::service_write_settings_copy(argument) },
         C::SET_SYSTEM_SETTINGS => unsafe { console::service_set_system_settings(argument) },
         C::GET_SYSTEM_SETTINGS => unsafe { console::service_get_system_settings(argument) },

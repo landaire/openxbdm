@@ -868,14 +868,11 @@ unsafe extern "C" fn invoke(target: u32, slots: *const u64, registers: *mut u64)
 }
 
 /// The call block of `call`.
-///
-/// # Safety
-///
-/// `call` must come from `rpc_create`.
 #[inline(always)]
-unsafe fn call_pointer(call: RpcCall) -> CallPointer {
-    // SAFETY: `rpc_create` returns the address of the call block.
-    unsafe { CallPointer::from_address(call.0) }
+fn call_pointer(call: RpcCall) -> CallPointer {
+    // SAFETY: an `RpcCall` names a call block until it is aborted or
+    // released (`RpcCall::from_raw`), after which no copy is used.
+    unsafe { CallPointer::from_address(call.raw()) }
 }
 
 impl RpcBackend for Console {
@@ -885,13 +882,13 @@ impl RpcBackend for Console {
         context: RpcContext,
         thread: RpcThread<'_>,
     ) -> Result<RpcCall, RpcCreateError> {
+        // Stock adds without a carry, so a size near 4 GB gets a small block
+        // its upload overruns; here that size fails as an allocation does.
+        let total = size
+            .checked_add(core::mem::size_of::<CallBlock>() as u32)
+            .ok_or(RpcCreateError::OutOfMemory)?;
         // SAFETY: the allocation takes only a size and tag.
-        let address = unsafe {
-            xboxkrnl::ExAllocatePoolWithTag(
-                size.wrapping_add(core::mem::size_of::<CallBlock>() as u32),
-                CALL_TAG,
-            )
-        };
+        let address = unsafe { xboxkrnl::ExAllocatePoolWithTag(total, CALL_TAG) };
         // SAFETY: the allocation is 0 or a new block sized for a call block
         // and its buffer.
         let Some(call) = (unsafe { CallPointer::new(address) }) else {
@@ -959,24 +956,25 @@ impl RpcBackend for Console {
             }
             block.thread.store(object, Ordering::Relaxed);
         }
-        Ok(RpcCall(call.address()))
+        // SAFETY: the block is new; it is freed only through `rpc_abort` or
+        // `rpc_release`, whose contracts end the use of every copy.
+        Ok(unsafe { RpcCall::from_raw(call.address()) })
     }
 
     fn rpc_buffer_address(&mut self, call: RpcCall) -> u32 {
-        call.0 + core::mem::size_of::<CallBlock>() as u32
+        call.raw() + core::mem::size_of::<CallBlock>() as u32
     }
 
-    fn rpc_write(&mut self, call: RpcCall, offset: u32, data: &[u8]) {
-        // SAFETY: `call` comes from `rpc_create`.
-        let call = unsafe { call_pointer(call) };
+    unsafe fn rpc_write(&mut self, call: RpcCall, offset: u32, data: &[u8]) {
+        let call = call_pointer(call);
         let destination = call.buffer().cast::<u8>().wrapping_add(offset as usize);
-        // SAFETY: the upload never exceeds the buffer size it was sized for.
+        // SAFETY: the bytes lie in the buffer the block was allocated with,
+        // per the trait contract.
         unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), destination, data.len()) };
     }
 
     fn rpc_start(&mut self, call: RpcCall) {
-        // SAFETY: `call` comes from `rpc_create`.
-        let call = unsafe { call_pointer(call) };
+        let call = call_pointer(call);
         // SAFETY: the stream owns the block until it releases it.
         match unsafe { call.block() }.thread_object() {
             None => push_call(call),
@@ -987,9 +985,8 @@ impl RpcBackend for Console {
         }
     }
 
-    fn rpc_abort(&mut self, call: RpcCall) {
-        // SAFETY: `call` comes from `rpc_create`.
-        let call = unsafe { call_pointer(call) };
+    unsafe fn rpc_abort(&mut self, call: RpcCall) {
+        let call = call_pointer(call);
         // SAFETY: the stream owns the block until it releases it.
         let block = unsafe { call.block() };
         match block.thread_object() {
@@ -1012,8 +1009,7 @@ impl RpcBackend for Console {
     }
 
     fn rpc_wait(&mut self, call: RpcCall) -> bool {
-        // SAFETY: `call` comes from `rpc_create`.
-        let call = unsafe { call_pointer(call) };
+        let call = call_pointer(call);
         // SAFETY: the stream owns the block until it releases it.
         let block = unsafe { call.block() };
         match block.thread_object() {
@@ -1047,17 +1043,16 @@ impl RpcBackend for Console {
         }
     }
 
-    fn rpc_read(&mut self, call: RpcCall, offset: u32, output: &mut [u8]) {
-        // SAFETY: `call` comes from `rpc_create`.
-        let call = unsafe { call_pointer(call) };
+    unsafe fn rpc_read(&mut self, call: RpcCall, offset: u32, output: &mut [u8]) {
+        let call = call_pointer(call);
         let source = call.buffer().cast::<u8>().wrapping_add(offset as usize);
-        // SAFETY: reads stay within the buffer size.
+        // SAFETY: the bytes lie in the buffer the block was allocated with,
+        // per the trait contract.
         unsafe { core::ptr::copy_nonoverlapping(source, output.as_mut_ptr(), output.len()) };
     }
 
-    fn rpc_release(&mut self, call: RpcCall) {
-        // SAFETY: `call` comes from `rpc_create`.
-        let call = unsafe { call_pointer(call) };
+    unsafe fn rpc_release(&mut self, call: RpcCall) {
+        let call = call_pointer(call);
         // SAFETY: the stream owns the block until it releases it here.
         let block = unsafe { call.block() };
         match block.thread_object() {

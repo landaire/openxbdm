@@ -1,13 +1,15 @@
 //! Process, thread, breakpoint, and execution control commands, and the
 //! processing of debug events reported by the platform.
 
+// Backend::module_event and Backend::set_thread_name take raw console addresses.
+#![allow(unsafe_code)]
+
 mod breakpoints;
 mod context;
 mod direct;
 mod events;
 mod kd;
 
-use crate::commands::system::hardware_flags;
 use core::fmt::Write as _;
 
 use openxbdm_core::status::ErrorCode;
@@ -448,9 +450,24 @@ impl ExitStatus {
     pub const STILL_ACTIVE: Self = Self(0x103);
 }
 
-/// Handle of a loaded debugger extension module.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExtensionHandle(pub u32);
+/// Handle of a loaded debugger extension module, owned until it is passed
+/// to [`Backend::unload_extension`].
+#[derive(Debug)]
+pub struct ExtensionHandle(u32);
+
+impl ExtensionHandle {
+    /// # Safety
+    ///
+    /// `value` must be the loader handle of a loaded debugger extension
+    /// image that no other `ExtensionHandle` names.
+    pub unsafe fn from_raw(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub fn raw(&self) -> u32 {
+        self.0
+    }
+}
 
 /// Platform services this domain needs.
 pub trait Backend {
@@ -490,7 +507,15 @@ pub trait Backend {
         context: &Context,
     ) -> Result<(), StoppedThreadError>;
     /// Copy the NUL-terminated name at `address` as the name of `thread`.
-    fn set_thread_name(&mut self, thread: ThreadId, address: u32);
+    ///
+    /// # Safety
+    ///
+    /// `address` must be the name parameter of a thread-name exception
+    /// (type 0x1000) raised by a thread that stays stopped in the monitor
+    /// at that exception for the duration of the call. The raising code
+    /// supplies it as a NUL-terminated string, readable through its
+    /// terminator, or 0.
+    unsafe fn set_thread_name(&mut self, thread: ThreadId, address: u32);
     /// Exit status of the thread behind a handle of the monitor process:
     /// [`ExitStatus::STILL_ACTIVE`] while it runs.
     fn thread_exit_status(&mut self, handle: ThreadHandle) -> Result<ExitStatus, KernelError>;
@@ -505,7 +530,16 @@ pub trait Backend {
     fn set_data_breakpoint_register(&mut self, value: u32);
     /// Describe the module of a load or unload trap from the loader's
     /// name string and module entry.
-    fn module_event(
+    ///
+    /// # Safety
+    ///
+    /// `thread` must be stopped in the monitor at a module load or unload
+    /// trap for the duration of the call, with `name_string` and `entry`
+    /// its r3 and r4. The loader raises the trap with r3 addressing the
+    /// module's counted name string (16-bit length, buffer address at +4,
+    /// `length` readable bytes) and r4 its loader table entry (image base
+    /// at +0, size at +0xc, of an image mapped at that base), or with 0.
+    unsafe fn module_event(
         &mut self,
         name_string: u32,
         entry: u32,
@@ -662,7 +696,9 @@ pub(crate) fn kernel_debugger_enabled(
     backend: &mut dyn AnyBackend,
 ) -> bool {
     *state.debugger.kernel_debugger.get_or_insert_with(|| {
-        hardware_flags(backend).contains(HardwareFlags::KERNEL_DEBUGGER_ENABLED)
+        backend
+            .hardware_flags()
+            .contains(HardwareFlags::KERNEL_DEBUGGER_ENABLED)
     })
 }
 
@@ -1358,10 +1394,14 @@ fn threads(invocation: &mut Invocation<'_>) -> CommandResult {
         match invocation.backend.thread_ids(&mut ids) {
             Some(count) => count,
             None => {
-                invocation
-                    .state
-                    .transfer_blocks
-                    .release(invocation.backend, list);
+                // SAFETY: the transfer was not started, so this command holds
+                // the only copy.
+                unsafe {
+                    invocation
+                        .state
+                        .transfer_blocks
+                        .release(invocation.backend, list)
+                };
                 return Err(CommandError::Unexpected);
             }
         }
@@ -1392,7 +1432,9 @@ fn thread_lines(
     cx: &mut ContinuationContext<'_>,
 ) -> CommandResult {
     if *remaining == 0 {
-        cx.state.transfer_blocks.release(cx.backend, list);
+        // SAFETY: the transfer ends with this result, so the server drops the
+        // continuation, the only other holder.
+        unsafe { cx.state.transfer_blocks.release(cx.backend, list) };
         return Err(CommandError::EndOfData);
     }
     let ids = cx
@@ -1551,7 +1593,9 @@ fn context_lines(
         .map(|bytes| Context::decode(bytes))
         .unwrap_or_default();
     if ContextLine::first_from(*position, context.flags).is_none() {
-        cx.state.transfer_blocks.release(cx.backend, snapshot);
+        // SAFETY: the transfer ends with this result, so the server drops the
+        // continuation, the only other holder.
+        unsafe { cx.state.transfer_blocks.release(cx.backend, snapshot) };
         return Err(CommandError::EndOfData);
     }
     let mut out = BinaryWriter {

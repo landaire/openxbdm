@@ -473,7 +473,10 @@ pub(crate) mod backend {
     /// Capture thread value of no thread.
     const NO_CAPTURE_THREAD: u32 = u32::MAX;
 
-    pub(crate) fn post(code: u32, payload: &[u32]) -> bool {
+    /// # Safety
+    ///
+    /// As `performance::Backend::pix_post`.
+    pub(crate) unsafe fn post(code: u32, payload: &[u32]) -> bool {
         session::post(code, payload)
     }
 

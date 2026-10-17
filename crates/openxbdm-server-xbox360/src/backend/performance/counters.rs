@@ -419,7 +419,9 @@ pub(super) fn query(
     query: CounterQuery,
     out: &mut CounterSample,
 ) -> Result<Evaluation, CounterError> {
-    counters::query(&mut counter.0, query, out)
+    // SAFETY: only `register` creates counter objects, and it initializes
+    // each; only the sampler writes the history index after that.
+    unsafe { counters::query(&mut counter.0, query, out) }
 }
 
 /// One directory entry after `context` (0 restarts), its name copied into
@@ -536,10 +538,10 @@ impl CounterView {
     }
 }
 
-// The offset accessors rely on the invariant documented on `CounterView`.
 impl CounterObject for CounterView {
-    fn read_u32(&self, offset: i32) -> u32 {
-        // SAFETY: `counters` reads within the object header and the body.
+    unsafe fn read_u32(&self, offset: i32) -> u32 {
+        // SAFETY: the caller keeps `offset` within the object header and the
+        // body.
         let [word] = unsafe { self.words::<1>(offset) };
         word.load(Ordering::Relaxed)
     }
@@ -547,45 +549,50 @@ impl CounterObject for CounterView {
     // One address computation and forced inlining keep the callers in
     // `counters` small enough to be inlined themselves.
     #[inline(always)]
-    fn read_u64(&self, offset: i32) -> u64 {
+    unsafe fn read_u64(&self, offset: i32) -> u64 {
         // SAFETY: as in `read_u32`.
         load_pair(unsafe { self.words::<2>(offset) })
     }
 
-    fn write_u32(&mut self, offset: i32, value: u32) {
-        // SAFETY: `counters` writes within the body.
+    unsafe fn write_u32(&mut self, offset: i32, value: u32) {
+        // SAFETY: the caller keeps `offset` within the body.
         let [word] = unsafe { self.words::<1>(offset) };
         word.store(value, Ordering::Relaxed);
     }
 
-    fn write_u64(&mut self, offset: i32, value: u64) {
+    unsafe fn write_u64(&mut self, offset: i32, value: u64) {
         // SAFETY: as in `write_u32`.
         store_pair(unsafe { self.words::<2>(offset) }, value);
     }
 
-    fn source_u32(&self, offset: u32) -> u32 {
-        // SAFETY: the evaluation reads the words of the source kind of the
+    unsafe fn source_u32(&self, offset: u32) -> u32 {
+        // SAFETY: the caller reads the words of the source kind of the
         // registration word (see `source_words`).
         let [word] = unsafe { self.source_words::<1>(offset) };
         word.load(Ordering::Relaxed)
     }
 
     #[inline(always)]
-    fn source_u64(&self, offset: u32) -> u64 {
+    unsafe fn source_u64(&self, offset: u32) -> u64 {
         // SAFETY: as in `source_u32`.
         load_pair(unsafe { self.source_words::<2>(offset) })
     }
 
-    fn call_reader(&mut self, value: &mut u64, rate: Option<&mut u64>) -> Result<(), CounterError> {
+    unsafe fn call_reader(
+        &mut self,
+        value: &mut u64,
+        rate: Option<&mut u64>,
+    ) -> Result<(), CounterError> {
         let rate = rate.map_or(0, |rate| rate as *mut u64 as usize as u32);
-        // SAFETY: kind 1 counters register a reader taking (value, rate).
+        // SAFETY: the caller checked kind 1, whose counters register a
+        // reader taking (value, rate).
         let result = Hresult(unsafe {
             kernel::call_export(self.source(), value as *mut u64 as usize as u32, rate, 0, 0)
         });
         counters::routine_result(result).map(|_| ())
     }
 
-    fn call_handler(
+    unsafe fn call_handler(
         &mut self,
         query: CounterQuery,
         out: &mut CounterSample,
@@ -596,8 +603,8 @@ impl CounterObject for CounterView {
         sample[2] = (out.rate >> 32) as u32;
         sample[3] = out.rate as u32;
         sample[4] = out.sample_type;
-        // SAFETY: handler counters register a routine taking (query,
-        // object, sample).
+        // SAFETY: the caller checked the handler flag; handler counters
+        // register a routine taking (query, object, sample).
         let result = Hresult(unsafe {
             kernel::call_export(
                 self.source(),
@@ -1188,7 +1195,10 @@ extern "C" fn sampler_dpc(_dpc: usize, _context: usize, _argument1: usize, _argu
                 let irql = unsafe { xboxkrnl::KfRaiseIrql(SAMPLER_IRQL) };
                 let tick = TickCount::now().milliseconds();
                 let frame = frame_number();
-                counters::sample(&mut counter, tick, frame);
+                // SAFETY: bucket entries are permanent counter objects that
+                // `register` created, initialized, and scheduled; only the
+                // sampler writes their history index.
+                unsafe { counters::sample(&mut counter, tick, frame) };
                 // SAFETY: returns to the IRQL raised from above.
                 unsafe { xboxkrnl::KfLowerIrql(irql) };
             } else {

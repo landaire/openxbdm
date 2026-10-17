@@ -16,12 +16,7 @@ use core::time::Duration;
 
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
-use openxbdm_server::commands::filesystem::CreateDisposition;
-use openxbdm_server::commands::filesystem::CreateOptions;
 use openxbdm_server::commands::filesystem::CreateRequest;
-use openxbdm_server::commands::filesystem::FileAccess;
-use openxbdm_server::commands::filesystem::FileAttributes;
-use openxbdm_server::commands::filesystem::ShareAccess;
 use openxbdm_server::commands::memory::detour;
 use openxbdm_server::commands::memory::detour::BLOCK_SIZE;
 use openxbdm_server::commands::memory::detour::CallContext;
@@ -52,6 +47,11 @@ use crate::kernel;
 use crate::kernel::CriticalSection;
 use crate::kernel::KernelEvent;
 use crate::kernel::pool_tag;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::FileAttributes;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
 core::arch::global_asm!(
     ".section .text.openxbdm_detour,\"ax\",@progbits",
@@ -387,25 +387,18 @@ impl detour::Platform for ConsolePlatform {
         RECORD_FREED.set();
     }
 
-    // The engine passes addresses in the stub locals, the hooked call's
-    // stack parameters or register save area, which stay live during the
-    // hooked call, or the call's XOVERLAPPED, which the title keeps live
-    // until the completion worker has written it. The trait from
-    // openxbdm-server takes addresses and is safe, so these four rely on
-    // that engine contract instead of an `unsafe fn` signature.
-
-    fn read_u32(&self, address: u32) -> u32 {
-        // SAFETY: the engine contract above; stock does not align them.
+    unsafe fn read_u32(&self, address: u32) -> u32 {
+        // SAFETY: the trait contract; stock does not align these reads.
         unsafe { core::ptr::with_exposed_provenance::<u32>(address as usize).read_unaligned() }
     }
 
-    fn read_u64(&self, address: u32) -> u64 {
-        // SAFETY: the engine contract above; stock does not align them.
+    unsafe fn read_u64(&self, address: u32) -> u64 {
+        // SAFETY: the trait contract; stock does not align these reads.
         unsafe { core::ptr::with_exposed_provenance::<u64>(address as usize).read_unaligned() }
     }
 
-    fn read_block(&self, address: u32, output: &mut [u8; BLOCK_SIZE]) {
-        // SAFETY: the engine contract above.
+    unsafe fn read_block(&self, address: u32, output: &mut [u8; BLOCK_SIZE]) {
+        // SAFETY: the trait contract.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 core::ptr::with_exposed_provenance::<u8>(address as usize),
@@ -415,8 +408,8 @@ impl detour::Platform for ConsolePlatform {
         };
     }
 
-    fn write_u32(&self, address: u32, value: u32) {
-        // SAFETY: the engine contract above: an aligned word of the title's
+    unsafe fn write_u32(&self, address: u32, value: u32) {
+        // SAFETY: the trait contract: an aligned word of the title's
         // XOVERLAPPED, which title threads may read concurrently.
         let word = unsafe {
             AtomicU32::from_ptr(core::ptr::with_exposed_provenance_mut::<u32>(
@@ -433,8 +426,8 @@ impl detour::Platform for ConsolePlatform {
         (object != 0).then_some(object)
     }
 
-    fn signal_event(&self, event: u32) {
-        // SAFETY: `event` is an event object referenced by `reference_event`.
+    unsafe fn signal_event(&self, event: u32) {
+        // SAFETY: the trait contract: a referenced event object.
         unsafe { xboxkrnl::KeSetEvent(event as usize as *mut Kevent, EVENT_INCREMENT, false) };
     }
 
@@ -579,12 +572,21 @@ extern "C" fn openxbdm_detour_notify_rust(context: u32, area: u32, notify: u32) 
     // SAFETY: the stubs pass the address of their locals, which stay live
     // on the calling thread's stack for this call.
     let mut call = unsafe { &*locals }.context(context);
-    match notify {
-        notification::ENTER => ENGINE.enter(&ConsolePlatform, &mut call, area),
-        notification::FLOATING_POINT => ENGINE.floating_point(&ConsolePlatform, &call, area),
-        notification::VECTOR => ENGINE.vector(&ConsolePlatform, &call, area),
-        notification::EXIT => ENGINE.exit(&ConsolePlatform, &mut call),
-        _ => return,
+    // SAFETY: the stubs pass their locals and, per notification, the hooked
+    // call's stack parameters or the save area they filled, all live on
+    // the calling thread's stack during this call. What the entry's
+    // overlapped offset and parameter size reach beyond that is covered by
+    // the contract of `Engine::configure`, under which they were set. The
+    // XOVERLAPPED of a discarded call belongs to the title, which keeps it
+    // until the request completes.
+    unsafe {
+        match notify {
+            notification::ENTER => ENGINE.enter(&ConsolePlatform, &mut call, area),
+            notification::FLOATING_POINT => ENGINE.floating_point(&ConsolePlatform, &call, area),
+            notification::VECTOR => ENGINE.vector(&ConsolePlatform, &call, area),
+            notification::EXIT => ENGINE.exit(&ConsolePlatform, &mut call),
+            _ => return,
+        }
     }
     // SAFETY: as above; the engine's accesses to the locals have ended.
     unsafe { &mut *locals }.store(&call);
@@ -702,12 +704,12 @@ pub(super) fn read_record(output: &mut [u8; RECORD_SIZE]) -> bool {
 }
 
 /// Create request of the log with `access` and `disposition`.
-const fn log_request(access: FileAccess, disposition: CreateDisposition) -> CreateRequest {
+const fn log_request(access: AccessMask, disposition: CreateDisposition) -> CreateRequest {
     CreateRequest {
         access,
         allocation_size: None,
         attributes: FileAttributes::NORMAL,
-        share: ShareAccess::ALL,
+        share: ShareAccess::all(),
         disposition,
         options: CreateOptions::SYNCHRONOUS_IO_NONALERT,
     }
@@ -717,9 +719,9 @@ const fn log_request(access: FileAccess, disposition: CreateDisposition) -> Crea
 /// (0x91f2cb28).
 fn open_log() -> Result<(), KernelError> {
     const WRITE: CreateRequest =
-        log_request(FileAccess::GENERIC_WRITE, CreateDisposition::OverwriteIf);
+        log_request(AccessMask::GENERIC_WRITE, CreateDisposition::OverwriteIf);
     const READ: CreateRequest = log_request(
-        FileAccess::GENERIC_READ.union(FileAccess::SYNCHRONIZE),
+        AccessMask::GENERIC_READ.union(AccessMask::SYNCHRONIZE),
         CreateDisposition::Open,
     );
     // SAFETY: the server thread wrote the path before creating this thread.

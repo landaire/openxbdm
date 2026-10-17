@@ -17,6 +17,9 @@
 //! that reach past the history read neighbouring fields. Evaluation goes
 //! through [`CounterObject`] byte offsets to keep that behavior.
 
+// CounterObject accesses raw counter object memory.
+#![allow(unsafe_code)]
+
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
@@ -231,20 +234,60 @@ impl CounterSample {
     };
 }
 
-/// Access to one counter object and its source.
+/// Access to one counter object and its source. The object has the layout
+/// above and is preceded by 0x10 readable bytes.
 pub trait CounterObject {
     /// Big-endian read at a signed offset from the object start.
-    fn read_u32(&self, offset: i32) -> u32;
-    fn read_u64(&self, offset: i32) -> u64;
-    fn write_u32(&mut self, offset: i32, value: u32);
-    fn write_u64(&mut self, offset: i32, value: u64);
+    ///
+    /// # Safety
+    ///
+    /// The 4 bytes at `offset` must lie within the object or the 0x10
+    /// bytes before it: `-0x10 <= offset <= OBJECT_SIZE - 4`.
+    unsafe fn read_u32(&self, offset: i32) -> u32;
+    /// # Safety
+    ///
+    /// As [`CounterObject::read_u32`], for 8 bytes:
+    /// `-0x10 <= offset <= OBJECT_SIZE - 8`.
+    unsafe fn read_u64(&self, offset: i32) -> u64;
+    /// # Safety
+    ///
+    /// The 4 bytes at `offset` must lie within the object:
+    /// `0 <= offset <= OBJECT_SIZE - 4`.
+    unsafe fn write_u32(&mut self, offset: i32, value: u32);
+    /// # Safety
+    ///
+    /// The 8 bytes at `offset` must lie within the object:
+    /// `0 <= offset <= OBJECT_SIZE - 8`.
+    unsafe fn write_u64(&mut self, offset: i32, value: u64);
     /// Read from the source the object points at.
-    fn source_u32(&self, offset: u32) -> u32;
-    fn source_u64(&self, offset: u32) -> u64;
+    ///
+    /// # Safety
+    ///
+    /// The registration word must name a source that holds the 4 bytes at
+    /// `offset`: a copied sample (u64 value, u64 rate, u32 type) when it
+    /// has the copied-sample flag, else a u32 value and rate for kinds 2
+    /// and 3 and a u64 value and rate for kind 4.
+    unsafe fn source_u32(&self, offset: u32) -> u32;
+    /// # Safety
+    ///
+    /// As [`CounterObject::source_u32`], for 8 bytes.
+    unsafe fn source_u64(&self, offset: u32) -> u64;
     /// Call the reader routine of a kind 1 counter.
-    fn call_reader(&mut self, value: &mut u64, rate: Option<&mut u64>) -> Result<(), CounterError>;
+    ///
+    /// # Safety
+    ///
+    /// The registration word must name source kind 1.
+    unsafe fn call_reader(
+        &mut self,
+        value: &mut u64,
+        rate: Option<&mut u64>,
+    ) -> Result<(), CounterError>;
     /// Call the query routine of a counter registered with a handler.
-    fn call_handler(
+    ///
+    /// # Safety
+    ///
+    /// The registration word must have the handler flag.
+    unsafe fn call_handler(
         &mut self,
         query: CounterQuery,
         out: &mut CounterSample,
@@ -256,29 +299,47 @@ pub trait CounterObject {
 }
 
 fn registration(object: &impl CounterObject) -> CounterRegistration {
-    CounterRegistration(object.read_u32(REGISTRATION_OFFSET))
+    // SAFETY: the registration word lies within the object.
+    CounterRegistration(unsafe { object.read_u32(REGISTRATION_OFFSET) })
 }
 
 fn history_index(object: &impl CounterObject) -> i32 {
-    object.read_u32(INDEX_OFFSET) as i32
+    // SAFETY: the history index lies within the object.
+    unsafe { object.read_u32(INDEX_OFFSET) as i32 }
 }
 
-fn value_at(object: &impl CounterObject, index: i32) -> u64 {
-    object.read_u64(VALUES_OFFSET + index * 8)
+/// # Safety
+///
+/// `index` must be in `-4..HISTORY_LENGTH`. Slot -4, 0x10 bytes before the
+/// object, is the furthest a history query reaches back.
+unsafe fn value_at(object: &impl CounterObject, index: i32) -> u64 {
+    // SAFETY: slots -4 to 10 span offsets -0x10 to 0x68.
+    unsafe { object.read_u64(VALUES_OFFSET + index * 8) }
 }
 
-fn rate_at(object: &impl CounterObject, index: i32) -> u32 {
-    object.read_u32(RATES_OFFSET + index * 4)
+/// # Safety
+///
+/// As [`value_at`].
+unsafe fn rate_at(object: &impl CounterObject, index: i32) -> u32 {
+    // SAFETY: slots -4 to 10 span offsets 0x58 to 0x94.
+    unsafe { object.read_u32(RATES_OFFSET + index * 4) }
 }
 
-fn frame_at(object: &impl CounterObject, index: i32) -> u32 {
-    object.read_u32(FRAMES_OFFSET + index * 4)
+/// # Safety
+///
+/// As [`value_at`].
+unsafe fn frame_at(object: &impl CounterObject, index: i32) -> u32 {
+    // SAFETY: slots -4 to 10 span offsets 0x84 to 0xc0.
+    unsafe { object.read_u32(FRAMES_OFFSET + index * 4) }
 }
 
 /// Initialize a new object: registration word and an empty history.
 pub fn initialize(object: &mut impl CounterObject, registration: CounterRegistration) {
-    object.write_u32(REGISTRATION_OFFSET, registration.0);
-    object.write_u32(INDEX_OFFSET, u32::MAX);
+    // SAFETY: both words lie within the object.
+    unsafe {
+        object.write_u32(REGISTRATION_OFFSET, registration.0);
+        object.write_u32(INDEX_OFFSET, u32::MAX);
+    }
 }
 
 /// Instantaneous read by source kind. Returns false when the source fails.
@@ -286,18 +347,25 @@ pub fn initialize(object: &mut impl CounterObject, registration: CounterRegistra
 fn read_source(object: &mut impl CounterObject, value: &mut u64, rate: Option<&mut u64>) -> bool {
     match registration(object).kind() {
         0 => false,
-        1 => object.call_reader(value, rate).is_ok(),
+        // SAFETY: the registration names kind 1.
+        1 => unsafe { object.call_reader(value, rate) }.is_ok(),
         2 | 3 => {
-            *value = u64::from(object.source_u32(0));
-            if let Some(rate) = rate {
-                *rate = u64::from(object.source_u32(4));
+            // SAFETY: kinds 2 and 3 name a u32 value and rate.
+            unsafe {
+                *value = u64::from(object.source_u32(0));
+                if let Some(rate) = rate {
+                    *rate = u64::from(object.source_u32(4));
+                }
             }
             true
         }
         4 => {
-            *value = object.source_u64(0);
-            if let Some(rate) = rate {
-                *rate = object.source_u64(8);
+            // SAFETY: kind 4 names a u64 value and rate.
+            unsafe {
+                *value = object.source_u64(0);
+                if let Some(rate) = rate {
+                    *rate = object.source_u64(8);
+                }
             }
             true
         }
@@ -308,7 +376,13 @@ fn read_source(object: &mut impl CounterObject, value: &mut u64, rate: Option<&m
 /// One sampler visit of a counter without a handler. The history index is
 /// never advanced: every visit rewrites the current slot `period` times, and
 /// the first valid sample fills it eleven times.
-pub fn sample(object: &mut impl CounterObject, tick_count: u32, frame_number: u32) {
+///
+/// # Safety
+///
+/// `object` must have been set up by [`initialize`], with its history
+/// index written since only by `sample`; the index is then -1 or a slot
+/// of the history.
+pub unsafe fn sample(object: &mut impl CounterObject, tick_count: u32, frame_number: u32) {
     let word = registration(object);
     let mut value = 0u64;
     let (valid, rate) = if word.class() != CounterClass::RATIO {
@@ -319,29 +393,40 @@ pub fn sample(object: &mut impl CounterObject, tick_count: u32, frame_number: u3
         (valid && rate >> 32 == 0, rate as u32)
     };
     if !valid {
-        object.write_u32(INDEX_OFFSET, u32::MAX);
+        // SAFETY: the history index lies within the object.
+        unsafe { object.write_u32(INDEX_OFFSET, u32::MAX) };
         return;
     }
     let count = if history_index(object) < 0 {
-        object.write_u32(INDEX_OFFSET, 0);
+        // SAFETY: as above.
+        unsafe { object.write_u32(INDEX_OFFSET, 0) };
         HISTORY_LENGTH as u32
     } else {
         word.period()
     };
     for _ in 0..count {
         if history_index(object) == HISTORY_LENGTH {
-            object.write_u32(INDEX_OFFSET, 0);
+            // SAFETY: as above.
+            unsafe { object.write_u32(INDEX_OFFSET, 0) };
         }
         let index = history_index(object);
-        object.write_u64(VALUES_OFFSET + index * 8, value);
-        object.write_u32(RATES_OFFSET + index * 4, rate);
-        object.write_u32(FRAMES_OFFSET + index * 4, frame_number);
+        // SAFETY: by the contract and the resets above, `index` is a slot
+        // from 0 to 10, whose words lie within the object.
+        unsafe {
+            object.write_u64(VALUES_OFFSET + index * 8, value);
+            object.write_u32(RATES_OFFSET + index * 4, rate);
+            object.write_u32(FRAMES_OFFSET + index * 4, frame_number);
+        }
     }
 }
 
 /// Evaluate `querypc type=<query>` into `out`. Fields the evaluation does
 /// not produce keep their previous content.
-pub fn query(
+///
+/// # Safety
+///
+/// As [`sample`].
+pub unsafe fn query(
     object: &mut impl CounterObject,
     query: CounterQuery,
     out: &mut CounterSample,
@@ -350,14 +435,18 @@ pub fn query(
     let class = word.class();
     if word.flags().contains(RegistrationFlags::COPIES_SAMPLE) {
         object.exclude_sampler();
-        out.value = object.source_u64(0);
-        out.rate = object.source_u64(8);
-        out.sample_type = object.source_u32(0x10);
+        // SAFETY: the registration has the copied-sample flag.
+        unsafe {
+            out.value = object.source_u64(0);
+            out.rate = object.source_u64(8);
+            out.sample_type = object.source_u32(0x10);
+        }
         object.allow_sampler();
         return Ok(Evaluation::Sampled);
     }
     if word.flags().contains(RegistrationFlags::HAS_HANDLER) {
-        return object.call_handler(query, out);
+        // SAFETY: the registration has the handler flag.
+        return unsafe { object.call_handler(query, out) };
     }
     if class != query.class() {
         return Err(CounterError::TypeInvalid);
@@ -377,7 +466,8 @@ pub fn query(
         out.value = 0;
         out.rate = count as u64;
         object.exclude_sampler();
-        let result = history_sum(object, count, out);
+        // SAFETY: the caller upholds the same contract; `count` is 1 to 15.
+        let result = unsafe { history_sum(object, count, out) };
         object.allow_sampler();
         return result;
     }
@@ -385,13 +475,18 @@ pub fn query(
         count = 10;
     }
     object.exclude_sampler();
-    let result = history_difference(object, query, count, out);
+    // SAFETY: the caller upholds the same contract; `count` is 1 to 15.
+    let result = unsafe { history_difference(object, query, count, out) };
     object.allow_sampler();
     result
 }
 
 /// Sum of the last `count` values (class 0 history query).
-fn history_sum(
+///
+/// # Safety
+///
+/// As [`sample`].
+unsafe fn history_sum(
     object: &impl CounterObject,
     count: i32,
     out: &mut CounterSample,
@@ -404,7 +499,9 @@ fn history_sum(
         if index < 0 {
             index += HISTORY_LENGTH;
         }
-        out.value = out.value.wrapping_add(value_at(object, index));
+        // SAFETY: by the contract `index` started as a slot from 0 to 10
+        // and wraps to stay in that range.
+        out.value = out.value.wrapping_add(unsafe { value_at(object, index) });
         index -= 1;
     }
     out.sample_type = u32::from(registration(object).counter_type());
@@ -413,7 +510,11 @@ fn history_sum(
 
 /// Value and rate change over the last `count` samples (rate and ratio
 /// history queries).
-fn history_difference(
+///
+/// # Safety
+///
+/// As [`sample`], and `count` must be 1 to 15.
+unsafe fn history_difference(
     object: &impl CounterObject,
     query: CounterQuery,
     count: i32,
@@ -428,14 +529,19 @@ fn history_difference(
     if back < 0 {
         back += HISTORY_LENGTH;
     }
-    out.value = value_at(object, index).wrapping_sub(value_at(object, back));
+    // SAFETY: by the contract `index` is a slot from 0 to 10; with `count`
+    // from 1 to 15, `back` is from -4 to 10.
+    out.value = unsafe { value_at(object, index).wrapping_sub(value_at(object, back)) };
     // A rate class per-frame query, tested with one mask as stock does.
     const PER_FRAME_RATE: u32 = sample_type(CounterClass::RATE, RateUnit::PER_FRAME);
     if query.0 & (CounterClass::MASK | RateUnit::PER_FRAME.bits()) == PER_FRAME_RATE {
         out.sample_type = PER_FRAME_RATE;
-        out.rate = u64::from(frame_at(object, index).wrapping_sub(frame_at(object, back)));
+        // SAFETY: as above.
+        out.rate =
+            u64::from(unsafe { frame_at(object, index).wrapping_sub(frame_at(object, back)) });
     } else {
-        out.rate = u64::from(rate_at(object, index).wrapping_sub(rate_at(object, back)));
+        // SAFETY: as above.
+        out.rate = u64::from(unsafe { rate_at(object, index).wrapping_sub(rate_at(object, back)) });
         out.sample_type = if class == CounterClass::RATE {
             if query.unit().contains(RateUnit::PER_TICK) {
                 sample_type(CounterClass::RATE, RateUnit::PER_TICK)
@@ -487,36 +593,36 @@ mod tests {
     }
 
     impl CounterObject for Image {
-        fn read_u32(&self, offset: i32) -> u32 {
+        unsafe fn read_u32(&self, offset: i32) -> u32 {
             let start = Self::at(offset);
             u32::from_be_bytes(self.bytes[start..start + 4].try_into().unwrap())
         }
-        fn read_u64(&self, offset: i32) -> u64 {
+        unsafe fn read_u64(&self, offset: i32) -> u64 {
             let start = Self::at(offset);
             u64::from_be_bytes(self.bytes[start..start + 8].try_into().unwrap())
         }
-        fn write_u32(&mut self, offset: i32, value: u32) {
+        unsafe fn write_u32(&mut self, offset: i32, value: u32) {
             let start = Self::at(offset);
             self.bytes[start..start + 4].copy_from_slice(&value.to_be_bytes());
         }
-        fn write_u64(&mut self, offset: i32, value: u64) {
+        unsafe fn write_u64(&mut self, offset: i32, value: u64) {
             let start = Self::at(offset);
             self.bytes[start..start + 8].copy_from_slice(&value.to_be_bytes());
         }
-        fn source_u32(&self, offset: u32) -> u32 {
+        unsafe fn source_u32(&self, offset: u32) -> u32 {
             self.source[offset as usize / 4]
         }
-        fn source_u64(&self, _offset: u32) -> u64 {
+        unsafe fn source_u64(&self, _offset: u32) -> u64 {
             unreachable!()
         }
-        fn call_reader(
+        unsafe fn call_reader(
             &mut self,
             _value: &mut u64,
             _rate: Option<&mut u64>,
         ) -> Result<(), CounterError> {
             unreachable!()
         }
-        fn call_handler(
+        unsafe fn call_handler(
             &mut self,
             _query: CounterQuery,
             _out: &mut CounterSample,
@@ -525,6 +631,21 @@ mod tests {
         }
         fn exclude_sampler(&mut self) {}
         fn allow_sampler(&mut self) {}
+    }
+
+    fn query(
+        object: &mut Image,
+        query: CounterQuery,
+        out: &mut CounterSample,
+    ) -> Result<Evaluation, CounterError> {
+        // SAFETY: `Image::new` initializes the object and only `sample`
+        // writes its history index.
+        unsafe { super::query(object, query, out) }
+    }
+
+    fn sample(object: &mut Image, tick_count: u32, frame_number: u32) {
+        // SAFETY: as in `query`.
+        unsafe { super::sample(object, tick_count, frame_number) }
     }
 
     #[test]

@@ -32,6 +32,7 @@ rust_library(
     deps = [
         "//crates/openxbdm-core:openxbdm_core",
         "//crates/openxbdm-server:openxbdm_server",
+        "//third-party/rust:xbox360-sys",
     ],
     doctests = True,
     visibility = [
@@ -58,6 +59,7 @@ rust_test(
         "//crates/openxbdm-core:openxbdm_core",
         "//crates/openxbdm-server:openxbdm_server",
         "//third-party/rust:tokio",
+        "//third-party/rust:xbox360-sys",
     ],
 )
 
@@ -75,6 +77,7 @@ rust_binary(
     deps = [
         "//crates/openxbdm-core:openxbdm_core",
         "//crates/openxbdm-server:openxbdm_server",
+        "//third-party/rust:xbox360-sys",
         ":openxbdm_server_host",
     ],
     visibility = [
@@ -101,6 +104,7 @@ rust_test(
         "//crates/openxbdm-core:openxbdm_core",
         "//crates/openxbdm-server:openxbdm_server",
         "//third-party/rust:tokio",
+        "//third-party/rust:xbox360-sys",
         ":openxbdm_server_host",
     ],
 )
@@ -124,6 +128,7 @@ rust_test(
         "//crates/openxbdm-core:openxbdm_core",
         "//crates/openxbdm-server:openxbdm_server",
         "//third-party/rust:tokio",
+        "//third-party/rust:xbox360-sys",
         ":openxbdm_server_host",
     ],
 )
@@ -147,6 +152,7 @@ rust_test(
         "//crates/openxbdm-core:openxbdm_core",
         "//crates/openxbdm-server:openxbdm_server",
         "//third-party/rust:tokio",
+        "//third-party/rust:xbox360-sys",
         ":openxbdm_server_host",
     ],
 )
@@ -170,6 +176,7 @@ rust_test(
         "//crates/openxbdm-core:openxbdm_core",
         "//crates/openxbdm-server:openxbdm_server",
         "//third-party/rust:tokio",
+        "//third-party/rust:xbox360-sys",
         ":openxbdm_server_host",
     ],
 )
@@ -193,6 +200,7 @@ rust_test(
         "//crates/openxbdm-core:openxbdm_core",
         "//crates/openxbdm-server:openxbdm_server",
         "//third-party/rust:tokio",
+        "//third-party/rust:xbox360-sys",
         ":openxbdm_server_host",
     ],
 )
@@ -216,6 +224,7 @@ rust_test(
         "//crates/openxbdm-core:openxbdm_core",
         "//crates/openxbdm-server:openxbdm_server",
         "//third-party/rust:tokio",
+        "//third-party/rust:xbox360-sys",
         ":openxbdm_server_host",
     ],
 )
@@ -239,6 +248,7 @@ rust_test(
         "//crates/openxbdm-core:openxbdm_core",
         "//crates/openxbdm-server:openxbdm_server",
         "//third-party/rust:tokio",
+        "//third-party/rust:xbox360-sys",
         ":openxbdm_server_host",
     ],
 )
@@ -262,6 +272,7 @@ rust_test(
         "//crates/openxbdm-core:openxbdm_core",
         "//crates/openxbdm-server:openxbdm_server",
         "//third-party/rust:tokio",
+        "//third-party/rust:xbox360-sys",
         ":openxbdm_server_host",
     ],
 )
@@ -285,6 +296,7 @@ rust_test(
         "//crates/openxbdm-core:openxbdm_core",
         "//crates/openxbdm-server:openxbdm_server",
         "//third-party/rust:tokio",
+        "//third-party/rust:xbox360-sys",
         ":openxbdm_server_host",
     ],
 )
@@ -308,6 +320,7 @@ rust_test(
         "//crates/openxbdm-core:openxbdm_core",
         "//crates/openxbdm-server:openxbdm_server",
         "//third-party/rust:tokio",
+        "//third-party/rust:xbox360-sys",
         ":openxbdm_server_host",
     ],
 )
@@ -331,6 +344,7 @@ rust_test(
         "//crates/openxbdm-core:openxbdm_core",
         "//crates/openxbdm-server:openxbdm_server",
         "//third-party/rust:tokio",
+        "//third-party/rust:xbox360-sys",
         ":openxbdm_server_host",
     ],
 )
@@ -354,6 +368,7 @@ rust_test(
         "//crates/openxbdm-core:openxbdm_core",
         "//crates/openxbdm-server:openxbdm_server",
         "//third-party/rust:tokio",
+        "//third-party/rust:xbox360-sys",
         ":openxbdm_server_host",
     ],
 )
@@ -377,6 +392,7 @@ rust_test(
         "//crates/openxbdm-core:openxbdm_core",
         "//crates/openxbdm-server:openxbdm_server",
         "//third-party/rust:tokio",
+        "//third-party/rust:xbox360-sys",
         ":openxbdm_server_host",
     ],
 )
@@ -400,6 +416,7 @@ rust_test(
         "//crates/openxbdm-core:openxbdm_core",
         "//crates/openxbdm-server:openxbdm_server",
         "//third-party/rust:tokio",
+        "//third-party/rust:xbox360-sys",
         ":openxbdm_server_host",
     ],
 )
@@ -423,6 +440,7 @@ rust_test(
         "//crates/openxbdm-core:openxbdm_core",
         "//crates/openxbdm-server:openxbdm_server",
         "//third-party/rust:tokio",
+        "//third-party/rust:xbox360-sys",
         ":openxbdm_server_host",
     ],
 )

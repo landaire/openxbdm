@@ -18,10 +18,10 @@ use openxbdm_client::commands::GetFileAttributes;
 use openxbdm_client::commands::GetFileRange;
 use openxbdm_client::commands::MakeDirectory;
 use openxbdm_client::commands::Rename;
-use openxbdm_server::commands::filesystem::FileAttributes;
 use openxbdm_server::notify::ExecutionState;
 use openxbdm_server_host::backend::filesystem::HARDDISK;
 use openxbdm_server_host::backend::memory::MEMORY_BASE;
+use xbox360_sys::xboxkrnl::FileAttributes;
 
 const DEVKIT: &str = "\\Device\\Harddisk0\\Partition1\\DEVKIT";
 
@@ -385,7 +385,7 @@ fn dirlist_lines_follow_the_stock_format() {
         host.backend.filesystem.write(&devkit("sub\\x"), b"12345");
         host.backend
             .filesystem
-            .set_attributes(&devkit("sub\\x"), FileAttributes(0x3));
+            .set_attributes(&devkit("sub\\x"), FileAttributes::from_bits_retain(0x3));
     }
     let mut session = session(&server);
     assert_eq!(
@@ -619,7 +619,7 @@ fn setfileattributes_changes_flags_and_times() {
             .entry(&devkit("a"))
             .unwrap()
             .attributes,
-        FileAttributes::NONE
+        FileAttributes::empty()
     );
 }
 
@@ -692,19 +692,19 @@ fn sendvfile_reports_one_result_per_file() {
 fn end_of_file_beyond_the_volume_is_disk_full() {
     use openxbdm_core::status::KernelError;
     use openxbdm_server::commands::filesystem::Backend as _;
-    use openxbdm_server::commands::filesystem::CreateOptions;
     use openxbdm_server::commands::filesystem::CreateRequest;
-    use openxbdm_server::commands::filesystem::FileAccess;
-    use openxbdm_server::commands::filesystem::ShareAccess;
+    use xbox360_sys::xboxkrnl::AccessMask;
+    use xbox360_sys::xboxkrnl::CreateOptions;
+    use xbox360_sys::xboxkrnl::ShareAccess;
 
     let server = TestServer::start();
     let mut host = server.host.lock();
     host.backend.filesystem.write(&devkit("other"), b"data");
     host.backend.filesystem.write(&devkit("huge"), b"");
     let request = CreateRequest::open(
-        FileAccess::GENERIC_WRITE,
-        ShareAccess::NONE,
-        CreateOptions::NONE,
+        AccessMask::GENERIC_WRITE,
+        ShareAccess::empty(),
+        CreateOptions::empty(),
     );
     let handle = host
         .backend

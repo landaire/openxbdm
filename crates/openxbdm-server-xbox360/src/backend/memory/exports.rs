@@ -1232,9 +1232,7 @@ extern "C" fn get_title_workspace_size(mut size: *mut u32) -> Hresult {
             if console::console_memory(console) != ConsoleMemory::ExtraMemoryInUse {
                 return Hresult::OK.0;
             }
-            match console
-                .title_xex_dword(memory::XexFieldKey(XexHeaderKey::ADDITIONAL_TITLE_MEMORY.0))
-            {
+            match console.title_additional_memory() {
                 Ok(Some(value)) => {
                     // SAFETY: the caller's size dword, as at entry.
                     unsafe { size.write_unaligned(value) };

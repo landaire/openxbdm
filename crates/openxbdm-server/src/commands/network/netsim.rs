@@ -2,6 +2,8 @@
 //! pass through ordered inbound and outbound queues that delay, limit, or
 //! drop them, and IPv4 redirects rewrite their addresses. The configuration
 //! is kept in a file of `netsim` lines that `reload` executes.
+// Pool blocks are freed through the unsafe `Backend::free_pool`.
+#![allow(unsafe_code)]
 
 pub mod api;
 pub mod classifier;
@@ -27,23 +29,23 @@ use super::decode_hex;
 use crate::backend::Backend as AnyBackend;
 use crate::commands::console;
 use crate::commands::console::TraceMask;
-use crate::commands::filesystem::CreateDisposition;
-use crate::commands::filesystem::CreateOptions;
 use crate::commands::filesystem::CreateRequest;
-use crate::commands::filesystem::FileAccess;
-use crate::commands::filesystem::FileAttributes;
 use crate::commands::filesystem::FileData;
 use crate::commands::filesystem::FileHandle;
 use crate::commands::filesystem::PoolBuffer;
 use crate::commands::filesystem::PoolRange;
 use crate::commands::filesystem::ReadTarget;
-use crate::commands::filesystem::ShareAccess;
 use crate::invocation::Invocation;
 use crate::reply::CommandError;
 use crate::reply::CommandResult;
 use crate::reply::Reply;
 use crate::text::HEX_UPPER;
 use crate::text::ResponseText;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::FileAttributes;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
 /// First system version with the simulator.
 const NETSIM_VERSION: SystemVersion = SystemVersion(0x2027_8700);
@@ -1331,10 +1333,10 @@ fn run_reload(invocation: &mut Invocation<'_>, name: &[u8]) -> CommandResult {
     }
     let file = &invocation.state.network.netsim.file;
     let request = CreateRequest {
-        access: FileAccess::GENERIC_READ,
+        access: AccessMask::GENERIC_READ,
         allocation_size: None,
-        attributes: FileAttributes::NONE,
-        share: ShareAccess::NONE,
+        attributes: FileAttributes::empty(),
+        share: ShareAccess::empty(),
         disposition: CreateDisposition::Open,
         options: CreateOptions::SYNCHRONOUS_IO_NONALERT,
     };
@@ -1350,7 +1352,8 @@ fn run_reload(invocation: &mut Invocation<'_>, name: &[u8]) -> CommandResult {
     let result = match invocation.backend.allocate_pool(FILE_BUFFER_SIZE as u32) {
         Some(buffer) => {
             let failed = execute_file(invocation, handle, buffer);
-            invocation.backend.free_pool(buffer);
+            // SAFETY: the block is local to this command and not used after.
+            unsafe { invocation.backend.free_pool(buffer) };
             // Stock rewrites before closing the reader, whose handle shares
             // nothing.
             if failed {
@@ -1570,10 +1573,10 @@ fn write_file(name: &[u8], backend: &mut dyn AnyBackend) {
     };
     backend.pool(buffer).fill(0);
     let request = CreateRequest {
-        access: FileAccess::GENERIC_WRITE,
+        access: AccessMask::GENERIC_WRITE,
         allocation_size: None,
-        attributes: FileAttributes::NONE,
-        share: ShareAccess::NONE,
+        attributes: FileAttributes::empty(),
+        share: ShareAccess::empty(),
         disposition: CreateDisposition::OverwriteIf,
         options: CreateOptions::SYNCHRONOUS_IO_NONALERT,
     };
@@ -1587,7 +1590,8 @@ fn write_file(name: &[u8], backend: &mut dyn AnyBackend) {
                     NtStatus::from(error).0
                 ),
             );
-            backend.free_pool(buffer);
+            // SAFETY: the block is local to this command and not used after.
+            unsafe { backend.free_pool(buffer) };
             return;
         }
     };
@@ -1636,7 +1640,8 @@ fn write_file(name: &[u8], backend: &mut dyn AnyBackend) {
         backend,
         format_args!("XBDM: NetSimWriteIniFile - Done writing ini file.\n"),
     );
-    backend.free_pool(buffer);
+    // SAFETY: the block is local to this command and not used after.
+    unsafe { backend.free_pool(buffer) };
 }
 
 #[cfg(test)]

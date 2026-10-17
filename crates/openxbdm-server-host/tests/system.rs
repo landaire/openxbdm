@@ -36,6 +36,7 @@ use openxbdm_server::notify::ExecutionState;
 use openxbdm_server::reply::CommandError;
 use openxbdm_server::reply::Reply;
 use openxbdm_server_host::Host;
+use xbox360_sys::xboxkrnl::HardwareFlags;
 
 const GAME: &str = "\\Device\\Harddisk0\\Partition1\\DEVKIT\\game.xex";
 
@@ -497,7 +498,7 @@ fn flash_receives_the_image_for_this_hardware() {
     assert_eq!(session.line(), "400- Flash failed with HRESULT 0x8007000b");
     server.host.lock().backend.system.flash_memory = 0;
     assert_eq!(session.command("flash size_t=1"), "400- Not enough memory");
-    server.host.lock().backend.system.hardware_flags = 0x7000_0003;
+    server.host.lock().backend.system.hardware_flags = HardwareFlags::from_bits_retain(0x7000_0003);
     assert_eq!(
         session.command("flash size_t=1"),
         "400- unsupported hardware type, requires (null)"

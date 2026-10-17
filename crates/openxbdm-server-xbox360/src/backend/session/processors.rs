@@ -154,7 +154,9 @@ extern "C" fn register_processor_ex(name: u32, handler: u32, dedicated: u32) -> 
     if dedicated != 0 {
         flags = flags.union(ProcessorFlags::DEDICATED_THREAD);
     }
-    let handler = (handler != 0).then_some(ProcessorHandle(handler));
+    // SAFETY: export callers pass 0 or a processor function that stays
+    // loaded while registered and while its calls run, the stock contract.
+    let handler = (handler != 0).then(|| unsafe { ProcessorHandle::from_raw(handler) });
     crate::exports::export_result(
         REGISTRY.with(|processors| processors.register(name, handler, flags)),
     )
@@ -162,7 +164,12 @@ extern "C" fn register_processor_ex(name: u32, handler: u32, dedicated: u32) -> 
 
 /// Monitor control code 0x1c (stock 0x91f3b6c0): register the `PIX`
 /// processor through export 30.
-pub(crate) fn service_register_pix_processor(handler: u32) -> u32 {
+///
+/// # Safety
+///
+/// `handler` must be 0 or a processor function that stays loaded while
+/// registered and while its calls run.
+pub(crate) unsafe fn service_register_pix_processor(handler: u32) -> u32 {
     register_processor(c"PIX".as_ptr() as usize as u32, handler).0
 }
 
@@ -179,7 +186,9 @@ struct ProcessorRegistration {
 /// # Safety
 ///
 /// `argument` must be the address of a [`ProcessorRegistration`] whose
-/// name is 0 or a NUL-terminated string, unchanged for the call.
+/// name is 0 or a NUL-terminated string and whose handler is 0 or a
+/// processor function that stays loaded while registered and while its
+/// calls run, unchanged for the call.
 pub(crate) unsafe fn service_register_processor(argument: u32) -> u32 {
     // SAFETY: the caller's contract.
     let registration = unsafe { kernel::object_at::<ProcessorRegistration>(argument) };
@@ -1161,7 +1170,7 @@ impl ProcessorBackend for Console {
         match self
             .session
             .processors
-            .start(index, call.thread, call.handle.0, arguments)
+            .start(index, call.thread, call.handle.raw(), arguments)
         {
             Started::Finished(result) => ProcessorProgress::Complete(self.finish_handler(
                 call,

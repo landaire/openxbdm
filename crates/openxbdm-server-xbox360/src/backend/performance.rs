@@ -329,10 +329,9 @@ impl performance::Backend for Console {
         }
     }
 
-    fn read_framebuffer_page(&mut self, address: u32, page: &mut [u8]) {
-        // SAFETY: the server passes a tile of the front buffer that
-        // `capture_display` reported, which stays mapped while the display
-        // controller scans it out.
+    unsafe fn read_framebuffer_page(&mut self, address: u32, page: &mut [u8; TILE_SIZE as usize]) {
+        // SAFETY: the caller passes a tile of the front buffer the display
+        // controller scans out.
         unsafe { xboxkrnl::KeFlushCacheRange(address, TILE_SIZE) };
         // SAFETY: as above.
         let source = unsafe {
@@ -504,8 +503,9 @@ impl performance::Backend for Console {
         profiler::info()
     }
 
-    fn pix_post(&mut self, code: u32, payload: &[u32]) -> bool {
-        pix::backend::post(code, payload)
+    unsafe fn pix_post(&mut self, code: u32, payload: &[u32]) -> bool {
+        // SAFETY: the caller upholds the same contract.
+        unsafe { pix::backend::post(code, payload) }
     }
 
     fn pix_status(&mut self, version: u32, flags: u32) -> Option<[u32; 12]> {

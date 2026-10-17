@@ -20,13 +20,8 @@ use core::time::Duration;
 
 use openxbdm_core::status::NtStatus;
 use openxbdm_server::Server;
-use openxbdm_server::commands::filesystem::CreateDisposition;
-use openxbdm_server::commands::filesystem::CreateOptions;
 use openxbdm_server::commands::filesystem::CreateRequest;
-use openxbdm_server::commands::filesystem::FileAccess;
-use openxbdm_server::commands::filesystem::FileAttributes;
 use openxbdm_server::commands::filesystem::ObjectPath;
-use openxbdm_server::commands::filesystem::ShareAccess;
 use openxbdm_server::commands::memory::PAGE_SIZE;
 use openxbdm_server::commands::performance::CpuProfilerInfo;
 use openxbdm_server::commands::performance::profiler;
@@ -50,8 +45,12 @@ use xbox360_sys::processor::Kpcr;
 use xbox360_sys::status::Win32ErrorCode;
 use xbox360_sys::xam::GetCurrentThreadId;
 use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::AccessMask;
 use xbox360_sys::xboxkrnl::AllocationType;
 use xbox360_sys::xboxkrnl::Boolean8;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::FileAttributes;
 use xbox360_sys::xboxkrnl::Handle;
 use xbox360_sys::xboxkrnl::InterlockedFlushSList;
 use xbox360_sys::xboxkrnl::InterlockedPopEntrySList;
@@ -64,6 +63,7 @@ use xbox360_sys::xboxkrnl::MmStatistics;
 use xbox360_sys::xboxkrnl::PageProtection;
 use xbox360_sys::xboxkrnl::ProcessorMode;
 use xbox360_sys::xboxkrnl::RtlImageDirectoryEntryToData;
+use xbox360_sys::xboxkrnl::ShareAccess;
 use xbox360_sys::xboxkrnl::ThreadCreationFlags;
 use xbox360_sys::xboxkrnl::WaitReason;
 
@@ -1322,7 +1322,7 @@ extern "C" fn writer_thread(_context: u32) -> u32 {
     // SAFETY: see `WriterPaths`.
     let paths = unsafe { &*WRITER_PATHS.0.get() };
     let request = CreateRequest {
-        access: FileAccess::GENERIC_WRITE.union(FileAccess::SYNCHRONIZE),
+        access: AccessMask::GENERIC_WRITE.union(AccessMask::SYNCHRONIZE),
         allocation_size: None,
         attributes: FileAttributes::NORMAL,
         share: ShareAccess::READ,
@@ -1518,14 +1518,14 @@ impl profiler::Engine for Sampler {
     /// Stock 0x91f64448.
     fn create_directories(&mut self, path: &[u8]) {
         let request = CreateRequest {
-            access: FileAccess::SYNCHRONIZE.union(FileAccess::LIST_DIRECTORY),
+            access: AccessMask::SYNCHRONIZE.union(AccessMask::LIST_DIRECTORY),
             allocation_size: None,
             attributes: FileAttributes::NORMAL,
-            share: ShareAccess::READ_WRITE,
+            share: ShareAccess::READ.union(ShareAccess::WRITE),
             disposition: CreateDisposition::Create,
             options: CreateOptions::DIRECTORY_FILE
                 .union(CreateOptions::SYNCHRONOUS_IO_NONALERT)
-                .union(CreateOptions::OPEN_FOR_BACKUP),
+                .union(CreateOptions::OPEN_FOR_BACKUP_INTENT),
         };
         for (index, _) in path
             .iter()

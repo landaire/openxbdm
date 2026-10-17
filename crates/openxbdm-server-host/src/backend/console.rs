@@ -35,6 +35,7 @@ use openxbdm_server::commands::console::SETTINGS_BLOCK_SIZE;
 use openxbdm_server::commands::console::SystemInformation;
 use openxbdm_server::commands::console::SystemSettings;
 use openxbdm_server::commands::console::Version;
+use xbox360_sys::xboxkrnl::HardwareFlags;
 
 use super::MockBackend;
 
@@ -155,7 +156,7 @@ impl Default for PublishedState {
             dump_settings: state.dump_settings.to_block().to_vec(),
             event_defer: state.event_defer.bits(),
             trace_mask: state.trace_mask.bits(),
-            registration: state.http_registration.result(),
+            registration: console::RegistrationResult::EMPTY,
         }
     }
 }
@@ -164,12 +165,24 @@ impl Default for PublishedState {
 /// over TCP on a worker thread, so the server polls it like the console's
 /// asynchronous client. The request carries the user agent and the host;
 /// the further headers of the console's HTTP stack are not known.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct HttpClient {
     /// Result of the request in progress, delivered by its worker.
     pending: Option<Receiver<Result<Vec<u8>, HttpFailure>>>,
+    /// Body of the last completed request.
+    pub body: [u8; REGISTRATION_RESPONSE_CAPACITY],
     /// Times the client was released.
     pub closes: u32,
+}
+
+impl Default for HttpClient {
+    fn default() -> Self {
+        Self {
+            pending: None,
+            body: [0; REGISTRATION_RESPONSE_CAPACITY],
+            closes: 0,
+        }
+    }
 }
 
 /// Header lookup error of the console HTTP stack (header not found).
@@ -306,7 +319,7 @@ impl Default for Mock {
             system_information: SystemInformation {
                 base_kernel: Version([2, 0, 1888, 0]),
                 kernel: Version([2, 0, 17559, 0]),
-                hardware_flags: 0x5001_0023,
+                hardware_flags: HardwareFlags::from_bits_retain(0x5001_0023),
             },
             console_id: Ok(ConsoleId(*b"012345678901")),
             debug_address: NetworkAddress {
@@ -464,7 +477,7 @@ impl console::Backend for MockBackend {
         Ok(())
     }
 
-    fn http_poll(&mut self, body: &mut [u8; REGISTRATION_RESPONSE_CAPACITY]) -> HttpProgress {
+    fn http_poll(&mut self) -> HttpProgress {
         let Some(receiver) = &self.console.http.pending else {
             return HttpProgress::Failed(HttpFailure::Work { error: None });
         };
@@ -475,6 +488,7 @@ impl console::Backend for MockBackend {
             }
             Ok(Err(failure)) => HttpProgress::Failed(failure),
             Ok(Ok(content)) => {
+                let body = &mut self.console.http.body;
                 body.fill(0);
                 body[..content.len()].copy_from_slice(&content);
                 HttpProgress::Complete(content.len())
@@ -488,6 +502,7 @@ impl console::Backend for MockBackend {
     }
 
     fn publish(&mut self, value: Published<'_>) {
+        let body = &self.console.http.body;
         let published = &mut self.console.published;
         match value {
             Published::DebugName(name) => published.name = name.as_bytes().to_vec(),
@@ -497,7 +512,9 @@ impl console::Backend for MockBackend {
             }
             Published::EventDefer(mask) => published.event_defer = mask.bits(),
             Published::TraceMask(mask) => published.trace_mask = mask.bits(),
-            Published::Registration(registration) => published.registration = registration.result(),
+            Published::Registration(registration) => {
+                published.registration = console::RegistrationResult::new(registration, body)
+            }
         }
     }
 

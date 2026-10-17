@@ -14,7 +14,6 @@ use super::events;
 use crate::backend::Backend as AnyBackend;
 use crate::commands::console::ConfigSetting;
 use crate::commands::console::ConsoleConfigFlags;
-use crate::commands::system::hardware_flags;
 use crate::invocation::Invocation;
 use crate::reply::CommandError;
 use crate::reply::CommandResult;
@@ -36,7 +35,7 @@ const EXTENSION_PATH_LIMIT: usize = 0x6b;
 pub const EXTENSION_NAME_CAPACITY: usize = 0x3f;
 
 /// The loaded debugger extension.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Extension {
     pub name: Text<EXTENSION_NAME_CAPACITY>,
     pub handle: ExtensionHandle,
@@ -64,7 +63,10 @@ pub(super) fn kernel_debugger(invocation: &mut Invocation<'_>) -> CommandResult 
     let except = if line.has("except") {
         true
     } else if line.has("exceptif") {
-        hardware_flags(invocation.backend).contains(HardwareFlags::KERNEL_DEBUGGER_ENABLED)
+        invocation
+            .backend
+            .hardware_flags()
+            .contains(HardwareFlags::KERNEL_DEBUGGER_ENABLED)
     } else {
         return improper(invocation);
     };
@@ -78,7 +80,11 @@ pub(super) fn kernel_debugger(invocation: &mut Invocation<'_>) -> CommandResult 
 /// `kdlite enable|disable`.
 pub(super) fn kernel_debugger_lite(invocation: &mut Invocation<'_>) -> CommandResult {
     // Kd lite exists only on test kits.
-    if !hardware_flags(invocation.backend).contains(HardwareFlags::TEST_KIT) {
+    if !invocation
+        .backend
+        .hardware_flags()
+        .contains(HardwareFlags::TEST_KIT)
+    {
         return improper(invocation);
     }
     let enable = if invocation.line.has("enable") {
@@ -451,18 +457,18 @@ impl From<ExtensionError> for CommandError {
 
 /// Load the extension `name` from the DMEXT directory, or count another
 /// reference to the loaded one (stock export 178, 0x91f2e5e0). Only one
-/// extension can be loaded.
+/// extension can be loaded. Returns its module handle.
 pub fn load_extension(
     state: &mut ServerState,
     backend: &mut dyn AnyBackend,
     name: &[u8],
-) -> Result<ExtensionHandle, ExtensionError> {
+) -> Result<u32, ExtensionError> {
     if let Some(extension) = state.debugger.extension.as_mut() {
         if !extension.name.as_bytes().eq_ignore_ascii_case(name) {
             return Err(ExtensionError::OtherLoaded);
         }
         extension.references += 1;
-        return Ok(extension.handle);
+        return Ok(extension.handle.raw());
     }
     let mut path = Text::<EXTENSION_PATH_LIMIT>::new();
     let _ = path.push_bytes(EXTENSION_DIRECTORY);
@@ -470,6 +476,7 @@ pub fn load_extension(
     let handle = backend
         .load_extension(path.as_bytes())
         .map_err(ExtensionError::Kernel)?;
+    let module = handle.raw();
     let mut stored = Text::new();
     stored.set_bytes(name);
     state.debugger.extension = Some(Extension {
@@ -477,21 +484,21 @@ pub fn load_extension(
         handle,
         references: 1,
     });
-    Ok(handle)
+    Ok(module)
 }
 
-/// Drop a reference to the loaded extension, unloading it with the last
-/// (stock export 179, 0x91f2e6e0).
+/// Drop a reference to the loaded extension with module handle `module`,
+/// unloading it with the last (stock export 179, 0x91f2e6e0).
 pub fn release_extension(
     state: &mut ServerState,
     backend: &mut dyn AnyBackend,
-    handle: ExtensionHandle,
+    module: u32,
 ) -> Result<(), ExtensionError> {
     let Some(extension) = state
         .debugger
         .extension
         .as_mut()
-        .filter(|extension| extension.handle == handle)
+        .filter(|extension| extension.handle.raw() == module)
     else {
         return Err(ExtensionError::UnknownHandle);
     };
@@ -499,9 +506,11 @@ pub fn release_extension(
     if extension.references != 0 {
         return Ok(());
     }
-    state.debugger.extension = None;
+    let Some(extension) = state.debugger.extension.take() else {
+        return Ok(());
+    };
     backend
-        .unload_extension(handle)
+        .unload_extension(extension.handle)
         .map_err(ExtensionError::Kernel)
 }
 
@@ -513,11 +522,7 @@ pub(super) fn debugger_extension(invocation: &mut Invocation<'_>) -> CommandResu
             invocation.set_text(format_args!("missing module"));
             return Err(ErrorCode::BadParameter.into());
         };
-        release_extension(
-            invocation.state,
-            invocation.backend,
-            ExtensionHandle(module),
-        )?;
+        release_extension(invocation.state, invocation.backend, module)?;
         return Ok(Reply::Ok);
     }
     let Some(value) = line.param("name") else {
@@ -526,8 +531,8 @@ pub(super) fn debugger_extension(invocation: &mut Invocation<'_>) -> CommandResu
     };
     let mut buffer = [0u8; EXTENSION_NAME_CAPACITY + 1];
     let name = value.copy_into(&mut buffer);
-    let handle = load_extension(invocation.state, invocation.backend, name)?;
-    invocation.set_text(format_args!("module=0x{:08x}", handle.0));
+    let module = load_extension(invocation.state, invocation.backend, name)?;
+    invocation.set_text(format_args!("module=0x{:08x}", module));
     Ok(Reply::Ok)
 }
 

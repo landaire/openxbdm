@@ -1026,14 +1026,15 @@ struct SocketStream {
 }
 
 impl Stream for SocketStream {
-    fn send(&mut self, data: Outgoing<'_>) -> Option<u32> {
+    unsafe fn send(&mut self, data: Outgoing<'_>) -> Option<u32> {
         let (pointer, length) = match data {
             Outgoing::Local(bytes) => (bytes.as_ptr(), bytes.len() as i32),
             Outgoing::Caller(buffer) => {
                 (buffer.address as usize as *const u8, buffer.length as i32)
             }
         };
-        // SAFETY: `pointer` addresses `length` readable bytes of the request.
+        // SAFETY: `pointer` addresses `length` readable bytes: a local slice
+        // or caller memory under the trait contract.
         let sent = unsafe {
             xam::NetDll_send(
                 XnCaller::DebugMonitor,
@@ -1046,12 +1047,13 @@ impl Stream for SocketStream {
         u32::try_from(sent).ok()
     }
 
-    fn receive(&mut self, into: Incoming<'_>) -> Option<u32> {
+    unsafe fn receive(&mut self, into: Incoming<'_>) -> Option<u32> {
         let (pointer, length) = match into {
             Incoming::Local(bytes) => (bytes.as_mut_ptr(), bytes.len() as i32),
             Incoming::Caller(buffer) => (buffer.address as usize as *mut u8, buffer.length as i32),
         };
-        // SAFETY: `pointer` addresses `length` writable bytes of the request.
+        // SAFETY: `pointer` addresses `length` writable bytes: a local slice
+        // or caller memory under the trait contract.
         let received = unsafe {
             xam::NetDll_recv(
                 XnCaller::DebugMonitor,
@@ -1068,10 +1070,8 @@ impl Stream for SocketStream {
         xam::NetDll_WSAGetLastError(XnCaller::DebugMonitor).error() == Some(Win32Error::WOULD_BLOCK)
     }
 
-    fn read_length(&mut self, address: u32) -> u32 {
-        // SAFETY: the engine passes the start of a caller receive buffer that
-        // holds a received length word; the studio service keeps the buffer
-        // live until its request completes.
+    unsafe fn read_length(&mut self, address: u32) -> u32 {
+        // SAFETY: the caller passes 4 readable bytes, of any alignment.
         unsafe { (address as usize as *const u32).read_unaligned() }
     }
 
@@ -1224,15 +1224,21 @@ fn socket_queue(
         object.bind_event(request.event());
         request.result.store(object.handle(slot), Ordering::Relaxed);
         let mut stream = object.stream();
-        object.engine.submit(
-            slot,
-            direction,
-            CallerBuffer {
-                address: buffer,
-                length,
-            },
-            &mut stream,
-        );
+        // SAFETY: the studio service queues a buffer that it keeps until it
+        // reads the request's result or the transport is cancelled, both
+        // after the request finishes. Its receive buffers hold at least the
+        // 4-byte length prefix, the precondition stock asserts.
+        unsafe {
+            object.engine.submit(
+                slot,
+                direction,
+                CallerBuffer {
+                    address: buffer,
+                    length,
+                },
+                &mut stream,
+            )
+        };
     });
     // SAFETY: entered above; `object` is not used afterwards.
     unsafe { leave(this) };

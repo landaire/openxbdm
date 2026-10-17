@@ -7,14 +7,10 @@ use openxbdm_core::status::Win32Error;
 use openxbdm_server::Platform;
 use openxbdm_server::commands::filesystem;
 use openxbdm_server::commands::filesystem::BasicInformation;
-use openxbdm_server::commands::filesystem::CreateDisposition;
-use openxbdm_server::commands::filesystem::CreateOptions;
 use openxbdm_server::commands::filesystem::CreateRequest;
 use openxbdm_server::commands::filesystem::DeviceObject;
 use openxbdm_server::commands::filesystem::DirectoryEntry;
 use openxbdm_server::commands::filesystem::DvdTrace;
-use openxbdm_server::commands::filesystem::FileAccess;
-use openxbdm_server::commands::filesystem::FileAttributes;
 use openxbdm_server::commands::filesystem::FileData;
 use openxbdm_server::commands::filesystem::FileHandle;
 use openxbdm_server::commands::filesystem::FileInformation;
@@ -23,12 +19,18 @@ use openxbdm_server::commands::filesystem::ObjectDirectory;
 use openxbdm_server::commands::filesystem::PoolBuffer;
 use openxbdm_server::commands::filesystem::PoolRange;
 use openxbdm_server::commands::filesystem::ReadTarget;
-use openxbdm_server::commands::filesystem::ShareAccess;
+use openxbdm_server::commands::filesystem::ScratchBlock;
 use openxbdm_server::commands::filesystem::TransferDirection;
 use openxbdm_server::commands::filesystem::VolumeSize;
 
 use super::MockBackend;
 use super::POOL_LIMIT;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::FileAttributes;
+use xbox360_sys::xboxkrnl::FileSystemAttributes;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
 /// The development partition holding `E:` and `DEVKIT:`.
 pub const PARTITION1: &str = "\\Device\\Harddisk0\\Partition1";
@@ -46,18 +48,18 @@ pub const HARDDISK: &str = "\\Device\\Harddisk0\\Partition0";
 /// FATX names are at most 42 characters.
 const MAX_NAME: usize = 42;
 /// Rights that permit reading file data.
-const READ_ACCESS: FileAccess = FileAccess(
-    FileAccess::READ_DATA.0
-        | FileAccess::MAXIMUM_ALLOWED.0
-        | FileAccess::GENERIC_ALL.0
-        | FileAccess::GENERIC_READ.0,
+const READ_ACCESS: AccessMask = AccessMask::from_bits_retain(
+    AccessMask::READ_DATA.bits()
+        | AccessMask::MAXIMUM_ALLOWED.bits()
+        | AccessMask::GENERIC_ALL.bits()
+        | AccessMask::GENERIC_READ.bits(),
 );
 /// Rights that permit writing file data.
-const WRITE_ACCESS: FileAccess = FileAccess(
-    FileAccess::WRITE_DATA.0
-        | FileAccess::APPEND_DATA.0
-        | FileAccess::GENERIC_ALL.0
-        | FileAccess::GENERIC_WRITE.0,
+const WRITE_ACCESS: AccessMask = AccessMask::from_bits_retain(
+    AccessMask::WRITE_DATA.bits()
+        | AccessMask::APPEND_DATA.bits()
+        | AccessMask::GENERIC_ALL.bits()
+        | AccessMask::GENERIC_WRITE.bits(),
 );
 const CLUSTER: u64 = 0x4000;
 const DVD_TRACE_SIZE: u32 = 0x20_0000;
@@ -112,7 +114,7 @@ struct OpenFile {
     volume: usize,
     /// `None` for the volume root.
     path: Option<Vec<u8>>,
-    access: FileAccess,
+    access: AccessMask,
     position: u64,
     delete_pending: bool,
     cursor: usize,
@@ -360,7 +362,7 @@ impl Mock {
                 path,
                 directory: false,
                 data: data.to_vec(),
-                attributes: FileAttributes::NONE,
+                attributes: FileAttributes::empty(),
                 creation_time: FileTime(0),
                 last_access_time: FileTime(0),
                 last_write_time: FileTime(0),
@@ -403,7 +405,7 @@ impl Mock {
         };
         let word = (blocks << 25) | ((lba & 0xff_ffff) << 1) | u32::from(valid);
         let start = *length as usize;
-        let pool = self.pools.get_mut(&buffer.0).expect("trace buffer");
+        let pool = self.pools.get_mut(&buffer.raw()).expect("trace buffer");
         pool[start..start + 8].copy_from_slice(&time.to_be_bytes());
         pool[start + 8..start + 12].copy_from_slice(&word.to_be_bytes());
         pool[start + 12..start + 16].copy_from_slice(&elapsed.to_be_bytes());
@@ -434,7 +436,7 @@ impl Mock {
     fn pool_slice(&mut self, range: PoolRange) -> &mut [u8] {
         let pool = self
             .pools
-            .get_mut(&range.buffer.0)
+            .get_mut(&range.buffer.raw())
             .expect("allocated pool block");
         &mut pool[range.offset as usize..(range.offset + range.length) as usize]
     }
@@ -526,9 +528,9 @@ impl filesystem::Backend for MockBackend {
                     return Err(KernelError::ObjectNameNotFound);
                 }
                 let directory = request.options.contains(CreateOptions::DIRECTORY_FILE);
-                let mut attributes = request.attributes.0 & !FileAttributes::NORMAL.0;
+                let mut attributes = request.attributes.bits() & !FileAttributes::NORMAL.bits();
                 if directory {
-                    attributes |= FileAttributes::DIRECTORY.0;
+                    attributes |= FileAttributes::DIRECTORY.bits();
                 }
                 if let Some(size) = request.allocation_size {
                     let free = disk.total_units.saturating_sub(disk.used_units()) * CLUSTER;
@@ -542,7 +544,7 @@ impl filesystem::Backend for MockBackend {
                     path: stored.clone(),
                     directory,
                     data: Vec::new(),
-                    attributes: FileAttributes(attributes),
+                    attributes: FileAttributes::from_bits_retain(attributes),
                     creation_time: now,
                     last_access_time: now,
                     last_write_time: now,
@@ -566,7 +568,7 @@ impl filesystem::Backend for MockBackend {
         &mut self,
         root: ObjectDirectory,
         name: &[u8],
-        access: FileAccess,
+        access: AccessMask,
         share: ShareAccess,
         options: CreateOptions,
     ) -> Result<FileHandle, KernelError> {
@@ -735,10 +737,12 @@ impl filesystem::Backend for MockBackend {
                 *target = value;
             }
         }
-        if information.attributes.0 != 0 {
-            let kept = entry.attributes.0 & FileAttributes::DIRECTORY.0;
-            entry.attributes = FileAttributes(
-                information.attributes.0 & !FileAttributes::NORMAL.0 & !FileAttributes::DIRECTORY.0
+        if information.attributes.bits() != 0 {
+            let kept = entry.attributes.bits() & FileAttributes::DIRECTORY.bits();
+            entry.attributes = FileAttributes::from_bits_retain(
+                information.attributes.bits()
+                    & !FileAttributes::NORMAL.bits()
+                    & !FileAttributes::DIRECTORY.bits()
                     | kept,
             );
         }
@@ -890,7 +894,7 @@ impl filesystem::Backend for MockBackend {
         let mut name = [0; filesystem::FILE_SYSTEM_NAME_CAPACITY];
         name[..4].copy_from_slice(b"FATX");
         Ok(filesystem::VolumeAttributes {
-            flags: filesystem::FileSystemFlags::CASE_PRESERVED_NAMES,
+            flags: FileSystemAttributes::CASE_PRESERVED_NAMES,
             maximum_component_length: MAX_NAME as u32,
             name,
             name_length: 4,
@@ -957,11 +961,13 @@ impl filesystem::Backend for MockBackend {
             .devices
             .iter()
             .position(|device| device.name.eq_ignore_ascii_case(name))
-            .map(|index| DeviceObject(index as u32))
+            // SAFETY: the host checks device indices against `devices`;
+            // dereferencing does nothing.
+            .map(|index| unsafe { DeviceObject::from_raw(index as u32) })
             .ok_or(KernelError::ObjectNameNotFound)
     }
 
-    fn dereference_device(&mut self, _device: DeviceObject) {}
+    unsafe fn dereference_device(&mut self, _device: DeviceObject) {}
 
     fn transfer_device(
         &mut self,
@@ -970,7 +976,8 @@ impl filesystem::Backend for MockBackend {
         offset: u64,
         buffer: PoolRange,
     ) -> Result<(), KernelError> {
-        let size = self.filesystem.devices[device.0 as usize].bytes.len() as u64;
+        let device = device.raw() as usize;
+        let size = self.filesystem.devices[device].bytes.len() as u64;
         let end = offset + u64::from(buffer.length);
         if end > size {
             return Err(KernelError::InvalidParameter);
@@ -978,12 +985,12 @@ impl filesystem::Backend for MockBackend {
         let range = offset as usize..end as usize;
         match direction {
             TransferDirection::Read => {
-                let bytes = self.filesystem.devices[device.0 as usize].bytes[range].to_vec();
+                let bytes = self.filesystem.devices[device].bytes[range].to_vec();
                 self.filesystem.pool_slice(buffer).copy_from_slice(&bytes);
             }
             TransferDirection::Write => {
                 let bytes = self.filesystem.pool_slice(buffer).to_vec();
-                self.filesystem.devices[device.0 as usize].bytes[range].copy_from_slice(&bytes);
+                self.filesystem.devices[device].bytes[range].copy_from_slice(&bytes);
             }
         }
         Ok(())
@@ -997,34 +1004,36 @@ impl filesystem::Backend for MockBackend {
         let id = self.filesystem.next_pool;
         self.filesystem.next_pool += 1;
         self.filesystem.pools.insert(id, vec![0; size as usize]);
-        Some(PoolBuffer(id))
+        // SAFETY: the id names the new entry of `pools`, removed only by
+        // `free_pool`, after which no copy is used (the trait contract).
+        Some(unsafe { PoolBuffer::from_raw(id) })
     }
 
-    fn free_pool(&mut self, buffer: PoolBuffer) {
-        self.filesystem.pools.remove(&buffer.0);
+    unsafe fn free_pool(&mut self, buffer: PoolBuffer) {
+        self.filesystem.pools.remove(&buffer.raw());
     }
 
     fn pool(&mut self, buffer: PoolBuffer) -> &mut [u8] {
         self.filesystem
             .pools
-            .get_mut(&buffer.0)
+            .get_mut(&buffer.raw())
             .expect("allocated pool block")
     }
 
-    fn allocate_scratch(&mut self, size: u32) -> Option<&'static mut [u8]> {
+    fn allocate_scratch(&mut self, size: u32) -> Option<ScratchBlock> {
         if self.filesystem.pool_exhausted || size > POOL_LIMIT {
             return None;
         }
         let block = Box::into_raw(vec![0; size as usize].into_boxed_slice());
-        // SAFETY: the caller owns the block until `free_scratch` rebuilds
-        // the box from it.
-        Some(unsafe { &mut *block })
+        // SAFETY: the box is referenced only by the token; `free_scratch`
+        // rebuilds and frees it.
+        Some(unsafe { ScratchBlock::from_raw(&mut *block) })
     }
 
-    fn free_scratch(&mut self, block: &'static mut [u8]) {
-        // SAFETY: `allocate_scratch` released this box and the caller gave
-        // up its only reference.
-        drop(unsafe { Box::from_raw(block as *mut [u8]) });
+    fn free_scratch(&mut self, block: ScratchBlock) {
+        // SAFETY: a `ScratchBlock` of this backend holds a box that
+        // `allocate_scratch` released; the token is consumed here.
+        drop(unsafe { Box::from_raw(block.into_raw() as *mut [u8]) });
     }
 
     fn open_close_tray(&mut self, value: u32) {
@@ -1064,7 +1073,8 @@ impl filesystem::Backend for MockBackend {
 
     fn start_dvd_trace(&mut self) {
         if let Some((buffer, _)) = self.filesystem.dvd_trace.take() {
-            self.free_pool(buffer);
+            // SAFETY: the trace held the only copy, taken out here.
+            unsafe { self.free_pool(buffer) };
         }
         if let Some(buffer) = self.allocate_pool(DVD_TRACE_SIZE) {
             self.filesystem.dvd_trace = Some((buffer, 0));

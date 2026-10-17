@@ -8,11 +8,8 @@ use openxbdm_core::status::KernelError;
 use openxbdm_core::status::Win32Error;
 use openxbdm_server::commands::filesystem;
 use openxbdm_server::commands::filesystem::Backend as _;
-use openxbdm_server::commands::filesystem::CreateOptions;
 use openxbdm_server::commands::filesystem::CreateRequest;
 use openxbdm_server::commands::filesystem::DriveTable;
-use openxbdm_server::commands::filesystem::FileAccess;
-use openxbdm_server::commands::filesystem::ShareAccess;
 use openxbdm_server::commands::performance;
 use openxbdm_server::commands::performance::COUNTER_NAME_CAPACITY;
 use openxbdm_server::commands::performance::CaptureValue;
@@ -39,6 +36,9 @@ use openxbdm_server::commands::performance::counters::Evaluation;
 use openxbdm_server::commands::performance::profiler;
 use openxbdm_server::commands::performance::profiler::ProfilerError;
 use openxbdm_server::commands::performance::studio::StudioError;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
 use super::MockBackend;
 
@@ -213,14 +213,18 @@ impl Counters {
                 continue;
             }
             let period = counter.registration().period();
-            counters::sample(
-                &mut View {
-                    counter,
-                    counters: &sources,
-                },
-                tick_count,
-                frame_number,
-            );
+            // SAFETY: `register` initializes every object and only `sample`
+            // writes its history index.
+            unsafe {
+                counters::sample(
+                    &mut View {
+                        counter,
+                        counters: &sources,
+                    },
+                    tick_count,
+                    frame_number,
+                )
+            };
             counter.bucket = Some((self.bucket + period) % BUCKETS);
         }
         self.bucket = (self.bucket + 1) % BUCKETS;
@@ -247,27 +251,27 @@ impl View<'_> {
 }
 
 impl CounterObject for View<'_> {
-    fn read_u32(&self, offset: i32) -> u32 {
+    unsafe fn read_u32(&self, offset: i32) -> u32 {
         let start = Self::at(offset);
         u32::from_be_bytes(self.counter.image[start..start + 4].try_into().unwrap())
     }
 
-    fn read_u64(&self, offset: i32) -> u64 {
+    unsafe fn read_u64(&self, offset: i32) -> u64 {
         let start = Self::at(offset);
         u64::from_be_bytes(self.counter.image[start..start + 8].try_into().unwrap())
     }
 
-    fn write_u32(&mut self, offset: i32, value: u32) {
+    unsafe fn write_u32(&mut self, offset: i32, value: u32) {
         let start = Self::at(offset);
         self.counter.image[start..start + 4].copy_from_slice(&value.to_be_bytes());
     }
 
-    fn write_u64(&mut self, offset: i32, value: u64) {
+    unsafe fn write_u64(&mut self, offset: i32, value: u64) {
         let start = Self::at(offset);
         self.counter.image[start..start + 8].copy_from_slice(&value.to_be_bytes());
     }
 
-    fn source_u32(&self, offset: u32) -> u32 {
+    unsafe fn source_u32(&self, offset: u32) -> u32 {
         match self.counter.source {
             Source::Words(index) => self
                 .counters
@@ -279,11 +283,14 @@ impl CounterObject for View<'_> {
         }
     }
 
-    fn source_u64(&self, offset: u32) -> u64 {
-        (u64::from(self.source_u32(offset)) << 32) | u64::from(self.source_u32(offset + 4))
+    unsafe fn source_u64(&self, offset: u32) -> u64 {
+        // SAFETY: the caller upholds the same contract.
+        unsafe {
+            (u64::from(self.source_u32(offset)) << 32) | u64::from(self.source_u32(offset + 4))
+        }
     }
 
-    fn call_reader(
+    unsafe fn call_reader(
         &mut self,
         value: &mut u64,
         _rate: Option<&mut u64>,
@@ -298,7 +305,7 @@ impl CounterObject for View<'_> {
         Ok(())
     }
 
-    fn call_handler(
+    unsafe fn call_handler(
         &mut self,
         _query: counters::CounterQuery,
         _out: &mut CounterSample,
@@ -746,21 +753,25 @@ impl performance::Backend for MockBackend {
         if locked {
             return Err(CounterError::NotFound);
         }
-        counters::query(
-            &mut View {
-                counter,
-                counters: &sources,
-            },
-            query,
-            out,
-        )
+        // SAFETY: `Counters::register` initializes every object and only
+        // `sample` writes its history index.
+        unsafe {
+            counters::query(
+                &mut View {
+                    counter,
+                    counters: &sources,
+                },
+                query,
+                out,
+            )
+        }
     }
 
     fn capture_display(&mut self) -> DisplayCapture {
         self.performance.display.capture
     }
 
-    fn read_framebuffer_page(&mut self, address: u32, page: &mut [u8]) {
+    unsafe fn read_framebuffer_page(&mut self, address: u32, page: &mut [u8; TILE_SIZE as usize]) {
         let display = &mut self.performance.display;
         display.reads.push(address);
         let base = display.capture.front_buffer.wrapping_sub(0x4000_0000);
@@ -820,8 +831,11 @@ impl performance::Backend for MockBackend {
         path: &[u8],
         buffer: capture::BufferRequest,
     ) -> Result<Started, CaptureError> {
-        let request =
-            CreateRequest::open(FileAccess::DELETE, ShareAccess::ALL, CreateOptions::NONE);
+        let request = CreateRequest::open(
+            AccessMask::DELETE,
+            ShareAccess::all(),
+            CreateOptions::empty(),
+        );
         if let Ok(handle) = filesystem::Backend::create_file(self, path, &request) {
             let _ = self.set_delete_disposition(handle, true);
             self.close_file(handle);
@@ -893,7 +907,7 @@ impl performance::Backend for MockBackend {
             .info(&mut performance.cpu_profiler)
     }
 
-    fn pix_post(&mut self, code: u32, payload: &[u32]) -> bool {
+    unsafe fn pix_post(&mut self, code: u32, payload: &[u32]) -> bool {
         let message = PixMessage::new(code, payload);
         let pix = &mut self.performance.pix;
         if !pix.session {

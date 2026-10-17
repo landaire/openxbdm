@@ -1,6 +1,8 @@
 //! Command processors registered by other modules (`NAME!command`). The
 //! platform owns the registry: other modules register at any time, from
 //! any thread.
+// `ProcessorHandle` names code the platform calls.
+#![allow(unsafe_code)]
 
 use openxbdm_core::status::Hresult;
 
@@ -14,7 +16,24 @@ pub const PROCESSOR_NAME_CAPACITY: usize = 63;
 
 /// Platform token identifying an external processor handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ProcessorHandle(pub u32);
+pub struct ProcessorHandle(u32);
+
+impl ProcessorHandle {
+    /// # Safety
+    ///
+    /// `value` must identify a handler that the registering backend's
+    /// [`ProcessorBackend::call_processor`] can call while the handle is
+    /// registered and while a call made with it, or its continuation, is in
+    /// progress. On the console it is the address of a function with the
+    /// stock processor signature that stays loaded that long.
+    pub const unsafe fn from_raw(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
 
 xbox360_sys::flags! {
     /// Registration flags.

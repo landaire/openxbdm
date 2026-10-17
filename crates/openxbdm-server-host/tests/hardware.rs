@@ -14,8 +14,6 @@ use openxbdm_server::commands::hardware::AvatarHook;
 use openxbdm_server::commands::hardware::InputOwner;
 use openxbdm_server::commands::hardware::PlayToCommand;
 use openxbdm_server::commands::hardware::PlayToState;
-use openxbdm_server::commands::hardware::SystemApp;
-use openxbdm_server::commands::hardware::SystemMessage;
 use openxbdm_server::commands::hardware::UsbController;
 use openxbdm_server::commands::hardware::UsbPort;
 use openxbdm_server::commands::hardware::XamError;
@@ -23,7 +21,6 @@ use openxbdm_server::commands::hardware::automation::DebuggerMessage;
 use openxbdm_server::commands::hardware::automation::Gamepad;
 use openxbdm_server::commands::hardware::automation::Poll;
 use openxbdm_server_host::backend::hardware::PgoRecord;
-use openxbdm_server_host::backend::hardware::SentMessage;
 use openxbdm_server_host::backend::hardware::UsbPortRequest;
 
 fn session(server: &TestServer) -> RawSession {
@@ -602,18 +599,13 @@ fn mockcurrencyvalue_messages_the_marketplace() {
         session.command("mockcurrencyvalue enabled=off value=7"),
         "200- OK"
     );
-    let mut expected = vec![0, 0, 0, 1, 0, 0, 0x12, 0x34];
-    expected.extend([0; 12]);
-    let sent = |buffer| SentMessage {
-        app: SystemApp::MARKETPLACE,
-        message: SystemMessage::MOCK_CURRENCY,
-        buffer,
-    };
+    let mut expected = [0u8; 0x14];
+    expected[..8].copy_from_slice(&[0, 0, 0, 1, 0, 0, 0x12, 0x34]);
     assert_eq!(
-        server.host.lock().backend.hardware.system_messages,
-        [sent(expected), sent(vec![0; 20])]
+        server.host.lock().backend.hardware.mock_currency_settings,
+        [expected, [0; 0x14]]
     );
-    server.host.lock().backend.hardware.system_message_result = Ok(());
+    server.host.lock().backend.hardware.mock_currency_result = Ok(());
     assert_eq!(
         session.command("mockcurrencyvalue enabled=off"),
         "414- access denied"

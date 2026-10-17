@@ -23,54 +23,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("need at least one needle".into());
     }
 
-    let mut entries: Vec<PathBuf> = fs::read_dir(&dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("xex"))
-        .collect();
-    entries.sort();
+    // Bytes of context shown on each side of a hit; an unset or invalid
+    // XEXGREP_CTX uses the default.
+    let context_len: usize = std::env::var("XEXGREP_CTX")
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .unwrap_or(16);
 
-    for path in &entries {
+    let mut paths: Vec<PathBuf> = fs::read_dir(&dir)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("xex"))
+        .collect();
+    paths.sort();
+
+    for path in &paths {
         let bytes = fs::read(path)?;
         let parsed = match Xex2::parse(bytes) {
-            Ok(x) => x,
+            Ok(parsed) => parsed,
             Err(e) => {
                 eprintln!("{}: parse failed: {e:?}", path.display());
                 continue;
             }
         };
         let base = match parsed.extract_basefile() {
-            Ok(b) => b,
+            Ok(base) => base,
             Err(e) => {
                 eprintln!("{}: extract_basefile failed: {e:?}", path.display());
                 continue;
             }
         };
+
         let name = path.file_name().unwrap().to_string_lossy();
         for needle in &needles {
-            let nb = needle.as_bytes();
-            for (i, w) in base.windows(nb.len()).enumerate() {
-                if w == nb {
-                    let ctx_size: usize = std::env::var("XEXGREP_CTX")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(16);
-                    let ctx_start = i.saturating_sub(ctx_size);
-                    let ctx_end = (i + nb.len() + ctx_size * 2).min(base.len());
-                    let ctx: String = base[ctx_start..ctx_end]
-                        .iter()
-                        .map(|&b| {
-                            if (0x20..0x7f).contains(&b) {
-                                b as char
-                            } else {
-                                '.'
-                            }
-                        })
-                        .collect();
-                    println!("{name:30}  {needle:30}  @0x{i:08x}  |{ctx}|");
+            let needle_bytes = needle.as_bytes();
+            for (offset, window) in base.windows(needle_bytes.len()).enumerate() {
+                if window != needle_bytes {
+                    continue;
                 }
+
+                let context_start = offset.saturating_sub(context_len);
+                let context_end = (offset + needle_bytes.len() + context_len * 2).min(base.len());
+                let context: String = base[context_start..context_end]
+                    .iter()
+                    .map(|&byte| {
+                        if (0x20..0x7f).contains(&byte) {
+                            byte as char
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect();
+                println!("{name:30}  {needle:30}  @0x{offset:08x}  |{context}|");
             }
         }
     }
+
     Ok(())
 }

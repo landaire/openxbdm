@@ -9,7 +9,8 @@
 //! - `%upload <hex>`: bytes sent when the previous command replies `204`.
 //! - `%reconnect`: close the connection and open a new one.
 
-use std::fmt;
+use super::error::ScriptError;
+use super::error::ScriptErrorKind;
 
 /// One step of a command list.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,37 +26,6 @@ pub struct Command {
     pub upload: Option<Vec<u8>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub struct ScriptError {
-    /// One-based line number in the command file.
-    pub line: usize,
-    pub kind: ScriptErrorKind,
-}
-
-impl fmt::Display for ScriptError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "line {}: {}", self.line, self.kind)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ScriptErrorKind {
-    #[error("unknown directive `%{name}`")]
-    UnknownDirective { name: String },
-    #[error("`%repeat` needs a decimal count and text")]
-    InvalidRepeat,
-    #[error("`%upload` data is not pairs of hex digits")]
-    InvalidUpload,
-    #[error("`%reconnect` takes no argument")]
-    ReconnectArgument,
-    #[error("`%upload` does not follow a command")]
-    UploadWithoutCommand,
-    #[error("the previous command already has an upload")]
-    DuplicateUpload,
-    #[error("command line contains a carriage return")]
-    CarriageReturn,
-}
-
 /// Parse a command list.
 pub fn parse(text: &str) -> Result<Vec<Step>, ScriptError> {
     let mut steps = Vec::new();
@@ -67,13 +37,17 @@ pub fn parse(text: &str) -> Result<Vec<Step>, ScriptError> {
         if raw.contains('\r') {
             return Err(error(ScriptErrorKind::CarriageReturn));
         }
+
         if raw.trim().is_empty() || raw.starts_with('#') {
             continue;
         }
+
         let Some(directive) = raw.strip_prefix('%') else {
             steps.push(command(raw.to_owned()));
             continue;
         };
+
+        // A directive without a space has an empty argument.
         let (name, argument) = directive.split_once(' ').unwrap_or((directive, ""));
         match name {
             "send" => steps.push(command(argument.to_owned())),
@@ -110,6 +84,7 @@ pub fn parse(text: &str) -> Result<Vec<Step>, ScriptError> {
             }
         }
     }
+
     Ok(steps)
 }
 
@@ -122,6 +97,7 @@ fn decode_hex(text: &str) -> Option<Vec<u8>> {
     if !rest.is_empty() {
         return None;
     }
+
     pairs
         .iter()
         .map(|pair| {

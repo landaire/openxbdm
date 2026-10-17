@@ -1,0 +1,84 @@
+//! `discover` and `resolve`: NAP console discovery.
+
+use std::net::IpAddr;
+use std::net::Ipv4Addr;
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use openxbdm_client::discovery::DiscoveryConfig;
+use openxbdm_client::discovery::NAP_PORT;
+use openxbdm_client::discovery::discover_all;
+use openxbdm_client::discovery::find_by_name;
+use openxbdm_client::error::ArgumentError;
+use openxbdm_client::error::Error;
+use openxbdm_client::error::TransportError;
+use rootcause::Report;
+use tabled::Tabled;
+
+use crate::ui::UiOptions;
+use crate::ui::print_table;
+use crate::ui::warn_tag;
+
+pub async fn discover(
+    listen_ms: u64,
+    broadcast: Option<&str>,
+    ui: UiOptions,
+) -> Result<(), Report<Error>> {
+    let mut config = DiscoveryConfig::broadcast();
+    config.listen_for = Duration::from_millis(listen_ms);
+    if let Some(raw) = broadcast {
+        config.destination = raw
+            .parse()
+            .or_else(|_| format!("{raw}:{NAP_PORT}").parse::<SocketAddr>())
+            .map_err(|_| {
+                Report::new(Error::from(ArgumentError::QuotedContainsCrlf))
+                    .attach(format!("invalid --broadcast value {raw:?}"))
+            })?;
+    }
+
+    tracing::info!(destination = %config.destination, "broadcasting nap identify");
+    let consoles = discover_all(config).await?;
+    if consoles.is_empty() {
+        eprintln!("{} no consoles responded", warn_tag("warning:"));
+        return Ok(());
+    }
+
+    if !ui.is_pretty() {
+        for console in consoles {
+            println!("{}\t{}", console.name, console.addr);
+        }
+        return Ok(());
+    }
+
+    #[derive(Tabled)]
+    struct Row {
+        name: String,
+        address: String,
+    }
+
+    let rows: Vec<Row> = consoles
+        .iter()
+        .map(|console| Row {
+            name: console.name.clone(),
+            address: console.addr.to_string(),
+        })
+        .collect();
+    print_table(&ui.heading("discover"), rows);
+
+    Ok(())
+}
+
+pub async fn resolve(name: &str, listen_ms: u64) -> Result<(), Report<Error>> {
+    let mut config = DiscoveryConfig::broadcast();
+    config.listen_for = Duration::from_millis(listen_ms);
+    config.destination = SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), NAP_PORT);
+
+    let Some(console) = find_by_name(name, config).await? else {
+        return Err(Report::new(Error::from(TransportError::ConnectTimeout))
+            .attach(format!("no reply from console named {name:?}")));
+    };
+
+    println!("{}\t{}", console.name, console.addr);
+
+    Ok(())
+}

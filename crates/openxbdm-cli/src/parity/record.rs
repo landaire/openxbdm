@@ -12,6 +12,7 @@ use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 
+use super::error::RecordError;
 use super::script::Command;
 use super::script::Step;
 
@@ -80,26 +81,18 @@ pub enum BinaryEnd {
     Closed,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum RecordError {
-    #[error("connecting to the console failed")]
-    Connect(#[source] io::Error),
-    #[error("no banner within the reply timeout")]
-    BannerTimeout,
-    #[error("connection closed before the banner")]
-    BannerClosed,
-    #[error("reading the banner failed")]
-    Banner(#[source] io::Error),
-}
-
-const BYE_REPLY: &[u8] = b"200- bye\r\n";
-
 /// The exchanges recorded up to the end of the command list or the error
 /// that stopped the run.
 #[derive(Debug)]
 pub struct RecordOutcome {
     pub recording: Recording,
     pub error: Option<RecordError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineRead {
+    Line,
+    Closed,
 }
 
 /// Run `steps`, opening connections with `connect`. `progress` sees each
@@ -122,7 +115,23 @@ where
     let error = run_steps(steps, connect, reply_timeout, progress, &mut recording)
         .await
         .err();
+
     RecordOutcome { recording, error }
+}
+
+/// Printable ASCII is kept; a backslash becomes `\\` and other bytes
+/// `\xNN`.
+pub fn escape(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(bytes.len());
+    for &byte in bytes {
+        match byte {
+            b'\\' => text.push_str("\\\\"),
+            0x20..=0x7e => text.push(char::from(byte)),
+            _ => text.push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+
+    text
 }
 
 async fn run_steps<S, F, Fut>(
@@ -146,6 +155,7 @@ where
             }
             Step::Command(command) => command,
         };
+
         let stream = match &mut connection {
             Some(stream) => stream,
             None => {
@@ -158,12 +168,14 @@ where
                 if read == LineRead::Closed {
                     return Err(RecordError::BannerClosed);
                 }
+
                 recording
                     .banner
                     .get_or_insert_with(|| escape(trim_line(&line)));
                 connection.insert(stream)
             }
         };
+
         let mut transcript = Vec::new();
         let outcome =
             tokio::time::timeout(reply_timeout, exchange(stream, command, &mut transcript)).await;
@@ -185,6 +197,7 @@ where
         if !keep {
             connection = None;
         }
+
         let exchange = Exchange {
             command: command.line.clone(),
             reply,
@@ -192,22 +205,18 @@ where
         progress(&exchange);
         recording.exchanges.push(exchange);
     }
-    Ok(())
-}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LineRead {
-    Line,
-    Closed,
+    Ok(())
 }
 
 /// Read through the next LF. A partial line at end of stream counts as
 /// closed; its bytes stay in `line`.
-async fn read_line<S: AsyncRead + Unpin>(
-    stream: &mut BufReader<S>,
-    line: &mut Vec<u8>,
-) -> io::Result<LineRead> {
+async fn read_line<S>(stream: &mut BufReader<S>, line: &mut Vec<u8>) -> io::Result<LineRead>
+where
+    S: AsyncRead + Unpin,
+{
     stream.read_until(b'\n', line).await?;
+
     Ok(if line.ends_with(b"\n") {
         LineRead::Line
     } else {
@@ -222,26 +231,33 @@ fn trim_line(line: &[u8]) -> &[u8] {
 
 /// Send one command and read its reply. Returns the reply and whether the
 /// connection stays usable. Every byte read is appended to `transcript`.
-async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
+async fn exchange<S>(
     stream: &mut BufReader<S>,
     command: &Command,
     transcript: &mut Vec<u8>,
-) -> io::Result<(Reply, bool)> {
+) -> io::Result<(Reply, bool)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut line = Vec::with_capacity(command.line.len() + 2);
     line.extend_from_slice(command.line.as_bytes());
     line.extend_from_slice(b"\r\n");
     stream.get_mut().write_all(&line).await?;
+
     let (reply, keep) = read_reply(stream, transcript).await?;
     let Reply::Upload { head, after: None } = reply else {
         return Ok((reply, keep));
     };
+
     let Some(data) = &command.upload else {
         return Ok((Reply::Upload { head, after: None }, false));
     };
+
     stream.get_mut().write_all(data).await?;
     let (after, keep) = read_reply(stream, transcript).await?;
     // A second `204` would take the following command lines as data.
     let keep = keep && !matches!(after, Reply::Upload { .. });
+
     Ok((
         Reply::Upload {
             head,
@@ -253,10 +269,15 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
 
 /// Read one reply. A `204` is returned as an upload without `after`; the
 /// caller decides whether to continue.
-async fn read_reply<S: AsyncRead + AsyncWrite + Unpin>(
+async fn read_reply<S>(
     stream: &mut BufReader<S>,
     transcript: &mut Vec<u8>,
-) -> io::Result<(Reply, bool)> {
+) -> io::Result<(Reply, bool)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    const BYE_REPLY: &[u8] = b"200- bye\r\n";
+
     let start = transcript.len();
     if read_line(stream, transcript).await? == LineRead::Closed {
         return Ok((
@@ -266,6 +287,7 @@ async fn read_reply<S: AsyncRead + AsyncWrite + Unpin>(
             false,
         ));
     }
+
     let head = escape(trim_line(&transcript[start..]));
     let status = head.get(..3).unwrap_or_default();
     match status {
@@ -281,6 +303,7 @@ async fn read_reply<S: AsyncRead + AsyncWrite + Unpin>(
                         false,
                     ));
                 }
+
                 let line = trim_line(&transcript[start..]);
                 if line == b"." {
                     return Ok((Reply::Multiline { head, body }, true));
@@ -292,11 +315,13 @@ async fn read_reply<S: AsyncRead + AsyncWrite + Unpin>(
             stream.get_mut().write_all(b"bye\r\n").await?;
             let start = transcript.len();
             stream.read_to_end(transcript).await?;
+
             let rest = &transcript[start..];
             let (payload, end) = match rest.strip_suffix(BYE_REPLY) {
                 Some(payload) => (payload, BinaryEnd::Bye),
                 None => (rest, BinaryEnd::Closed),
             };
+
             Ok((
                 Reply::Binary {
                     head,
@@ -317,20 +342,6 @@ fn fnv1a64(data: &[u8]) -> u64 {
     data.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
     })
-}
-
-/// Printable ASCII is kept; a backslash becomes `\\` and other bytes
-/// `\xNN`.
-pub fn escape(bytes: &[u8]) -> String {
-    let mut text = String::with_capacity(bytes.len());
-    for &byte in bytes {
-        match byte {
-            b'\\' => text.push_str("\\\\"),
-            0x20..=0x7e => text.push(char::from(byte)),
-            _ => text.push_str(&format!("\\x{byte:02x}")),
-        }
-    }
-    text
 }
 
 #[cfg(test)]

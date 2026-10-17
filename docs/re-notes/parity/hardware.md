@@ -136,6 +136,14 @@ Unit tests in `automation.rs` cover the playback engine.
     UTF-8 is cut there for `pogo.ini`.
   - A UTF-8 phase whose last sequence takes the terminator: stock copies
     uninitialized stack units after it; they are 0.
+  - Export 107 with record 0 and an `OutputPath=` line: stock reads the
+    base path at address 0x88 and faults; the line is skipped.
+  - A count block read while export 112 on another thread is still
+    creating it (export 110, `pogoctrl snapshot`): stock reads the header
+    through the null block address and faults, or reads a block being
+    written; the console stops with `PCILookupPGCHdr: CLIENTINFO not
+    found`. Title termination in that window skips the record's shutdown
+    profile.
 - PGO runtime, other differences: the 0x20000-byte key table (0x91fa3af4) is
   not allocated, keys are computed directly (same keys; its allocation
   failure cannot occur); the profile directory scan, whose result the image
@@ -143,7 +151,11 @@ Unit tests in `automation.rs` cover the playback engine.
   exception handler treat an unmapped entry as the fault (a mapped read-only
   table faults here); the probe slots of the module interface receive the
   second instruction word of this module's export entries, as stock stores
-  its own.
+  its own; record byte +0x6cb, which stock leaves zero, is set with a
+  release store once the count block is written, and the readers of the
+  block load it with acquire first; count resets clear word counters with
+  word stores and doubleword counters with doubleword stores, so probes
+  still running update whole counters (stock calls memset).
 
 ## Gaps
 

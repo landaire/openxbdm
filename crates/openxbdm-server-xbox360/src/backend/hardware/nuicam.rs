@@ -3,151 +3,288 @@
 //! The capture switch is the kernel's NuiCam control routine (kernel
 //! ordinal 0x30d), resolved at startup.
 
-use core::cell::UnsafeCell;
+use core::mem::offset_of;
+use core::ptr::NonNull;
+use core::sync::atomic::AtomicPtr;
+use core::sync::atomic::AtomicU8;
+use core::sync::atomic::AtomicU16;
+use core::sync::atomic::AtomicU32;
+use core::sync::atomic::Ordering;
 
+use xbox360::module::Ordinal;
 use xbox360::module::SystemModule;
 use xbox360::sync::SpinLock;
 use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::Kevent;
 
 use crate::kernel;
 
-/// Kernel ordinal: NuiCam control routine `(&{u32 code, u32 value})`.
-const KERNEL_NUICAM_CONTROL: u32 = 0x30d;
-/// Control routine code that switches raw data capture.
-const CONTROL_RAW_CAPTURE: u32 = 0xa;
+/// Kernel export: NuiCam control routine `(&ControlRequest)`.
+const NUICAM_CONTROL: Ordinal = Ordinal::new(0x30d).unwrap();
 
-/// Capture mode set by a queued request and by the `op == 1` mode change.
-const MODE_CAPTURING: u32 = 1;
+/// Code of a NuiCam control routine request.
+#[repr(u32)]
+#[derive(Clone, Copy)]
+enum NuiCamControl {
+    /// Switch raw data capture to the request's value.
+    RawCapture = 0xa,
+}
 
-/// Request node offsets (caller memory): links, event, buffer, size,
-/// received length, then the block's u16, u8 and the missed flag.
-const NODE_EVENT: u32 = 8;
-const NODE_BUFFER: u32 = 0xc;
-const NODE_SIZE: u32 = 0x10;
-const NODE_LENGTH: u32 = 0x14;
-const NODE_TAG: u32 = 0x1c;
-const NODE_KIND: u32 = 0x1e;
-const NODE_MISSED: u32 = 0x1f;
+/// Argument of the NuiCam control routine.
+#[repr(C)]
+struct ControlRequest {
+    code: NuiCamControl,
+    value: CaptureMode,
+}
+
+const _: () = assert!(offset_of!(ControlRequest, value) == 4);
+const _: () = assert!(size_of::<ControlRequest>() == 8);
+
+/// Capture mode: the value the control routine switches capture to.
+/// Requesters may store any value.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CaptureMode(u32);
+
+impl CaptureMode {
+    const OFF: Self = Self(0);
+    /// Set by a queued request and by `CaptureOperation::Exchange`.
+    const CAPTURING: Self = Self(1);
+}
+
+/// Operation of a monitor control 0xa1 request.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CaptureOperation {
+    /// Op 0: store the value and switch capture to it.
+    Apply,
+    /// Op 1: return the old mode, select capture, and switch it off.
+    Exchange,
+    /// Other ops: store the value and switch capture off.
+    Store,
+}
+
+impl CaptureOperation {
+    fn from_raw(operation: u32) -> Self {
+        match operation {
+            0 => Self::Apply,
+            1 => Self::Exchange,
+            _ => Self::Store,
+        }
+    }
+}
+
+/// Monitor control 0xa1 request (caller memory).
+#[repr(C)]
+struct CaptureModeRequest {
+    operation: u32,
+    value: CaptureMode,
+}
+
+const _: () = assert!(offset_of!(CaptureModeRequest, value) == 4);
+
+/// Link of the request list: the next and the previous link. The list
+/// head and the first field of every queued node.
+#[repr(C)]
+struct Link {
+    next: AtomicPtr<Link>,
+    previous: AtomicPtr<Link>,
+}
+
+/// Requester node (caller memory): queued by monitor control 0x97,
+/// completed by 0x96 with a copy of the raw data block.
+#[repr(C)]
+struct RawDataNode {
+    link: Link,
+    /// Signaled on completion when present.
+    event: Option<NonNull<Kevent>>,
+    buffer: *mut u8,
+    /// Size of `buffer`.
+    size: u32,
+    /// Length of the block's data, which may exceed `size`.
+    received: AtomicU32,
+    _reserved: u32,
+    tag: AtomicU16,
+    kind: AtomicU8,
+    /// Nonzero when a completion found no request before this one.
+    missed: AtomicU8,
+}
+
+const _: () = {
+    assert!(offset_of!(RawDataNode, link) == 0);
+    assert!(offset_of!(RawDataNode, event) == 8);
+    assert!(offset_of!(RawDataNode, buffer) == 0xc);
+    assert!(offset_of!(RawDataNode, size) == 0x10);
+    assert!(offset_of!(RawDataNode, received) == 0x14);
+    assert!(offset_of!(RawDataNode, tag) == 0x1c);
+    assert!(offset_of!(RawDataNode, kind) == 0x1e);
+    assert!(offset_of!(RawDataNode, missed) == 0x1f);
+    assert!(size_of::<RawDataNode>() == 0x20);
+};
+
+/// Raw data block from the camera driver (monitor control 0x96).
+#[repr(C)]
+struct RawDataBlock {
+    _flag: u32,
+    tag: u16,
+    kind: u8,
+    _pad: u8,
+    data: *const u8,
+    length: u32,
+}
+
+const _: () = {
+    assert!(offset_of!(RawDataBlock, tag) == 4);
+    assert!(offset_of!(RawDataBlock, kind) == 6);
+    assert!(offset_of!(RawDataBlock, data) == 8);
+    assert!(offset_of!(RawDataBlock, length) == 0xc);
+    assert!(size_of::<RawDataBlock>() == 0x10);
+};
 
 struct Requests {
     /// The control routine; requests are accepted only once it resolved.
     control: Option<u32>,
     /// The last completion found no request.
     missed: bool,
-    mode: u32,
+    mode: CaptureMode,
 }
 
 static REQUESTS: SpinLock<Requests> = SpinLock::new(Requests {
     control: None,
     missed: false,
-    mode: 0,
+    mode: CaptureMode::OFF,
 });
 
 impl Requests {
     /// Queue `node`; the control routine when this request turns capture
     /// on.
-    fn queue(&mut self, node: u32) -> Option<u32> {
+    ///
+    /// # Safety
+    ///
+    /// Once the control routine is resolved, `node` is nonnull and meets
+    /// the contract of [`Link::push_back`].
+    unsafe fn queue(&mut self, node: *mut RawDataNode) -> Option<u32> {
         let control = self.control?;
-        LIST.push_back(node);
-        if self.mode != 0 {
+        // SAFETY: forwarded to the caller.
+        unsafe { LIST.push_back(NonNull::new_unchecked(node)) };
+        if self.mode != CaptureMode::OFF {
             return None;
         }
-        self.mode = MODE_CAPTURING;
+        self.mode = CaptureMode::CAPTURING;
         Some(control)
     }
 
     /// Complete the oldest request with the raw data `block`.
-    fn complete(&mut self, block: u32) {
-        let Some(node) = LIST.first() else {
+    ///
+    /// # Safety
+    ///
+    /// `block.data` points to `block.length` readable bytes for the call,
+    /// not overlapping a node buffer.
+    unsafe fn complete(&mut self, block: &RawDataBlock) {
+        // SAFETY: the `REQUESTS` lock is held, and every queued node meets
+        // the contract of `Link::push_back` until it is completed or
+        // flushed (the caller contract of monitor control 0x97).
+        let Some(node) = (unsafe { LIST.pop_front() }) else {
             self.missed = true;
             return;
         };
-        unlink(node);
-        let length = read_word(block + 0xc);
-        let copied = read_word(node + NODE_SIZE).min(length);
-        // SAFETY: the driver's block holds `length` bytes and the node's
-        // buffer `size` bytes.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                read_word(block + 8) as usize as *const u8,
-                read_word(node + NODE_BUFFER) as usize as *mut u8,
-                copied as usize,
-            );
-        }
-        write_word(node + NODE_LENGTH, length);
-        // SAFETY: the node and block layouts hold these fields.
-        unsafe {
-            let tag = core::ptr::read_volatile((block + 4) as usize as *const u16);
-            core::ptr::write_volatile((node + NODE_TAG) as usize as *mut u16, tag);
-            let kind = core::ptr::read_volatile((block + 6) as usize as *const u8);
-            core::ptr::write_volatile((node + NODE_KIND) as usize as *mut u8, kind);
-            core::ptr::write_volatile(
-                (node + NODE_MISSED) as usize as *mut u8,
-                u8::from(self.missed),
-            );
-        }
-        let event = read_word(node + NODE_EVENT);
-        if event != 0 {
-            // SAFETY: the requester stores an initialized event in its node.
-            unsafe { xboxkrnl::KeSetEvent(event as usize as *mut xboxkrnl::Kevent, 1, false) };
+        // SAFETY: as above; the node was queued until now.
+        let node = unsafe { node.as_ref() };
+        let length = block.length;
+        let copied = node.size.min(length);
+        // SAFETY: the block holds `length` readable bytes (caller
+        // contract) and the node's buffer `size` writable bytes (queue
+        // contract).
+        unsafe { core::ptr::copy_nonoverlapping(block.data, node.buffer, copied as usize) };
+        node.received.store(length, Ordering::Relaxed);
+        node.tag.store(block.tag, Ordering::Relaxed);
+        node.kind.store(block.kind, Ordering::Relaxed);
+        node.missed.store(u8::from(self.missed), Ordering::Relaxed);
+        if let Some(event) = node.event {
+            // SAFETY: a present event is initialized (queue contract).
+            unsafe { xboxkrnl::KeSetEvent(event.as_ptr(), xboxkrnl::EVENT_INCREMENT, false) };
         }
         self.missed = false;
     }
 
-    /// Apply capture mode `operation` of `request`; the control routine
-    /// once it resolved.
-    fn set_mode(&mut self, operation: u32, request: u32) -> Option<u32> {
+    /// Apply `operation` of `request`; the control routine once it
+    /// resolved.
+    fn set_mode(
+        &mut self,
+        operation: CaptureOperation,
+        request: &mut CaptureModeRequest,
+    ) -> Option<u32> {
         let control = self.control?;
-        if operation == 1 {
-            write_word(request + 4, self.mode);
-            self.mode = MODE_CAPTURING;
+        if operation == CaptureOperation::Exchange {
+            request.value = self.mode;
+            self.mode = CaptureMode::CAPTURING;
         } else {
-            self.mode = read_word(request + 4);
+            self.mode = request.value;
         }
         Some(control)
     }
 }
 
-/// List head of the queued nodes; guarded by the `REQUESTS` lock.
-struct ListHead(UnsafeCell<[u32; 2]>);
+/// Head of the queued nodes; changed with the `REQUESTS` lock held, or
+/// before the dispatcher is published.
+static LIST: Link = Link {
+    next: AtomicPtr::new(core::ptr::null_mut()),
+    previous: AtomicPtr::new(core::ptr::null_mut()),
+};
 
-// SAFETY: accessed only with the `REQUESTS` lock held, or before the
-// dispatcher is published.
-unsafe impl Sync for ListHead {}
-
-static LIST: ListHead = ListHead(UnsafeCell::new([0; 2]));
-
-impl ListHead {
-    fn address(&self) -> u32 {
-        self.0.get() as usize as u32
+impl Link {
+    fn as_ptr(&self) -> *mut Link {
+        core::ptr::from_ref(self).cast_mut()
     }
 
+    /// Empty the list, forgetting every queued node.
     fn reset(&self) {
-        let head = self.address();
-        write_word(head, head);
-        write_word(head + 4, head);
+        let head = self.as_ptr();
+        self.next.store(head, Ordering::Relaxed);
+        self.previous.store(head, Ordering::Relaxed);
     }
 
-    fn first(&self) -> Option<u32> {
-        let first = read_word(self.address());
-        (first != self.address()).then_some(first)
+    /// Append `node` to the list headed by `self`.
+    ///
+    /// # Safety
+    ///
+    /// The list is reset. Until `node` and every queued node are completed
+    /// or flushed, each stays valid and only this list touches its links,
+    /// its `buffer` holds `size` writable bytes, and its `event`, when
+    /// present, is an initialized event.
+    unsafe fn push_back(&self, node: NonNull<RawDataNode>) {
+        let head = self.as_ptr();
+        let last = self.previous.load(Ordering::Relaxed);
+        let link = node.cast::<Link>().as_ptr();
+        // SAFETY: `node` and `last` (a queued node or the head) are valid
+        // links per the caller contract.
+        unsafe {
+            (*link).next.store(head, Ordering::Relaxed);
+            (*link).previous.store(last, Ordering::Relaxed);
+            (*last).next.store(link, Ordering::Relaxed);
+        }
+        self.previous.store(link, Ordering::Relaxed);
     }
 
-    fn push_back(&self, node: u32) {
-        let head = self.address();
-        let last = read_word(head + 4);
-        write_word(node, head);
-        write_word(node + 4, last);
-        write_word(last, node);
-        write_word(head + 4, node);
+    /// Unlink the first node of the list headed by `self`.
+    ///
+    /// # Safety
+    ///
+    /// As [`Link::push_back`].
+    unsafe fn pop_front(&self) -> Option<NonNull<RawDataNode>> {
+        let first = self.next.load(Ordering::Relaxed);
+        if first == self.as_ptr() {
+            return None;
+        }
+        // SAFETY: `first` and its neighbors are queued nodes or the head,
+        // valid per the caller contract.
+        unsafe {
+            let next = (*first).next.load(Ordering::Relaxed);
+            let previous = (*first).previous.load(Ordering::Relaxed);
+            (*previous).next.store(next, Ordering::Relaxed);
+            (*next).previous.store(previous, Ordering::Relaxed);
+            Some(NonNull::new_unchecked(first).cast())
+        }
     }
-}
-
-fn unlink(node: u32) {
-    let next = read_word(node);
-    let previous = read_word(node + 4);
-    write_word(previous, next);
-    write_word(next + 4, previous);
 }
 
 /// Startup (stock 0x91f652b8).
@@ -158,30 +295,47 @@ pub(super) fn initialize() {
     };
     let mut address = 0u32;
     // SAFETY: `module` is the loaded kernel image and `address` a local word.
-    if (unsafe {
-        xboxkrnl::XexGetProcedureAddress(module.raw(), KERNEL_NUICAM_CONTROL, &mut address)
+    if unsafe {
+        xboxkrnl::XexGetProcedureAddress(
+            module.raw(),
+            u32::from(NUICAM_CONTROL.get()),
+            &mut address,
+        )
     }
-    .0 as i32)
-        >= 0
+    .is_success()
     {
         REQUESTS.lock().control = Some(address);
     }
 }
 
-fn switch_capture(control: u32, value: u32) {
-    let request = [CONTROL_RAW_CAPTURE, value];
-    // SAFETY: the control routine takes a pointer to `{code, value}`.
-    unsafe { kernel::call_export(control, request.as_ptr() as usize as u32, 0, 0, 0) };
+fn switch_capture(control: u32, value: CaptureMode) {
+    let request = ControlRequest {
+        code: NuiCamControl::RawCapture,
+        value,
+    };
+    // SAFETY: the control routine takes a pointer to a `ControlRequest`.
+    unsafe { kernel::call_export(control, kernel::address_of(&request), 0, 0, 0) };
 }
 
 /// Monitor control 0x97: queue a raw data request node; the first request
 /// turns capture on.
-pub(crate) fn service_queue_raw_data_request(node: u32) -> u32 {
+///
+/// # Safety
+///
+/// `argument` must be the nonnull address of a requester node that, until
+/// it is completed or flushed, stays valid and is touched only by this
+/// module, whose `buffer` holds `size` writable bytes, and whose `event`,
+/// when present, is an initialized event.
+pub(crate) unsafe fn service_queue_raw_data_request(argument: u32) -> u32 {
+    let node = core::ptr::with_exposed_provenance_mut::<RawDataNode>(argument as usize);
     // SAFETY: left below on the same thread.
     unsafe { xboxkrnl::KeEnterCriticalRegion() };
-    let enable = REQUESTS.lock().queue(node);
+    // SAFETY: the caller's contract for `node`. `initialize` reset the list
+    // before the control routine resolved, and `queue` queues only after
+    // that.
+    let enable = unsafe { REQUESTS.lock().queue(node) };
     if let Some(control) = enable {
-        switch_capture(control, 1);
+        switch_capture(control, CaptureMode::CAPTURING);
     }
     // SAFETY: entered above on the same thread.
     unsafe { xboxkrnl::KeLeaveCriticalRegion() };
@@ -189,9 +343,18 @@ pub(crate) fn service_queue_raw_data_request(node: u32) -> u32 {
 }
 
 /// Monitor control 0x96: complete the oldest request with a raw data
-/// block `{u32 flag, u16 tag, u8 kind, u8 pad, u32 data, u32 length}`.
-pub(crate) fn service_complete_raw_data_request(block: u32) -> u32 {
-    REQUESTS.lock().complete(block);
+/// block.
+///
+/// # Safety
+///
+/// `argument` must be the address of the driver's raw data block, valid
+/// and unchanged for the call, whose `data` points to `length` readable
+/// bytes outside every requester buffer.
+pub(crate) unsafe fn service_complete_raw_data_request(argument: u32) -> u32 {
+    // SAFETY: the caller's contract.
+    let block = unsafe { kernel::object_at::<RawDataBlock>(argument) };
+    // SAFETY: see `block`.
+    unsafe { REQUESTS.lock().complete(block) };
     0
 }
 
@@ -209,23 +372,28 @@ fn flush() {
     }
 }
 
-/// Monitor control 0xa1: `request` is `{u32 op, u32 value}`. Op 1 returns
-/// the old mode in `value` and selects capture; other ops store `value`.
-/// Pending requests are dropped and capture is switched to `value` for op
-/// 0, off otherwise.
-pub(crate) fn service_set_capture_mode(request: u32) -> u32 {
+/// Monitor control 0xa1: apply a `CaptureModeRequest`. Pending requests
+/// are dropped and capture is switched as the operation says.
+///
+/// # Safety
+///
+/// `argument` must be the address of the caller's `CaptureModeRequest`,
+/// readable and writable and not otherwise accessed for the call.
+pub(crate) unsafe fn service_set_capture_mode(argument: u32) -> u32 {
+    // SAFETY: the caller's contract.
+    let request = unsafe { kernel::object_at_mut::<CaptureModeRequest>(argument) };
     // SAFETY: left below on the same thread.
     unsafe { xboxkrnl::KeEnterCriticalRegion() };
-    let operation = read_word(request);
+    let operation = CaptureOperation::from_raw(request.operation);
     let control = REQUESTS.lock().set_mode(operation, request);
     if let Some(control) = control {
         flush();
         switch_capture(
             control,
-            if operation == 0 {
-                read_word(request + 4)
+            if operation == CaptureOperation::Apply {
+                request.value
             } else {
-                0
+                CaptureMode::OFF
             },
         );
     }
@@ -238,14 +406,4 @@ pub(crate) fn service_set_capture_mode(request: u32) -> u32 {
 /// 0x91f653d0).
 pub(crate) fn title_ended() {
     flush();
-}
-
-fn read_word(address: u32) -> u32 {
-    // SAFETY: callers pass addresses the input system supplied for output.
-    unsafe { core::ptr::read_volatile(address as usize as *const u32) }
-}
-
-fn write_word(address: u32, value: u32) {
-    // SAFETY: as `read_word`.
-    unsafe { core::ptr::write_volatile(address as usize as *mut u32, value) }
 }

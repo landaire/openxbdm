@@ -695,12 +695,16 @@ unsafe extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: 
         C::ADJUST_MEMORY_STATISTICS => unsafe {
             memory::service_adjust_memory_statistics(argument)
         },
-        C::NUI_CAM_COMPLETE_RAW_DATA => {
+        C::NUI_CAM_COMPLETE_RAW_DATA => unsafe {
             hardware::nuicam::service_complete_raw_data_request(argument)
-        }
-        C::NUI_CAM_QUEUE_RAW_DATA => hardware::nuicam::service_queue_raw_data_request(argument),
+        },
+        C::NUI_CAM_QUEUE_RAW_DATA => unsafe {
+            hardware::nuicam::service_queue_raw_data_request(argument)
+        },
         C::NUI_CAM_FLUSH_RAW_DATA => hardware::nuicam::service_flush_raw_data_requests(argument),
-        C::NUI_CAM_SET_CAPTURE_MODE => hardware::nuicam::service_set_capture_mode(argument),
+        C::NUI_CAM_SET_CAPTURE_MODE => unsafe {
+            hardware::nuicam::service_set_capture_mode(argument)
+        },
         C::SET_TRAP_PASSTHROUGH => {
             TRAP_PASSTHROUGH.store(u32::from(argument != 0), Ordering::Relaxed);
             0
@@ -716,7 +720,7 @@ unsafe extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: 
         },
         // 0x60 to 0x62 are empty routines; the remaining codes take the
         // monitor's default exit unless they are performance or PIX codes.
-        _ => super::performance::service(code.0, argument).unwrap_or(0),
+        _ => unsafe { super::performance::service(code, argument) }.unwrap_or(0),
     };
     monitor::tell_extension(code, argument, result)
 }

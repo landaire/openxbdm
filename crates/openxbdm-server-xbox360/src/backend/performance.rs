@@ -13,6 +13,9 @@ pub(crate) mod xtrace;
 
 pub(crate) use counters::memory_statistics;
 
+use core::sync::atomic::AtomicU32;
+use core::sync::atomic::Ordering;
+
 use openxbdm_server::commands::filesystem::DriveTable;
 use openxbdm_server::commands::performance;
 use openxbdm_server::commands::performance::COUNTER_NAME_CAPACITY;
@@ -42,7 +45,11 @@ use xbox360::module::SystemModule;
 use xbox360::module::module_handle;
 use xbox360::module::resolve_export;
 use xbox360::time::TickCount;
+use xbox360_sys::mmio::GpuRegisters;
+use xbox360_sys::mmio::GpuStatus;
 use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::AllocationType;
+use xbox360_sys::xboxkrnl::NotificationRegistration;
 use xbox360_sys::xboxkrnl::SmcCommand;
 use xbox360_sys::xboxkrnl::SmcMessage;
 use xbox360_sys::xboxkrnl::VdGetCurrentDisplayInformation;
@@ -50,26 +57,44 @@ use xbox360_sys::xboxkrnl::VdReadDVERegisterUlong;
 use xbox360_sys::xboxkrnl::VdWriteDVERegisterUlong;
 
 use super::Console;
+use super::dispatcher::ControlCode;
 use crate::kernel;
 
-/// GPU register block.
-const GPU_REGISTERS: usize = 0x7fc8_0000;
-/// GPU status register; bit 31 is set while a flip is pending.
-const GPU_FLIP_PENDING: usize = 0x7fc8_1740;
-/// Display controller gamma control; bits 8 to 10.
-const DISPLAY_GAMMA: usize = 0x7fc8_6104;
-/// Display controller front buffer address.
-const DISPLAY_FRONT_BUFFER: usize = 0x7fc8_6110;
-/// Longest wait for a pending flip.
-const FLIP_WAIT_MS: u32 = 500;
-/// Video encoder identification register; 0x10000 and up have the
-/// extended banks.
-const ENCODER_ID_REGISTER: u32 = 0xfe;
-const ENCODER_EXTENDED_ID: u32 = 0x1_0000;
-/// Kernel export that reads an EDID block.
-const EDID_EXPORT: Ordinal = Ordinal::new(623).unwrap();
-/// Extended registers whose writes are bracketed by bus requests.
-const BRACKETED_REGISTERS: core::ops::RangeInclusive<u32> = 0x1d0..=0x1f5;
+/// Bytes of an `SmcCommand::I2c` message.
+mod i2c {
+    /// Byte of the operation and its flags.
+    pub(super) const CONTROL: usize = 1;
+    /// Byte of the device: [`DEVICE_SELECT`] and the 7-bit bus address.
+    pub(super) const DEVICE: usize = 3;
+    pub(super) const REGISTER: usize = 6;
+    pub(super) const VALUE: usize = 7;
+    pub(super) const DEVICE_SELECT: u8 = 0x80;
+    /// Bus address of the video encoder registers 0x100 to 0x1ff.
+    pub(super) const ENCODER: u8 = 0x39;
+    /// Bus address of the video encoder registers 0x200 to 0x2ff.
+    pub(super) const ENCODER_HIGH: u8 = 0x3d;
+}
+
+xbox360_sys::flags! {
+    /// Control byte ([`i2c::CONTROL`]) of an SMC I2C message.
+    pub struct I2cControl(u8) {
+        /// The transfer is bracketed by bus requests.
+        BRACKETED = 0x01,
+        /// Write one byte.
+        WRITE_BYTE = 0x20,
+    }
+}
+
+impl I2cControl {
+    /// Control value of the bus request before a bracketed write:
+    /// [`I2cControl::BRACKETED`] and bit 0x2, whose meaning is unknown; stock
+    /// sets it only here.
+    const BUS_REQUEST: Self = Self::BRACKETED.union(Self::from_bits_retain(0x2));
+    /// Control value of the bus request after a bracketed write:
+    /// [`I2cControl::BRACKETED`] and bit 0x4, whose meaning is unknown; stock
+    /// sets it only here.
+    const BUS_RELEASE: Self = Self::BRACKETED.union(Self::from_bits_retain(0x4));
+}
 
 /// Platform state of this domain.
 pub struct Data {
@@ -90,24 +115,25 @@ pub(crate) fn initialize() {
     counters::initialize();
     capture::initialize();
     pix::initialize();
-    // SAFETY: written once, before the kernel uses the registration.
+    // SAFETY: the record is not registered yet. The routine stays loaded
+    // until `shut_down` removes the record.
     unsafe {
-        *TITLE_ENDED.0.get() = [
+        TITLE_ENDED.routine.store(
             title_ended_entry as *const () as usize as u32,
-            TITLE_ENDED_PRIORITY,
-            0,
-            0,
-        ]
-    };
-    // SAFETY: TITLE_ENDED is a static registration filled in above.
-    unsafe { xboxkrnl::ExRegisterTitleTerminateNotification(TITLE_ENDED.0.get().cast(), true) };
+            Ordering::Relaxed,
+        );
+        TITLE_ENDED
+            .priority
+            .store(TITLE_ENDED_PRIORITY, Ordering::Relaxed);
+        xboxkrnl::ExRegisterTitleTerminateNotification(TITLE_ENDED.as_ptr(), true);
+    }
 }
 
 /// Stop every timer, DPC, thread, and hook that calls into this image;
 /// runs before the image unloads.
 pub(crate) fn shut_down() {
     // SAFETY: TITLE_ENDED is the static registration added by `initialize`.
-    unsafe { xboxkrnl::ExRegisterTitleTerminateNotification(TITLE_ENDED.0.get().cast(), false) };
+    unsafe { xboxkrnl::ExRegisterTitleTerminateNotification(TITLE_ENDED.as_ptr(), false) };
     counters::shut_down();
     capture::shut_down();
     profiler::shut_down();
@@ -125,14 +151,9 @@ pub(crate) fn title_terminated() {
     pix::title_terminated();
 }
 
-/// Title terminate registration `{routine, priority, 0, 0}` of stock
-/// 0x91f97444, which runs after the main one (0x91f32398).
-struct Registration(core::cell::UnsafeCell<[u32; 4]>);
-
-// SAFETY: written once during initialization, then read by the kernel.
-unsafe impl Sync for Registration {}
-
-static TITLE_ENDED: Registration = Registration(core::cell::UnsafeCell::new([0; 4]));
+/// Title terminate registration of stock 0x91f97444, which runs after the
+/// main one (0x91f32398).
+static TITLE_ENDED: NotificationRegistration = NotificationRegistration::new();
 const TITLE_ENDED_PRIORITY: u32 = 0x6d80_0000;
 
 /// Second title terminate routine (stock 0x91f32418): the title's handles
@@ -145,89 +166,101 @@ extern "C" fn title_ended() {
 crate::exports::bridged!(title_ended_entry, title_ended);
 
 /// Monitor control codes of this domain; `None` for other codes.
-pub(crate) fn service(code: u32, argument: u32) -> Option<u32> {
-    match code {
-        0x99 => Some(studio::service_set_device_status(argument)),
-        0x1b => Some(pix::service_post_text(argument)),
-        0x27 => Some(pix::service_write_dword(argument)),
-        0x41 => Some(pix::service_unregister_consumer(argument)),
-        0x42 => Some(pix::service_register_consumer(argument)),
-        0x43 => Some(pix::service_write_block(argument)),
-        0x45 => Some(pix::service_filter_control(argument)),
-        0x58 => Some(pix::service_register_persistent_consumer(argument)),
-        0x5e => Some(pix::service_write_block_list(argument)),
-        0x7f => Some(pix::service_disk_start(argument)),
-        0x80 => Some(pix::service_disk_complete(argument)),
-        0x2e => Some(pix::service_frame(argument)),
-        0x2f => Some(pix::service_register_callback(argument)),
-        0x30 => Some(pix::service_unregister_callback(argument)),
-        0x3c => Some(pix::service_thread_slot(argument)),
-        0x3f => Some(pix::service_set_discard_output(argument)),
-        0x44 => Some(pix::service_state_flags(argument)),
-        0x52 => Some(pix::service_frame_record(argument)),
-        0x53 => Some(pix::service_open_for_capture(argument)),
-        0x54 => Some(pix::service_open_for_start(argument)),
-        0x55 => Some(pix::service_write_capture_record(argument)),
-        0x57 => Some(pix::service_queue_message(argument)),
-        0x59 => Some(pix::service_acquire_owner(argument)),
-        0x5a => Some(pix::service_release_owner(argument)),
-        0x83 => Some(pix::service_resource_begin(argument)),
-        0x84 => Some(pix::service_resource_record(argument)),
-        0x85 => Some(pix::service_resource_end(argument)),
-        0x87 => Some(pix::service_resource_information(argument)),
-        0x50 => Some(pix::service_timing_request(argument)),
-        0x51 => Some(pix::service_frame_buffer(argument)),
-        0x56 => Some(pix::service_configure(argument)),
-        0x5b => Some(pix::service_samples(argument)),
-        0x5c => Some(pix::service_command_buffers(argument)),
-        0x5d => Some(pix::service_fence(argument)),
-        0x8d => Some(pix::service_nuicam_begin(argument)),
-        0x8e => Some(pix::service_end(argument)),
-        0x9f => Some(studio::service_set_test_mode(argument)),
-        0x38 => Some(xtrace::service_start(argument)),
-        0x39 => Some(xtrace::service_stop(argument)),
-        0x3a => Some(xtrace::service_instruction_count(argument)),
-        0x3b => Some(xtrace::service_request_stop(argument)),
-        _ => None,
-    }
+///
+/// # Safety
+///
+/// `argument` must meet the contract of the service of `code`.
+pub(crate) unsafe fn service(code: ControlCode, argument: u32) -> Option<u32> {
+    use ControlCode as C;
+    // SAFETY: each `unsafe` arm passes `argument` under the caller's
+    // contract for `code`, which is the contract of its service.
+    Some(match code {
+        C::STUDIO_SET_DEVICE_STATUS => unsafe { studio::service_set_device_status(argument) },
+        C::PIX_POST_TEXT => unsafe { pix::service_post_text(argument) },
+        C::PIX_WRITE_DWORD => pix::service_write_dword(argument),
+        C::PIX_UNREGISTER_CONSUMER => unsafe { pix::service_unregister_consumer(argument) },
+        C::PIX_REGISTER_CONSUMER => unsafe { pix::service_register_consumer(argument) },
+        C::PIX_WRITE_BLOCK => unsafe { pix::service_write_block(argument) },
+        C::PIX_FILTER_CONTROL => unsafe { pix::service_filter_control(argument) },
+        C::PIX_REGISTER_PERSISTENT_CONSUMER => unsafe {
+            pix::service_register_persistent_consumer(argument)
+        },
+        C::PIX_WRITE_BLOCK_LIST => unsafe { pix::service_write_block_list(argument) },
+        C::PIX_DISK_START => unsafe { pix::service_disk_start(argument) },
+        C::PIX_DISK_COMPLETE => pix::service_disk_complete(argument),
+        C::PIX_FRAME => pix::service_frame(argument),
+        C::PIX_REGISTER_CALLBACK => unsafe { pix::service_register_callback(argument) },
+        C::PIX_UNREGISTER_CALLBACK => pix::service_unregister_callback(argument),
+        C::PIX_THREAD_SLOT => pix::service_thread_slot(argument),
+        C::PIX_SET_DISCARD_OUTPUT => pix::service_set_discard_output(argument),
+        C::PIX_STATE_FLAGS => pix::service_state_flags(argument),
+        C::PIX_FRAME_RECORD => unsafe { pix::service_frame_record(argument) },
+        C::PIX_OPEN_FOR_CAPTURE => unsafe { pix::service_open_for_capture(argument) },
+        C::PIX_OPEN_FOR_START => unsafe { pix::service_open_for_start(argument) },
+        C::PIX_WRITE_CAPTURE_RECORD => unsafe { pix::service_write_capture_record(argument) },
+        C::PIX_QUEUE_MESSAGE => unsafe { pix::service_queue_message(argument) },
+        C::PIX_ACQUIRE_OWNER => unsafe { pix::service_acquire_owner(argument) },
+        C::PIX_RELEASE_OWNER => pix::service_release_owner(argument),
+        C::PIX_RESOURCE_BEGIN => unsafe { pix::service_resource_begin(argument) },
+        C::PIX_RESOURCE_RECORD => unsafe { pix::service_resource_record(argument) },
+        C::PIX_RESOURCE_END => unsafe { pix::service_resource_end(argument) },
+        C::PIX_RESOURCE_INFORMATION => unsafe { pix::service_resource_information(argument) },
+        C::PIX_TIMING_REQUEST => unsafe { pix::service_timing_request(argument) },
+        C::PIX_FRAME_BUFFER => unsafe { pix::service_frame_buffer(argument) },
+        C::PIX_CONFIGURE => unsafe { pix::service_configure(argument) },
+        C::PIX_SAMPLES => unsafe { pix::service_samples(argument) },
+        C::PIX_COMMAND_BUFFERS => unsafe { pix::service_command_buffers(argument) },
+        C::PIX_FENCE => unsafe { pix::service_fence(argument) },
+        C::PIX_NUICAM_BEGIN => unsafe { pix::service_nuicam_begin(argument) },
+        C::PIX_END => pix::service_end(argument),
+        C::STUDIO_SET_TEST_MODE => unsafe { studio::service_set_test_mode(argument) },
+        C::XTRACE_START => xtrace::service_start(argument),
+        C::XTRACE_STOP => xtrace::service_stop(argument),
+        C::XTRACE_INSTRUCTION_COUNT => xtrace::service_instruction_count(argument),
+        C::XTRACE_REQUEST_STOP => xtrace::service_request_stop(argument),
+        _ => return None,
+    })
 }
 
-fn read_register(address: usize) -> u32 {
-    // SAFETY: GPU and display controller registers are mapped in every
-    // process.
-    unsafe { core::ptr::read_volatile(address as *const u32) }
+/// A 64-bit value as two relaxed words, high word first; the high word is
+/// accessed first. A reader that races the writer may see the halves of
+/// two values, as in stock.
+#[inline(always)]
+pub(super) fn load_pair(pair: &[AtomicU32; 2]) -> u64 {
+    let high = pair[0].load(Ordering::Relaxed);
+    (u64::from(high) << 32) | u64::from(pair[1].load(Ordering::Relaxed))
 }
 
-/// Bytes of the NUL-terminated string at `address`, at most `limit`.
-#[inline(never)]
-fn c_string<'a>(address: u32, limit: usize) -> &'a [u8] {
-    let mut length = 0;
-    // SAFETY: callers pass a NUL-terminated string or one of at least
-    // `limit` readable bytes.
-    while length < limit
-        && unsafe { core::ptr::read_volatile((address as usize + length) as *const u8) } != 0
-    {
-        length += 1;
-    }
-    // SAFETY: the bytes were just read.
-    unsafe { core::slice::from_raw_parts(address as usize as *const u8, length) }
+#[inline(always)]
+pub(super) fn store_pair(pair: &[AtomicU32; 2], value: u64) {
+    pair[0].store((value >> 32) as u32, Ordering::Relaxed);
+    pair[1].store(value as u32, Ordering::Relaxed);
 }
+
+/// `NtAllocateVirtualMemory` type: commit, reserve, 64 KiB pages.
+pub(crate) const COMMIT_RESERVE_LARGE: AllocationType = AllocationType::COMMIT
+    .union(AllocationType::RESERVE)
+    .union(AllocationType::LARGE_PAGES);
 
 impl Console {
     fn encoder_extended(&mut self) -> bool {
+        /// Video encoder identification register; identifications from
+        /// 0x10000 have the extended banks.
+        const ID_REGISTER: u32 = 0xfe;
+        const EXTENDED_ID: u32 = 0x1_0000;
         *self.performance.encoder_extended.get_or_insert_with(|| {
             // SAFETY: reads a video encoder register; no memory is involved.
-            let id = unsafe { VdReadDVERegisterUlong(ENCODER_ID_REGISTER) };
-            id >= ENCODER_EXTENDED_ID
+            let id = unsafe { VdReadDVERegisterUlong(ID_REGISTER) };
+            id >= EXTENDED_ID
         })
     }
 }
 
-/// Send one SMC I2C message carrying `flags` in byte 1.
-fn send_i2c_request(flags: u8) {
+/// Send one SMC I2C message carrying `control`.
+fn send_i2c_request(control: I2cControl) {
     let mut message = SmcMessage::new(SmcCommand::I2c);
     let mut reply = SmcMessage::default();
-    message.0[1] = flags;
+    message.0[i2c::CONTROL] = control.bits();
     // SAFETY: `message` and `reply` are live SMC messages.
     unsafe { xboxkrnl::HalSendSMCMessage(&message, &mut reply) };
 }
@@ -264,27 +297,32 @@ impl performance::Backend for Console {
     }
 
     fn capture_display(&mut self) -> DisplayCapture {
-        if read_register(GPU_FLIP_PENDING) & 0x8000_0000 != 0 {
+        /// Longest wait for a pending flip.
+        const FLIP_WAIT_MS: u32 = 500;
+        let gpu = GpuRegisters::get();
+        let flip_pending = || gpu.status().read().contains(GpuStatus::BUSY);
+        if flip_pending() {
             let start = TickCount::now().milliseconds();
             while TickCount::now().milliseconds().wrapping_sub(start) <= FLIP_WAIT_MS
-                && read_register(GPU_FLIP_PENDING) & 0x8000_0000 != 0
+                && flip_pending()
             {}
         }
-        let front_buffer = read_register(DISPLAY_FRONT_BUFFER);
-        let mut information = [0u32; 0x18];
-        // SAFETY: `information` is a live 0x60-byte display information block.
-        unsafe { VdGetCurrentDisplayInformation(information.as_mut_ptr().cast()) };
-        let gamma = (read_register(DISPLAY_GAMMA) >> 8) & 7 != 0;
+        let front_buffer = gpu.display_primary_surface().read();
+        let mut information = xboxkrnl::DisplayInformation::new();
+        // SAFETY: `information` is a live display information block.
+        unsafe { VdGetCurrentDisplayInformation(information.as_mut_ptr()) };
+        // Bits 8 to 10 hold the gamma setting.
+        let gamma = (gpu.display_graphics_control().read() >> 8) & 7 != 0;
         DisplayCapture {
             display: DisplayInformation {
-                surface_width: (information[0] >> 16) as u16,
-                colorspace: (information[1] >> 24) as u8,
-                left: information[2],
-                top: information[3],
-                right: information[4],
-                bottom: information[5],
-                scaled_width: information[6],
-                scaled_height: information[7],
+                surface_width: information.surface_width,
+                colorspace: information.colorspace,
+                left: information.left,
+                top: information.top,
+                right: information.right,
+                bottom: information.bottom,
+                scaled_width: information.scaled_width,
+                scaled_height: information.scaled_height,
             },
             front_buffer,
             gamma,
@@ -292,10 +330,11 @@ impl performance::Backend for Console {
     }
 
     fn read_framebuffer_page(&mut self, address: u32, page: &mut [u8]) {
-        // SAFETY: the page lies in the mapped front buffer.
+        // SAFETY: the server passes a tile of the front buffer that
+        // `capture_display` reported, which stays mapped while the display
+        // controller scans it out.
         unsafe { xboxkrnl::KeFlushCacheRange(address, TILE_SIZE) };
-        // SAFETY: the page lies in the front buffer the display controller
-        // scans out.
+        // SAFETY: as above.
         let source = unsafe {
             core::slice::from_raw_parts(address as usize as *const u8, TILE_SIZE as usize)
         };
@@ -321,45 +360,60 @@ impl performance::Backend for Console {
     /// One-byte I2C write to device 0x39 (0x100..0x1ff) or 0x3d
     /// (0x200..0x2ff), as stock 0x91f23f00.
     fn write_video_encoder_extended(&mut self, register: u32, value: u8) {
+        /// Extended registers whose writes are bracketed by bus requests.
+        const BRACKETED_REGISTERS: core::ops::RangeInclusive<u32> = 0x1d0..=0x1f5;
         let mut message = SmcMessage::new(SmcCommand::I2c);
         let mut reply = SmcMessage::default();
-        message.0[1] = 2 << 4;
-        message.0[3] = 0x80 | if register > 0x1ff { 0x3d } else { 0x39 };
-        message.0[6] = register as u8;
-        message.0[7] = value;
+        message.0[i2c::CONTROL] = I2cControl::WRITE_BYTE.bits();
+        message.0[i2c::DEVICE] = i2c::DEVICE_SELECT
+            | if register > 0x1ff {
+                i2c::ENCODER_HIGH
+            } else {
+                i2c::ENCODER
+            };
+        message.0[i2c::REGISTER] = register as u8;
+        message.0[i2c::VALUE] = value;
         let bracketed = BRACKETED_REGISTERS.contains(&register);
-        let bus_requests = hardware_flags().bits() & 0xf000_0000 != 0;
+        let bus_requests = hardware_flags().generation().get() != 0;
         if bracketed {
-            message.0[1] |= 1;
+            message.0[i2c::CONTROL] |= I2cControl::BRACKETED.bits();
             if bus_requests {
-                send_i2c_request(3);
+                send_i2c_request(I2cControl::BUS_REQUEST);
             }
         }
         // SAFETY: `message` and `reply` are live SMC messages.
         unsafe { xboxkrnl::HalSendSMCMessage(&message, &mut reply) };
         if bracketed && bus_requests {
-            send_i2c_request(5);
+            send_i2c_request(I2cControl::BUS_RELEASE);
         }
-        if reply.0[1] != 0 {
+        // Byte 1 of the reply is the error code.
+        if reply.0[i2c::CONTROL] != 0 {
             pmc::print(
                 c"BD: Failed to write I2C bus address %X, error code %u\n",
-                &[u64::from(register), u64::from(reply.0[1])],
+                &[u64::from(register), u64::from(reply.0[i2c::CONTROL])],
             );
         }
     }
 
     fn read_gpu_register(&mut self, index: u32) -> u32 {
-        read_register(GPU_REGISTERS + index as usize * 4)
+        // The command accepts indexes up to 0xfffc.
+        GpuRegisters::get().register(index as u16).read()
     }
 
     fn write_gpu_register(&mut self, index: u32, value: u32) {
-        // SAFETY: the index was checked against the register block.
+        // SAFETY: `gpoke` stores any GPU register at the debugger's request,
+        // as stock XBDM does; the debugger answers for the effects. Stock
+        // issues no `eieio` after the store.
         unsafe {
-            core::ptr::write_volatile((GPU_REGISTERS + index as usize * 4) as *mut u32, value)
+            GpuRegisters::get()
+                .register(index as u16)
+                .write_unordered(value)
         }
     }
 
     fn read_edid(&mut self, block: u8, output: &mut [u8; EDID_BLOCK_SIZE]) -> EdidRead {
+        /// Kernel export that reads an EDID block.
+        const EDID_EXPORT: Ordinal = Ordinal::new(623).unwrap();
         let Ok(function) = SystemModule::Kernel
             .handle()
             .and_then(|module| resolve_export(module, EDID_EXPORT))
@@ -431,7 +485,7 @@ impl performance::Backend for Console {
         let mut executable = [0u8; module_snapshot::PATH_LIMIT + 2];
         let length = drives.object_path_to_drive_path(
             self,
-            module_snapshot::executable_object_path(),
+            module_snapshot::ExecutableObjectPath::read().as_bytes(),
             &mut executable,
         );
         profiler::start(

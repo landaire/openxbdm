@@ -6,7 +6,9 @@
 //! through a table of six routines at the start of the transport object.
 
 use core::cell::UnsafeCell;
+use core::mem::offset_of;
 use core::sync::atomic::AtomicBool;
+use core::sync::atomic::AtomicU8;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
@@ -22,6 +24,7 @@ use openxbdm_server::commands::performance::studio::Stream;
 use openxbdm_server::commands::performance::studio::StudioError;
 use openxbdm_server::commands::performance::studio::Transport;
 use openxbdm_server::commands::performance::studio::routine_result;
+use xbox360::module::Ordinal;
 use xbox360_sys::status::Win32Error;
 use xbox360_sys::xam;
 use xbox360_sys::xam::AddressFamily;
@@ -29,6 +32,7 @@ use xbox360_sys::xam::IoctlCommand;
 use xbox360_sys::xam::MessageFlags;
 use xbox360_sys::xam::NetworkEvents;
 use xbox360_sys::xam::Protocol;
+use xbox360_sys::xam::SockAddrIn;
 use xbox360_sys::xam::Socket;
 use xbox360_sys::xam::SocketType;
 use xbox360_sys::xam::XnCaller;
@@ -44,52 +48,138 @@ use crate::kernel;
 use crate::kernel::CriticalSection;
 
 /// Kernel export that queues null-cable transfers.
-const NULL_CABLE_ORDINAL: u32 = 810;
+const NULL_CABLE_ORDINAL: Ordinal = Ordinal::new(810).unwrap();
 /// XAM export of the studio service.
-const STUDIO_SERVICE_ORDINAL: u32 = 1670;
-/// Studio service call made before a session starts; failure skips it.
-const SERVICE_PREPARE: u32 = 1;
-/// Studio service call that runs a session over `{transport, stop event}`
-/// until the event is set or the connection ends.
-const SERVICE_RUN: u32 = 0x101;
+const STUDIO_SERVICE_ORDINAL: Ordinal = Ordinal::new(1670).unwrap();
 
-/// Null-cable request codes.
-const NULL_CABLE_SEND: u32 = 1;
-const NULL_CABLE_RECEIVE: u32 = 2;
-const NULL_CABLE_CANCEL: u32 = 3;
-/// Report the device status again through monitor control code 0x99.
-const NULL_CABLE_REPORT_STATUS: u32 = 4;
-
-const WORKER_STACK_SIZE: u32 = 0x4000;
-const WORKER_CREATION_FLAGS: ThreadCreationFlags =
-    ThreadCreationFlags::from_bits_retain(0x1000042f);
-const NULL_CABLE_POOL_TAG: PoolTag = PoolTag::new(*b"uNSX");
-const SOCKET_POOL_TAG: PoolTag = PoolTag::new(*b"sNSX");
-
-const FD_READ_WRITE: NetworkEvents = NetworkEvents::READ.union(NetworkEvents::WRITE);
-const SOCKADDR_SIZE: i32 = 16;
-
-const STATUS_PENDING: u32 = 0x103;
-const INFINITE: u32 = u32::MAX;
-
-/// Offset of the event handle in a caller request; +0 receives the
-/// transfer count or request handle and +4 the null-cable status.
-const REQUEST_EVENT: u32 = 0x10;
-const REQUEST_STATUS: u32 = 4;
-
-fn failed(status: u32) -> bool {
-    (status as i32) < 0
+/// Call code of the studio service export.
+#[repr(u32)]
+enum StudioServiceCall {
+    /// Made before a session starts; failure skips the session.
+    Prepare = 1,
+    /// Runs a session over [`SessionArguments`] until the stop event is set
+    /// or the connection ends.
+    Run = 0x101,
 }
 
-fn read_u32(address: u32) -> u32 {
-    // SAFETY: the caller passes the address of a readable dword.
-    unsafe { core::ptr::read_volatile(address as usize as *const u32) }
+/// Argument record of [`StudioServiceCall::Run`].
+#[repr(C)]
+struct SessionArguments {
+    transport: u32,
+    stop_event: u32,
 }
 
-fn write_u32(address: u32, value: u32) {
-    // SAFETY: the caller passes the address of a writable dword.
-    unsafe { core::ptr::write_volatile(address as usize as *mut u32, value) }
+const _: () = {
+    assert!(offset_of!(SessionArguments, transport) == 0);
+    assert!(offset_of!(SessionArguments, stop_event) == 4);
+    assert!(size_of::<SessionArguments>() == 8);
+};
+
+/// Request code of the null-cable export.
+#[repr(u32)]
+enum NullCableRequest {
+    Send = 1,
+    Receive = 2,
+    Cancel = 3,
+    /// Report the device status again through monitor control code 0x99.
+    ReportStatus = 4,
 }
+
+/// Parameter record of [`NullCableRequest::Send`] and
+/// [`NullCableRequest::Receive`].
+#[repr(C)]
+struct NullCableTransfer {
+    buffer: u32,
+    length: u32,
+    event: u32,
+    process_type: u32,
+    /// Address of the word that receives the transfer count.
+    count_address: u32,
+    /// Address of the word that receives the status.
+    status_address: u32,
+}
+
+const _: () = {
+    assert!(offset_of!(NullCableTransfer, buffer) == 0);
+    assert!(offset_of!(NullCableTransfer, length) == 4);
+    assert!(offset_of!(NullCableTransfer, event) == 8);
+    assert!(offset_of!(NullCableTransfer, process_type) == 0xc);
+    assert!(offset_of!(NullCableTransfer, count_address) == 0x10);
+    assert!(offset_of!(NullCableTransfer, status_address) == 0x14);
+    assert!(size_of::<NullCableTransfer>() == 0x18);
+};
+
+/// Value the kind routine of a transport returns.
+#[repr(u32)]
+enum TransportKind {
+    NullCable = 1,
+    Socket = 2,
+}
+
+/// Caller request record of the transport send, receive and result
+/// routines. The null-cable driver completes it asynchronously.
+#[repr(C)]
+struct TransferRequest {
+    /// Null-cable transfer count, or the socket transport's request handle.
+    result: AtomicU32,
+    /// Null-cable status; [`NtStatus::PENDING`] until the transfer ends.
+    status: AtomicU32,
+    _reserved: [AtomicU32; 2],
+    /// Event handle the caller waits on.
+    event: AtomicU32,
+}
+
+const _: () = {
+    assert!(offset_of!(TransferRequest, result) == 0);
+    assert!(offset_of!(TransferRequest, status) == 4);
+    assert!(offset_of!(TransferRequest, event) == 0x10);
+    assert!(size_of::<TransferRequest>() == 0x14);
+};
+
+impl TransferRequest {
+    /// # Safety
+    /// `address` is a caller request record that stays live for `'a`.
+    unsafe fn from_address<'a>(address: u32) -> &'a Self {
+        // SAFETY: per the contract; every field is an atomic word, so
+        // concurrent writes by the null-cable driver are permitted.
+        unsafe { kernel::object_at(address) }
+    }
+
+    fn event(&self) -> u32 {
+        self.event.load(Ordering::Relaxed)
+    }
+}
+
+/// Caller word that receives a transfer count.
+///
+/// # Safety
+/// `address` is an aligned writable u32 that stays live for `'a`.
+unsafe fn count_word<'a>(address: u32) -> &'a AtomicU32 {
+    // SAFETY: per the contract.
+    unsafe { kernel::object_at(address) }
+}
+
+/// Routine table at the start of every transport object, through which the
+/// studio service drives the transport.
+#[repr(C)]
+struct Routines {
+    kind: u32,
+    release: u32,
+    receive: u32,
+    send: u32,
+    result: u32,
+    cancel: u32,
+}
+
+const _: () = {
+    assert!(offset_of!(Routines, kind) == 0);
+    assert!(offset_of!(Routines, release) == 4);
+    assert!(offset_of!(Routines, receive) == 8);
+    assert!(offset_of!(Routines, send) == 0xc);
+    assert!(offset_of!(Routines, result) == 0x10);
+    assert!(offset_of!(Routines, cancel) == 0x14);
+    assert!(size_of::<Routines>() == 0x18);
+};
 
 /// Stock assertion trap (`twi 31, 0, 0x19`); execution continues after it.
 fn assertion_trap() {
@@ -140,25 +230,14 @@ fn close_socket(socket: SocketId) {
     unsafe { xam::NetDll_closesocket(XnCaller::DebugMonitor, Socket::from_raw(socket.0)) };
 }
 
-/// A kernel spin lock word in static memory.
-struct SpinLock(UnsafeCell<u32>);
-
-// SAFETY: the kernel serializes access to the lock word.
-unsafe impl Sync for SpinLock {}
-
-impl SpinLock {
-    fn pointer(&self) -> *mut KspinLock {
-        self.0.get().cast()
-    }
-
-    fn with<R>(&self, operation: impl FnOnce() -> R) -> R {
-        // SAFETY: the lock word lives in static memory.
-        let irql = unsafe { xboxkrnl::KfAcquireSpinLock(self.pointer()) };
-        let result = operation();
-        // SAFETY: acquired above at `irql`.
-        unsafe { xboxkrnl::KfReleaseSpinLock(self.pointer(), irql) };
-        result
-    }
+/// Run `operation` holding [`LOCK`].
+fn with_lock<R>(operation: impl FnOnce() -> R) -> R {
+    // SAFETY: LOCK is a static spin lock.
+    let irql = unsafe { xboxkrnl::KfAcquireSpinLock(LOCK.as_ptr()) };
+    let result = operation();
+    // SAFETY: acquired above at `irql`.
+    unsafe { xboxkrnl::KfReleaseSpinLock(LOCK.as_ptr(), irql) };
+    result
 }
 
 /// Session state guarded by [`SECTION`].
@@ -188,7 +267,7 @@ fn with_session<R>(operation: impl FnOnce(&mut Session) -> R) -> R {
 }
 
 /// Guards the flags below (stock 0x91fab700).
-static LOCK: SpinLock = SpinLock(UnsafeCell::new(0));
+static LOCK: KspinLock = KspinLock::new();
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static DEVICE_ATTACHED: AtomicBool = AtomicBool::new(false);
 static DEDICATED: AtomicBool = AtomicBool::new(false);
@@ -210,11 +289,13 @@ static SESSION: SessionCell = SessionCell(UnsafeCell::new(Session {
 static NULL_CABLE_REQUEST: AtomicU32 = AtomicU32::new(0);
 static STUDIO_SERVICE: AtomicU32 = AtomicU32::new(0);
 
-fn resolve(module: SystemModule, ordinal: u32) -> Result<u32, KernelError> {
+fn resolve(module: SystemModule, ordinal: Ordinal) -> Result<u32, KernelError> {
     let handle = module.handle()?;
     let mut address = 0u32;
     // SAFETY: `handle` is a loaded module handle and `address` a live u32.
-    let status = unsafe { xboxkrnl::XexGetProcedureAddress(handle.raw(), ordinal, &mut address) };
+    let status = unsafe {
+        xboxkrnl::XexGetProcedureAddress(handle.raw(), u32::from(ordinal.get()), &mut address)
+    };
     status.result()?;
     Ok(address)
 }
@@ -242,8 +323,12 @@ pub(crate) fn initialize() {
         Ok((request, service)) => {
             NULL_CABLE_REQUEST.store(request, Ordering::Release);
             STUDIO_SERVICE.store(service, Ordering::Release);
-            LOCK.with(|| INITIALIZED.store(true, Ordering::Relaxed));
-            call(&NULL_CABLE_REQUEST, NULL_CABLE_REPORT_STATUS, 0);
+            with_lock(|| INITIALIZED.store(true, Ordering::Relaxed));
+            call(
+                &NULL_CABLE_REQUEST,
+                NullCableRequest::ReportStatus as u32,
+                0,
+            );
         }
     }
 }
@@ -252,7 +337,7 @@ pub(crate) fn initialize() {
 /// keeps a new worker from starting; a stop already running on the server
 /// thread is waited out.
 pub(super) fn shut_down() {
-    LOCK.with(|| INITIALIZED.store(false, Ordering::Relaxed));
+    with_lock(|| INITIALIZED.store(false, Ordering::Relaxed));
     if !SECTION_READY.load(Ordering::Acquire) {
         return;
     }
@@ -271,7 +356,7 @@ pub(super) fn shut_down() {
 /// Stock 0x91f65a18, run on every server pass. Stock alerts the server
 /// thread to run it sooner; the passes here are at most 20 ms apart.
 pub(crate) fn poll() {
-    let (start, stop) = LOCK.with(|| {
+    let (start, stop) = with_lock(|| {
         let mut start = false;
         let mut stop = false;
         if INITIALIZED.load(Ordering::Relaxed) && !DEDICATED.load(Ordering::Relaxed) {
@@ -293,29 +378,53 @@ pub(crate) fn poll() {
 
 /// Monitor control code 0x99 (stock 0x91f65ab8), issued by the kernel's
 /// null-cable driver with `{+0 u8 status}`.
-pub(crate) fn service_set_device_status(argument: u32) -> u32 {
-    // SAFETY: LOCK is a static spin lock word; the kernel calls this at
-    // raised IRQL.
-    unsafe { xboxkrnl::KeAcquireSpinLockAtRaisedIrql(LOCK.pointer()) };
+///
+/// # Safety
+///
+/// `argument` must be the address of the status byte, kept valid by the
+/// caller for the call.
+pub(crate) unsafe fn service_set_device_status(argument: u32) -> u32 {
+    // SAFETY: the caller's contract.
+    let status = unsafe { kernel::object_at::<AtomicU8>(argument) };
+    // SAFETY: LOCK is a static spin lock; the kernel calls this at raised
+    // IRQL.
+    unsafe { xboxkrnl::KeAcquireSpinLockAtRaisedIrql(LOCK.as_ptr()) };
     if INITIALIZED.load(Ordering::Relaxed) {
-        // SAFETY: the kernel passes the address of the status byte.
-        let status = unsafe { core::ptr::read_volatile(argument as usize as *const u8) };
-        DEVICE_ATTACHED.store(status != 0, Ordering::Relaxed);
+        DEVICE_ATTACHED.store(status.load(Ordering::Relaxed) != 0, Ordering::Relaxed);
     }
     // SAFETY: acquired above.
-    unsafe { xboxkrnl::KeReleaseSpinLockFromRaisedIrql(LOCK.pointer()) };
+    unsafe { xboxkrnl::KeReleaseSpinLockFromRaisedIrql(LOCK.as_ptr()) };
     0
 }
 
+/// Argument record of monitor control code 0x9f.
+#[repr(C)]
+struct TestModeArgument {
+    _reserved: AtomicU32,
+    enable: AtomicU32,
+}
+
+const _: () = {
+    assert!(offset_of!(TestModeArgument, enable) == 4);
+    assert!(size_of::<TestModeArgument>() == 8);
+};
+
 /// Monitor control code 0x9f (stock 0x91f65dd0): `{+4 enable}`.
-pub(crate) fn service_set_test_mode(argument: u32) -> u32 {
-    let enable = read_u32(argument.wrapping_add(4)) != 0;
+///
+/// # Safety
+///
+/// `argument` must be the address of a test mode argument record the
+/// caller keeps valid for the call.
+pub(crate) unsafe fn service_set_test_mode(argument: u32) -> u32 {
+    // SAFETY: the caller's contract.
+    let argument = unsafe { kernel::object_at::<TestModeArgument>(argument) };
+    let enable = argument.enable.load(Ordering::Relaxed) != 0;
     kernel::debug_print(if enable {
         c"XStudioSlave: Setting Test Mode\n"
     } else {
         c"XStudioSlave: Disabling Test Mode\n"
     });
-    LOCK.with(|| TEST_MODE.store(enable, Ordering::Relaxed));
+    with_lock(|| TEST_MODE.store(enable, Ordering::Relaxed));
     0
 }
 
@@ -371,6 +480,7 @@ fn open_listener() -> Result<u16, StudioError> {
 
 /// Non-blocking, bound to an ephemeral port on every interface, backlog 1.
 fn configure_listener(socket: SocketId) -> Option<u16> {
+    const SOCKADDR_SIZE: usize = size_of::<SockAddrIn>();
     let mut nonblocking = 1u32;
     // SAFETY: `socket` is the listener opened by the caller; `nonblocking`
     // is a live u32.
@@ -385,7 +495,7 @@ fn configure_listener(socket: SocketId) -> Option<u16> {
     {
         return None;
     }
-    let mut address = [0u8; SOCKADDR_SIZE as usize];
+    let mut address = [0u8; SOCKADDR_SIZE];
     address[..2].copy_from_slice(&(AddressFamily::Inet.raw() as u16).to_be_bytes());
     // SAFETY: `address` is a live sockaddr of SOCKADDR_SIZE bytes.
     if unsafe {
@@ -393,13 +503,13 @@ fn configure_listener(socket: SocketId) -> Option<u16> {
             XnCaller::DebugMonitor,
             Socket::from_raw(socket.0),
             address.as_ptr(),
-            SOCKADDR_SIZE,
+            SOCKADDR_SIZE as i32,
         ) != 0
             || xam::NetDll_listen(XnCaller::DebugMonitor, Socket::from_raw(socket.0), 1) != 0
     } {
         return None;
     }
-    let mut length = SOCKADDR_SIZE;
+    let mut length = SOCKADDR_SIZE as i32;
     // SAFETY: `address` and `length` are live and describe SOCKADDR_SIZE bytes.
     if unsafe {
         xam::NetDll_getsockname(
@@ -424,11 +534,12 @@ fn start_session() {
         && INITIALIZED.load(Ordering::Relaxed);
     if ready {
         let mut reply = 0u32;
-        let prepared = !failed(call(
+        let prepared = NtStatus(call(
             &STUDIO_SERVICE,
-            SERVICE_PREPARE,
+            StudioServiceCall::Prepare as u32,
             &mut reply as *mut u32 as usize as u32,
-        ));
+        ))
+        .is_success();
         if !(prepared && create_worker())
             && let Some(event) = with_session(|session| session.stop_event.take())
         {
@@ -439,6 +550,18 @@ fn start_session() {
 }
 
 fn create_worker() -> bool {
+    const STACK_SIZE: u32 = 0x4000;
+    /// Bit 0x4, which `ExCreateThread` does not test and which has no name
+    /// in [`ThreadCreationFlags`].
+    const UNTESTED_FLAG: ThreadCreationFlags = ThreadCreationFlags::from_bits_retain(0x4);
+    const CREATION_FLAGS: ThreadCreationFlags = ThreadCreationFlags::SUSPENDED
+        .union(ThreadCreationFlags::SYSTEM_PROCESS)
+        .union(UNTESTED_FLAG)
+        .union(ThreadCreationFlags::TLS_DATA)
+        .union(ThreadCreationFlags::PRIORITY_CLASS_13)
+        .union(ThreadCreationFlags::NOT_DEBUGGABLE)
+        .union(ThreadCreationFlags::PROCESSOR4);
+    const _: () = assert!(CREATION_FLAGS.bits() == 0x1000_042f);
     // SAFETY: unnamed event without security attributes.
     let event = unsafe { xam::CreateEventA(0, false, false, core::ptr::null()) };
     let Some(event) = Handle::new(event.raw()) else {
@@ -452,15 +575,15 @@ fn create_worker() -> bool {
     let status = unsafe {
         xboxkrnl::ExCreateThread(
             &mut thread,
-            WORKER_STACK_SIZE,
+            STACK_SIZE,
             core::ptr::null_mut(),
             0,
             entry,
             0,
-            WORKER_CREATION_FLAGS,
+            CREATION_FLAGS,
         )
     };
-    if failed(status.0) {
+    if !status.is_success() {
         return false;
     }
     // SAFETY: `thread` is the handle of the suspended worker created above.
@@ -485,7 +608,7 @@ fn stop_session() {
     SECTION.leave();
     let Some(worker) = worker else { return };
     // SAFETY: `worker` is the owned worker thread handle, closed below.
-    unsafe { xam::WaitForSingleObject(xboxkrnl::Handle::from_raw(worker.0), INFINITE) };
+    unsafe { xam::WaitForSingleObject(xboxkrnl::Handle::from_raw(worker.0), xam::INFINITE) };
     SECTION.enter();
     let event = with_session(|session| {
         session.worker = None;
@@ -498,7 +621,11 @@ fn stop_session() {
     close_handle(worker);
     FINISHED.store(false, Ordering::Relaxed);
     SECTION.leave();
-    call(&NULL_CABLE_REQUEST, NULL_CABLE_REPORT_STATUS, 0);
+    call(
+        &NULL_CABLE_REQUEST,
+        NullCableRequest::ReportStatus as u32,
+        0,
+    );
 }
 
 /// Session thread (stock 0x91f656e8).
@@ -530,10 +657,21 @@ extern "C" fn worker(_context: u32) -> u32 {
         },
     };
     if let Some(object) = transport {
-        let run = [object, raw_handle(stop_event)];
-        call(&STUDIO_SERVICE, SERVICE_RUN, run.as_ptr() as usize as u32);
-        // SAFETY: routine 1 of every transport is its release routine.
-        unsafe { kernel::call_export(read_u32(object + 4), object, 0, 0, 0) };
+        let run = SessionArguments {
+            transport: object,
+            stop_event: raw_handle(stop_event),
+        };
+        call(
+            &STUDIO_SERVICE,
+            StudioServiceCall::Run as u32,
+            &run as *const SessionArguments as usize as u32,
+        );
+        // SAFETY: `object` is the transport created above, which the studio
+        // service no longer uses; every transport starts with its routine
+        // table.
+        let release = unsafe { kernel::object_at::<Routines>(object) }.release;
+        // SAFETY: the release routine takes the object and frees it.
+        unsafe { kernel::call_export(release, object, 0, 0, 0) };
     }
     if let Some(socket) = accepted {
         close_socket(socket);
@@ -551,7 +689,7 @@ extern "C" fn worker(_context: u32) -> u32 {
     if let Some(listener) = listener {
         close_socket(listener);
     }
-    LOCK.with(|| FINISHED.store(true, Ordering::Relaxed));
+    with_lock(|| FINISHED.store(true, Ordering::Relaxed));
     SECTION.leave();
     0
 }
@@ -594,9 +732,9 @@ fn accept_connection(
             };
             if let Err(error) = wait.result() {
                 set_last_error(error);
-            } else if wait.0 == 0 {
+            } else if wait == NtStatus::WAIT_0 {
                 break Err(StudioError::Aborted);
-            } else if wait.0 == 1 {
+            } else if wait == NtStatus::WAIT_1 {
                 // SAFETY: `listener` is the open listener; no address is requested.
                 let socket = unsafe {
                     xam::NetDll_accept(
@@ -640,16 +778,34 @@ fn routine(entry: unsafe extern "C" fn()) -> u32 {
 /// Null-cable transport object (stock 0x91f830e0).
 #[repr(C)]
 struct NullCableTransport {
-    routines: [u32; 6],
+    routines: Routines,
+    /// Address of the null-cable export.
     request: u32,
 }
 
+const _: () = {
+    assert!(offset_of!(NullCableTransport, routines) == 0);
+    assert!(offset_of!(NullCableTransport, request) == 0x18);
+    assert!(size_of::<NullCableTransport>() == 0x1c);
+};
+
+impl NullCableTransport {
+    /// # Safety
+    /// `this` is a transport from [`create_null_cable_transport`] that is
+    /// not yet released.
+    unsafe fn from_address<'a>(this: u32) -> &'a Self {
+        // SAFETY: per the contract.
+        unsafe { kernel::object_at(this) }
+    }
+}
+
 fn create_null_cable_transport() -> Result<u32, StudioError> {
+    const POOL_TAG: PoolTag = PoolTag::new(*b"uNSX");
     // SAFETY: pool allocation of the object size; the result is checked below.
     let object = unsafe {
         xboxkrnl::ExAllocatePoolTypeWithTag(
             size_of::<NullCableTransport>() as u32,
-            NULL_CABLE_POOL_TAG,
+            POOL_TAG,
             PoolType::System,
         )
     };
@@ -664,7 +820,11 @@ fn create_null_cable_transport() -> Result<u32, StudioError> {
             let mut address = 0u32;
             // SAFETY: `module` is the loaded kernel handle and `address` a live u32.
             let status = unsafe {
-                xboxkrnl::XexGetProcedureAddress(module.raw(), NULL_CABLE_ORDINAL, &mut address)
+                xboxkrnl::XexGetProcedureAddress(
+                    module.raw(),
+                    u32::from(NULL_CABLE_ORDINAL.get()),
+                    &mut address,
+                )
             };
             status
                 .result()
@@ -679,14 +839,14 @@ fn create_null_cable_transport() -> Result<u32, StudioError> {
             return Err(failure);
         }
     };
-    let routines = [
-        routine(null_cable_kind_entry),
-        routine(null_cable_release_entry),
-        routine(null_cable_receive_entry),
-        routine(null_cable_send_entry),
-        routine(null_cable_result_entry),
-        routine(null_cable_cancel_entry),
-    ];
+    let routines = Routines {
+        kind: routine(null_cable_kind_entry),
+        release: routine(null_cable_release_entry),
+        receive: routine(null_cable_receive_entry),
+        send: routine(null_cable_send_entry),
+        result: routine(null_cable_result_entry),
+        cancel: routine(null_cable_cancel_entry),
+    };
     // SAFETY: the pool returned a block of the object's size.
     unsafe {
         (object as usize as *mut NullCableTransport).write(NullCableTransport { routines, request })
@@ -694,54 +854,53 @@ fn create_null_cable_transport() -> Result<u32, StudioError> {
     Ok(object)
 }
 
-fn null_cable_request(this: u32) -> u32 {
-    // SAFETY: `this` is a null-cable transport.
-    unsafe { (*(this as usize as *const NullCableTransport)).request }
-}
-
 /// Map a null-cable request status (stock 0x91f83290); any other nonzero
 /// status, informational ones included, fails.
-fn null_cable_status(status: u32) -> Result<(), StudioError> {
-    let status = NtStatus(status);
-    if status == NtStatus::SUCCESS {
-        Ok(())
-    } else if status == KernelError::NoSuchDevice.status() {
-        Err(StudioError::NotConnected)
-    } else if status == KernelError::NoMemory.status() {
-        Err(StudioError::OutOfMemory)
-    } else if status == KernelError::NotImplemented.status() {
-        Err(StudioError::NotImplemented)
-    } else {
-        Err(StudioError::Fail)
+fn null_cable_status(status: NtStatus) -> Result<(), StudioError> {
+    match status {
+        NtStatus::SUCCESS => Ok(()),
+        status => Err(match KernelError::from_status(status) {
+            Some(KernelError::NoSuchDevice) => StudioError::NotConnected,
+            Some(KernelError::NoMemory) => StudioError::OutOfMemory,
+            Some(KernelError::NotImplemented) => StudioError::NotImplemented,
+            _ => StudioError::Fail,
+        }),
     }
 }
 
-fn null_cable_transfer(this: u32, code: u32, buffer: u32, length: u32, request: u32) -> u32 {
-    let parameters = [
+fn null_cable_transfer(
+    transport: &NullCableTransport,
+    code: NullCableRequest,
+    buffer: u32,
+    length: u32,
+    request: &TransferRequest,
+) -> u32 {
+    let parameters = NullCableTransfer {
         buffer,
         length,
-        read_u32(request + REQUEST_EVENT),
-        xboxkrnl::KeGetCurrentProcessType().0,
-        request,
-        request + REQUEST_STATUS,
-    ];
-    write_u32(request, 0);
-    write_u32(request + REQUEST_STATUS, STATUS_PENDING);
-    // SAFETY: the object holds the resolved kernel export.
+        event: request.event(),
+        process_type: xboxkrnl::KeGetCurrentProcessType().0,
+        count_address: request.result.as_ptr() as usize as u32,
+        status_address: request.status.as_ptr() as usize as u32,
+    };
+    request.result.store(0, Ordering::Relaxed);
+    request.status.store(NtStatus::PENDING.0, Ordering::Relaxed);
+    // SAFETY: the object holds the resolved kernel export; `parameters` is
+    // live for the call.
     let status = unsafe {
         kernel::call_export(
-            null_cable_request(this),
-            code,
-            parameters.as_ptr() as usize as u32,
+            transport.request,
+            code as u32,
+            &parameters as *const NullCableTransfer as usize as u32,
             0,
             0,
         )
     };
-    routine_result(null_cable_status(status)).0
+    routine_result(null_cable_status(NtStatus(status))).0
 }
 
 extern "C" fn null_cable_kind(_this: u32) -> u32 {
-    1
+    TransportKind::NullCable as u32
 }
 
 extern "C" fn null_cable_release(this: u32) -> u32 {
@@ -751,36 +910,66 @@ extern "C" fn null_cable_release(this: u32) -> u32 {
 }
 
 extern "C" fn null_cable_receive(this: u32, buffer: u32, length: u32, request: u32) -> u32 {
-    null_cable_transfer(this, NULL_CABLE_RECEIVE, buffer, length, request)
+    // SAFETY: the studio service passes the transport it was given and a
+    // request record that stays live until the request completes.
+    let (transport, request) = unsafe {
+        (
+            NullCableTransport::from_address(this),
+            TransferRequest::from_address(request),
+        )
+    };
+    null_cable_transfer(
+        transport,
+        NullCableRequest::Receive,
+        buffer,
+        length,
+        request,
+    )
 }
 
 extern "C" fn null_cable_send(this: u32, buffer: u32, length: u32, request: u32) -> u32 {
-    if read_u32(request + REQUEST_EVENT) == 0 {
+    // SAFETY: the studio service passes the transport it was given and a
+    // request record that stays live until the request completes.
+    let (transport, request) = unsafe {
+        (
+            NullCableTransport::from_address(this),
+            TransferRequest::from_address(request),
+        )
+    };
+    if request.event() == 0 {
         assertion_trap();
     }
-    null_cable_transfer(this, NULL_CABLE_SEND, buffer, length, request)
+    null_cable_transfer(transport, NullCableRequest::Send, buffer, length, request)
 }
 
 extern "C" fn null_cable_result(_this: u32, request: u32, transferred: u32, wait: u32) -> u32 {
-    let event = read_u32(request + REQUEST_EVENT);
+    // SAFETY: the studio service passes a submitted request record and the
+    // address of its count word, both live for the call.
+    let (request, transferred) = unsafe {
+        (
+            TransferRequest::from_address(request),
+            count_word(transferred),
+        )
+    };
+    let event = request.event();
     if event == 0 {
         assertion_trap();
     }
     let status = loop {
         core::sync::atomic::fence(Ordering::Acquire);
-        let status = read_u32(request + REQUEST_STATUS);
-        if status != STATUS_PENDING {
+        let status = NtStatus(request.status.load(Ordering::Relaxed));
+        if status != NtStatus::PENDING {
             break status;
         }
         if wait == 0 {
             return routine_result(Err(StudioError::Pending)).0;
         }
         // SAFETY: `event` is the caller's event handle of the request.
-        unsafe { xam::WaitForSingleObject(xboxkrnl::Handle::from_raw(event), INFINITE) };
+        unsafe { xam::WaitForSingleObject(xboxkrnl::Handle::from_raw(event), xam::INFINITE) };
     };
     core::sync::atomic::fence(Ordering::Acquire);
-    write_u32(transferred, read_u32(request));
-    routine_result(if status != 0 {
+    transferred.store(request.result.load(Ordering::Relaxed), Ordering::Relaxed);
+    routine_result(if status != NtStatus::SUCCESS {
         Err(StudioError::Fail)
     } else {
         Ok(())
@@ -789,24 +978,25 @@ extern "C" fn null_cable_result(_this: u32, request: u32, transferred: u32, wait
 }
 
 extern "C" fn null_cable_cancel(this: u32) -> u32 {
+    // SAFETY: the studio service passes the transport it was given.
+    let transport = unsafe { NullCableTransport::from_address(this) };
     let parameters = [xboxkrnl::KeGetCurrentProcessType()];
     // SAFETY: the object holds the resolved kernel export.
     let status = unsafe {
         kernel::call_export(
-            null_cable_request(this),
-            NULL_CABLE_CANCEL,
+            transport.request,
+            NullCableRequest::Cancel as u32,
             parameters.as_ptr() as usize as u32,
             0,
             0,
         )
     };
-    let status = NtStatus(status);
-    let result = if status == NtStatus::SUCCESS {
-        Ok(())
-    } else if status == KernelError::NotImplemented.status() {
-        Err(StudioError::NotImplemented)
-    } else {
-        Err(StudioError::Fail)
+    let result = match NtStatus(status) {
+        NtStatus::SUCCESS => Ok(()),
+        status => Err(match KernelError::from_status(status) {
+            Some(KernelError::NotImplemented) => StudioError::NotImplemented,
+            _ => StudioError::Fail,
+        }),
     };
     routine_result(result).0
 }
@@ -822,7 +1012,7 @@ bridged!(null_cable_cancel_entry, null_cable_cancel);
 /// addresses inside the object, as stock's request nodes are.
 #[repr(C)]
 struct SocketTransport {
-    routines: [u32; 6],
+    routines: Routines,
     section: CriticalSection,
     /// Caller event bound by the first request.
     event: Option<Handle>,
@@ -879,7 +1069,10 @@ impl Stream for SocketStream {
     }
 
     fn read_length(&mut self, address: u32) -> u32 {
-        read_u32(address)
+        // SAFETY: the engine passes the start of a caller receive buffer that
+        // holds a received length word; the studio service keeps the buffer
+        // live until its request completes.
+        unsafe { (address as usize as *const u32).read_unaligned() }
     }
 
     fn signal(&mut self) {
@@ -892,25 +1085,26 @@ impl Stream for SocketStream {
 }
 
 fn create_socket_transport(socket: SocketId) -> Result<u32, StudioError> {
+    const POOL_TAG: PoolTag = PoolTag::new(*b"sNSX");
     // SAFETY: pool allocation of the object size; the result is checked below.
     let object = unsafe {
         xboxkrnl::ExAllocatePoolTypeWithTag(
             size_of::<SocketTransport>() as u32,
-            SOCKET_POOL_TAG,
+            POOL_TAG,
             PoolType::System,
         )
     };
     if object == 0 {
         return Err(StudioError::OutOfMemory);
     }
-    let routines = [
-        routine(socket_kind_entry),
-        routine(socket_release_entry),
-        routine(socket_receive_entry),
-        routine(socket_send_entry),
-        routine(socket_result_entry),
-        routine(socket_cancel_entry),
-    ];
+    let routines = Routines {
+        kind: routine(socket_kind_entry),
+        release: routine(socket_release_entry),
+        receive: routine(socket_receive_entry),
+        send: routine(socket_send_entry),
+        result: routine(socket_result_entry),
+        cancel: routine(socket_cancel_entry),
+    };
     let pointer = object as usize as *mut SocketTransport;
     // SAFETY: the pool returned a block of the object's size.
     unsafe {
@@ -954,9 +1148,14 @@ unsafe fn enter<'a>(this: u32) -> &'a mut SocketTransport {
     }
 }
 
-fn leave(this: u32) {
+/// Leave the object's critical section.
+///
+/// # Safety
+/// `this` is a socket transport whose section the calling thread holds, and
+/// no borrow from [`enter`] is used afterwards.
+unsafe fn leave(this: u32) {
     let pointer = this as usize as *mut SocketTransport;
-    // SAFETY: `this` is a socket transport whose section the thread holds.
+    // SAFETY: per the contract.
     unsafe { &(*pointer).section }.leave();
 }
 
@@ -987,6 +1186,7 @@ impl SocketTransport {
 
     /// Bind the caller's event on the first request (stock 0x91f84030).
     fn bind_event(&mut self, event: u32) {
+        const FD_READ_WRITE: NetworkEvents = NetworkEvents::READ.union(NetworkEvents::WRITE);
         if self.event.is_none() {
             self.event = Handle::new(event);
             // SAFETY: `socket` is the transport's connection and `event` the
@@ -1011,12 +1211,18 @@ impl SocketTransport {
     }
 }
 
-fn socket_queue(this: u32, direction: Direction, buffer: u32, length: u32, request: u32) -> u32 {
+fn socket_queue(
+    this: u32,
+    direction: Direction,
+    buffer: u32,
+    length: u32,
+    request: &TransferRequest,
+) -> u32 {
     // SAFETY: the studio service passes the transport it was given.
     let object = unsafe { enter(this) };
     let result = object.engine.reserve().map(|slot| {
-        object.bind_event(read_u32(request + REQUEST_EVENT));
-        write_u32(request, object.handle(slot));
+        object.bind_event(request.event());
+        request.result.store(object.handle(slot), Ordering::Relaxed);
         let mut stream = object.stream();
         object.engine.submit(
             slot,
@@ -1028,12 +1234,13 @@ fn socket_queue(this: u32, direction: Direction, buffer: u32, length: u32, reque
             &mut stream,
         );
     });
-    leave(this);
+    // SAFETY: entered above; `object` is not used afterwards.
+    unsafe { leave(this) };
     routine_result(result).0
 }
 
 extern "C" fn socket_kind(_this: u32) -> u32 {
-    2
+    TransportKind::Socket as u32
 }
 
 extern "C" fn socket_release(this: u32) -> u32 {
@@ -1044,10 +1251,16 @@ extern "C" fn socket_release(this: u32) -> u32 {
 }
 
 extern "C" fn socket_receive(this: u32, buffer: u32, length: u32, request: u32) -> u32 {
+    // SAFETY: the studio service passes a request record that stays live
+    // until the request completes.
+    let request = unsafe { TransferRequest::from_address(request) };
     socket_queue(this, Direction::Receive, buffer, length, request)
 }
 
 extern "C" fn socket_send(this: u32, buffer: u32, length: u32, request: u32) -> u32 {
+    // SAFETY: the studio service passes a request record that stays live
+    // until the request completes.
+    let request = unsafe { TransferRequest::from_address(request) };
     socket_queue(this, Direction::Send, buffer, length, request)
 }
 
@@ -1056,46 +1269,61 @@ extern "C" fn socket_send(this: u32, buffer: u32, length: u32, request: u32) -> 
 /// without leaving the section, so a later call from another thread would
 /// block forever; the section is left here.
 extern "C" fn socket_result(this: u32, request: u32, transferred: u32, wait: u32) -> u32 {
-    let handle = read_u32(request);
+    // SAFETY: the studio service passes a submitted request record and the
+    // address of its count word, both live for the call.
+    let (request, transferred) = unsafe {
+        (
+            TransferRequest::from_address(request),
+            count_word(transferred),
+        )
+    };
+    let handle = request.result.load(Ordering::Relaxed);
     // SAFETY: the studio service passes the transport it was given.
     let object = unsafe { enter(this) };
     let Some(slot) = object.slot(handle) else {
-        leave(this);
+        // SAFETY: entered above; `object` is not used afterwards.
+        unsafe { leave(this) };
         return routine_result(Err(StudioError::InvalidArgument)).0;
     };
     object.pump();
     if wait != 0 {
         loop {
             // SAFETY: the section is held.
-            let object = unsafe { &mut *(this as usize as *mut SocketTransport) };
+            let object = unsafe { kernel::object_at_mut::<SocketTransport>(this) };
             if !object.engine.is_pending(slot) {
                 break;
             }
             if !object.engine.is_connected() {
-                leave(this);
+                // SAFETY: the section is held; `object` is not used afterwards.
+                unsafe { leave(this) };
                 return routine_result(Err(StudioError::NotConnected)).0;
             }
             let event = object.event;
-            leave(this);
+            // SAFETY: the section is held; `object` is not used afterwards.
+            unsafe { leave(this) };
             // SAFETY: `event` is the caller's event handle bound to the transport.
             unsafe {
-                xam::WaitForSingleObject(xboxkrnl::Handle::from_raw(raw_handle(event)), INFINITE)
+                xam::WaitForSingleObject(
+                    xboxkrnl::Handle::from_raw(raw_handle(event)),
+                    xam::INFINITE,
+                )
             };
             // SAFETY: the studio service passes the transport it was given.
             unsafe { enter(this) }.pump();
         }
     }
     // SAFETY: the section is held.
-    let object = unsafe { &mut *(this as usize as *mut SocketTransport) };
+    let object = unsafe { kernel::object_at_mut::<SocketTransport>(this) };
     let result = match object.engine.complete(slot) {
         None => Err(StudioError::Pending),
         Some((status, count)) => {
-            write_u32(transferred, count);
-            write_u32(request, 0);
+            transferred.store(count, Ordering::Relaxed);
+            request.result.store(0, Ordering::Relaxed);
             status
         }
     };
-    leave(this);
+    // SAFETY: the section is held; `object` is not used afterwards.
+    unsafe { leave(this) };
     routine_result(result).0
 }
 
@@ -1104,7 +1332,8 @@ extern "C" fn socket_cancel(this: u32) -> u32 {
     let object = unsafe { enter(this) };
     let mut stream = object.stream();
     object.engine.cancel(&mut stream);
-    leave(this);
+    // SAFETY: entered above; `object` is not used afterwards.
+    unsafe { leave(this) };
     0
 }
 

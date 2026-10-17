@@ -207,6 +207,11 @@ Deviations (instruction trace and snapshot):
   registration and the previous routine, and still executes the trap.
 - The second loaded module list is skipped when its head is null; stock
   reads it unconditionally.
+- The lookup cache is cleared at a start one word at a time, and the
+  encoder state and stream words are written with single word stores, so
+  handlers that race a start, stop, or save (another single-stepped
+  thread, a stop from another thread) see whole words; stock clears the
+  cache with memset.
 - Unload (no stock counterpart): hooks and the registration are removed
   and the writer threads, including those title termination abandons as
   stock does, are stopped and awaited through their handles (up to 16

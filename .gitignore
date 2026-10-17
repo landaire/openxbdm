@@ -11,6 +11,8 @@
 
 /buck-out
 /.buckconfig.local
+# DotSlash and the Buck2 it fetches (bootstrap.sh, bootstrap.ps1).
+/.tools
 # A local rust-xbox360 checkout for `xbox360 = disabled` (DEVELOPING.md).
 /rust-xbox360
 /.cargo/*

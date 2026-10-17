@@ -19,6 +19,8 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+# The wrapper that runs the pinned Buck2 release.
+BUCK2 = ROOT / "bin" / ("buck2.cmd" if sys.platform == "win32" else "buck2")
 
 # Target and release name prefix of each build of the module.
 MODULES = {
@@ -30,7 +32,7 @@ MODULES = {
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--version", required=True, help="the release version, for example 0.1.0")
-    parser.add_argument("--buck2", default="buck2", help="the buck2 executable")
+    parser.add_argument("--buck2", default=str(BUCK2), help="the buck2 executable (default: bin/buck2)")
     parser.add_argument("--out-dir", type=Path, default=ROOT, help="the directory to write the files to")
     args = parser.parse_args()
 

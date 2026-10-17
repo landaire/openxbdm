@@ -49,11 +49,33 @@ methods: Console deployment, below.
 
 ## Environment
 
-`devenv shell` (`devenv.nix`) provides Buck2 (the release that
-`toolchains/buck2_release.json` pins), Reindeer, Python, and the Rust
-release in `rust-toolchain.toml`. It provides no C compiler.
-`devenv --profile ci shell` adds `bazel-remote` for the CI action cache
-(`ci/start-action-cache.sh`).
+`toolchains/buck2` is a [DotSlash](https://dotslash-cli.com) file that
+pins the Buck2 release: the URL, size and BLAKE3 digest of its build for
+each host. `bin/buck2` (`bin\buck2.cmd` on Windows) runs that release
+through a DotSlash that `bootstrap.sh` (`bootstrap.ps1` on Windows)
+installs into `.tools`, which Git ignores. The first run of `bin/buck2`
+runs the bootstrap script, which downloads DotSlash, checks its SHA-256,
+fetches Buck2 into `.tools/dotslash`, and reports missing host tools.
+Add `bin` to `PATH` to run it as `buck2`; the `build_defs` scripts use
+`bin/buck2` unless `--buck2` names another executable. To run the
+bootstrap script yourself on Windows, where PowerShell may refuse a
+downloaded script:
+
+    powershell -ExecutionPolicy Bypass -File bootstrap.ps1
+
+To move to another Buck2 release, replace `toolchains/buck2` with the
+`buck2` DotSlash file of that release:
+
+    curl -fsSL -o toolchains/buck2 https://github.com/facebook/buck2/releases/download/<tag>/buck2
+
+To move to another DotSlash release, change the version and SHA-256
+values in both bootstrap scripts and run them again.
+
+`devenv shell` (`devenv.nix`) puts `bin` on `PATH` and provides Reindeer,
+Python, and the Rust release in `rust-toolchain.toml`. It provides no C
+compiler. `devenv --profile ci shell` adds `bazel-remote` for the CI
+action cache (`ci/start-action-cache.sh`). `mise.toml` puts `bin` on
+`PATH` for its tasks.
 
 Buck2 takes its Rust toolchain from the `xbox360` cell,
 [rust-xbox360](https://github.com/landaire/rust-xbox360) at the commit in
@@ -88,11 +110,21 @@ of the cell, with this project's flags: the release profile for host
 crates, separate processes for doctests, and the size settings of the
 console module.
 
-Buck2 links host executables with the host's linker driver: `c++` (GCC
-or Clang) with the lld bundled in `rustc` on Linux, Xcode command line
-tools on macOS, and MSVC build tools on Windows. Console executables are
-linked by the bundled rust-lld alone. The prelude's Python tools run on a
-CPython that Buck2 downloads.
+Buck2 downloads everything it builds with except the host's linker
+driver: `c++` (GCC or Clang) with the lld bundled in `rustc` on Linux,
+Xcode command line tools on macOS, and MSVC build tools with a Windows SDK
+on Windows. These stay host tools: the macOS and Windows SDKs cannot be
+redistributed, and host executables link against the C library of the
+system they run on. Console executables are linked by the bundled
+rust-lld alone. The prelude's Python tools run on a CPython that Buck2
+downloads; Python on the host is only for the `build_defs` scripts. Buck2
+fetches the `xbox360` cell with `git`, and DotSlash downloads with `curl`.
+
+Windows needs long paths enabled (`LongPathsEnabled` under
+`HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem`), since `buck-out`
+paths exceed 260 characters, and `link.exe` still fails under a long
+checkout path; CI copies the checkout to `C:\a`
+(`ci/prepare-windows-runner.ps1`).
 
 ### Local changes to rust-xbox360
 

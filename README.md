@@ -127,17 +127,21 @@ xeedee -H 192.168.1.26 dump-module xboxkrnl.exe /tmp/xboxkrnl.exe
 
 _For in-depth info see [`DEVELOPING.md`](DEVELOPING.md)_.
 
-buck2 is used for building, testing, and linting across all platforms. It will automatically download all requirements (Rust, Python). Your host C++ compiler will be used where necessary (TODO: fix).
+[Buck2](https://buck2.build/) builds, tests and lints on every platform. You don't need to install it. Run `bin/buck2` (`bin\buck2.cmd` on Windows) wherever these docs say `buck2`, or add `bin` to your `PATH`. The first run downloads [DotSlash](https://dotslash-cli.com) and the Buck2 release that `toolchains/buck2` pins into `.tools`. Buck2 then downloads Rust, Python and every crate it needs.
+
+You do need a few host tools:
+
+- A C++ linker driver: GCC or Clang on Linux, the Xcode command line tools on macOS, or Visual Studio Build Tools with the C++ workload on Windows.
+- `git` and `curl`.
+- Python 3.11 or later for the `build_defs` scripts.
+- rustup, only to build with Cargo.
+- [reindeer](https://github.com/facebookincubator/reindeer), only to regenerate the build files after you change a `Cargo.toml`.
+
+`./bootstrap.sh` (`bootstrap.ps1` on Windows) does the first-run setup by hand and lists any host tools it can't find.
 
 We have a custom [rust-xbox360](https://github.com/landaire/rust-xbox360) toolchain used and creates the `xbox360` buck2 cell. Additionally, tools from [acceleration](https://github.com/landaire/acceleration) are used for translating from ppc64 ELF to ppc64 PE, then wrapping that as an XEX2.
 
 If you are a nix user, a [devenv](https://devenv.sh), is present whcih can provide all necessary tooling. Run `devenv shell` to activate.
-
-Otherwise, you will need:
-
-- [buck2](https://buck2.build/) (you can see which toolchain is pinned at [`toolchains/buck2_release.json`](toolchains/buck2_release.json), but this hopefully shouldn't matter too much)
-- Python 3.11 or later.
-- rustup, which installs the release that `rust-toolchain.toml` names, and [reindeer](https://github.com/facebookincubator/reindeer), to regenerate the build files.
 
 | Command                                                     | Purpose                                                                                        |
 | ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |

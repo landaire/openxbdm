@@ -12,130 +12,308 @@
 use core::fmt::Write as _;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
+use core::sync::atomic::Ordering::Relaxed;
 
 use openxbdm_server::text::Text;
+use xbox360::thread::current_object;
 use xbox360::time::TickCount;
 use xbox360::time::Timebase;
-use xbox360_sys::processor;
+use xbox360_sys::status::Hresult;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::Handle;
 use xbox360_sys::xboxkrnl::XAudioRegisterRenderDriverClient;
 use xbox360_sys::xboxkrnl::XAudioUnregisterRenderDriverClient;
 
 use super::super::backend::EVENT_NAME_BYTES;
+use super::super::events;
+use super::super::events::CallbackOperation;
+use super::super::files;
+use super::super::files::CaptureFile;
+use super::super::plugin;
+use super::super::plugin::PluginProcedure;
+use super::super::ring;
+use super::super::session;
+use super::super::session::EngineFlags;
+use super::super::session::EngineMessage;
+use super::super::session::FrameRecord;
+use super::super::session::MESSAGE_PAYLOAD_SIZE;
+use super::super::session::MemoryKind;
+use super::super::session::Part;
+use super::super::session::PartStream;
+use super::super::session::PixSession;
+use super::super::session::StreamId;
 use super::super::status::Status;
-use super::super::status::post as post_status;
-use super::S;
+use super::super::status::post_without_text as post_status;
+use super::FrameState;
 use super::buffers;
+use super::buffers::BUFFER_BYTES;
 use super::engine;
-use super::rd;
-use super::wr;
+use super::replay;
+use super::video;
+use super::video::VideoContextFlags;
 use crate::backend::debugger::MonitorRecordFlags;
 use crate::kernel;
 
-const MESSAGE: u32 = super::CURRENT_MESSAGE;
-const MESSAGE_WORD: u32 = 0x598;
-const PAYLOAD: u32 = 0x59c;
-const STEP: u32 = 0x5ec;
-const FRAME_RECORD: u32 = 0x5f4;
-/// Pause state: paused flag, thread write count at the pause, XAudio
-/// client and the saved monitor record flags.
-const PAUSED: u32 = 0xc838;
-const VIDEO_FLAGS: u32 = 0xc840;
-const AUDIO_CLIENT: u32 = 0x1_2290;
-const AUDIO_THREAD_FLAGS: u32 = 0x1_228c;
-const CALLER_FLAGS: u32 = 0x1_2288;
-/// Monitor record flags exchanged while paused: exempt from stops, not
-/// debuggable, and 0x1000.
-const RECORD_PAUSE_MASK: MonitorRecordFlags = MonitorRecordFlags::from_bits_retain(0x0200_3000);
-/// The record flags of a paused thread within [`RECORD_PAUSE_MASK`].
-const RECORD_PAUSED: MonitorRecordFlags = MonitorRecordFlags::from_bits_retain(0x0200_1000);
 const UNNAMED: &core::ffi::CStr = c"unnamed.pix2";
+/// Configuration word of a part writing stream 0.
+const FIRST_STREAM: PartStream = PartStream(StreamId::First.raw());
 
-fn payload(s: S) -> u32 {
-    s.0 + PAYLOAD
+xbox360_sys::flags! {
+    /// Capture support the title reports in its frame record flags word.
+    pub struct FrameSupport(u32) {
+        /// Per-thread timing capture (message 1).
+        TIMING_CAPTURE = 0x1,
+        /// Capture to file (message 5).
+        FILE_CAPTURE = 0x2,
+    }
 }
 
-fn open_unnamed() -> Option<super::super::files::CaptureFile> {
-    super::super::files::open(UNNAMED.as_ptr() as usize as u32, true)
+/// Monitor record flags the pause replaces, and their value while paused.
+const PAUSE_MASK: MonitorRecordFlags = MonitorRecordFlags::EXEMPT
+    .union(MonitorRecordFlags::DEBUGGABLE)
+    .union(MonitorRecordFlags::CAPTURE_PAUSE);
+const PAUSED: MonitorRecordFlags =
+    MonitorRecordFlags::EXEMPT.union(MonitorRecordFlags::CAPTURE_PAUSE);
+
+/// Payload words of an engine message.
+type Payload = [AtomicU32; MESSAGE_PAYLOAD_SIZE / 4];
+
+/// Fields of a message payload.
+///
+/// # Safety
+///
+/// The implementer is `#[repr(C)]` and has only `AtomicU32` fields or
+/// arrays of them.
+unsafe trait PayloadFields: Sized {
+    fn of(payload: &Payload) -> &Self {
+        const { assert!(size_of::<Self>() <= size_of::<Payload>()) };
+        // SAFETY: the implementer consists of words, as the payload, and
+        // is no larger.
+        unsafe { &*core::ptr::from_ref(payload).cast::<Self>() }
+    }
+}
+
+/// Message 1.
+#[repr(C)]
+struct CaptureFramesPayload {
+    frames: AtomicU32,
+    notify: AtomicU32,
+    /// Capture file; 0 opens `unnamed.pix2` and stores its handle.
+    file: AtomicU32,
+}
+
+/// Messages 3 and 4.
+#[repr(C)]
+struct TracePayload {
+    /// Milliseconds at the first step.
+    started: AtomicU32,
+}
+
+/// Message 5.
+#[repr(C)]
+struct CaptureToFilePayload {
+    notify: AtomicU32,
+    /// Capture file; 0 opens `unnamed.pix2` and stores its handle.
+    file: AtomicU32,
+    /// The plugin captures; it reports busy through `poll`.
+    plugin: AtomicU32,
+    /// Image `dogma` loaded for the capture.
+    image: AtomicU32,
+    /// Plugin installer of the capture callbacks.
+    installer: AtomicU32,
+    /// Submit hook value for the owner.
+    information: AtomicU32,
+    poll: AtomicU32,
+}
+
+/// Message 6.
+#[repr(C)]
+struct ConfigurationPayload {
+    _unknown_00: AtomicU32,
+    /// Parts, second threads and second flags: the leading words of
+    /// [`session::Configuration`] in its layout.
+    threads: [AtomicU32; 6],
+    _unknown_1c: AtomicU32,
+    title_budget: AtomicU32,
+    /// Size of stream 1 in 16 KiB units.
+    units: AtomicU32,
+    gpu_wait: AtomicU32,
+    frame_word: AtomicU32,
+}
+
+/// Message 7.
+#[repr(C)]
+struct WriteFramesPayload {
+    first: AtomicU32,
+    last: AtomicU32,
+    /// Stock traps when 0.
+    required: AtomicU32,
+}
+
+/// Message 8.
+#[repr(C)]
+struct ReplayFramesPayload {
+    first: AtomicU32,
+    last: AtomicU32,
+    begin: AtomicU32,
+    write: AtomicU32,
+    context: AtomicU32,
+    mode: AtomicU32,
+}
+
+/// Message 12.
+#[repr(C)]
+struct VideoOperationPayload {
+    first: AtomicU32,
+    last: AtomicU32,
+    operation: AtomicU32,
+    argument: AtomicU32,
+}
+
+/// Message 13: bit 0 sets [`EngineFlags::PAUSED`].
+#[repr(C)]
+struct PauseFlagPayload {
+    paused: AtomicU32,
+}
+
+/// Message 14.
+#[repr(C)]
+struct PausedVideoPayload {
+    first: AtomicU32,
+    last: AtomicU32,
+    no_gpu: AtomicU32,
+}
+
+/// Message 15.
+#[repr(C)]
+struct ResourceStatePayload {
+    active: AtomicU32,
+    notify: AtomicU32,
+    /// Start or stop the capture through the plugin, else report.
+    request: AtomicU32,
+    information: [AtomicU32; 3],
+}
+
+// SAFETY: each is `#[repr(C)]` of `AtomicU32` words.
+unsafe impl PayloadFields for CaptureFramesPayload {}
+// SAFETY: as above.
+unsafe impl PayloadFields for TracePayload {}
+// SAFETY: as above.
+unsafe impl PayloadFields for CaptureToFilePayload {}
+// SAFETY: as above.
+unsafe impl PayloadFields for ConfigurationPayload {}
+// SAFETY: as above.
+unsafe impl PayloadFields for WriteFramesPayload {}
+// SAFETY: as above.
+unsafe impl PayloadFields for ReplayFramesPayload {}
+// SAFETY: as above.
+unsafe impl PayloadFields for VideoOperationPayload {}
+// SAFETY: as above.
+unsafe impl PayloadFields for PauseFlagPayload {}
+// SAFETY: as above.
+unsafe impl PayloadFields for PausedVideoPayload {}
+// SAFETY: as above.
+unsafe impl PayloadFields for ResourceStatePayload {}
+
+fn open_unnamed() -> Option<CaptureFile> {
+    // SAFETY: a static NUL-terminated name.
+    unsafe { files::open(UNNAMED.as_ptr() as usize as u32, true) }
+}
+
+fn running(s: &PixSession) -> bool {
+    s.engine_flags().contains(EngineFlags::RUNNING)
+}
+
+#[inline(never)]
+fn stop(s: &PixSession) {
+    engine::stop(s, &s.frame_record, false, false);
+}
+
+/// Whether the capture buffers are reallocated: the title budget changed,
+/// or there are none and `parts_on`.
+fn reallocation_needed(s: &PixSession, parts_on: bool) -> bool {
+    s.configuration.title_budget.load(Relaxed) != s.budgets[MemoryKind::Title.index()].load(Relaxed)
+        || (s.buffer_count.load(Relaxed) == 0 && parts_on)
 }
 
 /// Process queued messages (stock 0x91f619d8). `flags` is the frame
 /// record's flags word; message 15 reports into `out`.
-pub(super) fn dispatch(s: S, flags: u32, out: &mut u32) {
+pub(super) fn dispatch(s: &PixSession, flags: u32, out: &mut FrameState) {
+    let support = FrameSupport::from_bits_retain(flags);
+    let message = &s.message;
     let mut processed = false;
     loop {
-        if s.word(MESSAGE) == 0 {
-            let Some(entry) = super::super::session::next_message(s) else {
+        if message.code.load(Relaxed) == 0 {
+            let Some(entry) = session::next_message(s) else {
                 break;
             };
-            // SAFETY: a queue entry and the current message are 0x58 bytes
-            // of the session block.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    entry as usize as *const u8,
-                    s.at(MESSAGE).cast::<u8>(),
-                    0x58,
-                )
-            };
-            s.set_word(STEP, 0);
+            message.copy_from(entry);
+            s.step.store(0, Relaxed);
         }
         processed = true;
-        let step = s.word(STEP);
-        let done = match s.word(MESSAGE) {
-            1 => capture_frames(s, flags, step, payload(s)),
-            2 => step != 0,
-            3 => trace(s, step, payload(s), false),
-            4 => trace(s, step, payload(s), true),
-            5 => capture_to_file(s, flags, step, payload(s)),
-            6 => {
-                record_configuration(s, payload(s), true);
+        let step = s.step.load(Relaxed);
+        let payload = &message.payload;
+        let done = match message.message() {
+            Some(EngineMessage::CaptureFrames) => capture_frames(s, support, step, payload),
+            Some(EngineMessage::WaitFrame) => step != 0,
+            Some(EngineMessage::TraceFrame) => trace(s, step, payload, false),
+            Some(EngineMessage::TraceEvent) => trace(s, step, payload, true),
+            Some(EngineMessage::CaptureToFile) => capture_to_file(s, support, step, payload),
+            Some(EngineMessage::RecordConfiguration) => {
+                record_configuration(s, payload, true);
                 processed = false;
                 true
             }
-            7 => write_frames(s, payload(s)),
-            8 => write_frames_with(s, payload(s)),
-            10 => pause(s),
-            12 => video_operation(s, payload(s)),
-            13 => {
-                let flag = rd(payload(s)) & 1;
-                s.set_word(
-                    super::FLAGS,
-                    (s.word(super::FLAGS) & !super::PAUSED) | flag << 30,
-                );
+            Some(EngineMessage::WriteFrames) => write_frames(s, payload),
+            Some(EngineMessage::ReplayFrames) => write_frames_with(s, payload),
+            Some(EngineMessage::Pause) => pause(s),
+            Some(EngineMessage::VideoOperation) => video_operation(s, payload),
+            Some(EngineMessage::PauseFlag) => {
+                let paused = PauseFlagPayload::of(payload).paused.load(Relaxed) & 1 != 0;
+                let mut flags = s.engine_flags();
+                flags.remove(EngineFlags::PAUSED);
+                if paused {
+                    flags.insert(EngineFlags::PAUSED);
+                }
+                s.set_engine_flags(flags);
                 true
             }
-            15 => resource_state(payload(s), out),
-            // 11 finishes at once; stock traps on 9, 14 and unknown codes.
-            _ => true,
+            Some(EngineMessage::ResourceState) => resource_state(payload, out),
+            // Resume finishes at once; stock traps on 9, 14 and unknown
+            // codes.
+            Some(
+                EngineMessage::DumpHeader | EngineMessage::Resume | EngineMessage::PausedVideo,
+            )
+            | None => true,
         };
         if !done {
-            s.set_word(STEP, step + 1);
+            s.step.store(step + 1, Relaxed);
             return;
         }
-        s.set_word(MESSAGE, 0);
+        message.code.store(0, Relaxed);
     }
-    // SAFETY: the current and requested configurations are 0x28 bytes.
-    let differs = (0..10).any(|index| {
-        s.word(index * 4) != s.word(super::super::session::REQUESTED_CONFIGURATION + index * 4)
-    });
-    if processed && differs {
+    if processed
+        && s.configuration
+            .words()
+            .iter()
+            .zip(s.requested.words())
+            .any(|(current, requested)| current.load(Relaxed) != requested.load(Relaxed))
+    {
         apply_requested(s, true);
     }
 }
 
 /// Stop, set the per-thread parts, reallocate when needed, and start
 /// (stock 0x91f60d50).
-fn reconfigure(s: S, first: u32, second: u32, tracing: u32) {
-    engine::stop(s, s.0 + FRAME_RECORD, false, false);
-    s.set_word(8, super::OFF);
-    s.set_word(0xc, super::OFF);
-    s.set_word(0, first);
-    s.set_word(4, second);
-    s.set_word(0x18, tracing);
-    if s.word(0x24) != s.word(0x2b4)
-        || (s.word(0x130) == 0 && (first != super::OFF || second != super::OFF))
-    {
+fn reconfigure(s: &PixSession, thread: PartStream, second: PartStream, tracing: bool) {
+    stop(s);
+    let configuration = &s.configuration;
+    configuration.set_part(Part::Gpu, PartStream::OFF);
+    configuration.set_part(Part::Audio, PartStream::OFF);
+    configuration.set_part(Part::Thread, thread);
+    configuration.set_part(Part::SecondThread, second);
+    configuration.tracing.store(u32::from(tracing), Relaxed);
+    if reallocation_needed(s, !thread.is_off() || !second.is_off()) {
         buffers::free(s);
         buffers::allocate_all(s);
     }
@@ -144,18 +322,19 @@ fn reconfigure(s: S, first: u32, second: u32, tracing: u32) {
 
 /// Make the requested configuration current (stock 0x91f60de0), with a
 /// stop and start around it when `restart`.
-pub(super) fn apply_requested(s: S, restart: bool) {
+pub(super) fn apply_requested(s: &PixSession, restart: bool) {
     if restart {
-        engine::stop(s, s.0 + FRAME_RECORD, false, false);
+        stop(s);
     }
-    for index in 0..10 {
-        s.set_word(
-            index * 4,
-            s.word(super::super::session::REQUESTED_CONFIGURATION + index * 4),
-        );
+    for (current, requested) in s.configuration.words().iter().zip(s.requested.words()) {
+        current.store(requested.load(Relaxed), Relaxed);
     }
-    let any = (0..4).any(|index| s.word(index * 4) != super::OFF);
-    if s.word(0x24) != s.word(0x2b4) || (s.word(0x130) == 0 && any) {
+    let parts_on = s
+        .configuration
+        .parts
+        .iter()
+        .any(|part| !PartStream(part.load(Relaxed)).is_off());
+    if reallocation_needed(s, parts_on) {
         buffers::free(s);
         buffers::allocate_all(s);
     }
@@ -164,38 +343,38 @@ pub(super) fn apply_requested(s: S, restart: bool) {
     }
 }
 
-/// Message 1 `{frames, notify, file}` (stock 0x91f60ea8): capture the
-/// next frames, then write them to the file (status 2, or 3 when nothing
-/// was written).
-fn capture_frames(s: S, flags: u32, step: u32, payload: u32) -> bool {
-    let frames = rd(payload);
+/// Message 1 (stock 0x91f60ea8): capture the next frames, then write them
+/// to the file (status 2, or 3 when nothing was written).
+fn capture_frames(s: &PixSession, support: FrameSupport, step: u32, payload: &Payload) -> bool {
+    let fields = CaptureFramesPayload::of(payload);
+    let frames = fields.frames.load(Relaxed);
     if step < frames {
-        if flags & 1 == 0 {
-            if rd(payload + 4) != 0 {
-                post_status(Status::BadD3dVersion, 0);
+        if !support.contains(FrameSupport::TIMING_CAPTURE) {
+            if fields.notify.load(Relaxed) != 0 {
+                post_status(Status::BadD3dVersion);
             }
             return true;
         }
         if step == 0 && frames != 0 {
-            reconfigure(s, 0, super::OFF, 0);
+            reconfigure(s, FIRST_STREAM, PartStream::OFF, false);
         }
         return false;
     }
-    engine::stop(s, s.0 + FRAME_RECORD, false, false);
+    stop(s);
     let mut written = false;
-    let file = match rd(payload + 8) {
+    let file = match fields.file.load(Relaxed) {
         0 => open_unnamed().map(|file| file.0),
         file => Some(file),
     };
     if let Some(file) = file {
-        wr(payload + 8, file);
-        written = super::replay::write_stream(s, file, frames, frames);
+        fields.file.store(file, Relaxed);
+        written = replay::write_stream(s, file, frames, frames);
         // SAFETY: the capture file handle, not used after the write.
         unsafe { xboxkrnl::NtClose(Handle::from_raw(file)) };
     }
     engine::start(s);
-    if rd(payload + 4) != 0 {
-        post_status(if written { Status::Timing } else { Status::No }, 0);
+    if fields.notify.load(Relaxed) != 0 {
+        post_status(if written { Status::Timing } else { Status::No });
     }
     true
 }
@@ -203,10 +382,14 @@ fn capture_frames(s: S, flags: u32, step: u32, payload: u32) -> bool {
 /// Messages 3 and 4 (stock 0x91f61140): record an instruction trace of
 /// the frame thread. 3 traces one frame; 4 traces the event named by
 /// `pixcmd k`, giving up after 10 s.
-fn trace(s: S, step: u32, payload: u32, by_event: bool) -> bool {
+fn trace(s: &PixSession, step: u32, payload: &Payload, by_event: bool) -> bool {
+    const TIMEOUT_MILLISECONDS: u32 = 10_000;
+    let fields = TracePayload::of(payload);
     if step == 0 {
-        wr(payload, TickCount::now().milliseconds());
-        reconfigure(s, super::OFF, super::OFF, u32::from(by_event));
+        fields
+            .started
+            .store(TickCount::now().milliseconds(), Relaxed);
+        reconfigure(s, PartStream::OFF, PartStream::OFF, by_event);
         if !by_event {
             super::super::super::xtrace::start_default();
         }
@@ -214,17 +397,17 @@ fn trace(s: S, step: u32, payload: u32, by_event: bool) -> bool {
     }
     if !by_event {
         super::super::super::xtrace::stop();
-        post_status(Status::Trace, 0);
+        post_status(Status::Trace);
         return true;
     }
     let now = TickCount::now().milliseconds();
-    if s.word(MESSAGE_WORD) != 0 {
-        post_status(Status::Trace, 0);
+    if s.message.done.load(Relaxed) != 0 {
+        post_status(Status::Trace);
         return true;
     }
-    if now.wrapping_sub(rd(payload)) >= 10_000 {
+    if now.wrapping_sub(fields.started.load(Relaxed)) >= TIMEOUT_MILLISECONDS {
         stop_event_trace();
-        post_status(Status::No, 0);
+        post_status(Status::No);
         return true;
     }
     false
@@ -263,16 +446,18 @@ fn trace_event_begin(name: &[u8; EVENT_NAME_BYTES]) {
 }
 
 fn on_capture_thread() -> bool {
-    let thread = processor::current_thread();
-    super::super::backend::capture_thread() == u32::from(super::rd8(thread + 0xbf))
+    super::super::backend::capture_thread()
+        == Some(u32::from(current_object().hardware_thread().get()))
 }
 
 /// Timing request on the trace capture path (stock 0x91f558e0): type 0
 /// begins an event, type 1 ends one; true when the traced event ended.
 pub(super) fn trace_event(kind: u32, name: &[u8; EVENT_NAME_BYTES]) -> bool {
+    const BEGIN: u32 = 0;
+    const END: u32 = 1;
     match kind {
-        0 => trace_event_begin(name),
-        1 if on_capture_thread() => {
+        BEGIN => trace_event_begin(name),
+        END if on_capture_thread() => {
             let depth = EVENT_DEPTH.load(Ordering::Acquire);
             if depth != 0 {
                 EVENT_DEPTH.store(depth - 1, Ordering::Release);
@@ -294,378 +479,435 @@ fn stop_event_trace() {
     EVENT_DEPTH.store(0, Ordering::Release);
 }
 
-/// Message 5 `{notify, file, plugin, image, installer, information,
-/// poll}` (stock 0x91f60fb0): write per-thread timing data to the capture
-/// file until the next frame, or while the plugin reports busy.
-fn capture_to_file(s: S, flags: u32, step: u32, payload: u32) -> bool {
-    let plugin = rd(payload + 8) != 0;
+/// Message 5 (stock 0x91f60fb0): write per-thread timing data to the
+/// capture file until the next frame, or while the plugin reports busy.
+fn capture_to_file(s: &PixSession, support: FrameSupport, step: u32, payload: &Payload) -> bool {
+    let fields = CaptureToFilePayload::of(payload);
+    let plugin = fields.plugin.load(Relaxed) != 0;
     if step >= 1 {
-        if plugin && !plugin_finished(rd(payload + 0x18)) {
+        if plugin && !plugin_finished(fields.poll.load(Relaxed)) {
             return false;
         }
-        super::super::files::set_capture_file(None);
-        let file = super::super::files::CaptureFile(rd(payload + 4));
-        super::super::files::write_words(file, &[0x0100_0018]);
+        files::set_capture_file(None);
+        let file = CaptureFile(fields.file.load(Relaxed));
+        files::write_words(file, &[replay::END_RECORD]);
         // SAFETY: the capture file handle, detached above.
         unsafe { xboxkrnl::NtClose(Handle::from_raw(file.0)) };
-        if rd(payload) != 0 {
-            post_status(Status::Gpu, 0);
+        if fields.notify.load(Relaxed) != 0 {
+            post_status(Status::Gpu);
         }
         // Stock unloads the image here and once more for plugin captures.
-        if super::super::plugin::handle().is_none() && rd(payload + 0xc) != 0 {
+        if plugin::handle().is_none() && fields.image.load(Relaxed) != 0 {
             // SAFETY: the image `dogma` loaded for this capture; its slot
             // is cleared below.
-            unsafe { xboxkrnl::XexUnloadImage(rd(payload + 0xc)) };
-            wr(payload + 0xc, 0);
+            unsafe { xboxkrnl::XexUnloadImage(fields.image.load(Relaxed)) };
+            fields.image.store(0, Relaxed);
         }
         return true;
     }
-    if flags & 2 == 0 && !plugin {
-        if rd(payload) != 0 {
-            post_status(Status::BadD3dVersion, 0);
+    if !support.contains(FrameSupport::FILE_CAPTURE) && !plugin {
+        if fields.notify.load(Relaxed) != 0 {
+            post_status(Status::BadD3dVersion);
         }
         return true;
     }
-    reconfigure(s, super::OFF, super::OFF, 1);
-    if rd(payload + 4) == 0
+    reconfigure(s, PartStream::OFF, PartStream::OFF, true);
+    if fields.file.load(Relaxed) == 0
         && let Some(file) = open_unnamed()
     {
-        wr(payload + 4, file.0);
+        fields.file.store(file.0, Relaxed);
     }
-    let file = super::super::files::CaptureFile(rd(payload + 4));
-    super::super::files::set_capture_file(Some(file));
-    super::super::files::write_words(file, &[0x0100_001b]);
+    let file = CaptureFile(fields.file.load(Relaxed));
+    files::set_capture_file(Some(file));
+    files::write_words(file, &[replay::TIMING_START_RECORD]);
     if plugin {
-        super::super::plugin::install_callbacks(rd(payload + 0x10));
-        super::super::events::notify_owner(0x22, rd(payload + 0x14));
+        plugin::install_callbacks(fields.installer.load(Relaxed));
+        events::notify_owner(
+            CallbackOperation::SubmitHook,
+            fields.information.load(Relaxed),
+        );
     }
     false
 }
 
 /// Poll the plugin's capture routine (stock 0x91f58e90): finished unless
-/// it reports 0x8000000a; the owner then forgets the hook and the plugin
+/// it reports `E_PENDING`; the owner then forgets the hook and the plugin
 /// is attached again.
 fn plugin_finished(poll: u32) -> bool {
     // SAFETY: the plugin's export without arguments.
-    if unsafe { kernel::call_export(poll, 0, 0, 0, 0) } == 0x8000_000a {
+    let result = Hresult(unsafe { kernel::call_export(poll, 0, 0, 0, 0) });
+    if result == Hresult::PENDING {
         return false;
     }
-    super::super::events::notify_owner(0x22, 0);
-    super::super::plugin::restart();
+    events::notify_owner(CallbackOperation::SubmitHook, 0);
+    plugin::restart();
     true
 }
 
-/// Message 6 (stock 0x91f61330): store a requested configuration
-/// `{+4 parts[4], +0x14, +0x18, +0x20 size, +0x24 units, +0x28, +0x2c}`,
-/// reset stream 1, and apply it.
-pub(super) fn record_configuration(s: S, payload: u32, restart: bool) {
+/// Message 6 (stock 0x91f61330): store a requested configuration, reset
+/// stream 1, and apply it.
+fn record_configuration(s: &PixSession, payload: &Payload, restart: bool) {
+    let fields = ConfigurationPayload::of(payload);
     if restart {
-        engine::stop(s, s.0 + FRAME_RECORD, false, false);
+        stop(s);
     }
-    let requested = super::super::session::REQUESTED_CONFIGURATION;
-    for index in 0..10 {
-        s.set_word(requested + index * 4, 0);
+    let requested = &s.requested;
+    for word in requested.words() {
+        word.store(0, Relaxed);
     }
-    for index in 0..6 {
-        s.set_word(requested + index * 4, rd(payload + 4 + index * 4));
+    const {
+        assert!(
+            core::mem::offset_of!(session::Configuration, second_flags)
+                == 5 * size_of::<AtomicU32>()
+        );
+    };
+    for (target, source) in requested.words().iter().zip(&fields.threads) {
+        target.store(source.load(Relaxed), Relaxed);
     }
-    s.set_word(requested + 0x24, rd(payload + 0x20));
-    s.set_word(requested + 0x1c, rd(payload + 0x28));
-    s.set_word(requested + 0x20, rd(payload + 0x2c));
-    let stream = buffers::stream(1);
-    for index in 0..buffers::TABLE_ENTRIES {
-        super::wr8(s.0 + stream + buffers::STREAM_TABLE + index * 8 + 4, 0xcc);
+    requested
+        .title_budget
+        .store(fields.title_budget.load(Relaxed), Relaxed);
+    requested
+        .gpu_wait
+        .store(fields.gpu_wait.load(Relaxed), Relaxed);
+    requested
+        .frame_word
+        .store(fields.frame_word.load(Relaxed), Relaxed);
+    let stream = s.stream(StreamId::Second);
+    for entry in &stream.table {
+        entry.generation().store(session::EMPTY_GENERATION, Relaxed);
     }
-    s.set_quad(stream + 0x18, 0);
-    s.set_word(stream + buffers::STREAM_SEQUENCE, 0);
-    s.set_quad(
-        stream + buffers::STREAM_SIZE,
-        u64::from(rd(payload + 0x24)) << 14,
-    );
+    stream.offset.set(0);
+    stream.sequence.store(0, Relaxed);
+    stream
+        .size
+        .set(u64::from(fields.units.load(Relaxed)) * u64::from(BUFFER_BYTES));
     apply_requested(s, false);
     if restart {
         engine::capture_record(s);
     }
-    let first = s.word(requested);
-    if first != s.word(0) && first == 0 && s.word(super::super::session::DUMP_FILE) == 0 {
-        post_status(Status::NoHarddrive, 0);
+    let first = requested.part(Part::Thread);
+    if first != s.configuration.part(Part::Thread)
+        && first == FIRST_STREAM
+        && s.stream(StreamId::First).handle.load(Relaxed) == 0
+    {
+        post_status(Status::NoHarddrive);
     }
     if restart {
         engine::start(s);
     }
 }
 
-/// Message 7 `{first, last, ...}` (stock 0x91f5eb00): write frames of the
-/// dump partition to `unnamed.pix2` (status 2, else 6).
-fn write_frames(s: S, payload: u32) -> bool {
-    // Stock traps without a third word.
-    if rd(payload + 8) == 0 {
+/// Message 7 (stock 0x91f5eb00): write frames of the dump partition to
+/// `unnamed.pix2` (status 2, else 6).
+fn write_frames(s: &PixSession, payload: &Payload) -> bool {
+    let fields = WriteFramesPayload::of(payload);
+    if fields.required.load(Relaxed) == 0 {
         return true;
     }
     let mut written = false;
-    if s.word(super::FLAGS) & super::RUNNING == 0
+    if !running(s)
         && let Some(file) = open_unnamed()
     {
-        written = super::replay::write_stream(s, file.0, rd(payload), rd(payload + 4));
+        written = replay::write_stream(
+            s,
+            file.0,
+            fields.first.load(Relaxed),
+            fields.last.load(Relaxed),
+        );
         // SAFETY: the file opened above, not used after the write.
         unsafe { xboxkrnl::NtClose(Handle::from_raw(file.0)) };
     }
-    post_status(
-        if written {
-            Status::Timing
-        } else {
-            Status::NoFrame
-        },
-        0,
-    );
+    post_status(if written {
+        Status::Timing
+    } else {
+        Status::NoFrame
+    });
     true
 }
 
-/// Message 8 `{first, last, begin, write, context, mode}` (stock
-/// 0x91f614d0): replay the dump partition through the title's routines.
-fn write_frames_with(s: S, payload: u32) -> bool {
-    let running = s.word(super::FLAGS) & super::RUNNING != 0;
+/// Message 8 (stock 0x91f614d0): replay the dump partition through the
+/// title's routines.
+fn write_frames_with(s: &PixSession, payload: &Payload) -> bool {
+    let fields = ReplayFramesPayload::of(payload);
+    let running = running(s);
     if running {
-        engine::stop(s, s.0 + FRAME_RECORD, false, false);
+        stop(s);
     }
-    super::replay::replay(
-        s,
-        rd(payload + 8),
-        rd(payload + 0xc),
-        rd(payload + 0x10),
-        rd(payload + 0x14),
-        rd(payload),
-        rd(payload + 4),
-    );
+    // SAFETY: only code 0x57 queues message 8 (the server's `pixcmd`
+    // never posts it), and its contract covers the routines.
+    unsafe {
+        replay::replay(
+            s,
+            fields.begin.load(Relaxed),
+            fields.write.load(Relaxed),
+            fields.context.load(Relaxed),
+            fields.mode.load(Relaxed),
+            fields.first.load(Relaxed),
+            fields.last.load(Relaxed),
+        )
+    };
     if running {
         engine::start(s);
     }
     true
 }
 
-/// Message 12 `{first, last, operation, argument}` (stock 0x91f61568):
-/// run a video operation over captured frames; a failure is reported as
-/// `VideoOpError <code>`.
-fn video_operation(s: S, payload: u32) -> bool {
-    if rd(payload + 8) == 0 {
+/// Message 12 (stock 0x91f61568): run a video operation over captured
+/// frames; a failure is reported as `VideoOpError <code>`.
+fn video_operation(s: &PixSession, payload: &Payload) -> bool {
+    let fields = VideoOperationPayload::of(payload);
+    if fields.operation.load(Relaxed) == 0 {
         return true;
     }
-    let running = s.word(super::FLAGS) & super::RUNNING != 0;
+    let running = running(s);
     if running {
-        engine::stop(s, s.0 + FRAME_RECORD, false, false);
+        stop(s);
     }
-    let error = super::video::run(s, rd(payload), rd(payload + 4), rd(payload + 0xc));
+    let result = video::run(
+        s,
+        fields.first.load(Relaxed),
+        fields.last.load(Relaxed),
+        fields.argument.load(Relaxed),
+    );
     if running {
         end_video(s);
         engine::start(s);
     }
-    if let Some(error) = error {
+    if let Err(error) = result {
         let mut text: Text<0x40> = Text::new();
-        let _ = write!(text, "{}\0", error as i32);
-        post_status(
-            Status::VideoOpError,
-            text.as_bytes().as_ptr() as usize as u32,
-        );
+        let _ = write!(text, "{}\0", error.code() as i32);
+        // SAFETY: the code and the NUL fit in `text`, which outlives the
+        // call.
+        unsafe {
+            super::super::status::post(
+                Status::VideoOpError,
+                text.as_bytes().as_ptr() as usize as u32,
+            )
+        };
     }
     true
 }
 
 /// End of a video operation (stock 0x91f5a488): the frame record's
 /// completion routine runs once.
-pub(super) fn end_video(s: S) {
-    if s.word(VIDEO_FLAGS) & 0x8000_0000 != 0 {
+pub(super) fn end_video(s: &PixSession) {
+    let flags = &s.video.flags;
+    if VideoContextFlags::from_bits_retain(flags.load(Relaxed))
+        .contains(VideoContextFlags::COMPLETION)
+    {
+        let record = &s.frame_record;
         // SAFETY: the title's frame record names a routine taking one
         // argument.
         unsafe {
             kernel::call_export(
-                s.word(FRAME_RECORD + 0x34),
-                s.word(FRAME_RECORD + 0x1c),
+                record.completion_routine.load(Relaxed),
+                record.routine_argument.load(Relaxed),
                 0,
                 0,
                 0,
             )
         };
-        s.set_word(VIDEO_FLAGS, s.word(VIDEO_FLAGS) & !0x8000_0000);
+        flags.store(
+            VideoContextFlags::from_bits_retain(flags.load(Relaxed))
+                .difference(VideoContextFlags::COMPLETION)
+                .bits(),
+            Relaxed,
+        );
     }
 }
 
-/// Message 15 `{active, notify, request, information[3]}` (stock
-/// 0x91f5d270): report the resource capture state into the frame flags,
-/// or start or stop it through the plugin.
-fn resource_state(payload: u32, out: &mut u32) -> bool {
-    let active = rd(payload) != 0;
-    if rd(payload + 8) == 0 {
+/// Message 15 (stock 0x91f5d270): report the resource capture state into
+/// the frame flags, or start or stop it through the plugin.
+fn resource_state(payload: &Payload, out: &mut FrameState) -> bool {
+    let fields = ResourceStatePayload::of(payload);
+    let active = fields.active.load(Relaxed) != 0;
+    if fields.request.load(Relaxed) == 0 {
         if active {
-            *out |= 0x20;
+            *out |= FrameState::RESOURCE_ACTIVE;
         } else {
-            *out |= 0x40;
-            if rd(payload + 4) != 0 {
-                *out |= 0x80;
+            *out |= FrameState::RESOURCE_INACTIVE;
+            if fields.notify.load(Relaxed) != 0 {
+                *out |= FrameState::RESOURCE_NOTIFY;
             }
         }
     } else {
-        let (procedure, refusal): (u32, &core::ffi::CStr) = if active {
+        let (procedure, refusal) = if active {
             (
-                super::super::plugin::procedure(2),
+                plugin::procedure(PluginProcedure::StartResourceCapture),
                 c"PIX!StartFailed ResourceCapture",
             )
         } else {
             (
-                super::super::plugin::procedure(3),
+                plugin::procedure(PluginProcedure::StopResourceCapture),
                 c"PIX!NotActive ResourceCapture",
             )
         };
-        if procedure != 0 {
+        if let Some(procedure) = procedure {
             // SAFETY: the plugin's resource capture routines take two
-            // arguments, the message payload and the frame flags.
+            // arguments, the message payload and the frame state, which
+            // they may update.
             unsafe {
-                kernel::call_export(procedure, payload, out as *mut u32 as usize as u32, 0, 0)
+                kernel::call_export(
+                    procedure,
+                    crate::kernel::address_of(payload),
+                    core::ptr::from_mut(out).expose_provenance() as u32,
+                    0,
+                    0,
+                )
             };
         } else {
-            // SAFETY: the refusal text is a static NUL-terminated string.
+            // SAFETY: `refusal` is a static NUL-terminated string.
             unsafe {
                 crate::backend::session::service_send_notification(refusal.as_ptr() as usize as u32)
             };
         }
     }
-    super::super::set_resource_information(payload + 0xc);
+    super::super::set_resource_information(&fields.information);
     true
 }
 
 /// Message 10 (stock 0x91f617b0): pause the title until a resume message.
 /// The frame thread services messages while paused; a message other than
 /// 11 resumes and is handled at the next frame.
-fn pause(s: S) -> bool {
-    super::super::ring::capture_timing(1, super::active_parts(s), Timebase::now().ticks());
-    if s.word(FRAME_RECORD + 0x18) != 0 {
-        relock(s, || {
-            // SAFETY: the title's frame record names a routine taking one
-            // argument.
-            unsafe {
-                kernel::call_export(
-                    s.word(FRAME_RECORD + 0x18),
-                    s.word(FRAME_RECORD + 0x1c),
-                    0,
-                    0,
-                    0,
-                )
-            };
-        });
+fn pause(s: &PixSession) -> bool {
+    /// Phases of [`ring::capture_timing`].
+    const TIMING_START: u32 = 1;
+    const TIMING_END: u32 = 2;
+    ring::capture_timing(
+        TIMING_START,
+        super::active_parts(s),
+        Timebase::now().ticks(),
+    );
+    let record = &s.frame_record;
+    if record.stop_routine.load(Relaxed) != 0 {
+        s.leave_lock();
+        // SAFETY: the title's frame record names a routine taking one
+        // argument.
+        unsafe {
+            kernel::call_export(
+                record.stop_routine.load(Relaxed),
+                record.routine_argument.load(Relaxed),
+                0,
+                0,
+                0,
+            )
+        };
+        s.enter_lock();
     }
     pause_engine(s);
-    post_status(Status::Pause, 0);
+    post_status(Status::Pause);
     let resumed = loop {
-        relock(s, || {});
-        let Some(entry) = super::super::session::next_message(s) else {
+        s.leave_lock();
+        s.enter_lock();
+        let Some(entry) = session::next_message(s) else {
             continue;
         };
-        let message = entry + 8;
-        match rd(entry) {
-            3 | 4 => post_status(Status::No, 0),
-            6 => record_configuration(s, message, false),
-            7 => {
-                write_frames(s, message);
+        let payload = &entry.payload;
+        match entry.message() {
+            Some(EngineMessage::TraceFrame | EngineMessage::TraceEvent) => {
+                post_status(Status::No);
             }
-            8 => {
-                write_frames_with(s, message);
+            Some(EngineMessage::RecordConfiguration) => record_configuration(s, payload, false),
+            Some(EngineMessage::WriteFrames) => {
+                write_frames(s, payload);
             }
-            9 => super::replay::dump_header(s, 1),
-            10 => {}
-            12 => {
-                video_operation(s, message);
+            Some(EngineMessage::ReplayFrames) => {
+                write_frames_with(s, payload);
             }
-            14 => paused_video(s, message),
+            Some(EngineMessage::DumpHeader) => replay::dump_header(s, StreamId::Second),
+            Some(EngineMessage::Pause) => {}
+            Some(EngineMessage::VideoOperation) => {
+                video_operation(s, payload);
+            }
+            Some(EngineMessage::PausedVideo) => paused_video(s, payload),
             _ => break entry,
         }
     };
     resume_engine(s);
-    super::super::ring::capture_timing(2, super::active_parts(s), Timebase::now().ticks());
-    if rd(resumed) == 11 {
+    ring::capture_timing(TIMING_END, super::active_parts(s), Timebase::now().ticks());
+    if resumed.is(EngineMessage::Resume) {
         return true;
     }
-    super::super::session::requeue_message(s);
+    session::requeue_message(s);
     false
-}
-
-/// Release the session lock around `f` and take it again.
-fn relock(s: S, f: impl FnOnce()) {
-    super::super::session::leave(
-        s.at(super::super::session::LOCK),
-        s.word(super::super::session::LOCK_PRIORITY),
-    );
-    f();
-    let saved = super::super::session::enter(s.at(super::super::session::LOCK));
-    s.set_word(super::super::session::LOCK_PRIORITY, saved);
 }
 
 /// Message 14 while paused (stock 0x91f5d360): video operation into
 /// `unnamed.pix2` (status 13, else 6).
-fn paused_video(s: S, payload: u32) {
+fn paused_video(s: &PixSession, payload: &Payload) {
+    let fields = PausedVideoPayload::of(payload);
     let written = open_unnamed().is_some_and(|file| {
-        let error = super::video::write(s, file.0, rd(payload + 8), rd(payload), rd(payload + 4));
+        let result = video::write(
+            s,
+            file.0,
+            fields.no_gpu.load(Relaxed),
+            fields.first.load(Relaxed),
+            fields.last.load(Relaxed),
+        );
         // SAFETY: the file opened above, not used after the write.
         unsafe { xboxkrnl::NtClose(Handle::from_raw(file.0)) };
-        error == 0
+        result.is_ok()
     });
-    post_status(
-        if written {
-            Status::MovieData
-        } else {
-            Status::NoFrame
-        },
-        0,
-    );
+    post_status(if written {
+        Status::MovieData
+    } else {
+        Status::NoFrame
+    });
 }
 
 /// Stop for the pause (stock 0x91f61610): exempt the frame thread and
 /// the audio render thread from execution stops, render silence through
 /// a monitor audio client, stop with an execution state notification, and
 /// stop controller vibration.
-fn pause_engine(s: S) {
+fn pause_engine(s: &PixSession) {
+    const CONTROLLER_PORTS: u32 = 4;
     // SAFETY: `resume_engine` leaves the region.
     unsafe { xboxkrnl::KeEnterCriticalRegion() };
-    s.set_word(0xc880, s.word(0xe210));
-    let routine = s.word(super::super::session::KERNEL_ROUTINE);
+    s.video
+        .writes_at_pause
+        .store(s.thread_writes.load(Relaxed), Relaxed);
+    let routine = s.kernel_routine.load(Relaxed);
     if routine != 0 {
-        let client = [super::video::render_entry_address(), s.0 + 0xc930];
+        let client = [
+            video::render_entry_address(),
+            crate::kernel::address_of(&s.render_client),
+        ];
         // SAFETY: `client` is live for the call; the handle slot lies in
         // the session block.
-        unsafe { XAudioRegisterRenderDriverClient(client.as_ptr(), s.at(AUDIO_CLIENT)) };
-        call_kernel_routine(routine, s.word(AUDIO_CLIENT), 1);
-        // SAFETY: takes no arguments; returns the thread object address.
-        let thread = unsafe { xboxkrnl::XAudioGetRenderDriverThread() } as usize as u32;
+        unsafe { XAudioRegisterRenderDriverClient(client.as_ptr(), s.audio_client.as_ptr()) };
+        call_kernel_routine(routine, s.audio_client.load(Relaxed), true);
+        // SAFETY: takes no arguments. Stock dereferences the result without
+        // a check; the pause relies on XAudio having a render driver thread
+        // while its kernel routine is set, as stock does.
+        let thread = unsafe { &*xboxkrnl::XAudioGetRenderDriverThread() };
         // SAFETY: the render driver thread runs while XAudio keeps it, which
-        // the pause relies on, as stock does.
-        if let Some(previous) = unsafe {
-            crate::backend::debugger::exchange_record_flags(
-                kernel::thread_at(thread),
-                RECORD_PAUSE_MASK,
-                RECORD_PAUSED,
-            )
-        } {
-            s.set_word(AUDIO_THREAD_FLAGS, previous.bits());
+        // the pause relies on above.
+        if let Some(previous) =
+            unsafe { crate::backend::debugger::exchange_record_flags(thread, PAUSE_MASK, PAUSED) }
+        {
+            s.audio_thread_flags.store(previous.bits(), Relaxed);
         }
     }
-    let thread = processor::current_thread();
     // SAFETY: the calling thread does not end during the call.
     if let Some(previous) = unsafe {
         crate::backend::debugger::exchange_record_flags(
-            kernel::thread_at(thread),
-            RECORD_PAUSE_MASK,
-            RECORD_PAUSED,
+            current_object().kthread(),
+            PAUSE_MASK,
+            PAUSED,
         )
     } {
-        s.set_word(CALLER_FLAGS, previous.bits());
+        s.caller_flags.store(previous.bits(), Relaxed);
     }
-    engine::stop(s, s.0 + FRAME_RECORD, false, true);
-    for port in 0..4 {
+    engine::stop(s, &s.frame_record, false, true);
+    for port in 0..CONTROLLER_PORTS {
         stop_vibration(port);
     }
-    s.set_word(PAUSED, 1);
+    s.paused.store(1, Relaxed);
 }
 
 /// Resume (stock 0x91f5ff30).
-fn resume_engine(s: S) {
+fn resume_engine(s: &PixSession) {
     end_video(s);
     engine::start(s);
     let target = if crate::backend::debugger::execution_state()
@@ -676,41 +918,42 @@ fn resume_engine(s: S) {
         openxbdm_server::notify::ExecutionState::Started
     };
     crate::backend::debugger::request_execution(target, true);
-    let thread = processor::current_thread();
     // SAFETY: as in `pause_engine`.
     unsafe {
         crate::backend::debugger::exchange_record_flags(
-            kernel::thread_at(thread),
-            RECORD_PAUSE_MASK,
-            MonitorRecordFlags::from_bits_retain(s.word(CALLER_FLAGS)),
+            current_object().kthread(),
+            PAUSE_MASK,
+            MonitorRecordFlags::from_bits_retain(s.caller_flags.load(Relaxed)),
         )
     };
-    let routine = s.word(super::super::session::KERNEL_ROUTINE);
+    let routine = s.kernel_routine.load(Relaxed);
     if routine != 0 {
-        // SAFETY: takes no arguments; returns the thread object address.
-        let audio = unsafe { xboxkrnl::XAudioGetRenderDriverThread() } as usize as u32;
+        // SAFETY: takes no arguments; dereferenced without a check as in
+        // `pause_engine`.
+        let audio = unsafe { &*xboxkrnl::XAudioGetRenderDriverThread() };
         // SAFETY: as in `pause_engine`.
         unsafe {
             crate::backend::debugger::exchange_record_flags(
-                kernel::thread_at(audio),
-                RECORD_PAUSE_MASK,
-                MonitorRecordFlags::from_bits_retain(s.word(AUDIO_THREAD_FLAGS)),
+                audio,
+                PAUSE_MASK,
+                MonitorRecordFlags::from_bits_retain(s.audio_thread_flags.load(Relaxed)),
             )
         };
-        call_kernel_routine(routine, s.word(AUDIO_CLIENT), 0);
+        call_kernel_routine(routine, s.audio_client.load(Relaxed), false);
         // SAFETY: the client `pause_engine` registered.
-        unsafe { XAudioUnregisterRenderDriverClient(s.word(AUDIO_CLIENT)) };
-        s.set_word(AUDIO_CLIENT, 0);
+        unsafe { XAudioUnregisterRenderDriverClient(s.audio_client.load(Relaxed)) };
+        s.audio_client.store(0, Relaxed);
     }
     // SAFETY: pairs with the `KeEnterCriticalRegion` of `pause_engine`.
     unsafe { xboxkrnl::KeLeaveCriticalRegion() };
-    s.set_word(PAUSED, 0);
+    s.paused.store(0, Relaxed);
 }
 
-fn call_kernel_routine(routine: u32, client: u32, enable: u32) {
+#[inline(always)]
+fn call_kernel_routine(routine: u32, client: u32, enable: bool) {
     // SAFETY: kernel export 0x2d4 takes two arguments, the audio client
     // and a flag.
-    unsafe { kernel::call_export(routine, client, enable, 0, 0) };
+    unsafe { kernel::call_export(routine, client, u32::from(enable), 0, 0) };
 }
 
 /// Stop the vibration of controller `port` (stock 0x91f78b20 with zero
@@ -725,51 +968,101 @@ fn stop_vibration(port: u32) {
 /// Title end part (stock 0x91f62100, from the title terminate routine):
 /// stop, forget the title's partition handles and every allocation, and
 /// finish a capture to file.
-pub(super) fn title_ended(s: S) {
-    let record = [0u32; 0x10];
-    s.set_word(0x87d4, 0);
-    if s.word(super::FLAGS) & super::RUNNING != 0 {
-        engine::stop(s, record.as_ptr() as usize as u32, true, false);
+pub(super) fn title_ended(s: &PixSession) {
+    let record = FrameRecord::new();
+    s.swap_routine_registered.store(0, Relaxed);
+    if running(s) {
+        engine::stop(s, &record, true, false);
     }
-    s.set_word(0x5f8, 0);
-    s.set_word(0x600, 0);
-    s.set_word(0x5fc, 0);
-    for k in 0..2 {
-        s.set_word(buffers::stream(k) + 4, 0);
+    let frame_record = &s.frame_record;
+    frame_record.milliseconds.store(0, Relaxed);
+    frame_record.flags.store(0, Relaxed);
+    frame_record.unknown_08.store(0, Relaxed);
+    for stream in &s.streams {
+        stream.title_handle.store(0, Relaxed);
     }
     buffers::free(s);
-    super::super::session::reset_budget(s);
-    if s.word(MESSAGE) == 5 {
-        super::super::files::set_capture_file(None);
-        if rd(payload(s)) != 0 {
-            post_status(Status::No, 0);
+    session::reset_budget(s);
+    if s.message.is(EngineMessage::CaptureToFile) {
+        files::set_capture_file(None);
+        if CaptureToFilePayload::of(&s.message.payload)
+            .notify
+            .load(Relaxed)
+            != 0
+        {
+            post_status(Status::No);
         }
-        s.set_word(MESSAGE, 0);
-        s.set_word(STEP, 0);
+        s.message.code.store(0, Relaxed);
+        s.step.store(0, Relaxed);
     }
 }
 
-/// Monitor control code 0x56 (stock 0x91f56420 and 0x91f61228): `{+0
-/// size, +4, +8, +0xc..+0x18 with size 0x1c}` sets the memory budget
-/// switches and overrides; a running capture restarts with them.
-pub(super) fn configure(argument: u32) -> u32 {
-    if rd(argument) < 0xc {
+/// Argument of monitor control code 0x56: its size, then the budget
+/// switches.
+#[repr(C)]
+struct BudgetArgument {
+    size: AtomicU32,
+    enabled: AtomicU32,
+    title_enabled: AtomicU32,
+}
+
+/// Code 0x56 argument with the budget overrides.
+#[repr(C)]
+struct BudgetOverrideArgument {
+    _switches: BudgetArgument,
+    override_title: AtomicU32,
+    title_size: AtomicU32,
+    override_system: AtomicU32,
+    system_size: AtomicU32,
+}
+
+/// Monitor control code 0x56 (stock 0x91f56420 and 0x91f61228) sets the
+/// memory budget switches and, with the larger argument, the overrides; a
+/// running capture restarts with them.
+///
+/// # Safety
+///
+/// `argument` must be the address of a record that starts with its size
+/// in bytes and is as large as that size says, kept valid by the caller
+/// for the call.
+pub(super) unsafe fn configure(argument: u32) -> u32 {
+    // SAFETY: the caller's contract.
+    let size = unsafe { crate::kernel::object_at::<AtomicU32>(argument) };
+    if size.load(Relaxed) < size_of::<BudgetArgument>() as u32 {
         return 0;
     }
-    let Some(locked) = super::super::session::lock() else {
+    // SAFETY: the record is as large as its size word says.
+    let switches = unsafe { crate::kernel::object_at::<BudgetArgument>(argument) };
+    let Some(locked) = session::lock() else {
         return 1;
     };
-    let s = locked.0;
-    let running = s.word(super::FLAGS) & super::RUNNING != 0;
+    let s = locked.session();
+    let running = running(s);
     if running {
-        engine::stop(s, s.0 + FRAME_RECORD, false, false);
+        stop(s);
     }
-    s.set_word(0x87dc, rd(argument + 4));
-    s.set_word(0x87e0, rd(argument + 8));
-    if rd(argument) >= 0x1c {
-        for index in 0..4 {
-            s.set_word(0x87e4 + index * 4, rd(argument + 0xc + index * 4));
-        }
+    let budget = &s.budget;
+    budget
+        .enabled
+        .store(switches.enabled.load(Relaxed), Relaxed);
+    budget
+        .title_enabled
+        .store(switches.title_enabled.load(Relaxed), Relaxed);
+    if switches.size.load(Relaxed) >= size_of::<BudgetOverrideArgument>() as u32 {
+        // SAFETY: as above.
+        let overrides = unsafe { crate::kernel::object_at::<BudgetOverrideArgument>(argument) };
+        budget
+            .override_title
+            .store(overrides.override_title.load(Relaxed), Relaxed);
+        budget
+            .title_size
+            .store(overrides.title_size.load(Relaxed), Relaxed);
+        budget
+            .override_system
+            .store(overrides.override_system.load(Relaxed), Relaxed);
+        budget
+            .system_size
+            .store(overrides.system_size.load(Relaxed), Relaxed);
     }
     if running {
         buffers::free(s);

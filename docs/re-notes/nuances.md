@@ -185,6 +185,13 @@ lists.
 - PIX capture: while paused (message 10) the frame thread spins on the session lock servicing messages; a message other than 11 resumes, goes back to the queue head, and pauses again at the next frame.
 - PIX capture: code 0x5c rate-limits command data buffers with a token budget of 0x87a23 time base ticks per allocation and a minimum spacing of 0x43d11 ticks.
 - PIX capture engine deviations (where stock traps, faults or reads uninitialized data): see `parity/performance.md`, "PIX capture engine deviations".
+- PIX capture, openxbdm deviations where stock reads stale data or faults:
+  - When fewer than ten words are appended to a stream, the stream's last record copy is padded with zeros. Stock copies ten words from the record's address, which for the pending GPU frame are the session's frame times and otherwise stack bytes.
+  - When no buffer is free, taking one waits for a write request to complete. Stock retries once and then writes through address 4.
+  - Corrupt request, ring, table or processor indexes, a buffer read without allocated buffers (`pixcmd d`), and malformed partition data in the frame extractor panic instead of reading or writing out of range.
+  - Configuration values other than 0, 1 and off select stream `value & 1`; stock indexes past the two stream blocks.
+  - Video replay passes 0 as the buffer of an End request whose unit is out of range.
+  - `pixcmd b` after `pixcmd e` starts with an empty `pixcmd r` snapshot. Stock keeps the snapshot positions of the freed ring and reads through them.
 
 ## Hardware and PGO
 

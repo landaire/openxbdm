@@ -3,121 +3,181 @@
 //! are converted to 16-bit samples, staged in the session block, and
 //! queued in buffers of 0x2000 samples (type 0xc).
 
+use core::sync::atomic::AtomicU16;
+use core::sync::atomic::Ordering::Relaxed;
+
 use xbox360_sys::xam;
 use xbox360_sys::xboxkrnl;
 
-use super::S;
-use super::buffers;
-use super::rd;
-use super::wr;
+use super::super::session::AUDIO_BUFFER_SAMPLES;
+use super::super::session::EngineFlags;
+use super::super::session::Part;
+use super::super::session::PixSession;
+use super::buffers::BufferEntry;
+use super::buffers::BufferInfo;
+use super::buffers::BufferType;
+use super::gpu::StreamRecordKind;
 
-const BLOCK_SAMPLES: u32 = 0x600;
-const BUFFER_SAMPLES: u32 = 0x2000;
-/// Staged samples and their count, and the blocks dropped while no buffer
-/// was ready.
-const STAGE: u32 = 0xe280;
-const STAGED: u32 = 0x1_2280;
-const DROPPED: u32 = 0x1_2284;
+/// Samples of one XAudio render frame.
+pub(super) const BLOCK_SAMPLES: usize = 0x600;
 
-/// Convert `count` float samples at `source` to 16-bit samples at
-/// `output` (stock 0x91f5d4b8): scaled by 32768, truncated and saturated.
-fn convert(output: u32, source: u32, count: u32) {
-    for index in 0..count & !0x1f {
-        let sample = f32::from_bits(rd(source + index * 4)) * 32768.0;
-        let value = (sample as i32).clamp(i16::MIN.into(), i16::MAX.into()) as i16;
-        // SAFETY: the output holds `count` samples.
-        unsafe { core::ptr::write_volatile((output + index * 2) as usize as *mut i16, value) };
+xbox360_sys::flags! {
+    /// Flags word of a queued audio slot; bits 7 to 30 hold the frame.
+    pub struct AudioSlotFlags(u32) {
+        /// Write the slot's record with the buffer.
+        RECORD = 0x8000_0000,
+    }
+}
+
+impl AudioSlotFlags {
+    /// Bits a queued slot keeps.
+    const KEPT: u32 = 0x7f;
+
+    pub(super) const fn frame(self) -> u32 {
+        self.bits() >> 7 & 0x00ff_ffff
+    }
+}
+
+/// Convert float samples of `source` to 16-bit samples in `output`
+/// (stock 0x91f5d4b8): scaled by 32768, truncated and saturated; whole
+/// groups of 32 only.
+fn convert(output: &[AtomicU16], source: &[f32]) {
+    let source = &source[..source.len() & !0x1f];
+    for (output, &sample) in output.iter().zip(source) {
+        // The cast truncates and saturates, as stock.
+        output.store((sample * 32768.0) as i16 as u16, Relaxed);
     }
 }
 
 /// Take a ready audio buffer for stream `k` (stock 0x91f5d5d8).
-fn ready_buffer(s: S, k: u32) -> Option<u32> {
-    if s.word(0x1b0) == 0 || s.word(0x1c8) == s.word(0x1cc) {
+fn ready_buffer(s: &PixSession, k: u32) -> Option<&BufferEntry> {
+    let tail = s.audio_ready_tail.load(Relaxed);
+    if s.audio_enabled.load(Relaxed) == 0 || s.audio_ready_head.load(Relaxed) == tail {
         return None;
     }
-    let index = s.word(0x1cc);
-    s.set_word(0x1cc, if index + 1 < 4 { index + 1 } else { 0 });
-    let entry = s.word(0x1b8 + index * 4);
-    wr(
-        entry + 4,
-        (k << 5 | 0xc) << 25 | (s.word(super::FLAGS) >> 4 & 0x01ff_fffe) | (rd(entry + 4) & 1),
+    let next = tail + 1;
+    s.audio_ready_tail.store(
+        if (next as usize) < s.audio_ready.len() {
+            next
+        } else {
+            0
+        },
+        Relaxed,
+    );
+    // Ready ring indexes wrap at its length, a power of two.
+    let word = &s.audio_ready[tail as usize % s.audio_ready.len()];
+    // SAFETY: the ready ring holds entries `gpu::service` took from the
+    // buffer table, or 0. As in stock, the table stays allocated while the
+    // capture runs, which `service_samples` checked.
+    let entry = unsafe { super::gpu::entry_at(word.load(Relaxed)) }?;
+    entry.info.store(
+        BufferInfo::new(k, BufferType::AUDIO, s.engine_flags(), entry.info()).0,
+        Relaxed,
     );
     Some(entry)
 }
 
 /// Queue a filled audio buffer with its record (stock 0x91f5d670).
-fn queue(s: S, entry: u32, record: &[u32; 3]) {
-    let index = s.word(0x298);
-    let slot = s.0 + 0x1d0 + index * 0x14;
-    wr(slot, entry);
-    wr(slot + 4, (rd(slot + 4) & 0x7f) | 0x8000_0000);
-    for (offset, &word) in record.iter().enumerate() {
-        wr(slot + 8 + offset as u32 * 4, word);
+fn queue(s: &PixSession, entry: &BufferEntry, record: &[u32; 3]) {
+    let index = s.audio_queue_head.load(Relaxed);
+    // SAFETY: the session block is allocated zeroed, and only this function
+    // (which wraps at the queue length) and the engine reset (which stores
+    // 0) store the queue head.
+    unsafe { core::hint::assert_unchecked((index as usize) < s.audio_queue.len()) };
+    let slot = &s.audio_queue[index as usize];
+    slot.entry.store(entry.address(), Relaxed);
+    let flags = AudioSlotFlags::from_bits_retain(slot.flags.load(Relaxed) & AudioSlotFlags::KEPT)
+        | AudioSlotFlags::RECORD;
+    slot.flags.store(flags.bits(), Relaxed);
+    for (slot, &word) in slot.record.iter().zip(record) {
+        slot.store(word, Relaxed);
     }
-    s.set_word(0x298, if index + 1 < 10 { index + 1 } else { 0 });
+    let next = index + 1;
+    s.audio_queue_head.store(
+        if (next as usize) < s.audio_queue.len() {
+            next
+        } else {
+            0
+        },
+        Relaxed,
+    );
 }
 
 /// Monitor control code 0x5b: one rendered block (1).
-pub(crate) fn service_samples(block: u32) -> u32 {
+///
+/// # Safety
+///
+/// `block` must be the address of a rendered block of `BLOCK_SAMPLES`
+/// floats that the caller does not change during the call.
+pub(crate) unsafe fn service_samples(block: u32) -> u32 {
     let Some(s) = super::super::session::session() else {
         return 1;
     };
-    let k = s.word(0xc);
-    if s.word(super::FLAGS) & super::RUNNING == 0 || k == super::OFF {
+    let k = s.configuration.part(Part::Audio);
+    if !s.engine_flags().contains(EngineFlags::RUNNING) || k.is_off() {
         return 1;
     }
-    let staged = s.word(STAGED);
-    if staged <= BUFFER_SAMPLES - BLOCK_SAMPLES {
-        convert(s.0 + STAGE + staged * 2, block, BLOCK_SAMPLES);
-        s.set_word(STAGED, staged + BLOCK_SAMPLES);
+    // SAFETY: the caller's contract.
+    let block: &[f32; BLOCK_SAMPLES] = unsafe { crate::kernel::object_at(block) };
+    let stage = &s.audio_stage.0;
+    let staged = s.staged.load(Relaxed) as usize;
+    // SAFETY: the session block is allocated zeroed, and only this function
+    // and the engine reset store the staged count: at most a full buffer
+    // below, the rest of a block (under `BLOCK_SAMPLES`), or 0.
+    unsafe { core::hint::assert_unchecked(staged <= AUDIO_BUFFER_SAMPLES) };
+    if staged <= AUDIO_BUFFER_SAMPLES - BLOCK_SAMPLES {
+        convert(&stage[staged..], block);
+        s.staged.store((staged + BLOCK_SAMPLES) as u32, Relaxed);
         return 1;
     }
-    // SAFETY: the spin lock word lies in the session block.
-    let irql = unsafe { xboxkrnl::KfAcquireSpinLock(s.at(0x1b4).cast()) };
-    match ready_buffer(s, k) {
-        None => s.set_word(DROPPED, s.word(DROPPED).wrapping_add(1)),
+    // SAFETY: the audio spin lock lies in the session block.
+    let irql = unsafe { xboxkrnl::KfAcquireSpinLock(s.audio_lock.as_ptr()) };
+    match ready_buffer(s, k.0) {
+        None => s
+            .dropped
+            .store(s.dropped.load(Relaxed).wrapping_add(1), Relaxed),
         Some(entry) => {
             let mut counter = 0u64;
             // SAFETY: `counter` is a live local.
             unsafe { xam::QueryPerformanceCounter(&mut counter) };
             let record = [
-                (s.word(DROPPED) << 16 | (staged & 0xffff)) << 3 | 5,
+                (s.dropped.load(Relaxed) << 16 | (staged as u32 & 0xffff)) << 3
+                    | StreamRecordKind::Audio as u32,
                 0,
                 (counter >> 10) as u32,
             ];
-            let data = buffers::data(entry);
-            // SAFETY: the stage holds `staged` samples and the buffer room
-            // for 0x2000.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    (s.0 + STAGE) as usize as *const u8,
-                    data as usize as *mut u8,
-                    (staged * 2) as usize,
-                )
-            };
-            let first = BUFFER_SAMPLES.wrapping_sub(staged);
-            let rest = BLOCK_SAMPLES.wrapping_sub(first);
-            convert(data + staged * 2, block, first);
+            let data = core::ptr::with_exposed_provenance_mut::<AtomicU16>(entry.data() as usize);
+            // SAFETY: a ready buffer's data is a capture buffer of
+            // `AUDIO_BUFFER_SAMPLES` samples that only this thread
+            // accesses until it is queued.
+            let samples = unsafe { core::slice::from_raw_parts(data, AUDIO_BUFFER_SAMPLES) };
+            // SAFETY: only the render thread accesses the stage, and the
+            // copy stays within the stage and the buffer.
+            unsafe { core::ptr::copy_nonoverlapping(stage.as_ptr(), data, staged) };
+            let first = AUDIO_BUFFER_SAMPLES - staged;
+            let rest = BLOCK_SAMPLES - first;
+            let (head, tail) = block.split_at(first);
+            convert(&samples[staged..], head);
             queue(s, entry, &record);
-            convert(s.0 + STAGE, block + first * 4, rest);
-            s.set_word(STAGED, rest);
-            s.set_word(DROPPED, 0);
+            convert(stage, tail);
+            s.staged.store(rest as u32, Relaxed);
+            s.dropped.store(0, Relaxed);
         }
     }
     // SAFETY: as above; the lock is held.
-    unsafe { xboxkrnl::KfReleaseSpinLock(s.at(0x1b4).cast(), irql) };
+    unsafe { xboxkrnl::KfReleaseSpinLock(s.audio_lock.as_ptr(), irql) };
     service_from_render_thread(s);
     1
 }
 
 /// Service the queues from the render thread when both session locks can
 /// be had within 25,000 ticks (stock 0x91f60288).
-fn service_from_render_thread(s: S) {
+fn service_from_render_thread(s: &PixSession) {
+    const WAIT_TICKS: u32 = 25_000;
     let start = super::timebase_low();
-    let expired = || super::timebase_low().wrapping_sub(start) > 0x61a8;
-    let lock: *mut xboxkrnl::RtlCriticalSection = s.at(super::super::session::LOCK).cast();
-    let engine_lock: *mut xboxkrnl::RtlCriticalSection =
-        s.at(super::super::session::ENGINE_LOCK).cast();
+    let expired = || super::timebase_low().wrapping_sub(start) > WAIT_TICKS;
+    let lock = s.lock.as_ptr();
+    let engine_lock = s.engine_lock.as_ptr();
     // SAFETY: both critical sections lie in the session block and were
     // initialized by `session::create`.
     while !unsafe { xboxkrnl::RtlTryEnterCriticalSection(lock) }.get() {

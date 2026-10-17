@@ -55,10 +55,13 @@ use openxbdm_server::notify::ExecutionState;
 use xbox360::console::hardware_flags;
 use xbox360::console::kernel_version;
 use xbox360::time::sleep;
+use xbox360_sys::image::ImageCharacteristics;
+use xbox360_sys::image::ImageDirectory;
 use xbox360_sys::processor;
 use xbox360_sys::processor::current_irql;
 use xbox360_sys::processor::current_thread;
 use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::DebugMonitorFlags;
 use xbox360_sys::xboxkrnl::DumpWriteDump;
 use xbox360_sys::xboxkrnl::ExRegisterThreadNotification;
 use xbox360_sys::xboxkrnl::Handle;
@@ -79,14 +82,13 @@ use xbox360_sys::xboxkrnl::ProcessorMode;
 use xbox360_sys::xboxkrnl::RtlCaptureContext;
 use xbox360_sys::xboxkrnl::RtlImageDirectoryEntryToData;
 use xbox360_sys::xboxkrnl::RtlImageNtHeader;
+use xbox360_sys::xboxkrnl::SpecialPurposeRegister;
 use xbox360_sys::xboxkrnl::WaitReason;
 use xbox360_sys::xboxkrnl::XexUnloadImage;
 
 use super::Console;
 use crate::kernel;
 
-/// Data address breakpoint register.
-const SPR_DABR: u32 = 0x3f5;
 /// Pool tag of monitor thread records ('Dmtd').
 const RECORD_TAG: PoolTag = PoolTag::new(*b"dtmD");
 /// Monitor record flag: the thread is under debugger control.
@@ -227,8 +229,8 @@ fn create_record(thread_object: u32) -> Option<u32> {
 fn process_of(kind: ProcessKind) -> u32 {
     let data = kernel::debug_monitor_data();
     match kind {
-        ProcessKind::Title => data.words[0x15],
-        ProcessKind::System => data.words[0x14],
+        ProcessKind::Title => data.title_process.load(Ordering::Relaxed),
+        ProcessKind::System => data.system_process.load(Ordering::Relaxed),
     }
 }
 
@@ -599,8 +601,9 @@ fn discard_detached() {
 /// Mark the data block as writing a crash dump (+0x0c bit 0x40), as stock
 /// does before each dump; returns the updated flags.
 fn mark_dump() -> u32 {
-    let flags = kernel::debug_monitor_data().words[3] | 0x40;
-    kernel::set_debug_monitor_word(0xc, flags);
+    let data = kernel::debug_monitor_data();
+    let flags = data.flags.load(Ordering::Relaxed) | DebugMonitorFlags::DUMP.bits();
+    data.flags.store(flags, Ordering::Release);
     flags
 }
 
@@ -726,7 +729,9 @@ unsafe extern "C" fn stack_overflow_entry() {
 /// Returns the faulting address as stock does; the kernel ignores it.
 extern "C" fn stack_overflow(frame: u32) -> u32 {
     let address = read_u32(frame + trap_frame::IAR);
-    let variable = kernel::debug_monitor_data().words[0x16];
+    let variable = kernel::debug_monitor_data()
+        .stack_overflow_notification
+        .load(Ordering::Relaxed);
     // SAFETY: the variable is the kernel's word-aligned notification
     // pointer, which `install` found nonzero.
     let hooked =
@@ -936,7 +941,7 @@ extern "C" fn thread_notification(_registration: u32, thread_object: u32, create
 /// monitor data is available.
 pub(crate) fn install() {
     let data = kernel::debug_monitor_data();
-    let routine_variable = data.words[0];
+    let routine_variable = data.debug_routine.load(Ordering::Relaxed);
     if routine_variable != 0 && PREVIOUS_DEBUG_ROUTINE.load(Ordering::Relaxed) == 0 {
         PREVIOUS_DEBUG_ROUTINE.store(read_u32(routine_variable), Ordering::Release);
         write_u32(
@@ -944,7 +949,7 @@ pub(crate) fn install() {
             debug_routine_entry as *const () as usize as u32,
         );
     }
-    let overflow_variable = data.words[0x16];
+    let overflow_variable = data.stack_overflow_notification.load(Ordering::Relaxed);
     if overflow_variable != 0 {
         write_u32(
             overflow_variable,
@@ -957,18 +962,18 @@ pub(crate) fn install() {
     );
     // SAFETY: the registration block is static and stays registered until
     // `uninstall`.
-    unsafe { ExRegisterThreadNotification(THREAD_NOTIFICATION.as_ptr() as *mut u32, true) };
+    unsafe { ExRegisterThreadNotification(THREAD_NOTIFICATION.as_ptr().cast_mut().cast(), true) };
 }
 
 /// Undo [`install`] before the image unloads.
 pub(crate) fn uninstall() {
     if THREAD_NOTIFICATION[0].load(Ordering::Relaxed) != 0 {
         // SAFETY: `install` registered this static block.
-        unsafe { ExRegisterThreadNotification(THREAD_NOTIFICATION.as_ptr() as *mut u32, false) };
+        unsafe { ExRegisterThreadNotification(THREAD_NOTIFICATION.as_ptr().cast_mut().cast(), false) };
         THREAD_NOTIFICATION[0].store(0, Ordering::Relaxed);
     }
     let data = kernel::debug_monitor_data();
-    let overflow_variable = data.words[0x16];
+    let overflow_variable = data.stack_overflow_notification.load(Ordering::Relaxed);
     if overflow_variable != 0 {
         // SAFETY: the kernel's word-aligned notification pointer.
         let slot = unsafe { AtomicU32::from_ptr(overflow_variable as usize as *mut u32) };
@@ -979,7 +984,7 @@ pub(crate) fn uninstall() {
             Ordering::Relaxed,
         );
     }
-    let routine_variable = data.words[0];
+    let routine_variable = data.debug_routine.load(Ordering::Relaxed);
     if routine_variable != 0
         && read_u32(routine_variable) == debug_routine_entry as *const () as usize as u32
     {
@@ -1417,7 +1422,7 @@ crate::exports::bridged!(set_data_breakpoint_entry, set_data_breakpoint_on_proce
 
 extern "C" fn set_data_breakpoint_on_processor(value: u32) -> u32 {
     // SAFETY: writing DABR on this processor only arms a data breakpoint.
-    unsafe { KeSetSpecialPurposeRegister(SPR_DABR, u64::from(value)) };
+    unsafe { KeSetSpecialPurposeRegister(SpecialPurposeRegister::DABR, u64::from(value)) };
     value
 }
 
@@ -1550,18 +1555,25 @@ fn describe_module(name_string: u32, entry: u32) -> Option<ModuleEvent> {
     module.size = read_u32(entry + 0xc);
     // SAFETY: `module.base` is the image base from the loader's module entry.
     let header = unsafe { RtlImageNtHeader(module.base) };
-    if header != 0 {
+    // SAFETY: a non-null result is the NT headers of the mapped image, which
+    // the loader keeps mapped across the load or unload trap.
+    if let Some(header) = unsafe { header.as_ref() } {
         module.has_header = true;
-        module.checksum = read_u32(header + 0x58).swap_bytes();
-        module.timestamp = read_u32(header + 8).swap_bytes();
-        module.image_size = read_u32(header + 0x50).swap_bytes();
-        let characteristics = ((read_u32(header + 0x14) & 0xffff) as u16).swap_bytes();
-        if characteristics & 0x2000 != 0 {
+        module.checksum = header.optional_header.check_sum.get();
+        module.timestamp = header.file_header.time_date_stamp.get();
+        module.image_size = header.optional_header.size_of_image.get();
+        if header
+            .file_header
+            .characteristics()
+            .contains(ImageCharacteristics::DLL)
+        {
             module.flags |= module_flags::DLL;
         }
         let mut size = 0u32;
         // SAFETY: the image has the NT header found above; `size` is a live local.
-        module.pdata = unsafe { RtlImageDirectoryEntryToData(module.base, true, 3, &mut size) };
+        module.pdata = unsafe {
+            RtlImageDirectoryEntryToData(module.base, true, ImageDirectory::Exception, &mut size)
+        };
         module.pdata_size = size;
     }
     Some(module)
@@ -1841,7 +1853,8 @@ impl debugger::Backend for Console {
     }
 
     fn thread_exit_status(&mut self, handle: ThreadHandle) -> Result<ExitStatus, KernelError> {
-        let object_type = xboxkrnl::ExThreadObjectType.address();
+        let object_type =
+            core::ptr::from_ref(kernel::resolved(&xboxkrnl::ExThreadObjectType)).addr() as u32;
         let mut object = 0u32;
         // SAFETY: `object` is a live local; the kernel validates the handle
         // against the thread object type.

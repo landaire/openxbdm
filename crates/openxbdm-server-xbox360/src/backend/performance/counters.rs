@@ -797,8 +797,9 @@ pub(crate) fn memory_statistics(out: &mut [u32; 12]) -> Result<(), StatisticsErr
         &reply[1..]
     } else {
         statistics[0] = MEMORY_STATISTICS_LENGTH;
-        // SAFETY: `statistics` is a live block with its length word set.
-        status = unsafe { MmQueryStatistics(statistics.as_mut_ptr()) };
+        // SAFETY: `statistics` is a live block of the `MmStatistics` size
+        // with its length word set.
+        status = unsafe { MmQueryStatistics(statistics.as_mut_ptr().cast()) };
         &statistics
     };
     status.result().map_err(StatisticsError::Kernel)?;
@@ -925,10 +926,13 @@ pub(super) fn initialize() {
         .store(DEFAULT_OBJECT.as_ptr() as usize as u32, Ordering::Relaxed);
 
     TITLE_INTERFACE[0].store(TITLE_INTERFACE_SIZE, Ordering::Relaxed);
-    kernel::set_debug_monitor_word(0x20, TITLE_INTERFACE.as_ptr() as usize as u32);
-    kernel::set_debug_monitor_word(0x24, TITLE_RESERVED.as_ptr() as usize as u32);
+    let data = kernel::debug_monitor_data();
+    data.title_interface
+        .store(TITLE_INTERFACE.as_ptr() as usize as u32, Ordering::Release);
+    data.title_reserved
+        .store(TITLE_RESERVED.as_ptr() as usize as u32, Ordering::Release);
     SAMPLER.processor_blocks.store(
-        kernel::debug_monitor_data().words[0x5c / 4],
+        data.processor_blocks.load(Ordering::Relaxed),
         Ordering::Relaxed,
     );
 

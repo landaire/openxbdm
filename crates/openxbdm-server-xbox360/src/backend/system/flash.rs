@@ -7,7 +7,6 @@ use core::num::NonZeroU32;
 use core::ptr::NonNull;
 
 use openxbdm_core::status::KernelError;
-use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::Win32Error;
 use xbox360::console::hardware_flags;
 use xbox360_sys::xboxkrnl;
@@ -17,6 +16,7 @@ use xbox360_sys::xboxkrnl::AnsiString;
 use xbox360_sys::xboxkrnl::CreateOptions;
 use xbox360_sys::xboxkrnl::FileAttributes;
 use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::IoControlCode;
 use xbox360_sys::xboxkrnl::IoStatusBlock;
 use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
 use xbox360_sys::xboxkrnl::ObjectAttributes;
@@ -27,9 +27,6 @@ use super::POOL_TAG;
 use crate::kernel;
 
 const DEVICE_NAME: &[u8] = b"\\Device\\Flash\0";
-/// Returns the 0x14-byte flash geometry; dwords 0 and 2 multiply to the
-/// device write unit.
-const IOCTL_FLASH_GEOMETRY: u32 = 0x003c_0028;
 const GEOMETRY_SIZE: u32 = 0x14;
 const PAGE_SIZE: u32 = 0x4000;
 /// `MmAllocatePhysicalMemory` protection of the boot loader buffer.
@@ -145,7 +142,7 @@ impl Buffers {
         }
         if let Some(boot_loader) = self.boot_loader {
             // SAFETY: `boot_loader` is the physical allocation of the writer.
-            unsafe { xboxkrnl::MmFreePhysicalMemory(0, boot_loader.get()) };
+            unsafe { xboxkrnl::MmFreePhysicalMemory(xboxkrnl::MemoryRegion::CurrentProcess, boot_loader.get()) };
         }
     }
 }
@@ -231,7 +228,7 @@ fn flash_kernel_image(
             &mut patch_size,
             AllocationType::COMMIT,
             PageProtection::READWRITE,
-            0,
+            xboxkrnl::MemoryRegion::CurrentProcess,
         )
     };
     buffers.patch = NonZeroU32::new(patch_base);
@@ -267,7 +264,7 @@ fn flash_kernel_image(
     // `loader_size` bytes.
     let status =
         unsafe { xboxkrnl::XeKeysSaveBootLoader(&mut flags, &mut loader_size, loader.get()) };
-    if !NtStatus(status).is_success() || flags != 0 {
+    if !status.is_success() || flags != 0 {
         // Stock reports this only on the debug output and returns success.
         kernel::debug_print(
             c"WRN[XAPI]: XapiFlashKernelImage(): unable to reencrypt boot loader\n",
@@ -453,7 +450,7 @@ impl Device {
                 0,
                 0,
                 &mut self.io_status,
-                IOCTL_FLASH_GEOMETRY,
+                IoControlCode::FLASH_GEOMETRY,
                 core::ptr::null(),
                 0,
                 geometry.as_mut_ptr().cast(),
@@ -535,7 +532,7 @@ impl Scratch {
                 &mut self.size,
                 AllocationType::COMMIT | AllocationType::RESERVE,
                 PageProtection::READWRITE,
-                0,
+                xboxkrnl::MemoryRegion::CurrentProcess,
             )
         };
         self.base = NonZeroU32::new(base);

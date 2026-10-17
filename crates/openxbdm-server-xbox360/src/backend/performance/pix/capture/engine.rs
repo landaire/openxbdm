@@ -4,8 +4,11 @@
 //! (0x91f5f948), the 100 ms marker timer, and the frame records
 //! (0x91f5e5b8).
 
+use core::sync::atomic::Ordering;
+
 use openxbdm_server::notify::ExecutionState;
 use xbox360::time::Timebase;
+use xbox360_sys::processor::Kpcr;
 use xbox360_sys::xboxkrnl;
 
 use super::S;
@@ -14,14 +17,6 @@ use super::rd;
 use super::wr;
 use crate::kernel;
 
-/// Processor control region fields of the capture buffers: cursor and
-/// limit of the first (types 0-5) and second (types 6-11) buffer, the
-/// four consecutive from `PCR_CURSOR`, and flags.
-pub(super) const PCR_CURSOR: u32 = 0x2b0;
-pub(super) const PCR_LIMIT: u32 = 0x2b4;
-const PCR_CURSOR2: u32 = 0x2b8;
-const PCR_FLAGS: u32 = 0x2c0;
-pub(super) const PCR_PROCESSOR: u32 = 0x10c;
 /// Data bytes of a per-thread buffer the kernel and titles fill, and of
 /// the second buffer.
 const THREAD_LIMIT: u32 = 0x3f2c;
@@ -143,18 +138,36 @@ extern "C" fn install(context: u32) -> u32 {
     let processor = super::processor();
     let slot = context + processor * (CONTEXT as u32 * 4);
     let s = S(rd(slot));
-    let pcr = super::pcr();
+    let pcr = Kpcr::current();
     super::interrupts_off();
-    s.set_word(0x98 + processor * 4, pcr + PCR_CURSOR);
-    s.set_word(0xb0 + processor * 4, pcr + PCR_CURSOR2);
-    // Cursor, limit, second cursor and second limit are consecutive.
-    for index in 0..4 {
-        wr(pcr + PCR_CURSOR + index * 4, rd(slot + 4 + index * 4));
-    }
-    wr(
-        pcr + PCR_FLAGS,
-        (rd(slot + 0x14) & !1) | (rd(pcr + PCR_FLAGS) & 1),
+    s.set_word(
+        0x98 + processor * 4,
+        core::ptr::from_ref(&pcr.pix_buffers[0].cursor).addr() as u32,
     );
+    s.set_word(
+        0xb0 + processor * 4,
+        core::ptr::from_ref(&pcr.pix_buffers[1].cursor).addr() as u32,
+    );
+    // SAFETY: the slot holds the bounds of this processor's buffers in the
+    // session, which stay allocated until `uninstall` takes them back.
+    unsafe {
+        pcr.pix_buffers[0]
+            .cursor
+            .store(rd(slot + 4), Ordering::Relaxed);
+        pcr.pix_buffers[0]
+            .limit
+            .store(rd(slot + 8), Ordering::Relaxed);
+        pcr.pix_buffers[1]
+            .cursor
+            .store(rd(slot + 0xc), Ordering::Relaxed);
+        pcr.pix_buffers[1]
+            .limit
+            .store(rd(slot + 0x10), Ordering::Relaxed);
+        pcr.pix_flags.store(
+            (rd(slot + 0x14) & !1) | (pcr.pix_flags.load(Ordering::Relaxed) & 1),
+            Ordering::Relaxed,
+        );
+    }
     super::interrupts_on();
     0
 }
@@ -165,18 +178,20 @@ extern "C" fn uninstall(context: u32) -> u32 {
     let processor = super::processor();
     let slot = context + processor * 0xc;
     let s = S(rd(slot));
-    let pcr = super::pcr();
+    let pcr = Kpcr::current();
     super::interrupts_off();
     for second in 0..2 {
         let index = processor + second * 6;
-        let field = PCR_CURSOR + second * (PCR_CURSOR2 - PCR_CURSOR);
-        let cursor = rd(pcr + field);
+        let field = &pcr.pix_buffers[second as usize].cursor;
+        let cursor = field.load(Ordering::Relaxed);
         let base = s.word(0x87a0 + index * 4);
         if (base..base.wrapping_add(0x800)).contains(&cursor) {
             match s.word(0x876c + index * 4) {
                 2 => super::timing::merge(s),
                 1 => {
-                    wr(pcr + field, s.word(0x8738 + index * 4));
+                    // SAFETY: the saved cursor lies inside the session's
+                    // buffer of this processor.
+                    unsafe { field.store(s.word(0x8738 + index * 4), Ordering::Relaxed) };
                     super::fence();
                     s.set_word(0x876c + index * 4, 0);
                     super::fence();
@@ -190,12 +205,18 @@ extern "C" fn uninstall(context: u32) -> u32 {
             }
         }
     }
-    wr(slot + 4, rd(pcr + PCR_CURSOR));
-    wr(slot + 8, rd(pcr + PCR_CURSOR2));
-    for index in 0..4 {
-        wr(pcr + PCR_CURSOR + index * 4, 0);
+    wr(slot + 4, pcr.pix_buffers[0].cursor.load(Ordering::Relaxed));
+    wr(slot + 8, pcr.pix_buffers[1].cursor.load(Ordering::Relaxed));
+    // SAFETY: an empty buffer and cleared flags stop the kernel and titles
+    // from writing records on this processor.
+    unsafe {
+        pcr.pix_buffers[0].cursor.store(0, Ordering::Relaxed);
+        pcr.pix_buffers[0].limit.store(0, Ordering::Relaxed);
+        pcr.pix_buffers[1].cursor.store(0, Ordering::Relaxed);
+        pcr.pix_buffers[1].limit.store(0, Ordering::Relaxed);
+        pcr.pix_flags
+            .store(pcr.pix_flags.load(Ordering::Relaxed) & 1, Ordering::Relaxed);
     }
-    wr(pcr + PCR_FLAGS, rd(pcr + PCR_FLAGS) & 1);
     super::interrupts_on();
     0
 }
@@ -219,20 +240,21 @@ extern "C" fn swap_record(old: u32, frame: u32, new: u32) -> u32 {
         return 0;
     };
     let processor = super::processor();
-    let pcr = super::pcr();
+    let pcr = Kpcr::current();
     let old_id = rd(old + super::THREAD_ID);
     let mut new_id = rd(new + super::THREAD_ID);
-    if super::rd8(pcr + 0x19) != 0 && new_id == 0 {
+    if pcr.unknown_019.load(Ordering::Relaxed) != 0 && new_id == 0 {
         new_id = (-2i32) as u32;
     }
+    let buffer = &pcr.pix_buffers[0];
     super::interrupts_off();
-    let mut cursor = rd(pcr + PCR_CURSOR);
-    if cursor >= rd(pcr + PCR_LIMIT) {
+    let mut cursor = buffer.cursor.load(Ordering::Relaxed);
+    if cursor >= buffer.limit.load(Ordering::Relaxed) {
         super::interrupts_on();
         super::timing::request_at_raised_level(s);
         super::interrupts_off();
-        cursor = rd(pcr + PCR_CURSOR);
-        if cursor >= rd(pcr + PCR_LIMIT) {
+        cursor = buffer.cursor.load(Ordering::Relaxed);
+        if cursor >= buffer.limit.load(Ordering::Relaxed) {
             s.set_word(0x1_2298 + processor * 4, 1);
             super::interrupts_on();
             return 0;
@@ -245,7 +267,8 @@ extern "C" fn swap_record(old: u32, frame: u32, new: u32) -> u32 {
     let total = first + second + 4;
     wr(cursor + (first + second + 3) * 4, old_id);
     wr(cursor + 4, total << 24 | 0x45);
-    wr(pcr + PCR_CURSOR, cursor + total * 4);
+    // SAFETY: the new cursor ends the record written inside the buffer.
+    unsafe { buffer.cursor.store(cursor + total * 4, Ordering::Relaxed) };
     super::interrupts_on();
     0
 }

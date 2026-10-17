@@ -11,6 +11,7 @@ use core::sync::atomic::AtomicI32;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
+use openxbdm_core::status::KernelError;
 use openxbdm_server::Server;
 use openxbdm_server::commands::console::TraceMask;
 use openxbdm_server::commands::filesystem::Backend as _;
@@ -18,15 +19,24 @@ use openxbdm_server::commands::session::debug_capture_print;
 use openxbdm_server::text::Text;
 use xbox360::console::hardware_flags;
 use xbox360::console::kernel_version;
+use xbox360_sys::processor::Kpcr;
 use xbox360_sys::processor::current_irql;
-use xbox360_sys::processor::pcr;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::DebugMonitorService;
+use xbox360_sys::xboxkrnl::DeviceObject;
+use xbox360_sys::xboxkrnl::DeviceObjectFlags;
+use xbox360_sys::xboxkrnl::DriverObject;
+use xbox360_sys::xboxkrnl::HardwareFlags;
+use xbox360_sys::xboxkrnl::IoControlCode;
+use xbox360_sys::xboxkrnl::IoStackControl;
+use xbox360_sys::xboxkrnl::IrpMajorFunction;
 use xbox360_sys::xboxkrnl::Irql;
 use xbox360_sys::xboxkrnl::Kdpc;
 use xbox360_sys::xboxkrnl::KspinLock;
 use xbox360_sys::xboxkrnl::Ktimer;
 use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
+use xbox360_sys::xboxkrnl::SmcCommand;
+use xbox360_sys::xboxkrnl::SmcMessage;
 
 use super::Console;
 use crate::exports::bridged;
@@ -42,48 +52,6 @@ xbox360_sys::import_thunk!(
 
 const PASSIVE_LEVEL: u8 = 0;
 const DISPATCH_LEVEL: u8 = 2;
-
-/// Processor control block; the channel lock records it as the owner.
-const PCR_PRCB: u32 = 0x100;
-const PCR_PROCESSOR: u32 = 0x10c;
-
-/// Hardware flag under which every request fails; its kernel meaning is
-/// unknown.
-const HARDWARE_FLAG_FAIL_OPTICAL_REQUESTS: u32 = 0x4000;
-
-const STATUS_DEVICE_REMOVED: u32 = 0xc000_02b6;
-const STATUS_MORE_PROCESSING_REQUIRED: u32 = 0xc000_0016;
-
-const DEVICE_DRIVER_OBJECT: u32 = 0x08;
-const DEVICE_CURRENT_IRP: u32 = 0x10;
-const DEVICE_FLAGS: u32 = 0x14;
-const DEVICE_STACK_SIZE: u32 = 0x1e;
-/// Set while the drive is reinitialized; a reinitialization that times out
-/// leaves it set and the device stays disabled.
-const DEVICE_FLAG_REINITIALIZING: u32 = 0x10;
-
-const DRIVER_OBJECT_SIZE: usize = 0x38;
-const DRIVER_START_IO: usize = 0;
-
-const IRP_STATUS: u32 = 0x10;
-const IRP_CURRENT_LOCATION: u32 = 0x19;
-/// Words the inquiry clears before it starts the request; purpose unknown.
-const IRP_CLEARED: [u32; 3] = [0x1c, 0x20, 0x24];
-const IRP_STACK_LOCATION: u32 = 0x50;
-const STACK_LOCATION_SIZE: u32 = 0x24;
-const STACK_MAJOR_FUNCTION: u32 = 0x00;
-const STACK_CONTROL: u32 = 0x03;
-/// Cleared for the inquiry; purpose unknown.
-const STACK_CLEARED: u32 = 0x04;
-const STACK_INPUT_BUFFER: u32 = 0x08;
-const STACK_INPUT_LENGTH: u32 = 0x0c;
-const STACK_CONTROL_CODE: u32 = 0x10;
-const STACK_DEVICE: u32 = 0x14;
-const STACK_COMPLETION_ROUTINE: u32 = 0x1c;
-const STACK_COMPLETION_CONTEXT: u32 = 0x20;
-const INQUIRY_MAJOR_FUNCTION: u8 = 9;
-/// Run the completion routine on success, error and cancel.
-const STACK_INVOKE_ALWAYS: u8 = 0xe0;
 
 /// `KDPC` byte stock sets after initialization.
 const DPC_IMPORTANCE_OFFSET: usize = 3;
@@ -167,7 +135,6 @@ const TICK_DUE: i64 = -1_000_000;
 const HOTPLUG_TIMER_DUE: i64 = -10_000_000;
 const HOTPLUG_TIMER_PERIOD_MS: u32 = 1000;
 
-const IOCTL_SCSI_PASS_THROUGH_DIRECT: u32 = 0x4_d014;
 const PASS_THROUGH_SIZE: usize = 0x24;
 const INQUIRY_LENGTH: usize = 0x24;
 const SCSI_INQUIRY: u8 = 0x12;
@@ -176,8 +143,8 @@ const EMULATOR_RUNNING: u32 = 0x1;
 const EMULATOR_REVISION_0002: u32 = 0x2;
 const EMULATOR_MEDIA_TYPE_1: u32 = 0x4;
 
-/// SMC message of the tray state; byte 1 is 0x60 plus the state index.
-const SMC_TRAY_STATE: u8 = 0x83;
+/// Byte 1 of an `SmcCommand::TrayState` message is this plus the state
+/// index.
 const SMC_TRAY_STATE_BASE: u8 = 0x60;
 const TRAY_STATES: [&str; 7] = [
     "TRAY_OPEN",
@@ -191,7 +158,6 @@ const TRAY_STATES: [&str; 7] = [
 /// SMC message the server thread sends after a reinitialization; its
 /// meaning is unknown.
 const SMC_REINITIALIZED: [u8; 2] = [0x8b, 0x66];
-const SMC_MESSAGE_SIZE: usize = 16;
 
 /// Longest text of the stock trace producer (0x91f3ebb0).
 const TRACE_TEXT_CAPACITY: usize = 0x1ff;
@@ -261,8 +227,8 @@ static INQUIRY: KernelStorage<Inquiry> = KernelStorage::new(Inquiry {
 static INQUIRY_IRP: AtomicU32 = AtomicU32::new(0);
 /// Copy of the CD-ROM driver object with the start I/O hook (stock
 /// 0x91f9fe7c).
-static DRIVER_OBJECT: KernelStorage<[u8; DRIVER_OBJECT_SIZE]> =
-    KernelStorage::new([0; DRIVER_OBJECT_SIZE]);
+static DRIVER_OBJECT: KernelStorage<DriverObject> =
+    KernelStorage::new(DriverObject::new(None, [None; 11]));
 /// CD-ROM channel extension (stock 0x91f9feb4).
 static CHANNEL: AtomicU32 = AtomicU32::new(0);
 /// Channel packet routines from the debug monitor service; 0 when the
@@ -546,7 +512,13 @@ fn trace(trace: Trace) {
 }
 
 fn processor() -> u8 {
-    read_u8(pcr() + PCR_PROCESSOR)
+    Kpcr::current().processor_number().get()
+}
+
+/// Address of this processor's PRCB, which the channel lock records as its
+/// owner.
+fn prcb() -> u32 {
+    core::ptr::from_ref(&Kpcr::current().prcb).addr() as u32
 }
 
 /// Stock assertion: the trap the debug routine or the kernel handles.
@@ -583,6 +555,7 @@ fn write_u32(address: u32, value: u32) {
     unsafe { core::ptr::write_volatile(address as usize as *mut u32, value) }
 }
 
+/// Address of a live kernel device object.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Device(u32);
 
@@ -590,14 +563,27 @@ impl Device {
     fn new(object: u32) -> Option<Self> {
         (object != 0).then_some(Self(object))
     }
+
+    fn as_ptr(self) -> *mut DeviceObject {
+        core::ptr::with_exposed_provenance_mut(self.0 as usize)
+    }
 }
 
+/// Address of a live kernel I/O request.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Irp(u32);
 
 impl Irp {
     fn new(irp: u32) -> Option<Self> {
         (irp != 0).then_some(Self(irp))
+    }
+
+    fn from_ptr(irp: *mut xboxkrnl::Irp) -> Option<Self> {
+        Self::new(irp.expose_provenance() as u32)
+    }
+
+    fn as_ptr(self) -> *mut xboxkrnl::Irp {
+        core::ptr::with_exposed_provenance_mut(self.0 as usize)
     }
 }
 
@@ -668,7 +654,7 @@ impl Channel {
                 (self.0 + CHANNEL_LOCK) as usize as *mut KspinLock,
             );
         }
-        self.write(CHANNEL_LOCK_OWNER, pcr() + PCR_PRCB);
+        self.write(CHANNEL_LOCK_OWNER, prcb());
         ChannelLock(self)
     }
 }
@@ -679,7 +665,7 @@ impl ChannelLock {
     fn release(self, irql: u8) {
         let channel = self.0;
         check(current_irql() == Irql::new(channel.irql()));
-        check(channel.read(CHANNEL_LOCK_OWNER) == pcr() + PCR_PRCB);
+        check(channel.read(CHANNEL_LOCK_OWNER) == prcb());
         // SAFETY: this processor holds the channel lock, as checked above.
         unsafe {
             xboxkrnl::KeReleaseSpinLockFromRaisedIrql(
@@ -702,7 +688,9 @@ fn start_packet(channel: Channel, irp: Irp) {
             unsafe { kernel::call_export(routine, channel.0, irp.0, 0, 0) };
         }
         // SAFETY: the device and request are the channel's live kernel objects.
-        None => unsafe { xboxkrnl::IoStartPacket(channel.device().0, irp.0, core::ptr::null()) },
+        None => unsafe {
+            xboxkrnl::IoStartPacket(channel.device().as_ptr(), irp.as_ptr(), core::ptr::null())
+        },
     }
 }
 
@@ -713,7 +701,7 @@ fn start_next_packet(channel: Channel) {
             unsafe { kernel::call_export(routine, channel.0, 0, 0, 0) };
         }
         // SAFETY: the device is the channel's live kernel device object.
-        None => unsafe { xboxkrnl::IoStartNextPacket(channel.device().0) },
+        None => unsafe { xboxkrnl::IoStartNextPacket(channel.device().as_ptr()) },
     }
 }
 
@@ -797,23 +785,28 @@ fn patch(device: Option<Device>) -> Result<(), PatchError> {
     let version = kernel_version();
     let channel = find_channel(device, version_words(version))?;
     initialize(device)?;
-    let driver = read_u32(device.0 + DEVICE_DRIVER_OBJECT);
-    if driver == 0 {
+    let device_object = device.as_ptr();
+    // SAFETY: `device` is the referenced CD-ROM device object.
+    let driver = unsafe { (&raw const (*device_object).driver_object).read_volatile() };
+    if driver.is_null() {
         return Err(PatchError::NoDriverObject);
     }
 
     // SAFETY: released below after the driver object is replaced.
     let irql = unsafe { xboxkrnl::IoAcquireDeviceObjectLock() };
     let copy = DRIVER_OBJECT.get();
-    // SAFETY: the driver object holds DRIVER_OBJECT_SIZE bytes; the copy
-    // is unused until the device points at it below.
+    // SAFETY: `driver` is the device's driver object; the copy is unused
+    // until the device points at it below. The hook entry runs
+    // `start_io_hook`, which takes (device, irp) in the console ABI.
     unsafe {
-        core::ptr::copy_nonoverlapping(driver as usize as *const [u8; DRIVER_OBJECT_SIZE], copy, 1);
-        copy.cast::<u32>()
-            .add(DRIVER_START_IO)
-            .write(start_io_hook_entry as *const () as usize as u32);
+        core::ptr::copy_nonoverlapping(driver, copy, 1);
+        (*copy).start_io = Some(core::mem::transmute::<
+            unsafe extern "C" fn(),
+            xboxkrnl::DriverStartIo,
+        >(start_io_hook_entry));
     }
-    write_u32(device.0 + DEVICE_DRIVER_OBJECT, copy as usize as u32);
+    // SAFETY: as above; the device object lock is held.
+    unsafe { (&raw mut (*device_object).driver_object).write_volatile(copy) };
     // SAFETY: `irql` is the result of the acquisition above.
     unsafe { xboxkrnl::IoReleaseDeviceObjectLock(irql) };
 
@@ -897,13 +890,14 @@ fn initialize(device: Device) -> Result<(), PatchError> {
     };
     // SAFETY: the byte lies inside the initialized DPC.
     unsafe { dpc.add(DPC_IMPORTANCE_OFFSET).write(DPC_IMPORTANCE) };
-    // SAFETY: IoAllocateIrp takes only a stack location count.
+    // SAFETY: IoAllocateIrp takes only a stack location count; `device` is
+    // the referenced CD-ROM device object.
     let (reinit, inquiry) = unsafe {
         (
-            Irp::new(xboxkrnl::IoAllocateIrp(0)),
-            Irp::new(xboxkrnl::IoAllocateIrp(u32::from(read_u8(
-                device.0 + DEVICE_STACK_SIZE,
-            )))),
+            Irp::from_ptr(xboxkrnl::IoAllocateIrp(0)),
+            Irp::from_ptr(xboxkrnl::IoAllocateIrp(u32::from(
+                (&raw const (*device.as_ptr()).stack_size).read_volatile(),
+            ))),
         )
     };
     let (Some(reinit), Some(inquiry)) = (reinit, inquiry) else {
@@ -968,7 +962,9 @@ fn queue_reinitialize(device: Device, channel: Channel) {
     let wait = channel.read(CHANNEL_WAIT_ROUTINE);
     let reset = channel.read(CHANNEL_RESET_ROUTINE);
     let interrupt = channel.read(CHANNEL_INTERRUPT_ROUTINE);
-    let current = read_u32(device.0 + DEVICE_CURRENT_IRP);
+    // SAFETY: `device` is the channel's live device object.
+    let current = unsafe { (&raw const (*device.as_ptr()).current_irp).read_volatile() }
+        .expose_provenance() as u32;
     let mut restart_timer = false;
     let mut abort_current = false;
     if wait != 0 {
@@ -1016,9 +1012,12 @@ fn fail_request(channel: Channel, irp: Option<Irp>) {
     if let Some(irp) = irp
         && irp != reinit_irp()
     {
-        write_u32(irp.0 + IRP_STATUS, STATUS_DEVICE_REMOVED);
         // SAFETY: `irp` is a live request the channel owns.
-        unsafe { xboxkrnl::IoCompleteRequest(irp.0, 0) };
+        unsafe {
+            (&raw mut (*irp.as_ptr()).io_status.status)
+                .write_volatile(KernelError::DeviceRemoved.status());
+            xboxkrnl::IoCompleteRequest(irp.as_ptr(), 0);
+        }
     }
     start_next_packet(channel);
 }
@@ -1033,8 +1032,11 @@ extern "C" fn start_io_hook(_device: u32, irp: u32) {
         channel.write_u8(CHANNEL_HELD_IRP_STARTED, 1);
         return;
     }
+    /// Hardware flag under which the monitor fails every optical drive
+    /// request. Its kernel meaning is not known.
+    const FAIL_OPTICAL_REQUESTS: HardwareFlags = HardwareFlags::from_bits_retain(0x4000);
     if xboxkrnl::HalIsExecutingPowerDownDpc().get()
-        || hardware_flags().bits() & HARDWARE_FLAG_FAIL_OPTICAL_REQUESTS != 0
+        || hardware_flags().contains(FAIL_OPTICAL_REQUESTS)
     {
         fail_request(channel, Irp::new(irp));
         return;
@@ -1095,16 +1097,21 @@ fn wait_until_ready(registers: SataRegisters) -> bool {
 /// `StartReinitialize`).
 extern "C" fn start_reinitialize(channel: u32) {
     let channel = Channel(channel);
-    let device = channel.device();
+    let device = channel.device().as_ptr();
     let registers = channel.registers();
     trace(Trace::StartReinitialize {
         processor: processor(),
-        irp: read_u32(device.0 + DEVICE_CURRENT_IRP),
+        // SAFETY: `device` is the channel's live device object.
+        irp: unsafe { (&raw const (*device).current_irp).read_volatile() }.expose_provenance()
+            as u32,
     });
-    write_u32(
-        device.0 + DEVICE_FLAGS,
-        read_u32(device.0 + DEVICE_FLAGS) | DEVICE_FLAG_REINITIALIZING,
-    );
+    // Requests fail until a successful reinitialization clears the flag; one
+    // that times out leaves the device disabled.
+    // SAFETY: as above.
+    unsafe {
+        let flags = &raw mut (*device).flags;
+        flags.write_volatile(flags.read_volatile().union(DeviceObjectFlags::INITIALIZING));
+    }
     HOTPLUG_FLAGS.fetch_or(FLAG_REINITIALIZING, Ordering::SeqCst);
     let lock = channel.lock(DISPATCH_LEVEL);
     registers.write_u8(SATA_DEVICE, 0);
@@ -1168,10 +1175,15 @@ extern "C" fn finish_reinitialize(channel: u32, irp: u32, status: u32) {
     check(irp == reinit_irp().0);
     if (status as i32) >= 0 {
         HOTPLUG_FLAGS.fetch_and(!FLAG_REINITIALIZING, Ordering::SeqCst);
-        write_u32(
-            device.0 + DEVICE_FLAGS,
-            read_u32(device.0 + DEVICE_FLAGS) & !DEVICE_FLAG_REINITIALIZING,
-        );
+        // SAFETY: `device` is the channel's live device object.
+        unsafe {
+            let flags = &raw mut (*device.as_ptr()).flags;
+            flags.write_volatile(
+                flags
+                    .read_volatile()
+                    .difference(DeviceObjectFlags::INITIALIZING),
+            );
+        }
     } else {
         trace(Trace::ReinitTimedOut);
     }
@@ -1194,48 +1206,58 @@ fn issue_inquiry(channel: Channel) {
             PassThrough::inquiry(core::ptr::addr_of_mut!((*inquiry).data) as usize as u32);
         core::ptr::addr_of!((*inquiry).request) as usize as u32
     };
-    let irp = INQUIRY_IRP.load(Ordering::Relaxed);
-    let next = read_u32(irp + IRP_STACK_LOCATION) - STACK_LOCATION_SIZE;
-    write_u32(next + STACK_CONTROL_CODE, IOCTL_SCSI_PASS_THROUGH_DIRECT);
-    write_u32(next + STACK_CLEARED, 0);
-    write_u8(next + STACK_MAJOR_FUNCTION, INQUIRY_MAJOR_FUNCTION);
-    write_u32(next + STACK_INPUT_BUFFER, request);
-    write_u32(next + STACK_INPUT_LENGTH, PASS_THROUGH_SIZE as u32);
-    write_u32(next + STACK_DEVICE, channel.device().0);
-    write_u32(
-        next + STACK_COMPLETION_ROUTINE,
-        inquiry_completion_entry as *const () as usize as u32,
-    );
-    write_u32(next + STACK_COMPLETION_CONTEXT, channel.0);
-    write_u8(next + STACK_CONTROL, STACK_INVOKE_ALWAYS);
-    for offset in IRP_CLEARED {
-        write_u32(irp + offset, 0);
+    let irp = Irp(INQUIRY_IRP.load(Ordering::Relaxed));
+    // SAFETY: the inquiry request is idle; it has a stack location for the
+    // device below its current one, as it was allocated with the device's
+    // stack size.
+    unsafe {
+        let irp = irp.as_ptr();
+        let next = (&raw const (*irp).current_stack_location)
+            .read_volatile()
+            .sub(1);
+        (&raw mut (*next).parameters.device_control.control_code)
+            .write_volatile(IoControlCode::SCSI_PASS_THROUGH_DIRECT);
+        (&raw mut (*next).parameters.device_control.output_length).write_volatile(0);
+        (&raw mut (*next).major_function).write_volatile(IrpMajorFunction::DeviceControl.raw());
+        (&raw mut (*next).parameters.device_control.input_buffer).write_volatile(request);
+        (&raw mut (*next).parameters.device_control.input_length)
+            .write_volatile(PASS_THROUGH_SIZE as u32);
+        (&raw mut (*next).device_object).write_volatile(channel.device().as_ptr());
+        (&raw mut (*next).completion_routine)
+            .write_volatile(inquiry_completion_entry as *const () as usize as u32);
+        (&raw mut (*next).context).write_volatile(channel.0);
+        (&raw mut (*next).control).write_volatile(
+            IoStackControl::INVOKE_ON_CANCEL
+                .union(IoStackControl::INVOKE_ON_SUCCESS)
+                .union(IoStackControl::INVOKE_ON_ERROR),
+        );
+        (&raw mut (*irp).user_buffer).write_volatile(core::ptr::null_mut());
+        (&raw mut (*irp).unknown_020[0]).write_volatile(0);
+        (&raw mut (*irp).unknown_020[1]).write_volatile(0);
+        (&raw mut (*irp).current_stack_location).write_volatile(next);
+        let location = &raw mut (*irp).current_location;
+        location.write_volatile(location.read_volatile().wrapping_sub(1));
     }
-    write_u32(irp + IRP_STACK_LOCATION, next);
-    write_u8(
-        irp + IRP_CURRENT_LOCATION,
-        read_u8(irp + IRP_CURRENT_LOCATION).wrapping_sub(1),
-    );
-    start_packet(channel, Irp(irp));
+    start_packet(channel, irp);
 }
 
 /// Completion routine of the inquiry (0x91f3f9c0); keeps the request.
 extern "C" fn inquiry_completion(_device: u32, irp: u32, channel: u32) -> u32 {
+    // SAFETY: `irp` is the completed inquiry request.
+    let status = unsafe { (&raw const (*Irp(irp).as_ptr()).io_status.status).read_volatile() };
     // SAFETY: the request that filled the data has completed and no other
     // inquiry is outstanding.
-    report_inquiry(read_u32(irp + IRP_STATUS), unsafe {
-        &(*INQUIRY.get()).data
-    });
+    report_inquiry(status.0, unsafe { &(*INQUIRY.get()).data });
     if INQUIRIES.fetch_sub(1, Ordering::SeqCst) - 1 != 0 {
         issue_inquiry(Channel(channel));
     }
-    STATUS_MORE_PROCESSING_REQUIRED
+    KernelError::MoreProcessingRequired.status().0
 }
 
 crate::kernel::forward!(
     /// IoSynchronousDeviceIoControlRequest with a raw `internal` word: stock
     /// passes the request size there.
-    fn device_io_control(u32, u32, *const u8, u32, *mut u8, u32, *mut u32, u32) -> xboxkrnl::NtStatus
+    fn device_io_control(IoControlCode, *mut DeviceObject, *const u8, u32, *mut u8, u32, *mut u32, u32) -> xboxkrnl::NtStatus
         => xboxkrnl::IoSynchronousDeviceIoControlRequest
 );
 
@@ -1249,8 +1271,8 @@ fn detect_dvd_emulator(device: Device) {
     // and the inquiry buffer it points at are live locals.
     let status = unsafe {
         device_io_control(
-            IOCTL_SCSI_PASS_THROUGH_DIRECT,
-            device.0,
+            IoControlCode::SCSI_PASS_THROUGH_DIRECT,
+            device.as_ptr(),
             request.0.as_ptr(),
             PASS_THROUGH_SIZE as u32,
             core::ptr::null_mut(),
@@ -1319,10 +1341,11 @@ pub(crate) fn emulator_revision_0002() -> bool {
 }
 
 /// SMC notification (0x91f3f6f0): trace the tray state messages.
-extern "C" fn tray_notification(_registration: u32, message: *const u8) {
-    // SAFETY: the kernel passes an SMC message of SMC_MESSAGE_SIZE bytes.
-    let (kind, state) = unsafe { (*message, *message.add(1)) };
-    if kind == SMC_TRAY_STATE
+extern "C" fn tray_notification(_registration: u32, message: *const SmcMessage) {
+    // SAFETY: the kernel passes an SMC message.
+    let SmcMessage(message) = unsafe { &*message };
+    let (kind, state) = (message[0], message[1]);
+    if kind == SmcCommand::TrayState.raw()
         && let Some(&name) = TRAY_STATES.get(usize::from(state.wrapping_sub(SMC_TRAY_STATE_BASE)))
     {
         trace(Trace::Tray { name });
@@ -1339,11 +1362,10 @@ pub(crate) fn drain(server: &mut Server, console: &mut Console) {
         debug_capture_print(&mut server.state, console, text.as_bytes());
     }
     if DRIVE_REINITIALIZED.swap(false, Ordering::AcqRel) {
-        let mut message = [0u8; SMC_MESSAGE_SIZE];
-        message[..SMC_REINITIALIZED.len()].copy_from_slice(&SMC_REINITIALIZED);
-        // SAFETY: `message` is a local SMC message of SMC_MESSAGE_SIZE bytes;
-        // no reply is requested.
-        unsafe { xboxkrnl::HalSendSMCMessage(message.as_ptr(), core::ptr::null_mut()) };
+        let mut message = SmcMessage::default();
+        message.0[..SMC_REINITIALIZED.len()].copy_from_slice(&SMC_REINITIALIZED);
+        // SAFETY: `message` is a local SMC message; no reply is requested.
+        unsafe { xboxkrnl::HalSendSMCMessage(&message, core::ptr::null_mut()) };
         console.open_close_tray(0);
     }
 }

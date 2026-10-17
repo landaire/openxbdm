@@ -1,10 +1,15 @@
 //! Kernel helpers over the `xbox360_sys` imports, and the imports whose
 //! signature is specific to the module.
 
+use core::sync::atomic::Ordering;
+
 use xbox360::console::KernelVersion;
+use xbox360_sys::ImportedVariable;
 use xbox360_sys::xboxkrnl::AnsiString;
+use xbox360_sys::xboxkrnl::DebugMonitorData;
 use xbox360_sys::xboxkrnl::DebugMonitorService;
 use xbox360_sys::xboxkrnl::ExDebugMonitorService;
+use xbox360_sys::xboxkrnl::HardwareInfo;
 use xbox360_sys::xboxkrnl::KeDebugMonitorData;
 use xbox360_sys::xboxkrnl::KeEnterCriticalRegion;
 use xbox360_sys::xboxkrnl::KeLeaveCriticalRegion;
@@ -255,113 +260,79 @@ macro_rules! forward {
 }
 pub(crate) use forward;
 
-pub const DEBUG_MONITOR_DATA_WORDS: usize = 0x68 / 4;
-
-static DEBUG_MONITOR_DATA: [core::sync::atomic::AtomicU32; DEBUG_MONITOR_DATA_WORDS] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; DEBUG_MONITOR_DATA_WORDS];
-
-/// The 0x68-byte block returned by debug monitor service 1, as big-endian
-/// words (word `n` is at byte offset `n * 4`).
-#[derive(Clone, Copy)]
-pub struct DebugMonitorData {
-    pub words: [u32; DEBUG_MONITOR_DATA_WORDS],
-}
-
-impl DebugMonitorData {
-    /// Head of the loaded module list (+0x04).
-    pub fn module_list(&self) -> u32 {
-        self.words[1]
-    }
-
-    /// Spin lock guarding both module lists (+0x08).
-    pub fn loader_lock(&self) -> u32 {
-        self.words[2]
-    }
-
-    /// Processor count (+0x4c).
-    pub fn processor_count(&self) -> u32 {
-        self.words[0x13]
-    }
-
-    /// Head of the second loaded module list (+0x64); may be null.
-    pub fn secondary_module_list(&self) -> u32 {
-        self.words[0x19]
-    }
-}
+static DEBUG_MONITOR_DATA: DebugMonitorData = DebugMonitorData::new();
 
 /// Register `module` as the debug monitor and keep the debug monitor data.
 /// Fails when either service fails, as stock module initialization does.
 pub fn register_debug_monitor(module: u32) -> bool {
     // SAFETY: service 1 and 2 take scalar arguments or a 0x68-byte buffer.
-    if (unsafe { ExDebugMonitorService(DebugMonitorService::Register, module, 0, 0) }.0 as i32) < 0
-    {
+    if !unsafe { ExDebugMonitorService(DebugMonitorService::Register, module, 0, 0) }.is_success() {
         return false;
     }
-    let mut words = [0u32; DEBUG_MONITOR_DATA_WORDS];
-    // SAFETY: `words` is a live 0x68-byte buffer.
-    if (unsafe {
+    // SAFETY: the service fills the 0x68-byte block, whose fields are
+    // atomics, before any other thread reads it.
+    unsafe {
         ExDebugMonitorService(
             DebugMonitorService::Query,
-            words.as_mut_ptr() as usize as u32,
+            core::ptr::from_ref(&DEBUG_MONITOR_DATA).expose_provenance() as u32,
             0,
             0,
         )
     }
-    .0 as i32)
-        < 0
-    {
-        return false;
-    }
-    for (slot, word) in DEBUG_MONITOR_DATA.iter().zip(words) {
-        slot.store(word, core::sync::atomic::Ordering::Relaxed);
-    }
-    true
+    .is_success()
 }
 
 /// Debug monitor data stored by [`register_debug_monitor`].
-pub fn debug_monitor_data() -> DebugMonitorData {
-    DebugMonitorData {
-        words: core::array::from_fn(|index| {
-            DEBUG_MONITOR_DATA[index].load(core::sync::atomic::Ordering::Relaxed)
-        }),
+pub fn debug_monitor_data() -> &'static DebugMonitorData {
+    &DEBUG_MONITOR_DATA
+}
+
+/// Store the control dispatcher in the data block and publish the block to
+/// the kernel, as stock initialization does.
+pub fn publish_debug_monitor_dispatcher(dispatcher: u32) {
+    // SAFETY: the dispatcher is the module's control routine entry, which
+    // the kernel may call once the block is published.
+    unsafe {
+        DEBUG_MONITOR_DATA
+            .control_routine
+            .store(dispatcher, Ordering::Release)
+    };
+    let block = core::ptr::from_ref(&DEBUG_MONITOR_DATA).expose_provenance() as u32;
+    // SAFETY: the block is a static that lives as long as the module, and
+    // its routine fields hold the kernel's values or this module's entries.
+    unsafe { resolved(&KeDebugMonitorData).store(block, Ordering::Relaxed) };
+}
+
+/// The export of a data import. Stock uses its data imports without a
+/// check; a slot that the loader left unresolved stops the module.
+pub fn resolved<T: Sync>(variable: &ImportedVariable<T>) -> &'static T {
+    match variable.get() {
+        Some(export) => export,
+        None => unresolved_import(),
     }
 }
 
-/// Store the control dispatcher at +0x18 of the data block and publish the
-/// block to the kernel, as stock initialization does.
-pub fn publish_debug_monitor_dispatcher(dispatcher: u32) {
-    DEBUG_MONITOR_DATA[0x18 / 4].store(dispatcher, core::sync::atomic::Ordering::Release);
-    let variable = KeDebugMonitorData.address();
-    // SAFETY: the loader stored the address of the kernel export; the block
-    // is a static that lives as long as the module.
-    unsafe {
-        core::ptr::write_volatile(
-            variable as usize as *mut u32,
-            DEBUG_MONITOR_DATA.as_ptr() as usize as u32,
-        )
-    };
+/// One shared copy keeps the stop out of every caller.
+#[cold]
+#[inline(never)]
+fn unresolved_import() -> ! {
+    panic!("unresolved data import")
 }
 
-/// Store a monitor-owned field of the published data block at byte
-/// `offset`.
-pub fn set_debug_monitor_word(offset: usize, value: u32) {
-    DEBUG_MONITOR_DATA[offset / 4].store(value, core::sync::atomic::Ordering::Release);
+/// The debug monitor data block that the kernel reads, if one is
+/// published.
+pub fn published_debug_monitor_data() -> Option<&'static DebugMonitorData> {
+    let block = resolved(&KeDebugMonitorData).load(Ordering::Relaxed);
+    // SAFETY: a nonzero value is the address of a published debug monitor
+    // block, which stays mapped while its module runs.
+    (block != 0).then(|| unsafe {
+        &*core::ptr::with_exposed_provenance::<DebugMonitorData>(block as usize)
+    })
 }
 
-/// Replace the first dword of the hardware information export (the
-/// monitor sets the kernel debugger bit on a break-in).
-pub fn set_hardware_flags(flags: u32) {
-    let address = XboxHardwareInfo.address();
-    // SAFETY: the loader stored the address of the writable kernel export.
-    unsafe { core::ptr::write_volatile(address as usize as *mut u32, flags) }
-}
-
-/// The halfword at +0xe of the hardware information export; bit 0x400 is
-/// set when the console booted from disc.
-pub fn hardware_boot_flags() -> u16 {
-    let address = XboxHardwareInfo.address();
-    // SAFETY: the loader stored the address of the kernel export.
-    unsafe { core::ptr::read_volatile((address as usize + 0xe) as *const u16) }
+/// The hardware information export.
+pub fn hardware_info() -> &'static HardwareInfo {
+    resolved(&XboxHardwareInfo)
 }
 
 /// The version parts in export order.
@@ -369,17 +340,9 @@ pub const fn version_words(version: KernelVersion) -> [u16; 4] {
     [version.major, version.minor, version.build, version.qfe]
 }
 
-/// `XboxKrnlBaseVersion`, read unconditionally as stock does.
+/// `XboxKrnlBaseVersion`, which stock reads without a check.
 pub fn base_kernel_version() -> KernelVersion {
-    let address = XboxKrnlBaseVersion.address() as usize as *const u16;
-    // SAFETY: the loader stored the address of a four-u16 kernel export.
-    let part = |index| unsafe { core::ptr::read_volatile(address.add(index)) };
-    KernelVersion {
-        major: part(0),
-        minor: part(1),
-        build: part(2),
-        qfe: part(3),
-    }
+    *resolved(&XboxKrnlBaseVersion)
 }
 
 /// Write a NUL-terminated message to the debug output.

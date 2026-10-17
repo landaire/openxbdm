@@ -28,7 +28,6 @@ mod xbox360 {
     use core::time::Duration;
 
     use openxbdm_core::status::KernelError;
-    use openxbdm_core::status::NtStatus;
     use openxbdm_server::ConnectionIndex;
     use openxbdm_server::Server;
     use openxbdm_server::SocketId;
@@ -42,8 +41,14 @@ mod xbox360 {
     use xbox360_sys::xam::FdSet;
     use xbox360_sys::xam::Socket;
     use xbox360_sys::xam::TimeVal;
+    use xbox360_sys::xam::WinsockVersion;
+    use xbox360_sys::xam::WsaData;
     use xbox360_sys::xam::XnCaller;
+    use xbox360_sys::xam::XnetStartupFlags;
+    use xbox360_sys::xam::XnetStartupParams;
     use xbox360_sys::xboxkrnl;
+    use xbox360_sys::xboxkrnl::BugCheckCode;
+    use xbox360_sys::xboxkrnl::DllEntryReason;
     use xbox360_sys::xboxkrnl::Handle;
     use xbox360_sys::xboxkrnl::Irql;
     use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
@@ -70,7 +75,7 @@ mod xbox360 {
     const SERVER_THREAD_FLAGS: ThreadCreationFlags =
         ThreadCreationFlags::from_bits_retain(0x40004a6);
     /// Bug check code of a panic above passive level ('OXDP').
-    const BUG_CHECK_PANIC: u32 = 0x4f58_4450;
+    const BUG_CHECK_PANIC: BugCheckCode = BugCheckCode(0x4f58_4450);
     /// A failed listen is retried after LISTEN_RETRY_STEPS steps of
     /// LISTEN_RETRY_STEP_MS; each step serves queued requests.
     const LISTEN_RETRY_STEPS: u32 = 10;
@@ -131,19 +136,27 @@ mod xbox360 {
     // the server loop would stay allocated under every command.
     #[inline(never)]
     fn initialize_network() -> bool {
-        let mut startup = [0u8; 13];
-        startup[0] = 0x0d;
-        startup[1] = 0x81;
-        startup[4] = 0x40;
-        // SAFETY: `startup` is a live 13-byte parameter block.
-        if unsafe { xam::NetDll_XNetStartup(XnCaller::DebugMonitor, startup.as_ptr()) } != 0 {
+        let startup = XnetStartupParams {
+            // Stock also sets bit 0x80, which has no name.
+            flags: XnetStartupFlags::BYPASS_SECURITY | XnetStartupFlags::from_bits_retain(0x80),
+            default_receive_buffer_kib: 0x40,
+            ..XnetStartupParams::new()
+        };
+        // SAFETY: `startup` is a live parameter block.
+        if unsafe { xam::NetDll_XNetStartup(XnCaller::DebugMonitor, &startup) } != 0 {
             return false;
         }
-        let mut wsa_data = [0u8; 512];
-        // SAFETY: `wsa_data` is a live buffer larger than WSADATA.
-        let status =
-            unsafe { xam::NetDll_WSAStartup(XnCaller::DebugMonitor, 2, wsa_data.as_mut_ptr()) };
-        status.0 == 0
+        let mut wsa_data = WsaData::new();
+        // SAFETY: `wsa_data` is live storage for the call to fill.
+        unsafe {
+            xam::NetDll_WSAStartup(
+                XnCaller::DebugMonitor,
+                WinsockVersion::new(2, 0),
+                &mut wsa_data,
+            )
+        }
+        .error()
+        .is_none()
     }
 
     fn close_listener() {
@@ -394,8 +407,8 @@ mod xbox360 {
     }
 
     extern "C" fn module_entry(module: u32, reason: u32, _reserved: u32) -> u32 {
-        match reason {
-            0 => {
+        match DllEntryReason::from_raw(reason) {
+            Some(DllEntryReason::ProcessDetach) => {
                 SHUTDOWN.store(true, Ordering::SeqCst);
                 close_listener();
                 #[cfg(feature = "smb")]
@@ -424,7 +437,7 @@ mod xbox360 {
                 crate::backend::debugger::wait_for_event_waiters();
                 1
             }
-            1 => {
+            Some(DllEntryReason::ProcessAttach) => {
                 // The recovery installs nothing, refuses every export, and
                 // never waits on the loader thread.
                 #[cfg(feature = "boot-guard")]

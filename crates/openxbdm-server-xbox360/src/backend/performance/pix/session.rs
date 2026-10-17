@@ -293,7 +293,7 @@ fn reference_device(path: &[u8], device: &mut u32) -> u32 {
         xboxkrnl::ObReferenceObjectByName(
             &kernel::ansi_string(path),
             ObjectAttributeFlags::CASE_INSENSITIVE,
-            xboxkrnl::IoDeviceObjectType.address(),
+            core::ptr::from_ref(kernel::resolved(&xboxkrnl::IoDeviceObjectType)).addr() as u32,
             0,
             device,
         )

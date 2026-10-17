@@ -17,24 +17,21 @@ use openxbdm_server::commands::memory::Backend as _;
 use openxbdm_server::reply;
 use openxbdm_server::reply::CommandResult;
 use openxbdm_server::reply::Reply;
+use xbox360_sys::image::ImageCharacteristics;
+use xbox360_sys::image::ImageDirectory;
+use xbox360_sys::image::ImageNtHeaders;
+use xbox360_sys::image::ImageSectionHeader;
+use xbox360_sys::image::XexHeaderKey;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::DebugMonitorService;
+use xbox360_sys::xboxkrnl::LdrDataTableEntry;
+use xbox360_sys::xboxkrnl::MmStatistics;
 use xbox360_sys::xboxkrnl::PoolTag;
 use xbox360_sys::xboxkrnl::RtlImageDirectoryEntryToData;
 use xbox360_sys::xboxkrnl::RtlImageXexHeaderField;
 
-use super::ENTRY_BASE;
-use super::ENTRY_FLAG_REPORTED;
-use super::ENTRY_FLAGS;
-use super::ENTRY_NAME_BUFFER;
-use super::ENTRY_NAME_LENGTH;
-use super::ENTRY_SIZE;
-use super::ENTRY_XEX_HEADER;
-use super::IMAGE_DIRECTORY_EXCEPTION;
-use super::IMAGE_FILE_DLL;
 use super::LoaderLock;
 use super::REGISTERED_TYPE_NAMES;
-use super::SECTION_HEADER_SIZE;
 use super::TRACKING;
 use super::TRACKING_TYPE_COUNT;
 use super::TrackingError;
@@ -42,14 +39,12 @@ use super::Untracked;
 use super::all_entries;
 use super::code_view_of;
 use super::find_entry;
+use super::is_reported;
 use super::nt_header;
 use super::read_debug_byte;
-use super::read_le16;
-use super::read_le32;
 use super::read_u16;
 use super::read_u32;
 use super::section_info;
-use super::section_table;
 use super::track_allocation;
 use super::tracking_hresult;
 use super::tracking_type_name_bytes;
@@ -80,8 +75,6 @@ const SECTION_RECORD_SIZE: u32 = 0x110;
 const SECTION_SNAPSHOT_TAG: PoolTag = PoolTag::new(*b"dmws");
 const SECTION_SNAPSHOT_CAPACITY: u16 = 5;
 const MODULE_FLAG_DLL: u32 = 4;
-const XEX_FIELD_INLINE_REPORTED: u32 = 0x10100;
-const XEX_FIELD_ADDITIONAL_TITLE_MEMORY: u32 = 0x40801;
 const WALK_LIMIT: u32 = 0xa000_0000;
 const MEMORY_STATISTICS_LENGTH: u32 = 0x68;
 const MEMORY_STATISTICS_REPLY_LENGTH: u32 = 0x90;
@@ -295,32 +288,35 @@ extern "C" fn get_xbe_info(_name: u32, info: u32) -> u32 {
 export!(16, get_xbe_info);
 
 /// Fill the export 142 record at `record` for a loader entry.
-fn fill_module_record(record: u32, entry: u32, header: u32) {
+fn fill_module_record(record: u32, entry: &LdrDataTableEntry, header: &ImageNtHeaders) {
     write_u32(record, MODULE_RECORD_SIZE);
     // 0x91f485b8: the low byte of each name unit, at most 0x103 bytes.
-    let units = u32::from(read_u16(entry + ENTRY_NAME_LENGTH as u32) >> 1);
-    let buffer = read_u32(entry + ENTRY_NAME_BUFFER as u32);
+    let units = u32::from(entry.base_dll_name.length >> 1);
+    let buffer = entry.base_dll_name.buffer;
     let mut length = 0;
     while length < units && length < 0x103 {
         write_u8(record + 4 + length, read_u16(buffer + length * 2) as u8);
         length += 1;
     }
     write_u8(record + 4 + length, 0);
-    let base = read_u32(entry + ENTRY_BASE as u32);
+    let base = entry.dll_base;
     write_u32(record + 0x108, base);
-    write_u32(record + 0x10c, read_u32(entry + ENTRY_SIZE as u32));
-    write_u32(record + 0x114, read_le32(header + 0x58));
-    write_u32(record + 0x110, read_le32(header + 8));
-    write_u32(record + 0x128, read_le32(header + 0x50));
+    write_u32(record + 0x10c, entry.image_size);
+    write_u32(record + 0x114, header.optional_header.check_sum.get());
+    write_u32(record + 0x110, header.file_header.time_date_stamp.get());
+    write_u32(record + 0x128, header.optional_header.size_of_image.get());
     let mut pdata_size = 0u32;
     // SAFETY: `base` is the image of a loaded entry, held by the caller's
     // loader lock.
     let pdata = unsafe {
-        RtlImageDirectoryEntryToData(base, true, IMAGE_DIRECTORY_EXCEPTION, &mut pdata_size)
+        RtlImageDirectoryEntryToData(base, true, ImageDirectory::Exception, &mut pdata_size)
     };
     write_u32(record + 0x11c, pdata);
     write_u32(record + 0x120, pdata_size);
-    let dll = read_le16(header + 0x16) & IMAGE_FILE_DLL != 0;
+    let dll = header
+        .file_header
+        .characteristics()
+        .contains(ImageCharacteristics::DLL);
     write_u32(record + 0x118, if dll { MODULE_FLAG_DLL } else { 0 });
 }
 
@@ -344,9 +340,9 @@ fn module_snapshot() -> Option<u32> {
         // SAFETY: the pool block holds `size` bytes.
         unsafe { core::ptr::write_bytes(snapshot as usize as *mut u8, 0, size as usize) };
         {
-            let _lock = LoaderLock::acquire();
-            for entry in all_entries() {
-                if read_u32(entry + ENTRY_FLAGS as u32) & ENTRY_FLAG_REPORTED == 0 {
+            let lock = LoaderLock::acquire();
+            for entry in all_entries(&lock) {
+                if !is_reported(entry) {
                     continue;
                 }
                 let Some(header) = nt_header(entry) else {
@@ -469,7 +465,7 @@ extern "C" fn walk_modules(walk: u32, record: u32) -> u32 {
 export!(51, walk_modules);
 
 /// Fill one export 52 record from a section header (0x91f33b88).
-fn fill_section_record(record: u32, section: u32, base: u32) {
+fn fill_section_record(record: u32, section: &ImageSectionHeader, base: u32) {
     let info = section_info(section, base);
     for (offset, &byte) in info.name.iter().enumerate() {
         write_u8(record + offset as u32, byte);
@@ -513,23 +509,21 @@ extern "C" fn walk_module_sections(walk: u32, name: u32, record: u32) -> u32 {
             // SAFETY: the pool block holds `size` bytes.
             unsafe { core::ptr::write_bytes(snapshot as usize as *mut u8, 0, size as usize) };
             {
-                let _lock = LoaderLock::acquire();
-                if let Some(entry) = find_entry(name) {
-                    let base = read_u32(entry + ENTRY_BASE as u32);
+                let lock = LoaderLock::acquire();
+                if let Some(entry) = find_entry(&lock, name) {
+                    let base = entry.dll_base;
                     if let Some(header) = nt_header(entry) {
-                        let sections = section_table(header);
-                        let count = read_le16(header + 6);
+                        let count = header.file_header.number_of_sections.get();
                         found = true;
                         write_u16(snapshot, count);
                         if count <= capacity {
-                            for index in 0..count {
+                            // SAFETY: the headers of a loaded image, mapped
+                            // under the loader lock.
+                            let sections = unsafe { header.sections() };
+                            for (index, section) in (0..count).zip(sections) {
                                 let entry_record =
                                     snapshot + 4 + u32::from(index) * SECTION_RECORD_SIZE;
-                                fill_section_record(
-                                    entry_record,
-                                    sections + u32::from(index) * SECTION_HEADER_SIZE,
-                                    base,
-                                );
+                                fill_section_record(entry_record, section, base);
                                 write_u16(entry_record + 0x10c, index + 1);
                             }
                         }
@@ -604,7 +598,7 @@ fn kernel_memory_statistics(
     }
     output[0] = MEMORY_STATISTICS_LENGTH;
     // SAFETY: `output` is a live statistics block whose first word holds its length.
-    unsafe { xboxkrnl::MmQueryStatistics(output.as_mut_ptr()) }.result()
+    unsafe { xboxkrnl::MmQueryStatistics(output.as_mut_ptr().cast::<MmStatistics>()) }.result()
 }
 
 /// Stock export 165 (0x91f33318): `(statistics) -> HRESULT`; page counts
@@ -765,12 +759,12 @@ extern "C" fn get_xex_header_field(
         return Hresult::INVALID_ARGUMENT.0;
     }
     write_u32(size, 0);
-    let _lock = LoaderLock::acquire();
-    let Some(entry) = find_entry(caller_string(module)) else {
+    let lock = LoaderLock::acquire();
+    let Some(entry) = find_entry(&lock, caller_string(module)) else {
         return NO_SUCH_MODULE.0;
     };
     // SAFETY: the entry's XEX header stays mapped under the loader lock.
-    let field = unsafe { RtlImageXexHeaderField(read_u32(entry + ENTRY_XEX_HEADER as u32), key) };
+    let field = unsafe { RtlImageXexHeaderField(entry.xex_header_base, XexHeaderKey(key)) };
     if field == 0 {
         return NO_SUCH_FIELD.0;
     }
@@ -798,7 +792,7 @@ extern "C" fn get_xex_header_field(
                 count as usize,
             )
         };
-    } else if key == XEX_FIELD_INLINE_REPORTED {
+    } else if key == XexHeaderKey::ENTRY_POINT.0 {
         write_u32(size, 4);
         if buffer != 0 {
             if buffer_size < 4 {
@@ -847,7 +841,9 @@ extern "C" fn get_title_workspace_size(size: u32) -> u32 {
             if console::console_memory(console).value() & 2 == 0 {
                 return Hresult::OK.0;
             }
-            match console.title_xex_dword(memory::XexFieldKey(XEX_FIELD_ADDITIONAL_TITLE_MEMORY)) {
+            match console
+                .title_xex_dword(memory::XexFieldKey(XexHeaderKey::ADDITIONAL_TITLE_MEMORY.0))
+            {
                 Ok(Some(value)) => {
                     write_u32(size, value);
                     Hresult::OK.0

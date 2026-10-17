@@ -78,6 +78,8 @@ use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::DebugMonitorService;
 use xbox360_sys::xboxkrnl::ImageFlags;
 use xbox360_sys::xboxkrnl::ImageVersion;
+use xbox360_sys::xboxkrnl::SmcCommand;
+use xbox360_sys::xboxkrnl::SmcMessage;
 use xbox360_sys::xboxkrnl::XeKeysGetConsoleID;
 
 use super::Console;
@@ -103,8 +105,6 @@ const NETWORK_RA_MESSAGE: u32 = 0x00a0_0004;
 /// Descriptor kinds of the network configuration message.
 const NETWORK_RA_RECORD: u32 = 5;
 const NETWORK_RA_RESET: u32 = 2;
-/// SMC command that reads or writes the I2C settings block.
-const SMC_I2C_COMMAND: u8 = 0x11;
 /// I2C device of the settings block.
 const SMC_I2C_DEVICE: u8 = 0xd4;
 /// Bytes per SMC I2C transfer.
@@ -155,18 +155,17 @@ struct NetworkRaDescriptor {
     size: u32,
 }
 
-fn smc_i2c_message(address: usize) -> [u8; 16] {
-    let mut message = [0u8; 16];
-    message[0] = SMC_I2C_COMMAND;
-    message[3] = SMC_I2C_DEVICE;
-    message[6] = address as u8;
+fn smc_i2c_message(address: usize) -> SmcMessage {
+    let mut message = SmcMessage::new(SmcCommand::I2c);
+    message.0[3] = SMC_I2C_DEVICE;
+    message.0[6] = address as u8;
     message
 }
 
 fn send_network_ra(descriptor: &mut NetworkRaDescriptor) -> Result<(), NetworkRaError> {
     // SAFETY: `descriptor` is live for the synchronous request; no
     // overlapped block is passed.
-    let result = Hresult(unsafe {
+    let result = unsafe {
         xam::XMsgStartIORequest(
             NETWORK_SERVICE,
             NETWORK_RA_MESSAGE,
@@ -174,7 +173,7 @@ fn send_network_ra(descriptor: &mut NetworkRaDescriptor) -> Result<(), NetworkRa
             (descriptor as *mut NetworkRaDescriptor).cast(),
             size_of::<NetworkRaDescriptor>() as u32,
         )
-    });
+    };
     if result.is_failure() {
         Err(NetworkRaError(result))
     } else {
@@ -319,17 +318,17 @@ impl commands::console::Backend for Console {
         let mut block = [0u8; SETTINGS_BLOCK_SIZE];
         for address in (0..SETTINGS_BLOCK_SIZE).step_by(SMC_I2C_CHUNK) {
             let mut message = smc_i2c_message(address);
-            message[1] = 0x10;
-            message[2] = SMC_I2C_CHUNK as u8;
-            message[5] = SMC_I2C_DEVICE;
+            message.0[1] = 0x10;
+            message.0[2] = SMC_I2C_CHUNK as u8;
+            message.0[5] = SMC_I2C_DEVICE;
             let mut done = false;
             for _ in 0..SMC_I2C_ATTEMPTS {
-                let mut reply = [0u8; 16];
-                // SAFETY: `message` and `reply` are live 16-byte buffers.
-                unsafe { xboxkrnl::HalSendSMCMessage(message.as_ptr(), reply.as_mut_ptr()) };
-                if reply[1] == 0 {
+                let mut reply = SmcMessage::default();
+                // SAFETY: `message` and `reply` are live SMC messages.
+                unsafe { xboxkrnl::HalSendSMCMessage(&message, &mut reply) };
+                if reply.0[1] == 0 {
                     block[address..address + SMC_I2C_CHUNK]
-                        .copy_from_slice(&reply[3..3 + SMC_I2C_CHUNK]);
+                        .copy_from_slice(&reply.0[3..3 + SMC_I2C_CHUNK]);
                     done = true;
                     break;
                 }
@@ -346,14 +345,15 @@ impl commands::console::Backend for Console {
     fn write_settings_block(&mut self, block: &[u8; SETTINGS_BLOCK_SIZE]) -> bool {
         for address in (0..SETTINGS_BLOCK_SIZE).step_by(SMC_I2C_CHUNK) {
             let mut message = smc_i2c_message(address);
-            message[1] = ((SMC_I2C_CHUNK + 1) << 4) as u8;
-            message[7..7 + SMC_I2C_CHUNK].copy_from_slice(&block[address..address + SMC_I2C_CHUNK]);
+            message.0[1] = ((SMC_I2C_CHUNK + 1) << 4) as u8;
+            message.0[7..7 + SMC_I2C_CHUNK]
+                .copy_from_slice(&block[address..address + SMC_I2C_CHUNK]);
             let mut done = false;
             for _ in 0..SMC_I2C_ATTEMPTS {
-                let mut reply = [0u8; 16];
-                // SAFETY: `message` and `reply` are live 16-byte buffers.
-                unsafe { xboxkrnl::HalSendSMCMessage(message.as_ptr(), reply.as_mut_ptr()) };
-                if reply[1] == 0 {
+                let mut reply = SmcMessage::default();
+                // SAFETY: `message` and `reply` are live SMC messages.
+                unsafe { xboxkrnl::HalSendSMCMessage(&message, &mut reply) };
+                if reply.0[1] == 0 {
                     sleep(Duration::from_millis(2));
                     done = true;
                     break;
@@ -363,7 +363,7 @@ impl commands::console::Backend for Console {
                 let _ = writeln!(
                     text,
                     "dm: I2C Write failed.  Error=0x{:x}, Addr={}, DataLen={}, ",
-                    reply[1], address, SMC_I2C_CHUNK
+                    reply.0[1], address, SMC_I2C_CHUNK
                 );
                 self.debug_print(text.as_bytes());
             }
@@ -389,8 +389,7 @@ impl commands::console::Backend for Console {
     fn console_id(&mut self) -> Result<ConsoleId, KernelError> {
         let mut text = [0u8; CONSOLE_ID_LENGTH + 1];
         // SAFETY: `text` holds the console ID text and its NUL.
-        NtStatus(unsafe { XeKeysGetConsoleID(core::ptr::null_mut(), text.as_mut_ptr()) })
-            .result()?;
+        unsafe { XeKeysGetConsoleID(core::ptr::null_mut(), text.as_mut_ptr()) }.result()?;
         let mut id = [0u8; CONSOLE_ID_LENGTH];
         id.copy_from_slice(&text[..CONSOLE_ID_LENGTH]);
         Ok(ConsoleId(id))

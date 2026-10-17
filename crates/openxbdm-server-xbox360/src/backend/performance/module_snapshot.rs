@@ -2,9 +2,16 @@
 //! it): the loaded modules and console facts that capture and trace files
 //! embed.
 
+use core::sync::atomic::Ordering;
+
 use openxbdm_server::Server;
+use xbox360_sys::image::CodeViewRsds;
+use xbox360_sys::image::DebugType;
+use xbox360_sys::image::ImageDebugDirectory;
+use xbox360_sys::image::ImageDirectory;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::ExLoadedImageName;
+use xbox360_sys::xboxkrnl::LdrDataTableEntry;
 use xbox360_sys::xboxkrnl::PageProtection;
 use xbox360_sys::xboxkrnl::RtlImageDirectoryEntryToData;
 
@@ -18,7 +25,7 @@ use crate::net::XamNetwork;
 /// Bytes of the block.
 pub(crate) const SIZE: u32 = 0xc000;
 /// Physical memory type of the block (`MmFreePhysicalMemory` takes it too).
-const MEMORY_TYPE: u32 = 1;
+const MEMORY_TYPE: xboxkrnl::MemoryRegion = xboxkrnl::MemoryRegion::Title;
 const VERSION: u32 = 0xa;
 const MODULE_CAPACITY: u32 = 0x80;
 /// Module records start at +8.
@@ -37,18 +44,6 @@ const EXECUTABLE: u32 = 0xa934;
 const MAGIC: u32 = 0xaa38;
 const MAGIC_VALUE: u32 = 0x5308;
 const PERFORMANCE_FREQUENCY: u32 = 0xaa3c;
-
-/// Loader data table entry offsets.
-const ENTRY_BASE: u32 = 0x18;
-const ENTRY_SIZE: u32 = 0x20;
-const ENTRY_NAME_LENGTH: u32 = 0x2c;
-const ENTRY_NAME_BUFFER: u32 = 0x30;
-const ENTRY_TIME_STAMP: u32 = 0x50;
-
-const IMAGE_DIRECTORY_DEBUG: u32 = 6;
-const DEBUG_DIRECTORY_ENTRY_SIZE: u32 = 0x1c;
-const IMAGE_DEBUG_TYPE_CODEVIEW: u32 = 2;
-const CODEVIEW_RSDS: u32 = u32::from_be_bytes(*b"RSDS");
 
 /// Capture state the block records.
 #[derive(Clone, Copy)]
@@ -111,33 +106,56 @@ fn copy_string(destination: u32, source: u32, limit: u32) {
     }
 }
 
+/// The loader entry at `entry`.
+///
+/// # Safety
+///
+/// `entry` must be linked into a loader module list of the debug monitor
+/// data while the caller holds the loader lock.
+unsafe fn loader_entry<'a>(entry: u32) -> &'a LdrDataTableEntry {
+    // SAFETY: guaranteed by the caller.
+    unsafe { &*core::ptr::with_exposed_provenance::<LdrDataTableEntry>(entry as usize) }
+}
+
 fn contains(head: u32, base: u32) -> bool {
     if head == 0 {
         return false;
     }
     let mut entry = read_u32(head);
     while entry != head {
-        if read_u32(entry + ENTRY_BASE) == base {
+        // SAFETY: `entry` is on the list at `head`; the caller holds the
+        // loader lock.
+        let current = unsafe { loader_entry(entry) };
+        if current.dll_base == base {
             return true;
         }
-        entry = read_u32(entry);
+        entry = current.in_load_order_links.flink.load(Ordering::Relaxed);
     }
     false
 }
 
 /// Debug directory of a loaded image, looked up as stock 0x91f280d8 does
 /// with the loader lock already held.
-fn debug_directory(base: u32, lists: [u32; 2]) -> Option<(u32, u32)> {
+fn debug_directory(base: u32, lists: [u32; 2]) -> Option<&'static [ImageDebugDirectory]> {
     let mut size = 0u32;
     for list in lists {
         if contains(list, base) {
             // SAFETY: `base` is a loaded image on a list whose lock the
             // caller holds; `size` is a live u32.
             let directory = unsafe {
-                RtlImageDirectoryEntryToData(base, true, IMAGE_DIRECTORY_DEBUG, &mut size)
+                RtlImageDirectoryEntryToData(base, true, ImageDirectory::Debug, &mut size)
             };
             if directory != 0 && size != 0 {
-                return Some((directory, size));
+                // SAFETY: the debug directory of a mapped image holds `size`
+                // bytes and stays mapped under the loader lock.
+                return Some(unsafe {
+                    core::slice::from_raw_parts(
+                        core::ptr::with_exposed_provenance::<ImageDebugDirectory>(
+                            directory as usize,
+                        ),
+                        size as usize / core::mem::size_of::<ImageDebugDirectory>(),
+                    )
+                });
             }
         }
     }
@@ -148,41 +166,56 @@ fn debug_directory(base: u32, lists: [u32; 2]) -> Option<(u32, u32)> {
 /// `record`; any CodeView entry selects the record named by the first
 /// entry, as in stock 0x91f280d8.
 fn store_code_view(record: u32, base: u32, lists: [u32; 2]) {
-    let Some((directory, size)) = debug_directory(base, lists) else {
+    let Some(entries) = debug_directory(base, lists) else {
         return;
     };
-    let count = size / DEBUG_DIRECTORY_ENTRY_SIZE;
-    if !(0..count).any(|index| {
-        read_u32(directory + index * DEBUG_DIRECTORY_ENTRY_SIZE + 0xc).swap_bytes()
-            == IMAGE_DEBUG_TYPE_CODEVIEW
-    }) {
+    if !entries
+        .iter()
+        .any(|entry| entry.debug_type() == DebugType::CODEVIEW)
+    {
         return;
     }
-    let code_view = base.wrapping_add(read_u32(directory + 0x14).swap_bytes());
-    if code_view == 0 || read_u32(code_view) != CODEVIEW_RSDS {
+    let Some(first) = entries.first() else {
+        return;
+    };
+    let code_view = base.wrapping_add(first.address_of_raw_data.get());
+    if code_view == 0 {
         return;
     }
-    write_u32(record + 0x38, read_u32(code_view + 0x14));
-    for word in 0..4 {
-        write_u32(record + 0x3c + 4 * word, read_u32(code_view + 4 + 4 * word));
+    // SAFETY: the debug data of a mapped image lies in the image.
+    let rsds = unsafe { &*core::ptr::with_exposed_provenance::<CodeViewRsds>(code_view as usize) };
+    if rsds.signature != CodeViewRsds::SIGNATURE {
+        return;
     }
-    copy_string(record + 0x4c, code_view + 0x18, PATH_LIMIT as u32);
+    write_u32(record + 0x38, u32::from_ne_bytes(rsds.age.bytes()));
+    for (word, bytes) in rsds.guid.chunks_exact(4).enumerate() {
+        write_u32(
+            record + 0x3c + 4 * word as u32,
+            u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        );
+    }
+    copy_string(
+        record + 0x4c,
+        code_view + core::mem::offset_of!(CodeViewRsds, path) as u32,
+        PATH_LIMIT as u32,
+    );
 }
 
 /// Write one module record; false when the name does not fit.
-fn store_module(record: u32, entry: u32, base: u32, lists: [u32; 2]) -> bool {
+fn store_module(record: u32, entry: &LdrDataTableEntry, lists: [u32; 2]) -> bool {
+    let base = entry.dll_base;
     write_u32(record, base);
-    write_u32(record + 8, read_u32(entry + ENTRY_TIME_STAMP).swap_bytes());
-    write_u32(record + 4, read_u32(entry + ENTRY_SIZE));
-    let characters = u32::from(read_u16(entry + ENTRY_NAME_LENGTH)) >> 1;
+    write_u32(record + 8, entry.time_date_stamp.swap_bytes());
+    write_u32(record + 4, entry.image_size);
+    let characters = u32::from(entry.base_dll_name.length) >> 1;
     if characters > NAME_LIMIT {
         super::pmc::print(
             c"PERF: ignore module \"%wZ\" because the name is too long.\n",
-            &[u64::from(entry + ENTRY_NAME_LENGTH)],
+            &[core::ptr::from_ref(&entry.base_dll_name).addr() as u64],
         );
         return false;
     }
-    let name = read_u32(entry + ENTRY_NAME_BUFFER);
+    let name = entry.base_dll_name.buffer;
     for index in 0..characters {
         write_u8(record + 0xc + index, read_u16(name + 2 * index) as u8);
     }
@@ -211,9 +244,15 @@ pub(crate) fn build(executable: &[u8], capture: CaptureFields) -> Option<Snapsho
     // SAFETY: the allocation holds `SIZE` bytes.
     unsafe { core::ptr::write_bytes(block as usize as *mut u8, 0, SIZE as usize) };
     let data = kernel::debug_monitor_data();
-    let lists = [data.module_list(), data.secondary_module_list()];
+    let lists = [
+        data.loaded_module_list.load(Ordering::Relaxed),
+        data.loaded_usermode_module_list.load(Ordering::Relaxed),
+    ];
     write_u32(block, VERSION);
-    write_u32(block + PROCESSOR_COUNT, data.processor_count());
+    write_u32(
+        block + PROCESSOR_COUNT,
+        data.processor_count.load(Ordering::Relaxed),
+    );
     write_u32(block + MAGIC, MAGIC_VALUE);
     write_u32(block + CAPTURE_PREVIOUS_FLAGS, capture.previous_flags);
     let frequency = kernel::performance_frequency();
@@ -224,7 +263,7 @@ pub(crate) fn build(executable: &[u8], capture: CaptureFields) -> Option<Snapsho
         &executable[..executable.len().min(PATH_LIMIT)],
     );
 
-    let lock = data.loader_lock() as usize as *mut _;
+    let lock = data.loaded_module_list_lock.load(Ordering::Relaxed) as usize as *mut _;
     // SAFETY: the loader lock lives in the kernel debug monitor data.
     let irql = unsafe { xboxkrnl::KfAcquireSpinLock(lock) };
     let mut count = 0;
@@ -238,12 +277,15 @@ pub(crate) fn build(executable: &[u8], capture: CaptureFields) -> Option<Snapsho
             if count >= MODULE_CAPACITY {
                 break 'lists;
             }
-            let base = read_u32(entry + ENTRY_BASE);
-            if base != 0 && store_module(block + RECORDS + count * RECORD_SIZE, entry, base, lists)
+            // SAFETY: `entry` is on a loader list of the debug monitor data,
+            // under the loader lock acquired above.
+            let current = unsafe { loader_entry(entry) };
+            if current.dll_base != 0
+                && store_module(block + RECORDS + count * RECORD_SIZE, current, lists)
             {
                 count += 1;
             }
-            entry = read_u32(entry);
+            entry = current.in_load_order_links.flink.load(Ordering::Relaxed);
         }
     }
     // SAFETY: acquired above at `irql`.
@@ -268,7 +310,7 @@ pub(crate) fn free(snapshot: Snapshot) {
 
 /// Object path of the running executable.
 pub(crate) fn executable_object_path() -> &'static [u8] {
-    let path = ExLoadedImageName.address();
+    let path = core::ptr::from_ref(kernel::resolved(&ExLoadedImageName)).expose_provenance() as u32;
     let mut length = 0;
     while read_u8(path + length) != 0 {
         length += 1;
@@ -340,7 +382,7 @@ extern "C" fn export_free(_address: u32) -> u32 {
         "mr 4, 3",
         "li 3, {kind}",
         "b {free}",
-        kind = const MEMORY_TYPE,
+        kind = const MEMORY_TYPE as u32,
         free = sym xboxkrnl::MmFreePhysicalMemory,
     )
 }

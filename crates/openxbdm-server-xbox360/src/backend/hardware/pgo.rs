@@ -12,6 +12,7 @@ use core::sync::atomic::Ordering;
 use core::sync::atomic::fence;
 
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::Server;
 use openxbdm_server::commands::filesystem::CreateDisposition;
@@ -46,11 +47,13 @@ use xbox360::status::set_last_error_value;
 use xbox360::time::FileTime;
 use xbox360_sys::export_raw;
 use xbox360_sys::processor;
+use xbox360_sys::processor::Kpcr;
 use xbox360_sys::xam;
 use xbox360_sys::xam::DuplicateHandle;
 use xbox360_sys::xam::DuplicateOptions;
 use xbox360_sys::xam::GetCurrentThreadId;
 use xbox360_sys::xam::GetProcessHeap;
+use xbox360_sys::xam::HeapFlags;
 use xbox360_sys::xam::ResetEvent;
 use xbox360_sys::xam::RtlAllocateHeap;
 use xbox360_sys::xam::RtlFreeHeap;
@@ -58,6 +61,7 @@ use xbox360_sys::xam::WaitResult;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::AccessMask;
 use xbox360_sys::xboxkrnl::AllocationType;
+use xbox360_sys::xboxkrnl::BugCheckCode;
 use xbox360_sys::xboxkrnl::FileInformationClass;
 use xbox360_sys::xboxkrnl::Handle;
 use xbox360_sys::xboxkrnl::IoStatusBlock;
@@ -79,11 +83,7 @@ use crate::kernel;
 use crate::kernel::CriticalSection;
 use crate::net::XamNetwork;
 
-/// KMODE_EXCEPTION_NOT_HANDLED, the code of every runtime failure.
-const BUG_CHECK_CODE: u32 = 0x1e;
 const INFINITE: u32 = u32::MAX;
-const HEAP_ZERO_MEMORY: u32 = 8;
-const STATUS_PENDING: u32 = 0x103;
 /// FILE_READ_ATTRIBUTES, added to both profile opens.
 const READ_ATTRIBUTES: u32 = 0x80;
 
@@ -299,7 +299,7 @@ fn title_thread() -> bool {
 /// Print a failure and stop the console (0x91f74280, then KeBugCheck).
 fn fatal(failure: Fatal) -> ! {
     kernel::debug_print_bytes(failure.text().as_bytes());
-    KeBugCheck(BUG_CHECK_CODE)
+    KeBugCheck(BugCheckCode::KMODE_EXCEPTION_NOT_HANDLED)
 }
 
 fn warn(warning: WriteWarning) {
@@ -494,7 +494,10 @@ fn enter_probe(block: u32, record: Option<u32>) -> bool {
         let Some(record) = record else {
             return false;
         };
-        write32(record + thread::STATE, processor::pcr());
+        write32(
+            record + thread::STATE,
+            core::ptr::from_ref(Kpcr::current()).addr() as u32,
+        );
         // SAFETY: SWEEP_EVENT holds the event created at startup.
         unsafe {
             xam::WaitForSingleObject(
@@ -510,7 +513,10 @@ fn enter_probe(block: u32, record: Option<u32>) -> bool {
 
 fn leave_probe(block: u32, record: Option<u32>) {
     match record {
-        Some(record) => write32(record + thread::STATE, processor::pcr()),
+        Some(record) => write32(
+            record + thread::STATE,
+            core::ptr::from_ref(Kpcr::current()).addr() as u32,
+        ),
         None => {
             fetch_add(block + block::UNTRACKED, u32::MAX);
         }
@@ -528,7 +534,7 @@ fn thread_record(block: u32) -> Option<u32> {
         return Some(existing);
     }
     // SAFETY: the process heap takes a size only.
-    let record = unsafe { RtlAllocateHeap(GetProcessHeap(), 0, thread::SIZE) };
+    let record = unsafe { RtlAllocateHeap(GetProcessHeap(), HeapFlags::empty(), thread::SIZE) };
     if record == 0 {
         fatal(Fatal::ThreadListAllocation);
     }
@@ -582,7 +588,10 @@ fn release_for_sweep(block: u32) -> Option<u32> {
         None
     };
     match record {
-        Some(record) => write32(record + thread::STATE, processor::pcr()),
+        Some(record) => write32(
+            record + thread::STATE,
+            core::ptr::from_ref(Kpcr::current()).addr() as u32,
+        ),
         None => {
             fetch_add(block + block::UNTRACKED, u32::MAX);
         }
@@ -632,7 +641,7 @@ fn begin_sweep(block: u32, new_generation: bool) {
                 {
                     close_handle(read32(record + thread::HANDLE));
                     // SAFETY: the record was unlinked above and came from the process heap.
-                    unsafe { RtlFreeHeap(GetProcessHeap(), 0, record) };
+                    unsafe { RtlFreeHeap(GetProcessHeap(), HeapFlags::empty(), record) };
                     record = read32(link);
                     continue;
                 }
@@ -1662,7 +1671,7 @@ fn create_block(node: Node) {
             &mut size,
             AllocationType::COMMIT,
             PageProtection::READWRITE,
-            0,
+            xboxkrnl::MemoryRegion::CurrentProcess,
         )
     };
     if let Err(error) = status.result() {
@@ -1862,7 +1871,8 @@ extern "C" fn export_register(
                 fatal(Fatal::ModuleNameTooLong);
             }
             // SAFETY: the process heap takes a size only.
-            let record = unsafe { RtlAllocateHeap(GetProcessHeap(), HEAP_ZERO_MEMORY, node::SIZE) };
+            let record =
+                unsafe { RtlAllocateHeap(GetProcessHeap(), HeapFlags::ZERO_MEMORY, node::SIZE) };
             if record == 0 {
                 fatal(Fatal::NodeAllocation);
             }
@@ -2078,7 +2088,7 @@ fn write_file(handle: u32, buffer: u32, length: u32) -> bool {
             core::ptr::null(),
         )
     };
-    if status.0 == STATUS_PENDING {
+    if status == NtStatus::PENDING {
         // SAFETY: `handle` is the open profile file.
         unsafe {
             xboxkrnl::NtWaitForSingleObjectEx(

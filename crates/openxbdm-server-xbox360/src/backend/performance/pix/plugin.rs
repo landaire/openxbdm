@@ -12,6 +12,7 @@ use core::sync::atomic::Ordering;
 use openxbdm_core::status::KernelError;
 use openxbdm_server::commands::performance::PixDogma;
 use openxbdm_server::text::Text;
+use xbox360_sys::image::XexHeaderKey;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::AccessMask;
 use xbox360_sys::xboxkrnl::CreateOptions;
@@ -19,6 +20,7 @@ use xbox360_sys::xboxkrnl::Handle;
 use xbox360_sys::xboxkrnl::ImageFlags;
 use xbox360_sys::xboxkrnl::ImageVersion;
 use xbox360_sys::xboxkrnl::IoStatusBlock;
+use xbox360_sys::xboxkrnl::LdrDataTableEntry;
 use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
 use xbox360_sys::xboxkrnl::ObjectAttributes;
 use xbox360_sys::xboxkrnl::PoolTag;
@@ -54,14 +56,9 @@ const PLUGIN_TAG: PoolTag = PoolTag::new(*b"PIXd");
 const MODULE_DLL: u32 = 4;
 const RECORD_SIZE: usize = memory::MODULE_RECORD_SHORT_SIZE;
 const RECORD_FLAGS: usize = 0x114;
-/// XEX header field of the linked static libraries: 16-byte entries
-/// `{name[8], major, minor, build, qfe}` after a size word.
-const XEX_LIBRARIES: u32 = 0x2_00ff;
 const SUBMIT_RETURNS_BUILD: u16 = 0x2028;
 const ORDINAL_SUBMIT_RETURNS: u32 = 4;
 const ORDINAL_SUBMIT: u32 = 2;
-/// Loader entry field holding the XEX header.
-const ENTRY_XEX_HEADER: u32 = 0x58;
 
 /// `catma.xex` exists (stock 0x91fa2aac, probed at initialization).
 static PRESENT: AtomicBool = AtomicBool::new(false);
@@ -295,12 +292,16 @@ fn submit_hook(image: u32, hook: &mut u32) -> Result<(), KernelError> {
                 core::str::from_utf8(name).unwrap_or_default()
             ));
             let libraries = memory::loader_entry(name).map_or(0, |entry| {
-                // SAFETY: the loader entry of a loaded module holds its XEX
-                // header address.
+                // SAFETY: `loader_entry` returns the address of the loader
+                // entry of a loaded module.
+                let entry = unsafe {
+                    &*core::ptr::with_exposed_provenance::<LdrDataTableEntry>(entry as usize)
+                };
+                // SAFETY: the loader entry holds the module's XEX header address.
                 unsafe {
                     xboxkrnl::RtlImageXexHeaderField(
-                        super::read_u32(entry + ENTRY_XEX_HEADER),
-                        XEX_LIBRARIES,
+                        entry.xex_header_base,
+                        XexHeaderKey::STATIC_LIBRARIES,
                     )
                 }
             });

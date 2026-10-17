@@ -17,12 +17,23 @@ use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::AccessMask;
 use xbox360_sys::xboxkrnl::AnsiString;
 use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::DeviceObject;
+use xbox360_sys::xboxkrnl::DeviceObjectFlags;
+use xbox360_sys::xboxkrnl::DriverDispatch;
+use xbox360_sys::xboxkrnl::DriverObject;
+use xbox360_sys::xboxkrnl::DriverStartIo;
 use xbox360_sys::xboxkrnl::EventType;
+use xbox360_sys::xboxkrnl::FileDeviceType;
 use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::IoControlCode;
 use xbox360_sys::xboxkrnl::IoCreateDevice;
 use xbox360_sys::xboxkrnl::IoDismountVolume;
 use xbox360_sys::xboxkrnl::IoInvalidDeviceRequest;
+use xbox360_sys::xboxkrnl::IoStackControl;
+use xbox360_sys::xboxkrnl::IoStackFlags;
 use xbox360_sys::xboxkrnl::IoStatusBlock;
+use xbox360_sys::xboxkrnl::Irp;
+use xbox360_sys::xboxkrnl::IrpMajorFunction;
 use xbox360_sys::xboxkrnl::Irql;
 use xbox360_sys::xboxkrnl::KeSetPriorityThread;
 use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
@@ -32,12 +43,6 @@ use xbox360_sys::xboxkrnl::ProcessorMode;
 use xbox360_sys::xboxkrnl::ShareAccess;
 use xbox360_sys::xboxkrnl::ThreadCreationFlags;
 use xbox360_sys::xboxkrnl::WaitReason;
-
-const STATUS_PENDING: NtStatus = NtStatus(0x103);
-const STATUS_INVALID_PARAMETER: NtStatus = NtStatus(0xc000_000d);
-const STATUS_INVALID_DEVICE_REQUEST: NtStatus = NtStatus(0xc000_0010);
-const STATUS_END_OF_FILE: NtStatus = NtStatus(0xc000_0011);
-const STATUS_BUFFER_TOO_SMALL: NtStatus = NtStatus(0xc000_0023);
 
 /// `ExCreateThread` flags of the mount thread.
 const MOUNT_THREAD_FLAGS: ThreadCreationFlags = ThreadCreationFlags::from_bits_retain(0x22);
@@ -49,43 +54,20 @@ const THREAD_SYSTEM_PROCESS: u32 = 0x2;
 const WORKER_STACK_SIZE: u32 = 0x4000;
 const WORKER_PRIORITY: u32 = 0x1f;
 
-const DEVICE_TYPE: u32 = 0x3d;
-/// Device flag set by the kernel at creation, cleared once the device is
-/// ready and set again before its volume is dismounted.
-const DEVICE_INITIALIZING: u32 = 0x10;
+const DEVICE_TYPE: FileDeviceType = FileDeviceType(0x3d);
 /// Alignment requirement of the device: word aligned transfer buffers.
 const WORD_ALIGNMENT: u32 = 1;
 const SECTOR_SIZE: u32 = 0x200;
 const SECTOR_SHIFT: u32 = 9;
 const SECTOR_MASK: u32 = SECTOR_SIZE - 1;
 
-const MAJOR_READ: u8 = 2;
-const MAJOR_WRITE: u8 = 3;
-const MAJOR_FUNCTIONS: usize = 11;
-/// Stack location flag: the buffer parameter is the transfer address and
-/// the request is checked with assertion traps instead of refused.
-const LOCATION_BUFFER_ADDRESS: u8 = 1;
-/// Stack location control bit set before a request is queued.
-const CONTROL_PENDING_RETURNED: u8 = 1;
-/// Control code returning the sector count and the sector size (two dwords).
-const CONTROL_GET_GEOMETRY: u32 = 0x0007_0000;
-/// Control code returning the start offset and the length in bytes (two
-/// quadwords).
-const CONTROL_GET_PARTITION: u32 = 0x0007_4004;
-
-/// Stack location parameter words (+0x04): transfer length, or output
-/// buffer length of a control request.
+/// Stack location parameter words as the worker reads them once a request
+/// is queued: transfer length, transfer address or user buffer, first
+/// sector, and the offset added to the buffer word.
 const LENGTH: usize = 0;
-/// Transfer address, or offset into the user buffer.
 const BUFFER: usize = 1;
-/// Byte offset as received, high word first.
-const OFFSET: usize = 2;
-/// Once queued: the first sector.
 const SECTOR: usize = 2;
-/// Once queued: added to the buffer parameter to form the transfer address.
 const BUFFER_OFFSET: usize = 3;
-const CONTROL_CODE: usize = 3;
-
 const NOTIFICATION: u8 = 0;
 const SYNCHRONIZATION: u8 = 1;
 
@@ -145,39 +127,6 @@ static DISMOUNTED: GlobalEvent = GlobalEvent::new(SYNCHRONIZATION, &DISMOUNTED);
 /// Mount threads holding a device (stock 0x91fab7d0).
 static MOUNTED: AtomicU32 = AtomicU32::new(0);
 
-/// I/O request packet; only the fields this driver uses.
-#[repr(C)]
-struct Irp {
-    _header: [u32; 4],
-    io_status: IoStatusBlock,
-    _reserved: u32,
-    user_buffer: u32,
-    _overlay: [u32; 12],
-    location: *mut StackLocation,
-}
-
-/// I/O stack location.
-#[repr(C)]
-struct StackLocation {
-    major_function: u8,
-    _minor_function: u8,
-    flags: u8,
-    control: u8,
-    parameters: [u32; 4],
-}
-
-/// Device object; only the fields this driver uses.
-#[repr(C)]
-struct DeviceObject {
-    _header: [u32; 4],
-    current_irp: Option<NonNull<Irp>>,
-    flags: u32,
-    extension: *mut Extension,
-    _type: [u8; 4],
-    _unknown: u32,
-    alignment: u32,
-}
-
 /// Device extension. Packed because the kernel places it.
 #[repr(C, packed(4))]
 struct Extension {
@@ -200,17 +149,6 @@ struct Extension {
     _unused: [u32; 4],
 }
 
-type Dispatch = extern "C" fn(*mut DeviceObject, *mut Irp) -> u32;
-
-/// Driver object.
-#[repr(C)]
-struct DriverObject {
-    start_io: Dispatch,
-    /// Routines this driver does not supply.
-    unsupplied: [Option<Dispatch>; 2],
-    major_function: [Dispatch; MAJOR_FUNCTIONS],
-}
-
 /// Stack block of the export (stock frame +0x50), the mount thread context.
 #[repr(C)]
 struct MountRequest {
@@ -222,13 +160,6 @@ struct MountRequest {
 }
 
 const _: () = {
-    assert!(core::mem::offset_of!(Irp, io_status) == 0x10);
-    assert!(core::mem::offset_of!(Irp, user_buffer) == 0x1c);
-    assert!(core::mem::offset_of!(Irp, location) == 0x50);
-    assert!(core::mem::offset_of!(StackLocation, parameters) == 4);
-    assert!(core::mem::offset_of!(DeviceObject, current_irp) == 0x10);
-    assert!(core::mem::offset_of!(DeviceObject, extension) == 0x18);
-    assert!(core::mem::offset_of!(DeviceObject, alignment) == 0x24);
     assert!(core::mem::offset_of!(Extension, start) == 0x10);
     assert!(core::mem::offset_of!(Extension, work) == 0x20);
     assert!(core::mem::offset_of!(Extension, writes) == 0x30);
@@ -241,9 +172,9 @@ const _: () = {
 /// Entry of a routine the kernel calls, through `export_bridge` for the
 /// console register convention.
 macro_rules! kernel_entry {
-    ($entry:ident, $function:path) => {
+    ($entry:ident: $ty:ty, $function:path) => {
         #[unsafe(naked)]
-        extern "C" fn $entry(_: *mut DeviceObject, _: *mut Irp) -> u32 {
+        unsafe extern "C" fn $entry(_: *mut DeviceObject, _: *mut Irp) -> $ty {
             core::arch::naked_asm!(
                 "lis 12, {function}@ha",
                 "addi 12, 12, {function}@l",
@@ -255,11 +186,11 @@ macro_rules! kernel_entry {
     };
 }
 
-kernel_entry!(start_io_entry, start_io);
-kernel_entry!(read_write_entry, read_write);
-kernel_entry!(flush_entry, flush);
-kernel_entry!(device_control_entry, device_control);
-kernel_entry!(invalid_request_entry, IoInvalidDeviceRequest);
+kernel_entry!(start_io_entry: (), start_io);
+kernel_entry!(read_write_entry: NtStatus, read_write);
+kernel_entry!(flush_entry: NtStatus, flush);
+kernel_entry!(device_control_entry: NtStatus, device_control);
+kernel_entry!(invalid_request_entry: NtStatus, IoInvalidDeviceRequest);
 
 /// Writable like stock's (0x91f98e94, in .data); the kernel keeps a
 /// pointer to it.
@@ -268,23 +199,26 @@ struct Driver(UnsafeCell<DriverObject>);
 // SAFETY: never written by this module.
 unsafe impl Sync for Driver {}
 
-static DRIVER: Driver = Driver(UnsafeCell::new(DriverObject {
-    start_io: start_io_entry,
-    unsupplied: [None, None],
-    major_function: [
-        invalid_request_entry,
-        invalid_request_entry,
-        read_write_entry,
-        read_write_entry,
-        invalid_request_entry,
-        invalid_request_entry,
-        flush_entry,
-        invalid_request_entry,
-        invalid_request_entry,
-        device_control_entry,
-        invalid_request_entry,
+const START_IO: DriverStartIo = start_io_entry;
+const INVALID: Option<DriverDispatch> = Some(invalid_request_entry);
+const READ_WRITE: Option<DriverDispatch> = Some(read_write_entry);
+
+static DRIVER: Driver = Driver(UnsafeCell::new(DriverObject::new(
+    Some(START_IO),
+    [
+        INVALID,
+        INVALID,
+        READ_WRITE,
+        READ_WRITE,
+        INVALID,
+        INVALID,
+        Some(flush_entry),
+        INVALID,
+        INVALID,
+        Some(device_control_entry),
+        INVALID,
     ],
-}));
+)));
 
 /// Stock assertion trap (`twi 31, 0, 0x19`).
 fn assertion_trap() {
@@ -477,12 +411,12 @@ fn create_device(
         )
     };
     created.result()?;
-    let mut device = 0u32;
+    let mut device: *mut DeviceObject = null_mut();
     // SAFETY: `DRIVER` is the static driver object, `name` is the caller's
     // counted name, and `device` is a live local.
     let status = unsafe {
         IoCreateDevice(
-            DRIVER.0.get() as usize as u32,
+            DRIVER.0.get(),
             size_of::<Extension>() as u32,
             name,
             DEVICE_TYPE,
@@ -492,7 +426,6 @@ fn create_device(
             &mut device,
         )
     };
-    let device = device as usize as *mut DeviceObject;
     if let Err(error) = status.result() {
         // SAFETY: `io_event` was created above and is closed once.
         unsafe { xboxkrnl::NtClose(Handle::from_raw(io_event)) };
@@ -501,13 +434,13 @@ fn create_device(
     // SAFETY: the kernel created the device with an extension of the
     // requested size; nothing else uses it yet.
     unsafe {
-        let Some(extension) = NonNull::new((*device).extension) else {
+        let Some(extension) = NonNull::new((*device).device_extension.cast::<Extension>()) else {
             assertion_trap();
             // Stock goes on to write through the null extension.
             panic!();
         };
         let extension = extension.as_ptr();
-        (*device).alignment = WORD_ALIGNMENT;
+        (*device).alignment_requirement = WORD_ALIGNMENT;
         (*extension).file = file;
         (*extension).io_event = io_event;
         (*extension).irp = None;
@@ -540,7 +473,7 @@ fn create_device(
                 .map_or(null_mut(), |thread| thread.as_ptr().cast()),
             WORKER_PRIORITY,
         );
-        (*device).flags &= !DEVICE_INITIALIZING;
+        (*device).flags.remove(DeviceObjectFlags::INITIALIZING);
     }
     Ok(device)
 }
@@ -554,13 +487,13 @@ unsafe fn delete_device(device: *mut DeviceObject) -> u32 {
     // SAFETY: guaranteed by the caller; the worker ends before the device
     // is released.
     unsafe {
-        let extension = (*device).extension;
-        (*device).flags |= DEVICE_INITIALIZING;
-        IoDismountVolume(device as usize as u32);
+        let extension = (*device).device_extension.cast::<Extension>();
+        (*device).flags.insert(DeviceObjectFlags::INITIALIZING);
+        IoDismountVolume(device);
         let thread = (*extension).thread;
         (*extension).thread = None;
         if let Some(thread) = thread {
-            if (*device).current_irp.is_some() {
+            if !(*device).current_irp.is_null() {
                 assertion_trap();
             }
             xboxkrnl::KeSetEvent((&raw mut (*extension).work).cast(), 1, false);
@@ -591,7 +524,7 @@ extern "C" fn worker(device: *mut DeviceObject) -> u32 {
     // SAFETY: the device outlives its worker; `delete_device` waits for the
     // worker before it releases the device.
     unsafe {
-        let extension = (*device).extension;
+        let extension = (*device).device_extension.cast::<Extension>();
         loop {
             let waited = xboxkrnl::KeWaitForSingleObject(
                 (&raw mut (*extension).work).cast(),
@@ -605,7 +538,9 @@ extern "C" fn worker(device: *mut DeviceObject) -> u32 {
             };
             (*extension).irp = None;
             let irp = irp.as_ptr();
-            let status = if (*(*irp).location).major_function > MAJOR_WRITE {
+            let status = if (*(*irp).current_stack_location).major_function
+                > IrpMajorFunction::Write.raw()
+            {
                 xboxkrnl::NtFlushBuffersFile(
                     Handle::from_raw((*extension).file),
                     &raw mut (*irp).io_status,
@@ -616,8 +551,8 @@ extern "C" fn worker(device: *mut DeviceObject) -> u32 {
             };
             (*irp).io_status.status = NtStatus(status);
             xboxkrnl::KfRaiseIrql(Irql::DISPATCH);
-            xboxkrnl::IoCompleteRequest(irp as usize as u32, u32::from(succeeded(status)));
-            xboxkrnl::IoStartNextPacket(device as usize as u32);
+            xboxkrnl::IoCompleteRequest(irp, u32::from(succeeded(status)));
+            xboxkrnl::IoStartNextPacket(device);
             xboxkrnl::KfLowerIrql(Irql::PASSIVE);
         }
     }
@@ -632,8 +567,8 @@ unsafe fn transfer(extension: *mut Extension, irp: *mut Irp) -> u32 {
     // SAFETY: guaranteed by the caller; the transfer address was checked or
     // asserted when the request was queued.
     unsafe {
-        let location = (*irp).location;
-        let parameters = (*location).parameters;
+        let location = (*irp).current_stack_location;
+        let parameters = (*location).parameters.words;
         let length = parameters[LENGTH];
         // Stock forms the byte offset in 32 bits.
         let offset = u64::from(parameters[SECTOR] << SECTOR_SHIFT);
@@ -641,7 +576,7 @@ unsafe fn transfer(extension: *mut Extension, irp: *mut Irp) -> u32 {
         let (file, event) = ((*extension).file, (*extension).io_event);
         let mut io_status = IoStatusBlock::default();
         let io_status = &raw mut io_status;
-        let read = (*location).major_function == MAJOR_READ;
+        let read = (*location).major_function == IrpMajorFunction::Read.raw();
         let started = if read {
             xboxkrnl::NtReadFile(
                 Handle::from_raw(file),
@@ -665,7 +600,7 @@ unsafe fn transfer(extension: *mut Extension, irp: *mut Irp) -> u32 {
                 &offset,
             )
         };
-        let mut status = if started == STATUS_PENDING {
+        let mut status = if started == NtStatus::PENDING {
             if !succeeded(
                 xboxkrnl::NtWaitForSingleObjectEx(
                     Handle::from_raw(event),
@@ -684,7 +619,7 @@ unsafe fn transfer(extension: *mut Extension, irp: *mut Irp) -> u32 {
         let information = (&raw const (*io_status).information).read_volatile();
         (*irp).io_status.information = information;
         if read {
-            if NtStatus(status) == STATUS_END_OF_FILE {
+            if NtStatus(status) == KernelError::EndOfFile.status() {
                 core::ptr::write_bytes(buffer as usize as *mut u8, 0, length as usize);
                 (*irp).io_status.information = length;
                 status = NtStatus::SUCCESS.0;
@@ -699,7 +634,7 @@ unsafe fn transfer(extension: *mut Extension, irp: *mut Irp) -> u32 {
         } else if succeeded(status) {
             (*extension).writes = (*extension).writes.wrapping_add(1);
             if information < length {
-                status = STATUS_END_OF_FILE.0;
+                status = KernelError::EndOfFile.status().0;
             }
         }
         status
@@ -710,13 +645,13 @@ unsafe fn transfer(extension: *mut Extension, irp: *mut Irp) -> u32 {
 ///
 /// # Safety
 /// `irp` must be a request this driver owns.
-unsafe fn complete(irp: *mut Irp, status: NtStatus) -> u32 {
+unsafe fn complete(irp: *mut Irp, status: NtStatus) -> NtStatus {
     // SAFETY: guaranteed by the caller.
     unsafe {
         (*irp).io_status.status = status;
-        xboxkrnl::IoCompleteRequest(irp as usize as u32, 0);
+        xboxkrnl::IoCompleteRequest(irp, 0);
     }
-    status.0
+    status
 }
 
 /// Start I/O (stock 0x91f54658): hand the request to the worker.
@@ -724,7 +659,7 @@ extern "C" fn start_io(device: *mut DeviceObject, irp: *mut Irp) -> u32 {
     // SAFETY: the kernel passes a device of this driver; the worker has
     // taken the previous request before the next packet starts.
     unsafe {
-        let extension = (*device).extension;
+        let extension = (*device).device_extension.cast::<Extension>();
         if (*extension).irp.is_some() {
             assertion_trap();
         }
@@ -735,95 +670,100 @@ extern "C" fn start_io(device: *mut DeviceObject, irp: *mut Irp) -> u32 {
 
 /// Read and write dispatch (stock 0x91f54310): checks the request, converts
 /// it to sectors, and queues it.
-extern "C" fn read_write(device: *mut DeviceObject, irp: *mut Irp) -> u32 {
+extern "C" fn read_write(device: *mut DeviceObject, irp: *mut Irp) -> NtStatus {
     // SAFETY: the kernel passes a device of this driver and a request with
     // its current stack location.
     unsafe {
-        let extension = (*device).extension;
-        let location = (*irp).location;
-        let parameters = (*location).parameters;
-        let length = parameters[LENGTH];
-        let offset = (u64::from(parameters[OFFSET]) << 32) | u64::from(parameters[OFFSET + 1]);
+        let extension = (*device).device_extension.cast::<Extension>();
+        let location = (*irp).current_stack_location;
+        let parameters = (*location).parameters.read_write;
+        let length = parameters.length;
+        let offset = parameters.byte_offset();
         let end = u64::from(length).wrapping_add(offset) as i64;
         let limit = (*extension).length as i64;
-        let address_given = (*location).flags & LOCATION_BUFFER_ADDRESS != 0;
+        let user_buffer = (*irp).user_buffer.addr() as u32;
+        let address_given = (*location).flags.contains(IoStackFlags::BUFFER_ADDRESS);
         if address_given {
-            if parameters[BUFFER] & SECTOR_MASK != 0 {
+            if parameters.buffer & SECTOR_MASK != 0 {
                 assertion_trap();
             }
             if length & SECTOR_MASK != 0 {
                 assertion_trap();
             }
-            if parameters[OFFSET + 1] & SECTOR_MASK != 0 {
+            if offset as u32 & SECTOR_MASK != 0 {
                 assertion_trap();
             }
             if end > limit {
                 assertion_trap();
             }
-        } else if (*irp).user_buffer & WORD_ALIGNMENT != 0
-            || parameters[BUFFER] & WORD_ALIGNMENT != 0
+        } else if user_buffer & WORD_ALIGNMENT != 0
+            || parameters.buffer & WORD_ALIGNMENT != 0
             || length & SECTOR_MASK != 0
-            || parameters[OFFSET + 1] & SECTOR_MASK != 0
+            || offset as u32 & SECTOR_MASK != 0
             || end > limit
         {
-            return complete(irp, STATUS_INVALID_PARAMETER);
+            return complete(irp, KernelError::InvalidParameter.status());
         }
         if length == 0 {
             (*irp).io_status.information = 0;
             return complete(irp, NtStatus::SUCCESS);
         }
-        (*location).parameters[SECTOR] =
-            ((*extension).start.wrapping_add(offset) as i64 >> SECTOR_SHIFT) as u32;
+        let words = &mut (*location).parameters.words;
+        words[SECTOR] = ((*extension).start.wrapping_add(offset) as i64 >> SECTOR_SHIFT) as u32;
         if address_given {
-            (*location).parameters[BUFFER_OFFSET] = 0;
+            words[BUFFER_OFFSET] = 0;
         } else {
-            (*location).parameters[BUFFER_OFFSET] = parameters[BUFFER];
-            (*location).parameters[BUFFER] = (*irp).user_buffer;
+            words[BUFFER_OFFSET] = parameters.buffer;
+            words[BUFFER] = user_buffer;
         }
         (*irp).io_status.information = length;
-        (*location).control |= CONTROL_PENDING_RETURNED;
+        (*location).control |= IoStackControl::PENDING_RETURNED;
     }
     // SAFETY: the kernel passed `device` and `irp` to this dispatch routine.
-    unsafe { xboxkrnl::IoStartPacket(device as usize as u32, irp as usize as u32, null()) };
-    STATUS_PENDING.0
+    unsafe { xboxkrnl::IoStartPacket(device, irp, null()) };
+    NtStatus::PENDING
 }
 
 /// Flush dispatch (stock 0x91f54470): queued for the worker.
-extern "C" fn flush(device: *mut DeviceObject, irp: *mut Irp) -> u32 {
+extern "C" fn flush(device: *mut DeviceObject, irp: *mut Irp) -> NtStatus {
     // SAFETY: the kernel passes a request with its current stack location.
-    unsafe { (*(*irp).location).control |= CONTROL_PENDING_RETURNED };
+    unsafe { (*(*irp).current_stack_location).control |= IoStackControl::PENDING_RETURNED };
     // SAFETY: the kernel passed `device` and `irp` to this dispatch routine.
-    unsafe { xboxkrnl::IoStartPacket(device as usize as u32, irp as usize as u32, null()) };
-    STATUS_PENDING.0
+    unsafe { xboxkrnl::IoStartPacket(device, irp, null()) };
+    NtStatus::PENDING
 }
 
 /// Device control dispatch (stock 0x91f544f0, geometry in 0x91f544a8).
-extern "C" fn device_control(device: *mut DeviceObject, irp: *mut Irp) -> u32 {
+extern "C" fn device_control(device: *mut DeviceObject, irp: *mut Irp) -> NtStatus {
     // SAFETY: the kernel passes a device of this driver and a request whose
     // user buffer holds the stated output length.
     unsafe {
-        let extension = (*device).extension;
-        let location = (*irp).location;
-        let output_length = (*location).parameters[LENGTH];
-        let output = (*irp).user_buffer as usize;
-        let status = match (*location).parameters[CONTROL_CODE] {
-            CONTROL_GET_GEOMETRY if output_length < 8 => STATUS_BUFFER_TOO_SMALL,
-            CONTROL_GET_GEOMETRY => {
-                let output = output as *mut u32;
+        let extension = (*device).device_extension.cast::<Extension>();
+        let parameters = (*(*irp).current_stack_location).parameters.device_control;
+        let output_length = parameters.output_length;
+        let output = (*irp).user_buffer;
+        let status = match parameters.control_code {
+            IoControlCode::DISK_GET_DRIVE_GEOMETRY if output_length < 8 => {
+                KernelError::BufferTooSmall.status()
+            }
+            IoControlCode::DISK_GET_DRIVE_GEOMETRY => {
+                let output = output.cast::<u32>();
                 output.add(1).write_unaligned(SECTOR_SIZE);
                 output.write_unaligned(((*extension).length as i64 >> SECTOR_SHIFT) as u32);
                 (*irp).io_status.information = 8;
                 NtStatus::SUCCESS
             }
-            CONTROL_GET_PARTITION if output_length < 0x10 => STATUS_BUFFER_TOO_SMALL,
-            CONTROL_GET_PARTITION => {
-                let output = output as *mut u64;
+            IoControlCode::DISK_GET_PARTITION_INFO if output_length < 0x10 => {
+                KernelError::BufferTooSmall.status()
+            }
+            IoControlCode::DISK_GET_PARTITION_INFO => {
+                let output = output.cast::<u64>();
                 output.write_unaligned((*extension).start);
                 output.add(1).write_unaligned((*extension).length);
                 (*irp).io_status.information = 0x10;
                 NtStatus::SUCCESS
             }
-            _ => STATUS_INVALID_DEVICE_REQUEST,
+            _ => KernelError::InvalidDeviceRequest.status(),
         };
         complete(irp, status)
     }

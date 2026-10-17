@@ -100,6 +100,15 @@ fn physical_size(kind: u32) -> u32 {
     0x2c0 + kind * 4
 }
 
+/// The physical memory region of pool type `kind`.
+fn region(kind: u32) -> xboxkrnl::MemoryRegion {
+    if kind == 1 {
+        xboxkrnl::MemoryRegion::Title
+    } else {
+        xboxkrnl::MemoryRegion::System
+    }
+}
+
 /// Allocate `size` zeroed bytes against the system budget, else the title
 /// budget (stock 0x91f5c418).
 pub(super) fn allocate(s: S, size: u32) -> u32 {
@@ -170,7 +179,7 @@ pub(super) fn free(s: S) {
             flush(start, start.wrapping_add(s.word(physical_size(kind))));
             // SAFETY: the physical block of this kind that `try_allocate`
             // allocated; its slot is cleared below.
-            unsafe { xboxkrnl::MmFreePhysicalMemory(kind, address) };
+            unsafe { xboxkrnl::MmFreePhysicalMemory(region(kind), address) };
             s.set_word(physical_block(kind), 0);
             s.set_word(physical_size(kind), 0);
         }
@@ -314,7 +323,7 @@ fn try_allocate(s: S) -> bool {
             // SAFETY: no pointer arguments.
             let address = unsafe {
                 xboxkrnl::MmAllocatePhysicalMemoryEx(
-                    kind,
+                    region(kind),
                     bytes,
                     PageProtection::READWRITE
                         | PageProtection::WRITECOMBINE

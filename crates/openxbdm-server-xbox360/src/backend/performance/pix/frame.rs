@@ -15,7 +15,9 @@ use openxbdm_server::commands::performance::CounterSample;
 use openxbdm_server::commands::performance::counters::CounterQuery;
 use openxbdm_server::commands::performance::counters::Evaluation;
 use xbox360::time::Timebase;
-use xbox360_sys::processor;
+use xbox360_sys::processor::HARDWARE_THREAD_COUNT;
+use xbox360_sys::processor::HardwareThread;
+use xbox360_sys::processor::Kpcr;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::DebugMonitorService;
 use xbox360_sys::xboxkrnl::ProcessType;
@@ -175,7 +177,6 @@ const XBDM_WORDS: usize = 0x21;
 /// `Cntn` and `Cnt2` records of the processor statistics.
 const CNTN_TAG: u32 = 0x436e_746e;
 const CNT2_TAG: u32 = 0x436e_7432;
-const PROCESSORS: u32 = 6;
 
 /// History of the time counters (stock 0x91fa2898 last percentages,
 /// 0x91fa28e0 previous rates, 0x91fa2970 previous values); written only by
@@ -282,18 +283,16 @@ pub(super) fn sample_counters() {
 
 /// Sums of the per-processor statistics as `Cntn` and `Cnt2` records.
 fn write_processor_statistics(time: u64) {
-    let mut processor =
-        processor::pcr() - (u32::from(super::read_u8(processor::pcr() + 0x10c)) << 12);
     let mut cycles = 0u64;
     let mut waits = 0u64;
     let mut title = 0u32;
     let mut system = 0u32;
-    for _ in 0..PROCESSORS {
-        // SAFETY: processor control regions are 4 KiB apart and mapped.
-        cycles = cycles.wrapping_add(unsafe {
-            core::ptr::read_volatile((processor + 0x2c8) as usize as *const u64)
-        });
-        let statistics = super::read_u32(processor + 0x2d0);
+    for number in (0..HARDWARE_THREAD_COUNT as u8).filter_map(HardwareThread::new) {
+        // SAFETY: the console kernel maps the control regions of all
+        // hardware threads 4 KiB apart, ordered by number.
+        let pcr = unsafe { Kpcr::of_processor(number) };
+        cycles = cycles.wrapping_add(pcr.cycles());
+        let statistics = pcr.wait_statistics.load(Ordering::Relaxed);
         if statistics != 0 && super::read_u32(statistics + 4) & 1 != 0 {
             // SAFETY: the statistics block of the processor.
             waits = waits.wrapping_add(unsafe {
@@ -306,7 +305,6 @@ fn write_processor_statistics(time: u64) {
                 super::read_u32(statistics + 0x24).wrapping_add(super::read_u32(statistics + 0x1c)),
             );
         }
-        processor += 0x1000;
     }
     let (time_high, time_low) = ((time >> 32) as u32, time as u32);
     super::write_tagged_words(
@@ -351,8 +349,9 @@ const LEGACY_MEMORY_RECORD: u32 = 0x20;
 fn write_memory_statistics(record: &mut [u32; XBDM_WORDS]) {
     let mut statistics = [0u32; DEBUG_STATISTICS_LENGTH as usize / 4];
     statistics[0] = MEMORY_STATISTICS_LENGTH;
-    // SAFETY: the buffer is 0x90 bytes and its length word says 0x68.
-    if (unsafe { xboxkrnl::MmQueryStatistics(statistics.as_mut_ptr()) }.0 as i32) >= 0 {
+    // SAFETY: the buffer is 0x90 bytes, at least the `MmStatistics` size,
+    // and its length word says 0x68.
+    if unsafe { xboxkrnl::MmQueryStatistics(statistics.as_mut_ptr().cast()) }.is_success() {
         for (index, &field) in MEMORY_FIELDS.iter().enumerate() {
             let value = statistics[usize::from(field)];
             record[FIRST_MEMORY_WORD + index] = value;
@@ -443,7 +442,10 @@ fn sample_pmc() {
     if pmc::acquire(pmc::Owner::PIX)
         && pmc::install_on_all_processors(pmc::Owner::PIX, PMC_SETUPS[next as usize])
         && pmc::clear(pmc::Owner::PIX)
-        && pmc::set_trigger_processor(pmc::Owner::PIX, u32::from(pmc::current_processor()) >> 1)
+        && pmc::set_trigger_processor(
+            pmc::Owner::PIX,
+            u32::from(Kpcr::current().processor_number().get()) >> 1,
+        )
         && pmc::start(pmc::Owner::PIX)
     {
         PMC_ACTIVE.store(true, Ordering::Release);

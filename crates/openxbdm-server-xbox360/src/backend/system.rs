@@ -42,11 +42,13 @@ use xbox360_sys::xam::XamNotifyCreateListenerInternal;
 use xbox360_sys::xam::XnCaller;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::BugCheckCode;
 use xbox360_sys::xboxkrnl::CreateOptions;
 use xbox360_sys::xboxkrnl::FileAttributes;
 use xbox360_sys::xboxkrnl::FileInformationClass;
 use xbox360_sys::xboxkrnl::FirmwareRequest;
 use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::HardwareBootFlags;
 use xbox360_sys::xboxkrnl::IoStatusBlock;
 use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
 use xbox360_sys::xboxkrnl::ObjectAttributes;
@@ -75,10 +77,8 @@ const WRITE_BUFFER_SIZE: usize = 0x4000;
 /// Write buffer of a settings copy to a caller's file.
 const COPY_BUFFER_SIZE: usize = 0x1000;
 const POOL_TAG: PoolTag = PoolTag::new(*b"mdbX");
-/// Hardware boot flag: the console booted from disc.
-const BOOT_FROM_DISC: u16 = 0x400;
 /// Bug check code stock raises when a settings write fails.
-const BUG_CHECK_SETTINGS_WRITE: u32 = 0x2c;
+const BUG_CHECK_SETTINGS_WRITE: BugCheckCode = BugCheckCode(0x2c);
 /// Size of the network open information stock queries for the size of the
 /// settings file; the low dword of the end of file is at +0x2c.
 const NETWORK_OPEN_INFORMATION_SIZE: usize = 0x38;
@@ -337,7 +337,9 @@ impl commands::system::Backend for Console {
     }
 
     fn booted_from_disc(&mut self) -> bool {
-        kernel::hardware_boot_flags() & BOOT_FROM_DISC != 0
+        kernel::hardware_info()
+            .boot_flags
+            .contains(HardwareBootFlags::FROM_DISC)
     }
 
     fn title_process_caller(&mut self) -> bool {

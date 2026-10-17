@@ -10,7 +10,7 @@ use core::cell::UnsafeCell;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::XbdmHresult;
 use xbox360::time::Timebase;
-use xbox360_sys::processor::pcr;
+use xbox360_sys::processor::Kpcr;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::Irql;
 use xbox360_sys::xboxkrnl::KeAcquireSpinLockAtRaisedIrql;
@@ -699,7 +699,7 @@ pub(super) fn stop() {
 /// (stock 0x91f63b40). Skipped when another processor holds the ring.
 extern "C" fn context_switch(_old: u32, _frame: u32, _new: u32) {
     let time = Timebase::now().ticks();
-    let processor = super::read_u8(pcr() + 0x10c);
+    let processor = Kpcr::current().processor_number().get();
     let record = [
         0x0600_0062,
         CONTEXT_SWITCH_TAG,
@@ -818,7 +818,7 @@ extern "C" fn consumer_write(tag: u32, data: u32, length: u32, extra: u32) {
 /// whose first dword carries the dword count in bits 24 to 30. The ring
 /// stays locked by the writing processor until the packet is complete.
 pub(crate) fn service_write_dword(word: u32) -> u32 {
-    let processor = pcr();
+    let processor = core::ptr::from_ref(Kpcr::current()).addr() as u32;
     // SAFETY: the owner field is only written by the processor that holds
     // the lock; another processor reading a stale value only takes the
     // lock.

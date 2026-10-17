@@ -9,13 +9,16 @@
 //! A record is `{time << 7 | kind, dwords << 24 | id, data}`; `kind` 1 is
 //! a data record, 0x19 a formatted event, 0x1d a named begin, 0 an end.
 
+use core::sync::atomic::Ordering;
+
+use xbox360::thread::current_object;
+use xbox360_sys::processor::Kpcr;
+use xbox360_sys::processor::PixBuffer;
 use xbox360_sys::xboxkrnl::_vsnprintf;
 
 use super::super::backend::EVENT_NAME_BYTES;
 use super::S;
 use super::buffers;
-use super::engine::PCR_CURSOR;
-use super::engine::PCR_LIMIT;
 use super::rd;
 use super::wr;
 
@@ -37,16 +40,17 @@ fn request_space(request: &[u32; 5]) -> bool {
 }
 
 /// With interrupts off, wait for `dwords` of buffer space, asking code
-/// 0x50 for more; the processor control region and the cursor, or `None`
-/// when no buffer is installed or the request fails (interrupts on again).
-fn reserve(dwords: u32, request: &[u32; 5]) -> Option<(u32, u32)> {
+/// 0x50 for more; the first capture buffer of the processor and the
+/// cursor, or `None` when no buffer is installed or the request fails
+/// (interrupts on again).
+fn reserve(dwords: u32, request: &[u32; 5]) -> Option<(&'static PixBuffer, u32)> {
     super::interrupts_off();
     loop {
-        let pcr = super::pcr();
-        let cursor = rd(pcr + PCR_CURSOR);
-        let limit = rd(pcr + PCR_LIMIT);
+        let buffer = &Kpcr::current().pix_buffers[0];
+        let cursor = buffer.cursor.load(Ordering::Relaxed);
+        let limit = buffer.limit.load(Ordering::Relaxed);
         if cursor.wrapping_add(dwords.wrapping_mul(4)) < limit {
-            return Some((pcr, cursor));
+            return Some((buffer, cursor));
         }
         super::interrupts_on();
         if limit == 0 || !request_space(request) {
@@ -74,7 +78,7 @@ pub(super) fn write_typed_record(id: u32, data: &[u32]) {
 }
 
 fn write(kind: u32, id: u32, data: &[u32], extra: u32, request: [u32; 5]) {
-    let Some((pcr, cursor)) = reserve(extra, &request) else {
+    let Some((buffer, cursor)) = reserve(extra, &request) else {
         return;
     };
     let dwords = data.len() as u32 + 2;
@@ -83,7 +87,8 @@ fn write(kind: u32, id: u32, data: &[u32], extra: u32, request: [u32; 5]) {
     for (index, &word) in data.iter().enumerate() {
         wr(cursor + 8 + index as u32 * 4, word);
     }
-    wr(pcr + PCR_CURSOR, cursor + dwords * 4);
+    // SAFETY: the new cursor ends the record written inside the buffer.
+    unsafe { buffer.cursor.store(cursor + dwords * 4, Ordering::Relaxed) };
     super::interrupts_on();
 }
 
@@ -99,17 +104,18 @@ pub(crate) fn service_nuicam_begin(name: u32) -> u32 {
 /// packed after the color; a full buffer falls back to the formatted
 /// writer.
 fn begin_named(color: u32, name: u32) {
-    if rd(super::pcr() + PCR_LIMIT) == 0 {
+    if Kpcr::current().pix_buffers[0].limit.load(Ordering::Relaxed) == 0 {
         return;
     }
     super::interrupts_off();
-    let pcr = super::pcr();
-    let cursor = rd(pcr + PCR_CURSOR);
-    if cursor < rd(pcr + PCR_LIMIT) {
+    let buffer = &Kpcr::current().pix_buffers[0];
+    let cursor = buffer.cursor.load(Ordering::Relaxed);
+    if cursor < buffer.limit.load(Ordering::Relaxed) {
         wr(cursor, super::timebase_low() << 7 | 0x1d);
         wr(cursor + 4, color);
         let end = pack(cursor + 8, name, cursor + 8 + 0x24, false);
-        wr(pcr + PCR_CURSOR, end);
+        // SAFETY: the new cursor ends the record written inside the buffer.
+        unsafe { buffer.cursor.store(end, Ordering::Relaxed) };
         super::interrupts_on();
         return;
     }
@@ -121,9 +127,10 @@ fn begin_named(color: u32, name: u32) {
 /// Code 0x8e (stock 0x91f56668 to 0x91f78760): end the current timing
 /// event.
 pub(crate) fn service_end(_argument: u32) -> u32 {
-    if let Some((pcr, cursor)) = reserve(0, &[1, 0, 0, 0, 0]) {
+    if let Some((buffer, cursor)) = reserve(0, &[1, 0, 0, 0, 0]) {
         wr(cursor, super::timebase_low() << 7);
-        wr(pcr + PCR_CURSOR, cursor + 4);
+        // SAFETY: the new cursor ends the record written inside the buffer.
+        unsafe { buffer.cursor.store(cursor + 4, Ordering::Relaxed) };
         super::interrupts_on();
     }
     0
@@ -172,7 +179,7 @@ fn pack(output: u32, source: u32, limit: u32, wide: bool) -> u32 {
 /// consumes (at most eight, 8-byte slots), the format text, and the
 /// strings `%s`/`%S` arguments name, within 0x24 bytes.
 fn formatted(kind: u32, extra: u32, color: u32, format: u32, arguments: &[u64; 8]) {
-    if rd(super::pcr() + PCR_LIMIT) == 0 {
+    if Kpcr::current().pix_buffers[0].limit.load(Ordering::Relaxed) == 0 {
         return;
     }
     let mut cursor = format;
@@ -227,7 +234,7 @@ fn formatted(kind: u32, extra: u32, color: u32, format: u32, arguments: &[u64; 8
         }
     }
     let request = [extra, color, format, arguments.as_ptr() as usize as u32, 0];
-    let Some((pcr, output)) = reserve(0, &request) else {
+    let Some((buffer, output)) = reserve(0, &request) else {
         return;
     };
     let misalignment = format & 3;
@@ -250,7 +257,8 @@ fn formatted(kind: u32, extra: u32, color: u32, format: u32, arguments: &[u64; 8
     for (index, &string) in strings[..string_count as usize].iter().enumerate() {
         position = pack(position, string, limit, wide & 1 << index != 0);
     }
-    wr(pcr + PCR_CURSOR, position);
+    // SAFETY: the new cursor ends the record written inside the buffer.
+    unsafe { buffer.cursor.store(position, Ordering::Relaxed) };
     super::interrupts_on();
 }
 
@@ -261,8 +269,8 @@ pub(super) fn request_at_raised_level(s: S) -> bool {
     let mut granted = true;
     let mut switched = false;
     super::interrupts_off();
-    let pcr = super::pcr();
-    if rd(pcr + PCR_LIMIT) == 0 {
+    let buffer = &Kpcr::current().pix_buffers[0];
+    if buffer.limit.load(Ordering::Relaxed) == 0 {
         super::interrupts_on();
         return false;
     }
@@ -270,18 +278,25 @@ pub(super) fn request_at_raised_level(s: S) -> bool {
     let base = s.word(TEMPORARY + processor * 4);
     match s.word(STATE + processor * 4) {
         0 => {
-            s.set_word(SAVED_CURSOR + processor * 4, rd(pcr + PCR_CURSOR));
-            wr(pcr + PCR_CURSOR, base);
-            wr(pcr + PCR_LIMIT, base + 4);
+            s.set_word(
+                SAVED_CURSOR + processor * 4,
+                buffer.cursor.load(Ordering::Relaxed),
+            );
+            // SAFETY: the processor's temporary block in the session.
+            unsafe {
+                buffer.cursor.store(base, Ordering::Relaxed);
+                buffer.limit.store(base + 4, Ordering::Relaxed);
+            }
             super::fence();
             s.set_word(STATE + processor * 4, 1);
             super::fence();
             switched = true;
         }
         1 => {
-            let cursor = rd(pcr + PCR_CURSOR);
+            let cursor = buffer.cursor.load(Ordering::Relaxed);
             if cursor + TEMPORARY_RESERVE <= base + TEMPORARY_BYTES {
-                wr(pcr + PCR_LIMIT, cursor + 4);
+                // SAFETY: room for one more record remains in the block.
+                unsafe { buffer.limit.store(cursor + 4, Ordering::Relaxed) };
             } else {
                 granted = false;
             }
@@ -307,10 +322,10 @@ pub(super) fn take_pending_service(s: S) -> bool {
 /// Copy the temporary block's records into the processor's new buffer and
 /// continue there (stock 0x91f5ed80), with interrupts off.
 pub(super) fn merge(s: S) {
-    let pcr = super::pcr();
+    let buffer = &Kpcr::current().pix_buffers[0];
     let processor = super::processor();
     let base = s.word(TEMPORARY + processor * 4);
-    let dwords = rd(pcr + PCR_CURSOR).wrapping_sub(base) >> 2;
+    let dwords = buffer.cursor.load(Ordering::Relaxed).wrapping_sub(base) >> 2;
     let data = buffers::data(s.word(0xc8 + processor * 4));
     // SAFETY: the temporary block holds `dwords` dwords and the buffer has
     // room for them after its header.
@@ -321,8 +336,13 @@ pub(super) fn merge(s: S) {
             (dwords * 4) as usize,
         )
     };
-    wr(pcr + PCR_CURSOR, data + 4 + dwords * 4);
-    wr(pcr + PCR_LIMIT, data + 0x3f2c);
+    // SAFETY: the processor's buffer, past the records copied into it.
+    unsafe {
+        buffer
+            .cursor
+            .store(data + 4 + dwords * 4, Ordering::Relaxed);
+        buffer.limit.store(data + 0x3f2c, Ordering::Relaxed);
+    }
     if s.word(LOST + processor * 4) != 0 {
         s.set_word(LOST + processor * 4, 0);
         lost_records_marker();
@@ -334,16 +354,18 @@ pub(super) fn merge(s: S) {
 
 /// Record noting that context swap records were lost (stock 0x91f5ed20).
 fn lost_records_marker() {
-    let pcr = super::pcr();
-    let mut thread_id = rd(rd(pcr + 0x100) + super::THREAD_ID);
-    if super::rd8(pcr + 0x19) != 0 && thread_id == 0 {
+    let pcr = Kpcr::current();
+    let mut thread_id = rd(pcr.prcb.current_thread.load(Ordering::Relaxed) + super::THREAD_ID);
+    if pcr.unknown_019.load(Ordering::Relaxed) != 0 && thread_id == 0 {
         thread_id = (-2i32) as u32;
     }
-    let cursor = rd(pcr + PCR_CURSOR);
+    let buffer = &pcr.pix_buffers[0];
+    let cursor = buffer.cursor.load(Ordering::Relaxed);
     wr(cursor, super::timebase_low() << 7 | 1);
     wr(cursor + 4, 0x0300_0045);
     wr(cursor + 8, thread_id);
-    wr(pcr + PCR_CURSOR, cursor + 0xc);
+    // SAFETY: the new cursor ends the record written inside the buffer.
+    unsafe { buffer.cursor.store(cursor + 0xc, Ordering::Relaxed) };
 }
 
 /// Replace the calling processor's full buffer at passive level (stock
@@ -351,14 +373,14 @@ fn lost_records_marker() {
 fn replace_buffer(s: S, dwords: u32) {
     let kind = s.word(0);
     super::interrupts_off();
-    let pcr = super::pcr();
+    let buffer = &Kpcr::current().pix_buffers[0];
     let processor = super::processor();
     let slot = 0xc8 + processor * 4;
     let mut full = 0;
     match s.word(STATE + processor * 4) {
         0 => {
-            let cursor = rd(pcr + PCR_CURSOR);
-            if cursor + dwords * 4 >= rd(pcr + PCR_LIMIT) {
+            let cursor = buffer.cursor.load(Ordering::Relaxed);
+            if cursor + dwords * 4 >= buffer.limit.load(Ordering::Relaxed) {
                 buffers::close(s.word(slot), processor, cursor);
                 full = s.word(slot);
             }
@@ -383,9 +405,16 @@ fn replace_buffer(s: S, dwords: u32) {
             if s.word(STATE + processor * 4) == 1 {
                 merge(s);
             } else {
-                let pcr = super::pcr();
-                wr(pcr + PCR_CURSOR, buffers::data(entry) + 4);
-                wr(pcr + PCR_LIMIT, buffers::data(entry) + 0x3f2c);
+                let buffer = &Kpcr::current().pix_buffers[0];
+                // SAFETY: the new buffer of this processor, taken above.
+                unsafe {
+                    buffer
+                        .cursor
+                        .store(buffers::data(entry) + 4, Ordering::Relaxed);
+                    buffer
+                        .limit
+                        .store(buffers::data(entry) + 0x3f2c, Ordering::Relaxed);
+                }
                 super::fence();
                 s.set_word(STATE + processor * 4, 0);
                 super::fence();
@@ -433,8 +462,9 @@ pub(super) fn timing_request(argument: u32) -> u32 {
     let text = rd(argument + 8);
     let arguments = rd(argument + 0xc);
     let dwords = if kind == 5 { rd(argument + 0x10) } else { 0 };
-    let pcr = super::pcr();
-    if super::rd8(pcr + 0x18) >= 2 || super::rd8(rd(pcr + 0x100) + 0x70) >= 0x12 {
+    if Kpcr::current().irql.load(Ordering::Relaxed) >= 2
+        || current_object().kthread().priority.load(Ordering::Relaxed) >= 0x12
+    {
         // Stock dereferences the missing session.
         let Some(s) = super::super::session::session() else {
             return 0;
@@ -449,7 +479,7 @@ pub(super) fn timing_request(argument: u32) -> u32 {
     };
     let s = locked.0;
     super::gpu::poll(s, false);
-    if rd(super::pcr() + PCR_LIMIT) == 0 {
+    if Kpcr::current().pix_buffers[0].limit.load(Ordering::Relaxed) == 0 {
         return 0;
     }
     let tracing = s.word(0x18) != 0;
@@ -474,5 +504,5 @@ pub(super) fn timing_request(argument: u32) -> u32 {
         }
     }
     drop(locked);
-    u32::from(!tracing && rd(super::pcr() + PCR_LIMIT) != 0)
+    u32::from(!tracing && Kpcr::current().pix_buffers[0].limit.load(Ordering::Relaxed) != 0)
 }

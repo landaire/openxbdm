@@ -2,6 +2,7 @@
 //! allocation tracking.
 
 use core::fmt::Write as _;
+use core::marker::PhantomData;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
@@ -26,11 +27,20 @@ use openxbdm_server::text::Text;
 use xbox360::module::Ordinal;
 use xbox360::module::SystemModule;
 use xbox360::module::resolve_export;
+use xbox360_sys::image::CodeViewRsds;
+use xbox360_sys::image::DebugType;
+use xbox360_sys::image::ImageCharacteristics;
+use xbox360_sys::image::ImageDebugDirectory;
+use xbox360_sys::image::ImageDirectory;
+use xbox360_sys::image::ImageNtHeaders;
+use xbox360_sys::image::ImageSectionHeader;
+use xbox360_sys::image::XexHeaderKey;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::DebugMonitorService;
 use xbox360_sys::xboxkrnl::ExLoadedImageName;
 use xbox360_sys::xboxkrnl::Irql;
 use xbox360_sys::xboxkrnl::KspinLock;
+use xbox360_sys::xboxkrnl::LdrDataTableEntry;
 use xbox360_sys::xboxkrnl::PoolTag;
 use xbox360_sys::xboxkrnl::RtlAssert;
 use xbox360_sys::xboxkrnl::RtlImageDirectoryEntryToData;
@@ -51,24 +61,6 @@ pub(crate) use exports::next_module;
 
 /// Debugger context the kernel fills for a writable mapping.
 const WRITE_CONTEXT_WORDS: usize = 14;
-
-/// Loader data table entry offsets.
-const ENTRY_BASE: usize = 0x18;
-const ENTRY_SIZE: usize = 0x20;
-const ENTRY_NAME_LENGTH: usize = 0x2c;
-const ENTRY_NAME_BUFFER: usize = 0x30;
-const ENTRY_FLAGS: usize = 0x34;
-const ENTRY_XEX_HEADER: usize = 0x58;
-/// Loader flag of modules `modules` reports.
-const ENTRY_FLAG_REPORTED: u32 = 0x10_0000;
-
-const IMAGE_DIRECTORY_EXCEPTION: u32 = 3;
-const IMAGE_DIRECTORY_DEBUG: u32 = 6;
-const IMAGE_DEBUG_TYPE_CODEVIEW: u32 = 2;
-const IMAGE_FILE_DLL: u16 = 0x2000;
-const DEBUG_DIRECTORY_ENTRY_SIZE: u32 = 0x1c;
-const SECTION_HEADER_SIZE: u32 = 0x28;
-const CODEVIEW_RSDS: u32 = u32::from_be_bytes(*b"RSDS");
 
 /// Words of the service 8 reply, including its size and length header.
 const MEMORY_STATISTICS_REPLY_WORDS: usize = 0x90 / 4;
@@ -158,15 +150,6 @@ fn read_u16(address: u32) -> u16 {
     unsafe { core::ptr::read_volatile(address as usize as *const u16) }
 }
 
-/// A little-endian PE field.
-fn read_le32(address: u32) -> u32 {
-    read_u32(address).swap_bytes()
-}
-
-fn read_le16(address: u32) -> u16 {
-    read_u16(address).swap_bytes()
-}
-
 /// Module init of this domain: the detour trampolines and engine.
 pub(crate) fn initialize() {
     detour::initialize();
@@ -180,7 +163,9 @@ struct LoaderLock {
 
 impl LoaderLock {
     fn acquire() -> Self {
-        let lock = kernel::debug_monitor_data().loader_lock();
+        let lock = kernel::debug_monitor_data()
+            .loaded_module_list_lock
+            .load(Ordering::Relaxed);
         // SAFETY: the debug monitor data holds the address of the kernel
         // loader spin lock.
         let irql = unsafe { xboxkrnl::KfAcquireSpinLock(lock as usize as *mut KspinLock) };
@@ -198,18 +183,20 @@ impl Drop for LoaderLock {
 /// Loader data table entries of each list in `heads`, one list after the
 /// other; a zero head is an empty list. One iterator for both lists keeps
 /// the walks from being instantiated once per list.
-struct LoaderEntries {
+struct LoaderEntries<'a> {
     heads: [u32; 2],
     list: usize,
     entry: u32,
+    _lock: PhantomData<&'a LoaderLock>,
 }
 
-impl LoaderEntries {
+impl LoaderEntries<'_> {
     fn new(heads: [u32; 2]) -> Self {
         Self {
             heads,
             list: 0,
             entry: first_entry(heads[0]),
+            _lock: PhantomData,
         }
     }
 }
@@ -218,15 +205,20 @@ fn first_entry(head: u32) -> u32 {
     if head == 0 { 0 } else { read_u32(head) }
 }
 
-impl Iterator for LoaderEntries {
-    type Item = u32;
+impl<'a> Iterator for LoaderEntries<'a> {
+    type Item = &'a LdrDataTableEntry;
 
-    fn next(&mut self) -> Option<u32> {
+    fn next(&mut self) -> Option<&'a LdrDataTableEntry> {
         loop {
             let head = *self.heads.get(self.list)?;
             if head != 0 && self.entry != head {
-                let current = self.entry;
-                self.entry = read_u32(current);
+                // SAFETY: `self.entry` is linked into a loader module list of
+                // the debug monitor data; callers hold the loader lock, which
+                // keeps the entry linked and mapped.
+                let current = unsafe {
+                    &*core::ptr::with_exposed_provenance::<LdrDataTableEntry>(self.entry as usize)
+                };
+                self.entry = current.in_load_order_links.flink.load(Ordering::Relaxed);
                 return Some(current);
             }
             self.list += 1;
@@ -238,63 +230,75 @@ impl Iterator for LoaderEntries {
     }
 }
 
-/// Entries of both loader lists, in the order the monitor walks them.
-fn all_entries() -> LoaderEntries {
+/// Entries of both loader lists, in the order the monitor walks them,
+/// valid while `_lock` is held.
+fn all_entries(_lock: &LoaderLock) -> LoaderEntries<'_> {
     let data = kernel::debug_monitor_data();
-    LoaderEntries::new([data.module_list(), data.secondary_module_list()])
+    LoaderEntries::new([
+        data.loaded_module_list.load(Ordering::Relaxed),
+        data.loaded_usermode_module_list.load(Ordering::Relaxed),
+    ])
 }
 
-fn entry_name_units(entry: u32) -> impl Iterator<Item = u16> {
-    let length = u32::from(read_u16(entry + ENTRY_NAME_LENGTH as u32) >> 1);
-    let buffer = read_u32(entry + ENTRY_NAME_BUFFER as u32);
+xbox360_sys::flags! {
+    /// Bits of a loader entry's flags word that the monitor reads; their
+    /// kernel meaning is not known.
+    pub struct LoaderEntryFlags(u32) {
+        /// The monitor lists the module.
+        REPORTED = 0x10_0000,
+    }
+}
+
+fn is_reported(entry: &LdrDataTableEntry) -> bool {
+    LoaderEntryFlags::from_bits_retain(entry.flags.load(Ordering::Relaxed))
+        .contains(LoaderEntryFlags::REPORTED)
+}
+
+fn entry_name_units(entry: &LdrDataTableEntry) -> impl Iterator<Item = u16> {
+    let length = u32::from(entry.base_dll_name.length >> 1);
+    let buffer = entry.base_dll_name.buffer;
     (0..length).map(move |index| read_u16(buffer + index * 2))
 }
 
 /// The entry whose base name exactly matches `name`, searching the first
 /// list and then the second. Callers hold the loader lock.
-fn find_entry(name: &[u8]) -> Option<u32> {
-    all_entries().find(|&entry| memory::module_name_matches(entry_name_units(entry), name, true))
+fn find_entry<'a>(lock: &'a LoaderLock, name: &[u8]) -> Option<&'a LdrDataTableEntry> {
+    all_entries(lock).find(|entry| memory::module_name_matches(entry_name_units(entry), name, true))
 }
 
 /// The loader entry of the module whose base name exactly matches `name`
 /// (stock 0x91f33fb0 with exact matching), looked up under the loader lock.
 pub(crate) fn loader_entry(name: &[u8]) -> Option<u32> {
-    let _lock = LoaderLock::acquire();
-    find_entry(name)
+    let lock = LoaderLock::acquire();
+    find_entry(&lock, name).map(|entry| core::ptr::from_ref(entry).expose_provenance() as u32)
 }
 
-fn nt_header(entry: u32) -> Option<u32> {
-    let base = read_u32(entry + ENTRY_BASE as u32);
+fn nt_header(entry: &LdrDataTableEntry) -> Option<&ImageNtHeaders> {
+    let base = entry.dll_base;
     if base == 0 {
         return None;
     }
     // SAFETY: `base` is the image base of a loaded module entry.
-    Some(unsafe { RtlImageNtHeader(base) }).filter(|&header| header != 0)
+    let header = unsafe { RtlImageNtHeader(base) };
+    // SAFETY: a non-null result is the NT headers of the mapped image, which
+    // stays mapped while the caller holds the loader lock.
+    unsafe { header.as_ref() }
 }
 
-/// Address of the section table after the NT header `header`.
-fn section_table(header: u32) -> u32 {
-    header + 0x18 + u32::from(read_le16(header + 0x14))
-}
-
-/// The section header at `section` of the module loaded at `base`
+/// The section header `section` of the module loaded at `base`
 /// (also the export 52 record, 0x91f33b88).
 #[inline(never)]
-fn section_info(section: u32, base: u32) -> SectionInfo {
-    let mut name = [0u8; memory::SECTION_NAME_LENGTH];
-    for (offset, byte) in name.iter_mut().enumerate() {
-        // SAFETY: section headers are part of the mapped image header.
-        *byte = unsafe { core::ptr::read_volatile((section as usize + offset) as *const u8) };
-    }
+fn section_info(section: &ImageSectionHeader, base: u32) -> SectionInfo {
+    let mut name = section.name;
     // Stock copies the name with strncpy: bytes after a NUL are zero.
     if let Some(end) = name.iter().position(|&byte| byte == 0) {
         name[end..].fill(0);
     }
     SectionInfo {
         name,
-        address: read_le32(section + 0xc).wrapping_add(base),
-        size: read_le32(section + 8),
-        characteristics: read_le32(section + 0x24),
+        address: section.virtual_address.get().wrapping_add(base),
+        size: section.virtual_size.get(),
+        characteristics: section.characteristics.get(),
     }
 }
 
@@ -688,10 +692,14 @@ fn list_has_base(head: u32, base: u32) -> bool {
     }
     let mut entry = read_u32(head);
     while entry != head {
-        if read_u32(entry + ENTRY_BASE as u32) == base {
+        // SAFETY: `entry` is linked into a loader module list of the debug
+        // monitor data; the caller holds the loader lock.
+        let current =
+            unsafe { &*core::ptr::with_exposed_provenance::<LdrDataTableEntry>(entry as usize) };
+        if current.dll_base == base {
             return true;
         }
-        entry = read_u32(entry);
+        entry = current.in_load_order_links.flink.load(Ordering::Relaxed);
     }
     false
 }
@@ -702,53 +710,52 @@ fn code_view_of(base: u32) -> Option<CodeView> {
     let data = kernel::debug_monitor_data();
     let mut directory = 0u32;
     let mut size = 0u32;
-    if list_has_base(data.module_list(), base) {
+    if list_has_base(data.loaded_module_list.load(Ordering::Relaxed), base) {
         // SAFETY: `base` is a module in the loader list, held by the loader lock.
         directory =
-            unsafe { RtlImageDirectoryEntryToData(base, true, IMAGE_DIRECTORY_DEBUG, &mut size) };
+            unsafe { RtlImageDirectoryEntryToData(base, true, ImageDirectory::Debug, &mut size) };
     }
     if directory == 0 || size == 0 {
         directory = 0;
-        if list_has_base(data.secondary_module_list(), base) {
+        if list_has_base(
+            data.loaded_usermode_module_list.load(Ordering::Relaxed),
+            base,
+        ) {
             // SAFETY: `base` is a module in the loader list, held by the loader lock.
             directory = unsafe {
-                RtlImageDirectoryEntryToData(base, true, IMAGE_DIRECTORY_DEBUG, &mut size)
+                RtlImageDirectoryEntryToData(base, true, ImageDirectory::Debug, &mut size)
             };
         }
     }
     if directory == 0 || size == 0 {
         return None;
     }
+    let count = size as usize / core::mem::size_of::<ImageDebugDirectory>();
+    // SAFETY: the debug directory of a mapped image holds `size` bytes and
+    // stays mapped under the loader lock.
+    let entries = unsafe {
+        core::slice::from_raw_parts(
+            core::ptr::with_exposed_provenance::<ImageDebugDirectory>(directory as usize),
+            count,
+        )
+    };
     // Any CodeView entry selects the record named by the first entry.
-    let count = size / DEBUG_DIRECTORY_ENTRY_SIZE;
-    let has_code_view = (0..count).any(|index| {
-        read_le32(directory + index * DEBUG_DIRECTORY_ENTRY_SIZE + 0xc) == IMAGE_DEBUG_TYPE_CODEVIEW
-    });
-    if !has_code_view {
+    if !entries
+        .iter()
+        .any(|entry| entry.debug_type() == DebugType::CODEVIEW)
+    {
         return None;
     }
-    let record = base.wrapping_add(read_le32(directory + 0x14));
-    if read_u32(record) != CODEVIEW_RSDS {
+    let record = base.wrapping_add(entries.first()?.address_of_raw_data.get());
+    // SAFETY: the debug data of a mapped image lies in the image.
+    let record = unsafe { &*core::ptr::with_exposed_provenance::<CodeViewRsds>(record as usize) };
+    if record.signature != CodeViewRsds::SIGNATURE {
         return None;
     }
-    let mut guid = [0u8; 16];
-    let mut age = [0u8; 4];
-    // SAFETY: the CodeView record lies in the mapped image.
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            (record + 4) as usize as *const u8,
-            guid.as_mut_ptr(),
-            guid.len(),
-        );
-        core::ptr::copy_nonoverlapping(
-            (record + 0x14) as usize as *const u8,
-            age.as_mut_ptr(),
-            age.len(),
-        );
-    }
-    Some(CodeView::read(guid, age, |offset| {
-        // SAFETY: as above; the path is NUL-terminated.
-        unsafe { core::ptr::read_volatile((record as usize + 0x18 + offset) as *const u8) }
+    let path = core::ptr::from_ref(&record.path).addr();
+    Some(CodeView::read(record.guid, record.age.bytes(), |offset| {
+        // SAFETY: the path is NUL-terminated in the mapped image.
+        unsafe { core::ptr::read_volatile(core::ptr::with_exposed_provenance::<u8>(path + offset)) }
     }))
 }
 
@@ -789,27 +796,30 @@ impl memory::Backend for Console {
     }
 
     fn module(&mut self, index: ModuleIndex) -> Option<ModuleInfo> {
-        let _lock = LoaderLock::acquire();
-        let (entry, header) = all_entries()
-            .filter(|&entry| read_u32(entry + ENTRY_FLAGS as u32) & ENTRY_FLAG_REPORTED != 0)
+        let lock = LoaderLock::acquire();
+        let (entry, header) = all_entries(&lock)
+            .filter(|entry| is_reported(entry))
             .filter_map(|entry| nt_header(entry).map(|header| (entry, header)))
             .nth(index.0 as usize)?;
-        let base = read_u32(entry + ENTRY_BASE as u32);
+        let base = entry.dll_base;
         let mut pdata_size = 0u32;
         // SAFETY: `base` is a module image with an NT header, held by the loader lock.
         let pdata = unsafe {
-            RtlImageDirectoryEntryToData(base, true, IMAGE_DIRECTORY_EXCEPTION, &mut pdata_size)
+            RtlImageDirectoryEntryToData(base, true, ImageDirectory::Exception, &mut pdata_size)
         };
         Some(ModuleInfo {
             name: ModuleName::from_units(entry_name_units(entry)),
             base,
-            size: read_u32(entry + ENTRY_SIZE as u32),
-            checksum: read_le32(header + 0x58),
-            timestamp: read_le32(header + 8),
+            size: entry.image_size,
+            checksum: header.optional_header.check_sum.get(),
+            timestamp: header.file_header.time_date_stamp.get(),
             pdata,
             pdata_size,
-            dll: read_le16(header + 0x16) & IMAGE_FILE_DLL != 0,
-            image_size: read_le32(header + 0x50),
+            dll: header
+                .file_header
+                .characteristics()
+                .contains(ImageCharacteristics::DLL),
+            image_size: header.optional_header.size_of_image.get(),
         })
     }
 
@@ -818,16 +828,17 @@ impl memory::Backend for Console {
         name: &[u8],
         index: SectionIndex,
     ) -> Result<Option<SectionInfo>, NoSuchModule> {
-        let _lock = LoaderLock::acquire();
-        let entry = find_entry(name).ok_or(NoSuchModule)?;
+        let lock = LoaderLock::acquire();
+        let entry = find_entry(&lock, name).ok_or(NoSuchModule)?;
         let header = nt_header(entry).ok_or(NoSuchModule)?;
-        let base = read_u32(entry + ENTRY_BASE as u32);
-        let count = read_le16(header + 6);
-        if index.0 == 0 || index.0 > count {
+        let Some(slot) = index.0.checked_sub(1) else {
             return Ok(None);
-        }
-        let section = section_table(header) + u32::from(index.0 - 1) * SECTION_HEADER_SIZE;
-        Ok(Some(section_info(section, base)))
+        };
+        // SAFETY: the headers of a loaded image, mapped under the loader lock.
+        let sections = unsafe { header.sections() };
+        Ok(sections
+            .get(usize::from(slot))
+            .map(|section| section_info(section, entry.dll_base)))
     }
 
     fn code_view(&mut self, base: u32) -> Option<CodeView> {
@@ -839,11 +850,10 @@ impl memory::Backend for Console {
         module: &[u8],
         field: XexFieldKey,
     ) -> Result<u32, XexFieldError> {
-        let _lock = LoaderLock::acquire();
-        let entry = find_entry(module).ok_or(XexFieldError::NoSuchModule)?;
+        let lock = LoaderLock::acquire();
+        let entry = find_entry(&lock, module).ok_or(XexFieldError::NoSuchModule)?;
         // SAFETY: the entry's XEX header stays mapped under the loader lock.
-        let value =
-            unsafe { RtlImageXexHeaderField(read_u32(entry + ENTRY_XEX_HEADER as u32), field.0) };
+        let value = unsafe { RtlImageXexHeaderField(entry.xex_header_base, XexHeaderKey(field.0)) };
         match value {
             0 => Err(XexFieldError::FieldAbsent),
             value => Ok(value),
@@ -857,11 +867,10 @@ impl memory::Backend for Console {
         offset: u32,
         output: &mut [u8],
     ) -> Result<(), XexFieldError> {
-        let _lock = LoaderLock::acquire();
-        let entry = find_entry(module).ok_or(XexFieldError::NoSuchModule)?;
+        let lock = LoaderLock::acquire();
+        let entry = find_entry(&lock, module).ok_or(XexFieldError::NoSuchModule)?;
         // SAFETY: the entry's XEX header stays mapped under the loader lock.
-        let data =
-            unsafe { RtlImageXexHeaderField(read_u32(entry + ENTRY_XEX_HEADER as u32), field.0) };
+        let data = unsafe { RtlImageXexHeaderField(entry.xex_header_base, XexHeaderKey(field.0)) };
         let data = match data {
             0 => return Err(XexFieldError::FieldAbsent),
             data => data,
@@ -879,13 +888,16 @@ impl memory::Backend for Console {
     }
 
     fn title_xex_dword(&mut self, field: XexFieldKey) -> Result<Option<u32>, NoSuchModule> {
-        let module = read_u32(XexExecutableModuleHandle.address());
+        let module = kernel::resolved(&XexExecutableModuleHandle).load(Ordering::Relaxed);
         if module == 0 {
             return Err(NoSuchModule);
         }
+        // SAFETY: the executable module handle is the loader entry of the
+        // running executable, which stays loaded while it runs.
+        let entry =
+            unsafe { &*core::ptr::with_exposed_provenance::<LdrDataTableEntry>(module as usize) };
         // SAFETY: the running executable's XEX header stays mapped while it runs.
-        let value =
-            unsafe { RtlImageXexHeaderField(read_u32(module + ENTRY_XEX_HEADER as u32), field.0) };
+        let value = unsafe { RtlImageXexHeaderField(entry.xex_header_base, XexHeaderKey(field.0)) };
         match value {
             0 => Ok(None),
             data => Ok(Some(read_u32(data))),
@@ -893,18 +905,7 @@ impl memory::Backend for Console {
     }
 
     fn running_executable_path(&mut self, output: &mut [u8]) -> usize {
-        let path = ExLoadedImageName.address();
-        let mut length = 0;
-        while length < output.len() {
-            // SAFETY: the export is a NUL-terminated string the kernel owns.
-            let byte = unsafe { core::ptr::read_volatile((path as usize + length) as *const u8) };
-            if byte == 0 {
-                break;
-            }
-            output[length] = byte;
-            length += 1;
-        }
-        length
+        kernel::resolved(&ExLoadedImageName).copy_to(output)
     }
 
     fn read_flash(&mut self, offset: u32, output: &mut [u8]) -> Result<(), KernelError> {

@@ -17,6 +17,7 @@ use xbox360::time::sleep;
 use xbox360_sys::processor;
 use xbox360_sys::processor::current_thread;
 use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::HardwareFlags;
 use xbox360_sys::xboxkrnl::Irql;
 use xbox360_sys::xboxkrnl::ProcessorMode;
 use xbox360_sys::xboxkrnl::WaitReason;
@@ -50,9 +51,6 @@ static DEBUGGER_ATTACHED: AtomicU32 = AtomicU32::new(0);
 static DEBUGGER_ADDRESS: AtomicU32 = AtomicU32::new(0);
 static DEBUGGER_PORT: AtomicU32 = AtomicU32::new(0);
 static THREADS_STOPPED: AtomicBool = AtomicBool::new(false);
-
-/// Hardware flag set by a kernel debugger break-in.
-const HARDWARE_KERNEL_DEBUGGER: u32 = 0x100;
 
 /// Ask the server thread to write the settings file.
 pub(crate) fn request_settings_write() {
@@ -416,7 +414,7 @@ extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: u32) ->
         0x18 => memory::service_get_module_proc_address(argument),
         0x19 => {
             let kd = KERNEL_DEBUGGER.load(Ordering::Relaxed)
-                && hardware_flags().bits() & HARDWARE_KERNEL_DEBUGGER != 0;
+                && hardware_flags().contains(HardwareFlags::KERNEL_DEBUGGER);
             u32::from(passive() || kd)
         }
         0x1c => session::service_register_pix_processor(argument),
@@ -507,7 +505,15 @@ pub(crate) fn drain(server: &mut Server, console: &mut Console, network: &mut Xa
         debugger::refresh_kd_lite(&mut server.state, console);
     }
     if BREAK_IN.swap(false, Ordering::AcqRel) {
-        kernel::set_hardware_flags(hardware_flags().bits() | HARDWARE_KERNEL_DEBUGGER);
+        let flags = &kernel::hardware_info().flags;
+        // SAFETY: the monitor sets the kernel debugger bit on a break-in, as
+        // stock does; the kernel only reads the word.
+        unsafe {
+            flags.store(
+                flags.load(Ordering::Relaxed) | HardwareFlags::KERNEL_DEBUGGER.bits(),
+                Ordering::Relaxed,
+            )
+        };
         debugger::break_in(&mut server.state, console, network);
     }
     // The server's timer pass writes dirty settings.

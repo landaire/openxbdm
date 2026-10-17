@@ -1,5 +1,7 @@
 //! File system, object namespace, and block device services.
 
+use core::sync::atomic::Ordering;
+
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
@@ -28,14 +30,18 @@ use openxbdm_server::commands::filesystem::VolumeSize;
 use xbox360::module::SystemModule;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::AnsiString;
+use xbox360_sys::xboxkrnl::DebugMonitorFlags;
+use xbox360_sys::xboxkrnl::FileDeviceType;
 use xbox360_sys::xboxkrnl::FileInformationClass;
 use xbox360_sys::xboxkrnl::FsInformationClass;
 use xbox360_sys::xboxkrnl::HalOpenCloseODDTray;
 use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::IoControlCode;
 use xbox360_sys::xboxkrnl::IoDeviceObjectType;
 use xbox360_sys::xboxkrnl::IoDismountVolumeByFileHandle;
 use xbox360_sys::xboxkrnl::IoStatusBlock;
 use xbox360_sys::xboxkrnl::IoSynchronousFsdRequest;
+use xbox360_sys::xboxkrnl::IrpMajorFunction;
 use xbox360_sys::xboxkrnl::NtOpenDirectoryObject;
 use xbox360_sys::xboxkrnl::NtQueryDirectoryFile;
 use xbox360_sys::xboxkrnl::NtQueryVolumeInformationFile;
@@ -55,13 +61,6 @@ const STATUS_PENDING: u32 = 0x103;
 const POOL_TAG: PoolTag = PoolTag::new(*b"xdbm");
 /// Pool blocks carry their size in a header of this many bytes.
 const POOL_HEADER: u32 = 8;
-#[cfg(feature = "smb")]
-const IRP_MJ_READ: u32 = 2;
-const IRP_MJ_WRITE: u32 = 3;
-const IOCTL_DISK_GET_DRIVE_GEOMETRY: u32 = 0x7_0000;
-const IOCTL_DISK_GET_PARTITION_INFO: u32 = 0x7_4004;
-/// Device type of the devices that always get a 32-bit FAT.
-const FILE_DEVICE_FORCE_FAT32: u32 = 0x46;
 /// Directory query buffer of the image.
 const DIRECTORY_BUFFER: usize = 0x190;
 const DIRECTORY_NAME_OFFSET: usize = 0x40;
@@ -69,10 +68,6 @@ const DIRECTORY_NAME_OFFSET: usize = 0x40;
 const OBJECT_DIRECTORY_BUFFER: usize = 0x10c;
 /// Size of the optical drive trace buffer.
 const DVD_TRACE_SIZE: u32 = 0x20_0000;
-/// Debug monitor block: trace flags word and current trace write pointer.
-const MONITOR_FLAGS: u32 = 0xc;
-const MONITOR_TRACE_POINTER: u32 = 0x3c;
-const MONITOR_DVD_TRACE: u32 = 0x20;
 /// Longest object name passed to the kernel.
 const PATH_CAPACITY: usize = 0x200;
 
@@ -254,13 +249,6 @@ fn pool_range(range: PoolRange) -> &'static mut [u8] {
     &mut pool_bytes(range.buffer)[range.offset as usize..(range.offset + range.length) as usize]
 }
 
-fn monitor_block() -> Option<u32> {
-    let slot = xboxkrnl::KeDebugMonitorData.address();
-    // SAFETY: the loader stored the address of the kernel variable.
-    let block = unsafe { core::ptr::read_volatile(slot as usize as *const u32) };
-    (block != 0).then_some(block)
-}
-
 /// Format `device` as XTAF (0x91f72e58): header, FAT, and an empty root
 /// directory cluster.
 fn format_xtaf(device: &[u8], cluster_size: u32) -> Result<(), KernelError> {
@@ -308,7 +296,7 @@ fn open_file(
 #[inline(never)]
 pub(crate) fn device_control(
     handle: FileHandle,
-    code: u32,
+    code: IoControlCode,
     output: &mut [u8],
 ) -> Result<(), KernelError> {
     let mut io_status = IoStatusBlock::default();
@@ -345,7 +333,11 @@ fn format_open_volume(handle: FileHandle, cluster_size: u32) -> Result<(), Kerne
     };
     status(raw.0)?;
     let mut geometry = [0u8; 8];
-    device_control(handle, IOCTL_DISK_GET_DRIVE_GEOMETRY, &mut geometry)?;
+    device_control(
+        handle,
+        IoControlCode::DISK_GET_DRIVE_GEOMETRY,
+        &mut geometry,
+    )?;
     let bytes_per_sector = word(&geometry[4..]);
     let sector_shift = if bytes_per_sector == 0 {
         0
@@ -353,7 +345,11 @@ fn format_open_volume(handle: FileHandle, cluster_size: u32) -> Result<(), Kerne
         31 - bytes_per_sector.leading_zeros()
     };
     let mut partition = [0u8; 0x10];
-    device_control(handle, IOCTL_DISK_GET_PARTITION_INFO, &mut partition)?;
+    device_control(
+        handle,
+        IoControlCode::DISK_GET_PARTITION_INFO,
+        &mut partition,
+    )?;
     let length = time(&partition[8..]).0;
     if length == 0 {
         return Err(KernelError::ObjectNameNotFound);
@@ -365,7 +361,10 @@ fn format_open_volume(handle: FileHandle, cluster_size: u32) -> Result<(), Kerne
         return Err(KernelError::DiskFull);
     }
     let clusters = (length / u64::from(cluster)) as u32 + 1;
-    let fat16 = clusters < 0xfff0 && word(&device) != FILE_DEVICE_FORCE_FAT32;
+    /// Device type whose volumes the monitor formats with a 32-bit FAT
+    /// whatever their size.
+    const FORCE_FAT32: FileDeviceType = FileDeviceType(0x46);
+    let fat16 = clusters < 0xfff0 && FileDeviceType(word(&device)) != FORCE_FAT32;
     let entries = if fat16 {
         clusters.wrapping_mul(2)
     } else {
@@ -837,15 +836,15 @@ impl commands::filesystem::Backend for Console {
 
     fn reference_device(&mut self, name: &[u8]) -> Result<DeviceObject, KernelError> {
         let name = ansi(name);
-        let slot = IoDeviceObjectType.address();
+        let object_type = kernel::resolved(&IoDeviceObjectType);
         let mut object = 0u32;
-        // SAFETY: `name` and `object` are live locals; `slot` is the kernel
-        // device object type.
+        // SAFETY: `name` and `object` are live locals; `object_type` is the
+        // kernel device object type.
         let raw = unsafe {
             xboxkrnl::ObReferenceObjectByName(
                 &name,
                 ObjectAttributeFlags::empty(),
-                slot,
+                core::ptr::from_ref(object_type).expose_provenance() as u32,
                 0,
                 &mut object,
             )
@@ -867,14 +866,20 @@ impl commands::filesystem::Backend for Console {
         buffer: PoolRange,
     ) -> Result<(), KernelError> {
         let major = match direction {
-            TransferDirection::Read => IRP_MJ_READ,
-            TransferDirection::Write => IRP_MJ_WRITE,
+            TransferDirection::Read => IrpMajorFunction::Read,
+            TransferDirection::Write => IrpMajorFunction::Write,
         };
         let bytes = pool_range(buffer);
         // SAFETY: `device` is referenced; `bytes` is a live pool range of
         // `buffer.length` bytes.
         let raw = unsafe {
-            IoSynchronousFsdRequest(major, device.0, bytes.as_mut_ptr(), buffer.length, &offset)
+            IoSynchronousFsdRequest(
+                major,
+                core::ptr::with_exposed_provenance_mut(device.0 as usize),
+                bytes.as_mut_ptr(),
+                buffer.length,
+                &offset,
+            )
         };
         status(raw.0)
     }
@@ -909,9 +914,10 @@ impl commands::filesystem::Backend for Console {
     }
 
     fn update_sequence(&mut self) -> u16 {
-        let address = xboxkrnl::KeTimeStampBundle.address();
-        // SAFETY: the loader stored the address of the kernel export.
-        unsafe { core::ptr::read_volatile((address + 0x12) as usize as *const u16) }
+        // Stock reads the halfword at +0x12: the low half of the tick count.
+        kernel::resolved(&xboxkrnl::KeTimeStampBundle)
+            .tick_count
+            .load(Ordering::Relaxed) as u16
     }
 
     fn dos_error(&mut self, error: KernelError) -> Option<Win32Error> {
@@ -919,12 +925,10 @@ impl commands::filesystem::Backend for Console {
     }
 
     fn start_dvd_trace(&mut self) {
-        let block = monitor_block();
+        let block = kernel::published_debug_monitor_data();
         if let Some(block) = block {
-            // SAFETY: the debug monitor block stays mapped while the module runs.
-            unsafe {
-                core::ptr::write_volatile((block + MONITOR_TRACE_POINTER) as usize as *mut u32, 0)
-            };
+            // SAFETY: 0 stops the recording before the old buffer is freed.
+            unsafe { block.dvd_trace_pointer.store(0, Ordering::Relaxed) };
         }
         if let Some(buffer) = self.filesystem.dvd_trace.take() {
             free(buffer);
@@ -936,37 +940,28 @@ impl commands::filesystem::Backend for Console {
         let first = pool_bytes(buffer);
         first[8] &= !1;
         if let Some(block) = block {
-            // SAFETY: as above.
-            unsafe {
-                let flags = (block + MONITOR_FLAGS) as usize as *mut u32;
-                core::ptr::write_volatile(
-                    flags,
-                    core::ptr::read_volatile(flags) | MONITOR_DVD_TRACE,
-                );
-                core::ptr::write_volatile(
-                    (block + MONITOR_TRACE_POINTER) as usize as *mut u32,
-                    buffer.0,
-                );
-            }
+            let flags = &block.flags;
+            flags.store(
+                flags.load(Ordering::Relaxed) | DebugMonitorFlags::DVD_TRACE.bits(),
+                Ordering::Relaxed,
+            );
+            // SAFETY: the buffer is a live pool block of `DVD_TRACE_SIZE`
+            // bytes, kept until the pointer is cleared again.
+            unsafe { block.dvd_trace_pointer.store(buffer.0, Ordering::Relaxed) };
         }
     }
 
     fn stop_dvd_trace(&mut self) -> Option<DvdTrace> {
-        let end = match monitor_block() {
+        let end = match kernel::published_debug_monitor_data() {
             Some(block) => {
-                let pointer = (block + MONITOR_TRACE_POINTER) as usize
-                    as *const core::sync::atomic::AtomicU32;
-                // SAFETY: the write pointer is a naturally aligned word of the
-                // debug monitor block, updated atomically by the driver.
-                let end = unsafe { (*pointer).swap(0, core::sync::atomic::Ordering::SeqCst) };
-                // SAFETY: as above.
-                unsafe {
-                    let flags = (block + MONITOR_FLAGS) as usize as *mut u32;
-                    core::ptr::write_volatile(
-                        flags,
-                        core::ptr::read_volatile(flags) & !MONITOR_DVD_TRACE,
-                    );
-                }
+                // The driver updates the write pointer atomically.
+                // SAFETY: 0 stops the recording before the buffer is freed.
+                let end = unsafe { block.dvd_trace_pointer.swap(0, Ordering::SeqCst) };
+                let flags = &block.flags;
+                flags.store(
+                    flags.load(Ordering::Relaxed) & !DebugMonitorFlags::DVD_TRACE.bits(),
+                    Ordering::Relaxed,
+                );
                 end
             }
             None => 0,

@@ -14,9 +14,6 @@ use super::write_u32;
 use crate::kernel;
 
 const SWAP_SLOTS: usize = 8;
-/// Debug monitor data word holding the address of the kernel's swap
-/// routine slot.
-const SWAP_SLOT_WORD: usize = 0x1c / 4;
 
 /// Read by the dispatcher without the lock, as stock does.
 static ROUTINES: [AtomicU32; SWAP_SLOTS] = [const { AtomicU32::new(0) }; SWAP_SLOTS];
@@ -36,7 +33,9 @@ struct Chain {
 
 impl Chain {
     fn install(&mut self) {
-        let kernel_slot = kernel::debug_monitor_data().words[SWAP_SLOT_WORD];
+        let kernel_slot = kernel::debug_monitor_data()
+            .context_swap_notification
+            .load(Ordering::Relaxed);
         self.replaced = read_u32(kernel_slot);
         write_u32(kernel_slot, dispatch_entry as *const () as usize as u32);
         self.installed = true;
@@ -76,7 +75,9 @@ pub(crate) fn unregister_swap_routine(routine: u32) {
     }
     if remaining == 0 && chain.installed {
         write_u32(
-            kernel::debug_monitor_data().words[SWAP_SLOT_WORD],
+            kernel::debug_monitor_data()
+                .context_swap_notification
+                .load(Ordering::Relaxed),
             chain.replaced,
         );
         chain.installed = false;

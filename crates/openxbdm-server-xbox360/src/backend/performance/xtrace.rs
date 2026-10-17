@@ -38,6 +38,7 @@ use xbox360_sys::xboxkrnl::DebugMonitorService;
 use xbox360_sys::xboxkrnl::FileInformationClass;
 use xbox360_sys::xboxkrnl::Handle;
 use xbox360_sys::xboxkrnl::IoStatusBlock;
+use xbox360_sys::xboxkrnl::MemoryRegion;
 use xbox360_sys::xboxkrnl::MmQueryAddressProtect;
 use xbox360_sys::xboxkrnl::MmQueryAllocationSize;
 use xbox360_sys::xboxkrnl::NtQueryVirtualMemory;
@@ -66,8 +67,8 @@ const MEM_COMMIT_RESERVE_LARGE: AllocationType = AllocationType::COMMIT
     .union(AllocationType::LARGE_PAGES);
 /// Memory options of the session allocation: debug memory, then title
 /// memory when that fails.
-const DEBUG_MEMORY: u32 = 3;
-const TITLE_MEMORY: u32 = 1;
+const DEBUG_MEMORY: MemoryRegion = MemoryRegion::TitleDebug;
+const TITLE_MEMORY: MemoryRegion = MemoryRegion::Title;
 /// A queued buffer leaves room for one record.
 const RECORD_RESERVE: u32 = 8;
 /// Instructions and returns skipped after arming: the way back out of
@@ -149,7 +150,7 @@ static NEXT_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 /// Bytes of stream buffers requested (export 135); the session allocation
 /// adds the cache.
 static SIZE_LIMIT: AtomicU32 = AtomicU32::new(DEFAULT_SIZE_LIMIT);
-static MEMORY_OPTION: AtomicU32 = AtomicU32::new(DEBUG_MEMORY);
+static MEMORY_OPTION: AtomicU32 = AtomicU32::new(DEBUG_MEMORY as u32);
 /// Hardware thread of the writer thread (export 195).
 static WRITER_PROCESSOR: AtomicU32 = AtomicU32::new(DEFAULT_WRITER_PROCESSOR);
 static SPOOF_ENABLED: AtomicBool = AtomicBool::new(true);
@@ -847,7 +848,9 @@ fn hook() {
         HOOK_SLOT.store(hook_slot[0], Ordering::Release);
         write_u32(hook_slot[0], trace_hook_entry as *const () as usize as u32);
     }
-    let slot = kernel::debug_monitor_data().words[0];
+    let slot = kernel::debug_monitor_data()
+        .debug_routine
+        .load(Ordering::Relaxed);
     ROUTINE_SLOT.store(slot, Ordering::Release);
     let routine = debug_routine_entry as *const () as usize as u32;
     let previous = read_u32(slot);
@@ -1007,7 +1010,7 @@ fn allocate() -> bool {
             limit = MAXIMUM_ALLOCATION - 0x1_0000;
             SIZE_LIMIT.store(limit, Ordering::Relaxed);
         }
-        MEMORY_OPTION.store(DEBUG_MEMORY, Ordering::Relaxed);
+        MEMORY_OPTION.store(DEBUG_MEMORY as u32, Ordering::Relaxed);
         let mut size = limit + 0x1_0000;
         // SAFETY: BASE and `size` are live u32 values.
         let mut status = unsafe {
@@ -1021,7 +1024,7 @@ fn allocate() -> bool {
         };
         if is_failure(status.0) {
             BASE.store(0, Ordering::Relaxed);
-            MEMORY_OPTION.store(TITLE_MEMORY, Ordering::Relaxed);
+            MEMORY_OPTION.store(TITLE_MEMORY as u32, Ordering::Relaxed);
             size = limit + 0x1_0000;
             // SAFETY: as above.
             status = unsafe {

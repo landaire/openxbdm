@@ -41,7 +41,9 @@ use openxbdm_server::reply;
 use openxbdm_server::reply::CommandError;
 use openxbdm_server::reply::Reply;
 use xbox360_sys::export_raw;
+use xbox360_sys::image::XexHeaderKey;
 use xbox360_sys::processor;
+use xbox360_sys::processor::Kpcr;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::AccessMask;
 use xbox360_sys::xboxkrnl::AnsiString;
@@ -53,6 +55,7 @@ use xbox360_sys::xboxkrnl::FileInformationClass;
 use xbox360_sys::xboxkrnl::Handle;
 use xbox360_sys::xboxkrnl::IoStatusBlock;
 use xbox360_sys::xboxkrnl::KeIpiGenericCall;
+use xbox360_sys::xboxkrnl::LdrDataTableEntry;
 use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
 use xbox360_sys::xboxkrnl::ObjectAttributes;
 use xbox360_sys::xboxkrnl::PageProtection;
@@ -90,21 +93,14 @@ const TITLE_NAME_LIMIT: usize = 0x140;
 const TITLE_CAPTURE_POLL_MS: u32 = 60;
 const TITLE_CAPTURE_TIMEOUT_MS: u32 = 15_000;
 /// Physical memory type and allocation bounds of the buffers.
-const MEMORY_TYPE: u32 = 1;
+const MEMORY_TYPE: xboxkrnl::MemoryRegion = xboxkrnl::MemoryRegion::Title;
 const PAGE_READWRITE: u32 = 4;
 const BUFFER_PROTECT: u32 = 0x404;
 const PAGE_SIZE: u32 = 0x1000;
 /// Access of the capture file (stock 0x91f2eb68 callers).
 const FILE_ACCESS: AccessMask = AccessMask::SYNCHRONIZE.union(AccessMask::GENERIC_WRITE);
-/// Loader data table entry: XEX header pointer.
-const ENTRY_XEX_HEADER: u32 = 0x58;
-/// Processor control region: processor number.
-const PCR_PROCESSOR: u32 = 0x10c;
 /// Thread object: thread id.
 const THREAD_ID: u32 = 0x14c;
-/// Debug monitor data word holding the address of the kernel's thread
-/// switch routine variable.
-const SWAP_ROUTINE_WORD: usize = 0x1c / 4;
 const ASSERT_FILE: &[u8] =
     b"e:\\xenon\\xdksep13\\core\\private\\xdk\\tools\\debug\\xbdm\\core\\dmcap.c\0";
 const ASSERT_PAGE_ALIGNED: &[u8] = b"((ULONG_PTR)bufstart % PAGE_SIZE) == 0\0";
@@ -209,13 +205,6 @@ fn write(address: u32, value: u32) {
     unsafe { core::ptr::write_volatile(address as usize as *mut u32, value) }
 }
 
-fn current_processor() -> usize {
-    // SAFETY: the processor control region is always mapped.
-    usize::from(unsafe {
-        core::ptr::read_volatile((processor::pcr() + PCR_PROCESSOR) as usize as *const u8)
-    })
-}
-
 fn current_thread_id() -> u32 {
     read(processor::current_thread() + THREAD_ID)
 }
@@ -247,7 +236,10 @@ fn restore_interrupts(state: u32) {
 }
 
 fn processor_count() -> usize {
-    (kernel::debug_monitor_data().processor_count() as usize).min(MAX_PROCESSORS)
+    (kernel::debug_monitor_data()
+        .processor_count
+        .load(Ordering::Relaxed) as usize)
+        .min(MAX_PROCESSORS)
 }
 
 fn load_pair(pair: &[AtomicU32; 2]) -> u64 {
@@ -261,7 +253,10 @@ fn store_pair(pair: &[AtomicU32; 2], value: u64) {
 
 /// Address of the kernel's thread switch routine variable, if any.
 fn swap_routine_slot() -> Option<u32> {
-    match kernel::debug_monitor_data().words[SWAP_ROUTINE_WORD] {
+    match kernel::debug_monitor_data()
+        .context_swap_notification
+        .load(Ordering::Relaxed)
+    {
         0 => None,
         slot => Some(slot),
     }
@@ -431,7 +426,7 @@ fn append_control(processor: usize, record: ControlRecord, value: u32, checked: 
 /// Export 65.
 extern "C" fn record_pair(first: u32, second: u32) {
     append(
-        current_processor(),
+        usize::from(Kpcr::current().processor_number().get()),
         RecordKind::Pair,
         first,
         Some(second),
@@ -442,13 +437,19 @@ export!(65, record_pair);
 
 /// Export 66.
 extern "C" fn record_single(value: u32) {
-    append(current_processor(), RecordKind::Single, value, None, true);
+    append(
+        usize::from(Kpcr::current().processor_number().get()),
+        RecordKind::Single,
+        value,
+        None,
+        true,
+    );
 }
 export!(66, record_single);
 
 extern "C" fn record_entry(return_address: u32) {
     append(
-        current_processor(),
+        usize::from(Kpcr::current().processor_number().get()),
         RecordKind::Entry,
         return_address,
         None,
@@ -460,7 +461,7 @@ export_raw!(70, entry_hook);
 
 extern "C" fn record_exit(return_address: u32) {
     append(
-        current_processor(),
+        usize::from(Kpcr::current().processor_number().get()),
         RecordKind::Exit,
         return_address,
         None,
@@ -474,7 +475,7 @@ export_raw!(71, exit_hook);
 /// records the incoming thread, then runs the replaced routine.
 extern "C" fn thread_switched(previous: u32, next: u32) {
     append_control(
-        current_processor(),
+        usize::from(Kpcr::current().processor_number().get()),
         ControlRecord::ThreadSwitch,
         read(next + THREAD_ID),
         true,
@@ -521,7 +522,7 @@ fn program_processor_counters(setup: CounterSetup) {
     let first = (0..MAX_PROCESSORS)
         .find(|&processor| flags & 1 << processor != 0)
         .unwrap_or(MAX_PROCESSORS);
-    if first != current_processor() {
+    if first != usize::from(Kpcr::current().processor_number().get()) {
         return;
     }
     for (number, &value) in COUNTER_NUMBERS.iter().zip(&setup.counter_numbers()) {
@@ -546,7 +547,7 @@ struct StartArguments {
 extern "C" fn start_on_processor(arguments: u32) -> u32 {
     // SAFETY: the initiator's arguments outlive the IPI.
     let arguments = unsafe { &*(arguments as usize as *const StartArguments) };
-    let processor = current_processor();
+    let processor = usize::from(Kpcr::current().processor_number().get());
     let flags = CaptureFlags(FLAGS.load(Ordering::Relaxed));
     let state = disable_interrupts();
     if let Some(block) = BLOCKS
@@ -582,7 +583,7 @@ bridged!(start_on_processor_entry, start_on_processor);
 
 /// Stop recording on this processor (stock 0x91f29160, IPI routine).
 extern "C" fn stop_on_processor(_context: u32) -> u32 {
-    let processor = current_processor();
+    let processor = usize::from(Kpcr::current().processor_number().get());
     let state = disable_interrupts();
     if let Some(block) = BLOCKS
         .get(processor)
@@ -611,7 +612,7 @@ bridged!(stop_on_processor_entry, stop_on_processor);
 extern "C" fn reset_on_processor(_context: u32) -> u32 {
     let state = disable_interrupts();
     if let Some(block) = BLOCKS
-        .get(current_processor())
+        .get(usize::from(Kpcr::current().processor_number().get()))
         .filter(|block| block.enabled.load(Ordering::Relaxed))
     {
         block.reset();
@@ -839,16 +840,23 @@ impl capture::Engine for Engine {
     /// Stock 0x91f28ae0: the first loader list only, under the loader lock.
     fn instrumented(&mut self, kind: Instrumentation) -> bool {
         let data = kernel::debug_monitor_data();
-        let lock = data.loader_lock() as usize as *mut _;
+        let lock = data.loaded_module_list_lock.load(Ordering::Relaxed) as usize as *mut _;
         // SAFETY: the loader lock lives in the kernel debug monitor data.
         let irql = unsafe { xboxkrnl::KfAcquireSpinLock(lock) };
-        let head = data.module_list();
+        let head = data.loaded_module_list.load(Ordering::Relaxed);
         let mut entry = read(head);
         let mut found = false;
         while entry != head {
-            let header = read(entry + ENTRY_XEX_HEADER);
+            // SAFETY: `entry` is a loader entry on the module list, whose
+            // lock is held.
+            let loader_entry = unsafe {
+                &*core::ptr::with_exposed_provenance::<LdrDataTableEntry>(entry as usize)
+            };
+            let header = loader_entry.xex_header_base;
             // SAFETY: `header` is the XEX header of a loaded module.
-            if header != 0 && unsafe { RtlImageXexHeaderField(header, kind.header_field()) } != 0 {
+            if header != 0
+                && unsafe { RtlImageXexHeaderField(header, XexHeaderKey(kind.header_field())) } != 0
+            {
                 found = true;
                 break;
             }
@@ -923,8 +931,8 @@ impl capture::Engine for Engine {
         {
             return Err(CaptureError::Busy);
         }
-        let flags =
-            CaptureFlags(FLAGS.load(Ordering::Relaxed)).for_start(current_processor() as u8);
+        let flags = CaptureFlags(FLAGS.load(Ordering::Relaxed))
+            .for_start(Kpcr::current().processor_number().get());
         FLAGS.store(flags.0, Ordering::Relaxed);
         let continued = recording();
         if continued && exclusive {

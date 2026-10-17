@@ -37,7 +37,9 @@ use openxbdm_server::commands::session::format_wait_trace;
 use openxbdm_server::notify::POSTED_TEXT_CAPACITY;
 use openxbdm_server::notify::PostedTexts;
 use xbox360::sync::SpinLock;
+use xbox360_sys::image::XexHeaderKey;
 use xbox360_sys::processor;
+use xbox360_sys::processor::Kpcr;
 use xbox360_sys::processor::current_thread;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::ExRegisterTitleTerminateNotification;
@@ -47,6 +49,7 @@ use xbox360_sys::xboxkrnl::Handle;
 use xbox360_sys::xboxkrnl::IoStatusBlock;
 use xbox360_sys::xboxkrnl::Irql;
 use xbox360_sys::xboxkrnl::KeResumeThread;
+use xbox360_sys::xboxkrnl::LdrDataTableEntry;
 use xbox360_sys::xboxkrnl::PoolTag;
 use xbox360_sys::xboxkrnl::PoolType;
 use xbox360_sys::xboxkrnl::ProcessorMode;
@@ -105,12 +108,6 @@ const STATUS_SUCCESS: u32 = 0;
 /// `KeGetCurrentProcessType` of the title process.
 const TITLE_PROCESS: u32 = 1;
 
-/// Processor control region fields.
-const PCR_STACK_BASE: u32 = 0x70;
-const PCR_STACK_LIMIT: u32 = 0x74;
-const PCR_CURRENT_PROCESSOR: u32 = 0x10c;
-const PCR_LAST_ERROR_OVERRIDE: u32 = 0x150;
-const PCR_WAIT_STATISTICS: u32 = 0x2d0;
 /// Thread fields.
 const THREAD_ID: u32 = 0x14c;
 const THREAD_PROCESSOR: u32 = 0xbf;
@@ -131,16 +128,6 @@ impl Data {
             processors: processors::Data::new(),
         }
     }
-}
-
-fn pcr_word(offset: u32) -> u32 {
-    // SAFETY: the processor control region is always mapped.
-    unsafe { core::ptr::read_volatile((processor::pcr() + offset) as usize as *const u32) }
-}
-
-fn pcr_byte(offset: u32) -> u8 {
-    // SAFETY: the processor control region is always mapped.
-    unsafe { core::ptr::read_volatile((processor::pcr() + offset) as usize as *const u8) }
 }
 
 fn passive() -> bool {
@@ -256,12 +243,16 @@ pub(crate) fn take_title_terminated() -> bool {
 
 /// Title identifier of the running executable (stock 0x91f335c0).
 fn current_title_id() -> u32 {
-    let module = read_u32(XexExecutableModuleHandle.address());
+    let module = crate::kernel::resolved(&XexExecutableModuleHandle).load(Ordering::Relaxed);
     if module == 0 {
         return 0;
     }
-    // SAFETY: +0x58 of a loaded module holds its XEX header address.
-    match unsafe { RtlImageXexHeaderField(read_u32(module + 0x58), 0x40006) } {
+    // SAFETY: a nonzero executable module handle is the address of the
+    // title's loader entry, which stays loaded while the title runs.
+    let entry =
+        unsafe { &*core::ptr::with_exposed_provenance::<LdrDataTableEntry>(module as usize) };
+    // SAFETY: the loader entry holds the address of its XEX header.
+    match unsafe { RtlImageXexHeaderField(entry.xex_header_base, XexHeaderKey::EXECUTION_INFO) } {
         0 => 0,
         field => read_u32(field + 0xc),
     }
@@ -300,12 +291,14 @@ impl commands::session::Backend for Console {
     }
 
     fn current_processor(&mut self) -> ProcessorNumber {
-        ProcessorNumber(pcr_byte(PCR_CURRENT_PROCESSOR))
+        ProcessorNumber(Kpcr::current().processor_number().get())
     }
 
     fn set_server_processor(&mut self, processor: ProcessorNumber) {
         let mut thread = 0u32;
-        let object_type = xboxkrnl::ExThreadObjectType.address();
+        let object_type =
+            core::ptr::from_ref(crate::kernel::resolved(&xboxkrnl::ExThreadObjectType)).addr()
+                as u32;
         // SAFETY: `thread` is a local word; the pseudo handle names the
         // calling thread.
         if (unsafe {
@@ -626,7 +619,7 @@ fn release_runner(block: u32) {
 
 /// `GetLastError` of the calling thread (stock 0x91f72ba0).
 fn last_error() -> u32 {
-    if pcr_word(PCR_LAST_ERROR_OVERRIDE) != 0 {
+    if Kpcr::current().prcb.dpc_active.load(Ordering::Relaxed) != 0 {
         0
     } else {
         read_u32(current_thread() + THREAD_LAST_ERROR)
@@ -1040,7 +1033,7 @@ pub(crate) fn service_cs_trace_wait_end(section: u32, entry_stack: u32) -> u32 {
 /// Count the wait in the processor's wait statistics when they are
 /// enabled: `title` for title threads, `system` otherwise.
 fn count_wait(title: u32, system: u32) {
-    let statistics = pcr_word(PCR_WAIT_STATISTICS);
+    let statistics = Kpcr::current().wait_statistics.load(Ordering::Relaxed);
     if statistics == 0 || read_u32(statistics + 4) & 1 == 0 {
         return;
     }
@@ -1077,7 +1070,7 @@ crate::exports::bridged!(reset_title_wait_counts_entry, reset_title_wait_counts)
 extern "C" fn reset_title_wait_counts(_context: u32) -> u32 {
     // SAFETY: re-enabled below; nothing in between waits or faults.
     unsafe { processor::disable_interrupts() };
-    let statistics = pcr_word(PCR_WAIT_STATISTICS);
+    let statistics = Kpcr::current().wait_statistics.load(Ordering::Relaxed);
     if statistics != 0 && read_u32(statistics + 4) & 1 != 0 {
         write_u32(statistics + 0x1c, read_u32(statistics + 0x18));
     }
@@ -1095,7 +1088,7 @@ fn trace_wait(trace: WaitTrace, section: u32, entry_stack: u32) {
     }
     let thread = current_thread();
     let time_base = Timebase::now().ticks();
-    let processor = pcr_byte(PCR_CURRENT_PROCESSOR);
+    let processor = Kpcr::current().processor_number().get();
     let title = xboxkrnl::KeGetCurrentProcessType().0 == TITLE_PROCESS;
     let (lock_count, recursion_count, owner) = if section == 0 {
         (0, 0, 0)
@@ -1144,8 +1137,9 @@ fn trace_wait(trace: WaitTrace, section: u32, entry_stack: u32) {
 /// followed through their back chains within the thread's stack, and a
 /// console frame's return address is saved 8 bytes below it.
 fn callers(entry_stack: u32) -> [u32; 3] {
-    let base = pcr_word(PCR_STACK_BASE);
-    let limit = pcr_word(PCR_STACK_LIMIT);
+    let pcr = Kpcr::current();
+    let base = pcr.stack_base.load(Ordering::Relaxed);
+    let limit = pcr.stack_limit.load(Ordering::Relaxed);
     let mut callers = [0u32; 3];
     let mut skip = 2;
     let mut found = 0;

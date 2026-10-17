@@ -347,7 +347,9 @@ fn refresh_kernel_hooks(kind: u32) {
     let wanted = || sessions().any(|session| read_u32(count_address(session, kind)) != 0);
     match kind {
         KIND_KERNEL_CALLBACK => {
-            let slot = kernel::debug_monitor_data().words[0x10 / 4];
+            let slot = kernel::debug_monitor_data()
+                .callback_routine
+                .load(Ordering::Relaxed);
             if slot != 0 {
                 let routine = if wanted() {
                     kernel_callback_entry as *const () as usize as u32

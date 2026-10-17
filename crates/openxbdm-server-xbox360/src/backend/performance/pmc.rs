@@ -25,6 +25,7 @@ use xbox360::time::TickCount;
 use xbox360::time::Timebase;
 use xbox360_sys::export_raw;
 use xbox360_sys::processor;
+use xbox360_sys::processor::Kpcr;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::Handle;
 use xbox360_sys::xboxkrnl::Irql;
@@ -33,31 +34,19 @@ use xbox360_sys::xboxkrnl::KeGetPMWRegister;
 use xbox360_sys::xboxkrnl::KeGetSpecialPurposeRegister;
 use xbox360_sys::xboxkrnl::KeSetPMWRegister;
 use xbox360_sys::xboxkrnl::KeSetPRVRegister;
+use xbox360_sys::xboxkrnl::PmwRegister;
+use xbox360_sys::xboxkrnl::PrvRegister;
+use xbox360_sys::xboxkrnl::SpecialPurposeRegister;
 
 use crate::exports::export;
 use crate::kernel;
 
-/// Counter run control.
-const PRV_RUN: u32 = 0x1c0;
-/// Interval timer control.
-const PRV_INTERVAL_CONTROL: u32 = 0x1c8;
-/// Processor whose events trigger the counters.
-const PRV_TRIGGER: u32 = 0x1d8;
-const PRV_INTERVAL: u32 = 0x1e0;
-const PRV_INTERVAL_RELOAD: u32 = 0x1e8;
-const PRV_COUNTER_VALUES: u32 = 0x200;
-const PRV_COUNTER_CONTROLS: u32 = 0x280;
-/// Monitor control: bit 1 freezes, bit 2 enables the counters; bits 10..15
-/// select the event bus width.
-const SPR_MONITOR_CONTROL: u32 = 0x3f6;
-const SPR_EVENT_SELECT: u32 = 0x3fa;
 /// Counter values: one register per counter, the count in the high word.
 const COUNTER_VALUES: u32 = 0x8fff_1200;
 const INTERVAL_COUNT: u32 = 0x8fff_11e0;
 /// Status: bit 47 marks an interval overflow, bits 63 down to 48 counter
 /// overflows.
 const STATUS: u32 = 0x8fff_11c8;
-const PMW_L2_ECC: u32 = 0x860;
 /// Trigger selection of processors 0..2.
 const TRIGGERS: [u32; 3] = [0x0842_2108, 0x39ce_8420, 0x6b5a_e738];
 /// Print flags the setup installers store: suppress the routing and
@@ -168,15 +157,6 @@ unsafe impl Sync for NameBuffer {}
 
 static NAME_BUFFER: NameBuffer = NameBuffer(UnsafeCell::new([0; 0x40]));
 
-pub(super) fn pcr_byte(offset: u32) -> u8 {
-    // SAFETY: the processor control region is always mapped.
-    unsafe { core::ptr::read_volatile((processor::pcr() + offset) as usize as *const u8) }
-}
-
-pub(super) fn current_processor() -> u8 {
-    pcr_byte(0x10c)
-}
-
 /// The monitor lock, taken without lowering an IRQL above dispatch level.
 struct Locked {
     irql: Option<Irql>,
@@ -223,7 +203,7 @@ impl Drop for Locked {
 
 /// `KeGetSpecialPurposeRegister`, splitting the 64-bit result into r3:r4.
 #[unsafe(naked)]
-extern "C" fn get_spr(register: u32) -> u64 {
+extern "C" fn get_spr(register: SpecialPurposeRegister) -> u64 {
     core::arch::naked_asm!(
         "stwu 1, -0x20(1)",
         "mflr 0",
@@ -242,7 +222,7 @@ extern "C" fn get_spr(register: u32) -> u64 {
 
 /// `KeGetPMWRegister`, splitting the 64-bit result into r3:r4.
 #[unsafe(naked)]
-extern "C" fn get_pmw(register: u32) -> u64 {
+extern "C" fn get_pmw(register: PmwRegister) -> u64 {
     core::arch::naked_asm!(
         "stwu 1, -0x20(1)",
         "mflr 0",
@@ -299,18 +279,18 @@ fn pointer(text: &[u8]) -> u64 {
     u64::from(text.as_ptr() as usize as u32)
 }
 
-fn set_prv_value(register: u32, value: u64) {
+fn set_prv_value(register: PrvRegister, value: u64) {
     // SAFETY: PRV register writes reach only the performance monitor.
     unsafe { KeSetPRVRegister(register, value) };
 }
 
-fn set_spr_value(register: u32, value: u64) {
+fn set_spr_value(register: SpecialPurposeRegister, value: u64) {
     // SAFETY: the callers write only the monitor control and event select
     // registers.
     unsafe { xboxkrnl::KeSetSpecialPurposeRegister(register, value) };
 }
 
-fn set_pmw_value(register: u32, value: u64) {
+fn set_pmw_value(register: PmwRegister, value: u64) {
     // SAFETY: PMW register writes reach only the event bus selection.
     unsafe { KeSetPMWRegister(register, value) };
 }
@@ -350,11 +330,11 @@ struct LiveRegisters;
 
 impl pmc::Registers for LiveRegisters {
     fn select(&mut self) -> u64 {
-        get_spr(SPR_EVENT_SELECT)
+        get_spr(SpecialPurposeRegister::EVENT_SELECT)
     }
 
     fn bus(&mut self, register: BusRegister) -> u64 {
-        get_pmw(register.0)
+        get_pmw(PmwRegister(register.0))
     }
 }
 
@@ -386,7 +366,7 @@ pub(super) fn acquire(owner: Owner) -> bool {
         return false;
     }
     if locked.hardware().owner.0 > 0 {
-        set_prv_value(PRV_RUN, 0);
+        set_prv_value(PrvRegister::RUN, 0);
     }
     locked.hardware().owner = owner;
     true
@@ -407,13 +387,13 @@ pub(super) fn start(owner: Owner) -> bool {
     if locked.preempted(owner) {
         return false;
     }
-    let control = get_spr(SPR_MONITOR_CONTROL) & !6;
-    set_spr_value(SPR_MONITOR_CONTROL, control);
+    let control = get_spr(SpecialPurposeRegister::MONITOR_CONTROL) & !6;
+    set_spr_value(SpecialPurposeRegister::MONITOR_CONTROL, control);
     set_prv_value(
-        PRV_RUN,
+        PrvRegister::RUN,
         u64::from(0x8000_0000 | (locked.hardware().trigger & 3) << 26) << 32,
     );
-    set_spr_value(SPR_MONITOR_CONTROL, control | 4);
+    set_spr_value(SpecialPurposeRegister::MONITOR_CONTROL, control | 4);
     locked.hardware().started = Timebase::now().ticks();
     true
 }
@@ -425,8 +405,11 @@ pub(super) fn stop(owner: Owner) -> bool {
         return false;
     }
     locked.hardware().stopped = Timebase::now().ticks();
-    set_spr_value(SPR_MONITOR_CONTROL, get_spr(SPR_MONITOR_CONTROL) | 2);
-    set_prv_value(PRV_RUN, 0);
+    set_spr_value(
+        SpecialPurposeRegister::MONITOR_CONTROL,
+        get_spr(SpecialPurposeRegister::MONITOR_CONTROL) | 2,
+    );
+    set_prv_value(PrvRegister::RUN, 0);
     true
 }
 
@@ -447,7 +430,7 @@ pub(super) fn set_trigger_processor(owner: Owner, processor: u32) -> bool {
             0
         }
     };
-    set_prv_value(PRV_TRIGGER, u64::from(trigger) << 32);
+    set_prv_value(PrvRegister::TRIGGER, u64::from(trigger) << 32);
     drop(locked);
     true
 }
@@ -455,13 +438,13 @@ pub(super) fn set_trigger_processor(owner: Owner, processor: u32) -> bool {
 /// Enable the monitor and reset the event selection, trigger, and counter
 /// controls (stock 0x91f91800).
 pub(super) fn reset() {
-    set_spr_value(SPR_EVENT_SELECT, 0);
+    set_spr_value(SpecialPurposeRegister::EVENT_SELECT, 0);
     // SAFETY: enables the monitor of the current processor; no memory is involved.
     unsafe { KeEnablePPUPerformanceMonitor() };
-    set_prv_value(PRV_TRIGGER, u64::from(TRIGGERS[0]) << 32);
+    set_prv_value(PrvRegister::TRIGGER, u64::from(TRIGGERS[0]) << 32);
     set_spr_value(
-        SPR_MONITOR_CONTROL,
-        get_spr(SPR_MONITOR_CONTROL) & !0xfc00 | 5 << 11,
+        SpecialPurposeRegister::MONITOR_CONTROL,
+        get_spr(SpecialPurposeRegister::MONITOR_CONTROL) & !0xfc00 | 5 << 11,
     );
     for counter in 0..COUNTERS {
         set_control(counter, CounterControl::RESET);
@@ -473,12 +456,12 @@ fn clear_locked(locked: &mut Locked, owner: Owner) -> bool {
     if locked.preempted(owner) {
         return false;
     }
-    for counter in 0..COUNTERS as u32 {
-        set_prv_value(PRV_COUNTER_VALUES + counter * 8, 0);
+    for counter in 0..COUNTERS as u8 {
+        set_prv_value(PrvRegister::counter_value(counter), 0);
     }
-    set_prv_value(PRV_INTERVAL, 0);
-    set_prv_value(PRV_INTERVAL_RELOAD, 0);
-    set_prv_value(PRV_INTERVAL_CONTROL, 0);
+    set_prv_value(PrvRegister::INTERVAL, 0);
+    set_prv_value(PrvRegister::INTERVAL_RELOAD, 0);
+    set_prv_value(PrvRegister::INTERVAL_CONTROL, 0);
     true
 }
 
@@ -546,7 +529,7 @@ fn select_events_locked(locked: &mut Locked, owner: Owner, setup: &Setup) -> boo
         return false;
     }
     reset();
-    set_spr_value(SPR_EVENT_SELECT, setup.select);
+    set_spr_value(SpecialPurposeRegister::EVENT_SELECT, setup.select);
     true
 }
 
@@ -565,10 +548,10 @@ fn configure_locked(locked: &mut Locked, owner: Owner, setup: &Setup) -> bool {
         route_counter(route.source, route.lane, counter);
     }
     for (register, value) in pmc::bus_selection(5) {
-        set_pmw_value(register.0, value);
+        set_pmw_value(PmwRegister(register.0), value);
     }
     locked.hardware().trigger = setup.trigger & 3;
-    set_pmw_value(BusRegister::L2_GROUP.0, setup.group);
+    set_pmw_value(PmwRegister::L2_GROUP, setup.group);
     write_controls();
     clear_locked(locked, owner)
 }
@@ -630,7 +613,7 @@ fn write_controls() {
         }
         set_control(counter, control);
         set_prv_value(
-            PRV_COUNTER_CONTROLS + counter as u32 * 8,
+            PrvRegister::counter_control(counter as u8),
             u64::from(control.0) << 32,
         );
     }
@@ -652,7 +635,8 @@ fn current_setup(index: u32) -> Option<Setup> {
 /// Run the calling thread on processor `processor` (stock 0x91f78a68).
 fn set_processor(processor: u8) {
     let mut thread = 0u32;
-    let object_type = xboxkrnl::ExThreadObjectType.address();
+    let object_type =
+        core::ptr::from_ref(kernel::resolved(&xboxkrnl::ExThreadObjectType)).addr() as u32;
     // SAFETY: CURRENT_THREAD is the pseudo-handle of the calling thread,
     // `object_type` the kernel thread type, and `thread` a live u32.
     let status = unsafe {
@@ -676,7 +660,7 @@ fn set_processor(processor: u8) {
 /// Install built-in setup `index`, selecting its events on each core by
 /// moving the calling thread (stock 0x91f92ae0).
 pub(super) fn install(owner: Owner, index: u32) -> bool {
-    let processor = current_processor();
+    let processor = Kpcr::current().processor_number().get();
     if Locked::take().preempted(owner) {
         return false;
     }
@@ -701,7 +685,7 @@ struct SelectRequest {
 /// Per-processor routine of [`install_on_all_processors`] (stock
 /// 0x91f92c00): the first thread of each core selects the events.
 extern "C" fn select_on_processor(request: u32) -> u32 {
-    if current_processor() & 1 != 0 {
+    if Kpcr::current().processor_number().get() & 1 != 0 {
         return 1;
     }
     // SAFETY: the requester waits in `KeIpiGenericCall` while the request
@@ -743,7 +727,10 @@ fn begin(owner: Owner, index: u32) -> bool {
     acquire(owner)
         && install(owner, index)
         && clear(owner)
-        && set_trigger_processor(owner, u32::from(current_processor() >> 1))
+        && set_trigger_processor(
+            owner,
+            u32::from(Kpcr::current().processor_number().get() >> 1),
+        )
         && start(owner)
 }
 
@@ -761,20 +748,20 @@ fn end(owner: Owner) -> bool {
 
 /// Program the interval timer control (stock 0x91f920f8).
 pub(super) fn set_interval_control(value: u64) {
-    set_prv_value(PRV_INTERVAL_CONTROL, value);
+    set_prv_value(PrvRegister::INTERVAL_CONTROL, value);
 }
 
 /// Load the interval timer and its reload value with `ticks` before the
 /// next interrupt (stock 0x91f92108, 0x91f92138); the count is in the high
 /// word, the low word stock leaves uninitialized is 0.
 pub(super) fn set_interval(ticks: u32) {
-    set_prv_value(PRV_INTERVAL, u64::from(ticks) << 32);
-    set_prv_value(PRV_INTERVAL_RELOAD, u64::from(ticks) << 32);
+    set_prv_value(PrvRegister::INTERVAL, u64::from(ticks) << 32);
+    set_prv_value(PrvRegister::INTERVAL_RELOAD, u64::from(ticks) << 32);
 }
 
 /// Load the interval reload value (stock 0x91f92138).
 pub(super) fn set_interval_reload(ticks: u32) {
-    set_prv_value(PRV_INTERVAL_RELOAD, u64::from(ticks) << 32);
+    set_prv_value(PrvRegister::INTERVAL_RELOAD, u64::from(ticks) << 32);
 }
 
 /// Wait until a pending interval reload completes; false when none is
@@ -906,7 +893,7 @@ fn print_statistics(state: &mut PmcState, flags: u32) {
 
 /// Stock 0x91f92020: one line per field, A0Q0 in the top byte.
 fn print_ecc_counts() {
-    let counts = get_pmw(PMW_L2_ECC);
+    let counts = get_pmw(PmwRegister::L2_ECC);
     print(c"L2 ECC ERROR COUNTS\n", &[]);
     let words = [(counts >> 32) as u32, counts as u32];
     for index in 0..8u32 {

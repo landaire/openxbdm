@@ -20,9 +20,11 @@ mod replay;
 mod timing;
 mod video;
 
+use core::sync::atomic::Ordering;
+
 use xbox360::time::Timebase;
 use xbox360_sys::processor;
-use xbox360_sys::processor::pcr;
+use xbox360_sys::processor::Kpcr;
 use xbox360_sys::xboxkrnl;
 
 use super::session;
@@ -70,7 +72,7 @@ fn rd16(address: u32) -> u16 {
 
 /// Hardware thread of the calling processor.
 fn processor() -> u32 {
-    u32::from(rd8(pcr() + engine::PCR_PROCESSOR))
+    u32::from(Kpcr::current().processor_number().get())
 }
 
 fn timebase_low() -> u32 {
@@ -209,7 +211,9 @@ pub(super) fn module_records() {
     if session::session().is_some_and(|s| s.word(FLAGS) & PAUSED != 0) {
         return;
     }
-    let table = kernel::debug_monitor_data().words[0x17];
+    let table = kernel::debug_monitor_data()
+        .processor_blocks
+        .load(Ordering::Relaxed);
     if table != 0 {
         // Stock leaves the identifiers of empty slots unset.
         let mut threads = [0u32; 6];

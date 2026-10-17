@@ -37,10 +37,12 @@ use openxbdm_server::commands::performance::profiler::ProfilerFlags;
 use xbox360::module::Ordinal;
 use xbox360::module::SystemModule;
 use xbox360::module::resolve_export;
+use xbox360::thread::current_object;
 use xbox360::time::FileTime;
 use xbox360::time::Timebase;
 use xbox360::time::sleep;
-use xbox360_sys::processor;
+use xbox360_sys::image::ImageDirectory;
+use xbox360_sys::processor::Kpcr;
 use xbox360_sys::xam::GetCurrentThreadId;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::AllocationType;
@@ -49,6 +51,9 @@ use xbox360_sys::xboxkrnl::InterlockedFlushSList;
 use xbox360_sys::xboxkrnl::InterlockedPopEntrySList;
 use xbox360_sys::xboxkrnl::IoStatusBlock;
 use xbox360_sys::xboxkrnl::Kevent;
+use xbox360_sys::xboxkrnl::LdrDataTableEntry;
+use xbox360_sys::xboxkrnl::MemoryRegion;
+use xbox360_sys::xboxkrnl::MmStatistics;
 use xbox360_sys::xboxkrnl::PageProtection;
 use xbox360_sys::xboxkrnl::ProcessorMode;
 use xbox360_sys::xboxkrnl::RtlImageDirectoryEntryToData;
@@ -106,12 +111,11 @@ const ALLOCATION_TYPE: AllocationType = AllocationType::COMMIT
     .union(AllocationType::RESERVE)
     .union(AllocationType::LARGE_PAGES);
 /// Memory options of the sample buffers.
-const TITLE_MEMORY: u32 = 3;
-const SYSTEM_FALLBACK_MEMORY: u32 = 1;
-const SYSTEM_MEMORY: u32 = 2;
+const TITLE_MEMORY: MemoryRegion = MemoryRegion::TitleDebug;
+const SYSTEM_FALLBACK_MEMORY: MemoryRegion = MemoryRegion::Title;
+const SYSTEM_MEMORY: MemoryRegion = MemoryRegion::System;
 /// Physical memory of the function table copies.
-const PHYSICAL_MEMORY: u32 = 1;
-const IMAGE_DIRECTORY_EXCEPTION: u32 = 3;
+const PHYSICAL_MEMORY: MemoryRegion = MemoryRegion::Title;
 /// Interval timer control: interrupt when the interval expires.
 const INTERVAL_INTERRUPT: u64 = 0x8000 << 32;
 
@@ -208,10 +212,6 @@ fn start_timebase() -> u64 {
 fn read_u32(address: u32) -> u32 {
     // SAFETY: callers pass mapped addresses.
     unsafe { core::ptr::read_volatile(address as usize as *const u32) }
-}
-
-fn pcr_word(offset: u32) -> u32 {
-    read_u32(processor::pcr() + offset)
 }
 
 /// A kernel notification event in static storage.
@@ -501,9 +501,11 @@ fn walk_stack(frame: TrapFrame, frames: Option<u32>) -> Option<usize> {
     let mut count = 1;
     let mut stack = frame.register(1);
     loop {
-        let thread = pcr_word(0x100);
+        let thread = current_object().kthread();
         stack = read_u32(stack);
-        if stack >= read_u32(thread + 0x5c) || stack <= read_u32(thread + 0x60) {
+        if stack >= thread.stack_base.load(Ordering::Relaxed)
+            || stack <= thread.stack_limit.load(Ordering::Relaxed)
+        {
             return Some(count);
         }
         store(count, read_u32(stack - 8));
@@ -574,7 +576,8 @@ fn sample(frame: TrapFrame, processor: usize) {
 /// processor reloads the interval; samples are skipped above dispatch level
 /// and in an idle thread without pending DPCs.
 extern "C" fn profile_interrupt(frame: u32, irql: u32) {
-    let processor = usize::from(pmc::current_processor());
+    let pcr = Kpcr::current();
+    let processor = usize::from(pcr.processor_number().get());
     if !sampled(processor) {
         return;
     }
@@ -586,8 +589,11 @@ extern "C" fn profile_interrupt(frame: u32, irql: u32) {
         return;
     }
     count(header::INTERRUPTS, processor);
-    let prcb = pcr_word(0x2a8);
-    if irql & 0xff > 2 || (read_u32(prcb + 8) == pcr_word(0x100) && read_u32(prcb + 0x50) == 0) {
+    let prcb = &pcr.prcb;
+    if irql & 0xff > 2
+        || (prcb.idle_thread.load(Ordering::Relaxed) == prcb.current_thread.load(Ordering::Relaxed)
+            && prcb.dpc_active.load(Ordering::Relaxed) == 0)
+    {
         count(header::SKIPPED, processor);
         return;
     }
@@ -647,8 +653,8 @@ fn create_buffers(flags: ProfilerFlags) -> bool {
     BLOCKS.store(layout.blocks, Ordering::Relaxed);
     let mut base = 0u32;
     let mut bytes = layout.bytes();
-    let mut allocate = |memory| {
-        BUFFER_MEMORY.store(memory, Ordering::Relaxed);
+    let mut allocate = |memory: MemoryRegion| {
+        BUFFER_MEMORY.store(memory as u32, Ordering::Relaxed);
         // SAFETY: `base` and `bytes` are live u32 values of the enclosing
         // function.
         let status = unsafe {
@@ -776,29 +782,37 @@ struct FunctionTable {
 /// memory (stock 0x91f32e90); `None` when a copy cannot be allocated.
 fn copy_function_tables(tables: &mut [FunctionTable; MODULE_CAPACITY]) -> Option<usize> {
     let data = kernel::debug_monitor_data();
-    let lock = data.loader_lock() as usize as *mut _;
+    let lock = data.loaded_module_list_lock.load(Ordering::Relaxed) as usize as *mut _;
     // SAFETY: the loader lock lives in the kernel debug monitor data.
     let irql = unsafe { xboxkrnl::KfAcquireSpinLock(lock) };
     let mut count = 0;
     let mut result = Some(0);
-    'lists: for &head in &[data.module_list(), data.secondary_module_list()] {
+    'lists: for &head in &[
+        data.loaded_module_list.load(Ordering::Relaxed),
+        data.loaded_usermode_module_list.load(Ordering::Relaxed),
+    ] {
         // Stock reads a missing list head without a check.
         if head == 0 {
             continue;
         }
         let mut entry = read_u32(head);
         while entry != head && count < MODULE_CAPACITY {
-            let base = read_u32(entry + 0x18);
+            // SAFETY: `entry` is a loader entry on a module list whose lock
+            // is held.
+            let record = unsafe {
+                &*core::ptr::with_exposed_provenance::<LdrDataTableEntry>(entry as usize)
+            };
+            let base = record.dll_base;
             if base != 0 {
                 let mut size = 0u32;
                 // SAFETY: `base` is a loaded image on a list whose lock is
                 // held; `size` is a live u32.
                 let directory = unsafe {
-                    RtlImageDirectoryEntryToData(base, true, IMAGE_DIRECTORY_EXCEPTION, &mut size)
+                    RtlImageDirectoryEntryToData(base, true, ImageDirectory::Exception, &mut size)
                 };
                 let mut table = FunctionTable {
                     base,
-                    image_size: read_u32(entry + 0x20),
+                    image_size: record.image_size,
                     size: 0,
                     copy: 0,
                 };
@@ -842,7 +856,7 @@ fn copy_function_tables(tables: &mut [FunctionTable; MODULE_CAPACITY]) -> Option
                 tables[count] = table;
                 count += 1;
             }
-            entry = read_u32(entry);
+            entry = record.in_load_order_links.flink.load(Ordering::Relaxed);
         }
     }
     // SAFETY: acquired above at `irql`.
@@ -1131,10 +1145,9 @@ impl profiler::Engine for Sampler {
         for word in &HEADER {
             word.store(0, Ordering::Relaxed);
         }
-        let mut statistics = [0u32; 0x68 / 4];
-        statistics[0] = 0x68;
-        // SAFETY: `statistics` is a live block with its length word set.
-        unsafe { xboxkrnl::MmQueryStatistics(statistics.as_mut_ptr()) };
+        let mut statistics = MmStatistics::new();
+        // SAFETY: `statistics` is a live block with its length set.
+        unsafe { xboxkrnl::MmQueryStatistics(&mut statistics) };
         header_word(header::VERSION).store(HEADER_VERSION, Ordering::Relaxed);
         header_word(header::PROCESSORS).store(flags.processors(), Ordering::Relaxed);
         for (index, &word) in TITLE_WORDS.iter().enumerate() {

@@ -69,6 +69,7 @@ use xbox360_sys::xam::XnCaller;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::DebugMonitorService;
 use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::IoControlCode;
 use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
 use xbox360_sys::xboxkrnl::PoolTag;
 use xbox360_sys::xboxkrnl::PoolType;
@@ -231,14 +232,10 @@ impl Controllers for XboxControllers {
 
     fn tell_debugger(&mut self, message: DebuggerMessage) {
         let (payload, _) = message.payload();
-        let slot = xboxkrnl::KeDebugMonitorData.address();
-        // SAFETY: the loader stored the address of the kernel variable.
-        let block = unsafe { core::ptr::read_volatile(slot as usize as *const u32) };
-        if block == 0 {
+        let Some(block) = kernel::published_debug_monitor_data() else {
             return;
-        }
-        // SAFETY: a published monitor data block holds the control routine at +0x18.
-        let control = unsafe { core::ptr::read_volatile((block as usize + 0x18) as *const u32) };
+        };
+        let control = block.control_routine.load(Ordering::Relaxed);
         if control != 0 {
             // SAFETY: the control routine takes a code and a data pointer.
             unsafe {
@@ -694,7 +691,6 @@ pub(crate) fn service_odd_auth_state(state: u32) -> u32 {
 }
 
 const OPTICAL_DRIVE: &[u8] = b"\\Device\\CdRom0";
-const IOCTL_ODD_AUTH_STATE: u32 = 0x2_40cc;
 /// Object attributes stock passes when opening the drive.
 const OPTICAL_DRIVE_ATTRIBUTES: ObjectAttributeFlags =
     ObjectAttributeFlags::PERMANENT.union(ObjectAttributeFlags::CASE_INSENSITIVE);
@@ -751,7 +747,7 @@ fn odd_initialize() {
             0,
             0,
             &mut io_status,
-            IOCTL_ODD_AUTH_STATE,
+            IoControlCode::ODD_AUTH_STATE,
             core::ptr::null(),
             0,
             state.as_mut_ptr(),
@@ -1381,7 +1377,7 @@ impl commands::hardware::Backend for Console {
         buffer: &mut [u8],
     ) -> Result<(), XamError> {
         // SAFETY: `buffer` is valid for its length; the request is synchronous.
-        XamError::check(Hresult(unsafe {
+        XamError::check(unsafe {
             xam::XMsgStartIORequest(
                 app.0,
                 message.0,
@@ -1389,7 +1385,7 @@ impl commands::hardware::Backend for Console {
                 buffer.as_mut_ptr(),
                 buffer.len() as u32,
             )
-        }))
+        })
     }
 
     fn play_to(&mut self, command: PlayToCommand) -> Result<PlayToState, XamError> {
@@ -1406,7 +1402,7 @@ impl commands::hardware::Backend for Console {
                 12,
             )
         };
-        XamError::check(Hresult(result))?;
+        XamError::check(result)?;
         Ok(PlayToState {
             xmp_heap: output[0],
             play_to: output[1],

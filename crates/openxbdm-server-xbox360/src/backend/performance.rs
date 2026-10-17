@@ -43,6 +43,8 @@ use xbox360::module::module_handle;
 use xbox360::module::resolve_export;
 use xbox360::time::TickCount;
 use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::SmcCommand;
+use xbox360_sys::xboxkrnl::SmcMessage;
 use xbox360_sys::xboxkrnl::VdGetCurrentDisplayInformation;
 use xbox360_sys::xboxkrnl::VdReadDVERegisterUlong;
 use xbox360_sys::xboxkrnl::VdWriteDVERegisterUlong;
@@ -66,8 +68,6 @@ const ENCODER_ID_REGISTER: u32 = 0xfe;
 const ENCODER_EXTENDED_ID: u32 = 0x1_0000;
 /// Kernel export that reads an EDID block.
 const EDID_EXPORT: Ordinal = Ordinal::new(623).unwrap();
-/// SMC message that carries an I2C transfer.
-const SMC_I2C: u8 = 0x11;
 /// Extended registers whose writes are bracketed by bus requests.
 const BRACKETED_REGISTERS: core::ops::RangeInclusive<u32> = 0x1d0..=0x1f5;
 
@@ -225,12 +225,11 @@ impl Console {
 
 /// Send one SMC I2C message carrying `flags` in byte 1.
 fn send_i2c_request(flags: u8) {
-    let mut message = [0u8; 16];
-    let mut reply = [0u8; 16];
-    message[0] = SMC_I2C;
-    message[1] = flags;
-    // SAFETY: `message` and `reply` are live 16-byte SMC buffers.
-    unsafe { xboxkrnl::HalSendSMCMessage(message.as_ptr(), reply.as_mut_ptr()) };
+    let mut message = SmcMessage::new(SmcCommand::I2c);
+    let mut reply = SmcMessage::default();
+    message.0[1] = flags;
+    // SAFETY: `message` and `reply` are live SMC messages.
+    unsafe { xboxkrnl::HalSendSMCMessage(&message, &mut reply) };
 }
 
 impl performance::Backend for Console {
@@ -274,7 +273,7 @@ impl performance::Backend for Console {
         let front_buffer = read_register(DISPLAY_FRONT_BUFFER);
         let mut information = [0u32; 0x18];
         // SAFETY: `information` is a live 0x60-byte display information block.
-        unsafe { VdGetCurrentDisplayInformation(information.as_mut_ptr()) };
+        unsafe { VdGetCurrentDisplayInformation(information.as_mut_ptr().cast()) };
         let gamma = (read_register(DISPLAY_GAMMA) >> 8) & 7 != 0;
         DisplayCapture {
             display: DisplayInformation {
@@ -322,30 +321,29 @@ impl performance::Backend for Console {
     /// One-byte I2C write to device 0x39 (0x100..0x1ff) or 0x3d
     /// (0x200..0x2ff), as stock 0x91f23f00.
     fn write_video_encoder_extended(&mut self, register: u32, value: u8) {
-        let mut message = [0u8; 16];
-        let mut reply = [0u8; 16];
-        message[0] = SMC_I2C;
-        message[1] = 2 << 4;
-        message[3] = 0x80 | if register > 0x1ff { 0x3d } else { 0x39 };
-        message[6] = register as u8;
-        message[7] = value;
+        let mut message = SmcMessage::new(SmcCommand::I2c);
+        let mut reply = SmcMessage::default();
+        message.0[1] = 2 << 4;
+        message.0[3] = 0x80 | if register > 0x1ff { 0x3d } else { 0x39 };
+        message.0[6] = register as u8;
+        message.0[7] = value;
         let bracketed = BRACKETED_REGISTERS.contains(&register);
         let bus_requests = hardware_flags().bits() & 0xf000_0000 != 0;
         if bracketed {
-            message[1] |= 1;
+            message.0[1] |= 1;
             if bus_requests {
                 send_i2c_request(3);
             }
         }
-        // SAFETY: `message` and `reply` are live 16-byte SMC buffers.
-        unsafe { xboxkrnl::HalSendSMCMessage(message.as_ptr(), reply.as_mut_ptr()) };
+        // SAFETY: `message` and `reply` are live SMC messages.
+        unsafe { xboxkrnl::HalSendSMCMessage(&message, &mut reply) };
         if bracketed && bus_requests {
             send_i2c_request(5);
         }
-        if reply[1] != 0 {
+        if reply.0[1] != 0 {
             pmc::print(
                 c"BD: Failed to write I2C bus address %X, error code %u\n",
-                &[u64::from(register), u64::from(reply[1])],
+                &[u64::from(register), u64::from(reply.0[1])],
             );
         }
     }

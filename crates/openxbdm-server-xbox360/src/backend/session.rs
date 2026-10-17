@@ -112,7 +112,6 @@ const TITLE_PROCESS: u32 = 1;
 const THREAD_ID: u32 = 0x14c;
 const THREAD_PROCESSOR: u32 = 0xbf;
 const THREAD_LAST_ERROR: u32 = 0x160;
-const THREAD_PROCESS_TYPE: u32 = 0x72;
 
 /// Platform state of this domain owned by the server thread.
 pub struct Data {
@@ -876,13 +875,15 @@ unsafe impl Sync for WriterCell {}
 static TELL_LOG_WRITER: WriterCell = WriterCell(UnsafeCell::new(TellLogWriter::new()));
 
 fn tell_log_engine() -> Option<Engine> {
-    Engine::new(TELL_LOG.engine.load(Ordering::SeqCst))
+    // SAFETY: the cell holds 0 or the engine tell_log_start created;
+    // tell_log_stop clears it before any other use of a closed engine.
+    unsafe { Engine::new(TELL_LOG.engine.load(Ordering::SeqCst)) }
 }
 
 /// Engine callback of the log (stock 0x91f51938): collect the entry text
 /// and write the collection to the log file. The state is static, so the
 /// context is not read.
-extern "C" fn tell_log_write(_context: u32, entry: u32, length: u32) -> u32 {
+extern "C" fn tell_log_write(_context: u32, entry: u32, length: u32) -> Hresult {
     // SAFETY: only the worker of the open log calls the writer.
     let writer = unsafe { &mut *TELL_LOG_WRITER.0.get() };
     // SAFETY: the worker passes an entry of `length` bytes.
@@ -892,8 +893,8 @@ extern "C" fn tell_log_write(_context: u32, entry: u32, length: u32) -> u32 {
     let closing = TELL_LOG.closing.load(Ordering::Acquire);
     let mut write = |bytes: &[u8]| write_log(file, bytes);
     match writer.process(entry, closing, &mut write) {
-        Ok(()) => TELL_LOG_STATUS_FLAG,
-        Err(error) => Hresult::from(error).0,
+        Ok(()) => Hresult(TELL_LOG_STATUS_FLAG),
+        Err(error) => Hresult::from(error),
     }
 }
 
@@ -936,7 +937,7 @@ impl TellLogBackend for Console {
         let context = &TELL_LOG as *const TellLog as usize as u32;
         match log_engine::create_for_callback(
             context,
-            tell_log_write as *const () as usize as u32,
+            tell_log_write,
             config,
         ) {
             Ok(engine) => {
@@ -960,8 +961,7 @@ impl TellLogBackend for Console {
     fn tell_log_close(&mut self) -> Option<TellLogCounters> {
         let engine = tell_log_engine()?;
         TELL_LOG.closing.store(true, Ordering::SeqCst);
-        let record = 0u8;
-        log_engine::write(engine, &record as *const u8 as usize as u32, 1);
+        log_engine::write(engine, &[0]);
         Some(log_engine::counters(engine))
     }
 
@@ -972,7 +972,9 @@ impl TellLogBackend for Console {
         while TELL_LOG.producers.load(Ordering::SeqCst) != 0 {
             sleep(Duration::from_millis(1));
         }
-        log_engine::close_after_worker(engine);
+        // SAFETY: producers have left and the closing flag keeps new ones
+        // out; the engine cell is cleared next.
+        unsafe { log_engine::close_after_worker(engine) };
         TELL_LOG.engine.store(0, Ordering::SeqCst);
         TELL_LOG.worker.store(0, Ordering::Release);
         TELL_LOG.area.store(0, Ordering::Release);
@@ -994,7 +996,11 @@ pub(crate) fn service_tell_log_record(argument: u32) -> u32 {
         let length = read_u32(argument) >> 16;
         let text = read_u32(argument + 4);
         if length != 0 && text != 0 {
-            log_engine::write(engine, text, length);
+            // SAFETY: control code 0x88 contract: the record's text holds
+            // `length` bytes.
+            let record =
+                unsafe { core::slice::from_raw_parts(text as usize as *const u8, length as usize) };
+            log_engine::write(engine, record);
         }
     }
     TELL_LOG.producers.fetch_sub(1, Ordering::SeqCst);

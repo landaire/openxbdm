@@ -1,459 +1,555 @@
 //! Hash table 'LFHT' (exports 330-338): an array of sorted lists, each
-//! headed by a sentinel node, selected by the hash routine.
-//!
-//! Object (0x80 bytes, then the allocator record and the sorted container
-//! options): +0x00 free nodes (tagged), +0x08 bucket array, +0x0c bucket
-//! count, +0x10 free node credits, +0x14 free node semaphore, +0x18
-//! blocked removers, +0x1c item count, +0x20 item semaphore, +0x28 node
-//! blocks (tagged), +0x30 nodes per block, +0x34 nodes the limit allows,
-//! +0x38 node total, +0x3c bytes allocated, +0x40 signature, +0x6c
-//! allocation base, +0x70 bucket array allocation base, +0x74 allocator
-//! record, +0x78 options. A bucket is 8 bytes: +0 sentinel node, +4 zero.
-//! Nodes are those of the priority queue. The semaphores are handles,
-//! which stock never closes.
+//! headed by a sentinel node, selected by the hash routine. The nodes are
+//! those of the priority queue. The semaphores are handles, which stock
+//! never closes.
+
+use core::mem::offset_of;
+use core::ptr;
+use core::slice;
+use core::sync::atomic::AtomicU32;
+use core::sync::atomic::Ordering::Relaxed;
 
 use openxbdm_core::status::Hresult;
+use xbox360::atomic::Interlocked32;
+use xbox360_sys::processor::lwsync;
+use xbox360_sys::xboxkrnl::Handle;
 
-use super::ALLOCATOR_SIZE;
-use super::Allocator;
-use super::CREATE_FAILED;
+use super::AllocatorRecord;
 use super::Creation;
-use super::Failure;
-use super::Object;
-use super::SUCCESS;
+use super::Error;
+use super::ItemOrder;
+use super::Layout;
+use super::ListNode;
+use super::NodeAddress;
+use super::NodeWord;
+use super::Nodes;
+use super::OutputWord;
+use super::Routine;
 use super::SemaphoreKind;
-use super::Shape;
-use super::Side;
-use super::UNLIMITED;
+use super::Signature;
+use super::Supply;
+use super::TaggedList;
 use super::Wait;
-use super::call;
-use super::close_handle;
-use super::compare_exchange;
-use super::copy;
-use super::counts;
+use super::claim;
+use super::close_semaphore;
+use super::container;
 use super::create_semaphore;
-use super::exchange;
-use super::export_result;
-use super::fetch_add;
-use super::fetch_sub;
 use super::insert_result;
-use super::load;
-use super::lwsync;
-use super::options_wait;
 use super::priority::Blocking;
 use super::priority::Handoff;
 use super::priority::Item;
 use super::priority::Key;
-use super::priority::RECORD;
-use super::priority::SORTED_OPTIONS_SIZE;
 use super::priority::Search;
-use super::priority::VALUE;
-use super::priority::first;
-use super::priority::insert;
-use super::priority::insert_options;
-use super::priority::occupied;
-use super::priority::remove;
-use super::priority::sorted_options;
-use super::read_field;
-use super::remove_result;
-use super::store;
-use super::walk;
-use super::zero;
+use super::priority::SortedList;
+use super::priority::SortedOptions;
+use super::removed;
+use super::report;
+use super::success_result;
 use crate::exports::export;
 
-const LFHT: u32 = u32::from_be_bytes(*b"LFHT");
-const ARRAY: usize = 0x08;
-const BUCKETS: usize = 0x0c;
-const BASE: u8 = 0x6c;
-const ARRAY_BASE: u8 = 0x70;
-/// Bytes of the object before the allocator record.
-const OBJECT_SIZE: u32 = 0x80;
-const NODE_SIZE: u8 = 0x10;
-/// Largest bucket count.
-const BUCKET_LIMIT: u32 = 0x0fff_ffff;
+/// Hash table object (caller-visible, 0x80 bytes, then the allocator record
+/// and the sorted options).
+#[repr(C, align(8))]
+struct HashTable {
+    /// Free nodes, linked through their value word.
+    free: TaggedList,
+    /// Address of the bucket array.
+    buckets: AtomicU32,
+    bucket_count: AtomicU32,
+    supply: Supply,
+    signature: AtomicU32,
+    _reserved_44: [AtomicU32; 10],
+    /// Base of the allocation that holds the table.
+    allocation: AtomicU32,
+    /// Base of the allocation that holds the bucket array.
+    bucket_allocation: AtomicU32,
+    /// Address of the allocator record after the table.
+    allocator: AtomicU32,
+    /// Address of the sorted options after the allocator record.
+    options: AtomicU32,
+    _reserved_7c: AtomicU32,
+}
 
-static SHAPE: Shape = Shape {
-    signature: LFHT,
-    tag: 0x40,
-    credits: 0x10,
-    free_semaphore: 0x14,
-    waiters: 0x18,
-    item_semaphore: 0x20,
-    count: 0x1c,
-    blocks: 0x28,
-    grow: 0x30,
-    remaining: 0x34,
-    total: 0x38,
-    memory: 0x3c,
-    allocator: 0x74,
-    options: 0x78,
-    node_size: NODE_SIZE,
-    link: 8,
-    semaphores: SemaphoreKind::GatedHandle,
+const _: () = {
+    use core::mem::offset_of;
+    assert!(offset_of!(HashTable, buckets) == 0x08);
+    assert!(offset_of!(HashTable, bucket_count) == 0x0c);
+    assert!(offset_of!(HashTable, supply) == 0x10);
+    assert!(offset_of!(HashTable, signature) == 0x40);
+    assert!(offset_of!(HashTable, allocation) == 0x6c);
+    assert!(offset_of!(HashTable, bucket_allocation) == 0x70);
+    assert!(offset_of!(HashTable, allocator) == 0x74);
+    assert!(offset_of!(HashTable, options) == 0x78);
+    assert!(size_of::<HashTable>() == 0x80);
 };
 
-/// Address of bucket `index`.
-fn bucket_at(table: Object, index: u32) -> usize {
-    load(table.base + ARRAY).wrapping_add(index.wrapping_mul(8)) as usize
+/// Bucket (8 bytes).
+#[repr(C)]
+struct Bucket {
+    /// Address of the sentinel node of the bucket's list.
+    sentinel: AtomicU32,
+    zero: AtomicU32,
 }
 
-fn bucket_count(table: Object) -> u32 {
-    load(table.base + BUCKETS)
-}
+static LAYOUT: Layout = Layout {
+    node_size: size_of::<ListNode>() as u32,
+    link: NodeWord::Word2,
+    semaphores: SemaphoreKind::GatedHandle,
+    items: ItemOrder::CountFirst,
+};
 
-/// Bucket of `key` by the hash routine.
-fn bucket(table: Object, key: Key) -> usize {
-    let index = call(load(table.options() + 4), key.0, bucket_count(table), 0, 0);
-    bucket_at(table, index)
-}
+impl HashTable {
+    const SIZE: u32 = size_of::<Self>() as u32;
+    /// Largest bucket count.
+    const MAX_BUCKETS: u32 = 0x0fff_ffff;
 
-/// Close the item semaphore, then the free node semaphore.
-fn close_semaphores(table: Object) {
-    for offset in [SHAPE.item_semaphore, SHAPE.free_semaphore] {
-        let handle = load(table.field(offset));
-        if handle != 0 {
-            close_handle(handle);
-        }
+    /// The table at `handle`.
+    ///
+    /// # Safety
+    ///
+    /// `handle` is 0 or the address of a hash table (export contract) that
+    /// stays allocated for `'a`.
+    unsafe fn from_handle<'a>(handle: u32) -> Option<&'a Self> {
+        // SAFETY: the caller guarantees the table.
+        unsafe { container(handle, Signature::HASH_TABLE, offset_of!(Self, signature)) }
     }
-}
 
-/// Take a block of at least `minimum` nodes within the limit, in a
-/// multiple of the nodes per block.
-fn grow_at_least(table: Object, minimum: u32) -> Option<u32> {
-    let step = load(table.field(SHAPE.grow));
-    let mut nodes = step;
-    while (nodes as i32) < minimum as i32 {
-        nodes = nodes.wrapping_add(step);
+    fn nodes(&self) -> Nodes<'_> {
+        // SAFETY: the parts of this table, which creation set up with the
+        // sorted node layout.
+        unsafe { Nodes::new(&self.free, &self.supply, &self.allocator, &LAYOUT) }
     }
-    let remaining = table.field(SHAPE.remaining);
-    loop {
-        let left = load(remaining);
-        if (left as i32) < 0 {
-            break;
-        }
-        if left == 0 {
-            return None;
-        }
-        if nodes as i32 > left as i32 {
-            nodes = left;
-        }
-        if (nodes as i32) < minimum as i32 {
-            return None;
-        }
-        if compare_exchange(remaining, left, left.wrapping_sub(nodes)) == left {
-            break;
-        }
-    }
-    table.populate(nodes)
-}
 
-fn create(buckets: u32, creation: &Creation) -> Option<Object> {
-    if buckets as i32 <= 0 || buckets > BUCKET_LIMIT {
-        return None;
+    fn options(&self) -> &SortedOptions {
+        // SAFETY: creation stores the address of the sorted options it wrote
+        // after the allocator record.
+        unsafe { &*ptr::with_exposed_provenance(self.options.load(Relaxed) as usize) }
     }
-    let mut memory = 0u32;
-    let counter = &raw mut memory as usize;
-    let allocator = Allocator::of(&creation.allocator);
-    let (base, raw) =
-        allocator.allocate_aligned(OBJECT_SIZE + ALLOCATOR_SIZE + SORTED_OPTIONS_SIZE, counter)?;
-    let Some((array, array_raw)) = allocator.allocate_aligned(buckets * 8, counter) else {
-        allocator.free(raw);
-        return None;
-    };
-    let base = base as usize;
-    let table = Object {
-        base,
-        shape: &SHAPE,
-    };
-    zero(array as usize, buckets as usize * 8);
-    zero(base, OBJECT_SIZE as usize);
-    store(base + BUCKETS, buckets);
-    store(base + ARRAY, array);
-    store(table.field(BASE), raw);
-    store(table.field(ARRAY_BASE), array_raw);
-    store(table.field(SHAPE.memory), load(counter));
-    let record = base + OBJECT_SIZE as usize;
-    store(table.field(SHAPE.allocator), record as u32);
-    copy(
-        record,
-        creation.allocator.as_ptr() as usize,
-        ALLOCATOR_SIZE as usize,
-    );
-    store(table.field(SHAPE.options), record as u32 + ALLOCATOR_SIZE);
-    let (initial, limit) = counts(creation.initial, creation.limit, u32::from(NODE_SIZE));
-    store(table.field(SHAPE.grow), initial);
-    store(table.field(SHAPE.remaining), limit.unwrap_or(UNLIMITED));
-    let mut created = true;
-    if creation.item_wait() {
-        let handle = create_semaphore();
-        store(table.field(SHAPE.item_semaphore), handle);
-        created = handle != 0;
+
+    /// Whether the signature is still in place; stock checks it again
+    /// inside each operation.
+    fn is_live(&self) -> bool {
+        Signature::HASH_TABLE.is_in(&self.signature)
     }
-    if created && creation.free_wait() && limit.is_some() {
-        let handle = create_semaphore();
-        store(table.field(SHAPE.free_semaphore), handle);
-        if handle == 0 {
-            close_semaphores(table);
-            created = false;
+
+    fn buckets(&self) -> &[Bucket] {
+        let address = self.buckets.load(Relaxed);
+        let count = self.bucket_count.load(Relaxed);
+        // SAFETY: creation stores the address and count of the bucket array
+        // it allocated, which stays until destroy.
+        unsafe {
+            slice::from_raw_parts(
+                ptr::with_exposed_provenance(address as usize),
+                count as usize,
+            )
         }
     }
-    if created {
-        if let Some(sentinel) = grow_at_least(table, buckets) {
-            let credits = table.field(SHAPE.credits);
-            let free_wait = table.free_semaphore().is_some();
-            for index in 0..buckets {
-                // The block holds a node for every bucket.
-                let Some(node) = (if index == 0 {
-                    Some(sentinel)
-                } else {
-                    table.pop_node()
-                }) else {
-                    unreachable!()
-                };
-                if free_wait {
-                    store(credits, load(credits).wrapping_sub(1));
-                }
-                store(node as usize, 0);
-                store(node as usize + 4, 0);
-                let bucket = bucket_at(table, index);
-                store(bucket, node);
-                store(bucket + 4, 0);
+
+    /// Bucket of `key` by the hash routine.
+    fn bucket(&self, key: Key) -> &Bucket {
+        let buckets = self.buckets();
+        let index = self.options().hash.call(key.0, buckets.len() as u32, 0, 0);
+        // SAFETY: a hash routine returns an index below the bucket count: the
+        // default masks the key's hash with the power-of-two count less one,
+        // and the export contract requires it of caller routines.
+        unsafe { buckets.get_unchecked(index as usize) }
+    }
+
+    fn list<'a>(&'a self, nodes: &'a Nodes<'a>, bucket: &'a Bucket) -> SortedList<'a> {
+        // SAFETY: a bucket of this table, whose sentinel word names a node
+        // of the table; `nodes` are the table's.
+        unsafe { SortedList::new(&bucket.sentinel, nodes, self.options()) }
+    }
+
+    /// Close the item semaphore, then the free node semaphore.
+    fn close_semaphores(&self) {
+        close_semaphore(self.nodes().item_words().0);
+        close_semaphore(&self.supply.free_semaphore);
+    }
+
+    /// Take a block of at least `minimum` nodes within the limit, in a
+    /// multiple of the nodes per block.
+    fn grow_at_least(&self, nodes: &Nodes<'_>, minimum: u32) -> Option<NodeAddress> {
+        let step = self.supply.per_block.load(Relaxed);
+        let mut wanted = step;
+        while (wanted as i32) < minimum as i32 {
+            wanted = wanted.wrapping_add(step);
+        }
+        let claimed = self.supply.remaining.claim_at_least(wanted, minimum)?;
+        nodes.populate(claimed)
+    }
+
+    fn create(
+        buckets: u32,
+        creation: &Creation,
+        options: &SortedOptions,
+    ) -> Result<&'static Self, Error> {
+        if buckets as i32 <= 0 || buckets > Self::MAX_BUCKETS {
+            return Err(Error::NotEnoughMemory);
+        }
+        let memory = AtomicU32::new(0);
+        let allocator = &creation.allocator;
+        let size = Self::SIZE + AllocatorRecord::SIZE + size_of::<SortedOptions>() as u32;
+        let allocation = allocator
+            .allocate_aligned(size, &memory)
+            .ok_or(Error::NotEnoughMemory)?;
+        let array_size = buckets * size_of::<Bucket>() as u32;
+        let Some(array) = allocator.allocate_aligned(array_size, &memory) else {
+            allocator.free(allocation.base);
+            return Err(Error::NotEnoughMemory);
+        };
+        let array_object = ptr::with_exposed_provenance_mut::<Bucket>(array.aligned.get() as usize);
+        let object = ptr::with_exposed_provenance_mut::<Self>(allocation.aligned.get() as usize);
+        // SAFETY: the new allocations hold the bucket array, and the object
+        // with the allocator record and the sorted options, aligned to at
+        // least 8 bytes; zero bytes are valid buckets and a valid table.
+        let table = unsafe {
+            array_object.write_bytes(0, buckets as usize);
+            object.write_bytes(0, 1);
+            &*object
+        };
+        table.bucket_count.store(buckets, Relaxed);
+        table.buckets.store(array.aligned.get(), Relaxed);
+        table.allocation.store(allocation.base, Relaxed);
+        table.bucket_allocation.store(array.base, Relaxed);
+        table.supply.memory.store(memory.load(Relaxed), Relaxed);
+        let record = object.wrapping_add(1).cast::<AllocatorRecord>();
+        table
+            .allocator
+            .store(record.expose_provenance() as u32, Relaxed);
+        let sorted = record.wrapping_add(1).cast::<SortedOptions>();
+        // SAFETY: the record follows the object inside the allocation.
+        unsafe { record.write(*allocator) };
+        table
+            .options
+            .store(sorted.expose_provenance() as u32, Relaxed);
+        let counts = creation.counts(LAYOUT.node_size);
+        table.supply.per_block.store(counts.per_block, Relaxed);
+        table.supply.remaining.set(counts.limit);
+        let nodes = table.nodes();
+        let (item_semaphore, _) = nodes.item_words();
+        let mut created = true;
+        if creation.item_wait() {
+            let handle = create_semaphore();
+            item_semaphore.store(handle.map_or(0, Handle::raw), Relaxed);
+            created = handle.is_some();
+        }
+        if created && creation.free_wait() && counts.limit.is_some() {
+            let handle = create_semaphore();
+            table
+                .supply
+                .free_semaphore
+                .store(handle.map_or(0, Handle::raw), Relaxed);
+            if handle.is_none() {
+                table.close_semaphores();
+                created = false;
             }
-            store(table.field(SHAPE.tag), LFHT);
-            lwsync();
-            return Some(table);
         }
-        close_semaphores(table);
+        if created {
+            if let Some(sentinel) = table.grow_at_least(&nodes, buckets) {
+                let credits = &table.supply.credits;
+                let free_wait = nodes.free_semaphore().is_some();
+                for (index, bucket) in table.buckets().iter().enumerate() {
+                    // The block holds a node for every bucket.
+                    let Some(node) = (if index == 0 {
+                        Some(sentinel)
+                    } else {
+                        nodes.pop_free()
+                    }) else {
+                        unreachable!()
+                    };
+                    if free_wait {
+                        credits.store(credits.load(Relaxed).wrapping_sub(1), Relaxed);
+                    }
+                    // SAFETY: a node of the new block.
+                    let sentinel = unsafe { node.get::<ListNode, _>(table) };
+                    sentinel.next.high.store(0, Relaxed);
+                    sentinel.next.low.store(0, Relaxed);
+                    bucket.sentinel.store(node.raw(), Relaxed);
+                    bucket.zero.store(0, Relaxed);
+                }
+                table.signature.store(Signature::HASH_TABLE.0, Relaxed);
+                lwsync();
+                // Stock copies the options after the barrier that publishes
+                // the table, before it returns the handle.
+                // SAFETY: the options follow the record inside the
+                // allocation.
+                unsafe { sorted.write(*options) };
+                return Ok(table);
+            }
+            table.close_semaphores();
+        }
+        allocator.free(array.base);
+        allocator.free(allocation.base);
+        Err(Error::NotEnoughMemory)
     }
-    let allocator = table.allocator();
-    allocator.free(array_raw);
-    allocator.free(raw);
-    None
-}
 
-/// Remove from each bucket in turn without waiting; the error carries the
-/// failure of the last bucket, `None` when there is none.
-fn sweep(table: Object, item: &mut Item, wait: &Wait) -> Result<(), Option<Failure>> {
-    let mut last = None;
-    let mut index = 0;
-    while (index as i32) < bucket_count(table) as i32 {
-        let result = if valid(table) {
-            remove(
-                table,
-                bucket_at(table, index),
+    /// Clear the signature of the table at `handle` and free it; the
+    /// semaphore handles stay open, as stock.
+    ///
+    /// # Safety
+    ///
+    /// `handle` is 0 or the address of a hash table (export contract) on
+    /// which no other operation runs, now or later.
+    unsafe fn destroy(handle: u32) {
+        // SAFETY: the caller guarantees the table. The reference is not used
+        // once the table is freed.
+        let Some(table) =
+            (unsafe { claim::<Self>(handle, Signature::HASH_TABLE, offset_of!(Self, signature)) })
+        else {
+            return;
+        };
+        let bucket_allocation = table.bucket_allocation.load(Relaxed);
+        let allocation = table.allocation.load(Relaxed);
+        let allocator = *table.nodes().allocator();
+        // SAFETY: the block list of the table, which no operation uses
+        // anymore.
+        unsafe { allocator.free_blocks(&table.supply.blocks) };
+        allocator.free(bucket_allocation);
+        allocator.free(allocation);
+        lwsync();
+    }
+
+    /// Remove from each bucket in turn without waiting; the error carries
+    /// the failure of the last bucket, nothing when there is none.
+    fn sweep(&self, nodes: &Nodes<'_>, item: &mut Item, wait: &Wait) -> Result<(), Option<Error>> {
+        let mut last = None;
+        for bucket in self.buckets() {
+            let result = if self.is_live() {
+                self.list(nodes, bucket).remove(
+                    item,
+                    wait,
+                    Search::First,
+                    Blocking::Once,
+                    Handoff::Items,
+                )
+            } else {
+                Err(Error::InvalidArgument)
+            };
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last)
+    }
+
+    /// Remove an item by key, or any item with [`Search::First`].
+    fn remove(&self, item: &mut Item, wait: &Wait, search: Search) -> Result<(), Error> {
+        if !self.is_live() {
+            return Err(Error::InvalidArgument);
+        }
+        let nodes = self.nodes();
+        if search != Search::First {
+            let bucket = self.bucket(item.key);
+            if !self.is_live() {
+                return Err(Error::InvalidArgument);
+            }
+            return self.list(&nodes, bucket).remove(
                 item,
                 wait,
-                Search::First,
-                Blocking::Once,
+                search,
+                Blocking::Wait,
                 Handoff::Items,
-            )
-        } else {
-            Err(Failure::InvalidParameter)
-        };
-        match result {
+            );
+        }
+        let last = match self.sweep(&nodes, item, wait) {
             Ok(()) => return Ok(()),
-            Err(failure) => last = Some(failure),
-        }
-        index += 1;
-    }
-    Err(last)
-}
-
-/// Whether the signature is still in place; stock checks it again inside
-/// each operation.
-fn valid(table: Object) -> bool {
-    load(table.field(SHAPE.tag)) == LFHT
-}
-
-/// Remove an item by key, or any item with [`Search::First`].
-fn remove_item(table: Object, item: &mut Item, wait: &Wait, search: Search) -> Result<(), Failure> {
-    if !valid(table) {
-        return Err(Failure::InvalidParameter);
-    }
-    if search != Search::First {
-        let bucket = bucket(table, item.key);
-        if !valid(table) {
-            return Err(Failure::InvalidParameter);
-        }
-        return remove(
-            table,
-            bucket,
-            item,
-            wait,
-            search,
-            Blocking::Wait,
-            Handoff::Items,
-        );
-    }
-    let last = match sweep(table, item, wait) {
-        Ok(()) => return Ok(()),
-        Err(last) => last,
-    };
-    let Some(semaphore) = table.item_semaphore() else {
-        // A table without buckets reports success, as stock.
-        return match last {
-            Some(failure) => Err(failure),
-            None => Ok(()),
+            Err(last) => last,
         };
-    };
-    let waiters = table.field(SHAPE.waiters);
-    fetch_add(waiters, 1);
-    if sweep(table, item, wait).is_ok() {
-        fetch_sub(waiters, 1);
-        return Ok(());
+        let Some(semaphore) = nodes.item_semaphore() else {
+            // A table without buckets reports success, as stock.
+            return last.map_or(Ok(()), Err);
+        };
+        let waiters = &self.supply.waiters;
+        waiters.fetch_add_relaxed(1);
+        if self.sweep(&nodes, item, wait).is_ok() {
+            waiters.fetch_add_relaxed(1_u32.wrapping_neg());
+            return Ok(());
+        }
+        // Stock reports success after the wait without removing an item and
+        // leaves the remover counted as waiting.
+        let result = wait.block(semaphore);
+        if result.is_err() {
+            waiters.fetch_add_relaxed(1_u32.wrapping_neg());
+        }
+        result
     }
-    // Stock reports success after the wait without removing an item and
-    // leaves the remover counted as waiting.
-    let result = wait.block(semaphore);
-    if result.is_err() {
-        fetch_sub(waiters, 1);
+
+    /// Remove an item (by key with [`Search::Exact`]); its value.
+    fn take(&self, key: Key, search: Search) -> Result<u32, Error> {
+        let wait = self.options().remove_wait();
+        let mut item = Item { value: 0, key };
+        self.remove(&mut item, &wait, search)?;
+        Ok(item.value)
     }
-    result
+
+    fn insert(&self, item: Item) -> Result<(), Error> {
+        let (wait, search) = self.options().insert_wait();
+        if !self.is_live() {
+            return Err(Error::InvalidArgument);
+        }
+        let bucket = self.bucket(item.key);
+        if !self.is_live() {
+            return Err(Error::InvalidArgument);
+        }
+        let nodes = self.nodes();
+        self.list(&nodes, bucket).insert(item, &wait, search)
+    }
+
+    /// Whether every bucket is empty; a bucket checked after the signature
+    /// is gone counts as empty.
+    fn is_empty(&self) -> bool {
+        let nodes = self.nodes();
+        !self
+            .buckets()
+            .iter()
+            .any(|bucket| self.is_live() && self.list(&nodes, bucket).is_occupied())
+    }
+
+    /// `callback(context, value, node)` bucket by bucket in key order until
+    /// one returns nonzero.
+    fn enumerate(&self, context: u32, callback: Option<Routine>) -> Result<(), Error> {
+        let nodes = self.nodes();
+        for bucket in self.buckets() {
+            let Some(callback) = callback.filter(|_| self.is_live()) else {
+                return Err(Error::InvalidArgument);
+            };
+            self.list(&nodes, bucket).enumerate(context, callback)?;
+        }
+        Ok(())
+    }
 }
 
-extern "C" fn insert_export(table: u32, key: u32, value: u32) -> u32 {
-    let Some(table) = Object::validate(table, &SHAPE) else {
-        return Hresult::INVALID_ARGUMENT.0;
+extern "C" fn insert(table: u32, key: u32, value: u32) -> Hresult {
+    // SAFETY: export 330 contract: `table` is 0 or a hash table of export
+    // 332.
+    let Some(table) = (unsafe { HashTable::from_handle(table) }) else {
+        return Hresult::INVALID_ARGUMENT;
     };
-    let (wait, search) = insert_options(table.options() + RECORD);
-    if !valid(table) {
-        return Hresult::INVALID_ARGUMENT.0;
-    }
-    let key = Key(key);
-    let bucket = bucket(table, key);
-    if !valid(table) {
-        return Hresult::INVALID_ARGUMENT.0;
-    }
-    insert_result(insert(table, bucket, Item { value, key }, &wait, search))
+    insert_result(table.insert(Item {
+        value,
+        key: Key(key),
+    }))
 }
-export!(330, insert_export);
+export!(330, insert);
 
-extern "C" fn memory(table: u32, output: u32) -> u32 {
-    read_field(table, &SHAPE, SHAPE.memory, output)
+extern "C" fn memory(table: u32, output_word: u32) -> Hresult {
+    // SAFETY: export 331 contract: `table` is 0 or a hash table of export
+    // 332; `output_word` is 0 or a writable word.
+    let (table, output_word) =
+        unsafe { (HashTable::from_handle(table), OutputWord::new(output_word)) };
+    report(
+        table.map(|table| table.supply.memory.load(Relaxed)),
+        output_word,
+    )
 }
 export!(331, memory);
 
 /// `compare` is an optional compare descriptor. The bucket count rounds up
 /// to a power of two unless it supplies a hash routine.
-extern "C" fn create_export(descriptor: u32, compare: u32, buckets: u32, output: u32) -> u32 {
-    if output == 0 {
-        return Hresult::INVALID_ARGUMENT.0;
+extern "C" fn create(descriptor: u32, compare: u32, buckets: u32, output_word: u32) -> Hresult {
+    // SAFETY: export 332 contract: `output_word` is 0 or a writable word.
+    let Some(output_word) = (unsafe { OutputWord::new(output_word) }) else {
+        return Hresult::INVALID_ARGUMENT;
+    };
+    output_word.store(0);
+    // Zero or above i32::MAX.
+    if buckets as i32 <= 0 {
+        return Hresult::INVALID_ARGUMENT;
     }
-    store(output as usize, 0);
-    if buckets == 0 || buckets & 0x8000_0000 != 0 {
-        return Hresult::INVALID_ARGUMENT.0;
-    }
-    let creation = match Creation::read(descriptor) {
-        Ok(creation) => creation,
-        Err(error) => return Hresult::from(error).0,
-    };
-    let options = match sorted_options(&creation, compare) {
-        Ok(options) => options,
-        Err(error) => return Hresult::from(error).0,
-    };
-    let buckets = if options.custom_hash {
-        buckets
-    } else {
-        buckets.next_power_of_two()
-    };
-    let Some(table) = create(buckets, &creation) else {
-        return CREATE_FAILED.0;
-    };
-    copy(
-        table.options(),
-        options.words.as_ptr() as usize,
-        SORTED_OPTIONS_SIZE as usize,
-    );
-    store(output as usize, table.base as u32);
-    SUCCESS.0
-}
-export!(332, create_export);
-
-/// Always 1, as stock; the semaphore handles stay open.
-extern "C" fn destroy(table: u32) -> u32 {
-    if table != 0 && exchange(table as usize + usize::from(SHAPE.tag), 0) == LFHT {
-        Object {
-            base: table as usize,
-            shape: &SHAPE,
+    // SAFETY: export 332 contract: `descriptor` is 0 or a creation
+    // descriptor and `compare` 0 or a compare descriptor.
+    let created = unsafe { Creation::read(descriptor) }.and_then(|creation| {
+        // SAFETY: as above.
+        let sorted = unsafe { SortedOptions::read(&creation, compare) }?;
+        let buckets = if sorted.custom_hash {
+            buckets
+        } else {
+            buckets.next_power_of_two()
+        };
+        HashTable::create(buckets, &creation, &sorted.options)
+    });
+    match created {
+        Ok(table) => {
+            output_word.store(ptr::from_ref(table).expose_provenance() as u32);
+            Hresult::SUCCESS
         }
-        .free_storage(&[ARRAY_BASE, BASE]);
+        Err(error) => error.into(),
     }
+}
+export!(332, create);
+
+/// Always 1, as stock.
+extern "C" fn destroy(table: u32) -> u32 {
+    // SAFETY: export 333 contract: `table` is 0 or a hash table of export
+    // 332 on which no other operation runs.
+    unsafe { HashTable::destroy(table) };
     1
 }
 export!(333, destroy);
 
-extern "C" fn count(table: u32, output: u32) -> u32 {
-    read_field(table, &SHAPE, SHAPE.count, output)
+extern "C" fn count(table: u32, output_word: u32) -> Hresult {
+    // SAFETY: export 334 contract: as for export 331.
+    let (table, output_word) =
+        unsafe { (HashTable::from_handle(table), OutputWord::new(output_word)) };
+    report(
+        table.map(|table| table.nodes().count().load(Relaxed)),
+        output_word,
+    )
 }
 export!(334, count);
 
 /// 1 when every bucket is empty or the table is invalid; 0 when the
 /// signature changed meanwhile.
 extern "C" fn is_empty(table: u32) -> u32 {
-    let Some(table) = Object::validate(table, &SHAPE) else {
+    // SAFETY: export 335 contract: `table` is 0 or a hash table of export
+    // 332.
+    let Some(table) = (unsafe { HashTable::from_handle(table) }) else {
         return 1;
     };
-    if !valid(table) {
-        return 0;
-    }
-    let mut index = 0;
-    while (index as i32) < bucket_count(table) as i32 {
-        // A bucket checked after the signature is gone counts as empty.
-        if valid(table) && occupied(table, bucket_at(table, index)) {
-            return 0;
-        }
-        index += 1;
-    }
-    1
+    u32::from(table.is_live() && table.is_empty())
 }
 export!(335, is_empty);
 
-/// Remove an item (by key with [`Search::Exact`]) and store its value.
-fn take(table: u32, key: u32, search: Search, output: u32) -> u32 {
-    let Some(table) = Object::validate(table, &SHAPE) else {
-        return Hresult::INVALID_ARGUMENT.0;
+/// Exports 336 and 337: remove an item (by key with [`Search::Exact`]) and
+/// store its value.
+///
+/// # Safety
+///
+/// Export contract: `table` is 0 or a hash table of export 332, and
+/// `output_word` 0 or a writable word.
+unsafe fn remove(table: u32, key: Key, search: Search, output_word: u32) -> Hresult {
+    // SAFETY: the caller guarantees both.
+    let (table, output_word) =
+        unsafe { (HashTable::from_handle(table), OutputWord::new(output_word)) };
+    let Some(table) = table else {
+        return Hresult::INVALID_ARGUMENT;
     };
-    let wait = options_wait(table.options() + RECORD, Side::Remove).unwrap_or(Wait::NONE);
-    let mut item = Item {
-        value: 0,
-        key: Key(key),
-    };
-    if let Err(failure) = remove_item(table, &mut item, &wait, search) {
-        return remove_result(failure);
-    }
-    if output != 0 {
-        store(output as usize, item.value);
-    }
-    SUCCESS.0
+    removed(table.take(key, search), output_word)
 }
 
-extern "C" fn remove_any(table: u32, output: u32) -> u32 {
-    take(table, 0, Search::First, output)
+extern "C" fn remove_any(table: u32, output_word: u32) -> Hresult {
+    // SAFETY: export 336 contract.
+    unsafe { remove(table, Key(0), Search::First, output_word) }
 }
 export!(336, remove_any);
 
-extern "C" fn remove_key(table: u32, key: u32, output: u32) -> u32 {
-    take(table, key, Search::Exact, output)
+extern "C" fn remove_key(table: u32, key: u32, output_word: u32) -> Hresult {
+    // SAFETY: export 337 contract.
+    unsafe { remove(table, Key(key), Search::Exact, output_word) }
 }
 export!(337, remove_key);
 
 /// `callback(context, value, node)` bucket by bucket in key order until one
 /// returns nonzero; positive results become HRESULTs.
-extern "C" fn enumerate(table: u32, context: u32, callback: u32) -> u32 {
-    let Some(table) = Object::validate(table, &SHAPE) else {
-        return export_result(Err(Failure::InvalidParameter));
+extern "C" fn enumerate(table: u32, context: u32, callback: u32) -> Hresult {
+    // SAFETY: export 338 contract: `table` is 0 or a hash table of export
+    // 332 and `callback` 0 or a console routine.
+    let (table, callback) = unsafe { (HashTable::from_handle(table), Routine::new(callback)) };
+    let Some(table) = table else {
+        return success_result(Err(Error::InvalidArgument));
     };
-    let mut index = 0;
-    while (index as i32) < bucket_count(table) as i32 {
-        if callback == 0 || load(table.field(SHAPE.tag)) != LFHT {
-            return export_result(Err(Failure::InvalidParameter));
-        }
-        let result = walk(first(bucket_at(table, index)), VALUE, context, callback);
-        if result.is_err() {
-            return export_result(result);
-        }
-        index += 1;
-    }
-    SUCCESS.0
+    success_result(table.enumerate(context, callback))
 }
 export!(338, enumerate);

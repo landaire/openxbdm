@@ -11,7 +11,6 @@ use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::Win32Error;
 use openxbdm_core::status::XbdmHresult;
-use openxbdm_core::status::xbdm_error;
 
 use crate::access::Access;
 use crate::commands::console;
@@ -417,8 +416,8 @@ pub enum MemoryError {
 impl From<MemoryError> for Hresult {
     fn from(error: MemoryError) -> Self {
         match error {
-            MemoryError::NoSuchField => xbdm_error(0x25),
-            MemoryError::DetourNotRunning => xbdm_error(0x2a),
+            MemoryError::NoSuchField => Hresult::NO_SUCH_FIELD,
+            MemoryError::DetourNotRunning => Hresult::INVALID_STATE,
             // Stock moves the code to the Win32 facility without the sign
             // test of HRESULT_FROM_WIN32.
             MemoryError::TrackingSave(error) => Hresult(0x8007_0000 | (error.code() & 0xffff)),

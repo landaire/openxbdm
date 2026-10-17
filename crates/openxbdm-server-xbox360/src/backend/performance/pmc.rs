@@ -12,7 +12,6 @@ use core::sync::atomic::Ordering;
 
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::XbdmHresult;
-use openxbdm_core::status::xbdm_error;
 use openxbdm_server::commands::performance::pmc;
 use openxbdm_server::commands::performance::pmc::BusRegister;
 use openxbdm_server::commands::performance::pmc::COUNTERS;
@@ -54,9 +53,6 @@ const TRIGGERS: [u32; 3] = [0x0842_2108, 0x39ce_8420, 0x6b5a_e738];
 const QUIET: u32 = 0xffff_fff9;
 /// Handle of the calling thread.
 const CURRENT_THREAD: u32 = 0xffff_fffe;
-
-const NOT_ACQUIRED: Hresult = xbdm_error(0x2c);
-const NOT_OWNER: Hresult = xbdm_error(0x2d);
 
 /// A counter owner; a higher priority preempts a lower one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -951,19 +947,19 @@ fn result(succeeded: bool, failure: Hresult) -> u32 {
 
 /// Export 196: acquire, install setup `index`, and run the counters.
 extern "C" fn export_begin(index: u32) -> u32 {
-    result(begin(Owner::EXPORTS, index), NOT_ACQUIRED)
+    result(begin(Owner::EXPORTS, index), Hresult::NOT_ACQUIRED)
 }
 
 /// Export 197: stop, release, and print the statistics.
 extern "C" fn export_end() -> u32 {
-    result(end(Owner::EXPORTS), NOT_OWNER)
+    result(end(Owner::EXPORTS), Hresult::NOT_OWNER)
 }
 
 /// Export 198: acquire and install setup `index`.
 extern "C" fn export_install(index: u32) -> u32 {
     result(
         acquire(Owner::EXPORTS) && install(Owner::EXPORTS, index),
-        NOT_ACQUIRED,
+        Hresult::NOT_ACQUIRED,
     )
 }
 
@@ -975,22 +971,25 @@ extern "C" fn export_stop_and_release() {
 
 /// Export 200.
 extern "C" fn export_clear() -> u32 {
-    result(clear(Owner::EXPORTS), NOT_OWNER)
+    result(clear(Owner::EXPORTS), Hresult::NOT_OWNER)
 }
 
 /// Export 201.
 extern "C" fn export_set_trigger_processor(processor: u32) -> u32 {
-    result(set_trigger_processor(Owner::EXPORTS, processor), NOT_OWNER)
+    result(
+        set_trigger_processor(Owner::EXPORTS, processor),
+        Hresult::NOT_OWNER,
+    )
 }
 
 /// Export 202.
 extern "C" fn export_start() -> u32 {
-    result(start(Owner::EXPORTS), NOT_OWNER)
+    result(start(Owner::EXPORTS), Hresult::NOT_OWNER)
 }
 
 /// Export 203.
 extern "C" fn export_stop() -> u32 {
-    result(stop(Owner::EXPORTS), NOT_OWNER)
+    result(stop(Owner::EXPORTS), Hresult::NOT_OWNER)
 }
 
 /// Export 204 (stock 0x91f92378): count of counter `index` into `value`;
@@ -1005,7 +1004,7 @@ extern "C" fn export_query_counter(index: u32, value: *mut u32) -> u32 {
     drop(locked);
     // SAFETY: the caller passes a writable u32.
     unsafe { core::ptr::write_volatile(value, count) };
-    result(succeeded, NOT_OWNER)
+    result(succeeded, Hresult::NOT_OWNER)
 }
 
 /// Export 205.
@@ -1013,7 +1012,7 @@ extern "C" fn export_read_state(state: *mut PmcState) -> u32 {
     // SAFETY: the caller passes a writable 0xa0-byte state.
     result(
         read_reported(Owner::EXPORTS, unsafe { &mut *state }),
-        NOT_OWNER,
+        Hresult::NOT_OWNER,
     )
 }
 

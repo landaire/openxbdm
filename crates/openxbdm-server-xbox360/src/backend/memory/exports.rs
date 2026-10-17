@@ -10,7 +10,6 @@ use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::XbdmHresult;
-use openxbdm_core::status::xbdm_error;
 use openxbdm_server::commands::console;
 use openxbdm_server::commands::memory;
 use openxbdm_server::commands::memory::Backend as _;
@@ -57,10 +56,8 @@ use crate::exports::export_result;
 /// Result of an export whose server part could not run (on the server
 /// thread or above passive level).
 const SERVER_UNAVAILABLE: Hresult = Hresult::FAIL;
-const BAD_PARAMETER: Hresult = xbdm_error(0x17);
-const NO_SUCH_MODULE: Hresult = xbdm_error(3);
-const NO_SUCH_FIELD: Hresult = xbdm_error(0x25);
-const BUFFER_TOO_SMALL: Hresult = xbdm_error(0x105);
+const BAD_PARAMETER: Hresult = ErrorCode::BadParameter.hresult();
+const NO_SUCH_MODULE: Hresult = ErrorCode::NoSuchModule.hresult();
 /// HRESULT_FROM_WIN32(ERROR_NOT_FOUND).
 const NOT_FOUND: u32 = 0x8007_0490;
 /// HRESULT_FROM_WIN32(ERROR_INVALID_FUNCTION)-style limit of 0x10000 names.
@@ -240,7 +237,7 @@ extern "C" fn get_proc_address(module: u32, ordinal: u32, address: u32) -> u32 {
     let status =
         unsafe { xboxkrnl::XexGetProcedureAddress(module, ordinal, address as usize as *mut u32) };
     if (status.0 as i32) < 0 {
-        return xbdm_error(2).0;
+        return ErrorCode::FileNotFound.hresult().0;
     }
     Hresult::OK.0
 }
@@ -750,7 +747,7 @@ extern "C" fn get_xex_header_field(
     // SAFETY: the entry's XEX header stays mapped under the loader lock.
     let field = unsafe { RtlImageXexHeaderField(entry.xex_header_base, XexHeaderKey(key)) };
     if field == 0 {
-        return NO_SUCH_FIELD.0;
+        return Hresult::NO_SUCH_FIELD.0;
     }
     let mut truncated = false;
     match key & 0xff {
@@ -787,7 +784,7 @@ extern "C" fn get_xex_header_field(
         }
     }
     if truncated {
-        BUFFER_TOO_SMALL.0
+        Hresult::BUFFER_TOO_SMALL.0
     } else {
         Hresult::OK.0
     }

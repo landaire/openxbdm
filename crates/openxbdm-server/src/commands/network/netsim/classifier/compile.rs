@@ -10,7 +10,9 @@
 //! string literals, address literals, the built-in string functions and no
 //! other functions.
 
+use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::XbdmHresult;
 
 use super::FieldId;
 use super::Item as WireItem;
@@ -96,8 +98,8 @@ impl From<CompileError> for Hresult {
             CompileError::IndexOutOfRange => 0x8007_0585,
             CompileError::TooFewArguments => 0x8002_0004,
             CompileError::TooManyArguments => 0x8002_000e,
-            CompileError::AlwaysFalse => 0x82da_0010,
-            CompileError::UnknownField => 0x82da_0025,
+            CompileError::AlwaysFalse => ErrorCode::NotDebuggable.hresult().0,
+            CompileError::UnknownField => Hresult::NO_SUCH_FIELD.0,
             CompileError::Value(error) => return error.into(),
         })
     }
@@ -1667,11 +1669,11 @@ mod tests {
         ("99999999999999999999", 0x80070216),
         ("4294967296u", 0x800700ea),
         ("1lll", 0x8007000d),
-        ("foo", 0x82da0025),
-        ("String.Length", 0x82da0025),
-        ("0", 0x82da0010),
-        ("1 == 2", 0x82da0010),
-        ("false", 0x82da0010),
+        ("foo", Hresult::NO_SUCH_FIELD.0),
+        ("String.Length", Hresult::NO_SUCH_FIELD.0),
+        ("0", ErrorCode::NotDebuggable.hresult().0),
+        ("1 == 2", ErrorCode::NotDebuggable.hresult().0),
+        ("false", ErrorCode::NotDebuggable.hresult().0),
         ("UDP[-1]", 0x80070083),
         ("UDP[0xffffffffffffffff]", 0x80070083),
         ("UDP[\"a\"]", 0x80070545),

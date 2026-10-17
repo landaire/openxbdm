@@ -17,10 +17,10 @@
 //! that reach past the history read neighbouring fields. Evaluation goes
 //! through [`CounterObject`] byte offsets to keep that behavior.
 
+use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::XbdmHresult;
-use openxbdm_core::status::xbdm_error;
 
 use crate::reply::CommandError;
 
@@ -130,12 +130,12 @@ impl From<CounterError> for Hresult {
     #[inline(never)]
     fn from(error: CounterError) -> Self {
         match error {
-            CounterError::TypeInvalid => xbdm_error(0x11),
-            CounterError::DataNotAvailable => xbdm_error(0x12),
+            CounterError::TypeInvalid => ErrorCode::TypeInvalid.hresult(),
+            CounterError::DataNotAvailable => ErrorCode::DataNotAvailable.hresult(),
             CounterError::Routine(result) => result,
-            CounterError::NoDirectory => xbdm_error(0x02),
-            CounterError::NotFound => xbdm_error(0x0e),
-            CounterError::NameTooLong => xbdm_error(0x105),
+            CounterError::NoDirectory => ErrorCode::FileNotFound.hresult(),
+            CounterError::NotFound => ErrorCode::AccessDenied.hresult(),
+            CounterError::NameTooLong => Hresult::BUFFER_TOO_SMALL,
             CounterError::Kernel(_) | CounterError::End | CounterError::Unexpected => {
                 CommandError::from(error).into()
             }

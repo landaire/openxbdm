@@ -192,24 +192,19 @@ pub fn from_processor(result: Hresult) -> CommandResult {
         Hresult::INVALID_ARGUMENT => return Err(CommandError::InvalidArgument),
         Hresult::END_OF_DATA => return Err(CommandError::EndOfData),
         failure if failure.is_failure() => {
-            return Err(listed_status(failure).map_or(CommandError::Processor(failure), Into::into));
+            return Err(ErrorCode::from_hresult(failure)
+                .map_or(CommandError::Processor(failure), Into::into));
         }
         other => Reply::Processor(other),
     };
     Ok(reply)
 }
 
-/// The table status a facility 0x2da failure carries.
-fn listed_status(result: Hresult) -> Option<ErrorCode> {
-    if result.0 & 0xffff_ff00 != 0x82da_0000 {
-        return None;
-    }
-    ErrorCode::from_raw(400 + (result.0 & 0xff) as u16)
-}
-
 #[cfg(test)]
 mod tests {
     use openxbdm_core::status::NtStatus;
+    use openxbdm_core::status::xbdm_error;
+    use openxbdm_core::status::xbdm_success;
 
     use super::*;
 
@@ -229,26 +224,22 @@ mod tests {
 
     #[test]
     fn processor_results_pass_unchanged() {
-        for raw in [
-            0,
-            1,
-            0x02da_0000,
-            0x02da_0002,
-            0x02da_0005,
-            0x02da_0064,
-            0x82da_0000,
-            0x82da_000e,
-            0x82da_0013,
-            0x82da_0104,
-            0x8000_4005,
-            0x8007_0002,
-            0xd000_0034,
+        for result in [
+            Hresult::SUCCESS,
+            Hresult::FALSE,
+            Hresult::OK,
+            Hresult::MULTILINE,
+            Hresult::DEDICATED,
+            xbdm_success(0x64),
+            ErrorCode::Undefined.hresult(),
+            ErrorCode::AccessDenied.hresult(),
+            xbdm_error(0x13),
+            Hresult::END_OF_DATA,
+            Hresult::FAIL,
+            Hresult(0x8007_0002),
+            Hresult(0xd000_0034),
         ] {
-            assert_eq!(
-                hresult(from_processor(Hresult(raw))),
-                Hresult(raw),
-                "{raw:#x}"
-            );
+            assert_eq!(hresult(from_processor(result)), result, "{:#x}", result.0);
         }
     }
 }

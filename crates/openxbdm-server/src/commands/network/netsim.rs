@@ -13,7 +13,7 @@ use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::Win32Error;
-use openxbdm_core::status::xbdm_error;
+use openxbdm_core::status::XbdmHresult;
 
 use self::classifier::CompileError;
 pub use self::classifier::Program;
@@ -98,18 +98,18 @@ impl From<NetsimError> for Hresult {
     #[inline(never)]
     fn from(error: NetsimError) -> Self {
         match error {
-            NetsimError::NoInstance => xbdm_error(0x2),
-            NetsimError::InstanceExists => xbdm_error(0x8),
-            NetsimError::RoutineMissing => xbdm_error(0xe),
-            NetsimError::InterceptBusy => xbdm_error(0x10),
+            NetsimError::NoInstance => ErrorCode::FileNotFound.hresult(),
+            NetsimError::InstanceExists => ErrorCode::NotStopped.hresult(),
+            NetsimError::RoutineMissing => ErrorCode::AccessDenied.hresult(),
+            NetsimError::InterceptBusy => ErrorCode::NotDebuggable.hresult(),
             NetsimError::Intercept(error) => Win32Error::from(error).into(),
-            NetsimError::Invalid => xbdm_error(0x17),
-            NetsimError::InstanceChanged => xbdm_error(0x1a),
-            NetsimError::OutOfMemory => xbdm_error(0x1c),
-            NetsimError::ShortBuffer => xbdm_error(0x26),
+            NetsimError::Invalid => ErrorCode::BadParameter.hresult(),
+            NetsimError::InstanceChanged => Hresult::ALREADY_STOPPED,
+            NetsimError::OutOfMemory => ErrorCode::OutOfMemory.hresult(),
+            NetsimError::ShortBuffer => Hresult::BUFFER_FULL,
             NetsimError::Unencodable => Hresult(0x8007_0545),
             NetsimError::Compile(error) => error.into(),
-            NetsimError::Busy => xbdm_error(0x150),
+            NetsimError::Busy => Hresult::IN_PROGRESS,
         }
     }
 }

@@ -6,12 +6,12 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 use core::time::Duration;
 
+use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::Win32Error;
 use openxbdm_core::status::XbdmHresult;
-use openxbdm_core::status::xbdm_error;
 use openxbdm_server::Platform;
 use openxbdm_server::Server;
 use openxbdm_server::commands;
@@ -751,7 +751,7 @@ static TRACE_MASK: AtomicU32 = AtomicU32::new(0);
 static REGISTRATION: SpinLock<RegistrationResult> = SpinLock::new(RegistrationResult::EMPTY);
 
 /// Result of a NULL output pointer.
-const BAD_PARAMETER: Hresult = xbdm_error(0x17);
+const BAD_PARAMETER: Hresult = ErrorCode::BadParameter.hresult();
 /// Hardware flag that enables the setting of exports 175 and 176; 0x20
 /// marks a hard disk.
 const HARDWARE_XCONFIG_QWORD: u32 = 0x10;
@@ -930,7 +930,7 @@ fn xconfig_result(status: u32) -> u32 {
 /// Export 175: read the 8-byte setting (3, 8) into `output`.
 extern "C" fn export_get_xconfig_qword(output: u32) -> u32 {
     if hardware_flags().bits() & HARDWARE_XCONFIG_QWORD == 0 {
-        return xbdm_error(7).0;
+        return ErrorCode::UnknownCommand.hresult().0;
     }
     if output == 0 {
         return BAD_PARAMETER.0;
@@ -957,7 +957,7 @@ export!(175, export_get_xconfig_qword);
 /// [`export_set_xconfig_qword_entry`].
 extern "C" fn export_set_xconfig_qword(high: u32, low: u32) -> u32 {
     if hardware_flags().bits() & HARDWARE_XCONFIG_QWORD == 0 {
-        return xbdm_error(7).0;
+        return ErrorCode::UnknownCommand.hresult().0;
     }
     let value = (u64::from(high) << 32 | u64::from(low)).to_be_bytes();
     // SAFETY: `value` is a live 8-byte local.

@@ -7,7 +7,6 @@ use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::Win32Error;
-use openxbdm_core::status::xbdm_error;
 
 use self::capture_file::CaptureFileError;
 use super::NetworkError;
@@ -225,8 +224,8 @@ pub enum StartError {
 impl From<StartError> for Hresult {
     fn from(error: StartError) -> Self {
         match error {
-            StartError::AlreadyCapturing => xbdm_error(0x08),
-            StartError::InterceptBusy => xbdm_error(0x10),
+            StartError::AlreadyCapturing => ErrorCode::NotStopped.hresult(),
+            StartError::InterceptBusy => ErrorCode::NotDebuggable.hresult(),
             StartError::Intercept(error) => intercept_result(error),
             StartError::Open(error) => capture_result(error),
         }

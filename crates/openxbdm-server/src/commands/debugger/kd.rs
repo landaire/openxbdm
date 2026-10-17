@@ -5,7 +5,7 @@ use openxbdm_core::line::CommandLine;
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
-use openxbdm_core::status::xbdm_error;
+use openxbdm_core::status::XbdmHresult;
 
 use super::ExtensionHandle;
 use super::HARDWARE_KD_ENABLED;
@@ -436,7 +436,7 @@ pub enum ExtensionError {
 impl From<ExtensionError> for Hresult {
     fn from(error: ExtensionError) -> Self {
         match error {
-            ExtensionError::OtherLoaded => xbdm_error(0x2b),
+            ExtensionError::OtherLoaded => Hresult::EXTENSION_LOADED,
             ExtensionError::UnknownHandle => ErrorCode::BadParameter.hresult(),
             ExtensionError::Kernel(error) => {
                 CommandError::from_kernel(error, CommandError::Fail).into()

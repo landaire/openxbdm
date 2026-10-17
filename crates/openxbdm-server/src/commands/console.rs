@@ -6,7 +6,7 @@ use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::Win32Error;
-use openxbdm_core::status::xbdm_error;
+use openxbdm_core::status::XbdmHresult;
 
 use crate::access::Access;
 use crate::backend::Backend as AnyBackend;
@@ -49,7 +49,7 @@ pub enum ConsoleError {
 impl From<ConsoleError> for Hresult {
     fn from(error: ConsoleError) -> Self {
         match error {
-            ConsoleError::AddressPending => xbdm_error(0x2a),
+            ConsoleError::AddressPending => Hresult::INVALID_STATE,
         }
     }
 }
@@ -277,7 +277,7 @@ pub struct BufferTooSmall;
 
 impl From<BufferTooSmall> for Hresult {
     fn from(_: BufferTooSmall) -> Self {
-        xbdm_error(0x105)
+        Hresult::BUFFER_TOO_SMALL
     }
 }
 
@@ -708,11 +708,11 @@ pub enum RegistrationError {
 impl From<RegistrationError> for Hresult {
     fn from(error: RegistrationError) -> Self {
         match error {
-            RegistrationError::NotRegistered => xbdm_error(0x150),
-            RegistrationError::Cleared => xbdm_error(0x2),
-            RegistrationError::Failed => xbdm_error(0x100),
-            RegistrationError::Rejected => xbdm_error(0x10a),
-            RegistrationError::ResponseTooLarge => xbdm_error(0xf),
+            RegistrationError::NotRegistered => Hresult::IN_PROGRESS,
+            RegistrationError::Cleared => ErrorCode::FileNotFound.hresult(),
+            RegistrationError::Failed => Hresult::REQUEST_FAILED,
+            RegistrationError::Rejected => Hresult::SERVICE_FAILED,
+            RegistrationError::ResponseTooLarge => ErrorCode::NoRoomOnDevice.hresult(),
             RegistrationError::BufferTooSmall => BufferTooSmall.into(),
         }
     }
@@ -2555,28 +2555,36 @@ mod tests {
             transaction: 0,
             length: 0,
         };
-        for (state, error, code) in [
+        for (state, error, result) in [
             (
                 RegistrationState::Pending,
                 RegistrationError::NotRegistered,
-                0x150,
+                Hresult::IN_PROGRESS,
             ),
             (
                 RegistrationState::InProgress,
                 RegistrationError::NotRegistered,
-                0x150,
+                Hresult::IN_PROGRESS,
             ),
-            (RegistrationState::Cleared, RegistrationError::Cleared, 0x2),
-            (RegistrationState::Failed, RegistrationError::Failed, 0x100),
+            (
+                RegistrationState::Cleared,
+                RegistrationError::Cleared,
+                ErrorCode::FileNotFound.hresult(),
+            ),
+            (
+                RegistrationState::Failed,
+                RegistrationError::Failed,
+                Hresult::REQUEST_FAILED,
+            ),
             (
                 RegistrationState::Rejected,
                 RegistrationError::Rejected,
-                0x10a,
+                Hresult::SERVICE_FAILED,
             ),
             (
                 RegistrationState::ResponseTooLarge,
                 RegistrationError::ResponseTooLarge,
-                0xf,
+                ErrorCode::NoRoomOnDevice.hresult(),
             ),
         ] {
             registration.state = state;
@@ -2584,7 +2592,7 @@ mod tests {
                 registration.export_response(Some(&mut [0; 8])),
                 failed(error)
             );
-            assert_eq!(Hresult::from(error), xbdm_error(code));
+            assert_eq!(Hresult::from(error), result);
         }
         registration.state = RegistrationState::Registered;
         registration.transaction = 0x0123_4567_89ab_cdef;
@@ -2607,7 +2615,7 @@ mod tests {
         );
         assert_eq!(
             Hresult::from(RegistrationError::BufferTooSmall),
-            xbdm_error(0x105)
+            Hresult::BUFFER_TOO_SMALL
         );
         assert_eq!(registration.export_response(None), registered(Ok(())));
     }

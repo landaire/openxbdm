@@ -9,12 +9,11 @@
 //! per-processor data byte counts at +0xa91c, then for each processor in
 //! order the chunks of its records from first to last.
 
+use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::Win32Error;
 use openxbdm_core::status::XbdmHresult;
-use openxbdm_core::status::xbdm_error;
-use openxbdm_core::status::xbdm_success;
 
 use super::pmc::COUNTERS;
 use super::pmc::Route;
@@ -89,9 +88,9 @@ impl From<Started> for Reply {
 impl From<CaptureReply> for Hresult {
     fn from(reply: CaptureReply) -> Self {
         match reply {
-            CaptureReply::Continued => xbdm_success(0x06),
-            CaptureReply::FastCapEnabled => xbdm_success(0x07),
-            CaptureReply::CallCapEnabled => xbdm_success(0x08),
+            CaptureReply::Continued => Hresult::CAPTURE_CONTINUED,
+            CaptureReply::FastCapEnabled => Hresult::FAST_CAP_ENABLED,
+            CaptureReply::CallCapEnabled => Hresult::CALL_CAP_ENABLED,
         }
     }
 }
@@ -100,20 +99,20 @@ impl From<CaptureError> for Hresult {
     #[inline(never)]
     fn from(error: CaptureError) -> Self {
         match error {
-            CaptureError::FileFailed => xbdm_error(0x0d),
-            CaptureError::FastCapDisabled => xbdm_error(0x1b),
-            CaptureError::CallCapDisabled => xbdm_error(0x21),
-            CaptureError::NoCapture => xbdm_error(0x18),
-            CaptureError::AlreadyRunning => xbdm_error(0x19),
-            CaptureError::NoBufferMemory => xbdm_error(0x1c),
-            CaptureError::TitleCaptureFailed => xbdm_error(0x1d),
-            CaptureError::NotInstrumented => xbdm_error(0x23),
-            CaptureError::CallCapUnavailable => xbdm_error(0x24),
-            CaptureError::BufferFull => xbdm_error(0x26),
-            CaptureError::TitleTerminated => xbdm_error(0x27),
-            CaptureError::TooLong => xbdm_error(0x29),
-            CaptureError::CountersUnavailable => xbdm_error(0x2c),
-            CaptureError::CountersLost => xbdm_error(0x2d),
+            CaptureError::FileFailed => ErrorCode::FileCannotBeCreated.hresult(),
+            CaptureError::FastCapDisabled => Hresult::FAST_CAP_DISABLED,
+            CaptureError::CallCapDisabled => Hresult::CALL_CAP_DISABLED,
+            CaptureError::NoCapture => Hresult::NOT_STARTED,
+            CaptureError::AlreadyRunning => Hresult::ALREADY_STARTED,
+            CaptureError::NoBufferMemory => ErrorCode::OutOfMemory.hresult(),
+            CaptureError::TitleCaptureFailed => Hresult::NO_RESPONSE,
+            CaptureError::NotInstrumented => Hresult::CAPTURE_NOT_ENABLED,
+            CaptureError::CallCapUnavailable => Hresult::CALL_CAP_UNAVAILABLE,
+            CaptureError::BufferFull => Hresult::BUFFER_FULL,
+            CaptureError::TitleTerminated => Hresult::TITLE_TERMINATED,
+            CaptureError::TooLong => Hresult::DURATION_EXCEEDED,
+            CaptureError::CountersUnavailable => Hresult::NOT_ACQUIRED,
+            CaptureError::CountersLost => Hresult::NOT_OWNER,
             CaptureError::Busy => Hresult(0x8007_00aa),
             CaptureError::Kernel(error) => error.into(),
             CaptureError::Write(error) => error.into(),

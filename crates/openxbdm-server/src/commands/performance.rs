@@ -12,7 +12,7 @@ use core::fmt::Write as _;
 
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
-use openxbdm_core::status::xbdm_error;
+use openxbdm_core::status::XbdmHresult;
 
 use crate::access::Access;
 use crate::commands::console::ConfigSetting;
@@ -104,7 +104,7 @@ impl From<DisplayError> for Hresult {
             DisplayError::BadParameter => ErrorCode::BadParameter.hresult(),
             DisplayError::MemoryNotMapped => ErrorCode::MemoryNotMapped.hresult(),
             DisplayError::Unsupported => ErrorCode::UnknownCommand.hresult(),
-            DisplayError::EdidFailed => xbdm_error(0x1d),
+            DisplayError::EdidFailed => Hresult::NO_RESPONSE,
             DisplayError::NoTransferBlock => super::console::BufferTooSmall.into(),
         }
     }

@@ -1,5 +1,6 @@
 //! Status codes, monitor result codes, and their default reply text.
 
+use xbox360_sys::status::Facility;
 pub use xbox360_sys::status::Hresult;
 pub use xbox360_sys::status::KernelError;
 pub use xbox360_sys::status::NtStatus;
@@ -224,23 +225,36 @@ impl core::fmt::Display for ErrorCode {
     }
 }
 
-/// Facility code of monitor results.
-const FACILITY_XBDM: u32 = 0x02da_0000;
+/// Facility of monitor results.
+const FACILITY_XBDM: Facility = Facility::new(0x2da);
+
+/// Bits 16 to 30 of a result. The line builder compares them whole, so
+/// bits 29 and 30 count, unlike [`Hresult::facility`].
+const FACILITY_BITS: u32 = 0x7fff_0000;
 
 /// Facility 0x2da success with status `200 + code`.
 pub const fn xbdm_success(code: u16) -> Hresult {
-    Hresult(FACILITY_XBDM | code as u32)
+    Hresult::success(FACILITY_XBDM, code)
 }
 
 /// Facility 0x2da failure with status `400 + code`.
 pub const fn xbdm_error(code: u16) -> Hresult {
-    Hresult(0x8000_0000 | FACILITY_XBDM | code as u32)
+    Hresult::failure(FACILITY_XBDM, code)
 }
 
 impl ErrorCode {
     /// The failure result for this status.
     pub const fn hresult(self) -> Hresult {
         xbdm_error(self.raw() - 400)
+    }
+
+    /// The table status of a facility 0x2da failure. Low words above 0xff
+    /// are outside the table.
+    pub const fn from_hresult(result: Hresult) -> Option<Self> {
+        if result.0 & 0xffff_ff00 != xbdm_error(0).0 {
+            return None;
+        }
+        Self::from_raw(400 + result.code())
     }
 }
 
@@ -259,6 +273,56 @@ pub trait XbdmHresult: Sized {
     const FAST_PIPE: Self;
     /// End of a transfer or of a list.
     const END_OF_DATA: Self;
+    /// A capture continues under a new file name.
+    const CAPTURE_CONTINUED: Self;
+    /// A loaded module carries fast-cap instrumentation.
+    const FAST_CAP_ENABLED: Self;
+    /// A loaded module carries call-cap instrumentation.
+    const CALL_CAP_ENABLED: Self;
+    /// `424-`: the log, capture or profile is not running.
+    const NOT_STARTED: Self;
+    /// `425-`: the log, capture or profile is running already.
+    const ALREADY_STARTED: Self;
+    /// `426-`: the target is stopped or not started.
+    const ALREADY_STOPPED: Self;
+    /// `427-`: no loaded module carries fast-cap instrumentation.
+    const FAST_CAP_DISABLED: Self;
+    /// `429-`: the title or the kernel did not supply the data.
+    const NO_RESPONSE: Self;
+    /// `433-`: no loaded module carries call-cap instrumentation.
+    const CALL_CAP_DISABLED: Self;
+    /// `434-`: a persistent capture requested from the title process.
+    const PERSISTENT_FROM_TITLE: Self;
+    /// `435-`: no capture is enabled or possible.
+    const CAPTURE_NOT_ENABLED: Self;
+    /// `436-`: the kernel call-cap service is unavailable.
+    const CALL_CAP_UNAVAILABLE: Self;
+    /// `437-`: a required field or parameter is absent.
+    const NO_SUCH_FIELD: Self;
+    /// `438-`: a buffer filled, so data was lost or does not fit.
+    const BUFFER_FULL: Self;
+    /// `439-`: the title terminated during the operation.
+    const TITLE_TERMINATED: Self;
+    /// `441-`: the capture ran longer than its timestamps cover.
+    const DURATION_EXCEEDED: Self;
+    /// `442-`: the engine or device is not in a state for the request.
+    const INVALID_STATE: Self;
+    /// `443-`: another extension is loaded.
+    const EXTENSION_LOADED: Self;
+    /// `444-`: the performance counters could not be acquired.
+    const NOT_ACQUIRED: Self;
+    /// `445-`: another owner holds the performance counters.
+    const NOT_OWNER: Self;
+    /// `400-`: a request failed.
+    const REQUEST_FAILED: Self;
+    /// `400-`: the connection ended during a transfer.
+    const CONNECTION_LOST: Self;
+    /// `400-`: the caller's buffer is too small for the result.
+    const BUFFER_TOO_SMALL: Self;
+    /// `400-`: a monitor service call failed or was rejected.
+    const SERVICE_FAILED: Self;
+    /// `400-`: a request is pending or in progress.
+    const IN_PROGRESS: Self;
 
     /// The three status digits of the monitor's line builder: the first
     /// from the sign, the others `'0' + low / 10` and `'0' + low % 10` of
@@ -281,13 +345,38 @@ impl XbdmHresult for Hresult {
     const DEDICATED: Self = xbdm_success(5);
     const FAST_PIPE: Self = xbdm_success(9);
     const END_OF_DATA: Self = xbdm_error(0x104);
+    const CAPTURE_CONTINUED: Self = xbdm_success(6);
+    const FAST_CAP_ENABLED: Self = xbdm_success(7);
+    const CALL_CAP_ENABLED: Self = xbdm_success(8);
+    const NOT_STARTED: Self = xbdm_error(0x18);
+    const ALREADY_STARTED: Self = xbdm_error(0x19);
+    const ALREADY_STOPPED: Self = xbdm_error(0x1a);
+    const FAST_CAP_DISABLED: Self = xbdm_error(0x1b);
+    const NO_RESPONSE: Self = xbdm_error(0x1d);
+    const CALL_CAP_DISABLED: Self = xbdm_error(0x21);
+    const PERSISTENT_FROM_TITLE: Self = xbdm_error(0x22);
+    const CAPTURE_NOT_ENABLED: Self = xbdm_error(0x23);
+    const CALL_CAP_UNAVAILABLE: Self = xbdm_error(0x24);
+    const NO_SUCH_FIELD: Self = xbdm_error(0x25);
+    const BUFFER_FULL: Self = xbdm_error(0x26);
+    const TITLE_TERMINATED: Self = xbdm_error(0x27);
+    const DURATION_EXCEEDED: Self = xbdm_error(0x29);
+    const INVALID_STATE: Self = xbdm_error(0x2a);
+    const EXTENSION_LOADED: Self = xbdm_error(0x2b);
+    const NOT_ACQUIRED: Self = xbdm_error(0x2c);
+    const NOT_OWNER: Self = xbdm_error(0x2d);
+    const REQUEST_FAILED: Self = xbdm_error(0x100);
+    const CONNECTION_LOST: Self = xbdm_error(0x101);
+    const BUFFER_TOO_SMALL: Self = xbdm_error(0x105);
+    const SERVICE_FAILED: Self = xbdm_error(0x10a);
+    const IN_PROGRESS: Self = xbdm_error(0x150);
 
     fn status_digits(self) -> [u8; 3] {
-        let monitor = self.0 & 0x7fff_0000 == FACILITY_XBDM;
-        let (failure, low) = if monitor && self.0 & 0xffff > 0xff {
+        let monitor = self.0 & FACILITY_BITS == Self::OK.0;
+        let (failure, low) = if monitor && self.code() > 0xff {
             (true, 0)
         } else if monitor {
-            (self.is_failure(), (self.0 & 0xffff) as u8)
+            (self.is_failure(), self.code() as u8)
         } else {
             (self.is_failure(), 0)
         };
@@ -299,21 +388,18 @@ impl XbdmHresult for Hresult {
     }
 
     fn default_message(self) -> &'static str {
-        match self.0 {
-            0x02da_0000 => "OK",
-            0x02da_0002 => "multiline response follows",
-            0x02da_0003 => "binary response follows",
-            0x02da_0004 => "send binary data",
-            0x8000_ffff => "unexpected error",
-            0x8007_000e => "out of memory",
-            0x8007_0057 => "bad parameter",
-            value if value & 0xffff_0000 == 0x82da_0000 && value & 0xffff <= 0xff => {
-                match ErrorCode::from_raw((400 + (value & 0xffff)) as u16) {
-                    Some(code) => code.message(),
-                    None => "",
-                }
-            }
-            _ => "",
+        match self {
+            Self::OK => "OK",
+            Self::MULTILINE => "multiline response follows",
+            Self::BINARY => "binary response follows",
+            Self::SEND_BINARY => "send binary data",
+            Self::UNEXPECTED => "unexpected error",
+            Self::OUT_OF_MEMORY => "out of memory",
+            Self::INVALID_ARGUMENT => "bad parameter",
+            other => match ErrorCode::from_hresult(other) {
+                Some(code) => code.message(),
+                None => "",
+            },
         }
     }
 }
@@ -330,7 +416,7 @@ mod tests {
         assert_eq!(&Hresult::END_OF_DATA.status_digits(), b"400");
         assert_eq!(&Hresult::FAIL.status_digits(), b"400");
         assert_eq!(&Hresult(0x0000_0001).status_digits(), b"200");
-        assert_eq!(&Hresult(0x02da_0100).status_digits(), b"400");
+        assert_eq!(&xbdm_success(0x100).status_digits(), b"400");
         assert_eq!(&xbdm_success(0x64).status_digits(), b"2:0");
         assert_eq!(&xbdm_success(0xc8).status_digits(), b"2D0");
         assert_eq!(&xbdm_error(0x96).status_digits(), b"4?0");

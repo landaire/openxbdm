@@ -10,7 +10,7 @@ use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
-use openxbdm_core::status::xbdm_error;
+use openxbdm_core::status::XbdmHresult;
 
 use crate::access::Access;
 use crate::commands::console;
@@ -221,11 +221,13 @@ pub enum HardwareError {
 impl From<HardwareError> for Hresult {
     fn from(error: HardwareError) -> Self {
         match error {
-            HardwareError::NotLogging => xbdm_error(0x18),
-            HardwareError::AlreadyLogging | HardwareError::CountBlockAllocated => xbdm_error(0x19),
-            HardwareError::MissingParameter => xbdm_error(0x25),
-            HardwareError::NotConnected => xbdm_error(0x2a),
-            HardwareError::ServiceFailed => xbdm_error(0x10a),
+            HardwareError::NotLogging => Hresult::NOT_STARTED,
+            HardwareError::AlreadyLogging | HardwareError::CountBlockAllocated => {
+                Hresult::ALREADY_STARTED
+            }
+            HardwareError::MissingParameter => Hresult::NO_SUCH_FIELD,
+            HardwareError::NotConnected => Hresult::INVALID_STATE,
+            HardwareError::ServiceFailed => Hresult::SERVICE_FAILED,
             HardwareError::Xam(error) => error.into(),
         }
     }

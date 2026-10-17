@@ -8,8 +8,9 @@
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::Ordering;
 
+use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
-use openxbdm_core::status::xbdm_error;
+use openxbdm_core::status::XbdmHresult;
 
 use super::CpuProfilerInfo;
 use crate::reply::CommandError;
@@ -39,18 +40,18 @@ pub enum ProfilerError {
 
 impl From<ProfilerError> for Hresult {
     fn from(error: ProfilerError) -> Self {
-        xbdm_error(match error {
-            ProfilerError::AlreadyRunning => 0x19,
-            ProfilerError::NotRunning => 0x18,
-            ProfilerError::Suspended => 0x27,
-            ProfilerError::PrologueFailed => 0,
-            ProfilerError::NoKernel => 0x03,
-            ProfilerError::NoProfileExport => 0x07,
-            ProfilerError::ProfileInterruptRefused => 0x17,
-            ProfilerError::NoBuffers => 0x1c,
-            ProfilerError::NoCounters => 0x2c,
-            ProfilerError::NotCounterOwner => 0x2d,
-        })
+        match error {
+            ProfilerError::AlreadyRunning => Hresult::ALREADY_STARTED,
+            ProfilerError::NotRunning => Hresult::NOT_STARTED,
+            ProfilerError::Suspended => Hresult::TITLE_TERMINATED,
+            ProfilerError::PrologueFailed => ErrorCode::Undefined.hresult(),
+            ProfilerError::NoKernel => ErrorCode::NoSuchModule.hresult(),
+            ProfilerError::NoProfileExport => ErrorCode::UnknownCommand.hresult(),
+            ProfilerError::ProfileInterruptRefused => ErrorCode::BadParameter.hresult(),
+            ProfilerError::NoBuffers => ErrorCode::OutOfMemory.hresult(),
+            ProfilerError::NoCounters => Hresult::NOT_ACQUIRED,
+            ProfilerError::NotCounterOwner => Hresult::NOT_OWNER,
+        }
     }
 }
 

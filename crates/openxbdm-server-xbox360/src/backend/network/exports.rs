@@ -9,7 +9,6 @@ use core::ffi::c_char;
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::XbdmHresult;
-use openxbdm_core::status::xbdm_error;
 use openxbdm_server::Server;
 use openxbdm_server::commands::network::LinkFlags;
 use openxbdm_server::commands::network::NetworkError;
@@ -35,8 +34,6 @@ use crate::exports::export;
 use crate::exports::export_result;
 use crate::net::XamNetwork;
 
-/// A persistent capture requested from the title process.
-const PERSISTENT_FROM_TITLE: Hresult = xbdm_error(0x22);
 /// Position argument that selects every entry or appends.
 const ALL: u32 = u32::MAX;
 
@@ -113,7 +110,7 @@ extern "C" fn capture_start(name: u32, data_limit: u32, buffer: u32, flags: u32)
     if flags.contains(CaptureFlags::PERSISTENT)
         && xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE
     {
-        return PERSISTENT_FROM_TITLE.0;
+        return Hresult::PERSISTENT_FROM_TITLE.0;
     }
     let mut start = CaptureStart {
         name: c_string(name).unwrap_or_default(),

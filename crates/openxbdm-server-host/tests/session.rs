@@ -229,7 +229,7 @@ fn status_lines_follow_the_line_builder() {
         host.backend
             .register_processor(
                 b"big",
-                Some(Box::new(|_, _| Hresult(0x02da_0100))),
+                Some(Box::new(|_, _| xbdm_success(0x100))),
                 ProcessorFlags::NONE,
             )
             .unwrap();

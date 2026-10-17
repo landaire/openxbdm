@@ -9,7 +9,6 @@ use core::sync::atomic::Ordering;
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::XbdmHresult;
-use openxbdm_core::status::xbdm_error;
 use openxbdm_server::commands::debugger;
 use openxbdm_server::commands::debugger::ContextFlags;
 use openxbdm_server::commands::debugger::DataTarget;
@@ -32,8 +31,6 @@ use crate::exports::export;
 
 /// Export 178's result for a missing or overlong name.
 const BAD_PARAMETER: Hresult = ErrorCode::BadParameter.hresult();
-/// More threads exist than the caller's list holds.
-const BUFFER_TOO_SMALL: Hresult = xbdm_error(0x105);
 /// Longest extension name export 178 accepts.
 const EXTENSION_NAME_LIMIT: usize = 0x3f;
 /// Return addresses export 82 stores at most.
@@ -170,7 +167,7 @@ extern "C" fn get_thread_list(ids: u32, count: u32) -> u32 {
     });
     write_u32(count, list.count as u32);
     if list.overflow {
-        BUFFER_TOO_SMALL.0
+        Hresult::BUFFER_TOO_SMALL.0
     } else {
         Hresult::OK.0
     }

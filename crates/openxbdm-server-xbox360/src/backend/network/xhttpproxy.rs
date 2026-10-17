@@ -6,6 +6,9 @@ use core::ptr::null_mut;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::Ordering;
 
+use openxbdm_core::status::ErrorCode;
+use openxbdm_core::status::Hresult;
+use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::commands::network::decode_hex;
 use openxbdm_server::commands::network::xhttpproxy;
 use openxbdm_server::commands::network::xhttpproxy::Certificate;
@@ -359,10 +362,10 @@ fn request(argument: u32) -> *mut u32 {
     argument as usize as *mut u32
 }
 
-const NOT_FOUND: u32 = 0x82da_0002;
-const NOT_FORCED: u32 = 0x82da_000a;
-const BAD_REQUEST: u32 = 0x82da_0017;
-const SUCCESS: u32 = 0x02da_0000;
+const NOT_FOUND: u32 = ErrorCode::FileNotFound.hresult().0;
+const NOT_FORCED: u32 = ErrorCode::FileAlreadyExists.hresult().0;
+const BAD_REQUEST: u32 = ErrorCode::BadParameter.hresult().0;
+const SUCCESS: u32 = Hresult::OK.0;
 
 /// Control code 0xa5 (stock 0x91f380f8): look up the proxy of a scope for
 /// title code. Mode 1 is the title scope and counts a consumer reference;
@@ -473,7 +476,7 @@ pub(crate) fn service_http_proxy_certificate(argument: u32) -> u32 {
         return NOT_FOUND;
     }
     if ProxyFlags(flags).contains(ProxyFlags::CERTIFICATE_PENDING) {
-        return 0x82da_0150;
+        return Hresult::IN_PROGRESS.0;
     }
     // SAFETY: the callback is the caller's; it takes (context, value 5,
     // value 6, certificate, size).
@@ -489,7 +492,7 @@ pub(crate) fn service_http_proxy_certificate(argument: u32) -> u32 {
     };
     drop(guard);
     if (result as i32) < 0 {
-        0x82da_0003
+        ErrorCode::NoSuchModule.hresult().0
     } else {
         SUCCESS
     }

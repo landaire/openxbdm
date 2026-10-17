@@ -21,8 +21,9 @@
 //! repeats its stop after a reset and answers the host's request with a
 //! resend request.
 
+mod error;
+
 use crate::DecodeError;
-use crate::EncodeError;
 use crate::packet::Beacon;
 use crate::packet::ControlKind;
 use crate::packet::ControlPacket;
@@ -35,13 +36,7 @@ use crate::packet::PacketType;
 use crate::packet::Verified;
 use crate::packet::encode_data;
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum SessionError {
-    #[error("packet {outstanding:?} is not acknowledged yet")]
-    Outstanding { outstanding: PacketId },
-    #[error(transparent)]
-    Encode(#[from] EncodeError),
-}
+pub use self::error::SessionError;
 
 #[derive(Debug, Clone)]
 pub enum Event<'a> {
@@ -75,15 +70,10 @@ pub struct Received<'a> {
 pub struct Session {
     next_send_id: PacketId,
     last_received: Option<PacketId>,
+
     outstanding: Option<PacketId>,
     outstanding_len: usize,
     outstanding_bytes: [u8; MAX_DATAGRAM_LEN],
-}
-
-impl Default for Session {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl Session {
@@ -111,11 +101,14 @@ impl Session {
         if let Some(outstanding) = self.outstanding {
             return Err(SessionError::Outstanding { outstanding });
         }
+
         let id = self.next_send_id;
         let length = encode_data(&mut self.outstanding_bytes, packet_type, id, parts)?;
+
         self.next_send_id = id.next();
         self.outstanding = Some(id);
         self.outstanding_len = length;
+
         Ok(&self.outstanding_bytes[..length])
     }
 
@@ -136,6 +129,7 @@ impl Session {
     pub fn reset(&mut self) -> [u8; HEADER_LEN] {
         self.outstanding = None;
         self.last_received = None;
+
         ControlPacket::new(ControlKind::Reset, self.next_send_id).encode()
     }
 
@@ -150,24 +144,22 @@ impl Session {
             }
             Err(error) => return Err(error),
         };
-        Ok(match decoded {
+
+        let received = match decoded {
             Datagram::Data(packet) => match packet.verify() {
                 Err(error) => self.corrupt(error),
                 Ok(packet) => {
                     let id = packet.id();
                     let reply = Some(ControlPacket::new(ControlKind::Acknowledge, id).encode());
-                    if self.last_received == Some(id) {
-                        Received {
-                            reply,
-                            event: Event::Duplicate(id),
-                        }
+
+                    let event = if self.last_received == Some(id) {
+                        Event::Duplicate(id)
                     } else {
                         self.last_received = Some(id);
-                        Received {
-                            reply,
-                            event: Event::Data(packet),
-                        }
-                    }
+                        Event::Data(packet)
+                    };
+
+                    Received { reply, event }
                 }
             },
             Datagram::Control(control) => {
@@ -185,6 +177,7 @@ impl Session {
                         }
                     }
                 };
+
                 Received { reply: None, event }
             }
             Datagram::Beacon(beacon) => Received {
@@ -196,7 +189,9 @@ impl Session {
                     length: datagram.len(),
                 });
             }
-        })
+        };
+
+        Ok(received)
     }
 
     fn corrupt<'a>(&self, error: DecodeError) -> Received<'a> {
@@ -204,5 +199,11 @@ impl Session {
             reply: Some(ControlPacket::new(ControlKind::Resend, PacketId(0)).encode()),
             event: Event::Corrupt(error),
         }
+    }
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self::new()
     }
 }

@@ -46,10 +46,12 @@ impl<'a> DebugIo<'a> {
                 actual: payload.len(),
             });
         }
+
         let api = wire::le32(payload, 0)?;
         let processor = Processor(wire::le16(payload, 6)?);
         let text = &payload[HEADER_LEN..];
-        Ok(match api {
+
+        let message = match api {
             PRINT => Self::Print { processor, text },
             PROMPT => Self::Prompt {
                 processor,
@@ -57,14 +59,17 @@ impl<'a> DebugIo<'a> {
                 reply_capacity: wire::le32(payload, 0xc)?,
             },
             api => Self::Other { api, data: text },
-        })
+        };
+
+        Ok(message)
     }
 }
 
 /// Header of the host's reply to a prompt; `reply_length` data bytes follow.
 pub fn encode_prompt_reply(reply_length: u32) -> [u8; HEADER_LEN] {
-    let mut out = [0u8; HEADER_LEN];
-    wire::put_le32(&mut out, 0, PROMPT);
-    wire::put_le32(&mut out, 8, reply_length);
-    out
+    let mut header = [0u8; HEADER_LEN];
+    wire::put_le32(&mut header, 0, PROMPT);
+    wire::put_le32(&mut header, 8, reply_length);
+
+    header
 }

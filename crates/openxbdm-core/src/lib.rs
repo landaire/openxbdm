@@ -4,8 +4,8 @@
 
 pub mod auth;
 pub mod line;
+mod network;
 pub mod status;
 pub mod value;
 
-/// TCP port of the command server and UDP port of name discovery.
-pub const XBDM_PORT: u16 = 730;
+pub use self::network::XBDM_PORT;

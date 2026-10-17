@@ -17,6 +17,7 @@ fn main() -> ExitCode {
         eprintln!("usage: openxbdm-ffi-bindgen <lib.rs> <output directory>");
         return ExitCode::FAILURE;
     };
+
     if let Err(error) = std::fs::create_dir_all(output) {
         eprintln!(
             "openxbdm-ffi-bindgen: creating {}: {error}",
@@ -24,7 +25,9 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
+
     let docs = DocsUrlGenerator::with_base_urls(None, HashMap::new());
+
     match diplomat_tool::r#gen(entry, "cpp", output, &docs, Config::default(), true) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

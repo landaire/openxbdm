@@ -24,6 +24,7 @@ use crate::packet::MAX_PAYLOAD_LEN;
 use crate::wire;
 
 pub const HEADER_LEN: usize = 0x38;
+
 /// Largest data block that fits one reply.
 pub const MAX_TRANSFER_LEN: usize = MAX_PAYLOAD_LEN - HEADER_LEN;
 
@@ -197,33 +198,36 @@ impl Request {
     }
 
     pub fn encode(&self, processor: Processor) -> [u8; HEADER_LEN] {
-        let mut out = [0u8; HEADER_LEN];
-        wire::put_le32(&mut out, 0, self.api().0);
-        wire::put_le16(&mut out, 6, processor.0);
+        let mut header = [0u8; HEADER_LEN];
+        wire::put_le32(&mut header, 0, self.api().0);
+        wire::put_le16(&mut header, 6, processor.0);
+
         match *self {
             Self::ReadVirtualMemory { address, length }
             | Self::WriteVirtualMemory { address, length }
             | Self::ReadPhysicalMemory { address, length }
             | Self::WritePhysicalMemory { address, length } => {
-                wire::put_le64(&mut out, 0x10, address);
-                wire::put_le32(&mut out, 0x18, length);
+                wire::put_le64(&mut header, 0x10, address);
+                wire::put_le32(&mut header, 0x18, length);
             }
             Self::ReadContextRange { offset, length } => {
-                wire::put_le32(&mut out, 0x10, offset);
-                wire::put_le32(&mut out, 0x14, length);
+                wire::put_le32(&mut header, 0x10, offset);
+                wire::put_le32(&mut header, 0x14, length);
             }
             Self::WriteContextRange { offset, length } => {
-                wire::put_le32(&mut out, 0x14, offset);
-                wire::put_le32(&mut out, 0x18, length);
+                wire::put_le32(&mut header, 0x14, offset);
+                wire::put_le32(&mut header, 0x18, length);
             }
-            Self::WriteBreakpoint { address } => wire::put_le64(&mut out, 0x10, address),
-            Self::RestoreBreakpoint { handle } => wire::put_le32(&mut out, 0x10, handle.0.get()),
+            Self::WriteBreakpoint { address } => wire::put_le64(&mut header, 0x10, address),
+            Self::RestoreBreakpoint { handle } => wire::put_le32(&mut header, 0x10, handle.0.get()),
             Self::Continue { disposition } => {
-                wire::put_le32(&mut out, 0x10, disposition.status().0)
+                wire::put_le32(&mut header, 0x10, disposition.status().0)
             }
+            // These requests carry no fields.
             Self::GetVersion | Self::Reboot => {}
         }
-        out
+
+        header
     }
 }
 
@@ -304,8 +308,10 @@ impl<'a> Reply<'a> {
                 actual: payload.len(),
             });
         }
+
         let api = ApiNumber(wire::le32(payload, 0)?);
         let data = &payload[HEADER_LEN..];
+
         let body = match api {
             ApiNumber::READ_VIRTUAL_MEMORY | ApiNumber::READ_PHYSICAL_MEMORY => {
                 ReplyBody::ReadMemory {
@@ -355,6 +361,7 @@ impl<'a> Reply<'a> {
                 data,
             },
         };
+
         Ok(Self {
             api,
             processor_level: wire::le16(payload, 4)?,

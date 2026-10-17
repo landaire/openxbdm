@@ -8,12 +8,6 @@
 
 /// Maximum characters the monitor copies before parsing a numeric value.
 const NUMBER_TEXT_LIMIT: usize = 0x1f;
-/// Maximum characters the monitor copies before parsing a quadword value.
-const QWORD_TEXT_LIMIT: usize = 0x1e;
-
-fn is_separator(byte: u8) -> bool {
-    matches!(byte, b' ' | b'\r' | 0)
-}
 
 /// A received command line, without the terminating LF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,11 +22,13 @@ impl<'a> CommandLine<'a> {
             .iter()
             .position(|&byte| byte == 0)
             .unwrap_or(line.len());
+
         Self {
             bytes: &line[..end],
         }
     }
 
+    /// Bytes past the end read as NUL, matching the monitor's C string scan.
     fn at(&self, index: usize) -> u8 {
         self.bytes.get(index).copied().unwrap_or(0)
     }
@@ -47,6 +43,7 @@ impl<'a> CommandLine<'a> {
         let end = (0..self.bytes.len())
             .find(|&index| is_separator(self.bytes[index]))
             .unwrap_or(self.bytes.len());
+
         &self.bytes[..end]
     }
 
@@ -82,25 +79,31 @@ impl<'a> CommandLine<'a> {
         let name = name.as_bytes();
         let mut position = self.command().len();
         let mut quoted = false;
+
         loop {
             while position < self.bytes.len() && is_separator(self.at(position)) {
                 position += 1;
             }
+
             if position >= self.bytes.len() {
                 return None;
             }
 
             let key_start = position;
             let mut key_end = position;
+
             while !is_separator(self.at(key_end)) {
                 if self.at(key_end) == b'=' {
                     if self.bytes[key_start..key_end].eq_ignore_ascii_case(name) {
                         return Some(Token::Value(key_end + 1));
                     }
+
                     break;
                 }
+
                 key_end += 1;
             }
+
             if !value_required
                 && self.at(key_end) != b'='
                 && self.bytes[key_start..key_end].eq_ignore_ascii_case(name)
@@ -109,11 +112,13 @@ impl<'a> CommandLine<'a> {
             }
 
             position = key_end;
+
             loop {
                 let byte = self.at(position);
                 if byte == 0 || (is_separator(byte) && !quoted) {
                     break;
                 }
+
                 position += 1;
                 if byte == b'"' {
                     quoted = !quoted;
@@ -121,11 +126,6 @@ impl<'a> CommandLine<'a> {
             }
         }
     }
-}
-
-enum Token {
-    Value(usize),
-    Flag,
 }
 
 /// The text of a parameter value as it appears on the line.
@@ -155,6 +155,7 @@ impl<'a> Value<'a> {
             .iter()
             .position(|&byte| byte == 0)
             .unwrap_or(self.line.bytes.len());
+
         &self.line.bytes[self.start.min(end)..end]
     }
 
@@ -174,10 +175,12 @@ impl<'a> Value<'a> {
     pub fn copy_into<'b>(&self, output: &'b mut [u8]) -> &'b [u8] {
         let limit = output.len().saturating_sub(1);
         let mut length = 0;
+
         for byte in self.bytes().take(limit) {
             output[length] = byte;
             length += 1;
         }
+
         &output[..length]
     }
 
@@ -189,7 +192,10 @@ impl<'a> Value<'a> {
         let mut buffer = [0u8; NUMBER_TEXT_LIMIT + 1];
         let text = self.copy_into(&mut buffer);
         let (value, consumed) = parse_number(text);
+
+        // The end of the copied text terminates the number like a NUL.
         let next = text.get(consumed).copied().unwrap_or(0);
+
         is_separator(next).then_some(value)
     }
 
@@ -197,6 +203,7 @@ impl<'a> Value<'a> {
     /// parameter absent: the parsed prefix of the copied text.
     pub fn dword_prefix(&self) -> u32 {
         let mut buffer = [0u8; NUMBER_TEXT_LIMIT + 1];
+
         parse_number(self.copy_into(&mut buffer)).0
     }
 
@@ -204,26 +211,37 @@ impl<'a> Value<'a> {
     /// last sixteen digits form the value; longer input is accepted up to
     /// the copy limit.
     pub fn qword(&self) -> Option<u64> {
+        /// Maximum characters the monitor copies before parsing a quadword value.
+        const QWORD_TEXT_LIMIT: usize = 0x1e;
+
         let mut buffer = [0u8; QWORD_TEXT_LIMIT + 1];
         let text = self.copy_into(&mut buffer);
+
         if text.len() < 2 || text[0] != b'0' || text[1] != b'q' {
             return None;
         }
+
         let mut count = 0;
+
         for &byte in &text[2..] {
             if is_separator(byte) {
                 break;
             }
+
             if !byte.is_ascii_hexdigit() {
                 return None;
             }
+
             count += 1;
         }
+
         if count == 0 {
             return None;
         }
+
         let digits = &text[2..2 + count];
         let keep = &digits[digits.len().saturating_sub(16)..];
+
         Some(keep.iter().fold(0u64, |value, &digit| {
             (value << 4) | u64::from(hex_value(digit))
         }))
@@ -247,18 +265,30 @@ impl Iterator for Unquoted<'_> {
             if byte == 0 || (is_separator(byte) && !self.quoted) {
                 return None;
             }
+
             if byte != b'"' {
                 self.position += 1;
                 return Some(byte);
             }
+
             if self.quoted && self.line.at(self.position + 1) == b'"' {
                 self.position += 2;
                 return Some(b'"');
             }
+
             self.quoted = !self.quoted;
             self.position += 1;
         }
     }
+}
+
+enum Token {
+    Value(usize),
+    Flag,
+}
+
+fn is_separator(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\r' | 0)
 }
 
 fn hex_value(digit: u8) -> u8 {
@@ -273,41 +303,50 @@ fn hex_value(digit: u8) -> u8 {
 /// C `strtol` base-0 subset used by the monitor. Returns the value and the
 /// number of bytes consumed. Arithmetic wraps at 32 bits.
 fn parse_number(text: &[u8]) -> (u32, usize) {
+    // Bytes past the copied text read as the NUL terminator.
     let at = |index: usize| text.get(index).copied().unwrap_or(0);
+
     if at(0) != b'0' {
         let negative = at(0) == b'-';
         let mut index = usize::from(negative);
         let mut value = 0u32;
+
         while at(index).is_ascii_digit() {
             value = value
                 .wrapping_mul(10)
                 .wrapping_add(u32::from(at(index) - b'0'));
             index += 1;
         }
-        return (
-            if negative {
-                value.wrapping_neg()
-            } else {
-                value
-            },
-            index,
-        );
+
+        let value = if negative {
+            value.wrapping_neg()
+        } else {
+            value
+        };
+
+        return (value, index);
     }
+
     if matches!(at(1), b'x' | b'X') {
         let mut index = 2;
         let mut value = 0u32;
+
         while at(index).is_ascii_hexdigit() {
             value = (value << 4) | u32::from(hex_value(at(index)));
             index += 1;
         }
+
         return (value, index);
     }
+
     let mut index = 1;
     let mut value = 0u32;
+
     while matches!(at(index), b'0'..=b'7') {
         value = (value << 3).wrapping_add(u32::from(at(index) - b'0'));
         index += 1;
     }
+
     (value, index)
 }
 
@@ -328,14 +367,14 @@ mod tests {
     #[test]
     fn keys_match_case_insensitively_and_exactly() {
         let cmd = line("getmem ADDR=5 addrx=6 length=7");
-        assert_eq!(cmd.param("addr").and_then(|v| v.dword()), Some(5));
-        assert_eq!(cmd.param("addrx").and_then(|v| v.dword()), Some(6));
+        assert_eq!(cmd.param("addr").and_then(|param| param.dword()), Some(5));
+        assert_eq!(cmd.param("addrx").and_then(|param| param.dword()), Some(6));
         assert!(cmd.param("add").is_none());
     }
 
     #[test]
     fn numbers_follow_strtol_base_zero() {
-        let value = |text: &str| line(text).param("v").and_then(|v| v.dword());
+        let value = |text: &str| line(text).param("v").and_then(|param| param.dword());
         assert_eq!(value("x v=0x1F"), Some(0x1f));
         assert_eq!(value("x v=010"), Some(8));
         assert_eq!(value("x v=10"), Some(10));
@@ -356,13 +395,13 @@ mod tests {
             cmd.param("name").unwrap().copy_into(&mut buffer),
             br#"e:\a b"c.txt"#
         );
-        assert_eq!(cmd.param("next").and_then(|v| v.dword()), Some(1));
+        assert_eq!(cmd.param("next").and_then(|param| param.dword()), Some(1));
     }
 
     #[test]
     fn quoted_spaces_do_not_create_tokens() {
         let cmd = line(r#"x name="a len=5" len=6"#);
-        assert_eq!(cmd.param("len").and_then(|v| v.dword()), Some(6));
+        assert_eq!(cmd.param("len").and_then(|param| param.dword()), Some(6));
     }
 
     #[test]
@@ -383,7 +422,7 @@ mod tests {
 
     #[test]
     fn qwords_take_the_last_sixteen_digits() {
-        let value = |text: &str| line(text).param("q").and_then(|v| v.qword());
+        let value = |text: &str| line(text).param("q").and_then(|param| param.qword());
         assert_eq!(value("x q=0q1122334455667788"), Some(0x1122_3344_5566_7788));
         assert_eq!(value("x q=0qff"), Some(0xff));
         assert_eq!(

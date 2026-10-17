@@ -112,14 +112,17 @@ impl<'a> StateChange<'a> {
                 actual: payload.len(),
             });
         }
+
         let new_state = NewState(wire::le32(payload, 0)?);
         let data = &payload[HEADER_LEN..];
+
         let body = match new_state {
             NewState::EXCEPTION => {
                 let mut information = [0u64; EXCEPTION_PARAMETER_COUNT];
                 for (index, slot) in information.iter_mut().enumerate() {
                     *slot = wire::le64(payload, 0x40 + 8 * index)?;
                 }
+
                 StateBody::Exception {
                     record: ExceptionRecord {
                         code: NtStatus(wire::le32(payload, 0x20)?),
@@ -142,6 +145,7 @@ impl<'a> StateChange<'a> {
             }),
             _ => StateBody::Other,
         };
+
         let path = match body {
             StateBody::LoadSymbols(symbols) => {
                 let declared = symbols.path_name_length as usize;
@@ -152,6 +156,7 @@ impl<'a> StateChange<'a> {
                         actual: data.len(),
                     });
                 }
+
                 match data.split_last() {
                     Some((0, name)) => name,
                     _ => data,
@@ -159,8 +164,10 @@ impl<'a> StateChange<'a> {
             }
             _ => data,
         };
+
         let mut instruction_stream = [0u8; 16];
         instruction_stream.copy_from_slice(&payload[0xc4..0xd4]);
+
         Ok(Self {
             new_state,
             processor_level: wire::le16(payload, 4)?,

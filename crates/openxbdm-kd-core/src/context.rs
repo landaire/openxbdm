@@ -20,9 +20,10 @@
 //! | 0x22c | 4 | unused |
 //! | 0x230 | 0x810 | vector state copied from thread +0x170; layout not analyzed |
 
+use crate::manipulate::MAX_TRANSFER_LEN;
+
 pub const CONTEXT_LEN: usize = 0xa40;
 
-const FLAGS: usize = 0x000;
 const MSR: usize = 0x004;
 const IAR: usize = 0x008;
 const LR: usize = 0x00c;
@@ -82,6 +83,121 @@ pub struct Context {
     bytes: [u8; CONTEXT_LEN],
 }
 
+impl Context {
+    pub fn from_bytes(bytes: [u8; CONTEXT_LEN]) -> Self {
+        Self { bytes }
+    }
+
+    pub fn as_bytes(&self) -> &[u8; CONTEXT_LEN] {
+        &self.bytes
+    }
+
+    pub fn as_bytes_mut(&mut self) -> &mut [u8; CONTEXT_LEN] {
+        &mut self.bytes
+    }
+
+    fn read32(&self, offset: usize) -> u32 {
+        let mut raw = [0u8; 4];
+        raw.copy_from_slice(&self.bytes[offset..offset + 4]);
+
+        u32::from_be_bytes(raw)
+    }
+
+    fn read64(&self, offset: usize) -> u64 {
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(&self.bytes[offset..offset + 8]);
+
+        u64::from_be_bytes(raw)
+    }
+
+    fn write32(&mut self, offset: usize, value: u32) {
+        self.bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+    }
+
+    fn write64(&mut self, offset: usize, value: u64) {
+        self.bytes[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
+    }
+
+    pub fn flags(&self) -> ContextFlags {
+        const FLAGS: usize = 0x000;
+
+        ContextFlags(self.read32(FLAGS))
+    }
+
+    pub fn msr(&self) -> u32 {
+        self.read32(MSR)
+    }
+
+    pub fn set_msr(&mut self, value: u32) {
+        self.write32(MSR, value)
+    }
+
+    pub fn iar(&self) -> u32 {
+        self.read32(IAR)
+    }
+
+    pub fn set_iar(&mut self, value: u32) {
+        self.write32(IAR, value)
+    }
+
+    pub fn lr(&self) -> u32 {
+        self.read32(LR)
+    }
+
+    pub fn set_lr(&mut self, value: u32) {
+        self.write32(LR, value)
+    }
+
+    pub fn ctr(&self) -> u64 {
+        self.read64(CTR)
+    }
+
+    pub fn set_ctr(&mut self, value: u64) {
+        self.write64(CTR, value)
+    }
+
+    pub fn gpr(&self, register: Gpr) -> u64 {
+        self.read64(GPR + 8 * usize::from(register.0))
+    }
+
+    pub fn set_gpr(&mut self, register: Gpr, value: u64) {
+        self.write64(GPR + 8 * usize::from(register.0), value)
+    }
+
+    pub fn cr(&self) -> u32 {
+        self.read32(CR)
+    }
+
+    pub fn set_cr(&mut self, value: u32) {
+        self.write32(CR, value)
+    }
+
+    pub fn xer(&self) -> u32 {
+        self.read32(XER)
+    }
+
+    pub fn set_xer(&mut self, value: u32) {
+        self.write32(XER, value)
+    }
+
+    pub fn fpscr(&self) -> u64 {
+        self.read64(FPSCR)
+    }
+
+    pub fn set_fpscr(&mut self, value: u64) {
+        self.write64(FPSCR, value)
+    }
+
+    /// Raw IEEE 754 double bits.
+    pub fn fpr(&self, register: Fpr) -> u64 {
+        self.read64(FPR + 8 * usize::from(register.0))
+    }
+
+    pub fn set_fpr(&mut self, register: Fpr, value: u64) {
+        self.write64(FPR + 8 * usize::from(register.0), value)
+    }
+}
+
 impl Default for Context {
     fn default() -> Self {
         Self {
@@ -100,117 +216,6 @@ impl core::fmt::Debug for Context {
     }
 }
 
-impl Context {
-    pub fn from_bytes(bytes: [u8; CONTEXT_LEN]) -> Self {
-        Self { bytes }
-    }
-
-    pub fn as_bytes(&self) -> &[u8; CONTEXT_LEN] {
-        &self.bytes
-    }
-
-    pub fn as_bytes_mut(&mut self) -> &mut [u8; CONTEXT_LEN] {
-        &mut self.bytes
-    }
-
-    fn get32(&self, offset: usize) -> u32 {
-        let mut raw = [0u8; 4];
-        raw.copy_from_slice(&self.bytes[offset..offset + 4]);
-        u32::from_be_bytes(raw)
-    }
-
-    fn get64(&self, offset: usize) -> u64 {
-        let mut raw = [0u8; 8];
-        raw.copy_from_slice(&self.bytes[offset..offset + 8]);
-        u64::from_be_bytes(raw)
-    }
-
-    fn set32(&mut self, offset: usize, value: u32) {
-        self.bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
-    }
-
-    fn set64(&mut self, offset: usize, value: u64) {
-        self.bytes[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
-    }
-
-    pub fn flags(&self) -> ContextFlags {
-        ContextFlags(self.get32(FLAGS))
-    }
-
-    pub fn msr(&self) -> u32 {
-        self.get32(MSR)
-    }
-
-    pub fn set_msr(&mut self, value: u32) {
-        self.set32(MSR, value)
-    }
-
-    pub fn iar(&self) -> u32 {
-        self.get32(IAR)
-    }
-
-    pub fn set_iar(&mut self, value: u32) {
-        self.set32(IAR, value)
-    }
-
-    pub fn lr(&self) -> u32 {
-        self.get32(LR)
-    }
-
-    pub fn set_lr(&mut self, value: u32) {
-        self.set32(LR, value)
-    }
-
-    pub fn ctr(&self) -> u64 {
-        self.get64(CTR)
-    }
-
-    pub fn set_ctr(&mut self, value: u64) {
-        self.set64(CTR, value)
-    }
-
-    pub fn gpr(&self, register: Gpr) -> u64 {
-        self.get64(GPR + 8 * usize::from(register.0))
-    }
-
-    pub fn set_gpr(&mut self, register: Gpr, value: u64) {
-        self.set64(GPR + 8 * usize::from(register.0), value)
-    }
-
-    pub fn cr(&self) -> u32 {
-        self.get32(CR)
-    }
-
-    pub fn set_cr(&mut self, value: u32) {
-        self.set32(CR, value)
-    }
-
-    pub fn xer(&self) -> u32 {
-        self.get32(XER)
-    }
-
-    pub fn set_xer(&mut self, value: u32) {
-        self.set32(XER, value)
-    }
-
-    pub fn fpscr(&self) -> u64 {
-        self.get64(FPSCR)
-    }
-
-    pub fn set_fpscr(&mut self, value: u64) {
-        self.set64(FPSCR, value)
-    }
-
-    /// Raw IEEE 754 double bits.
-    pub fn fpr(&self, register: Fpr) -> u64 {
-        self.get64(FPR + 8 * usize::from(register.0))
-    }
-
-    pub fn set_fpr(&mut self, register: Fpr, value: u64) {
-        self.set64(FPR + 8 * usize::from(register.0), value)
-    }
-}
-
 /// A byte range of the context record transferred by one request.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct ContextChunk {
@@ -222,12 +227,11 @@ pub struct ContextChunk {
 /// write handler (0x801b6438) commits the staged record only when a range
 /// ends at [`CONTEXT_LEN`], so the last chunk must be sent last.
 pub fn context_chunks() -> impl Iterator<Item = ContextChunk> {
-    let step = crate::manipulate::MAX_TRANSFER_LEN;
     (0..CONTEXT_LEN)
-        .step_by(step)
-        .map(move |offset| ContextChunk {
+        .step_by(MAX_TRANSFER_LEN)
+        .map(|offset| ContextChunk {
             // Both bounded by CONTEXT_LEN.
             offset: offset as u32,
-            length: (CONTEXT_LEN - offset).min(step) as u32,
+            length: (CONTEXT_LEN - offset).min(MAX_TRANSFER_LEN) as u32,
         })
 }

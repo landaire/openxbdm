@@ -22,9 +22,13 @@ pub enum Message<'a> {
 }
 
 impl<'a> Message<'a> {
-    pub fn decode<S: ChecksumState>(packet: &DataPacket<'a, S>) -> Result<Self, DecodeError> {
+    pub fn decode<S>(packet: &DataPacket<'a, S>) -> Result<Self, DecodeError>
+    where
+        S: ChecksumState,
+    {
         let payload = packet.payload();
-        Ok(match packet.packet_type() {
+
+        let message = match packet.packet_type() {
             PacketType::MANIPULATE => Self::Manipulate(Reply::decode(payload)?),
             PacketType::STATE_CHANGE => Self::StateChange(StateChange::decode(payload)?),
             PacketType::DEBUG_IO => Self::DebugIo(DebugIo::decode(payload)?),
@@ -33,6 +37,8 @@ impl<'a> Message<'a> {
                 packet_type,
                 payload,
             },
-        })
+        };
+
+        Ok(message)
     }
 }

@@ -97,13 +97,15 @@ impl core::fmt::Debug for PacketId {
 pub struct Checksum(pub u32);
 
 impl Checksum {
-    pub fn of(parts: &[&[u8]]) -> Self {
+    pub fn from_parts(parts: &[&[u8]]) -> Self {
         let mut sum = 0u32;
+
         for part in parts {
             for &byte in *part {
                 sum = sum.wrapping_add(u32::from(byte));
             }
         }
+
         Self(sum)
     }
 }
@@ -126,6 +128,7 @@ pub struct PacketHeader {
 impl PacketHeader {
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
         wire::require(bytes, HEADER_LEN)?;
+
         Ok(Self {
             leader: wire::le32(bytes, 0)?,
             packet_type: PacketType(wire::le16(bytes, 4)?),
@@ -136,13 +139,14 @@ impl PacketHeader {
     }
 
     pub fn encode(&self) -> [u8; HEADER_LEN] {
-        let mut out = [0u8; HEADER_LEN];
-        wire::put_le32(&mut out, 0, self.leader);
-        wire::put_le16(&mut out, 4, self.packet_type.0);
-        wire::put_le16(&mut out, 6, self.byte_count);
-        wire::put_le32(&mut out, 8, self.id.0);
-        wire::put_le32(&mut out, 0xc, self.checksum.0);
-        out
+        let mut bytes = [0u8; HEADER_LEN];
+        wire::put_le32(&mut bytes, 0, self.leader);
+        wire::put_le16(&mut bytes, 4, self.packet_type.0);
+        wire::put_le16(&mut bytes, 6, self.byte_count);
+        wire::put_le32(&mut bytes, 8, self.id.0);
+        wire::put_le32(&mut bytes, 0xc, self.checksum.0);
+
+        bytes
     }
 }
 
@@ -204,21 +208,29 @@ pub trait ChecksumState {}
 /// The checksum has not been compared with the payload.
 #[derive(Debug, Copy, Clone)]
 pub enum Unverified {}
+
+impl ChecksumState for Unverified {}
+
 /// The checksum matched the payload.
 #[derive(Debug, Copy, Clone)]
 pub enum Verified {}
 
-impl ChecksumState for Unverified {}
 impl ChecksumState for Verified {}
 
 #[derive(Debug, Copy, Clone)]
-pub struct DataPacket<'a, S: ChecksumState> {
+pub struct DataPacket<'a, S>
+where
+    S: ChecksumState,
+{
     header: PacketHeader,
     payload: &'a [u8],
     state: PhantomData<S>,
 }
 
-impl<'a, S: ChecksumState> DataPacket<'a, S> {
+impl<'a, S> DataPacket<'a, S>
+where
+    S: ChecksumState,
+{
     pub fn header(&self) -> &PacketHeader {
         &self.header
     }
@@ -236,7 +248,7 @@ impl<'a, S: ChecksumState> DataPacket<'a, S> {
     }
 
     pub fn computed_checksum(&self) -> Checksum {
-        Checksum::of(&[self.payload])
+        Checksum::from_parts(&[self.payload])
     }
 }
 
@@ -249,6 +261,7 @@ impl<'a> DataPacket<'a, Unverified> {
                 computed,
             });
         }
+
         Ok(DataPacket {
             header: self.header,
             payload: self.payload,
@@ -277,10 +290,11 @@ impl Beacon {
     }
 
     pub fn encode(&self) -> [u8; BEACON_LEN] {
-        let mut out = [0u8; BEACON_LEN];
-        wire::put_le64(&mut out, 0, self.unidentified);
-        wire::put_le32(&mut out, 8, u32::from(self.host_address));
-        out
+        let mut bytes = [0u8; BEACON_LEN];
+        wire::put_le64(&mut bytes, 0, self.unidentified);
+        wire::put_le32(&mut bytes, 8, u32::from(self.host_address));
+
+        bytes
     }
 }
 
@@ -299,14 +313,18 @@ impl<'a> Datagram<'a> {
             if bytes.len() == BEACON_LEN {
                 return Beacon::decode(bytes).map(Self::Beacon);
             }
+
             if bytes.first() == Some(&BREAK_IN[0]) {
                 return Ok(Self::BreakIn);
             }
+
             return Err(DecodeError::UnrecognizedShortDatagram {
                 length: bytes.len(),
             });
         }
+
         let header = PacketHeader::decode(bytes)?;
+
         match header.leader {
             CONTROL_LEADER => {
                 let kind = ControlKind::from_packet_type(header.packet_type).ok_or(
@@ -314,6 +332,7 @@ impl<'a> Datagram<'a> {
                         packet_type: header.packet_type,
                     },
                 )?;
+
                 Ok(Self::Control(ControlPacket {
                     kind,
                     id: header.id,
@@ -327,6 +346,7 @@ impl<'a> Datagram<'a> {
                         maximum: MAX_PAYLOAD_LEN,
                     });
                 }
+
                 let payload = &bytes[HEADER_LEN..];
                 if payload.len() != declared {
                     return Err(DecodeError::PayloadLengthMismatch {
@@ -334,6 +354,7 @@ impl<'a> Datagram<'a> {
                         actual: payload.len(),
                     });
                 }
+
                 Ok(Self::Data(DataPacket {
                     header,
                     payload,
@@ -354,12 +375,14 @@ pub fn encode_data(
     parts: &[&[u8]],
 ) -> Result<usize, EncodeError> {
     let length: usize = parts.iter().map(|part| part.len()).sum();
+
     if length > MAX_PAYLOAD_LEN {
         return Err(EncodeError::PayloadTooLarge {
             length,
             maximum: MAX_PAYLOAD_LEN,
         });
     }
+
     let total = HEADER_LEN + length;
     if out.len() < total {
         return Err(EncodeError::BufferTooSmall {
@@ -367,19 +390,22 @@ pub fn encode_data(
             actual: out.len(),
         });
     }
+
     let header = PacketHeader {
         leader: DATA_LEADER,
         packet_type,
         // Bounded by MAX_PAYLOAD_LEN above.
         byte_count: length as u16,
         id,
-        checksum: Checksum::of(parts),
+        checksum: Checksum::from_parts(parts),
     };
     out[..HEADER_LEN].copy_from_slice(&header.encode());
+
     let mut cursor = HEADER_LEN;
     for part in parts {
         out[cursor..cursor + part.len()].copy_from_slice(part);
         cursor += part.len();
     }
+
     Ok(total)
 }

@@ -23,7 +23,9 @@ fn field<'a, O>(
         needed: offset + width,
         actual: bytes.len(),
     };
+
     let mut input = bytes.get(offset..offset + width).ok_or(truncated.clone())?;
+
     parser.parse_next(&mut input).map_err(|_| truncated)
 }
 
@@ -54,6 +56,7 @@ pub(crate) fn require(bytes: &[u8], needed: usize) -> Result<(), DecodeError> {
             actual: bytes.len(),
         });
     }
+
     Ok(())
 }
 

@@ -23,10 +23,59 @@ use openxbdm_kd_core::packet::PacketType;
 use openxbdm_kd_core::session::Event;
 use openxbdm_kd_core::session::Session;
 
+const FILE_SIZE: u64 = 258_048;
+const HANDLE: HostFileHandle = HostFileHandle(NonZeroU64::MIN);
+
+/// A 258048-byte file served for `host:\Device\Flash\xbdm.xex`.
+struct OneFile;
+
+impl HostFileSystem for OneFile {
+    fn open(&mut self, request: &OpenRequest<'_>) -> Result<OpenedFile, HostFileError> {
+        if request
+            .path
+            .to_string()
+            .eq_ignore_ascii_case(r"host:\Device\Flash\xbdm.xex")
+        {
+            Ok(OpenedFile {
+                handle: HANDLE,
+                size: FILE_SIZE,
+            })
+        } else {
+            Err(HostFileError::NotMapped)
+        }
+    }
+
+    fn read(
+        &mut self,
+        handle: HostFileHandle,
+        offset: u64,
+        buffer: &mut [u8],
+    ) -> Result<usize, HostFileError> {
+        if handle != HANDLE {
+            return Err(HostFileError::UnknownHandle);
+        }
+
+        let count = (FILE_SIZE.saturating_sub(offset) as usize).min(buffer.len());
+        for (index, byte) in buffer[..count].iter_mut().enumerate() {
+            *byte = (offset as usize + index) as u8;
+        }
+
+        Ok(count)
+    }
+
+    fn close(&mut self, handle: HostFileHandle) -> Result<(), HostFileError> {
+        if handle == HANDLE {
+            Ok(())
+        } else {
+            Err(HostFileError::UnknownHandle)
+        }
+    }
+}
+
 fn hex(text: &str) -> Vec<u8> {
     (0..text.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+        .map(|index| u8::from_str_radix(&text[index..index + 2], 16).unwrap())
         .collect()
 }
 
@@ -35,24 +84,37 @@ fn hex(text: &str) -> Vec<u8> {
 fn fixture_path(name: &str) -> PathBuf {
     let manifest_dir =
         std::env::var_os("CARGO_MANIFEST_DIR").expect("the test runner sets CARGO_MANIFEST_DIR");
+
     PathBuf::from(manifest_dir)
         .join("tests/fixtures")
         .join(name)
 }
 
-/// Datagrams from `tests/fixtures/kd.log` (`time peer length hex` lines).
-fn captured() -> Vec<Vec<u8>> {
-    let path = fixture_path("kd.log");
-    std::fs::read_to_string(path)
+/// Datagrams of a fixture log (`time peer length hex` lines).
+fn fixture_datagrams(name: &str) -> Vec<Vec<u8>> {
+    std::fs::read_to_string(fixture_path(name))
         .unwrap()
         .lines()
         .map(|line| hex(line.split_whitespace().nth(3).unwrap()))
         .collect()
 }
 
+/// Datagrams from `tests/fixtures/kd.log`.
+fn captured() -> Vec<Vec<u8>> {
+    fixture_datagrams("kd.log")
+}
+
+/// Host file requests captured while the kernel loaded `xbdm.xex` from the
+/// host: two opens, three reads (first, a short one ending at a 0x800
+/// boundary, last) and the close.
+fn captured_file_io() -> Vec<Vec<u8>> {
+    fixture_datagrams("file_io.log")
+}
+
 #[test]
 fn captured_datagrams() {
     let mut out = String::new();
+
     for datagram in captured() {
         match Datagram::decode(&datagram).unwrap() {
             Datagram::Data(packet) => {
@@ -63,16 +125,22 @@ fn captured_datagrams() {
             other => writeln!(out, "{other:#?}").unwrap(),
         }
     }
+
     insta::assert_snapshot!(out);
 }
 
 #[test]
 fn checksum_mismatch_is_reported() {
-    let mut datagram = captured().into_iter().find(|d| d.len() > 16).unwrap();
+    let mut datagram = captured()
+        .into_iter()
+        .find(|datagram| datagram.len() > 16)
+        .unwrap();
     datagram[20] ^= 1;
+
     let Datagram::Data(packet) = Datagram::decode(&datagram).unwrap() else {
         panic!("data packet")
     };
+
     insta::assert_debug_snapshot!(packet.verify().unwrap_err());
 }
 
@@ -99,12 +167,14 @@ fn request_encodings() {
         },
         Request::GetVersion,
     ];
+
     let mut out = String::new();
     for request in requests {
         let encoded = request.encode(Processor(0));
         let text: String = encoded.iter().map(|byte| format!("{byte:02x}")).collect();
         writeln!(out, "{:?} {text}", request.api()).unwrap();
     }
+
     insta::assert_snapshot!(out);
 }
 
@@ -118,6 +188,7 @@ fn session_exchange() {
     let received = session.receive(state_change).unwrap();
     writeln!(out, "state change: reply {:02x?}", received.reply.unwrap()).unwrap();
     assert!(matches!(received.event, Event::Data(_)));
+
     let received = session.receive(state_change).unwrap();
     writeln!(out, "repeat: {:?}", received.event).unwrap();
 
@@ -168,66 +239,8 @@ fn session_exchange() {
     };
     writeln!(out, "reply id {:?}", packet.id()).unwrap();
     assert_eq!(packet.id(), PacketId(2));
+
     insta::assert_snapshot!(out);
-}
-
-/// Host file requests captured while the kernel loaded `xbdm.xex` from the
-/// host: two opens, three reads (first, a short one ending at a 0x800
-/// boundary, last) and the close.
-fn captured_file_io() -> Vec<Vec<u8>> {
-    let path = fixture_path("file_io.log");
-    std::fs::read_to_string(path)
-        .unwrap()
-        .lines()
-        .map(|line| hex(line.split_whitespace().nth(3).unwrap()))
-        .collect()
-}
-
-/// A 258048-byte file served for `host:\Device\Flash\xbdm.xex`.
-struct OneFile;
-
-const FILE_SIZE: u64 = 258_048;
-const HANDLE: HostFileHandle = HostFileHandle(NonZeroU64::MIN);
-
-impl HostFileSystem for OneFile {
-    fn open(&mut self, request: &OpenRequest<'_>) -> Result<OpenedFile, HostFileError> {
-        if request
-            .path
-            .to_string()
-            .eq_ignore_ascii_case(r"host:\Device\Flash\xbdm.xex")
-        {
-            Ok(OpenedFile {
-                handle: HANDLE,
-                size: FILE_SIZE,
-            })
-        } else {
-            Err(HostFileError::NotMapped)
-        }
-    }
-
-    fn read(
-        &mut self,
-        handle: HostFileHandle,
-        offset: u64,
-        buffer: &mut [u8],
-    ) -> Result<usize, HostFileError> {
-        if handle != HANDLE {
-            return Err(HostFileError::UnknownHandle);
-        }
-        let count = (FILE_SIZE.saturating_sub(offset) as usize).min(buffer.len());
-        for (index, byte) in buffer[..count].iter_mut().enumerate() {
-            *byte = (offset as usize + index) as u8;
-        }
-        Ok(count)
-    }
-
-    fn close(&mut self, handle: HostFileHandle) -> Result<(), HostFileError> {
-        if handle == HANDLE {
-            Ok(())
-        } else {
-            Err(HostFileError::UnknownHandle)
-        }
-    }
 }
 
 #[test]
@@ -241,6 +254,7 @@ fn file_io_exchange() {
             packet.verify().unwrap().payload().to_vec()
         })
         .collect();
+
     // A read at the end of the file, which the kernel does not send for a
     // file of known size.
     let mut past_end = requests[4].clone();
@@ -250,9 +264,11 @@ fn file_io_exchange() {
     let mut session = Session::new();
     let mut data = [0u8; MAX_READ_LEN];
     let mut out = String::new();
+
     for payload in &requests {
         let request = FileIoRequest::decode(payload).unwrap();
         writeln!(out, "{request:?}").unwrap();
+
         let (reply, length) = file_io::respond(&request, &mut OneFile, &mut data);
         let header = reply.encode();
         let datagram = session
@@ -260,13 +276,16 @@ fn file_io_exchange() {
             .unwrap()
             .to_vec();
         session.abandon();
+
         let text: String = header.iter().map(|byte| format!("{byte:02x}")).collect();
         writeln!(out, "  {reply:?} data {length:#x}\n  header {text}").unwrap();
         writeln!(out, "  packet {:02x?}", &datagram[..16]).unwrap();
+
         assert_eq!(
             FileIoReply::decode(&datagram[16..]).unwrap(),
             (reply, &data[..length])
         );
     }
+
     insta::assert_snapshot!(out);
 }

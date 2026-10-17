@@ -22,6 +22,9 @@
 //! reply carries the file bytes as data directly after the header; the
 //! kernel takes the byte count from the payload length.
 
+mod error;
+mod host;
+
 use core::num::NonZeroU64;
 
 use crate::DecodeError;
@@ -29,7 +32,12 @@ use crate::NtStatus;
 use crate::packet::MAX_PAYLOAD_LEN;
 use crate::wire;
 
+pub use self::error::HostFileError;
+pub use self::host::HostFileSystem;
+pub use self::host::respond;
+
 pub const HEADER_LEN: usize = 0x40;
+
 /// Largest read length the kernel requests (0x801b39cc). A read reply must
 /// not carry more data than the request's length: the kernel copies at most
 /// that many bytes but checksums the whole payload, so a longer reply is
@@ -78,9 +86,11 @@ impl<'a> HostPath<'a> {
         if !rest.is_empty() {
             return Err(DecodeError::OddPathLength { length: data.len() });
         }
+
         let Some(end) = units.iter().position(|unit| *unit == [0, 0]) else {
             return Err(DecodeError::UnterminatedPath);
         };
+
         Ok(Self {
             bytes: &data[..end * 2],
         })
@@ -109,9 +119,11 @@ impl core::fmt::Debug for HostPath<'_> {
 impl core::fmt::Display for HostPath<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         use core::fmt::Write;
-        for c in self.chars() {
-            f.write_char(c.unwrap_or(char::REPLACEMENT_CHARACTER))?;
+
+        for character in self.chars() {
+            f.write_char(character.unwrap_or(char::REPLACEMENT_CHARACTER))?;
         }
+
         Ok(())
     }
 }
@@ -150,12 +162,6 @@ pub enum FileIoRequest<'a> {
     Other { api: FileIoApi, payload: &'a [u8] },
 }
 
-fn handle(payload: &[u8], api: FileIoApi) -> Result<HostFileHandle, DecodeError> {
-    NonZeroU64::new(wire::le64(payload, 8)?)
-        .map(HostFileHandle)
-        .ok_or(DecodeError::ZeroFileHandle { api })
-}
-
 impl<'a> FileIoRequest<'a> {
     pub fn decode(payload: &'a [u8]) -> Result<Self, DecodeError> {
         if payload.len() < HEADER_LEN {
@@ -164,8 +170,9 @@ impl<'a> FileIoRequest<'a> {
                 actual: payload.len(),
             });
         }
+
         let api = FileIoApi(wire::le32(payload, 0)?);
-        Ok(match api {
+        let request = match api {
             FileIoApi::OPEN => Self::Open(OpenRequest {
                 desired_access: wire::le32(payload, 0x08)?,
                 file_attributes: wire::le32(payload, 0x0c)?,
@@ -175,15 +182,17 @@ impl<'a> FileIoRequest<'a> {
                 path: HostPath::decode(&payload[HEADER_LEN..])?,
             }),
             FileIoApi::READ => Self::Read(ReadRequest {
-                handle: handle(payload, api)?,
+                handle: decode_handle(payload, 0x08, api)?,
                 offset: wire::le64(payload, 0x10)?,
                 length: wire::le32(payload, 0x18)?,
             }),
             FileIoApi::CLOSE => Self::Close(CloseRequest {
-                handle: handle(payload, api)?,
+                handle: decode_handle(payload, 0x08, api)?,
             }),
             api => Self::Other { api, payload },
-        })
+        };
+
+        Ok(request)
     }
 
     pub fn api(&self) -> FileIoApi {
@@ -218,15 +227,6 @@ pub enum FileIoReply {
 }
 
 impl FileIoReply {
-    pub fn api(&self) -> FileIoApi {
-        match self {
-            Self::Opened(_) => FileIoApi::OPEN,
-            Self::Read => FileIoApi::READ,
-            Self::Closed => FileIoApi::CLOSE,
-            Self::Failed { api, .. } => *api,
-        }
-    }
-
     /// Decodes a host reply. Returns the reply and its data.
     pub fn decode(payload: &[u8]) -> Result<(Self, &[u8]), DecodeError> {
         if payload.len() < HEADER_LEN {
@@ -235,16 +235,16 @@ impl FileIoReply {
                 actual: payload.len(),
             });
         }
+
         let api = FileIoApi(wire::le32(payload, 0)?);
         let status = NtStatus(wire::le32(payload, 4)?);
+
         let reply = if status.is_error() {
             Self::Failed { api, status }
         } else {
             match api {
                 FileIoApi::OPEN => Self::Opened(OpenedFile {
-                    handle: NonZeroU64::new(wire::le64(payload, 0x20)?)
-                        .map(HostFileHandle)
-                        .ok_or(DecodeError::ZeroFileHandle { api })?,
+                    handle: decode_handle(payload, 0x20, api)?,
                     size: wire::le64(payload, 0x28)?,
                 }),
                 FileIoApi::READ => Self::Read,
@@ -252,104 +252,43 @@ impl FileIoReply {
                 api => return Err(DecodeError::UnknownFileIoApi { api }),
             }
         };
+
         Ok((reply, &payload[HEADER_LEN..]))
     }
 
     pub fn encode(&self) -> [u8; HEADER_LEN] {
-        let mut out = [0u8; HEADER_LEN];
-        wire::put_le32(&mut out, 0, self.api().0);
+        let mut header = [0u8; HEADER_LEN];
+        wire::put_le32(&mut header, 0, self.api().0);
+
         match self {
             Self::Opened(opened) => {
-                wire::put_le64(&mut out, 0x20, opened.handle.0.get());
-                wire::put_le64(&mut out, 0x28, opened.size);
+                wire::put_le64(&mut header, 0x20, opened.handle.0.get());
+                wire::put_le64(&mut header, 0x28, opened.size);
             }
-            Self::Failed { status, .. } => wire::put_le32(&mut out, 4, status.0),
+            Self::Failed { status, .. } => wire::put_le32(&mut header, 4, status.0),
+            // These replies carry only the api word.
             Self::Read | Self::Closed => {}
         }
-        out
+
+        header
     }
-}
 
-/// A file request the host does not complete.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum HostFileError {
-    /// No host file serves the path.
-    NotMapped,
-    /// The host file serving the path cannot be opened.
-    OpenFailed,
-    /// The handle is not open.
-    UnknownHandle,
-    /// The host file cannot be read.
-    ReadFailed,
-}
-
-/// Files the host offers to the kernel.
-pub trait HostFileSystem {
-    fn open(&mut self, request: &OpenRequest<'_>) -> Result<OpenedFile, HostFileError>;
-    /// Reads at `offset` into `buffer`. Returns 0 only at end of file.
-    fn read(
-        &mut self,
-        handle: HostFileHandle,
-        offset: u64,
-        buffer: &mut [u8],
-    ) -> Result<usize, HostFileError>;
-    fn close(&mut self, handle: HostFileHandle) -> Result<(), HostFileError>;
-}
-
-/// A request `respond` fails.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-enum RequestFailure {
-    Host(HostFileError),
-    /// A non-empty read at or past the end of the file.
-    EndOfFile,
-    UnknownApi,
-}
-
-impl RequestFailure {
-    fn status(self) -> NtStatus {
+    pub fn api(&self) -> FileIoApi {
         match self {
-            // The kernel then opens the file from its own devices.
-            Self::Host(HostFileError::NotMapped | HostFileError::OpenFailed) => {
-                NtStatus::OBJECT_NAME_NOT_FOUND
-            }
-            Self::Host(HostFileError::UnknownHandle) => NtStatus::INVALID_HANDLE,
-            Self::Host(HostFileError::ReadFailed) => NtStatus::UNSUCCESSFUL,
-            Self::EndOfFile => NtStatus::END_OF_FILE,
-            Self::UnknownApi => NtStatus::NOT_IMPLEMENTED,
+            Self::Opened(_) => FileIoApi::OPEN,
+            Self::Read => FileIoApi::READ,
+            Self::Closed => FileIoApi::CLOSE,
+            Self::Failed { api, .. } => *api,
         }
     }
 }
 
-/// Answers a request from `files`. Read data is placed in `data`; the
-/// reply payload is the encoded header followed by `data[..length]`.
-pub fn respond(
-    request: &FileIoRequest<'_>,
-    files: &mut impl HostFileSystem,
-    data: &mut [u8; MAX_READ_LEN],
-) -> (FileIoReply, usize) {
-    let failed = |failure: RequestFailure| FileIoReply::Failed {
-        api: request.api(),
-        status: failure.status(),
-    };
-    match request {
-        FileIoRequest::Open(open) => match files.open(open) {
-            Ok(opened) => (FileIoReply::Opened(opened), 0),
-            Err(error) => (failed(RequestFailure::Host(error)), 0),
-        },
-        FileIoRequest::Read(read) => {
-            let length = (read.length as usize).min(MAX_READ_LEN);
-            match files.read(read.handle, read.offset, &mut data[..length]) {
-                // A successful empty reply makes the kernel repeat the
-                // request forever (0x801b3a68 subtracts zero).
-                Ok(0) if length != 0 => (failed(RequestFailure::EndOfFile), 0),
-                Ok(count) => (FileIoReply::Read, count.min(length)),
-                Err(error) => (failed(RequestFailure::Host(error)), 0),
-            }
-        }
-        FileIoRequest::Close(close) => match files.close(close.handle) {
-            Ok(()) => (FileIoReply::Closed, 0),
-            Err(error) => (failed(RequestFailure::Host(error)), 0),
-        },
-        FileIoRequest::Other { .. } => (failed(RequestFailure::UnknownApi), 0),
-    }
+fn decode_handle(
+    payload: &[u8],
+    offset: usize,
+    api: FileIoApi,
+) -> Result<HostFileHandle, DecodeError> {
+    NonZeroU64::new(wire::le64(payload, offset)?)
+        .map(HostFileHandle)
+        .ok_or(DecodeError::ZeroFileHandle { api })
 }

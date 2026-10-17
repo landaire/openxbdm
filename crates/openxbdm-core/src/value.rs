@@ -7,8 +7,9 @@ pub struct Qword(pub u64);
 
 impl core::fmt::Display for Qword {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let hi = (self.0 >> 32) as u32;
-        let lo = self.0 as u32;
-        write!(f, "0q{:08x}{:08x}", hi, lo)
+        let high = (self.0 >> 32) as u32;
+        let low = self.0 as u32;
+
+        write!(f, "0q{high:08x}{low:08x}")
     }
 }

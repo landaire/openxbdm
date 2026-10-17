@@ -22,6 +22,6 @@ pub mod state_change;
 pub mod status;
 mod wire;
 
-pub use error::DecodeError;
-pub use error::EncodeError;
-pub use status::NtStatus;
+pub use self::error::DecodeError;
+pub use self::error::EncodeError;
+pub use self::status::NtStatus;

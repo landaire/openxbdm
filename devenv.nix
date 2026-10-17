@@ -62,6 +62,14 @@ in
     pkgs.python3
   ];
 
+  # askama, which diplomat-tool uses, writes template paths relative to the
+  # source file. With CARGO_HOME under a symbolic link (/home -> var/home on
+  # Fedora Atomic) the relative path walks out of the link and does not
+  # resolve, so Cargo builds of openxbdm-ffi-bindgen fail.
+  enterShell = ''
+    export CARGO_HOME="$(realpath -m "''${CARGO_HOME:-$HOME/.cargo}")"
+  '';
+
   # bazel-remote serves the Buck2 action cache in CI.
   profiles.ci.module.packages = [ pkgs.bazel-remote ];
 }

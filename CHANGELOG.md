@@ -77,6 +77,7 @@
 - `-c rust.profile=release` builds with the optimization, stripping and thin LTO of Cargo's release profile.
 - Report each libtest case as its own Buck2 test through the internal test runner.
 - `devenv.nix` provides the Buck2 release that `toolchains/buck2_release.json` pins, and no C compiler or LLVM tools.
+- The devenv shell resolves `CARGO_HOME` through symbolic links, so Cargo builds of `openxbdm-ffi-bindgen` work when the home directory is a link (Fedora Atomic).
 - CI builds and tests everything, including the console module and the C++ headers, with Buck2 on Linux x86_64, macOS arm64 and Windows x86_64, with a bazel-remote action cache on Linux and macOS, and checks formatting, clippy diagnostics and the generated files on Linux x86_64.
 
 ### Releases

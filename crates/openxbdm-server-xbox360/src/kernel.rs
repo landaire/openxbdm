@@ -214,6 +214,15 @@ impl KernelEvent {
     }
 }
 
+/// Pool tags shared by several services.
+pub mod pool_tag {
+    use xbox360_sys::xboxkrnl::PoolTag;
+
+    /// Monitor allocations of the generic pool exports and of copies made
+    /// for callers.
+    pub const MONITOR: PoolTag = PoolTag::new(*b"xbdm");
+}
+
 /// `KeQueryPerformanceFrequency`. The console returns the quadword in one
 /// 64-bit register; this splits it into the r3:r4 pair the 32-bit ABI
 /// expects. The CPU model of the target has no 64-bit mnemonics, so the
@@ -370,4 +379,41 @@ pub fn debug_print_bytes(text: &[u8]) {
 #[inline(always)]
 pub fn address_of<T: ?Sized>(value: &T) -> u32 {
     core::ptr::from_ref(value).cast::<u8>().expose_provenance() as u32
+}
+
+/// The `T` at `address`.
+///
+/// # Safety
+///
+/// `address` must hold an initialized, aligned `T` that stays allocated
+/// and is not written through another path except by interior mutability
+/// for `'a`.
+#[inline(always)]
+pub unsafe fn object_at<'a, T>(address: u32) -> &'a T {
+    // SAFETY: the caller guarantees the object for `'a`.
+    unsafe { &*core::ptr::with_exposed_provenance::<T>(address as usize) }
+}
+
+/// The `T` at `address`, for writing.
+///
+/// # Safety
+///
+/// As [`object_at`], and no other reference to the object is used for
+/// `'a`.
+#[inline(always)]
+pub unsafe fn object_at_mut<'a, T>(address: u32) -> &'a mut T {
+    // SAFETY: the caller guarantees exclusive access for `'a`.
+    unsafe { &mut *core::ptr::with_exposed_provenance_mut::<T>(address as usize) }
+}
+
+/// Bytes before the NUL of the string at `address`; none for 0.
+///
+/// # Safety
+///
+/// `address` must be 0 or the address of a NUL-terminated string that
+/// stays unchanged for `'a`.
+pub unsafe fn c_string<'a>(address: u32) -> Option<&'a [u8]> {
+    let start = core::ptr::with_exposed_provenance::<core::ffi::c_char>(address as usize);
+    // SAFETY: guaranteed by the caller.
+    (!start.is_null()).then(|| unsafe { core::ffi::CStr::from_ptr(start) }.to_bytes())
 }

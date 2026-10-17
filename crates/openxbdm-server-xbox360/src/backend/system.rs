@@ -35,6 +35,7 @@ use openxbdm_server::reply;
 use openxbdm_server::reply::CommandError;
 use openxbdm_server::text::Text;
 use xbox360::console::hardware_flags;
+use xbox360::module::Ordinal;
 use xbox360::time::sleep;
 use xbox360_sys::xam;
 use xbox360_sys::xam::XamLoaderGetDvdTrayState;
@@ -102,7 +103,7 @@ const XAM_VERSION_DISC_WAIT: u32 = 0x2018_3800;
 const DISC_WAIT_MS: u32 = 5000;
 const DISC_POLL_MS: u32 = 100;
 /// XAM export queried before a disc image is opened (stock 0x91f52040).
-const XAM_DISC_QUERY: u32 = 0x1a3;
+const XAM_DISC_QUERY: Ordinal = Ordinal::new(0x1a3).unwrap();
 
 /// Registration of code 0x20 (stock 0x91fa2004): size, title launch
 /// routine, system software version, as copied from the caller.

@@ -9,6 +9,7 @@ use openxbdm_server::Platform;
 use openxbdm_server::Server;
 use openxbdm_server::SocketId;
 use openxbdm_server::smb::SmbService;
+use xbox360::time::FileTime;
 use xbox360_sys::xam::FdSet;
 use xbox360_sys::xam::Socket;
 
@@ -22,14 +23,14 @@ const SMB_PORT: u16 = 445;
 const LISTEN_BACKLOG: i32 = 4;
 /// Each connection holds two pool blocks of `smb::BUFFER_SIZE` bytes.
 const CONNECTIONS: usize = 2;
-/// Delay before a failed listen is tried again, in FILETIME units (5 s).
-const LISTEN_RETRY: u64 = 5 * 10_000_000;
+/// Delay before a failed listen is tried again (5 s).
+const LISTEN_RETRY: u64 = 5 * FileTime::INTERVALS_PER_SECOND;
 
 /// Service state used by the server thread only.
 struct Local {
     service: SmbService<CONNECTIONS>,
     /// When to try to listen again while there is no listener.
-    listen_at: Option<u64>,
+    listen_at: Option<FileTime>,
 }
 
 /// Connection state is static: the server thread's stack could not hold
@@ -43,7 +44,8 @@ static LOCAL: LocalCell = LocalCell(UnsafeCell::new(Local {
     service: SmbService::new(),
     listen_at: None,
 }));
-/// The listener; unload closes it from another thread.
+/// The listener, [`Socket::INVALID`] while there is none; unload closes it
+/// from another thread.
 static LISTENER: AtomicU32 = AtomicU32::new(Socket::INVALID.raw());
 
 /// The service state.
@@ -57,10 +59,15 @@ unsafe fn local() -> &'static mut Local {
     unsafe { &mut *LOCAL.0.get() }
 }
 
+/// When a failed listen is tried again.
+fn retry_time(console: &mut Console) -> FileTime {
+    FileTime::from_intervals(console.system_time().wrapping_add(LISTEN_RETRY))
+}
+
 /// Sockets of one select pass: the listener and each connection with
 /// whether it waits to send.
 pub(crate) struct Sockets {
-    listener: Option<u32>,
+    listener: Option<Socket>,
     connections: [Option<(SocketId, bool)>; CONNECTIONS],
 }
 
@@ -77,12 +84,12 @@ pub(crate) fn open(console: &mut Console) {
 fn listen(local: &mut Local, console: &mut Console) {
     match net::listen(SMB_PORT, LISTEN_BACKLOG) {
         Ok(listener) => {
-            LISTENER.store(listener, Ordering::SeqCst);
+            LISTENER.store(listener.raw(), Ordering::SeqCst);
             local.listen_at = None;
             kernel::debug_print(c"openxbdm: SMB listening on TCP port 445\n");
         }
         Err(_) => {
-            local.listen_at = Some(console.system_time().wrapping_add(LISTEN_RETRY));
+            local.listen_at = Some(retry_time(console));
             kernel::debug_print(c"openxbdm: SMB listen failed\n");
         }
     }
@@ -90,8 +97,8 @@ fn listen(local: &mut Local, console: &mut Console) {
 
 /// Close the listener; safe on any thread.
 pub(crate) fn close_listener() {
-    let socket = LISTENER.swap(Socket::INVALID.raw(), Ordering::SeqCst);
-    if socket != Socket::INVALID.raw() {
+    let socket = Socket::from_raw(LISTENER.swap(Socket::INVALID.raw(), Ordering::SeqCst));
+    if socket != Socket::INVALID {
         net::close(socket);
     }
 }
@@ -114,7 +121,7 @@ pub(crate) fn poll(server: &Server, console: &mut Console, network: &mut XamNetw
     let local = unsafe { local() };
     local.service.poll_timers(&server.state, console, network);
     if let Some(at) = local.listen_at
-        && console.system_time() >= at
+        && FileTime::from_intervals(console.system_time()) >= at
     {
         listen(local, console);
     }
@@ -123,8 +130,8 @@ pub(crate) fn poll(server: &Server, console: &mut Console, network: &mut XamNetw
 /// Add the service's sockets to the select sets.
 #[inline(never)]
 pub(crate) fn select_sockets(read: &mut FdSet, write: &mut FdSet) -> Sockets {
-    let listener =
-        Some(LISTENER.load(Ordering::SeqCst)).filter(|&socket| socket != Socket::INVALID.raw());
+    let listener = Some(Socket::from_raw(LISTENER.load(Ordering::SeqCst)))
+        .filter(|&socket| socket != Socket::INVALID);
     if let Some(listener) = listener {
         read.insert(listener);
     }
@@ -134,9 +141,9 @@ pub(crate) fn select_sockets(read: &mut FdSet, write: &mut FdSet) -> Sockets {
     for (slot, (socket, wants_write)) in connections.iter_mut().zip(service.sockets()) {
         *slot = Some((socket, wants_write));
         if wants_write {
-            write.insert(socket.0);
+            write.insert(net::socket_of(socket));
         } else {
-            read.insert(socket.0);
+            read.insert(net::socket_of(socket));
         }
     }
     Sockets {
@@ -160,11 +167,11 @@ pub(crate) fn dispatch(
     // SAFETY: called on the server thread.
     let local = unsafe { local() };
     for &(socket, wants_write) in sockets.connections.iter().flatten() {
-        if wants_write && write.contains(socket.0) {
+        if wants_write && write.contains(net::socket_of(socket)) {
             local
                 .service
                 .on_writable(socket, &server.state, console, network);
-        } else if !wants_write && read.contains(socket.0) {
+        } else if !wants_write && read.contains(net::socket_of(socket)) {
             local
                 .service
                 .on_readable(socket, &server.state, console, network);
@@ -177,12 +184,14 @@ pub(crate) fn dispatch(
         return;
     }
     match net::accept(listener) {
-        Some(socket) => local
-            .service
-            .accept(SocketId(socket), &server.state, console, network),
+        Some(socket) => {
+            local
+                .service
+                .accept(SocketId(socket.raw()), &server.state, console, network)
+        }
         None => {
             close_listener();
-            local.listen_at = Some(console.system_time().wrapping_add(LISTEN_RETRY));
+            local.listen_at = Some(retry_time(console));
             kernel::debug_print(c"openxbdm: SMB accept failed\n");
         }
     }

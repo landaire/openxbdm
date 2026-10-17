@@ -7,7 +7,6 @@ use core::sync::atomic::AtomicBool;
 use core::sync::atomic::Ordering;
 
 use openxbdm_core::status::ErrorCode;
-use openxbdm_core::status::Hresult;
 use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::commands::network::decode_hex;
 use openxbdm_server::commands::network::xhttpproxy;
@@ -20,10 +19,12 @@ use openxbdm_server::commands::network::xhttpproxy::ProxyError;
 use openxbdm_server::commands::network::xhttpproxy::ProxyFlags;
 use openxbdm_server::commands::network::xhttpproxy::ProxyId;
 use openxbdm_server::commands::network::xhttpproxy::ProxyOutcome;
+use xbox360::status::Hresult;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::PoolTag;
 
 use crate::backend::Console;
+use crate::exports::export_result;
 use crate::kernel::CriticalSection;
 
 /// Pool tag of proxy entries (`HPXY`).
@@ -42,6 +43,14 @@ struct Entry {
     certificate: *mut u8,
     certificate_size: u32,
 }
+
+const _: () = {
+    assert!(core::mem::offset_of!(Entry, flags) == 0x8);
+    assert!(core::mem::offset_of!(Entry, name) == 0x14);
+    assert!(core::mem::offset_of!(Entry, port) == 0x18);
+    assert!(core::mem::offset_of!(Entry, certificate) == 0x1c);
+    assert!(size_of::<Entry>() == 0x24);
+};
 
 /// List sentinel; only the links are used.
 static mut HEAD: Entry = Entry {
@@ -357,30 +366,141 @@ impl xhttpproxy::Backend for Console {
     }
 }
 
-/// Request record of the proxy control codes; dword fields.
-fn request(argument: u32) -> *mut u32 {
-    argument as usize as *mut u32
+/// Scope of a proxy control code request, from its mode field.
+#[derive(Clone, Copy)]
+enum Scope {
+    Title,
+    System,
 }
 
-const NOT_FOUND: u32 = ErrorCode::FileNotFound.hresult().0;
-const NOT_FORCED: u32 = ErrorCode::FileAlreadyExists.hresult().0;
-const BAD_REQUEST: u32 = ErrorCode::BadParameter.hresult().0;
-const SUCCESS: u32 = Hresult::OK.0;
+impl Scope {
+    const fn from_mode(mode: u32) -> Option<Self> {
+        match mode {
+            1 => Some(Self::Title),
+            2 => Some(Self::System),
+            _ => None,
+        }
+    }
+
+    /// What a lookup of the scope counts: the title scope counts a
+    /// consumer, the system scope a reference.
+    const fn counts(self) -> Counts {
+        match self {
+            Self::Title => Counts {
+                references: 0,
+                consumers: 1,
+            },
+            Self::System => Counts {
+                references: 1,
+                consumers: 0,
+            },
+        }
+    }
+}
+
+/// Counts an entry holds for a lookup.
+#[derive(Clone, Copy)]
+struct Counts {
+    references: u32,
+    consumers: u32,
+}
+
+/// Leading fields of the proxy control code records.
+#[repr(C)]
+struct ProxyRecord {
+    mode: u32,
+    _reserved: u32,
+    /// Name pointer of the entry, as code 0xa5 returns it.
+    name: u32,
+    port: u32,
+}
+
+/// Record of code 0xa5: a [`ProxyRecord`] and the force byte at +0x10,
+/// 0x11 bytes with no tail padding. The force byte in: refuse an entry
+/// without the force bit; out: the force bit.
+const ACQUIRE_FORCE_OFFSET: u32 = size_of::<ProxyRecord>() as u32;
+
+/// Record of code 0xa7: the callback takes (context, argument, argument,
+/// certificate, size).
+#[repr(C)]
+struct CertificateRequest {
+    proxy: ProxyRecord,
+    _reserved: u32,
+    arguments: [u32; 2],
+    context: u32,
+    callback: u32,
+}
+
+const _: () = {
+    assert!(size_of::<ProxyRecord>() == 0x10);
+    assert!(core::mem::offset_of!(CertificateRequest, arguments) == 0x14);
+    assert!(core::mem::offset_of!(CertificateRequest, callback) == 0x20);
+    assert!(size_of::<CertificateRequest>() == 0x24);
+};
+
+/// Failures of the proxy control codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlError {
+    NotFound,
+    /// The caller asked for a forced entry and the entry is not forced.
+    NotForced,
+    BadRequest,
+    /// The certificate upload has not finished.
+    UploadPending,
+    /// The caller's certificate callback failed.
+    CallbackFailed,
+}
+
+impl core::fmt::Display for ControlError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::NotFound => "no matching proxy",
+            Self::NotForced => "proxy is not forced",
+            Self::BadRequest => "invalid proxy request",
+            Self::UploadPending => "certificate upload pending",
+            Self::CallbackFailed => "certificate callback failed",
+        })
+    }
+}
+
+impl core::error::Error for ControlError {}
+
+impl From<ControlError> for Hresult {
+    fn from(error: ControlError) -> Self {
+        match error {
+            ControlError::NotFound => ErrorCode::FileNotFound.hresult(),
+            ControlError::NotForced => ErrorCode::FileAlreadyExists.hresult(),
+            ControlError::BadRequest => ErrorCode::BadParameter.hresult(),
+            ControlError::UploadPending => Hresult::IN_PROGRESS,
+            ControlError::CallbackFailed => ErrorCode::NoSuchModule.hresult(),
+        }
+    }
+}
 
 /// Control code 0xa5 (stock 0x91f380f8): look up the proxy of a scope for
-/// title code. Mode 1 is the title scope and counts a consumer reference;
-/// mode 2 is the system scope and counts a reference (only when the entry
-/// has a name). With the caller's force-only byte set, an entry without
-/// the force bit is refused.
-pub(crate) fn service_http_proxy_acquire(argument: u32) -> u32 {
-    let request = request(argument);
-    // SAFETY: the caller passes a request record.
-    let mode = unsafe { request.read() };
-    let (sys, references, consumers) = match mode {
-        1 => (false, 0, 1),
-        2 => (true, 1, 0),
-        _ => return NOT_FOUND,
+/// title code and count the lookup (only when the entry has a name). With
+/// the caller's force-only byte set, an entry without the force bit is
+/// refused.
+///
+/// # Safety
+///
+/// `argument` must be the 4-aligned address of a writable 0x11-byte code
+/// 0xa5 record that no other thread uses for the call.
+pub(crate) unsafe fn service_http_proxy_acquire(argument: u32) -> u32 {
+    // SAFETY: the caller's contract; the proxy fields and the force byte
+    // are disjoint parts of the record.
+    let (proxy, force_only) = unsafe {
+        (
+            crate::kernel::object_at_mut::<ProxyRecord>(argument),
+            crate::kernel::object_at_mut::<u8>(argument.wrapping_add(ACQUIRE_FORCE_OFFSET)),
+        )
     };
+    export_result(acquire(proxy, force_only)).0
+}
+
+fn acquire(request: &mut ProxyRecord, force_only: &mut u8) -> Result<(), ControlError> {
+    let scope = Scope::from_mode(request.mode).ok_or(ControlError::NotFound)?;
+    let sys = matches!(scope, Scope::System);
     let guard = Guard::acquire();
     // Stock 0x91f37800 with the title rule: a title-scope query also takes
     // a system entry that is not system-only.
@@ -394,24 +514,23 @@ pub(crate) fn service_http_proxy_acquire(argument: u32) -> u32 {
         };
         scope && flags.contains(ProxyFlags::ACTIVE)
     });
-    let Some(entry) = found else { return NOT_FOUND };
-    // SAFETY: the entry is linked, the lock is held, and the request record
-    // has the fields of this code.
+    let entry = found.ok_or(ControlError::NotFound)?;
+    // SAFETY: the entry is linked and the lock is held.
     unsafe {
-        let force_only = request.cast::<u8>().add(0x10);
         let forced = ProxyFlags::from_bits_retain((*entry).flags).contains(ProxyFlags::FORCE);
-        if force_only.read() != 0 && !forced {
-            return NOT_FORCED;
+        if *force_only != 0 && !forced {
+            return Err(ControlError::NotForced);
         }
         if !(*entry).name.is_null() {
-            (*entry).references += references;
-            (*entry).consumers += consumers;
+            let counts = scope.counts();
+            (*entry).references += counts.references;
+            (*entry).consumers += counts.consumers;
         }
-        request.add(2).write((*entry).name as usize as u32);
-        request.add(3).write((*entry).port);
-        force_only.write(u8::from(forced));
+        request.name = (*entry).name as usize as u32;
+        request.port = (*entry).port;
+        *force_only = u8::from(forced);
     }
-    SUCCESS
+    Ok(())
 }
 
 /// Find an entry by the name pointer and port a title received.
@@ -424,46 +543,69 @@ fn find_by_name(guard: &Guard, name: u32, port: u32) -> Option<*mut Entry> {
 
 /// Control code 0xa6 (stock 0x91f381f8): release a reference taken by
 /// code 0xa5.
-pub(crate) fn service_http_proxy_release(argument: u32) -> u32 {
-    let request = request(argument);
-    // SAFETY: the caller passes a request record.
-    let (mode, name, port) =
-        unsafe { (request.read(), request.add(2).read(), request.add(3).read()) };
-    let (references, consumers) = match mode {
-        1 => (0, 1),
-        2 => (1, 0),
-        _ => return BAD_REQUEST,
-    };
-    if name == 0 || port == 0 {
-        return BAD_REQUEST;
+///
+/// # Safety
+///
+/// `argument` must be the address of a [`ProxyRecord`] unchanged for the
+/// call.
+pub(crate) unsafe fn service_http_proxy_release(argument: u32) -> u32 {
+    // SAFETY: the caller's contract.
+    let request = unsafe { crate::kernel::object_at::<ProxyRecord>(argument) };
+    export_result(release(request)).0
+}
+
+fn release(request: &ProxyRecord) -> Result<(), ControlError> {
+    let scope = Scope::from_mode(request.mode).ok_or(ControlError::BadRequest)?;
+    if request.name == 0 || request.port == 0 {
+        return Err(ControlError::BadRequest);
     }
     let guard = Guard::acquire();
-    let Some(entry) = find_by_name(&guard, name, port) else {
-        return NOT_FOUND;
-    };
+    let entry = find_by_name(&guard, request.name, request.port).ok_or(ControlError::NotFound)?;
+    let counts = scope.counts();
     // SAFETY: the entry is linked and the lock is held.
     unsafe {
-        (*entry).references = (*entry).references.wrapping_sub(references);
-        (*entry).consumers = (*entry).consumers.wrapping_sub(consumers);
+        (*entry).references = (*entry).references.wrapping_sub(counts.references);
+        (*entry).consumers = (*entry).consumers.wrapping_sub(counts.consumers);
         guard.release_if_unused(entry);
     }
-    SUCCESS
+    Ok(())
 }
 
 /// Control code 0xa7 (stock 0x91f38320): pass the certificate of an entry
 /// to a caller-supplied function.
-pub(crate) fn service_http_proxy_certificate(argument: u32) -> u32 {
-    let request = request(argument);
-    // SAFETY: the caller passes a request record of nine dwords.
-    let field = |index: usize| unsafe { request.add(index).read() };
-    let mode = field(0);
-    if !(1..=2).contains(&mode) || [2, 3, 5, 6, 8].iter().any(|&index| field(index) == 0) {
-        return BAD_REQUEST;
+///
+/// # Safety
+///
+/// As for `pass_certificate`, with `argument` the address of the record.
+pub(crate) unsafe fn service_http_proxy_certificate(argument: u32) -> u32 {
+    // SAFETY: the caller's contract.
+    export_result(unsafe {
+        pass_certificate(core::ptr::with_exposed_provenance(argument as usize))
+    })
+    .0
+}
+
+/// # Safety
+///
+/// `request` points at a readable record. Fields are read through the
+/// pointer, not a reference, because the caller's callback may change the
+/// record.
+unsafe fn pass_certificate(request: *const CertificateRequest) -> Result<(), ControlError> {
+    // SAFETY: guaranteed by the caller.
+    let (mode, name, port, [first, second], callback) = unsafe {
+        (
+            (*request).proxy.mode,
+            (*request).proxy.name,
+            (*request).proxy.port,
+            (*request).arguments,
+            (*request).callback,
+        )
+    };
+    if Scope::from_mode(mode).is_none() || [name, port, first, second, callback].contains(&0) {
+        return Err(ControlError::BadRequest);
     }
     let guard = Guard::acquire();
-    let Some(entry) = find_by_name(&guard, field(2), field(3)) else {
-        return NOT_FOUND;
-    };
+    let entry = find_by_name(&guard, name, port).ok_or(ControlError::NotFound)?;
     // SAFETY: the entry is linked and the lock is held.
     let (flags, certificate, size) = unsafe {
         (
@@ -473,28 +615,28 @@ pub(crate) fn service_http_proxy_certificate(argument: u32) -> u32 {
         )
     };
     if size == 0 {
-        return NOT_FOUND;
+        return Err(ControlError::NotFound);
     }
     if ProxyFlags::from_bits_retain(flags).contains(ProxyFlags::CERTIFICATE_PENDING) {
-        return Hresult::IN_PROGRESS.0;
+        return Err(ControlError::UploadPending);
     }
-    // SAFETY: the callback is the caller's; it takes (context, value 5,
-    // value 6, certificate, size).
+    // SAFETY: the callback is the caller's; it takes (context, argument,
+    // argument, certificate, size). The record is readable per the contract.
     let result = unsafe {
         call_callback(
-            field(8),
-            field(7),
-            field(5),
-            field(6),
+            callback,
+            (*request).context,
+            first,
+            second,
             certificate as usize as u32,
             size,
         )
     };
     drop(guard);
-    if (result as i32) < 0 {
-        ErrorCode::NoSuchModule.hresult().0
+    if Hresult(result).is_failure() {
+        Err(ControlError::CallbackFailed)
     } else {
-        SUCCESS
+        Ok(())
     }
 }
 

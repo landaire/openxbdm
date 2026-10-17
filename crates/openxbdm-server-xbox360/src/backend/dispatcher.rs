@@ -505,9 +505,11 @@ extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: u32) ->
             TRAP_PASSTHROUGH.store(u32::from(argument != 0), Ordering::Relaxed);
             0
         }
-        0xa5 => network::xhttpproxy::service_http_proxy_acquire(argument),
-        0xa6 => network::xhttpproxy::service_http_proxy_release(argument),
-        0xa7 => network::xhttpproxy::service_http_proxy_certificate(argument),
+        // SAFETY: a caller of codes 0xa5 to 0xa7 passes the record that the
+        // code defines.
+        0xa5 => unsafe { network::xhttpproxy::service_http_proxy_acquire(argument) },
+        0xa6 => unsafe { network::xhttpproxy::service_http_proxy_release(argument) },
+        0xa7 => unsafe { network::xhttpproxy::service_http_proxy_certificate(argument) },
         // 0x60 to 0x62 are empty routines; the remaining codes take the
         // monitor's default exit unless they are performance or PIX codes.
         _ => super::performance::service(code, argument).unwrap_or(0),

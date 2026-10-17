@@ -8,8 +8,6 @@ use core::ptr::NonNull;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
-use openxbdm_core::status::KernelError;
-use openxbdm_core::status::NtStatus;
 use openxbdm_server::commands::network::WsaError;
 use openxbdm_server::commands::network::netcap;
 use openxbdm_server::commands::network::netcap::CaptureClose;
@@ -21,11 +19,16 @@ use openxbdm_server::commands::network::netcap::capture_file::CaptureFileError;
 use openxbdm_server::commands::network::netcap::capture_file::Clock;
 use openxbdm_server::commands::network::netcap::capture_file::LocalTime;
 use openxbdm_server::commands::network::netcap::capture_file::Recorder;
+use xbox360::status::KernelError;
+use xbox360::status::NtStatus;
 use xbox360::sync::SpinLock;
 use xbox360::time::Timebase;
 use xbox360_sys::xam;
+use xbox360_sys::xam::EthernetInterceptFlags;
 use xbox360_sys::xam::NetDll_XNetSetOpt;
 use xbox360_sys::xam::NetDll_XnpEthernetInterceptSetCallbacks;
+use xbox360_sys::xam::SystemTime;
+use xbox360_sys::xam::XnCaller;
 use xbox360_sys::xam::XnetOption;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::PoolTag;
@@ -33,7 +36,6 @@ use xbox360_sys::xboxkrnl::PoolType;
 
 use self::writer::Writer;
 use super::FrameHook;
-use super::XNCALLER_SYSAPP;
 use crate::backend::Console;
 use crate::kernel;
 
@@ -218,28 +220,18 @@ impl Data {
 }
 
 fn local_time() -> LocalTime {
-    let mut fields = [0u16; 8];
-    // SAFETY: `fields` is a live SYSTEMTIME-sized array of eight u16 values.
-    unsafe { xam::GetLocalTime(fields.as_mut_ptr().cast()) };
-    let [
-        year,
-        month,
-        day_of_week,
-        day,
-        hour,
-        minute,
-        second,
-        millisecond,
-    ] = fields;
+    let mut time = SystemTime::default();
+    // SAFETY: `time` is a live SYSTEMTIME.
+    unsafe { xam::GetLocalTime(&mut time) };
     LocalTime {
-        year,
-        month,
-        day_of_week,
-        day,
-        hour,
-        minute,
-        second,
-        millisecond,
+        year: time.year,
+        month: time.month,
+        day_of_week: time.day_of_week,
+        day: time.day,
+        hour: time.hour,
+        minute: time.minute,
+        second: time.second,
+        millisecond: time.milliseconds,
     }
 }
 
@@ -300,10 +292,10 @@ impl netcap::Backend for Console {
         // SAFETY: `value` is a live u32 option value of the stated size.
         let error = unsafe {
             NetDll_XNetSetOpt(
-                XNCALLER_SYSAPP,
+                XnCaller::SystemApp,
                 XnetOption::PROMISCUOUS,
                 (&raw const value).cast(),
-                4,
+                size_of::<u32>() as u32,
             )
         };
         error == 0
@@ -322,16 +314,16 @@ impl netcap::Backend for Console {
             receive,
             context: pointer.as_ptr() as usize,
         };
-        if !super::netsim::chain_capture(Some(hook)) {
+        if !super::netsim::chain_capture(self, Some(hook)) {
             // SAFETY: the entries take `hook.context`, which stays allocated
             // until `close_capture`, after `detach_capture` removes the hook.
             let error = unsafe {
                 NetDll_XnpEthernetInterceptSetCallbacks(
-                    XNCALLER_SYSAPP,
+                    XnCaller::SystemApp,
                     transmit_entry as *const () as usize,
                     receive_entry as *const () as usize,
                     hook.context,
-                    0,
+                    EthernetInterceptFlags::empty().bits(),
                 )
             };
             if let Some(error) = WsaError::new(error) {
@@ -343,9 +335,17 @@ impl netcap::Backend for Console {
     }
 
     fn detach_capture(&mut self) {
-        if !super::netsim::chain_capture(None) {
+        if !super::netsim::chain_capture(self, None) {
             // SAFETY: clearing the callbacks passes no pointers.
-            unsafe { NetDll_XnpEthernetInterceptSetCallbacks(XNCALLER_SYSAPP, 0, 0, 0, 0) };
+            unsafe {
+                NetDll_XnpEthernetInterceptSetCallbacks(
+                    XnCaller::SystemApp,
+                    0,
+                    0,
+                    0,
+                    EthernetInterceptFlags::empty().bits(),
+                )
+            };
         }
         self.network.netcap.attached = false;
     }

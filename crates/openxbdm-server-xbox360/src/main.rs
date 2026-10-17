@@ -160,8 +160,9 @@ mod xbox360 {
     }
 
     fn close_listener() {
-        let socket = LISTENER_SOCKET.swap(Socket::INVALID.raw(), Ordering::SeqCst);
-        if socket != Socket::INVALID.raw() {
+        let socket =
+            Socket::from_raw(LISTENER_SOCKET.swap(Socket::INVALID.raw(), Ordering::SeqCst));
+        if socket != Socket::INVALID {
             net::close(socket);
         }
     }
@@ -173,8 +174,8 @@ mod xbox360 {
         server: &mut Server,
         console: &mut Console,
         network: &mut XamNetwork,
-        listener: u32,
-        discovery: Option<u32>,
+        listener: Socket,
+        discovery: Option<Socket>,
     ) {
         crate::backend::debugger::begin_event_service();
         serve_passes(server, console, network, listener, discovery);
@@ -186,8 +187,8 @@ mod xbox360 {
         server: &mut Server,
         console: &mut Console,
         network: &mut XamNetwork,
-        listener: u32,
-        discovery: Option<u32>,
+        listener: Socket,
+        discovery: Option<Socket>,
     ) {
         let mut timer_ms = POLL_INTERVAL_MS;
         while !shutting_down() {
@@ -206,15 +207,15 @@ mod xbox360 {
             }
             for &(_, socket, wants_write) in active.iter().flatten() {
                 if wants_write {
-                    write.insert(socket.0);
+                    write.insert(net::socket_of(socket));
                 } else {
-                    read.insert(socket.0);
+                    read.insert(net::socket_of(socket));
                 }
             }
             let mut pipes = [None::<SocketId>; session::PIPE_SLOTS];
             for (slot, socket) in pipes.iter_mut().zip(server.fast_pipe_sockets()) {
                 *slot = Some(socket);
-                read.insert(socket.0);
+                read.insert(net::socket_of(socket));
             }
             #[cfg(feature = "smb")]
             let smb_sockets = crate::smb::select_sockets(&mut read, &mut write);
@@ -226,14 +227,14 @@ mod xbox360 {
             }
 
             for &(index, socket, wants_write) in active.iter().flatten() {
-                if wants_write && write.contains(socket.0) {
+                if wants_write && write.contains(net::socket_of(socket)) {
                     server.on_writable(index, console, network);
-                } else if !wants_write && read.contains(socket.0) {
+                } else if !wants_write && read.contains(net::socket_of(socket)) {
                     server.on_readable(index, console, network);
                 }
             }
             for socket in pipes.into_iter().flatten() {
-                if read.contains(socket.0) {
+                if read.contains(net::socket_of(socket)) {
                     server.on_fast_pipe_readable(socket, console, network);
                 }
             }
@@ -256,7 +257,7 @@ mod xbox360 {
             if read.contains(listener) {
                 match net::accept(listener) {
                     Some(socket) => {
-                        server.accept(SocketId(socket), console, network);
+                        server.accept(SocketId(socket.raw()), console, network);
                     }
                     None => return,
                 }
@@ -265,7 +266,7 @@ mod xbox360 {
     }
 
     #[inline(never)]
-    fn answer_discovery(server: &Server, socket: u32) {
+    fn answer_discovery(server: &Server, socket: Socket) {
         let mut request = [0u8; session::DISCOVERY_PACKET_CAPACITY];
         let Ok((length, sender)) = net::receive_from(socket, &mut request) else {
             return;
@@ -317,7 +318,7 @@ mod xbox360 {
                 }
                 continue;
             };
-            LISTENER_SOCKET.store(listener, Ordering::SeqCst);
+            LISTENER_SOCKET.store(listener.raw(), Ordering::SeqCst);
             if shutting_down() {
                 break;
             }

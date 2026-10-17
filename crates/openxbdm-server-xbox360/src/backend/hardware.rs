@@ -87,13 +87,13 @@ use crate::kernel::KernelEvent;
 use crate::net::XamNetwork;
 
 /// XAM ordinal: input focus query, nonzero when the system has focus.
-const XAM_INPUT_FOCUS: u32 = 0x3dd;
+const XAM_INPUT_FOCUS: Ordinal = Ordinal::new(0x3dd).unwrap();
 /// XAM ordinal: avatar test hook lookup `(index, &function) -> HRESULT`.
-const XAM_AVATAR_HOOKS: u32 = 0x5f2;
+const XAM_AVATAR_HOOKS: Ordinal = Ordinal::new(0x5f2).unwrap();
 /// XAM ordinal: heap information `(id, class, buffer) -> HRESULT`.
-const XAM_HEAP_INFO: u32 = 0x827;
+const XAM_HEAP_INFO: Ordinal = Ordinal::new(0x827).unwrap();
 /// XAM ordinal: heap counts `(buffer) -> HRESULT`.
-const XAM_HEAP_COUNT: u32 = 0x828;
+const XAM_HEAP_COUNT: Ordinal = Ordinal::new(0x828).unwrap();
 /// Kernel ordinal: USB port power `(controller, port, enable) -> NTSTATUS`.
 const KERNEL_USB_PORT_POWER: Ordinal = Ordinal::new(825).unwrap();
 /// Media service application and PlayTo message.
@@ -262,7 +262,7 @@ impl CachedExport {
     }
 
     /// XAM exports are resolved without the entry point check.
-    fn xam(&self, ordinal: u32) -> Option<u32> {
+    fn xam(&self, ordinal: Ordinal) -> Option<u32> {
         let cached = self.0.load(Ordering::Relaxed);
         if cached != 0 {
             return Some(cached);

@@ -29,36 +29,27 @@ use openxbdm_server::commands::network::XnAddr;
 use openxbdm_server::commands::network::Xnkid;
 use openxbdm_server::network::Ipv4Address;
 use openxbdm_server::server::MAX_CONNECTIONS;
+use xbox360::module::Ordinal;
 use xbox360::module::SystemModule;
+use xbox360::status::Win32Error;
 use xbox360_sys::xam;
+use xbox360_sys::xam::EthernetInterceptFlags;
 use xbox360_sys::xam::NetDll_XNetGetEthernetLinkStatus;
 use xbox360_sys::xam::NetDll_XNetSetOpt;
-use xbox360_sys::xam::NetDll_XnpConfig;
 use xbox360_sys::xam::NetDll_XnpGetActiveSocketList;
 use xbox360_sys::xam::NetDll_XnpGetConfigStatus;
 use xbox360_sys::xam::XnCaller;
+use xbox360_sys::xam::XnetConfigFlags;
+use xbox360_sys::xam::XnetConfigParams;
 use xbox360_sys::xam::XnetOption;
+use xbox360_sys::xam::ordinal;
 use xbox360_sys::xboxkrnl;
-use xbox360_sys::xboxkrnl::NicGetStats;
-use xbox360_sys::xboxkrnl::PoolTag;
+use xbox360_sys::xboxkrnl::NicStatistics;
 
 use super::Console;
+use super::dispatcher;
 use crate::kernel;
-
-/// Caller identifier the monitor passes to XNet configuration functions.
-pub(crate) const XNCALLER_SYSAPP: XnCaller = XnCaller::SystemApp;
-/// Caller identifier the monitor passes to the table queries.
-const XNCALLER_XBDM: XnCaller = XnCaller::DebugMonitor;
-/// Pool tag of monitor allocations.
-pub(crate) const POOL_TAG: PoolTag = PoolTag::new(*b"xbdm");
-/// QoS lookup query result for a too-small buffer (`WSAEMSGSIZE`).
-const WSAEMSGSIZE: u32 = 0x2747;
-/// Bytes of the adapter counter block: stock passes an 8-aligned 0x60-byte
-/// stack slot (u64 counters, then eleven u32 counters and padding).
-const NIC_STATS_SIZE: usize = 0x60;
-
-#[repr(C, align(8))]
-struct NicStatsBlock([u8; NIC_STATS_SIZE]);
+use crate::kernel::pool_tag;
 
 /// Static address configuration (stock 0x91faddbc use, 0x91faddb8 address,
 /// 0x91faddb4 subnet, 0x91faddb0 gateway). Debug-monitor control codes
@@ -68,12 +59,29 @@ static STATIC_IP_ADDRESS: AtomicU32 = AtomicU32::new(0);
 static STATIC_IP_SUBNET: AtomicU32 = AtomicU32::new(0);
 static STATIC_IP_GATEWAY: AtomicU32 = AtomicU32::new(0);
 
-/// Bytes of the network stack configuration status (stock 0x91fadc20).
-const CONFIG_STATUS_SIZE: usize = 0x3a;
-/// Bytes of the configuration record passed to `XnpConfig`.
-const CONFIG_SIZE: usize = 0x1ec;
-/// Configuration flags: static address, subnet, and gateway present.
-const CONFIG_STATIC_ADDRESS: u16 = 0xc;
+/// Words that hold the 0x3a bytes of the network stack configuration
+/// status.
+const CONFIG_STATUS_WORDS: usize = 0x3a_usize.div_ceil(4);
+
+/// Network stack configuration status (stock 0x91fadc20), which each query
+/// refills. Concurrent queries share it, as in stock.
+static CONFIG_STATUS: [AtomicU32; CONFIG_STATUS_WORDS] =
+    [const { AtomicU32::new(0) }; CONFIG_STATUS_WORDS];
+
+/// `XnpConfig` flags of a static address, subnet, and gateway; stock sets
+/// both bits together.
+const STATIC_ADDRESS: XnetConfigFlags = XnetConfigFlags::from_bits_retain(0xc);
+
+/// Control codes that read the static address configuration. Code 0x0b
+/// reads them through the dispatcher, so extensions see them.
+#[derive(Clone, Copy)]
+#[repr(u32)]
+enum AddressQuery {
+    UseStatic = 0x0d,
+    Address = 0x0f,
+    Subnet = 0x11,
+    Gateway = 0x13,
+}
 
 fn address(value: u32) -> Ipv4Address {
     Ipv4Address(value.to_be_bytes())
@@ -98,26 +106,26 @@ fn set_and_save(target: &AtomicU32, value: u32) -> u32 {
 
 /// Control code 0x0b (stock 0x91f3b2c8): configure the network stack with
 /// the static address (when enabled) and the debug name as host name. The
-/// address values come through the dispatcher, so extensions see codes
-/// 0x0d, 0x0f, 0x11, and 0x13.
+/// address configuration is read through the dispatcher, so extensions see
+/// the queries.
 pub(crate) fn service_apply_xnet_config(_argument: u32) -> u32 {
-    use crate::backend::dispatcher::dispatch;
-    // SAFETY: plain buffer; only this function and the status queries
-    // use it, as in stock.
-    unsafe { CONFIG_STATUS = [0; CONFIG_STATUS_SIZE] };
-    let mut config = [0u8; CONFIG_SIZE];
-    if dispatch(0x0d, 0) != 0 {
-        config[0x4c..0x4e].copy_from_slice(&CONFIG_STATIC_ADDRESS.to_be_bytes());
-        config[0x54..0x58].copy_from_slice(&dispatch(0x0f, 0).to_be_bytes());
-        config[0x58..0x5c].copy_from_slice(&dispatch(0x11, 0).to_be_bytes());
-        config[0x5c..0x60].copy_from_slice(&dispatch(0x13, 0).to_be_bytes());
+    let query = |code: AddressQuery| dispatcher::dispatch(code as u32, 0);
+    for word in &CONFIG_STATUS {
+        word.store(0, Ordering::Relaxed);
+    }
+    let mut config = XnetConfigParams::new();
+    if query(AddressQuery::UseStatic) != 0 {
+        config.flags = STATIC_ADDRESS;
+        config.address = query(AddressQuery::Address);
+        config.subnet = query(AddressQuery::Subnet);
+        config.gateway = query(AddressQuery::Gateway);
     }
     let name = crate::backend::console::debug_name();
     let name = name.as_bytes();
-    config[0x68..0x68 + name.len()].copy_from_slice(name);
+    config.host_name[..name.len()].copy_from_slice(name);
     // The dispatcher case discards the result (0x91f3bb10).
-    // SAFETY: `config` is a live CONFIG_SIZE-byte configuration block.
-    unsafe { NetDll_XnpConfig(XnCaller::DebugMonitor, config.as_ptr(), 0) };
+    // SAFETY: the debug monitor caller with flags 0, as stock passes them.
+    unsafe { xam::xnp_config(XnCaller::DebugMonitor, &config, 0) };
     0
 }
 
@@ -153,30 +161,36 @@ pub(crate) fn service_get_gateway(_argument: u32) -> u32 {
     STATIC_IP_GATEWAY.load(Ordering::SeqCst)
 }
 
-static mut CONFIG_STATUS: [u8; CONFIG_STATUS_SIZE] = [0; CONFIG_STATUS_SIZE];
-
-/// Query the configuration status and return the dword at `offset`
-/// (stock cases 0x14..0x16).
-fn config_status_dword(offset: usize) -> u32 {
-    // SAFETY: as in stock, concurrent queries share the status buffer.
+/// Query the configuration status and return its word `index` (stock
+/// cases 0x14..0x16).
+fn config_status_word(index: usize) -> u32 {
+    // SAFETY: the status words are static storage of at least the 0x3a
+    // bytes the network stack writes; atomics allow the shared writes.
     unsafe {
-        let status = &raw mut CONFIG_STATUS;
-        NetDll_XnpGetConfigStatus(XnCaller::DebugMonitor, status.cast());
-        dword(&*status, offset)
-    }
+        NetDll_XnpGetConfigStatus(
+            XnCaller::DebugMonitor,
+            CONFIG_STATUS.as_ptr().cast::<u8>().cast_mut(),
+        )
+    };
+    CONFIG_STATUS[index].load(Ordering::Relaxed)
 }
 
 pub(crate) fn service_config_status_1(_argument: u32) -> u32 {
-    config_status_dword(4)
+    config_status_word(1)
 }
 
 pub(crate) fn service_config_status_2(_argument: u32) -> u32 {
-    config_status_dword(8)
+    config_status_word(2)
 }
 
 pub(crate) fn service_config_status_3(_argument: u32) -> u32 {
-    config_status_dword(0xc)
+    config_status_word(3)
 }
+
+/// Intercept flags of the simulator registration and its removal; a
+/// capture registers with none.
+pub(crate) const SIMULATOR_INTERCEPT: EthernetInterceptFlags =
+    EthernetInterceptFlags::from_bits_retain(0x2);
 
 /// Ethernet frame callback of the network stack intercept; returns nonzero
 /// when the frame is consumed.
@@ -192,16 +206,20 @@ pub(crate) struct FrameHook {
 
 /// Address of a `xam.xex` export (stock 0x91f31010 handle and
 /// `XexGetProcedureAddress`; any success status counts).
-pub(crate) fn xam_procedure(ordinal: u32) -> Option<u32> {
+pub(crate) fn xam_procedure(ordinal: Ordinal) -> Option<u32> {
     let module = SystemModule::Xam.handle().ok()?;
     let mut address = 0u32;
     // SAFETY: `module` is the loaded xam.xex handle and `address` is a live u32.
-    let status = unsafe { xboxkrnl::XexGetProcedureAddress(module.raw(), ordinal, &mut address) };
-    ((status.0 as i32) >= 0).then_some(address)
+    let status = unsafe {
+        xboxkrnl::XexGetProcedureAddress(module.raw(), u32::from(ordinal.get()), &mut address)
+    };
+    status.is_success().then_some(address)
 }
 
-/// A pool allocation holding raw table records.
-#[derive(Clone, Copy)]
+/// A pool allocation holding raw table records. It owns the allocation,
+/// which [`Snapshot::free`] releases; it has no `Drop` so that storing one
+/// in a slot known to be empty emits no drop code.
+#[must_use]
 struct Snapshot {
     table: Table,
     buffer: u32,
@@ -209,12 +227,19 @@ struct Snapshot {
 }
 
 impl Snapshot {
+    fn free(self) {
+        // SAFETY: the snapshot owns its pool buffer, which nothing else
+        // uses; `self` is consumed.
+        unsafe { xboxkrnl::ExFreePool(self.buffer) };
+    }
+
     fn record_size(table: Table) -> u32 {
-        match table {
-            Table::Sockets | Table::Keys => 0x28,
-            Table::SecurityAssociations => 0x78,
-            Table::QosLookups => 0x88,
-        }
+        (match table {
+            Table::Sockets => size_of::<SocketEntry>(),
+            Table::Keys => size_of::<KeyEntry>(),
+            Table::SecurityAssociations => size_of::<SecurityAssociationEntry>(),
+            Table::QosLookups => size_of::<QosLookupEntry>(),
+        }) as u32
     }
 
     fn record(&self, index: u32) -> Option<Record> {
@@ -222,133 +247,189 @@ impl Snapshot {
             return None;
         }
         let address = self.buffer + index * Self::record_size(self.table);
-        // SAFETY: the buffer holds `count` records of `record_size` bytes,
-        // written by the network stack.
+        // SAFETY: the pool buffer (8-aligned) holds `count` records of
+        // `record_size` bytes, a multiple of 8, written by the network stack.
         Some(unsafe { decode(self.table, address as usize as *const u8) })
     }
 }
 
-/// Fixed offsets into a fixed-size block compile to plain loads.
-#[inline(always)]
-fn dword<const N: usize>(bytes: &[u8; N], offset: usize) -> u32 {
-    u32::from_be_bytes([
-        bytes[offset],
-        bytes[offset + 1],
-        bytes[offset + 2],
-        bytes[offset + 3],
-    ])
+/// Socket record of `XnpGetActiveSocketList` (see `getsockinfo`).
+#[repr(C)]
+struct SocketEntry {
+    handle: u32,
+    owner_type: i32,
+    flags: u32,
+    address_family: i32,
+    socket_type: i32,
+    protocol: i32,
+    local_address: u32,
+    remote_address: u32,
+    local_port: u16,
+    remote_port: u16,
+    tcp_state: u8,
+    _reserved: [u8; 3],
 }
 
-#[inline(always)]
-fn word<const N: usize>(bytes: &[u8; N], offset: usize) -> u16 {
-    u16::from_be_bytes([bytes[offset], bytes[offset + 1]])
+/// Key record of XAM 0x82 (see `getxnkeyinfo`).
+#[repr(C)]
+struct KeyEntry {
+    xnkid: [u8; 8],
+    owner_type: i32,
+    flags: u32,
+    qos_data_size: u32,
+    qos_bits_per_second: u32,
+    _reserved: [u8; 0x10],
 }
 
-#[inline(always)]
-fn array<const N: usize, const M: usize>(bytes: &[u8; N], offset: usize) -> [u8; M] {
-    let mut value = [0u8; M];
-    value.copy_from_slice(&bytes[offset..offset + M]);
-    value
+/// Security association record of XAM 0x81 (see `getxnsecassocinfo`).
+#[repr(C)]
+struct SecurityAssociationEntry {
+    secure_address: u32,
+    owner_type: i32,
+    flags: u32,
+    _reserved0: u32,
+    xnkid: [u8; 8],
+    xnaddr: [u8; 0x24],
+    service_id: i32,
+    remote_address: u32,
+    remote_port: u16,
+    state: u8,
+    _reserved1: u8,
+    nat_address: u32,
+    nat_port: u16,
+    _reserved2: [u8; 0x2a],
 }
 
-/// Record layouts of the stock table queries (see `getsockinfo`,
-/// `getxnkeyinfo`, `getxnsecassocinfo`, `getxnqoslookupinfo` specs).
+/// QoS lookup record of XAM 0x83 (see `getxnqoslookupinfo`).
+#[repr(C)]
+struct QosLookupEntry {
+    _reserved0: u32,
+    owner_type: i32,
+    flags: u32,
+    target_address: u32,
+    target_port: u16,
+    state: u8,
+    retry: u8,
+    secure_address: u32,
+    probes_requested: u32,
+    probes_sent: u32,
+    probes_received: u32,
+    data_received: u32,
+    bits_per_second: u32,
+    xnkid: [u8; 8],
+    xnaddr: [u8; 0x24],
+    _reserved1: [u8; 0x30],
+}
+
+const _: () = {
+    assert!(core::mem::offset_of!(SocketEntry, tcp_state) == 0x24);
+    assert!(size_of::<SocketEntry>() == 0x28);
+    assert!(core::mem::offset_of!(KeyEntry, qos_bits_per_second) == 0x14);
+    assert!(size_of::<KeyEntry>() == 0x28);
+    assert!(core::mem::offset_of!(SecurityAssociationEntry, xnkid) == 0x10);
+    assert!(core::mem::offset_of!(SecurityAssociationEntry, service_id) == 0x3c);
+    assert!(core::mem::offset_of!(SecurityAssociationEntry, state) == 0x46);
+    assert!(core::mem::offset_of!(SecurityAssociationEntry, nat_port) == 0x4c);
+    assert!(size_of::<SecurityAssociationEntry>() == 0x78);
+    assert!(core::mem::offset_of!(QosLookupEntry, retry) == 0x13);
+    assert!(core::mem::offset_of!(QosLookupEntry, bits_per_second) == 0x28);
+    assert!(core::mem::offset_of!(QosLookupEntry, xnkid) == 0x2c);
+    assert!(core::mem::offset_of!(QosLookupEntry, xnaddr) == 0x34);
+    assert!(size_of::<QosLookupEntry>() == 0x88);
+};
+
+/// Decode one table record.
 ///
 /// # Safety
-/// `record` points at a whole record of `table`.
+/// `record` points at a whole, 4-aligned record of `table`.
 unsafe fn decode(table: Table, record: *const u8) -> Record {
-    /// # Safety
-    /// `record` points at `N` readable bytes.
-    unsafe fn bytes<'a, const N: usize>(record: *const u8) -> &'a [u8; N] {
-        // SAFETY: guaranteed by the caller.
-        unsafe { &*record.cast::<[u8; N]>() }
-    }
     match table {
         Table::Sockets => {
-            // SAFETY: a socket record is 0x28 bytes.
-            let bytes = unsafe { bytes::<0x28>(record) };
+            // SAFETY: guaranteed by the caller.
+            let entry = unsafe { &*record.cast::<SocketEntry>() };
             Record::Socket(SocketRecord {
-                handle: dword(bytes, 0x00),
-                owner_type: dword(bytes, 0x04) as i32,
-                flags: dword(bytes, 0x08),
-                address_family: dword(bytes, 0x0c) as i32,
-                socket_type: dword(bytes, 0x10) as i32,
-                protocol: dword(bytes, 0x14) as i32,
-                local_address: dword(bytes, 0x18),
-                remote_address: dword(bytes, 0x1c),
-                local_port: word(bytes, 0x20),
-                remote_port: word(bytes, 0x22),
-                tcp_state: bytes[0x24],
+                handle: entry.handle,
+                owner_type: entry.owner_type,
+                flags: entry.flags,
+                address_family: entry.address_family,
+                socket_type: entry.socket_type,
+                protocol: entry.protocol,
+                local_address: entry.local_address,
+                remote_address: entry.remote_address,
+                local_port: entry.local_port,
+                remote_port: entry.remote_port,
+                tcp_state: entry.tcp_state,
             })
         }
         Table::Keys => {
-            // SAFETY: a key record is 0x28 bytes.
-            let bytes = unsafe { bytes::<0x28>(record) };
+            // SAFETY: guaranteed by the caller.
+            let entry = unsafe { &*record.cast::<KeyEntry>() };
             Record::Key(KeyRecord {
-                xnkid: Xnkid(array(bytes, 0x00)),
-                owner_type: dword(bytes, 0x08) as i32,
-                flags: dword(bytes, 0x0c),
-                qos_data_size: dword(bytes, 0x10),
-                qos_bits_per_second: dword(bytes, 0x14),
+                xnkid: Xnkid(entry.xnkid),
+                owner_type: entry.owner_type,
+                flags: entry.flags,
+                qos_data_size: entry.qos_data_size,
+                qos_bits_per_second: entry.qos_bits_per_second,
             })
         }
         Table::SecurityAssociations => {
-            // SAFETY: an association record is 0x78 bytes.
-            let bytes = unsafe { bytes::<0x78>(record) };
+            // SAFETY: guaranteed by the caller.
+            let entry = unsafe { &*record.cast::<SecurityAssociationEntry>() };
             Record::SecurityAssociation(SecurityAssociationRecord {
-                secure_address: dword(bytes, 0x00),
-                owner_type: dword(bytes, 0x04) as i32,
-                flags: dword(bytes, 0x08),
-                xnkid: Xnkid(array(bytes, 0x10)),
-                xnaddr: XnAddr(array(bytes, 0x18)),
-                service_id: dword(bytes, 0x3c) as i32,
-                remote_address: dword(bytes, 0x40),
-                remote_port: word(bytes, 0x44),
-                state: bytes[0x46],
-                nat_address: dword(bytes, 0x48),
-                nat_port: word(bytes, 0x4c),
+                secure_address: entry.secure_address,
+                owner_type: entry.owner_type,
+                flags: entry.flags,
+                xnkid: Xnkid(entry.xnkid),
+                xnaddr: XnAddr(entry.xnaddr),
+                service_id: entry.service_id,
+                remote_address: entry.remote_address,
+                remote_port: entry.remote_port,
+                state: entry.state,
+                nat_address: entry.nat_address,
+                nat_port: entry.nat_port,
             })
         }
         Table::QosLookups => {
-            // SAFETY: a QoS lookup record is 0x88 bytes.
-            let bytes = unsafe { bytes::<0x88>(record) };
+            // SAFETY: guaranteed by the caller.
+            let entry = unsafe { &*record.cast::<QosLookupEntry>() };
             Record::QosLookup(QosLookupRecord {
-                owner_type: dword(bytes, 0x04) as i32,
-                flags: dword(bytes, 0x08),
-                target_address: dword(bytes, 0x0c),
-                target_port: word(bytes, 0x10),
-                state: bytes[0x12],
-                retry: bytes[0x13],
-                secure_address: dword(bytes, 0x14),
-                probes_requested: dword(bytes, 0x18),
-                probes_sent: dword(bytes, 0x1c),
-                probes_received: dword(bytes, 0x20),
-                data_received: dword(bytes, 0x24),
-                bits_per_second: dword(bytes, 0x28),
-                xnkid: Xnkid(array(bytes, 0x2c)),
-                xnaddr: XnAddr(array(bytes, 0x34)),
+                owner_type: entry.owner_type,
+                flags: entry.flags,
+                target_address: entry.target_address,
+                target_port: entry.target_port,
+                state: entry.state,
+                retry: entry.retry,
+                secure_address: entry.secure_address,
+                probes_requested: entry.probes_requested,
+                probes_sent: entry.probes_sent,
+                probes_received: entry.probes_received,
+                data_received: entry.data_received,
+                bits_per_second: entry.bits_per_second,
+                xnkid: Xnkid(entry.xnkid),
+                xnaddr: XnAddr(entry.xnaddr),
             })
         }
     }
 }
 
 /// XAM ordinal of a table query `fn(caller, buffer, &count) -> u32`.
-fn table_ordinal(table: Table) -> Option<u32> {
+fn table_ordinal(table: Table) -> Option<Ordinal> {
     match table {
         Table::Sockets => None,
-        Table::SecurityAssociations => Some(0x81),
-        Table::Keys => Some(0x82),
-        Table::QosLookups => Some(0x83),
+        Table::SecurityAssociations => Some(ordinal::XNP_GET_SEC_ASSOC_LIST),
+        Table::Keys => Some(ordinal::XNP_GET_KEY_LIST),
+        Table::QosLookups => Some(ordinal::XNP_GET_QOS_LOOKUP_LIST),
     }
 }
 
-fn query(function: Option<u32>, buffer: u32, count: &mut u32) -> u32 {
-    match function {
+/// Run a table query; the result is a Winsock error code.
+fn query(function: Option<u32>, buffer: u32, count: &mut u32) -> Result<(), Win32Error> {
+    let code = match function {
         // SAFETY: XAM table queries take (caller, buffer, count pointer).
         Some(function) => unsafe {
             kernel::call_export(
                 function,
-                XNCALLER_XBDM.raw(),
+                XnCaller::DebugMonitor.raw(),
                 buffer,
                 count as *mut u32 as usize as u32,
                 0,
@@ -356,39 +437,46 @@ fn query(function: Option<u32>, buffer: u32, count: &mut u32) -> u32 {
         },
         // SAFETY: `buffer` holds `count` socket records; `count` is a live u32.
         None => unsafe {
-            NetDll_XnpGetActiveSocketList(XNCALLER_XBDM, buffer as usize as *mut u8, count)
+            NetDll_XnpGetActiveSocketList(XnCaller::DebugMonitor, buffer as usize as *mut u8, count)
         },
-    }
+    };
+    Win32Error::result(code)
 }
 
-/// Copy a table into a new pool buffer, following the stock capacities:
-/// 0x800 sockets, 0x400 keys or associations, and the reported number of
-/// QoS lookups plus one.
+/// Copy a table into a new pool buffer, following the stock capacities.
 fn take_snapshot(table: Table) -> Result<Snapshot, TableError> {
+    const SOCKET_CAPACITY: u32 = 0x800;
+    /// Capacity for keys or security associations.
+    const ENTRY_CAPACITY: u32 = 0x400;
     let function = match table_ordinal(table) {
         Some(ordinal) => Some(xam_procedure(ordinal).ok_or(TableError::Unavailable)?),
         None => None,
     };
     let mut count = match table {
-        Table::Sockets => 0x800,
-        Table::Keys | Table::SecurityAssociations => 0x400,
+        Table::Sockets => SOCKET_CAPACITY,
+        Table::Keys | Table::SecurityAssociations => ENTRY_CAPACITY,
+        // The reported number of lookups plus one; an empty buffer reports
+        // `WSAENOBUFS`.
         Table::QosLookups => {
             let mut count = 0u32;
-            let result = query(function, 0, &mut count);
-            if result != 0 && result != WSAEMSGSIZE {
-                return Err(TableError::Unavailable);
+            match query(function, 0, &mut count) {
+                Ok(()) | Err(Win32Error::NO_BUFFER_SPACE) => {}
+                Err(_) => return Err(TableError::Unavailable),
             }
             count.wrapping_add(1)
         }
     };
     // SAFETY: pool allocation of a computed size; the result is checked below.
     let buffer = unsafe {
-        xboxkrnl::ExAllocatePoolWithTag(count.wrapping_mul(Snapshot::record_size(table)), POOL_TAG)
+        xboxkrnl::ExAllocatePoolWithTag(
+            count.wrapping_mul(Snapshot::record_size(table)),
+            pool_tag::MONITOR,
+        )
     };
     if buffer == 0 {
         return Err(TableError::OutOfMemory);
     }
-    if query(function, buffer, &mut count) != 0 {
+    if query(function, buffer, &mut count).is_err() {
         // SAFETY: `buffer` was allocated above and is not used afterwards.
         unsafe { xboxkrnl::ExFreePool(buffer) };
         return Err(TableError::Unavailable);
@@ -410,7 +498,7 @@ pub struct Data {
 impl Data {
     pub const fn new() -> Self {
         Self {
-            snapshots: [None; MAX_CONNECTIONS],
+            snapshots: [const { None }; MAX_CONNECTIONS],
             netcap: netcap::Data::new(),
             ipproxy: ipproxy::Data::new(),
         }
@@ -422,15 +510,14 @@ impl Data {
             .get_mut(usize::from(connection.0))
             .and_then(Option::take)
         {
-            // SAFETY: the snapshot owned its pool buffer and was taken out of its slot.
-            unsafe { xboxkrnl::ExFreePool(snapshot.buffer) };
+            snapshot.free();
         }
     }
 }
 
 /// Ethernet link state (`XNetGetEthernetLinkStatus`); any thread.
 pub(crate) fn link_status() -> LinkStatus {
-    LinkStatus(NetDll_XNetGetEthernetLinkStatus(XNCALLER_SYSAPP).bits())
+    LinkStatus(NetDll_XNetGetEthernetLinkStatus(XnCaller::SystemApp).bits())
 }
 
 /// Force link state bits through `XNetSetOpt`; any thread.
@@ -441,7 +528,7 @@ pub(crate) fn set_link_flags(flags: LinkFlags) -> Result<(), WsaError> {
     // SAFETY: `value` is a live 8-byte option buffer of the stated length.
     let error = unsafe {
         NetDll_XNetSetOpt(
-            XNCALLER_SYSAPP,
+            XnCaller::SystemApp,
             XnetOption::LINK_FLAGS,
             value.as_ptr(),
             value.len() as u32,
@@ -459,13 +546,10 @@ impl network::Backend for Console {
         self.network.release(connection);
         let snapshot = take_snapshot(table)?;
         match self.network.snapshots.get_mut(usize::from(connection.0)) {
-            Some(slot) => {
-                *slot = Some(snapshot);
-                Ok(snapshot.count)
-            }
+            // The slot was emptied by `release`.
+            Some(slot) => Ok(slot.insert(snapshot).count),
             None => {
-                // SAFETY: the snapshot owns its pool buffer and was not stored.
-                unsafe { xboxkrnl::ExFreePool(snapshot.buffer) };
+                snapshot.free();
                 Err(TableError::OutOfMemory)
             }
         }
@@ -474,9 +558,8 @@ impl network::Backend for Console {
     fn table_record(&mut self, connection: ConnectionIndex, index: u32) -> Option<Record> {
         self.network
             .snapshots
-            .get(usize::from(connection.0))
-            .copied()
-            .flatten()?
+            .get(usize::from(connection.0))?
+            .as_ref()?
             .record(index)
     }
 
@@ -495,29 +578,27 @@ impl network::Backend for Console {
     /// The kernel result is ignored, as in stock; a failed query reports
     /// zeros where stock reports stale stack contents.
     fn nic_stats(&mut self, device_flags: u32) -> NicStats {
-        let mut block = NicStatsBlock([0; NIC_STATS_SIZE]);
-        // SAFETY: `block` is a live NIC_STATS_SIZE-byte buffer.
-        unsafe { NicGetStats(device_flags, block.0.as_mut_ptr()) };
-        let raw = &block.0;
-        let qword = |offset: usize| u64::from_be_bytes(array(raw, offset));
+        let mut block = NicStatistics::default();
+        // SAFETY: the device flags are the caller's, as stock passes them.
+        unsafe { xboxkrnl::nic_get_stats(device_flags, &mut block) };
         NicStats {
-            transmitted_bytes: qword(0x00),
-            received_unicast_bytes: qword(0x08),
-            received_unicast1_bytes: qword(0x10),
-            received_unicast2_bytes: qword(0x18),
-            received_multicast_bytes: qword(0x20),
-            received_broadcast_bytes: qword(0x28),
-            transmitted_frames: dword(raw, 0x30),
-            received_unicast_frames: dword(raw, 0x34),
-            received_unicast1_frames: dword(raw, 0x38),
-            received_unicast2_frames: dword(raw, 0x3c),
-            received_multicast_frames: dword(raw, 0x40),
-            received_broadcast_frames: dword(raw, 0x44),
-            transmit_underrun_errors: dword(raw, 0x48),
-            transmit_other_errors: dword(raw, 0x4c),
-            receive_frame_errors: dword(raw, 0x50),
-            receive_crc_errors: dword(raw, 0x54),
-            receive_other_errors: dword(raw, 0x58),
+            transmitted_bytes: block.transmitted_bytes,
+            received_unicast_bytes: block.received_unicast_bytes,
+            received_unicast1_bytes: block.received_unicast1_bytes,
+            received_unicast2_bytes: block.received_unicast2_bytes,
+            received_multicast_bytes: block.received_multicast_bytes,
+            received_broadcast_bytes: block.received_broadcast_bytes,
+            transmitted_frames: block.transmitted_frames,
+            received_unicast_frames: block.received_unicast_frames,
+            received_unicast1_frames: block.received_unicast1_frames,
+            received_unicast2_frames: block.received_unicast2_frames,
+            received_multicast_frames: block.received_multicast_frames,
+            received_broadcast_frames: block.received_broadcast_frames,
+            transmit_underrun_errors: block.transmit_underrun_errors,
+            transmit_other_errors: block.transmit_other_errors,
+            receive_frame_errors: block.receive_frame_errors,
+            receive_crc_errors: block.receive_crc_errors,
+            receive_other_errors: block.receive_other_errors,
         }
     }
 

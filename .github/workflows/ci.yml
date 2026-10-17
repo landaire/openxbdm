@@ -20,7 +20,6 @@ on:
 # the action cache.
 
 env:
-  ACTION_CACHE_DIR: ${{ github.workspace }}/../buck2-action-cache
   TARGETS: "//: //bindings/... //crates/... //xbox360/..."
 
 jobs:
@@ -56,9 +55,13 @@ jobs:
 
       # Action keys cover the linker command but not the compiler driver
       # that it runs from PATH, so each runner image keeps its own cache.
+      # actions/cache rejects paths with `..`, and the directory stays
+      # outside the Buck2 project.
       - name: Name the action cache
         id: action-cache
-        run: echo "prefix=buck2-action-cache-$ImageOS-$ImageVersion-${{ runner.arch }}-" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "prefix=buck2-action-cache-$ImageOS-$ImageVersion-${{ runner.arch }}-" >> "$GITHUB_OUTPUT"
+          echo "ACTION_CACHE_DIR=$RUNNER_TEMP/buck2-action-cache" >> "$GITHUB_ENV"
 
       - name: Restore the Buck2 action cache
         uses: actions/cache/restore@v4

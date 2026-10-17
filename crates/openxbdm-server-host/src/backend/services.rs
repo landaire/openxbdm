@@ -16,11 +16,6 @@ use openxbdm_server::commands::services::ThreadHandle;
 
 use super::MockBackend;
 
-/// First handle the simulated kernel hands out.
-const FIRST_THREAD_HANDLE: u32 = 0xf800_0040;
-/// Distance between simulated handles.
-const THREAD_HANDLE_STRIDE: u32 = 4;
-
 /// A request made to the XAM content verification services.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CivCall {
@@ -47,14 +42,17 @@ pub enum CivCall {
 pub struct Mock {
     /// Requests in the order they were made.
     pub calls: Vec<CivCall>,
+
     /// Thread creation fails with this last error when set.
     pub thread_failure: Option<LastError>,
     next_thread_handle: u32,
+
     /// Kernel security detection mask; `None` before the security state is
     /// initialized, when the kernel reports all bits set.
     pub detection_mask: Option<u64>,
     /// A detection export the simulated kernel lacks.
     pub missing_detection_routine: Option<DetectionRoutineMissing>,
+
     /// Return value of XAM 0x9bb.
     pub create_result: CivResult,
     /// Return value of XAM 0x9bd.
@@ -65,6 +63,9 @@ pub struct Mock {
 
 impl Default for Mock {
     fn default() -> Self {
+        /// First handle the simulated kernel hands out.
+        const FIRST_THREAD_HANDLE: u32 = 0xf800_0040;
+
         Self {
             calls: Vec::new(),
             thread_failure: None,
@@ -91,21 +92,28 @@ impl Mock {
         if bit.0 >= u64::BITS {
             return KernelError::InvalidParameter.into();
         }
+
         let mask = self.detection_mask.get_or_insert(0);
         *mask |= 1 << bit.0;
+
         NtStatus::SUCCESS
     }
 }
 
 impl services::Backend for MockBackend {
     fn start_civ_failure_thread(&mut self, reboot: bool) -> Result<ThreadHandle, LastError> {
+        /// Distance between simulated handles.
+        const THREAD_HANDLE_STRIDE: u32 = 4;
+
         let mock = &mut self.services;
         if let Some(error) = mock.thread_failure {
             return Err(error);
         }
+
         let handle = ThreadHandle(mock.next_thread_handle);
         mock.next_thread_handle += THREAD_HANDLE_STRIDE;
         mock.calls.push(CivCall::Failure { reboot });
+
         Ok(handle)
     }
 
@@ -124,9 +132,11 @@ impl services::Backend for MockBackend {
         if let Some(missing) = mock.missing_detection_routine {
             return Err(missing);
         }
+
         let old_mask = DetectionMask(mock.detected() as u32);
         mock.detection_mask = Some(0);
         let status = bit.map_or(NtStatus::SUCCESS, |bit| mock.set_detected(bit));
+
         Ok(DetectionUpdate {
             status,
             old_mask,
@@ -138,6 +148,7 @@ impl services::Backend for MockBackend {
         self.services
             .calls
             .push(CivCall::CreateProcess { thread_id });
+
         self.services.create_result
     }
 
@@ -147,6 +158,7 @@ impl services::Backend for MockBackend {
 
     fn verify_civ(&mut self, milliseconds: u32) -> CivResult {
         self.services.calls.push(CivCall::Verify { milliseconds });
+
         self.services.verify_result
     }
 

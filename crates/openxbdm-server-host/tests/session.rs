@@ -13,9 +13,6 @@ use std::net::UdpSocket;
 use std::thread;
 use std::time::Duration;
 
-use common::RawSession;
-use common::TestServer;
-use common::run;
 use openxbdm_client::commands::system::ExecutionState;
 use openxbdm_client::commands::system::Notify;
 use openxbdm_client::discovery::DiscoveryConfig;
@@ -32,6 +29,10 @@ use openxbdm_server::commands::session::debug_capture_print;
 use openxbdm_server::processors::ProcessorFlags;
 use openxbdm_server_host::Host;
 use openxbdm_server_host::backend::session::RpcRegisters;
+
+use common::RawSession;
+use common::TestServer;
+use common::run;
 
 const DEVKIT: &str = "\\Device\\Harddisk0\\Partition1\\DEVKIT";
 
@@ -53,6 +54,116 @@ fn read_exact(session: &mut RawSession, count: usize) -> Vec<u8> {
     let mut bytes = vec![0; count];
     session.reader.read_exact(&mut bytes).unwrap();
     bytes
+}
+
+/// A call buffer: result, return, last error request, flags, counts,
+/// module, target, then the arguments.
+fn call_buffer(
+    module: u64,
+    target: u64,
+    integers: &[u64],
+    doubles: &[f64],
+    size: usize,
+) -> Vec<u8> {
+    let mut buffer = Vec::new();
+
+    for word in [
+        0,
+        0,
+        1,
+        0,
+        integers.len() as u64,
+        doubles.len() as u64,
+        module,
+        target,
+    ] {
+        buffer.extend_from_slice(&word.to_be_bytes());
+    }
+
+    for integer in integers {
+        buffer.extend_from_slice(&integer.to_be_bytes());
+    }
+
+    for double in doubles {
+        buffer.extend_from_slice(&double.to_bits().to_be_bytes());
+    }
+
+    buffer.resize(size, 0);
+
+    buffer
+}
+
+fn qword(buffer: &[u8], offset: usize) -> u64 {
+    u64::from_be_bytes(buffer[offset..offset + 8].try_into().unwrap())
+}
+
+fn tell_log(server: &TestServer) -> Vec<u8> {
+    server
+        .host
+        .lock()
+        .backend
+        .filesystem
+        .read(&format!("{DEVKIT}\\tell.log"))
+        .expect("log file")
+        .to_vec()
+}
+
+/// A pipe packet padded to the first receive of 0x5b4 bytes.
+fn packet(magic: &[u8; 2], id: u16, offset: u32, body: &[u8]) -> Vec<u8> {
+    let length = 0xc + body.len() as u32;
+    let mut packet = Vec::new();
+    packet.extend_from_slice(magic);
+    packet.extend_from_slice(&id.to_be_bytes());
+    packet.extend_from_slice(&length.to_be_bytes());
+    packet.extend_from_slice(&offset.to_be_bytes());
+    packet.extend_from_slice(body);
+
+    if packet.len() < 0x5b4 {
+        packet.resize(0x5b4, 0);
+    }
+
+    packet
+}
+
+fn create_body(path: &str, size: u64, attributes: u32, data: &[u8]) -> Vec<u8> {
+    let header = 0x20 + path.len() as u32 + 1;
+    let mut body = Vec::new();
+    body.extend_from_slice(&header.to_be_bytes());
+    body.extend_from_slice(&0x01d0_0000_0000_0001u64.to_be_bytes());
+    body.extend_from_slice(&0x01d0_0000_0000_0002u64.to_be_bytes());
+    body.extend_from_slice(&size.to_be_bytes());
+    body.extend_from_slice(&attributes.to_be_bytes());
+    body.extend_from_slice(path.as_bytes());
+    body.push(0);
+    body.extend_from_slice(data);
+
+    body
+}
+
+fn reply(stream: &mut TcpStream) -> [u8; 12] {
+    let mut reply = [0u8; 12];
+    stream.read_exact(&mut reply).unwrap();
+
+    reply
+}
+
+fn expected_reply(id: u16, create_length: u32, result: u32) -> [u8; 12] {
+    let mut reply = [0u8; 12];
+    reply[..2].copy_from_slice(b"BB");
+    reply[2..4].copy_from_slice(&id.to_be_bytes());
+    reply[4..8].copy_from_slice(&create_length.to_be_bytes());
+    reply[8..].copy_from_slice(&result.to_be_bytes());
+
+    reply
+}
+
+fn discovery_responder(server: &TestServer) -> SocketAddr {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap();
+    let host = server.host.clone();
+    thread::spawn(move || host.serve_discovery(&socket));
+
+    address
 }
 
 #[test]
@@ -80,13 +191,16 @@ fn a_seventeenth_channel_sends_null_to_every_channel_and_fails() {
     let server = TestServer::start();
     let mut channels: Vec<RawSession> = (0..16).map(|_| channel(&server)).collect();
     let mut session = session(&server);
+
     assert_eq!(
         session.command("notifyport"),
         "400- notification limit exceeded"
     );
+
     for channel in &mut channels {
         assert_eq!(channel.line(), "null");
     }
+
     // The failed connection stays a command connection.
     assert_eq!(session.command("srvproc num=2"), "200- prev=0");
 }
@@ -97,11 +211,13 @@ fn notifyat_connects_sends_the_state_and_drops_on_request() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let mut session = session(&server);
+
     // The groups of `addr=` name the address bytes in reverse order.
     assert_eq!(
         session.command(&format!("notifyat port={port} addr=1.0.0.127")),
         "200- OK"
     );
+
     let (mut target, _) = listener.accept().unwrap();
     target
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -121,6 +237,7 @@ fn notifyat_connects_sends_the_state_and_drops_on_request() {
         session.command(&format!("notifyat port={port} addr=1.0.0.127 drop")),
         "200- OK"
     );
+
     let mut rest = Vec::new();
     target.read_to_end(&mut rest).unwrap();
     assert!(rest.is_empty());
@@ -130,6 +247,7 @@ fn notifyat_connects_sends_the_state_and_drops_on_request() {
 fn notifyat_requires_a_port() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     assert_eq!(session.command("notifyat addr=1.0.0.127"), "400- ");
 }
 
@@ -148,7 +266,9 @@ fn dedicate_moves_the_connection_between_contexts() {
             .register_processor(b"ttl", Some(echo), ProcessorFlags::TITLE)
             .unwrap();
     }
+
     let mut session = session(&server);
+
     assert_eq!(session.command("dedicate"), "400- missing handler");
     assert_eq!(
         session.command("dedicate handler=none"),
@@ -190,7 +310,9 @@ fn processor_answering_205_takes_the_connection() {
             )
             .unwrap();
     }
+
     let mut session = session(&server);
+
     assert_eq!(session.command("sys!x"), "200- OK");
     assert_eq!(session.command("own!take"), "205- connection dedicated");
     assert_eq!(
@@ -234,7 +356,9 @@ fn status_lines_follow_the_line_builder() {
             )
             .unwrap();
     }
+
     let mut session = session(&server);
+
     assert_eq!(session.command("low!x"), "2:0- ");
     assert_eq!(session.command("mid!x"), "2D0- ");
     assert_eq!(session.command("bad!x"), "4?0- ");
@@ -261,7 +385,9 @@ fn transfer_without_continuation_keeps_the_original_text() {
             )
             .unwrap();
     }
+
     let mut session = session(&server);
+
     assert_eq!(
         session.command("multi!x"),
         "400- multiline response follows"
@@ -286,11 +412,13 @@ fn processor_calls_on_other_threads_reply_when_they_end() {
             .register_processor(b"ttl", Some(echo), ProcessorFlags::TITLE)
             .unwrap();
     }
+
     let mut title = session(&server);
     title.send("ttl!echo");
     server.wait_until(|host| host.server.awaits_processor(ConnectionIndex(0)));
     let mut other = session(&server);
     assert_eq!(other.command("srvproc num=1"), "200- prev=0");
+
     {
         let mut host = server.host.lock();
         let Host {
@@ -300,6 +428,7 @@ fn processor_calls_on_other_threads_reply_when_they_end() {
         } = &mut *host;
         server.complete_processor_call(ConnectionIndex(0), backend, network);
     }
+
     assert_eq!(title.line(), "200- ttl!echo");
     assert_eq!(
         title.command("srvproc"),
@@ -324,6 +453,7 @@ fn title_termination_closes_title_connections_and_processors() {
             .register_processor(b"dsys", Some(ok()), ProcessorFlags::DEDICATED_THREAD)
             .unwrap();
     }
+
     let mut shared = session(&server);
     assert_eq!(shared.command("ttl!x"), "200- OK");
     let mut title_thread = session(&server);
@@ -337,6 +467,7 @@ fn title_termination_closes_title_connections_and_processors() {
         "205- connection dedicated"
     );
     let mut main = session(&server);
+
     {
         let mut host = server.host.lock();
         let Host {
@@ -346,11 +477,13 @@ fn title_termination_closes_title_connections_and_processors() {
         } = &mut *host;
         server.title_terminated(backend, network);
     }
+
     for closed in [&mut shared, &mut title_thread] {
         let mut rest = Vec::new();
         closed.reader.read_to_end(&mut rest).unwrap();
         assert!(rest.is_empty());
     }
+
     assert_eq!(system_thread.command("dsys!x"), "200- OK");
     assert_eq!(main.command("ttl!x"), "407- unknown command");
     assert_eq!(
@@ -363,6 +496,7 @@ fn title_termination_closes_title_connections_and_processors() {
 fn dbgprint_streams_captured_records() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     assert_eq!(
         session.command("dbgprint"),
         "400- Debug capture not started (use 'start' option to start capture)"
@@ -376,6 +510,7 @@ fn dbgprint_streams_captured_records() {
         session.command("dbgprint start=1"),
         "400- Debug capture already started"
     );
+
     {
         let mut host = server.host.lock();
         let Host {
@@ -388,6 +523,7 @@ fn dbgprint_streams_captured_records() {
         );
         debug_capture_print(&mut server.state, backend, b"XBDM: Updated Channel ISR.\n");
     }
+
     assert_eq!(
         session.command("dbgprint"),
         "202- Debug print strings follow"
@@ -424,15 +560,18 @@ fn fileevent_announces_start_and_stop_after_posted_texts() {
     let server = TestServer::start();
     let mut channel = channel(&server);
     let mut session = session(&server);
+
     assert_eq!(session.command("fileevent"), "400- ");
     assert_eq!(session.command("fileevent advise"), "200- OK");
     assert_eq!(channel.line(), "XBDMFE!Start 0x00000001");
     assert!(server.host.lock().backend.session.file_events);
+
     {
         let mut host = server.host.lock();
         host.backend.post_notification(b"XBDMFE!Begin 0x00000002");
         host.backend.post_notification(b"XBDMFE!End 0x00000002");
     }
+
     assert_eq!(session.command("fileevent unadvise"), "200- OK");
     assert_eq!(channel.line(), "XBDMFE!Begin 0x00000002");
     assert_eq!(channel.line(), "XBDMFE!End 0x00000002");
@@ -445,6 +584,7 @@ fn fileevent_sequence_wraps_to_zero() {
     let server = TestServer::start();
     let mut channel = channel(&server);
     let mut session = session(&server);
+
     server.host.lock().backend.session.file_event_id = FileEventId(0xffff_fffe);
     assert_eq!(session.command("fileevent advise"), "200- OK");
     assert_eq!(channel.line(), "XBDMFE!Start 0xffffffff");
@@ -458,6 +598,7 @@ fn fileevent_sequence_wraps_to_zero() {
 fn srvproc_reports_and_moves_the_server_processor() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     assert_eq!(session.command("srvproc num=4"), "200- prev=0");
     assert_eq!(session.command("srvproc"), "200- prev=4");
     assert_eq!(server.host.lock().backend.session.processor, 2);
@@ -469,6 +610,7 @@ fn srvproc_reports_and_moves_the_server_processor() {
 fn spew_writes_the_line_to_the_debug_output() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     assert_eq!(session.command("spew some text"), "200- OK");
     assert!(
         server
@@ -481,46 +623,11 @@ fn spew_writes_the_line_to_the_debug_output() {
     );
 }
 
-/// A call buffer: result, return, last error request, flags, counts,
-/// module, target, then the arguments.
-fn call_buffer(
-    module: u64,
-    target: u64,
-    integers: &[u64],
-    doubles: &[f64],
-    size: usize,
-) -> Vec<u8> {
-    let mut buffer = Vec::new();
-    for word in [
-        0,
-        0,
-        1,
-        0,
-        integers.len() as u64,
-        doubles.len() as u64,
-        module,
-        target,
-    ] {
-        buffer.extend_from_slice(&word.to_be_bytes());
-    }
-    for integer in integers {
-        buffer.extend_from_slice(&integer.to_be_bytes());
-    }
-    for double in doubles {
-        buffer.extend_from_slice(&double.to_bits().to_be_bytes());
-    }
-    buffer.resize(size, 0);
-    buffer
-}
-
-fn qword(buffer: &[u8], offset: usize) -> u64 {
-    u64::from_be_bytes(buffer[offset..offset + 8].try_into().unwrap())
-}
-
 #[test]
 fn rpc_checks_the_version_and_parameters() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     assert_eq!(
         session.command("rpc system buf_size=8"),
         "200- error=Version is not specified, expecting major version 4"
@@ -538,6 +645,7 @@ fn rpc_checks_the_version_and_parameters() {
         session.command("rpc version=4 title buf_size=0x1000001"),
         "428- out of memory"
     );
+
     server.host.lock().backend.session.rpc_exhausted = true;
     assert_eq!(
         session.command("rpc version=4 title buf_size=8"),
@@ -560,21 +668,26 @@ fn rpc_runs_on_its_own_thread_and_returns_the_buffer() {
             }),
         );
     }
+
     let mut session = session(&server);
     assert_eq!(
         session.command(&format!("rpc version=4 title buf_size={SIZE}")),
         "204- buf_addr=4A000068"
     );
+
     session
         .stream
         .write_all(&call_buffer(0, 0x8200_1000, &[5, 7], &[], SIZE))
         .unwrap();
+
     assert_eq!(session.line(), "203- binary response follows");
     assert_eq!(read_exact(&mut session, 8), [0; 8]);
+
     let buffer = read_exact(&mut session, SIZE);
     assert_eq!(qword(&buffer, 0), 0);
     assert_eq!(qword(&buffer, 8), 12);
     assert_eq!(qword(&buffer, 0x10), 0x57);
+
     // The stream ends; the connection takes commands again.
     assert_eq!(session.command("srvproc num=2"), "200- prev=0");
 }
@@ -590,15 +703,18 @@ fn rpc_argument_counts_stop_at_the_buffer_end() {
             f1: 0.0,
         }),
     );
+
     let mut session = session(&server);
     assert_eq!(
         session.command(&format!("rpc version=4 title buf_size={SIZE}")),
         "204- buf_addr=4A000068"
     );
+
     let mut buffer = call_buffer(0, 0x8200_1000, &[], &[], SIZE);
     buffer[0x20..0x28].copy_from_slice(&0xffff_ffffu64.to_be_bytes());
     buffer[0x28..0x30].copy_from_slice(&0xffff_ffffu64.to_be_bytes());
     session.stream.write_all(&buffer).unwrap();
+
     assert_eq!(session.line(), "203- binary response follows");
     assert_eq!(read_exact(&mut session, 8), [0; 8]);
     assert_eq!(qword(&read_exact(&mut session, SIZE), 8), 2);
@@ -609,14 +725,17 @@ fn rpc_reports_an_unknown_module() {
     const SIZE: usize = 0x48;
     let server = TestServer::start();
     let mut session = session(&server);
+
     assert_eq!(
         session.command(&format!("rpc version=4 system buf_size={SIZE}")),
         "204- buf_addr=4A000068"
     );
+
     // The module name sits in the buffer after the header.
     let mut buffer = call_buffer(0x4a00_0068 + 0x40, 1, &[], &[], SIZE);
     buffer[0x40..0x45].copy_from_slice(b"none\0");
     session.stream.write_all(&buffer).unwrap();
+
     assert_eq!(session.line(), "203- binary response follows");
     assert_eq!(read_exact(&mut session, 8), [0; 8]);
     assert_eq!(
@@ -640,45 +759,42 @@ fn rpc_for_a_named_thread_sends_markers_until_the_thread_drains() {
         );
         host.backend.session.rpc_drains.sender()
     };
+
     let mut session = session(&server);
     assert_eq!(
         session.command(&format!("rpc version=4 title thread=main buf_size={SIZE}")),
         "204- buf_addr=4A000068"
     );
+
     let mut buffer = call_buffer(0, 0x8200_2000, &[], &[1.5], SIZE);
     // Flag bit 0: the return value is the double.
     buffer[0x1f] = 1;
     session.stream.write_all(&buffer).unwrap();
+
     assert_eq!(session.line(), "203- binary response follows");
     assert_eq!(read_exact(&mut session, 8), [0, 0, 0, 0, 0, 0, 3, 0xe5]);
+
     // A thread of another name runs nothing.
     drains.send(b"other".to_vec()).unwrap();
     assert_eq!(read_exact(&mut session, 8), [0, 0, 0, 0, 0, 0, 3, 0xe5]);
+
     drains.send(b"main".to_vec()).unwrap();
     let mut marker = read_exact(&mut session, 8);
+
     while marker != [0; 8] {
         assert_eq!(marker, [0, 0, 0, 0, 0, 0, 3, 0xe5]);
         marker = read_exact(&mut session, 8);
     }
+
     let buffer = read_exact(&mut session, SIZE);
     assert_eq!(f64::from_bits(qword(&buffer, 8)), 3.0);
-}
-
-fn tell_log(server: &TestServer) -> Vec<u8> {
-    server
-        .host
-        .lock()
-        .backend
-        .filesystem
-        .read(&format!("{DEVKIT}\\tell.log"))
-        .expect("log file")
-        .to_vec()
 }
 
 #[test]
 fn dmtelllog_result_codes() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     assert_eq!(session.command("dmtelllog"), "407- unknown command");
     assert_eq!(
         session.command("dmtelllog start area=1"),
@@ -693,6 +809,7 @@ fn dmtelllog_result_codes() {
         session.command("dmtelllog start file=other.log area=1"),
         "200- hresult=0x420"
     );
+
     // A new area bit joins the open log, and a stop that leaves area bits
     // keeps it open; neither sends a reply.
     // The monitor takes one line per receive, so each line goes alone.
@@ -701,10 +818,12 @@ fn dmtelllog_result_codes() {
             host.backend.session.tell_log.as_ref().map(|log| log.area) == Some(expected)
         }
     };
+
     session.send("dmtelllog start file=other.log area=2");
     server.wait_until(area(TellLogAreas::from_bits_retain(3)));
     session.send("dmtelllog stop area=1");
     server.wait_until(area(TellLogAreas::CRITICAL_SECTIONS));
+
     assert_eq!(session.command("dmtelllog stop"), "200- hresult=0x10000000");
     assert_eq!(
         session.command("dmtelllog start file=tell.log area=1 size=0x10000 entries=0x1000"),
@@ -716,10 +835,12 @@ fn dmtelllog_result_codes() {
 fn dmtelllog_writes_record_text_on_close() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     assert_eq!(
         session.command("dmtelllog start file=tell.log area=3 size=8 entries=2"),
         "200- hresult=0x10000000"
     );
+
     {
         let mut host = server.host.lock();
         host.backend.tell_log_record(b"first\n\0");
@@ -728,9 +849,11 @@ fn dmtelllog_writes_record_text_on_close() {
         // The entry keeps the bytes beyond a shorter record.
         host.backend.tell_log_record(b"x");
     }
+
     assert!(tell_log(&server).is_empty());
     assert_eq!(session.command("dmtelllog stop"), "200- hresult=0x10000000");
     assert_eq!(tell_log(&server), b"first\nsecond lxirst\n");
+
     let output = &server.host.lock().backend.debug_output;
     assert!(
         output
@@ -743,21 +866,26 @@ fn dmtelllog_writes_record_text_on_close() {
 fn dmtelllog_drops_records_when_the_queue_is_full() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     assert_eq!(
         session.command("dmtelllog start file=tell.log area=1 entries=2"),
         "200- hresult=0x10000000"
     );
+
     {
         let mut host = server.host.lock();
         host.backend.session.tell_log_worker_paused = true;
+
         for record in [b"a\0".as_slice(), b"b\0", b"c\0"] {
             host.backend.tell_log_record(record);
         }
     }
+
     assert_eq!(session.command("dmtelllog stop"), "200- hresult=0x10000000");
     // The closing record found no entry either; the collection was never
     // written.
     assert!(tell_log(&server).is_empty());
+
     let output = &server.host.lock().backend.debug_output;
     assert!(
         output
@@ -766,73 +894,34 @@ fn dmtelllog_drops_records_when_the_queue_is_full() {
     );
 }
 
-/// A pipe packet padded to the first receive of 0x5b4 bytes.
-fn packet(magic: &[u8; 2], id: u16, offset: u32, body: &[u8]) -> Vec<u8> {
-    let length = 0xc + body.len() as u32;
-    let mut packet = Vec::new();
-    packet.extend_from_slice(magic);
-    packet.extend_from_slice(&id.to_be_bytes());
-    packet.extend_from_slice(&length.to_be_bytes());
-    packet.extend_from_slice(&offset.to_be_bytes());
-    packet.extend_from_slice(body);
-    if packet.len() < 0x5b4 {
-        packet.resize(0x5b4, 0);
-    }
-    packet
-}
-
-fn create_body(path: &str, size: u64, attributes: u32, data: &[u8]) -> Vec<u8> {
-    let header = 0x20 + path.len() as u32 + 1;
-    let mut body = Vec::new();
-    body.extend_from_slice(&header.to_be_bytes());
-    body.extend_from_slice(&0x01d0_0000_0000_0001u64.to_be_bytes());
-    body.extend_from_slice(&0x01d0_0000_0000_0002u64.to_be_bytes());
-    body.extend_from_slice(&size.to_be_bytes());
-    body.extend_from_slice(&attributes.to_be_bytes());
-    body.extend_from_slice(path.as_bytes());
-    body.push(0);
-    body.extend_from_slice(data);
-    body
-}
-
-fn reply(stream: &mut TcpStream) -> [u8; 12] {
-    let mut reply = [0u8; 12];
-    stream.read_exact(&mut reply).unwrap();
-    reply
-}
-
-fn expected_reply(id: u16, create_length: u32, result: u32) -> [u8; 12] {
-    let mut reply = [0u8; 12];
-    reply[..2].copy_from_slice(b"BB");
-    reply[2..4].copy_from_slice(&id.to_be_bytes());
-    reply[4..8].copy_from_slice(&create_length.to_be_bytes());
-    reply[8..].copy_from_slice(&result.to_be_bytes());
-    reply
-}
-
 #[test]
 fn fastpipe_receives_inline_and_block_files() {
     let server = TestServer::start();
     server.host.lock().backend.session.file_cache_elements = 0x40;
     let mut first = session(&server);
+
     assert_eq!(first.command("fastpipe"), "209- result code 1");
     assert_eq!(
         server.host.lock().backend.session.file_cache_elements,
         0x400
     );
+
     let mut second = session(&server);
     assert_eq!(second.command("fastpipe group=1"), "209- result code 1");
+
     let mut other = session(&server);
     assert_eq!(
         other.command("fastpipe group=5"),
         "400- fastpipe limit exceeded"
     );
+
     let mut first = first.stream;
 
     let inline_path = format!("{DEVKIT}\\inline.bin");
     let body = create_body(&inline_path, 5, 0, b"hello");
     let create = packet(b"CC", 1, 0, &body);
     first.write_all(&create).unwrap();
+
     assert_eq!(
         reply(&mut first),
         expected_reply(1, 0xc + body.len() as u32, 0)
@@ -850,10 +939,12 @@ fn fastpipe_receives_inline_and_block_files() {
     first.write_all(&packet(b"CC", 2, 0, &body)).unwrap();
     let data = vec![b'd'; 0x10000];
     first.write_all(&packet(b"AA", 2, 0, &data)).unwrap();
+
     assert_eq!(
         reply(&mut first),
         expected_reply(2, 0xc + body.len() as u32, 0)
     );
+
     {
         let host = server.host.lock();
         let entry = host.backend.filesystem.entry(&block_path).unwrap();
@@ -873,6 +964,7 @@ fn fastpipe_receives_inline_and_block_files() {
         .unwrap();
     second.stream.read_to_end(&mut rest).unwrap();
     assert!(rest.is_empty());
+
     assert_eq!(server.host.lock().backend.session.file_cache_elements, 0x40);
 }
 
@@ -881,15 +973,8 @@ fn fastpipe_requires_the_large_memory_configuration() {
     let server = TestServer::start();
     server.host.lock().backend.console.features.one_gigabyte_ram = false;
     let mut session = session(&server);
-    assert_eq!(session.command("fastpipe"), "400- ");
-}
 
-fn discovery_responder(server: &TestServer) -> SocketAddr {
-    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let address = socket.local_addr().unwrap();
-    let host = server.host.clone();
-    thread::spawn(move || host.serve_discovery(&socket));
-    address
+    assert_eq!(session.command("fastpipe"), "400- ");
 }
 
 #[test]
@@ -897,6 +982,7 @@ fn discovery_answers_identify_and_name_lookup() {
     let server = TestServer::start();
     let address = discovery_responder(&server);
     let mut session = session(&server);
+
     assert_eq!(session.command("dbgname name=DevKit-1"), "200- OK");
 
     let consoles = run(discover_all(DiscoveryConfig::unicast(address))).unwrap();

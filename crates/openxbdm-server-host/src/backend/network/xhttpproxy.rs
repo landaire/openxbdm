@@ -1,5 +1,7 @@
 //! Simulated proxy list.
 
+use std::mem;
+
 use openxbdm_server::commands::network::decode_hex;
 use openxbdm_server::commands::network::xhttpproxy;
 use openxbdm_server::commands::network::xhttpproxy::Certificate;
@@ -31,6 +33,7 @@ pub struct Entry {
 pub struct Mock {
     /// Entries, oldest first; the newest entry is the list head.
     pub entries: Vec<Entry>,
+
     /// Fail the next entry allocation.
     pub fail_allocation: bool,
     next_id: u32,
@@ -50,41 +53,47 @@ impl Mock {
     }
 
     /// Stock 0x91f37800 for the command: the newest active entry whose
-    /// system bit equals `sys`.
-    fn active(&self, sys: bool) -> Option<usize> {
+    /// system bit equals `system`.
+    fn active(&self, system: bool) -> Option<usize> {
         self.entries.iter().rposition(|entry| {
-            entry.flags.contains(ProxyFlags::ACTIVE) && entry.flags.contains(ProxyFlags::SYS) == sys
+            entry.flags.contains(ProxyFlags::ACTIVE)
+                && entry.flags.contains(ProxyFlags::SYS) == system
         })
     }
 }
 
 impl xhttpproxy::Backend for MockBackend {
-    fn proxy_update(&mut self, sys: bool, new: Option<&NewProxy<'_>>) -> ProxyOutcome {
+    fn proxy_update(&mut self, system: bool, new: Option<&NewProxy<'_>>) -> ProxyOutcome {
         let mock = &mut self.network.xhttpproxy;
-        let cleared = mock.active(sys).map(|position| {
+
+        let cleared = mock.active(system).map(|position| {
             let entry = &mut mock.entries[position];
             let flags = entry.flags;
             entry.flags.remove(ProxyFlags::ACTIVE);
             entry.references -= 1;
             mock.release_if_unused(position);
+
             flags
         });
+
         let Some(new) = new else {
             return ProxyOutcome {
                 cleared,
                 inserted: None,
             };
         };
+
         let certificate_size = match new.certificate {
             Certificate::None => 0,
             Certificate::Hex { size, .. } | Certificate::Upload { size } => size,
         };
-        if std::mem::take(&mut mock.fail_allocation) || certificate_size > POOL_LIMIT {
+        if mem::take(&mut mock.fail_allocation) || certificate_size > POOL_LIMIT {
             return ProxyOutcome {
                 cleared,
                 inserted: Some(Err(ProxyError::OutOfMemory)),
             };
         }
+
         mock.next_id += 1;
         let id = ProxyId(mock.next_id);
         let mut entry = Entry {
@@ -95,6 +104,7 @@ impl xhttpproxy::Backend for MockBackend {
             port: new.port,
             certificate: Vec::new(),
         };
+
         let inserted = match new.certificate {
             Certificate::None => Ok(Inserted::Applied),
             Certificate::Hex { text, size } => {
@@ -102,6 +112,7 @@ impl xhttpproxy::Backend for MockBackend {
                 match decode_hex(text, &mut certificate) {
                     Some(count) if count == size as usize => {
                         entry.certificate = certificate;
+
                         Ok(Inserted::Applied)
                     }
                     _ => Err(ProxyError::BadCertificate),
@@ -111,12 +122,14 @@ impl xhttpproxy::Backend for MockBackend {
                 entry.certificate = vec![0u8; size as usize];
                 entry.flags.insert(ProxyFlags::CERTIFICATE_PENDING);
                 entry.references += 1;
+
                 Ok(Inserted::Pending(id))
             }
         };
         if inserted.is_ok() {
             mock.entries.push(entry);
         }
+
         ProxyOutcome {
             cleared,
             inserted: Some(inserted),
@@ -134,11 +147,13 @@ impl xhttpproxy::Backend for MockBackend {
     fn proxy_upload_complete(&mut self, id: ProxyId) -> Option<ProxyFlags> {
         let mock = &mut self.network.xhttpproxy;
         let position = mock.position(id)?;
+
         let entry = &mut mock.entries[position];
         entry.flags.remove(ProxyFlags::CERTIFICATE_PENDING);
         entry.references -= 1;
         let flags = entry.flags;
         mock.release_if_unused(position);
+
         Some(flags)
     }
 
@@ -152,6 +167,7 @@ impl xhttpproxy::Backend for MockBackend {
         let Some(position) = mock.position(id) else {
             return;
         };
+
         let entry = &mut mock.entries[position];
         entry.references -= 1;
         if entry.flags.contains(ProxyFlags::ACTIVE) {
@@ -163,11 +179,13 @@ impl xhttpproxy::Backend for MockBackend {
 
     fn proxy_entry(&mut self, position: usize) -> Option<ProxyEntry> {
         let entry = self.network.xhttpproxy.entries.get(position)?;
+
         let mut name = [0u8; NAME_CAPACITY];
         let name_len = entry.name.as_ref().map(|stored| {
             name[..stored.len()].copy_from_slice(stored);
             stored.len()
         });
+
         Some(ProxyEntry {
             id: entry.id,
             flags: entry.flags,
@@ -190,6 +208,7 @@ impl xhttpproxy::Backend for MockBackend {
 
     fn proxy_title_exited(&mut self) {
         let mock = &mut self.network.xhttpproxy;
+
         for entry in &mut mock.entries {
             let flags = entry.flags;
             if !flags.contains(ProxyFlags::SYS)
@@ -200,6 +219,7 @@ impl xhttpproxy::Backend for MockBackend {
                 entry.references -= 1;
             }
         }
+
         mock.entries.retain(|entry| entry.references != 0);
     }
 }

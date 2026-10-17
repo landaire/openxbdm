@@ -4,8 +4,6 @@ mod common;
 
 use std::io::Write;
 
-use common::RawSession;
-use common::TestServer;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
@@ -19,6 +17,9 @@ use openxbdm_server::commands::services::DetectionRoutineMissing;
 use openxbdm_server::commands::services::LastError;
 use openxbdm_server::processors::ProcessorFlags;
 use openxbdm_server_host::backend::services::CivCall;
+
+use common::RawSession;
+use common::TestServer;
 
 fn session(server: &TestServer) -> RawSession {
     let mut session = server.raw();
@@ -82,6 +83,7 @@ fn iptv_switches_set_and_clear_their_bits() {
 fn iptv_switches_test_enable_first_and_require_a_flag() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     assert_eq!(session.command("iptv disable enable"), "200- OK");
     assert_eq!(iptv_flags(&server), 0x1000);
     assert_eq!(session.command("iptv"), "400- missing arguments");
@@ -95,6 +97,7 @@ fn iptv_switches_fall_back_without_the_modify_export() {
     let server = TestServer::start();
     server.host.lock().backend.console.xconfig.modify_export = false;
     let mut session = session(&server);
+
     assert_eq!(session.command("iptvdvr enable"), "200- OK");
     assert_eq!(session.command("iptv enable"), "200- OK");
     assert_eq!(iptv_flags(&server), 0x0008_1000);
@@ -104,23 +107,27 @@ fn iptv_switches_fall_back_without_the_modify_export() {
 fn iptv_failures_map_kernel_status() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     let failures = [
         (KernelError::AccessDenied, "414- access denied"),
         (KernelError::InvalidParameter, "400- unexpected error"),
     ];
+
     for (error, reply) in failures {
-        let mut host = server.host.lock();
-        host.backend
-            .console
-            .xconfig
-            .failures
-            .insert(ConfigSetting::new(3, 0xc), error);
-        host.backend
-            .console
-            .xconfig
-            .failures
-            .insert(ConfigSetting::new(9, 4), error);
-        drop(host);
+        {
+            let mut host = server.host.lock();
+            host.backend
+                .console
+                .xconfig
+                .failures
+                .insert(ConfigSetting::new(3, 0xc), error);
+            host.backend
+                .console
+                .xconfig
+                .failures
+                .insert(ConfigSetting::new(9, 4), error);
+        }
+
         assert_eq!(session.command("iptv enable"), reply);
         assert_eq!(session.command("iptvbootstrapurl x"), reply);
     }
@@ -130,6 +137,7 @@ fn iptv_failures_map_kernel_status() {
 fn iptv_strings_are_read_at_fixed_offsets() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     assert_eq!(
         session.command(r#"iptvprovidername Some"Name x"y z"#),
         "200- OK"
@@ -151,6 +159,7 @@ fn iptv_strings_truncate_and_sign_extend() {
     let server = TestServer::start();
     let mut session = session(&server);
     let long = "u".repeat(100);
+
     assert_eq!(
         session.command(&format!("iptvprovidername {long}")),
         "200- OK"
@@ -177,6 +186,7 @@ fn iptv_strings_truncate_and_sign_extend() {
 fn iptv_strings_past_a_short_line_read_the_receive_buffer() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     assert_eq!(session.command("iptvsupportinfo ABCDEFGHIJ"), "200- OK");
     assert_eq!(session.command("iptvsupportinfo"), "200- OK");
     assert_eq!(iptv_string(&server, 3), stored(b"\nBCDEFGHIJ", 0x80));
@@ -186,6 +196,7 @@ fn iptv_strings_past_a_short_line_read_the_receive_buffer() {
 fn civfail_reports_the_thread_handle() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     assert_eq!(
         session.command("civfail"),
         "200- Thread created: 0xF8000040"
@@ -219,6 +230,7 @@ fn civfail_reports_the_thread_handle() {
 fn civinject_names_the_last_missing_count() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     assert_eq!(
         session.command("civinject readerrors=3 hasherrors=0x10"),
         "200- OK"
@@ -259,6 +271,7 @@ fn civinject_names_the_last_missing_count() {
 fn civsetbits_reinitializes_then_sets_one_bit() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     assert_eq!(
         session.command("civsetbits on=3"),
         "200- Result 0x0; old mask 0x0, new mask 0x8"
@@ -308,6 +321,7 @@ fn civsetbits_reports_an_unresolved_export() {
         error: KernelError::from_status(NtStatus(0xc000_0139)).unwrap(),
     });
     let mut session = session(&server);
+
     assert_eq!(
         session.command("civsetbits on=2"),
         "200- Result 0xc0000139; old mask 0xbaadf00d, new mask 0xdeadbeef"
@@ -329,6 +343,7 @@ fn civsetbits_is_absent_on_test_kits() {
     let server = TestServer::start();
     server.host.lock().backend.test_kit = true;
     let mut session = session(&server);
+
     assert_eq!(session.command("civsetbits on=1"), "407- unknown command");
     assert_eq!(
         session.command("civstatus"),
@@ -340,6 +355,7 @@ fn civsetbits_is_absent_on_test_kits() {
 fn civstart_clamps_the_thread_id() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     assert_eq!(
         session.command("civstart threadid=9"),
         "200- XSecurityCreateProcess 0x0"
@@ -348,6 +364,7 @@ fn civstart_clamps_the_thread_id() {
         session.command("civstart threadid=-1"),
         "200- XSecurityCreateProcess 0x0"
     );
+
     server.host.lock().backend.services.create_result = CivResult::Returned(Hresult(0x8007_0005));
     assert_eq!(
         session.command("civstart"),
@@ -372,6 +389,7 @@ fn civstart_clamps_the_thread_id() {
 fn civstatus_formats_the_progress_record() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     server.host.lock().backend.services.progress = Ok(CivProgress {
         failed_reads: 2,
         failed_hashes: 3,
@@ -383,6 +401,7 @@ fn civstatus_formats_the_progress_record() {
         session.command("civstatus"),
         "200- Blocks Checked 10, Failed Reads 2, Failed Hashes 3, Total Blocks 100, In Progress."
     );
+
     server.host.lock().backend.services.progress = Ok(CivProgress {
         failed_reads: 0xffff_ffff,
         failed_hashes: 0,
@@ -394,6 +413,7 @@ fn civstatus_formats_the_progress_record() {
         session.command("civstatus"),
         "200- Blocks Checked 100, Failed Reads -1, Failed Hashes 0, Total Blocks 100, Completed."
     );
+
     server.host.lock().backend.services.progress = Err(CivResult::Returned(Hresult(0x8000_4005)));
     assert_eq!(
         session.command("civstatus"),
@@ -405,6 +425,7 @@ fn civstatus_formats_the_progress_record() {
 fn civstop_closes_the_process() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     assert_eq!(session.command("civstop now"), "200- XSecurityCloseProcess");
     assert_eq!(civ_calls(&server), [CivCall::CloseProcess]);
 }
@@ -423,6 +444,7 @@ fn own_thread_commands_run_on_title_connections() {
             .unwrap();
     }
     let mut session = session(&server);
+
     assert_eq!(session.command("ttl!x"), "200- OK");
     assert_eq!(session.command("civstop"), "200- XSecurityCloseProcess");
     assert_eq!(
@@ -443,6 +465,7 @@ fn own_thread_commands_run_on_title_connections() {
 fn civverify_replaces_non_positive_budgets() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     for command in [
         "civverify milliseconds=500",
         "civverify milliseconds=0",
@@ -456,11 +479,13 @@ fn civverify_replaces_non_positive_budgets() {
             "{command}"
         );
     }
+
     server.host.lock().backend.services.verify_result = CivResult::Returned(Hresult(0x103));
     assert_eq!(
         session.command("civverify milliseconds=0x20q"),
         "200- XSecurityVerify 0x103"
     );
+
     let budgets: Vec<u32> = civ_calls(&server)
         .into_iter()
         .map(|call| match call {
@@ -468,5 +493,6 @@ fn civverify_replaces_non_positive_budgets() {
             other => panic!("unexpected {other:?}"),
         })
         .collect();
+
     assert_eq!(budgets, [500, 0x100, 0xffff_ffff, 0x100, 0x100, 0x20]);
 }

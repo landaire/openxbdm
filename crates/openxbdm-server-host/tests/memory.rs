@@ -4,9 +4,6 @@ mod common;
 
 use std::io::Read;
 
-use common::RawSession;
-use common::TestServer;
-use common::run;
 use openxbdm_client::commands::GetMem;
 use openxbdm_client::commands::ModuleSections;
 use openxbdm_client::commands::Modules;
@@ -23,6 +20,12 @@ use openxbdm_server::commands::memory::detour::ReturnValue;
 use openxbdm_server_host::backend::memory::MEMORY_BASE;
 use openxbdm_server_host::backend::memory::detour::CallOutcome;
 use openxbdm_server_host::backend::memory::detour::SimulatedCall;
+
+use common::RawSession;
+use common::TestServer;
+use common::run;
+
+const DETOUR_LOG: &str = "\\Device\\Harddisk0\\Partition1\\DEVKIT\\detour.log";
 
 fn session(server: &TestServer) -> RawSession {
     let mut session = server.raw();
@@ -41,6 +44,22 @@ fn read_chunk(session: &mut RawSession) -> (u16, Vec<u8>) {
     let header = u16::from_le_bytes(read_bytes(session, 2).try_into().unwrap());
     let data = read_bytes(session, usize::from(header & 0x7fff));
     (header, data)
+}
+
+/// Big-endian dword `index` of a detour record.
+fn word(record: &[u8], index: usize) -> u32 {
+    u32::from_be_bytes(record[index * 4..index * 4 + 4].try_into().unwrap())
+}
+
+fn detour_records(server: &TestServer) -> Vec<Vec<u8>> {
+    let host = server.host.lock();
+    host.backend
+        .filesystem
+        .read(DETOUR_LOG)
+        .unwrap()
+        .chunks(0x70)
+        .map(<[u8]>::to_vec)
+        .collect()
 }
 
 #[test]
@@ -164,7 +183,7 @@ fn getmemex_streams_chunks_and_stops_at_unreadable_pages() {
     let mut session = session(&server);
 
     assert_eq!(
-        session.command(&format!("getmemex addr=0x{:08x} length=0x500", MEMORY_BASE)),
+        session.command(&format!("getmemex addr=0x{MEMORY_BASE:08x} length=0x500")),
         "203- binary response follows"
     );
     let (header, data) = read_chunk(&mut session);
@@ -211,6 +230,7 @@ fn getmem2_reads_the_whole_last_trampoline_page() {
         "203- binary response follows"
     );
     let (_, data) = read_chunk(&mut session);
+
     // The trampolines end at 0x91f231f0; the rest of the page reads as zero.
     assert!(data[0x1f0..].iter().all(|&byte| byte == 0));
 }
@@ -294,6 +314,7 @@ fn modsections_reports_section_flags_and_lookup_errors() {
             "name=\".bss\" base=0x81b02000 size=0x00020000 index=3 flags=22",
         ]
     );
+
     // Lookup includes modules `modules` omits.
     session.send("modsections name=\"bootanim.xex\"");
     assert_eq!(session.line(), "202- multiline response follows");
@@ -351,6 +372,7 @@ fn xexfield_dumps_field_data() {
         assert_eq!(session.command(command), "202- multiline response follows");
         session.multiline()
     };
+
     assert_eq!(
         field(&mut session, "xexfield module=xam.xex field=0x10100"),
         ["fieldsize=0x00000004", "00001234"]
@@ -409,6 +431,7 @@ fn xbeinfo_reports_the_running_executable_for_every_name() {
             ]
         );
     }
+
     assert_eq!(
         session.command("xbeinfo name=\"e:\\title\\default.xex\" ondiskonly"),
         "402- file not found"
@@ -559,6 +582,7 @@ fn memtrack_settings_and_queries() {
             TrackingFlags::from_bits_retain(0)
         );
     }
+
     assert_eq!(session.command("memtrack cmd=queryflags"), "200- 0x0");
 
     assert_eq!(
@@ -592,36 +616,20 @@ fn memtrack_save_writes_the_records_in_list_order() {
         session.command("memtrack cmd=save filename=e:\\track.bin"),
         "200- OK"
     );
-    let host = server.host.lock();
-    let file = host
-        .backend
-        .filesystem
-        .read("\\Device\\Harddisk0\\Partition1\\DEVKIT\\track.bin")
-        .unwrap();
-    assert_eq!(file, [[1u8; 0xe], [2; 0xe]].concat());
-    drop(host);
+    {
+        let host = server.host.lock();
+        let file = host
+            .backend
+            .filesystem
+            .read("\\Device\\Harddisk0\\Partition1\\DEVKIT\\track.bin")
+            .unwrap();
+        assert_eq!(file, [[1u8; 0xe], [2; 0xe]].concat());
+    }
+
     assert_eq!(
         session.command("memtrack cmd=save filename=e:\\missing\\track.bin"),
         "400- HRESULT 0x80070003"
     );
-}
-
-const DETOUR_LOG: &str = "\\Device\\Harddisk0\\Partition1\\DEVKIT\\detour.log";
-
-/// Big-endian dword `index` of a detour record.
-fn word(record: &[u8], index: usize) -> u32 {
-    u32::from_be_bytes(record[index * 4..index * 4 + 4].try_into().unwrap())
-}
-
-fn detour_records(server: &TestServer) -> Vec<Vec<u8>> {
-    let host = server.host.lock();
-    host.backend
-        .filesystem
-        .read(DETOUR_LOG)
-        .unwrap()
-        .chunks(0x70)
-        .map(<[u8]>::to_vec)
-        .collect()
 }
 
 #[test]
@@ -728,6 +736,7 @@ fn detour_entries_log_setinfo_and_release_records() {
         session.command("detour entry query Id=1"),
         "200- hresult=0x2da0000 enterdetour=0x91f13288 scribble=0x91f13290 size=0x50"
     );
+
     // Stock accepts the entry count itself and reads past the table.
     assert_eq!(
         session.command("detour entry query Id=0x2e8"),
@@ -796,6 +805,7 @@ fn detour_entries_log_setinfo_and_release_records() {
             .read(DETOUR_LOG)
             .is_none()
     );
+
     // Entries stay acquired across sessions.
     assert_eq!(
         session.command("detour start file=e:\\detour.log"),
@@ -819,6 +829,7 @@ fn detour_discarded_call_completes_its_overlapped_request() {
         session.command("detour entry acquire"),
         "200- hresult=0x2da0000 id=0x0"
     );
+
     // Log parameters and returns, registers, stack; overlapped pointer in r4.
     assert_eq!(
         session.command(
@@ -833,6 +844,7 @@ fn detour_discarded_call_completes_its_overlapped_request() {
         original_result: ReturnValue(0x99),
         ..SimulatedCall::default()
     };
+
     let outcome = server.host.lock().backend.detour_call(EntryId(0), call);
     assert_eq!(
         outcome,
@@ -845,10 +857,12 @@ fn detour_discarded_call_completes_its_overlapped_request() {
         let host = server.host.lock();
         assert_eq!(host.backend.memory.detour.signaled_events, [0x0c0d_0e0f]);
     }
+
     let mut overlapped_bytes = [0u8; 0x1c];
     for (offset, byte) in overlapped_bytes.iter_mut().enumerate() {
         *byte = server.host.lock().backend.memory.regions[4].bytes[0x100 + offset];
     }
+
     assert_eq!(word(&overlapped_bytes, 0), 0x55);
     assert_eq!(word(&overlapped_bytes, 1), 0);
     assert_eq!(word(&overlapped_bytes, 6), 0x1234);
@@ -919,6 +933,7 @@ fn detour_call_through_to_the_original_counts_discards() {
         session.command("detour entry acquire"),
         "200- hresult=0x2da0000 id=0x0"
     );
+
     // Every second call is discarded and returns 7.
     assert_eq!(
         session.command("detour entry setinfo Id=0 addr=0x82000000 paramsize=0 flags=0x302 return=7 sleep=0x20 disccallfreq=2"),
@@ -928,6 +943,7 @@ fn detour_call_through_to_the_original_counts_discards() {
         original_result: ReturnValue(9),
         ..SimulatedCall::default()
     };
+
     let first = server.host.lock().backend.detour_call(EntryId(0), call);
     let second = server.host.lock().backend.detour_call(EntryId(0), call);
     assert_eq!(
@@ -944,6 +960,7 @@ fn detour_call_through_to_the_original_counts_discards() {
             returned: ReturnValue(7)
         }
     );
+
     // Sleep before the call and after it, twice.
     assert_eq!(
         server.host.lock().backend.memory.detour.sleeps,

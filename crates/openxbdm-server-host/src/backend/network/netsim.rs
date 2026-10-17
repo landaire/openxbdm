@@ -48,6 +48,7 @@ impl Instance {
 #[derive(Debug, Default)]
 pub struct Mock {
     pub instance: Option<Instance>,
+
     /// Result of the next instance creation, standing in for intercept
     /// registration failures.
     pub create_error: Option<NetsimError>,
@@ -71,37 +72,6 @@ impl Mock {
     }
 }
 
-/// Insert before `position` or append; a position at or past the end is
-/// rejected.
-fn insert_at<T>(list: &mut Vec<T>, position: Option<u32>, item: T) -> Result<u32, NetsimError> {
-    match position {
-        None => {
-            list.push(item);
-            Ok(list.len() as u32 - 1)
-        }
-        Some(index) if (index as usize) < list.len() => {
-            list.insert(index as usize, item);
-            Ok(index)
-        }
-        Some(_) => Err(NetsimError::Invalid),
-    }
-}
-
-fn remove_at<T>(list: &mut Vec<T>, position: Option<u32>) -> Result<u32, NetsimError> {
-    match position {
-        None => {
-            let count = list.len() as u32;
-            list.clear();
-            Ok(count)
-        }
-        Some(index) if (index as usize) < list.len() => {
-            list.remove(index as usize);
-            Ok(1)
-        }
-        Some(_) => Err(NetsimError::Invalid),
-    }
-}
-
 impl netsim::Backend for MockBackend {
     fn simulator_exists(&mut self) -> bool {
         self.network.netsim.has_instance()
@@ -114,6 +84,7 @@ impl netsim::Backend for MockBackend {
         if mock.instance.is_some() {
             return Err(NetsimError::InstanceExists);
         }
+
         let attachment = &mut self.network.netcap.attachment;
         if let Some(error) = mock.create_error.take() {
             if attachment.is_some() {
@@ -121,11 +92,13 @@ impl netsim::Backend for MockBackend {
             }
             return Err(error);
         }
+
         if attachment.is_some() {
             *attachment = Some(Attachment::Simulator);
         }
         mock.instance = Some(Instance::default());
         mock.created += 1;
+
         Ok(())
     }
 
@@ -134,10 +107,12 @@ impl netsim::Backend for MockBackend {
         let mock = &mut self.network.netsim;
         mock.instance.take().ok_or(NetsimError::InstanceChanged)?;
         mock.destroyed += 1;
+
         let attachment = &mut self.network.netcap.attachment;
         if attachment.is_some() {
             *attachment = Some(Attachment::Intercept);
         }
+
         Ok(())
     }
 
@@ -164,6 +139,7 @@ impl netsim::Backend for MockBackend {
         program: Option<&Program>,
     ) -> Result<QueueIndex, NetsimError> {
         let instance = self.network.netsim.instance()?;
+
         let mut config = QueueConfig::default();
         config.merge(kind, update)?;
         let queue = Queue {
@@ -172,6 +148,7 @@ impl netsim::Backend for MockBackend {
             stats: QueueStats::default(),
             program: program.cloned(),
         };
+
         insert_at(
             instance.queues(direction),
             position.map(|QueueIndex(index)| index),
@@ -192,6 +169,7 @@ impl netsim::Backend for MockBackend {
             .get_mut(index.0 as usize)
             .ok_or(NetsimError::Invalid)?;
         queue.config.merge(queue.kind, update)?;
+
         Ok(())
     }
 
@@ -248,6 +226,7 @@ impl netsim::Backend for MockBackend {
             config: *redirect,
             program: program.cloned(),
         };
+
         insert_at(
             &mut instance.redirects,
             position.map(|RedirectIndex(index)| index),
@@ -276,5 +255,40 @@ impl netsim::Backend for MockBackend {
 
     fn key_status(&mut self) -> KeyStatus {
         KeyStatus::from_bits_retain(self.network.netsim.key_status)
+    }
+}
+
+/// Insert before `position` or append; a position at or past the end is
+/// rejected.
+fn insert_at<T>(list: &mut Vec<T>, position: Option<u32>, item: T) -> Result<u32, NetsimError> {
+    match position {
+        None => {
+            list.push(item);
+
+            Ok(list.len() as u32 - 1)
+        }
+        Some(index) if (index as usize) < list.len() => {
+            list.insert(index as usize, item);
+
+            Ok(index)
+        }
+        Some(_) => Err(NetsimError::Invalid),
+    }
+}
+
+fn remove_at<T>(list: &mut Vec<T>, position: Option<u32>) -> Result<u32, NetsimError> {
+    match position {
+        None => {
+            let count = list.len() as u32;
+            list.clear();
+
+            Ok(count)
+        }
+        Some(index) if (index as usize) < list.len() => {
+            list.remove(index as usize);
+
+            Ok(1)
+        }
+        Some(_) => Err(NetsimError::Invalid),
     }
 }

@@ -37,52 +37,21 @@ use crate::backend::MockBackend;
 pub const TRAMPOLINE_BASE: u32 = 0x91f1_3230;
 /// Address of the entry stub the trampolines branch to.
 pub const ENTRY_STUB: u32 = 0x91f1_3000;
-/// Filler of the trampoline area (`and r0, r0, r0`).
-const TRAMPOLINE_FILL: u32 = 0x7c00_0038;
-/// `NtCreateFile` options of both log handles.
-const LOG_OPTIONS: CreateOptions = CreateOptions::SYNCHRONOUS_IO_NONALERT;
-
-/// The stub page and the trampoline area after module init: each
-/// trampoline starts with `li r12, id` and `b ENTRY_STUB`. The stubs are
-/// not simulated and read as zero, as does the rest of the last page.
-pub fn trampoline_region() -> Region {
-    let stubs = (TRAMPOLINE_BASE - ENTRY_STUB) as usize;
-    let size = (detour::ENTRY_COUNT * detour::TRAMPOLINE_SIZE) as usize;
-    let mut bytes = vec![0u8; stubs];
-    bytes.extend(
-        TRAMPOLINE_FILL
-            .to_be_bytes()
-            .iter()
-            .copied()
-            .cycle()
-            .take(size),
-    );
-    for id in 0..detour::ENTRY_COUNT {
-        let address = TRAMPOLINE_BASE + id * detour::TRAMPOLINE_SIZE;
-        let branch = 0x4800_0000 | (ENTRY_STUB.wrapping_sub(address + 4) & 0x03ff_fffc);
-        let offset = stubs + (id * detour::TRAMPOLINE_SIZE) as usize;
-        bytes[offset..offset + 4].copy_from_slice(&(0x3980_0000 | id).to_be_bytes());
-        bytes[offset + 4..offset + 8].copy_from_slice(&branch.to_be_bytes());
-    }
-    bytes.resize(bytes.len().next_multiple_of(super::PAGE_SIZE), 0);
-    Region {
-        base: ENTRY_STUB,
-        bytes,
-    }
-}
 
 /// Simulated detour state.
 #[derive(Default)]
 pub struct Mock {
     pub engine: Arc<Engine>,
+
     write_handle: Option<FileHandle>,
     read_handle: Option<FileHandle>,
+    /// Record pool storage, obtained at the first start and kept.
+    records: Option<&'static [AtomicU32]>,
+
     /// Sleeps the logger requested, in milliseconds.
     pub sleeps: Vec<u32>,
     /// Event objects signaled by completed overlapped requests.
     pub signaled_events: Vec<u32>,
-    /// Record pool storage, obtained at the first start and kept.
-    records: Option<&'static [AtomicU32]>,
 }
 
 impl std::fmt::Debug for Mock {
@@ -121,6 +90,194 @@ pub struct CallOutcome {
     pub returned: ReturnValue,
 }
 
+impl MockBackend {
+    fn with_detour<T>(&mut self, operation: impl FnOnce(&Engine, &HostPlatform<'_>) -> T) -> T {
+        let engine = Arc::clone(&self.memory.detour.engine);
+        let platform = HostPlatform {
+            engine: &engine,
+            backend: RefCell::new(self),
+        };
+
+        operation(&engine, &platform)
+    }
+
+    pub(super) fn detour_operation(
+        &mut self,
+        operation: &mut dyn FnMut(&Engine, &dyn detour::Platform),
+    ) {
+        self.with_detour(|engine, platform| operation(engine, platform));
+    }
+
+    /// The writer worker's start (0x91f2cb28): reset the pool, then create
+    /// the log for writing and open it again for reading.
+    pub(super) fn start_detour_writer(&mut self, log: Option<&[u8]>) -> Result<(), KernelError> {
+        let engine = Arc::clone(&self.memory.detour.engine);
+        if !self.with_detour(|engine, platform| engine.prepare_log(platform)) {
+            engine.abort_start();
+            return Ok(());
+        }
+
+        let opened = self.open_detour_log(log);
+        engine.set_log_result(opened);
+
+        if opened.is_ok() {
+            engine.mark_running();
+        } else {
+            self.close_detour_log();
+            engine.abort_start();
+        }
+
+        Ok(())
+    }
+
+    fn open_detour_log(&mut self, log: Option<&[u8]>) -> Result<(), KernelError> {
+        let path = log.ok_or(KernelError::NoSuchFile)?;
+
+        let write_request = CreateRequest {
+            access: AccessMask::GENERIC_WRITE,
+            allocation_size: None,
+            attributes: FileAttributes::NORMAL,
+            share: ShareAccess::all(),
+            disposition: CreateDisposition::OverwriteIf,
+            options: CreateOptions::SYNCHRONOUS_IO_NONALERT,
+        };
+        self.memory.detour.write_handle = Some(self.create_file(path, &write_request)?);
+
+        let read_request = CreateRequest {
+            access: AccessMask::GENERIC_READ.union(AccessMask::SYNCHRONIZE),
+            disposition: CreateDisposition::Open,
+            ..write_request
+        };
+        self.memory.detour.read_handle = Some(self.create_file(path, &read_request)?);
+
+        Ok(())
+    }
+
+    fn close_detour_log(&mut self) {
+        let handles = [
+            self.memory.detour.write_handle.take(),
+            self.memory.detour.read_handle.take(),
+        ];
+
+        for handle in handles.into_iter().flatten() {
+            self.close_file(handle);
+        }
+    }
+
+    /// The rest of `stop` (0x91f2cd54): the writer drops queued records and
+    /// closes the log, the log file is deleted, and pending completions are
+    /// dropped.
+    pub(super) fn stop_detour_writer(&mut self, log: Option<&[u8]>) {
+        self.with_detour(|engine, platform| while engine.discard_queued(platform) {});
+
+        self.close_detour_log();
+        if let Some(path) = log {
+            self.delete_detour_log(path);
+        }
+
+        self.with_detour(|engine, platform| engine.finish_stop(platform));
+    }
+
+    /// `NtDeleteFile`.
+    fn delete_detour_log(&mut self, path: &[u8]) {
+        let request = CreateRequest::open(
+            AccessMask::DELETE.union(AccessMask::SYNCHRONIZE),
+            ShareAccess::all(),
+            CreateOptions::NON_DIRECTORY_FILE,
+        );
+        let Ok(handle) = self.create_file(path, &request) else {
+            return;
+        };
+
+        let _ = self.set_delete_disposition(handle, true);
+        self.close_file(handle);
+    }
+
+    /// One `log getentries` read (0x91f2bc90).
+    pub(super) fn read_detour_log(&mut self, output: &mut [u8; RECORD_SIZE]) -> bool {
+        let engine = Arc::clone(&self.memory.detour.engine);
+        let Some(handle) = self
+            .memory
+            .detour
+            .read_handle
+            .filter(|_| engine.has_unread())
+        else {
+            return false;
+        };
+        let Some(buffer) = self.allocate_pool(RECORD_SIZE as u32) else {
+            return false;
+        };
+
+        let read = self.read_file(
+            handle,
+            None,
+            ReadTarget::Pool(PoolRange {
+                buffer,
+                offset: 0,
+                length: RECORD_SIZE as u32,
+            }),
+        );
+        output.copy_from_slice(&self.pool(buffer)[..RECORD_SIZE]);
+
+        // SAFETY: the block is local to this read and not used after.
+        unsafe { self.free_pool(buffer) };
+
+        if read.is_err() {
+            return false;
+        }
+
+        engine.note_read();
+
+        true
+    }
+
+    /// Simulate a title call entering trampoline `hook`: the stub's
+    /// notifications in order, with the original returning
+    /// `call.original_result` when the logger lets it run.
+    pub fn detour_call(&mut self, hook: detour::EntryId, call: SimulatedCall) -> CallOutcome {
+        self.with_detour(|engine, platform| {
+            let mut context = CallContext {
+                address: call.context,
+                hook: hook.0,
+                registers: call.registers,
+                ..CallContext::default()
+            };
+
+            // SAFETY: the host platform reads and writes simulated memory,
+            // where every address is valid.
+            unsafe { engine.enter(platform, &mut context, call.frame) };
+
+            if context.flags.contains(detour::HookFlags::FLOATING_POINT) {
+                // SAFETY: as above.
+                unsafe { engine.floating_point(platform, &context, call.floating_point) };
+            }
+
+            if context.flags.contains(detour::HookFlags::VECTOR) {
+                // SAFETY: as above.
+                unsafe { engine.vector(platform, &context, call.vector) };
+            }
+
+            let called = context.function.is_some();
+            if called {
+                context.return_value = call.original_result;
+            }
+
+            // SAFETY: as above.
+            unsafe { engine.exit(platform, &mut context) };
+
+            CallOutcome {
+                called,
+                returned: context.return_value,
+            }
+        })
+    }
+
+    /// One pass of the completion worker, as after its poll interval.
+    pub fn service_detour_completions(&mut self) -> bool {
+        self.with_detour(|engine, platform| engine.service_completions(platform))
+    }
+}
+
 /// Platform services over the simulated console.
 struct HostPlatform<'a> {
     engine: &'a Engine,
@@ -138,6 +295,7 @@ impl HostPlatform<'_> {
         let Some(handle) = backend.memory.detour.write_handle else {
             return false;
         };
+
         backend
             .write_file(handle, None, FileData::Bytes(record))
             .is_ok()
@@ -191,15 +349,19 @@ impl detour::Platform for HostPlatform<'_> {
 
     fn allocate_records(&self) -> bool {
         let mut backend = self.backend.borrow_mut();
-        if backend.memory.detour.records.is_none() {
-            if backend.filesystem.pool_exhausted {
-                return false;
-            }
-            let storage = (0..detour::RECORD_STORAGE_WORDS)
-                .map(|_| AtomicU32::new(0))
-                .collect();
-            backend.memory.detour.records = Some(Vec::leak(storage));
+        if backend.memory.detour.records.is_some() {
+            return true;
         }
+
+        if backend.filesystem.pool_exhausted {
+            return false;
+        }
+
+        let storage = (0..detour::RECORD_STORAGE_WORDS)
+            .map(|_| AtomicU32::new(0))
+            .collect();
+        backend.memory.detour.records = Some(Vec::leak(storage));
+
         true
     }
 
@@ -253,169 +415,37 @@ impl detour::Platform for HostPlatform<'_> {
     fn completions_idle(&self) {}
 }
 
-impl MockBackend {
-    fn with_detour<T>(&mut self, operation: impl FnOnce(&Engine, &HostPlatform<'_>) -> T) -> T {
-        let engine = Arc::clone(&self.memory.detour.engine);
-        let platform = HostPlatform {
-            engine: &engine,
-            backend: RefCell::new(self),
-        };
-        operation(&engine, &platform)
+/// The stub page and the trampoline area after module init: each
+/// trampoline starts with `li r12, id` and `b ENTRY_STUB`. The stubs are
+/// not simulated and read as zero, as does the rest of the last page.
+pub fn trampoline_region() -> Region {
+    /// Filler of the trampoline area (`and r0, r0, r0`).
+    const TRAMPOLINE_FILL: u32 = 0x7c00_0038;
+
+    let stubs = (TRAMPOLINE_BASE - ENTRY_STUB) as usize;
+    let size = (detour::ENTRY_COUNT * detour::TRAMPOLINE_SIZE) as usize;
+    let mut bytes = vec![0u8; stubs];
+    bytes.extend(
+        TRAMPOLINE_FILL
+            .to_be_bytes()
+            .iter()
+            .copied()
+            .cycle()
+            .take(size),
+    );
+
+    for id in 0..detour::ENTRY_COUNT {
+        let address = TRAMPOLINE_BASE + id * detour::TRAMPOLINE_SIZE;
+        let branch = 0x4800_0000 | (ENTRY_STUB.wrapping_sub(address + 4) & 0x03ff_fffc);
+        let offset = stubs + (id * detour::TRAMPOLINE_SIZE) as usize;
+        bytes[offset..offset + 4].copy_from_slice(&(0x3980_0000 | id).to_be_bytes());
+        bytes[offset + 4..offset + 8].copy_from_slice(&branch.to_be_bytes());
     }
 
-    pub(super) fn detour_operation(
-        &mut self,
-        operation: &mut dyn FnMut(&Engine, &dyn detour::Platform),
-    ) {
-        self.with_detour(|engine, platform| operation(engine, platform));
-    }
+    bytes.resize(bytes.len().next_multiple_of(super::PAGE_SIZE), 0);
 
-    /// The writer worker's start (0x91f2cb28): reset the pool, then create
-    /// the log for writing and open it again for reading.
-    pub(super) fn start_detour_writer(&mut self, log: Option<&[u8]>) -> Result<(), KernelError> {
-        let engine = Arc::clone(&self.memory.detour.engine);
-        if !self.with_detour(|engine, platform| engine.prepare_log(platform)) {
-            engine.abort_start();
-            return Ok(());
-        }
-        let opened = self.open_detour_log(log);
-        engine.set_log_result(opened);
-        if opened.is_ok() {
-            engine.mark_running();
-        } else {
-            self.close_detour_log();
-            engine.abort_start();
-        }
-        Ok(())
-    }
-
-    fn open_detour_log(&mut self, log: Option<&[u8]>) -> Result<(), KernelError> {
-        let path = log.ok_or(KernelError::NoSuchFile)?;
-        let write = CreateRequest {
-            access: AccessMask::GENERIC_WRITE,
-            allocation_size: None,
-            attributes: FileAttributes::NORMAL,
-            share: ShareAccess::all(),
-            disposition: CreateDisposition::OverwriteIf,
-            options: LOG_OPTIONS,
-        };
-        self.memory.detour.write_handle = Some(self.create_file(path, &write)?);
-        let read = CreateRequest {
-            access: AccessMask::GENERIC_READ.union(AccessMask::SYNCHRONIZE),
-            disposition: CreateDisposition::Open,
-            ..write
-        };
-        self.memory.detour.read_handle = Some(self.create_file(path, &read)?);
-        Ok(())
-    }
-
-    fn close_detour_log(&mut self) {
-        for handle in [
-            self.memory.detour.write_handle.take(),
-            self.memory.detour.read_handle.take(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            self.close_file(handle);
-        }
-    }
-
-    /// The rest of `stop` (0x91f2cd54): the writer drops queued records and
-    /// closes the log, the log file is deleted, and pending completions are
-    /// dropped.
-    pub(super) fn stop_detour_writer(&mut self, log: Option<&[u8]>) {
-        self.with_detour(|engine, platform| while engine.discard_queued(platform) {});
-        self.close_detour_log();
-        if let Some(path) = log {
-            self.delete_detour_log(path);
-        }
-        self.with_detour(|engine, platform| engine.finish_stop(platform));
-    }
-
-    /// `NtDeleteFile`.
-    fn delete_detour_log(&mut self, path: &[u8]) {
-        let request = CreateRequest::open(
-            AccessMask::DELETE.union(AccessMask::SYNCHRONIZE),
-            ShareAccess::all(),
-            CreateOptions::NON_DIRECTORY_FILE,
-        );
-        if let Ok(handle) = self.create_file(path, &request) {
-            let _ = self.set_delete_disposition(handle, true);
-            self.close_file(handle);
-        }
-    }
-
-    /// One `log getentries` read (0x91f2bc90).
-    pub(super) fn read_detour_log(&mut self, output: &mut [u8; RECORD_SIZE]) -> bool {
-        let engine = Arc::clone(&self.memory.detour.engine);
-        let Some(handle) = self
-            .memory
-            .detour
-            .read_handle
-            .filter(|_| engine.has_unread())
-        else {
-            return false;
-        };
-        let Some(buffer) = self.allocate_pool(RECORD_SIZE as u32) else {
-            return false;
-        };
-        let read = self.read_file(
-            handle,
-            None,
-            ReadTarget::Pool(PoolRange {
-                buffer,
-                offset: 0,
-                length: RECORD_SIZE as u32,
-            }),
-        );
-        output.copy_from_slice(&self.pool(buffer)[..RECORD_SIZE]);
-        // SAFETY: the block is local to this read and not used after.
-        unsafe { self.free_pool(buffer) };
-        if read.is_err() {
-            return false;
-        }
-        engine.note_read();
-        true
-    }
-
-    /// Simulate a title call entering trampoline `hook`: the stub's
-    /// notifications in order, with the original returning
-    /// `call.original_result` when the logger lets it run.
-    pub fn detour_call(&mut self, hook: detour::EntryId, call: SimulatedCall) -> CallOutcome {
-        self.with_detour(|engine, platform| {
-            let mut context = CallContext {
-                address: call.context,
-                hook: hook.0,
-                registers: call.registers,
-                ..CallContext::default()
-            };
-            // SAFETY: the host platform reads and writes simulated memory,
-            // where every address is valid.
-            unsafe { engine.enter(platform, &mut context, call.frame) };
-            if context.flags.contains(detour::HookFlags::FLOATING_POINT) {
-                // SAFETY: as above.
-                unsafe { engine.floating_point(platform, &context, call.floating_point) };
-            }
-            if context.flags.contains(detour::HookFlags::VECTOR) {
-                // SAFETY: as above.
-                unsafe { engine.vector(platform, &context, call.vector) };
-            }
-            let called = context.function.is_some();
-            if called {
-                context.return_value = call.original_result;
-            }
-            // SAFETY: as above.
-            unsafe { engine.exit(platform, &mut context) };
-            CallOutcome {
-                called,
-                returned: context.return_value,
-            }
-        })
-    }
-
-    /// One pass of the completion worker, as after its poll interval.
-    pub fn service_detour_completions(&mut self) -> bool {
-        self.with_detour(|engine, platform| engine.service_completions(platform))
+    Region {
+        base: ENTRY_STUB,
+        bytes,
     }
 }

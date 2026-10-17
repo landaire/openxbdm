@@ -4,13 +4,14 @@ mod common;
 
 use std::io::Write;
 
-use common::RawSession;
-use common::TestServer;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::processors::ProcessorFlags;
 use openxbdm_server_host::Host;
 use openxbdm_server_host::backend::console::SERVER_THREAD;
+
+use common::RawSession;
+use common::TestServer;
 
 /// Object name of `e:\netsim.ini`.
 const NETSIM_FILE: &str = "\\Device\\Harddisk0\\Partition1\\DEVKIT\\netsim.ini";
@@ -40,6 +41,7 @@ fn thread_line(text: &str) -> String {
 fn command_and_status_lines() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     // The mask is set by the handler, so the command line itself is not
     // traced but its status line is.
     assert_eq!(session.command("verbose level=1"), "200- OK");
@@ -77,6 +79,7 @@ fn binary_receive_counts() {
     let server = TestServer::start();
     let mut session = session(&server);
     assert_eq!(session.command("verbose level=2"), "200- OK");
+
     // Bytes that arrive with the command line are taken from the line
     // buffer first; the rest comes from the socket.
     session
@@ -194,6 +197,7 @@ fn settings_file_lines() {
             core.execute_settings_line(line, backend, network);
         }
     }
+
     // The settings writer traces its own lines under the same bit.
     let lines: Vec<String> = traced(&server, "XBDM")
         .into_iter()
@@ -262,6 +266,7 @@ fn nothing_is_traced_with_the_bits_clear() {
         } = &mut *host;
         core.execute_settings_line(b"dbgname name=box", backend, network);
     }
+
     assert!(traced(&server, "XBDM").is_empty());
     assert!(traced(&server, "[xbdm] FFileNameToObName").is_empty());
 }
@@ -280,6 +285,7 @@ fn console_settings_write_precedes_the_status_line() {
             .position(|line| line == text)
             .unwrap_or_else(|| panic!("{text}: {lines:?}"))
     };
+
     let done = position("XBDM: WriteIniFileImpl - Done writing ini file...\n");
     assert!(position("XBDM: WriteIniFileImpl - entry\n") < done);
     assert!(done < position(&thread_line("R=200-  break")));

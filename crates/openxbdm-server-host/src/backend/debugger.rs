@@ -40,65 +40,6 @@ use openxbdm_server::notify::ExecutionState;
 
 use super::MockBackend;
 
-/// A simulated kernel thread.
-#[derive(Debug, Clone)]
-pub struct MockThread {
-    pub id: ThreadId,
-    pub process: ProcessKind,
-    /// Monitor record exists.
-    pub has_record: bool,
-    /// Monitor record debuggable flag; only these threads are listed,
-    /// stopped, and resumed.
-    pub debuggable: bool,
-    /// Exempt from suspension when execution stops.
-    pub exempt: bool,
-    pub info: ThreadInfo,
-    pub monitor_suspended: bool,
-    /// Switch frame of the thread while it is not in the monitor.
-    pub frame: Context,
-    pub name: Option<Vec<u8>>,
-}
-
-impl MockThread {
-    pub fn new(id: u32, process: ProcessKind) -> Self {
-        let mut frame = Context {
-            iar: 0x8200_0000 | (id & 0xfff0),
-            lr: 0x8200_1000,
-            cr: 0x2400_0042,
-            ..Context::default()
-        };
-        frame.gpr[1] = 0x7006_f000;
-        for n in 14..32 {
-            frame.gpr[n] = 0x1400 + n as u64;
-        }
-        Self {
-            id: ThreadId(id),
-            process,
-            has_record: true,
-            debuggable: true,
-            exempt: false,
-            info: ThreadInfo {
-                suspend_count: 0,
-                monitor_suspended: false,
-                priority: 9,
-                tls_base: 0x7006_f800,
-                start_address: 0x8200_4000,
-                stack_base: 0x7007_0000,
-                stack_limit: 0x7006_0000,
-                create_time: 0x01d9_1234_5678_9abc,
-                name: None,
-                processor: 1,
-                last_error: 0,
-            },
-            monitor_suspended: false,
-            frame,
-            name: None,
-        }
-    }
-}
-
-/// Address where the simulated kernel stores copied thread names.
-const THREAD_NAME_BASE: u32 = 0x9000_1000;
 /// Thread that runs commands; `break now` traps on it.
 pub const COMMAND_THREAD: u32 = 0xf900_0004;
 /// Address of the `break now` trap instruction.
@@ -114,17 +55,21 @@ pub struct Mock {
     pub in_monitor: BTreeMap<u32, Context>,
     /// Completed events, in order.
     pub completed: Vec<(ThreadId, Disposition)>,
+
     pub data_breakpoint_register: u32,
     pub crash_dumps: u32,
     pub kernel_build: u16,
+
     /// Exit status per thread handle.
     pub thread_handles: BTreeMap<ThreadHandle, Result<ExitStatus, KernelError>>,
     /// Module descriptions keyed by (name string, entry) addresses.
     pub modules: BTreeMap<(u32, u32), ModuleEvent>,
+
     /// Extension paths the loader accepts, with their handles.
     pub extension_images: BTreeMap<Vec<u8>, u32>,
     pub loaded_extensions: Vec<u32>,
     pub unloaded_extensions: Vec<u32>,
+
     /// State the server last published for direct exceptions.
     pub policy: DirectPolicy,
     pub direct_step: Option<DirectStep>,
@@ -179,6 +124,7 @@ impl Mock {
         let process = found.map_or(ProcessKind::Title, |found| found.process);
         let has_record = found.is_some_and(|found| found.has_record);
         let debuggable = found.is_some_and(|found| found.has_record && found.debuggable);
+
         self.in_monitor.insert(
             thread,
             Context {
@@ -207,6 +153,7 @@ impl Mock {
             record_address: 0x7006_e000,
             ..ExceptionRecord::default()
         };
+
         self.raise_exception(thread, record, context, false);
     }
 
@@ -216,6 +163,7 @@ impl Mock {
         if let Some(previous) = self.in_monitor.get(&thread) {
             context.msr = previous.msr;
         }
+
         let record = ExceptionRecord {
             code: NtStatus::SINGLE_STEP,
             address,
@@ -224,21 +172,25 @@ impl Mock {
             record_address: 0x7006_e000,
             ..ExceptionRecord::default()
         };
+
         self.raise_exception(thread, record, context, false);
     }
 
     /// Typical exception context: interrupts enabled, Iar at `address`.
     pub fn exception_context(&self, thread: u32, address: u32) -> Context {
+        // A thread the simulation lacks has no switch frame to start from.
         let mut context = self
             .thread(ThreadId(thread))
             .map(|found| found.frame.clone())
             .unwrap_or_default();
+
         context.flags = ContextFlags::FULL;
         context.msr = Msr::from_bits_retain(0x0000_9032);
         context.iar = address;
         context.ctr = 0x10;
         context.xer = 0x2000_0000;
         context.fpscr = 0x8000_0000_0000_0000;
+
         context
     }
 
@@ -249,6 +201,7 @@ impl Mock {
             start: thread.info.start_address,
             title_entry,
         };
+
         self.threads.push(thread);
         self.events.push_back(event);
     }
@@ -263,37 +216,84 @@ impl Mock {
     }
 }
 
-fn copy_groups(source: &Context, target: &mut Context, flags: ContextFlags) {
-    if flags.contains(ContextFlags::CONTROL) {
-        target.msr = source.msr;
-        target.iar = source.iar;
-        target.lr = source.lr;
-        target.ctr = source.ctr;
-    }
-    if flags.contains(ContextFlags::INTEGER) {
-        target.gpr = source.gpr;
-        target.cr = source.cr;
-        target.xer = source.xer;
-    }
-    if flags.contains(ContextFlags::FLOATING_POINT) {
-        target.fpscr = source.fpscr;
-        target.fpr = source.fpr;
-    }
-    if flags.contains(ContextFlags::VECTOR) {
-        target.vscr = source.vscr;
-        target.vr = source.vr;
+/// A simulated kernel thread.
+#[derive(Debug, Clone)]
+pub struct MockThread {
+    pub id: ThreadId,
+    pub process: ProcessKind,
+
+    /// Monitor record exists.
+    pub has_record: bool,
+    /// Monitor record debuggable flag; only these threads are listed,
+    /// stopped, and resumed.
+    pub debuggable: bool,
+    /// Exempt from suspension when execution stops.
+    pub exempt: bool,
+
+    pub info: ThreadInfo,
+    pub monitor_suspended: bool,
+
+    /// Switch frame of the thread while it is not in the monitor.
+    pub frame: Context,
+    pub name: Option<Vec<u8>>,
+}
+
+impl MockThread {
+    pub fn new(id: u32, process: ProcessKind) -> Self {
+        let mut frame = Context {
+            iar: 0x8200_0000 | (id & 0xfff0),
+            lr: 0x8200_1000,
+            cr: 0x2400_0042,
+            ..Context::default()
+        };
+        frame.gpr[1] = 0x7006_f000;
+
+        for register in 14..32 {
+            frame.gpr[register] = 0x1400 + register as u64;
+        }
+
+        Self {
+            id: ThreadId(id),
+            process,
+            has_record: true,
+            debuggable: true,
+            exempt: false,
+            info: ThreadInfo {
+                suspend_count: 0,
+                monitor_suspended: false,
+                priority: 9,
+                tls_base: 0x7006_f800,
+                start_address: 0x8200_4000,
+                stack_base: 0x7007_0000,
+                stack_limit: 0x7006_0000,
+                create_time: 0x01d9_1234_5678_9abc,
+                name: None,
+                processor: 1,
+                last_error: 0,
+            },
+            monitor_suspended: false,
+            frame,
+            name: None,
+        }
     }
 }
 
+/// Position of a guest address inside one of the simulated memory regions.
+struct RegionOffset {
+    region: usize,
+    offset: usize,
+}
+
 impl MockBackend {
-    fn region_offset(&self, address: u32, length: usize) -> Option<(usize, usize)> {
+    fn region_offset(&self, address: u32, length: usize) -> Option<RegionOffset> {
         self.memory
             .regions
             .iter()
             .enumerate()
-            .find_map(|(index, region)| {
-                let offset = address.checked_sub(region.base)? as usize;
-                (offset + length <= region.bytes.len()).then_some((index, offset))
+            .find_map(|(region, candidate)| {
+                let offset = address.checked_sub(candidate.base)? as usize;
+                (offset + length <= candidate.bytes.len())
+                    .then_some(RegionOffset { region, offset })
             })
     }
 
@@ -319,6 +319,7 @@ impl MockBackend {
         delivery: Delivery,
     ) -> DirectOutcome {
         use openxbdm_server::commands::system::Backend as _;
+
         let has_record = self
             .debugger
             .thread(ThreadId(thread))
@@ -331,11 +332,15 @@ impl MockBackend {
             hardware_flags: self.hardware_flags(),
             delivery,
         };
+
         let iar = context.iar;
-        let instruction = self.region_offset(iar, 4).map(|(index, offset)| {
-            let bytes = &self.memory.regions[index].bytes[offset..offset + 4];
-            u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-        });
+        let instruction = self
+            .region_offset(iar, 4)
+            .map(|RegionOffset { region, offset }| {
+                let bytes = &self.memory.regions[region].bytes[offset..offset + 4];
+                u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+            });
+
         let policy = self.debugger.policy;
         let mut registers = DirectRegisters {
             msr: context.msr,
@@ -350,6 +355,7 @@ impl MockBackend {
             instruction,
             &mut self.debugger.direct_step,
         );
+
         context.msr = registers.msr;
         context.iar = registers.iar;
         context.gpr[3] = registers.gpr3;
@@ -357,16 +363,18 @@ impl MockBackend {
         if let Some(value) = outcome.data_breakpoint_register {
             self.debugger.data_breakpoint_register = value;
         }
+
         let Some(notice) = outcome.notice else {
             return outcome;
         };
+
         let (text, module) = match notice {
             DirectNotice::DebugString { address, length }
             | DirectNotice::Rip { address, length } => {
                 let text = self
                     .region_offset(address, usize::from(length))
-                    .map_or_else(Vec::new, |(index, offset)| {
-                        self.memory.regions[index].bytes[offset..offset + usize::from(length)]
+                    .map_or_else(Vec::new, |RegionOffset { region, offset }| {
+                        self.memory.regions[region].bytes[offset..offset + usize::from(length)]
                             .to_vec()
                     });
                 (text, None)
@@ -380,6 +388,7 @@ impl MockBackend {
             ),
             _ => (Vec::new(), None),
         };
+
         let notification = DirectNotification {
             thread: ThreadId(thread),
             iar,
@@ -389,6 +398,7 @@ impl MockBackend {
             text_length: text.len(),
         };
         self.debugger.direct.push_back((notification, text));
+
         outcome
     }
 }
@@ -404,6 +414,7 @@ impl debugger::Backend for MockBackend {
             let Some(thread) = self.debugger.thread_mut(id) else {
                 continue;
             };
+
             if thread.has_record
                 && thread.debuggable
                 && !thread.exempt
@@ -421,6 +432,7 @@ impl debugger::Backend for MockBackend {
             let Some(thread) = self.debugger.thread_mut(id) else {
                 continue;
             };
+
             if thread.has_record && thread.debuggable && thread.monitor_suspended {
                 thread.monitor_suspended = false;
                 thread.info.suspend_count -= 1;
@@ -439,6 +451,7 @@ impl debugger::Backend for MockBackend {
 
     fn thread_ids(&mut self, ids: &mut [ThreadId]) -> Option<usize> {
         let mut count = 0;
+
         for process in [ProcessKind::Title, ProcessKind::System] {
             for thread in self
                 .debugger
@@ -449,20 +462,24 @@ impl debugger::Backend for MockBackend {
                 if !(thread.has_record && thread.debuggable) {
                     continue;
                 }
+
                 *ids.get_mut(count)? = thread.id;
                 count += 1;
             }
         }
+
         Some(count)
     }
 
     fn thread_info(&mut self, thread: ThreadId) -> Result<ThreadInfo, NoSuchThread> {
         let thread = self.debugger.thread(thread).ok_or(NoSuchThread)?;
+
         let mut info = thread.info;
         info.monitor_suspended = thread.has_record && thread.monitor_suspended;
         if !thread.has_record {
             info.name = None;
         }
+
         Ok(info)
     }
 
@@ -476,6 +493,7 @@ impl debugger::Backend for MockBackend {
     fn suspend_thread(&mut self, thread: ThreadId) -> Result<(), NoSuchThread> {
         let thread = self.debugger.thread_mut(thread).ok_or(NoSuchThread)?;
         thread.info.suspend_count += 1;
+
         Ok(())
     }
 
@@ -484,6 +502,7 @@ impl debugger::Backend for MockBackend {
         if thread.info.suspend_count > 0 {
             thread.info.suspend_count -= 1;
         }
+
         Ok(())
     }
 
@@ -498,11 +517,13 @@ impl debugger::Backend for MockBackend {
             .thread(thread)
             .filter(|thread| thread.has_record)
             .ok_or(NoSuchThread)?;
+
         if let Some(saved) = self.debugger.in_monitor.get(&thread.0) {
             copy_groups(saved, context, requested);
             context.flags = requested;
             return Ok(());
         }
+
         let frame = &found.frame;
         let mut flags = ContextFlags::empty();
         if requested.contains(ContextFlags::INTEGER) {
@@ -521,6 +542,7 @@ impl debugger::Backend for MockBackend {
             context.ctr = u64::MAX;
         }
         context.flags = flags;
+
         Ok(())
     }
 
@@ -529,33 +551,40 @@ impl debugger::Backend for MockBackend {
         thread: ThreadId,
         context: &Context,
     ) -> Result<(), StoppedThreadError> {
-        let found = self
+        let has_record = self
             .debugger
             .thread(thread)
-            .filter(|thread| thread.has_record);
-        if found.is_none() {
+            .is_some_and(|thread| thread.has_record);
+        if !has_record {
             return Err(StoppedThreadError::NoSuchThread);
         }
+
         let saved = self
             .debugger
             .in_monitor
             .get_mut(&thread.0)
             .ok_or(StoppedThreadError::NotStopped)?;
         copy_groups(context, saved, context.flags);
+
         Ok(())
     }
 
     unsafe fn set_thread_name(&mut self, thread: ThreadId, address: u32) {
+        /// Address where the simulated kernel stores copied thread names.
+        const THREAD_NAME_BASE: u32 = 0x9000_1000;
+
         let mut name = Vec::new();
         let mut cursor = address;
-        while let Some((index, offset)) = self.region_offset(cursor, 1) {
-            let byte = self.memory.regions[index].bytes[offset];
+        while let Some(RegionOffset { region, offset }) = self.region_offset(cursor, 1) {
+            let byte = self.memory.regions[region].bytes[offset];
             if byte == 0 {
                 break;
             }
+
             name.push(byte);
             cursor = cursor.wrapping_add(1);
         }
+
         if let Some(thread) = self.debugger.thread_mut(thread)
             && thread.has_record
         {
@@ -577,16 +606,19 @@ impl debugger::Backend for MockBackend {
     }
 
     fn replace_code_word(&mut self, address: u32, value: u32) -> Option<u32> {
-        let (index, offset) = self.region_offset(address, 4)?;
-        let bytes = &mut self.memory.regions[index].bytes[offset..offset + 4];
+        let RegionOffset { region, offset } = self.region_offset(address, 4)?;
+        let bytes = &mut self.memory.regions[region].bytes[offset..offset + 4];
+
         let previous = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         bytes.copy_from_slice(&value.to_be_bytes());
+
         Some(previous)
     }
 
     fn target_bytes(&mut self, address: u32, length: usize) -> Option<&[u8]> {
-        let (index, offset) = self.region_offset(address, length)?;
-        Some(&self.memory.regions[index].bytes[offset..offset + length])
+        let RegionOffset { region, offset } = self.region_offset(address, length)?;
+
+        Some(&self.memory.regions[region].bytes[offset..offset + length])
     }
 
     fn set_data_breakpoint_register(&mut self, value: u32) {
@@ -620,9 +652,11 @@ impl debugger::Backend for MockBackend {
         text: &mut [u8; NOTICE_TEXT_CAPACITY],
     ) -> Option<DirectNotification> {
         let (mut notification, captured) = self.debugger.direct.pop_front()?;
+
         let length = captured.len().min(NOTICE_TEXT_CAPACITY);
         text[..length].copy_from_slice(&captured[..length]);
         notification.text_length = length;
+
         Some(notification)
     }
 
@@ -633,10 +667,12 @@ impl debugger::Backend for MockBackend {
             thread.debuggable = false;
             self.debugger.threads.push(thread);
         }
+
         let context = self
             .debugger
             .exception_context(COMMAND_THREAD, BREAK_NOW_TRAP);
         self.debugger.in_monitor.insert(COMMAND_THREAD, context);
+
         let record = ExceptionRecord {
             code: NtStatus::BREAKPOINT,
             address: BREAK_NOW_TRAP,
@@ -645,6 +681,7 @@ impl debugger::Backend for MockBackend {
             record_address: 0x7005_e000,
             ..ExceptionRecord::default()
         };
+
         Some(DebugEvent::Exception {
             thread: id,
             process: ProcessKind::System,
@@ -671,6 +708,7 @@ impl debugger::Backend for MockBackend {
             .copied()
             .ok_or(KernelError::ObjectNameNotFound)?;
         self.debugger.loaded_extensions.push(handle);
+
         // SAFETY: the simulated loader has loaded the image; the server
         // holds one extension and loads again only after unloading it.
         Ok(unsafe { ExtensionHandle::from_raw(handle) })
@@ -678,6 +716,32 @@ impl debugger::Backend for MockBackend {
 
     fn unload_extension(&mut self, handle: ExtensionHandle) -> Result<(), KernelError> {
         self.debugger.unloaded_extensions.push(handle.raw());
+
         Ok(())
+    }
+}
+
+fn copy_groups(source: &Context, target: &mut Context, flags: ContextFlags) {
+    if flags.contains(ContextFlags::CONTROL) {
+        target.msr = source.msr;
+        target.iar = source.iar;
+        target.lr = source.lr;
+        target.ctr = source.ctr;
+    }
+
+    if flags.contains(ContextFlags::INTEGER) {
+        target.gpr = source.gpr;
+        target.cr = source.cr;
+        target.xer = source.xer;
+    }
+
+    if flags.contains(ContextFlags::FLOATING_POINT) {
+        target.fpscr = source.fpscr;
+        target.fpr = source.fpr;
+    }
+
+    if flags.contains(ContextFlags::VECTOR) {
+        target.vscr = source.vscr;
+        target.vr = source.vr;
     }
 }

@@ -13,27 +13,14 @@ use std::time::Duration;
 use openxbdm_server::SocketId;
 use openxbdm_server::smb::SmbService;
 
-use crate::Host;
-use crate::SharedHost;
+use super::Host;
+use super::SharedHost;
 use crate::network;
 
 /// Concurrent SMB connections.
 const CONNECTIONS: usize = 4;
-/// Longest wait for a socket before the connection state is checked
-/// again.
-const POLL: Duration = Duration::from_millis(500);
-/// Delay after a failed accept, which may repeat while the process has no
-/// free descriptors.
-const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
-pub(crate) type Service = SmbService<CONNECTIONS>;
-
-/// A started service.
-pub(crate) fn start(host: &mut Host) -> Arc<Mutex<Service>> {
-    let mut service = Service::new();
-    service.start(&mut host.backend);
-    Arc::new(Mutex::new(service))
-}
+pub(super) type Service = SmbService<CONNECTIONS>;
 
 impl SharedHost {
     fn lock_smb(&self) -> MutexGuard<'_, Service> {
@@ -44,6 +31,10 @@ impl SharedHost {
 
     /// Accept SMB connections; a failed accept is retried.
     pub fn serve_smb(&self, listener: &TcpListener) -> ! {
+        /// Delay after a failed accept, which may repeat while the process
+        /// has no free descriptors.
+        const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+
         loop {
             match listener.accept() {
                 Ok((stream, _)) => self.accept_smb(stream),
@@ -53,7 +44,7 @@ impl SharedHost {
     }
 
     /// Close SMB connections that exceeded a time limit.
-    pub(crate) fn poll_smb_timers(&self) {
+    pub(super) fn poll_smb_timers(&self) {
         let mut smb = self.lock_smb();
         let mut guard = self.lock();
         let Host {
@@ -68,9 +59,11 @@ impl SharedHost {
         let Ok(waiter) = stream.try_clone() else {
             return;
         };
+
         // Without keep-alive probes the time limits still end the
         // connection.
         let _ = network::set_keepalive(&stream);
+
         let mut smb = self.lock_smb();
         let mut guard = self.lock();
         let Host {
@@ -87,24 +80,32 @@ impl SharedHost {
     }
 
     fn service_smb(&self, socket: SocketId, waiter: &TcpStream) {
+        /// Longest wait for a socket before the connection state is checked
+        /// again.
+        const POLL: Duration = Duration::from_millis(500);
+
         loop {
             let wants_write = {
                 let smb = self.lock_smb();
                 if !smb.contains(socket) {
                     return;
                 }
+
                 smb.wants_write(socket)
             };
+
             let ready = if wants_write {
                 network::wait_writable(waiter, POLL)
             } else {
                 network::wait_readable(waiter, POLL)
             };
+
             // A failed socket counts as ready so that the service sees the
             // failure.
             if matches!(ready, Ok(false)) {
                 continue;
             }
+
             let mut smb = self.lock_smb();
             let mut guard = self.lock();
             let Host {
@@ -119,4 +120,11 @@ impl SharedHost {
             }
         }
     }
+}
+
+/// A started service.
+pub(super) fn start(host: &mut Host) -> Arc<Mutex<Service>> {
+    let mut service = Service::new();
+    service.start(&mut host.backend);
+    Arc::new(Mutex::new(service))
 }

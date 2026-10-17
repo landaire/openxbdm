@@ -10,20 +10,25 @@ use std::net::TcpListener;
 use std::net::TcpStream;
 use std::time::Duration;
 
-use common::TestServer;
+use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
+use openxbdm_server::commands::console::ConfigSetting;
 use openxbdm_server::commands::debugger::BREAKPOINT_BLOCKS;
 use openxbdm_server::commands::debugger::ContextFlags;
 use openxbdm_server::commands::debugger::ExceptionRecord;
 use openxbdm_server::commands::debugger::ExitStatus;
 use openxbdm_server::commands::debugger::Msr;
+use openxbdm_server::commands::debugger::ProcessKind;
 use openxbdm_server::commands::debugger::TRAP_INSTRUCTION;
 use openxbdm_server::commands::debugger::trap;
 use openxbdm_server::commands::services::ThreadHandle;
 use openxbdm_server::notify::ExecutionState;
 use openxbdm_server_host::Host;
+use openxbdm_server_host::backend::debugger::MockThread;
 use openxbdm_server_host::backend::memory::MEMORY_BASE;
 use xbox360_sys::xboxkrnl::HardwareFlags;
+
+use common::TestServer;
 
 const TITLE_THREAD: u32 = 0xfb00_0058;
 const OTHER_THREAD: u32 = 0xfb00_0060;
@@ -42,10 +47,12 @@ impl Channel {
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
+
         let (accepted, _) = listener.accept().unwrap();
         let mut host = server.host.lock();
         let socket = host.network.insert(accepted);
         host.server.state.notifications.add_socket(socket).unwrap();
+
         Self {
             reader: BufReader::new(client),
         }
@@ -81,6 +88,7 @@ fn code_word(server: &TestServer, address: u32) -> u32 {
         .iter()
         .find(|region| region.base == MEMORY_BASE)
         .unwrap();
+
     let offset = (address - MEMORY_BASE) as usize;
     u32::from_be_bytes(region.bytes[offset..offset + 4].try_into().unwrap())
 }
@@ -94,6 +102,7 @@ fn write_memory(server: &TestServer, address: u32, bytes: &[u8]) {
         .iter_mut()
         .find(|region| region.base == MEMORY_BASE)
         .unwrap();
+
     let offset = (address - MEMORY_BASE) as usize;
     region.bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
 }
@@ -127,6 +136,7 @@ fn software_breakpoints_are_set_queried_and_cleared() {
         session.command(&format!("isbreak addr=0x{:08x}", CODE + 4)),
         "200- type=0"
     );
+
     // Re-arming an existing breakpoint keeps the saved instruction.
     assert_eq!(
         session.command(&format!("break addr=0x{CODE:08x}")),
@@ -168,9 +178,11 @@ fn break_fails_once_no_spare_block_can_be_obtained() {
     let server = TestServer::start();
     let mut session = server.raw();
     session.line();
+
     // Ascending sets split each full 0x80-entry block in half: every block
     // but the last keeps 0x40 entries.
     let capacity = (BREAKPOINT_BLOCKS as u32 - 1) * 0x40 + 0x80;
+
     // One write per command, sent at once, keeps the run from waiting for
     // delayed acknowledgments.
     session.stream.set_nodelay(true).unwrap();
@@ -181,6 +193,7 @@ fn break_fails_once_no_spare_block_can_be_obtained() {
             .unwrap();
         assert_eq!(session.line(), "200- OK");
     }
+
     assert_eq!(
         session.command(&format!("break addr=0x{:08x}", CODE + capacity * 8)),
         "400- "
@@ -189,11 +202,13 @@ fn break_fails_once_no_spare_block_can_be_obtained() {
         session.command(&format!("isbreak addr=0x{:08x}", CODE + capacity * 8)),
         "200- type=0"
     );
+
     // An address below the first entry goes to the full last block.
     assert_eq!(
         session.command(&format!("break addr=0x{:08x}", CODE - 4)),
         "400- "
     );
+
     // The first block has room.
     assert_eq!(
         session.command(&format!("break addr=0x{:08x}", CODE + 4)),
@@ -272,6 +287,7 @@ fn data_breakpoint_follows_monitor_rules() {
         server.host.lock().backend.debugger.data_breakpoint_register,
         0
     );
+
     // The monitor stores address 0 as "no breakpoint": a breakpoint there is
     // reported but replaced by the next set.
     assert_eq!(session.command("break write=0x00000000 size=4"), "200- OK");
@@ -388,9 +404,11 @@ fn breakpoint_hit_stops_and_continue_steps_over_it() {
         let host = server.host.lock();
         let disposition = host.backend.debugger.disposition(TITLE_THREAD).unwrap();
         assert!(disposition.handled && !disposition.chain_kernel_debugger);
+
         // Continued while stopped: the thread stays suspended for the monitor.
         assert!(host.backend.debugger.threads[0].monitor_suspended);
     }
+
     // The breakpoint is lifted for the trace step over it.
     assert_eq!(code_word(&server, CODE), original);
     let mut context = server
@@ -450,6 +468,7 @@ fn first_chance_exception_is_reported_without_stopping() {
             .debugger
             .raise_exception(OTHER_THREAD, record, context, false);
     }
+
     poll(&server);
     assert_eq!(
         channel.line(),
@@ -488,6 +507,7 @@ fn stop_on_first_chance_exception_and_pass_it_on() {
             .debugger
             .raise_exception(OTHER_THREAD, record, context, false);
     }
+
     poll(&server);
     let line = format!(
         "exception code=0xc000001d thread=0x{OTHER_THREAD:08x} address=0x{CODE:08x} nparam=0 params=0x7006e014 first"
@@ -542,10 +562,12 @@ fn debug_strings_are_split_into_lines() {
             parameters: [u32::from(trap::DEBUG_STRING), 0, 0, 0],
             ..ExceptionRecord::default()
         };
+
         host.backend
             .debugger
             .raise_exception(SYSTEM_THREAD, record, context, false);
     }
+
     poll(&server);
     assert_eq!(
         channel.lines(4),
@@ -563,6 +585,7 @@ fn debug_strings_are_split_into_lines() {
         .debugger
         .disposition(SYSTEM_THREAD)
         .unwrap();
+
     // kd lite chaining is on by default: the kernel debugger finishes it.
     assert!(disposition.chain_kernel_debugger);
 }
@@ -576,12 +599,10 @@ fn thread_create_stops_when_requested() {
     assert_eq!(session.command("stopon createthread"), "200- OK");
     {
         let mut host = server.host.lock();
-        let thread = openxbdm_server_host::backend::debugger::MockThread::new(
-            0xfb00_0070,
-            openxbdm_server::commands::debugger::ProcessKind::Title,
-        );
+        let thread = MockThread::new(0xfb00_0070, ProcessKind::Title);
         host.backend.debugger.raise_thread_create(thread, false);
     }
+
     poll(&server);
     assert_eq!(
         channel.lines(2),
@@ -905,8 +926,6 @@ fn kd_commands_switch_routing() {
 
 #[test]
 fn kdnet_settings_are_set_shown_and_switched() {
-    use openxbdm_core::status::KernelError;
-    use openxbdm_server::commands::console::ConfigSetting;
     use openxbdm_server::commands::debugger::KDNET_RECORD_OFFSET;
     use openxbdm_server::commands::debugger::KDNET_RECORD_SIZE;
 
@@ -929,6 +948,7 @@ fn kdnet_settings_are_set_shown_and_switched() {
         session.command("kdnet set Port=50000"),
         "423- kdnet set failed: error code 0x82da0017"
     );
+
     // Without a MAC the console's address less one is used.
     assert_eq!(
         session.command("kdnet set IP=10.0.0.2 Port=50000"),
@@ -938,6 +958,7 @@ fn kdnet_settings_are_set_shown_and_switched() {
         let host = server.host.lock();
         host.backend.memory.flash[KDNET_RECORD_OFFSET as usize..][..KDNET_RECORD_SIZE].to_vec()
     };
+
     assert_eq!(&record[..2], &[0xca, 0x4a]);
     assert_eq!(
         &record[8..0x14],
@@ -1060,6 +1081,7 @@ fn extension_loads_once_and_counts_references() {
 fn break_now_replies_after_the_command_thread_is_continued() {
     use openxbdm_server_host::backend::debugger::BREAK_NOW_TRAP;
     use openxbdm_server_host::backend::debugger::COMMAND_THREAD;
+
     let server = TestServer::start();
     let mut channel = Channel::attach(&server);
     let mut breaking = server.raw();
@@ -1090,6 +1112,7 @@ fn break_now_replies_after_the_command_thread_is_continued() {
 #[test]
 fn debug_string_above_passive_level_is_deferred_only_when_selected() {
     use openxbdm_server::commands::debugger::Delivery;
+
     let server = TestServer::start();
     let mut channel = Channel::attach(&server);
     let mut session = server.raw();
@@ -1101,6 +1124,7 @@ fn debug_string_above_passive_level_is_deferred_only_when_selected() {
         parameters: [u32::from(trap::DEBUG_STRING), 0, 0, 0],
         ..ExceptionRecord::default()
     };
+
     let raise = |server: &TestServer| {
         let mut host = server.host.lock();
         let mut context = host.backend.debugger.exception_context(SYSTEM_THREAD, CODE);
@@ -1114,6 +1138,7 @@ fn debug_string_above_passive_level_is_deferred_only_when_selected() {
         );
         (outcome, context)
     };
+
     // No debugger attached: nothing is queued and the kernel debugger gets
     // the string (kd lite).
     poll(&server);
@@ -1145,6 +1170,7 @@ fn data_breakpoint_overlap_uses_the_instruction_access_length() {
         session.command(&format!("break write=0x{watched:08x} size=4")),
         "200- OK"
     );
+
     let raise = |server: &TestServer, instruction: u32, access: u32| {
         write_memory(server, CODE, &instruction.to_be_bytes());
         let record = ExceptionRecord {
@@ -1153,6 +1179,7 @@ fn data_breakpoint_overlap_uses_the_instruction_access_length() {
             parameters: [0, access, 0, 0],
             ..ExceptionRecord::default()
         };
+
         let context = server
             .host
             .lock()
@@ -1167,6 +1194,7 @@ fn data_breakpoint_overlap_uses_the_instruction_access_length() {
             .raise_exception(TITLE_THREAD, record, context, false);
         poll(server);
     };
+
     // lbz r3, 0(r4): one byte just below the watched word misses it; the
     // monitor steps over the data breakpoint without a notification.
     raise(&server, 0x8864_0000, watched - 1);
@@ -1180,6 +1208,7 @@ fn data_breakpoint_overlap_uses_the_instruction_access_length() {
             .unwrap()
             .handled
     );
+
     // stw r3, 0(r4): four bytes from two below the word reach it.
     raise(&server, 0x9064_0000, watched - 2);
     assert_eq!(
@@ -1195,10 +1224,8 @@ fn data_breakpoint_overlap_uses_the_instruction_access_length() {
 
 #[test]
 fn kdlite_needs_the_hardware_flag_and_persists() {
-    use openxbdm_core::status::KernelError;
-    use openxbdm_server::commands::console::ConfigSetting;
-
     let server = TestServer::start();
+
     // Setting (2,6) also holds the `hdd` and `builtinmu` bits.
     server.host.lock().backend.console.xconfig.settings.insert(
         ConfigSetting::new(2, 6),

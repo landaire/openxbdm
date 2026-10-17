@@ -9,9 +9,6 @@ mod common;
 use std::io::Read;
 use std::io::Write;
 
-use common::RawSession;
-use common::TestServer;
-use common::run;
 use openxbdm_client::Error;
 use openxbdm_client::ErrorCode;
 use openxbdm_client::commands::AddUser;
@@ -38,25 +35,36 @@ use openxbdm_server::state::ServerState;
 use openxbdm_server_host::Host;
 use openxbdm_server_host::backend::MockBackend;
 
+use common::RawSession;
+use common::TestServer;
+use common::run;
+
 const BOX_ID: &str = "0q0011223344556677";
 
-const ROUNDS: [u32; 8] = [
-    0x283c481d, 0x9ad82aa1, 0x85a5e1f9, 0x1b23963c, 0xf70b4975, 0xdfdc02c7, 0xf29176fc, 0x6b04bd38,
-];
+/// 768-bit number, least significant qword first; the wire bytes are its
+/// little-endian encoding.
+type Big = [u64; 12];
 
 fn block(key: [u32; 2], value: [u32; 2]) -> [u32; 2] {
-    let [mut b0, mut b1] = value;
+    const ROUNDS: [u32; 8] = [
+        0x283c481d, 0x9ad82aa1, 0x85a5e1f9, 0x1b23963c, 0xf70b4975, 0xdfdc02c7, 0xf29176fc,
+        0x6b04bd38,
+    ];
+
+    let [mut left, mut right] = value;
+
     for i in 0..8 {
-        b1 ^= (key[1] ^ b0)
-            .wrapping_add((!b0) << 6)
-            .wrapping_add(b0 >> 5)
+        right ^= (key[1] ^ left)
+            .wrapping_add((!left) << 6)
+            .wrapping_add(left >> 5)
             .wrapping_add(ROUNDS[i]);
-        b0 ^= (key[0] ^ b1)
-            .wrapping_add(b1 << 6)
-            .wrapping_add((!b1) >> 5)
+        left ^= (key[0] ^ right)
+            .wrapping_add(right << 6)
+            .wrapping_add((!right) >> 5)
             .wrapping_add(ROUNDS[7 - i]);
     }
-    [b0, b1]
+
+    [left, right]
 }
 
 fn split(value: u64) -> [u32; 2] {
@@ -69,43 +77,34 @@ fn join(words: [u32; 2]) -> u64 {
 
 /// F(X, D) = D xor E(X, D).
 fn mix(x: [u32; 2], d: [u32; 2]) -> [u32; 2] {
-    let e = block(x, d);
-    [d[0] ^ e[0], d[1] ^ e[1]]
+    let encrypted = block(x, d);
+
+    [d[0] ^ encrypted[0], d[1] ^ encrypted[1]]
 }
 
 /// H(S, C).
 fn respond(secret: u64, challenge: u64) -> u64 {
     let x = mix(split(0x2718281831415926), split(secret));
     let y = mix(x, split(challenge));
+
     join(mix(x, y))
 }
 
 /// Session key absorption of the shared value.
 fn absorb(bytes: &[u8]) -> u64 {
     let mut state = [0u32; 2];
+
     for chunk in bytes.chunks(8) {
         let mut padded = [0u8; 8];
         padded[..chunk.len()].copy_from_slice(chunk);
-        let m = split(u64::from_le_bytes(padded));
-        let e = block(state, m);
-        state = [e[0] ^ m[0], e[1] ^ m[1]];
+
+        let words = split(u64::from_le_bytes(padded));
+        let encrypted = block(state, words);
+        state = [encrypted[0] ^ words[0], encrypted[1] ^ words[1]];
     }
+
     join(state)
 }
-
-/// Group parameters at 0x91f06090: the 0x60-byte modulus and generator.
-const MODULUS: [u8; 96] = [
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x34, 0xc2, 0x68, 0x21, 0xa2, 0xda, 0x0f, 0xc9,
-    0xd1, 0x1c, 0xdc, 0x80, 0x8b, 0x62, 0xc6, 0xc4, 0x74, 0xcc, 0x67, 0x8a, 0x08, 0x4e, 0x02, 0x29,
-    0x22, 0x9b, 0x13, 0x3b, 0xa6, 0xbe, 0x0b, 0x02, 0xdd, 0x04, 0x34, 0x8e, 0x79, 0x08, 0x4a, 0x51,
-    0x1b, 0x43, 0x3a, 0xcd, 0xb3, 0x19, 0x95, 0xef, 0x37, 0x14, 0x5f, 0xf2, 0x6d, 0x0a, 0x2b, 0x30,
-    0x45, 0xc2, 0x51, 0x6d, 0x6d, 0x35, 0xe1, 0x4f, 0xc6, 0x7e, 0x5e, 0x62, 0x76, 0xb5, 0x85, 0xe4,
-    0x20, 0x36, 0x3a, 0xa6, 0xe9, 0x42, 0x4c, 0xf4, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-];
-
-/// 768-bit number, least significant qword first; the wire bytes are its
-/// little-endian encoding.
-type Big = [u64; 12];
 
 fn big(bytes: &[u8; 96]) -> Big {
     std::array::from_fn(|i| u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap()))
@@ -113,9 +112,11 @@ fn big(bytes: &[u8; 96]) -> Big {
 
 fn wire(value: &Big) -> [u8; 96] {
     let mut bytes = [0u8; 96];
+
     for (i, limb) in value.iter().enumerate() {
         bytes[i * 8..i * 8 + 8].copy_from_slice(&limb.to_le_bytes());
     }
+
     bytes
 }
 
@@ -125,11 +126,12 @@ fn at_least(a: &Big, b: &Big) -> bool {
 
 fn sub(a: &mut Big, b: &Big) {
     let mut borrow = false;
+
     for (x, y) in a.iter_mut().zip(b) {
-        let (d, b1) = x.overflowing_sub(*y);
-        let (d, b2) = d.overflowing_sub(u64::from(borrow));
-        *x = d;
-        borrow = b1 || b2;
+        let (difference, borrow_word) = x.overflowing_sub(*y);
+        let (difference, borrow_in) = difference.overflowing_sub(u64::from(borrow));
+        *x = difference;
+        borrow = borrow_word || borrow_in;
     }
 }
 
@@ -137,15 +139,18 @@ fn sub(a: &mut Big, b: &Big) {
 fn add_mod(a: &Big, b: &Big, m: &Big) -> Big {
     let mut sum = [0u64; 12];
     let mut carry = false;
+
     for i in 0..12 {
-        let (s, c1) = a[i].overflowing_add(b[i]);
-        let (s, c2) = s.overflowing_add(u64::from(carry));
-        sum[i] = s;
-        carry = c1 || c2;
+        let (limb, carry_word) = a[i].overflowing_add(b[i]);
+        let (limb, carry_in) = limb.overflowing_add(u64::from(carry));
+        sum[i] = limb;
+        carry = carry_word || carry_in;
     }
+
     if carry || at_least(&sum, m) {
         sub(&mut sum, m);
     }
+
     sum
 }
 
@@ -155,12 +160,14 @@ fn bit(value: &Big, index: usize) -> bool {
 
 fn mul_mod(a: &Big, b: &Big, m: &Big) -> Big {
     let mut result = [0u64; 12];
+
     for index in (0..768).rev() {
         result = add_mod(&result, &result, m);
         if bit(b, index) {
             result = add_mod(&result, a, m);
         }
     }
+
     result
 }
 
@@ -169,24 +176,29 @@ fn pow_mod(base: &Big, exponent: &Big, m: &Big) -> Big {
     if at_least(&base, m) {
         sub(&mut base, m);
     }
+
     let mut result = [0u64; 12];
     result[0] = 1;
+
     let top = (0..768)
         .rev()
         .find(|&index| bit(exponent, index))
         .map_or(0, |index| index + 1);
+
     for index in (0..top).rev() {
         result = mul_mod(&result, &result, m);
         if bit(exponent, index) {
             result = mul_mod(&result, &base, m);
         }
     }
+
     result
 }
 
 fn generator() -> Big {
     let mut bytes = [0u8; 96];
     bytes[0x58] = 2;
+
     big(&bytes)
 }
 
@@ -194,19 +206,35 @@ fn generator() -> Big {
 fn exponent() -> Big {
     let mut value = [0u64; 12];
     value[0] = 0x9e37_79b9_7f4a_7c15;
+
     value
 }
 
 /// Run `keyxchg` on a raw session and return the session key.
 fn exchange_keys(session: &mut RawSession) -> u64 {
+    /// Group parameters at 0x91f06090: the 0x60-byte modulus and generator.
+    const MODULUS: [u8; 96] = [
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x34, 0xc2, 0x68, 0x21, 0xa2, 0xda, 0x0f,
+        0xc9, 0xd1, 0x1c, 0xdc, 0x80, 0x8b, 0x62, 0xc6, 0xc4, 0x74, 0xcc, 0x67, 0x8a, 0x08, 0x4e,
+        0x02, 0x29, 0x22, 0x9b, 0x13, 0x3b, 0xa6, 0xbe, 0x0b, 0x02, 0xdd, 0x04, 0x34, 0x8e, 0x79,
+        0x08, 0x4a, 0x51, 0x1b, 0x43, 0x3a, 0xcd, 0xb3, 0x19, 0x95, 0xef, 0x37, 0x14, 0x5f, 0xf2,
+        0x6d, 0x0a, 0x2b, 0x30, 0x45, 0xc2, 0x51, 0x6d, 0x6d, 0x35, 0xe1, 0x4f, 0xc6, 0x7e, 0x5e,
+        0x62, 0x76, 0xb5, 0x85, 0xe4, 0x20, 0x36, 0x3a, 0xa6, 0xe9, 0x42, 0x4c, 0xf4, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    ];
+
     let modulus = big(&MODULUS);
     let public = pow_mod(&generator(), &exponent(), &modulus);
+
     assert_eq!(session.command("keyxchg"), "204- send binary data");
     session.stream.write_all(&wire(&public)).unwrap();
     assert_eq!(session.line(), "203- binary response follows");
-    let mut server = [0u8; 96];
-    session.reader.read_exact(&mut server).unwrap();
-    let shared = pow_mod(&big(&server), &exponent(), &modulus);
+
+    let mut server_public = [0u8; 96];
+    session.reader.read_exact(&mut server_public).unwrap();
+
+    let shared = pow_mod(&big(&server_public), &exponent(), &modulus);
+
     absorb(&wire(&shared))
 }
 
@@ -220,6 +248,7 @@ fn challenge(banner: &str) -> u64 {
         .strip_prefix(&format!("201- boxid={BOX_ID} nonce=0q"))
         .unwrap_or_else(|| panic!("unexpected banner {banner:?}"));
     assert_eq!(nonce.len(), 16);
+
     u64::from_str_radix(nonce, 16).unwrap()
 }
 
@@ -228,6 +257,7 @@ fn settings(server: &TestServer) -> Vec<String> {
     let host = server.host.lock();
     let text =
         String::from_utf8(host.backend.system.settings.clone().expect("settings file")).unwrap();
+
     text.split("\r\n")
         .filter(|line| {
             ["lockmode", "adminpw", "user "]
@@ -247,7 +277,22 @@ fn locked_server() -> (TestServer, RawSession) {
         admin.command(&format!("lockmode boxid={BOX_ID}")),
         "200- OK"
     );
+
     (server, admin)
+}
+
+/// Run a security export body on the host's server state, then write dirty
+/// settings as the console glue does for exports 61 and 64.
+fn export<T>(server: &TestServer, body: impl FnOnce(&mut ServerState, &mut MockBackend) -> T) -> T {
+    let mut host = server.host.lock();
+    let Host {
+        server, backend, ..
+    } = &mut *host;
+
+    let result = body(&mut server.state, backend);
+    server.save_settings_if_dirty(backend);
+
+    result
 }
 
 #[test]
@@ -701,18 +746,6 @@ fn client_commands() {
             read.union(Privileges::CONFIG)
         );
     });
-}
-
-/// Run a security export body on the host's server state, then write dirty
-/// settings as the console glue does for exports 61 and 64.
-fn export<T>(server: &TestServer, body: impl FnOnce(&mut ServerState, &mut MockBackend) -> T) -> T {
-    let mut host = server.host.lock();
-    let Host {
-        server, backend, ..
-    } = &mut *host;
-    let result = body(&mut server.state, backend);
-    server.save_settings_if_dirty(backend);
-    result
 }
 
 #[test]

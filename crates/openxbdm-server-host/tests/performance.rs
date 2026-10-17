@@ -5,9 +5,6 @@ mod common;
 
 use std::io::Read;
 
-use common::RawSession;
-use common::TestServer;
-use common::run;
 use openxbdm_client::commands::PerfCounterList;
 use openxbdm_client::commands::QueryPerfCounter;
 use openxbdm_core::status::Hresult;
@@ -25,6 +22,12 @@ use openxbdm_server_host::backend::performance::PAGES;
 use openxbdm_server_host::backend::performance::THREADS;
 use xbox360_sys::xboxkrnl::HardwareFlags;
 
+use common::RawSession;
+use common::TestServer;
+use common::run;
+
+const CAPTURE_PATH: &str = "\\Device\\Harddisk0\\Partition1\\DEVKIT\\cap.cap";
+
 fn session(server: &TestServer) -> RawSession {
     let mut session = server.raw();
     assert_eq!(session.line(), "201- connected");
@@ -35,6 +38,11 @@ fn read_bytes(session: &mut RawSession, count: usize) -> Vec<u8> {
     let mut bytes = vec![0u8; count];
     session.reader.read_exact(&mut bytes).unwrap();
     bytes
+}
+
+/// Pixel bytes of the simulated front buffer.
+fn pixel(x: u32, y: u32) -> [u8; 4] {
+    [x as u8, y as u8, (x >> 8) as u8 ^ 0x5a, (x ^ y) as u8]
 }
 
 #[test]
@@ -165,11 +173,6 @@ fn querypc_errors() {
     );
 }
 
-/// Pixel bytes of the simulated front buffer.
-fn pixel(x: u32, y: u32) -> [u8; 4] {
-    [x as u8, y as u8, (x >> 8) as u8 ^ 0x5a, (x ^ y) as u8]
-}
-
 #[test]
 fn screenshot_sends_the_header_then_whole_tiles() {
     let server = TestServer::start();
@@ -197,6 +200,7 @@ fn screenshot_sends_the_header_then_whole_tiles() {
          offsety=0x00000003, framebuffersize=0x00009000 sw=0x00000500 sh=0x000002d0 colorspace=0x1"
     );
     let body = read_bytes(&mut session, 0x9000);
+
     let reads = server.host.lock().backend.performance.display.reads.clone();
     let row = 0x280 * 32;
     let base = 0x0a00_0000u32;
@@ -212,11 +216,12 @@ fn screenshot_sends_the_header_then_whole_tiles() {
     });
     assert_eq!(shot.data, body);
     let rgba = shot.to_rgba8().unwrap();
+
     for y in 0..67 {
         for x in 0..70 {
-            let [b, g, r, _] = pixel(x + 40, y + 3);
+            let [blue, green, red, _] = pixel(x + 40, y + 3);
             let at = ((y * 70 + x) * 4) as usize;
-            assert_eq!(rgba[at..at + 4], [r, g, b, 0xff], "pixel {x},{y}");
+            assert_eq!(rgba[at..at + 4], [red, green, blue, 0xff], "pixel {x},{y}");
         }
     }
 }
@@ -267,8 +272,6 @@ fn autoprof_reads_and_writes_the_profile_setting() {
         .remove(HardwareFlags::AUTO_PROFILE);
     assert_eq!(session.command("autoprof"), "407- unknown command");
 }
-
-const CAPTURE_PATH: &str = "\\Device\\Harddisk0\\Partition1\\DEVKIT\\cap.cap";
 
 #[test]
 fn capctrl_replies_with_the_result() {

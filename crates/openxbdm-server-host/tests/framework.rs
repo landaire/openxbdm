@@ -2,6 +2,8 @@
 
 mod common;
 
+use openxbdm_server_host::backend::memory::MEMORY_BASE;
+
 use common::TestServer;
 use common::run;
 
@@ -32,6 +34,7 @@ fn ninth_connection_is_refused() {
     for session in &mut sessions {
         assert_eq!(session.line(), "201- connected");
     }
+
     let mut extra = server.raw();
     assert_eq!(extra.line(), "401- max number of connections exceeded");
 }
@@ -46,7 +49,6 @@ fn client_reads_console_identity_and_memory() {
     use openxbdm_client::commands::GetMem;
     use openxbdm_client::commands::GetPid;
     use openxbdm_client::commands::SetMem;
-    use openxbdm_server_host::backend::memory::MEMORY_BASE;
 
     let server = TestServer::start();
     run(async {
@@ -58,9 +60,11 @@ fn client_reads_console_identity_and_memory() {
             .await
             .unwrap();
         assert_eq!(client.run(DbgName::Get).await.unwrap(), "Development Kit");
+
         let pid = client.run(GetPid).await.unwrap();
         assert_ne!(pid, 0);
         assert_eq!(client.run(GetPid).await.unwrap(), pid);
+
         assert_eq!(
             client.run(GetConsoleType).await.unwrap(),
             ConsoleType::DevKit
@@ -78,6 +82,7 @@ fn client_reads_console_identity_and_memory() {
             .await
             .unwrap();
         assert_eq!(written.written, 3);
+
         let snapshot = client
             .run(GetMem {
                 address: MEMORY_BASE,
@@ -86,14 +91,13 @@ fn client_reads_console_identity_and_memory() {
             .await
             .unwrap();
         assert_eq!(snapshot.data, [0, 1, 0xAA, 0xBB, 0xCC, 5, 6, 7]);
+
         client.bye().await.unwrap();
     });
 }
 
 #[test]
 fn getmem_marks_unmapped_bytes_and_wraps_lines() {
-    use openxbdm_server_host::backend::memory::MEMORY_BASE;
-
     let server = TestServer::start();
     let mut session = server.raw();
     session.line();
@@ -101,6 +105,7 @@ fn getmem_marks_unmapped_bytes_and_wraps_lines() {
     assert_eq!(session.line(), "202- memory data follows");
     let lines = session.multiline();
     assert_eq!(lines.len(), 2);
+
     let expected = format!(
         "????{}",
         (0u8..0x1e)
@@ -113,12 +118,12 @@ fn getmem_marks_unmapped_bytes_and_wraps_lines() {
 
 #[test]
 fn setmem_reports_partial_writes_and_syntax_errors() {
-    use openxbdm_server_host::backend::memory::MEMORY_BASE;
     use openxbdm_server_host::backend::memory::MEMORY_SIZE;
 
     let server = TestServer::start();
     let mut session = server.raw();
     session.line();
+
     let end = MEMORY_BASE + MEMORY_SIZE as u32 - 1;
     assert_eq!(
         session.command(&format!("setmem addr=0x{end:08x} data=AABB")),

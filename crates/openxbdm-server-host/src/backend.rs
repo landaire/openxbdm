@@ -33,10 +33,6 @@ use openxbdm_server::processors::RegisterError;
 use openxbdm_server::server::TRANSFER_CAPACITY;
 use openxbdm_server::text::ResponseText;
 
-/// FILETIME of 2024-01-01T00:00:00Z, the simulated boot time.
-const BOOT_FILETIME: u64 = 133_485_408_000_000_000;
-/// Time base ticks per microsecond.
-const TIMEBASE_PER_MICROSECOND: u64 = 50;
 /// Pool allocations larger than this stand in for exhausted pool memory.
 pub(crate) const POOL_LIMIT: u32 = 0x100_0000;
 
@@ -48,19 +44,23 @@ pub type ExternalProcessor = Box<dyn FnMut(&[u8], &mut ResponseText) -> Hresult 
 pub struct MockBackend {
     boot: Instant,
     random_state: u64,
+
     /// Lines written to the debug output.
     pub debug_output: Vec<Vec<u8>>,
     /// Handlers of processors registered with
     /// [`MockBackend::register_processor`], by handle.
     pub processor_handlers: Vec<ExternalProcessor>,
     pub processors: Processors,
+
     /// Calls of processors that run on another thread report
     /// [`ProcessorProgress::Running`] and keep their line here until the
     /// test completes them with `Server::complete_processor_call`.
     pub defer_processor_calls: bool,
     deferred_calls: Vec<(ConnectionIndex, Vec<u8>)>,
+
     pub test_kit: bool,
     pub execution_state: ExecutionState,
+
     pub session: session::Mock,
     pub security: security::Mock,
     pub console: console::Mock,
@@ -116,6 +116,7 @@ impl MockBackend {
             // with a bounds check, so every value is callable or rejected.
             unsafe { ProcessorHandle::from_raw(self.processor_handlers.len() as u32 - 1) }
         });
+
         self.processors.register(name, handle, flags)
     }
 
@@ -125,6 +126,9 @@ impl MockBackend {
 
     /// Simulated clock before any `setsystime`.
     fn unadjusted_system_time(&self) -> u64 {
+        /// FILETIME of 2024-01-01T00:00:00Z, the simulated boot time.
+        const BOOT_FILETIME: u64 = 133_485_408_000_000_000;
+
         BOOT_FILETIME + self.elapsed_microseconds() * 10
     }
 }
@@ -136,6 +140,9 @@ impl Platform for MockBackend {
     }
 
     fn timebase(&mut self) -> u64 {
+        /// Time base ticks per microsecond.
+        const TIMEBASE_PER_MICROSECOND: u64 = 50;
+
         self.elapsed_microseconds() * TIMEBASE_PER_MICROSECOND
     }
 
@@ -195,12 +202,13 @@ impl ProcessorBackend for MockBackend {
             }
             None => line.to_vec(),
         };
-        ProcessorProgress::Complete(
-            match self.processor_handlers.get_mut(call.handle.raw() as usize) {
-                Some(processor) => processor(&line, text),
-                None => Hresult::FAIL,
-            },
-        )
+
+        let result = match self.processor_handlers.get_mut(call.handle.raw() as usize) {
+            Some(processor) => processor(&line, text),
+            None => Hresult::FAIL,
+        };
+
+        ProcessorProgress::Complete(result)
     }
 
     /// Host processors reply with single lines and start no transfers.

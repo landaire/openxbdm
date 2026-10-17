@@ -30,18 +30,68 @@ impl Mock {
             .map(|(name, user)| (name.as_slice(), user))
     }
 
-    fn position(&self, element: &[u8]) -> Option<(usize, usize)> {
+    fn position(&self, element: &[u8]) -> Option<Slot> {
         let bucket = hash_index(element);
         self.buckets[bucket]
             .iter()
             .position(|(name, _)| names_equal(name, element))
-            .map(|index| (bucket, index))
+            .map(|index| Slot { bucket, index })
     }
 
     /// The entry an open by `name` reaches.
-    fn find(&self, name: &[u8]) -> Option<(usize, usize)> {
+    fn find(&self, name: &[u8]) -> Option<Slot> {
         self.position(element(name)?)
     }
+}
+
+impl security::Backend for MockBackend {
+    fn find_user(&mut self, name: &[u8]) -> Option<User> {
+        let Slot { bucket, index } = self.security.find(name)?;
+        Some(self.security.buckets[bucket][index].1)
+    }
+
+    fn store_user(&mut self, name: &[u8], user: User) -> bool {
+        let Some(Slot { bucket, index }) = self.security.find(name) else {
+            return false;
+        };
+
+        self.security.buckets[bucket][index].1 = user;
+
+        true
+    }
+
+    fn create_user(&mut self, name: &[u8], user: User) -> Result<(), UserCreationFailed> {
+        let element = element(name).ok_or(UserCreationFailed)?;
+        if self.security.position(element).is_some() {
+            return Err(UserCreationFailed);
+        }
+
+        self.security.buckets[hash_index(element)].insert(0, (element.to_vec(), user));
+
+        Ok(())
+    }
+
+    fn remove_user(&mut self, name: &[u8]) -> bool {
+        let Some(Slot { bucket, index }) = self.security.find(name) else {
+            return false;
+        };
+
+        self.security.buckets[bucket].remove(index);
+
+        true
+    }
+
+    fn user_name_at(&mut self, index: u32) -> Option<UserName> {
+        let (name, _) = self.security.buckets.iter().flatten().nth(index as usize)?;
+        UserName::new(name)
+    }
+}
+
+/// Location of a user in the directory.
+struct Slot {
+    bucket: usize,
+    /// Chain position within the bucket.
+    index: usize,
 }
 
 /// Bucket of a name: bytes below 0x80 are folded to lower case and mixed;
@@ -55,6 +105,7 @@ fn hash_index(name: &[u8]) -> usize {
                 .wrapping_add(hash >> 1)
                 .wrapping_add(hash.wrapping_mul(3))
         });
+
     (hash % BUCKETS as u32) as usize
 }
 
@@ -71,10 +122,9 @@ fn upper(byte: u8) -> u8 {
 
 fn names_equal(left: &[u8], right: &[u8]) -> bool {
     left.len() == right.len()
-        && left
-            .iter()
-            .zip(right)
-            .all(|(&a, &b)| a == b || upper(a) == upper(b))
+        && left.iter().zip(right).all(|(&left_byte, &right_byte)| {
+            left_byte == right_byte || upper(left_byte) == upper(right_byte)
+        })
 }
 
 /// Element an open or insertion of `name` relative to the directory
@@ -86,46 +136,10 @@ fn element(name: &[u8]) -> Option<&[u8]> {
     if name.is_empty() || name[0] == b'\\' {
         return None;
     }
+
     match name.iter().position(|&byte| byte == b'\\') {
         None => Some(name),
         Some(split) if split + 1 == name.len() => Some(&name[..split]),
         Some(_) => None,
-    }
-}
-
-impl security::Backend for MockBackend {
-    fn find_user(&mut self, name: &[u8]) -> Option<User> {
-        let (bucket, index) = self.security.find(name)?;
-        Some(self.security.buckets[bucket][index].1)
-    }
-
-    fn store_user(&mut self, name: &[u8], user: User) -> bool {
-        let Some((bucket, index)) = self.security.find(name) else {
-            return false;
-        };
-        self.security.buckets[bucket][index].1 = user;
-        true
-    }
-
-    fn create_user(&mut self, name: &[u8], user: User) -> Result<(), UserCreationFailed> {
-        let element = element(name).ok_or(UserCreationFailed)?;
-        if self.security.position(element).is_some() {
-            return Err(UserCreationFailed);
-        }
-        self.security.buckets[hash_index(element)].insert(0, (element.to_vec(), user));
-        Ok(())
-    }
-
-    fn remove_user(&mut self, name: &[u8]) -> bool {
-        let Some((bucket, index)) = self.security.find(name) else {
-            return false;
-        };
-        self.security.buckets[bucket].remove(index);
-        true
-    }
-
-    fn user_name_at(&mut self, index: u32) -> Option<UserName> {
-        let (name, _) = self.security.buckets.iter().flatten().nth(index as usize)?;
-        UserName::new(name)
     }
 }

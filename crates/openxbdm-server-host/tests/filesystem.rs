@@ -4,10 +4,10 @@ mod common;
 
 use std::io::Read;
 use std::io::Write;
+use std::num::NonZeroU32;
+use std::thread;
+use std::time::Duration;
 
-use common::RawSession;
-use common::TestServer;
-use common::run;
 use openxbdm_client::commands::Delete;
 use openxbdm_client::commands::DirList;
 use openxbdm_client::commands::DriveFreeSpace;
@@ -18,10 +18,16 @@ use openxbdm_client::commands::GetFileAttributes;
 use openxbdm_client::commands::GetFileRange;
 use openxbdm_client::commands::MakeDirectory;
 use openxbdm_client::commands::Rename;
+use openxbdm_server::commands::filesystem;
 use openxbdm_server::notify::ExecutionState;
+use openxbdm_server_host::Host;
 use openxbdm_server_host::backend::filesystem::HARDDISK;
 use openxbdm_server_host::backend::memory::MEMORY_BASE;
 use xbox360_sys::xboxkrnl::FileAttributes;
+
+use common::RawSession;
+use common::TestServer;
+use common::run;
 
 const DEVKIT: &str = "\\Device\\Harddisk0\\Partition1\\DEVKIT";
 
@@ -46,6 +52,76 @@ fn upload(session: &mut RawSession, command: &str, data: &[u8]) -> String {
     assert_eq!(session.command(command), "204- send binary data");
     session.stream.write_all(data).unwrap();
     session.line()
+}
+
+/// CRC-32/MPEG-2 without final inversion, bit by bit.
+fn mpeg2_crc(data: impl IntoIterator<Item = u8>) -> u32 {
+    let mut crc = u32::MAX;
+
+    for byte in data {
+        crc ^= u32::from(byte) << 24;
+        for _ in 0..8 {
+            crc = if crc & 0x8000_0000 != 0 {
+                (crc << 1) ^ 0x04c1_1db7
+            } else {
+                crc << 1
+            };
+        }
+    }
+
+    crc
+}
+
+/// Reflected CRC-32 without final inversion.
+fn reflected_crc(data: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+
+    crc
+}
+
+fn write_memory(server: &TestServer, address: u32, bytes: &[u8]) {
+    let mut host = server.host.lock();
+    let region = host
+        .backend
+        .memory
+        .regions
+        .iter_mut()
+        .find(|region| region.base == MEMORY_BASE)
+        .unwrap();
+
+    let offset = (address - MEMORY_BASE) as usize;
+    region.bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
+}
+
+/// Run control code 0x03 for `name`, pointing at a string stored at
+/// `target` (or removing the drive).
+fn map_title_drive(server: &TestServer, name: &[u8], target: Option<(u32, &[u8])>) {
+    let request = MEMORY_BASE + 0x8000;
+    let mut bytes = [0u8; 0x24];
+    bytes[..name.len()].copy_from_slice(name);
+    if let Some((address, text)) = target {
+        write_memory(server, address, &[text, b"\0"].concat());
+        bytes[0x20..].copy_from_slice(&address.to_be_bytes());
+    }
+
+    write_memory(server, request, &bytes);
+
+    let mut guard = server.host.lock();
+    let Host {
+        server, backend, ..
+    } = &mut *guard;
+    filesystem::map_title_drive(&mut server.state, backend, request);
 }
 
 #[test]
@@ -79,8 +155,9 @@ fn client_file_operations_round_trip() {
 
         let range = GetFileRange::Range {
             offset: 0x10,
-            size: core::num::NonZeroU32::new(0x20),
+            size: NonZeroU32::new(0x20),
         };
+
         let range = client.get_file("E:\\dir\\data.bin", range).await.unwrap();
         assert_eq!(range.into_vec().await.unwrap(), payload[0x10..0x30]);
 
@@ -142,6 +219,7 @@ fn client_file_operations_round_trip() {
         assert_eq!(space.total_bytes, 0x1000 * 0x4000);
         assert_eq!(space.free_to_caller_bytes, space.total_free_bytes);
     });
+
     let host = server.host.lock();
     assert!(host.backend.filesystem.entry(&devkit("dir")).is_none());
     assert_eq!(host.backend.filesystem.open_handles(), 0);
@@ -203,6 +281,7 @@ fn delete_reports_kind_mismatches_and_protects_roots() {
         host.backend.filesystem.write(&devkit("file"), b"x");
         host.backend.filesystem.write(&devkit("full\\child"), b"y");
     }
+
     let mut session = session(&server);
     assert_eq!(session.command("delete"), "400- missing name");
     assert_eq!(
@@ -353,6 +432,7 @@ fn upload_write_failures_follow_the_staging_halves() {
         host.backend.filesystem.write(&devkit("w"), b"");
         host.backend.filesystem.write_limit = Some(0x4000);
     }
+
     let mut session = session(&server);
     let data = vec![0x5a; 0x4800];
     assert_eq!(
@@ -387,6 +467,7 @@ fn dirlist_lines_follow_the_stock_format() {
             .filesystem
             .set_attributes(&devkit("sub\\x"), FileAttributes::from_bits_retain(0x3));
     }
+
     let mut session = session(&server);
     assert_eq!(
         session.command("dirlist name=e:\\"),
@@ -510,8 +591,10 @@ fn a_stalled_transfer_reader_does_not_block_other_connections() {
         stalled.command("getfile name=e:\\big"),
         "203- binary response follows"
     );
+
     // Let the transfer fill the socket buffers.
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    thread::sleep(Duration::from_millis(500));
+
     let mut other = session(&server);
     assert_eq!(other.command("srvproc num=1"), "200- prev=0");
 }
@@ -540,6 +623,7 @@ fn translation_handles_prefixes_and_dos_links() {
         );
         session.multiline();
     }
+
     assert_eq!(session.command("getfileattributes name=e:t"), "400- ");
     assert_eq!(
         session.command("getfileattributes name=W:\\t"),
@@ -605,6 +689,7 @@ fn setfileattributes_changes_flags_and_times() {
         assert_eq!(entry.creation_time.0, 0x1_0000_0002);
         assert_eq!(entry.last_write_time.0, 0x3_0000_0004);
     }
+
     assert_eq!(session.command("delete name=e:\\a"), "414- access denied");
     assert_eq!(
         session.command("setfileattributes name=e:\\a readonly=0"),
@@ -645,6 +730,7 @@ fn getvfattr_returns_records_in_order() {
             .unwrap();
         session.stream.write_all(name).unwrap();
     }
+
     assert_eq!(session.line(), "203- binary response follows");
     let records = read_bytes(&mut session, 2 * 0x1c);
     let word =
@@ -676,6 +762,7 @@ fn sendvfile_reports_one_result_per_file() {
         stream.extend_from_slice(name);
         stream.extend_from_slice(data);
     }
+
     session.stream.write_all(&stream).unwrap();
     assert_eq!(session.line(), "203- binary response follows");
     let results = read_bytes(&mut session, 12);
@@ -693,6 +780,7 @@ fn end_of_file_beyond_the_volume_is_disk_full() {
     use openxbdm_core::status::KernelError;
     use openxbdm_server::commands::filesystem::Backend as _;
     use openxbdm_server::commands::filesystem::CreateRequest;
+    use openxbdm_server::commands::filesystem::FileData;
     use xbox360_sys::xboxkrnl::AccessMask;
     use xbox360_sys::xboxkrnl::CreateOptions;
     use xbox360_sys::xboxkrnl::ShareAccess;
@@ -715,30 +803,11 @@ fn end_of_file_beyond_the_volume_is_disk_full() {
         Err(KernelError::DiskFull)
     );
     assert_eq!(
-        host.backend.write_file(
-            handle,
-            Some(u64::MAX),
-            openxbdm_server::commands::filesystem::FileData::Bytes(b"x")
-        ),
+        host.backend
+            .write_file(handle, Some(u64::MAX), FileData::Bytes(b"x")),
         Err(KernelError::DiskFull)
     );
     host.backend.close_file(handle);
-}
-
-/// CRC-32/MPEG-2 without final inversion, bit by bit.
-fn mpeg2_crc(data: impl IntoIterator<Item = u8>) -> u32 {
-    let mut crc = u32::MAX;
-    for byte in data {
-        crc ^= u32::from(byte) << 24;
-        for _ in 0..8 {
-            crc = if crc & 0x8000_0000 != 0 {
-                (crc << 1) ^ 0x04c1_1db7
-            } else {
-                crc << 1
-            };
-        }
-    }
-    crc
 }
 
 #[test]
@@ -860,22 +929,6 @@ fn fmtfat_requires_force_or_a_pending_title() {
     assert!(host.backend.filesystem.entry(DEVKIT).is_none());
 }
 
-/// Reflected CRC-32 without final inversion.
-fn reflected_crc(data: &[u8]) -> u32 {
-    let mut crc = u32::MAX;
-    for &byte in data {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ 0xedb8_8320
-            } else {
-                crc >> 1
-            };
-        }
-    }
-    crc
-}
-
 #[test]
 fn sysfileupd_replaces_files_after_the_crc_check() {
     let server = TestServer::start();
@@ -909,6 +962,7 @@ fn sysfileupd_replaces_files_after_the_crc_check() {
                 .is_none()
         );
     }
+
     assert_eq!(
         session.command(&format!("sysfileupd name={target} query=1")),
         "200- 0x5000 0x100000002"
@@ -940,6 +994,7 @@ fn dvdperf_reports_valid_trace_records() {
             .filesystem
             .record_dvd_request(9000, 0x40, 2, 9, true);
     }
+
     assert_eq!(
         session.command("dvdperf stop report"),
         "202- multiline response follows"
@@ -963,7 +1018,7 @@ fn interrupted_transfers_release_their_resources() {
         .backend
         .filesystem
         .write(&devkit("big"), &vec![0x5a; 0x100_0000]);
-    let released = |host: &openxbdm_server_host::Host| {
+    let released = |host: &Host| {
         host.backend.filesystem.open_handles() == 0 && host.backend.filesystem.pool_blocks() == 0
     };
 
@@ -1013,37 +1068,6 @@ fn line_buffer_allocation_failures() {
     assert_eq!(server.host.lock().backend.filesystem.open_handles(), 0);
 }
 
-fn write_memory(server: &TestServer, address: u32, bytes: &[u8]) {
-    let mut host = server.host.lock();
-    let region = host
-        .backend
-        .memory
-        .regions
-        .iter_mut()
-        .find(|region| region.base == MEMORY_BASE)
-        .unwrap();
-    let offset = (address - MEMORY_BASE) as usize;
-    region.bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
-}
-
-/// Run control code 0x03 for `name`, pointing at a string stored at
-/// `target` (or removing the drive).
-fn map_title_drive(server: &TestServer, name: &[u8], target: Option<(u32, &[u8])>) {
-    let request = MEMORY_BASE + 0x8000;
-    let mut bytes = [0u8; 0x24];
-    bytes[..name.len()].copy_from_slice(name);
-    if let Some((address, text)) = target {
-        write_memory(server, address, &[text, b"\0"].concat());
-        bytes[0x20..].copy_from_slice(&address.to_be_bytes());
-    }
-    write_memory(server, request, &bytes);
-    let mut guard = server.host.lock();
-    let openxbdm_server_host::Host {
-        server, backend, ..
-    } = &mut *guard;
-    openxbdm_server::commands::filesystem::map_title_drive(&mut server.state, backend, request);
-}
-
 #[test]
 fn title_drive_mappings_follow_the_monitor_table() {
     let server = TestServer::start();
@@ -1052,12 +1076,14 @@ fn title_drive_mappings_follow_the_monitor_table() {
         host.backend.filesystem.write(&devkit("sub\\f"), b"f");
         host.backend.filesystem.write(&devkit("sux\\g"), b"g");
     }
+
     let target = MEMORY_BASE + 0x8100;
     map_title_drive(
         &server,
         b"T",
         Some((target, b"\\Device\\Harddisk0\\Partition1\\DEVKIT\\sub")),
     );
+
     // The table is full after the appended row.
     map_title_drive(&server, b"V", Some((MEMORY_BASE + 0x8200, b"\\Device")));
     let mut session = session(&server);
@@ -1086,6 +1112,7 @@ fn title_drive_mappings_follow_the_monitor_table() {
         "202- multiline response follows"
     );
     session.multiline();
+
     // Translation reads the string to its current end.
     write_memory(&server, target + 0x23, b"\0");
     assert_eq!(
@@ -1122,6 +1149,7 @@ fn file_change_counter_counts_closes_of_changed_files() {
         "200- OK"
     );
     assert_eq!(changes(&server), 3);
+
     // Failed opens and read-only commands do not count.
     assert_eq!(
         session.command("delete name=e:\\none"),

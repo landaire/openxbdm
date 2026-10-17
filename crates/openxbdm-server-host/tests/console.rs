@@ -11,9 +11,6 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
-use common::RawSession;
-use common::TestServer;
-use common::run;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
 use openxbdm_server::commands::console::ConfigSetting;
@@ -27,6 +24,10 @@ use openxbdm_server::commands::system::RebootKind;
 use openxbdm_server_host::Host;
 use xbox360_sys::xboxkrnl::HardwareFlags;
 
+use common::RawSession;
+use common::TestServer;
+use common::run;
+
 fn session(server: &TestServer) -> RawSession {
     let mut session = server.raw();
     assert_eq!(session.line(), "201- connected");
@@ -37,6 +38,75 @@ fn server_with(configure: impl FnOnce(&mut Host)) -> TestServer {
     let mut host = Host::default();
     configure(&mut host);
     TestServer::with_host(host)
+}
+
+/// Wait until the registration reaches `expected`.
+fn wait_for_registration(server: &TestServer, expected: RegistrationState) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+
+    loop {
+        let current = server
+            .host
+            .lock()
+            .server
+            .state
+            .console
+            .http_registration
+            .state;
+        if current == expected {
+            return;
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "registration stayed {current:?}, expected {expected:?}"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Accept the registration request and return its head (request line and
+/// headers, without the blank line).
+fn accept_registration(listener: &TcpListener) -> (TcpStream, String) {
+    let (stream, _) = listener.accept().unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut head = String::new();
+
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        if line == "\r\n" {
+            return (stream, head);
+        }
+
+        head.push_str(&line);
+    }
+}
+
+fn register(server: &TestServer, listener: &TcpListener) -> (TcpStream, String) {
+    let port = listener.local_addr().unwrap().port();
+    let mut session = session(server);
+    assert_eq!(
+        session.command(&format!(
+            "httpreg server=127.0.0.1 object=/lab/reg port={port}"
+        )),
+        "200- OK"
+    );
+    accept_registration(listener)
+}
+
+fn debug_output(server: &TestServer) -> Vec<String> {
+    server
+        .host
+        .lock()
+        .backend
+        .debug_output
+        .iter()
+        .map(|line| String::from_utf8_lossy(line).into_owned())
+        .collect()
 }
 
 #[test]
@@ -94,6 +164,7 @@ fn console_memory_classes() {
         debug_memory: 0,
         page_threshold: 0x2_0000,
     };
+
     let server = server_with(|host| host.backend.console.memory_statistics = Some(base));
     assert_eq!(
         session(&server).command("consolemem"),
@@ -253,6 +324,7 @@ fn flag_update_falls_back_without_the_modify_export() {
             0x0000_0001u32.to_be_bytes().to_vec(),
         );
     });
+
     let mut session = session(&server);
     assert_eq!(session.command("welcomedefault enabled=False"), "200- OK");
     assert_eq!(session.command("welcomehide enabled=off"), "200- OK");
@@ -526,71 +598,6 @@ fn http_registration() {
     assert_eq!(state(&server).port, 0);
 }
 
-/// Wait until the registration reaches `expected`.
-fn wait_for_registration(server: &TestServer, expected: RegistrationState) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let current = server
-            .host
-            .lock()
-            .server
-            .state
-            .console
-            .http_registration
-            .state;
-        if current == expected {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "registration stayed {current:?}, expected {expected:?}"
-        );
-        thread::sleep(Duration::from_millis(5));
-    }
-}
-
-/// Accept the registration request and return its head (request line and
-/// headers, without the blank line).
-fn accept_registration(listener: &TcpListener) -> (TcpStream, String) {
-    let (stream, _) = listener.accept().unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    let mut reader = BufReader::new(stream.try_clone().unwrap());
-    let mut head = String::new();
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
-        if line == "\r\n" {
-            return (stream, head);
-        }
-        head.push_str(&line);
-    }
-}
-
-fn register(server: &TestServer, listener: &TcpListener) -> (TcpStream, String) {
-    let port = listener.local_addr().unwrap().port();
-    let mut session = session(server);
-    assert_eq!(
-        session.command(&format!(
-            "httpreg server=127.0.0.1 object=/lab/reg port={port}"
-        )),
-        "200- OK"
-    );
-    accept_registration(listener)
-}
-
-fn debug_output(server: &TestServer) -> Vec<String> {
-    server
-        .host
-        .lock()
-        .backend
-        .debug_output
-        .iter()
-        .map(|line| String::from_utf8_lossy(line).into_owned())
-        .collect()
-}
-
 #[test]
 fn http_registration_exchange() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -621,11 +628,13 @@ fn http_registration_exchange() {
         .unwrap();
     wait_for_registration(&server, RegistrationState::Registered);
 
-    let host = server.host.lock();
-    let length = host.server.state.console.http_registration.response_len();
-    assert_eq!(&host.backend.console.http.body[..length], b"hello");
-    assert_eq!(host.backend.console.http.closes, 1);
-    drop(host);
+    {
+        let host = server.host.lock();
+        let length = host.server.state.console.http_registration.response_len();
+        assert_eq!(&host.backend.console.http.body[..length], b"hello");
+        assert_eq!(host.backend.console.http.closes, 1);
+    }
+
     let output = debug_output(&server);
     assert!(
         output.contains(&format!(
@@ -685,6 +694,7 @@ fn title_end_restarts_registration_on_old_system_software() {
         );
         assert_eq!(backend.console.http.closes, 1);
     }
+
     // The task starts the registration again.
     let (_second, head) = accept_registration(&listener);
     assert!(
@@ -716,11 +726,13 @@ fn unreadable_settings_block_makes_a_test_kit() {
         failing(host);
         host.backend.memory.flash[0x90..0x94].copy_from_slice(&[0, 0, 0, 1]);
     });
-    let host = server.host.lock();
-    assert_eq!(host.server.state.console.dump_mode, DumpMode::Enabled);
-    assert_eq!(host.backend.memory.flash[0x90..0x94], [0; 4]);
-    assert_eq!(host.backend.system.reboots, [RebootKind::Normal]);
-    drop(host);
+    {
+        let host = server.host.lock();
+        assert_eq!(host.server.state.console.dump_mode, DumpMode::Enabled);
+        assert_eq!(host.backend.memory.flash[0x90..0x94], [0; 4]);
+        assert_eq!(host.backend.system.reboots, [RebootKind::Normal]);
+    }
+
     assert_eq!(session(&server).command("consoletype"), "200- testkit");
 
     // A cleared flash field needs no restart; a stored dump mode is kept.
@@ -728,11 +740,12 @@ fn unreadable_settings_block_makes_a_test_kit() {
         failing(host);
         host.backend.system.settings = Some(b"dumpmode disabled\r\n".to_vec());
     });
-    let host = server.host.lock();
-    assert!(host.backend.console.marked_test_kit);
-    assert_eq!(host.server.state.console.dump_mode, DumpMode::Disabled);
-    assert!(host.backend.system.reboots.is_empty());
-    drop(host);
+    {
+        let host = server.host.lock();
+        assert!(host.backend.console.marked_test_kit);
+        assert_eq!(host.server.state.console.dump_mode, DumpMode::Disabled);
+        assert!(host.backend.system.reboots.is_empty());
+    }
 
     // Mapped internal drives, a readable block, or a console before Trinity
     // skip the check.
@@ -746,6 +759,7 @@ fn unreadable_settings_block_makes_a_test_kit() {
             failing(host);
             configure(host);
         });
+
         assert!(!server.host.lock().backend.console.marked_test_kit);
     }
 }
@@ -854,6 +868,7 @@ fn system_info() {
         host.backend.console.system_information.hardware_flags =
             HardwareFlags::from_bits_retain(0x7000_0001);
     });
+
     let mut session = self::session(&server);
     session.command("systeminfo");
     assert_eq!(
@@ -869,6 +884,7 @@ fn system_info() {
 #[test]
 fn exported_settings_reach_commands_and_mirrors() {
     use openxbdm_server::commands::console::DUMP_SETTINGS_SIZE;
+    use openxbdm_server::commands::console::DebugName;
     use openxbdm_server::commands::console::ExportedSetting;
     use openxbdm_server::commands::console::apply_exported_setting;
 
@@ -880,16 +896,16 @@ fn exported_settings_reach_commands_and_mirrors() {
         } = &mut *host;
         apply_exported_setting(&mut server.state, backend, setting);
     };
+
     apply(ExportedSetting::DumpMode(7));
+
     // Stock indexes past each name group for values only export 120 stores.
     let mut block = [0u8; DUMP_SETTINGS_SIZE];
     block[2..4].copy_from_slice(&[0x04, 0x23]);
     block[4..8].copy_from_slice(b"e:\\d");
     apply(ExportedSetting::DumpSettings(block));
     apply(ExportedSetting::EventDefer(0x41));
-    apply(ExportedSetting::DebugName(
-        openxbdm_server::commands::console::DebugName::new(b"kit"),
-    ));
+    apply(ExportedSetting::DebugName(DebugName::new(b"kit")));
 
     let mut session = session(&server);
     assert_eq!(session.command("dumpmode"), "200- smart");
@@ -952,5 +968,6 @@ fn settings_lines_formatted_whole_echo_once() {
             .collect();
         assert_eq!(pieces, [line], "{prefix}");
     }
+
     assert!(file.contains("httpreg server=lab object=/reg port=81\r\n"));
 }

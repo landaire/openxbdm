@@ -3,6 +3,7 @@
 
 use std::io;
 use std::io::ErrorKind;
+use std::mem;
 use std::net::Ipv4Addr;
 use std::net::SocketAddrV4;
 use std::net::UdpSocket;
@@ -59,6 +60,7 @@ pub struct Mock {
     pub register_failure: Option<RegisterStatus>,
     /// The next receive thread creation fails.
     pub thread_failure: bool,
+
     pub register_routine: bool,
     pub inject_routine: bool,
     pub host: Option<Endpoint>,
@@ -67,6 +69,7 @@ pub struct Mock {
     pub hook_installed: bool,
     /// Proxy bypass flag of the network simulator instance.
     pub proxy_bypass: bool,
+
     link: Arc<Mutex<Link>>,
     stopping: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -75,6 +78,7 @@ pub struct Mock {
 impl Default for Mock {
     fn default() -> Self {
         let now = Instant::now();
+
         Self {
             missing_routine: None,
             socket_failure: None,
@@ -115,6 +119,7 @@ impl Mock {
         else {
             return false;
         };
+
         let Some(outbound) = tunnel::encapsulate(
             packet,
             &Tunnel {
@@ -124,12 +129,143 @@ impl Mock {
         ) else {
             return false;
         };
+
         let mut datagram = outbound.message().to_vec();
         datagram.extend_from_slice(&packet[outbound.payload]);
+
         // The stack reports no delivery result to the hook.
         let _ = socket.send(&datagram);
         self.link().last_send = Instant::now();
+
         true
+    }
+}
+
+impl ipproxy::Backend for MockBackend {
+    fn proxy_started(&mut self) -> bool {
+        self.network.ipproxy.register_routine
+    }
+
+    fn resolve_proxy_routines(&mut self) -> Result<(), RoutineMissing> {
+        let mock = &mut self.network.ipproxy;
+        if mock.missing_routine == Some(Routine::Register) {
+            return Err(RoutineMissing);
+        }
+
+        mock.register_routine = true;
+        if mock.missing_routine == Some(Routine::Inject) {
+            return Err(RoutineMissing);
+        }
+        mock.inject_routine = true;
+
+        Ok(())
+    }
+
+    fn release_proxy_routines(&mut self) {
+        self.network.ipproxy.register_routine = false;
+        self.network.ipproxy.inject_routine = false;
+    }
+
+    fn open_proxy_socket(&mut self, host: Endpoint) -> Result<(), SocketFailed> {
+        let mock = &mut self.network.ipproxy;
+        mock.host = Some(host);
+
+        let now = Instant::now();
+        {
+            let mut link = lock(&mock.link);
+            link.last_receive = now;
+            link.last_send = now;
+        }
+
+        if let Some(error) = mock.socket_failure.take() {
+            return Err(error);
+        }
+
+        let (socket, port) = connect(host).map_err(|error| SocketFailed(Some(error)))?;
+
+        // The local address is the first dword of the debug XNADDR.
+        let record = self.console.debug_address.record;
+        mock.local = Endpoint {
+            address: Ipv4Address([record[0], record[1], record[2], record[3]]),
+            port,
+        };
+        mock.socket = Some(socket);
+
+        Ok(())
+    }
+
+    fn close_proxy_socket(&mut self) {
+        self.network.ipproxy.socket = None;
+    }
+
+    fn proxy_local_endpoint(&mut self) -> Endpoint {
+        self.network.ipproxy.local
+    }
+
+    fn set_proxy_bypass(&mut self, active: bool) {
+        self.network.ipproxy.proxy_bypass = active;
+    }
+
+    fn install_proxy_hook(&mut self) -> Result<(), RegisterStatus> {
+        let mock = &mut self.network.ipproxy;
+        if let Some(status) = mock.register_failure.take() {
+            return Err(status);
+        }
+
+        mock.hook_installed = true;
+
+        Ok(())
+    }
+
+    fn remove_proxy_hook(&mut self) -> Result<(), RegisterStatus> {
+        let mock = &mut self.network.ipproxy;
+        if let Some(status) = mock.register_failure.take() {
+            return Err(status);
+        }
+
+        mock.hook_installed = false;
+
+        Ok(())
+    }
+
+    fn start_proxy_thread(&mut self) -> Result<(), ThreadFailed> {
+        let mock = &mut self.network.ipproxy;
+        if mem::take(&mut mock.thread_failure) {
+            return Err(ThreadFailed);
+        }
+
+        let socket = mock
+            .socket
+            .as_ref()
+            .ok_or(ThreadFailed)?
+            .try_clone()
+            .map_err(|_| ThreadFailed)?;
+
+        mock.stopping.store(false, Ordering::SeqCst);
+        let link = Arc::clone(&mock.link);
+        let stopping = Arc::clone(&mock.stopping);
+        mock.thread = Some(thread::spawn(move || receive(socket, link, stopping)));
+
+        Ok(())
+    }
+
+    fn stop_proxy_thread(&mut self) {
+        let mock = &mut self.network.ipproxy;
+        mock.stopping.store(true, Ordering::SeqCst);
+
+        if let Some(socket) = mock.socket.take() {
+            // Closing a host socket does not end a pending receive on its
+            // clone: wake the loop with a datagram to itself instead.
+            if let Ok(own) = socket.local_addr()
+                && socket.connect(own).is_ok()
+            {
+                let _ = socket.send(&[]);
+            }
+        }
+
+        if let Some(thread) = mock.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -151,17 +287,20 @@ fn wsa_error(error: &io::Error) -> WsaError {
         ErrorKind::HostUnreachable => 10065,
         _ => 10050,
     };
+
     WsaError::new(code).expect("Winsock codes are nonzero")
 }
 
 fn connect(host: Endpoint) -> Result<(UdpSocket, u16), WsaError> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).map_err(|error| wsa_error(&error))?;
+
     let target = SocketAddrV4::new(Ipv4Addr::from(host.address.octets()), host.port);
     socket.connect(target).map_err(|error| wsa_error(&error))?;
     let port = socket
         .local_addr()
         .map_err(|error| wsa_error(&error))?
         .port();
+
     Ok((socket, port))
 }
 
@@ -173,6 +312,7 @@ fn receive(socket: UdpSocket, link: Arc<Mutex<Link>>, stopping: Arc<AtomicBool>)
     {
         return;
     }
+
     let mut buffer = [0u8; tunnel::MESSAGE_LIMIT];
     loop {
         let length = match socket.recv(&mut buffer) {
@@ -183,13 +323,16 @@ fn receive(socket: UdpSocket, link: Arc<Mutex<Link>>, stopping: Arc<AtomicBool>)
         if stopping.load(Ordering::SeqCst) {
             return;
         }
+
         let now = Instant::now();
         let mut link = lock(&link);
         if now.duration_since(link.last_send) >= tunnel::KEEPALIVE_INTERVAL {
             let _ = socket.send(&tunnel::KEEPALIVE);
             link.last_send = now;
         }
+
         match tunnel::decapsulate(&buffer[..length]) {
+            // Not a tunnel message; the loop ignores it.
             None => {}
             Some(Inbound::Keepalive) => link.last_receive = now,
             Some(Inbound::Packet(packet)) => {
@@ -199,118 +342,6 @@ fn receive(socket: UdpSocket, link: Arc<Mutex<Link>>, stopping: Arc<AtomicBool>)
                 bytes.extend_from_slice(packet.payload);
                 link.injected.push(bytes);
             }
-        }
-    }
-}
-
-impl ipproxy::Backend for MockBackend {
-    fn proxy_started(&mut self) -> bool {
-        self.network.ipproxy.register_routine
-    }
-
-    fn resolve_proxy_routines(&mut self) -> Result<(), RoutineMissing> {
-        let mock = &mut self.network.ipproxy;
-        if mock.missing_routine == Some(Routine::Register) {
-            return Err(RoutineMissing);
-        }
-        mock.register_routine = true;
-        if mock.missing_routine == Some(Routine::Inject) {
-            return Err(RoutineMissing);
-        }
-        mock.inject_routine = true;
-        Ok(())
-    }
-
-    fn release_proxy_routines(&mut self) {
-        self.network.ipproxy.register_routine = false;
-        self.network.ipproxy.inject_routine = false;
-    }
-
-    fn open_proxy_socket(&mut self, host: Endpoint) -> Result<(), SocketFailed> {
-        let mock = &mut self.network.ipproxy;
-        mock.host = Some(host);
-        let now = Instant::now();
-        {
-            let mut link = lock(&mock.link);
-            link.last_receive = now;
-            link.last_send = now;
-        }
-        if let Some(error) = mock.socket_failure.take() {
-            return Err(error);
-        }
-        let (socket, port) = connect(host).map_err(|error| SocketFailed(Some(error)))?;
-        // The local address is the first dword of the debug XNADDR.
-        let record = self.console.debug_address.record;
-        mock.local = Endpoint {
-            address: Ipv4Address([record[0], record[1], record[2], record[3]]),
-            port,
-        };
-        mock.socket = Some(socket);
-        Ok(())
-    }
-
-    fn close_proxy_socket(&mut self) {
-        self.network.ipproxy.socket = None;
-    }
-
-    fn proxy_local_endpoint(&mut self) -> Endpoint {
-        self.network.ipproxy.local
-    }
-
-    fn set_proxy_bypass(&mut self, active: bool) {
-        self.network.ipproxy.proxy_bypass = active;
-    }
-
-    fn install_proxy_hook(&mut self) -> Result<(), RegisterStatus> {
-        let mock = &mut self.network.ipproxy;
-        if let Some(status) = mock.register_failure.take() {
-            return Err(status);
-        }
-        mock.hook_installed = true;
-        Ok(())
-    }
-
-    fn remove_proxy_hook(&mut self) -> Result<(), RegisterStatus> {
-        let mock = &mut self.network.ipproxy;
-        if let Some(status) = mock.register_failure.take() {
-            return Err(status);
-        }
-        mock.hook_installed = false;
-        Ok(())
-    }
-
-    fn start_proxy_thread(&mut self) -> Result<(), ThreadFailed> {
-        let mock = &mut self.network.ipproxy;
-        if std::mem::take(&mut mock.thread_failure) {
-            return Err(ThreadFailed);
-        }
-        let socket = mock
-            .socket
-            .as_ref()
-            .ok_or(ThreadFailed)?
-            .try_clone()
-            .map_err(|_| ThreadFailed)?;
-        mock.stopping.store(false, Ordering::SeqCst);
-        let link = Arc::clone(&mock.link);
-        let stopping = Arc::clone(&mock.stopping);
-        mock.thread = Some(thread::spawn(move || receive(socket, link, stopping)));
-        Ok(())
-    }
-
-    fn stop_proxy_thread(&mut self) {
-        let mock = &mut self.network.ipproxy;
-        mock.stopping.store(true, Ordering::SeqCst);
-        if let Some(socket) = mock.socket.take() {
-            // Closing a host socket does not end a pending receive on its
-            // clone: wake the loop with a datagram to itself instead.
-            if let Ok(own) = socket.local_addr()
-                && socket.connect(own).is_ok()
-            {
-                let _ = socket.send(&[]);
-            }
-        }
-        if let Some(thread) = mock.thread.take() {
-            let _ = thread.join();
         }
     }
 }

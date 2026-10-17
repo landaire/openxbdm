@@ -18,8 +18,6 @@ use openxbdm_client::transport::tokio::TokioTransport;
 use openxbdm_server_host::Host;
 use openxbdm_server_host::SharedHost;
 
-/// Limit for a whole async test body.
-const RUN_LIMIT: Duration = Duration::from_secs(60);
 const WAIT_LIMIT: Duration = Duration::from_secs(10);
 
 /// A server on a loopback port with its own simulated console.
@@ -36,9 +34,11 @@ impl TestServer {
     pub fn with_host(host: Host) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+
         let host = SharedHost::new(host);
         let serving = host.clone();
         thread::spawn(move || serving.serve(&listener));
+
         Self { host, address }
     }
 
@@ -57,7 +57,9 @@ impl TestServer {
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
+
         let reader = BufReader::new(stream.try_clone().unwrap());
+
         RawSession { stream, reader }
     }
 
@@ -65,25 +67,12 @@ impl TestServer {
     /// deadline.
     pub fn wait_until(&self, done: impl Fn(&Host) -> bool) {
         let deadline = Instant::now() + WAIT_LIMIT;
+
         while !done(&self.host.lock()) {
             assert!(Instant::now() < deadline, "condition not reached");
             thread::sleep(Duration::from_millis(1));
         }
     }
-}
-
-/// Run an async test body on a current-thread runtime, failing after a
-/// deadline.
-pub fn run<F: Future>(future: F) -> F::Output {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        tokio::time::timeout(RUN_LIMIT, future)
-            .await
-            .expect("test body timed out")
-    })
 }
 
 /// A session that exchanges exact protocol lines.
@@ -98,6 +87,7 @@ impl RawSession {
         let mut line = String::new();
         let count = self.reader.read_line(&mut line).unwrap();
         assert_ne!(count, 0, "connection closed");
+
         line.trim_end_matches(['\r', '\n']).to_owned()
     }
 
@@ -116,12 +106,35 @@ impl RawSession {
     /// Read lines up to and excluding the `.` terminator.
     pub fn multiline(&mut self) -> Vec<String> {
         let mut lines = Vec::new();
+
         loop {
             let line = self.line();
             if line == "." {
                 return lines;
             }
+
             lines.push(line);
         }
     }
+}
+
+/// Run an async test body on a current-thread runtime, failing after a
+/// deadline.
+pub fn run<F>(future: F) -> F::Output
+where
+    F: Future,
+{
+    /// Limit for a whole async test body.
+    const RUN_LIMIT: Duration = Duration::from_secs(60);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    runtime.block_on(async {
+        tokio::time::timeout(RUN_LIMIT, future)
+            .await
+            .expect("test body timed out")
+    })
 }

@@ -1,23 +1,14 @@
 //! Simulated console identity and configuration.
 
+mod http;
+
 use std::collections::BTreeMap;
-use std::io;
-use std::io::Read;
-use std::io::Write;
-use std::net::TcpStream;
-use std::sync::mpsc;
-use std::sync::mpsc::Receiver;
-use std::sync::mpsc::TryRecvError;
-use std::thread;
-use std::time::Duration;
 use std::time::Instant;
 
 use openxbdm_core::status::KernelError;
-use openxbdm_core::status::Win32Error;
 use openxbdm_server::commands::console;
 use openxbdm_server::commands::console::ConfigSetting;
 use openxbdm_server::commands::console::ConsoleId;
-use openxbdm_server::commands::console::HttpFailure;
 use openxbdm_server::commands::console::HttpProgress;
 use openxbdm_server::commands::console::HttpRequest;
 use openxbdm_server::commands::console::HttpStartFailure;
@@ -29,8 +20,6 @@ use openxbdm_server::commands::console::NetworkRaError;
 use openxbdm_server::commands::console::NetworkRaRecord;
 use openxbdm_server::commands::console::NetworkRaRequest;
 use openxbdm_server::commands::console::Published;
-use openxbdm_server::commands::console::REGISTRATION_RESPONSE_CAPACITY;
-use openxbdm_server::commands::console::REGISTRATION_USER_AGENT;
 use openxbdm_server::commands::console::SETTINGS_BLOCK_SIZE;
 use openxbdm_server::commands::console::SystemInformation;
 use openxbdm_server::commands::console::SystemSettings;
@@ -39,63 +28,10 @@ use xbox360_sys::xboxkrnl::HardwareFlags;
 
 use super::MockBackend;
 
-/// Simulated console configuration settings.
-#[derive(Debug)]
-pub struct XConfig {
-    /// Stored values. A setting never written reads as zero bytes of the
-    /// requested length, as the fixed-layout settings of a new console do.
-    pub settings: BTreeMap<ConfigSetting, Vec<u8>>,
-    /// Failure of every read, write, or modify of a setting.
-    pub failures: BTreeMap<ConfigSetting, KernelError>,
-    /// Whether the kernel provides the modify export (ordinal 700).
-    pub modify_export: bool,
-}
+pub use self::http::HttpClient;
 
-impl Default for XConfig {
-    fn default() -> Self {
-        Self {
-            settings: BTreeMap::new(),
-            failures: BTreeMap::new(),
-            modify_export: true,
-        }
-    }
-}
-
-impl XConfig {
-    /// The stored value of a setting, if written.
-    pub fn value(&self, category: u16, index: u16) -> Option<&[u8]> {
-        self.settings
-            .get(&ConfigSetting::new(category, index))
-            .map(Vec::as_slice)
-    }
-
-    /// The first four stored bytes of a setting as a big-endian dword; zero
-    /// if never written.
-    pub fn dword(&self, category: u16, index: u16) -> u32 {
-        let mut bytes = [0u8; 4];
-        if let Some(value) = self.value(category, index) {
-            let length = value.len().min(4);
-            bytes[..length].copy_from_slice(&value[..length]);
-        }
-        u32::from_be_bytes(bytes)
-    }
-
-    fn check(&self, setting: ConfigSetting) -> Result<(), KernelError> {
-        match self.failures.get(&setting) {
-            Some(&error) => Err(error),
-            None => Ok(()),
-        }
-    }
-}
-
-/// Simulated system network service (data-center configuration).
-#[derive(Debug, Default)]
-pub struct NetworkRaService {
-    pub record: NetworkRaRecord,
-    /// Failure of every request while set.
-    pub failure: Option<NetworkRaError>,
-    pub resets: u32,
-}
+/// Kernel address of the simulated server thread object.
+pub const SERVER_THREAD: u32 = 0x8007_4a00;
 
 /// Simulated state of this domain.
 #[derive(Debug)]
@@ -106,11 +42,14 @@ pub struct Mock {
     pub settings_block: [u8; SETTINGS_BLOCK_SIZE],
     /// Every I2C read and write fails while set.
     pub i2c_failure: bool,
+
     pub memory_statistics: Option<MemoryStatistics>,
     pub system_information: SystemInformation,
     pub console_id: Result<ConsoleId, KernelError>,
+
     pub debug_address: NetworkAddress,
     pub title_address: NetworkAddress,
+
     /// Times the inactivity configuration was applied.
     pub inactivity_updates: u32,
     pub network_ra: NetworkRaService,
@@ -118,6 +57,7 @@ pub struct Mock {
     pub feature_calls: Option<Vec<(u32, u32)>>,
     /// Failure of loading the network file system client; `None` loads it.
     pub network_client_failure: Option<KernelError>,
+
     /// System software version reported to the registration task.
     pub system_version: u32,
     /// Origin of the millisecond tick.
@@ -125,6 +65,7 @@ pub struct Mock {
     pub http: HttpClient,
     /// Server state readable by other threads.
     pub published: PublishedState,
+
     pub system_settings: SystemSettings,
     /// Startup found a test kit without the hardware flag; the simulated
     /// hardware flags do not change.
@@ -133,175 +74,21 @@ pub struct Mock {
     pub current_thread: u32,
 }
 
-/// Server state the console publishes to other threads.
-#[derive(Debug)]
-pub struct PublishedState {
-    pub name: Vec<u8>,
-    pub dump_mode: u32,
-    /// Export 119 block.
-    pub dump_settings: Vec<u8>,
-    pub event_defer: u32,
-    pub trace_mask: u32,
-    /// Export 194 view of the lab server registration.
-    pub registration: console::RegistrationResult,
-}
-
-impl Default for PublishedState {
-    /// The server's initial state.
-    fn default() -> Self {
-        let state = console::State::new();
-        Self {
-            name: Vec::new(),
-            dump_mode: state.dump_mode.raw(),
-            dump_settings: state.dump_settings.to_block().to_vec(),
-            event_defer: state.event_defer.bits(),
-            trace_mask: state.trace_mask.bits(),
-            registration: console::RegistrationResult::EMPTY,
-        }
-    }
-}
-
-/// Simulated HTTP client of the registration task: an HTTP/1.1 exchange
-/// over TCP on a worker thread, so the server polls it like the console's
-/// asynchronous client. The request carries the user agent and the host;
-/// the further headers of the console's HTTP stack are not known.
-#[derive(Debug)]
-pub struct HttpClient {
-    /// Result of the request in progress, delivered by its worker.
-    pending: Option<Receiver<Result<Vec<u8>, HttpFailure>>>,
-    /// Body of the last completed request.
-    pub body: [u8; REGISTRATION_RESPONSE_CAPACITY],
-    /// Times the client was released.
-    pub closes: u32,
-}
-
-impl Default for HttpClient {
-    fn default() -> Self {
-        Self {
-            pending: None,
-            body: [0; REGISTRATION_RESPONSE_CAPACITY],
-            closes: 0,
-        }
-    }
-}
-
-/// Header lookup error of the console HTTP stack (header not found).
-const HTTP_HEADER_NOT_FOUND: Win32Error = Win32Error::new(12150).unwrap();
-/// Kernel address of the simulated server thread object.
-pub const SERVER_THREAD: u32 = 0x8007_4a00;
-/// Port of a request without one.
-const HTTP_DEFAULT_PORT: u16 = 80;
-/// Limit on each socket wait of a request.
-const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
-
-fn os_error(error: &io::Error) -> Option<Win32Error> {
-    error
-        .raw_os_error()
-        .and_then(|code| Win32Error::new(code as u32))
-}
-
-impl HttpClient {
-    fn exchange(server: &str, port: u16, path: &[u8]) -> Result<Vec<u8>, HttpFailure> {
-        let request_error = |state: u32, error: &io::Error| HttpFailure::Request {
-            state,
-            error: os_error(error),
-        };
-        let effective_port = if port == 0 { HTTP_DEFAULT_PORT } else { port };
-        let mut stream = TcpStream::connect((server, effective_port))
-            .map_err(|error| request_error(1, &error))?;
-        let _ = stream.set_read_timeout(Some(HTTP_TIMEOUT));
-        let _ = stream.set_write_timeout(Some(HTTP_TIMEOUT));
-        let host = if port == 0 {
-            server.to_owned()
-        } else {
-            format!("{server}:{port}")
-        };
-        let mut request = b"GET ".to_vec();
-        request.extend_from_slice(path);
-        request.extend_from_slice(
-            format!(" HTTP/1.1\r\nUser-Agent: {REGISTRATION_USER_AGENT}\r\nHost: {host}\r\n\r\n")
-                .as_bytes(),
-        );
-        stream
-            .write_all(&request)
-            .map_err(|error| request_error(1, &error))?;
-
-        let mut received = Vec::new();
-        let header_end = loop {
-            if let Some(position) = received.windows(4).position(|window| window == b"\r\n\r\n") {
-                break position;
-            }
-            let mut chunk = [0u8; 512];
-            match stream.read(&mut chunk) {
-                Ok(0) => {
-                    return Err(HttpFailure::Request {
-                        state: 3,
-                        error: None,
-                    });
-                }
-                Ok(count) => received.extend_from_slice(&chunk[..count]),
-                Err(error) => return Err(request_error(3, &error)),
-            }
-        };
-        let head = String::from_utf8_lossy(&received[..header_end]).into_owned();
-        let mut lines = head.split("\r\n");
-        let code = lines
-            .next()
-            .and_then(|status| status.split(' ').nth(1))
-            .and_then(|code| code.parse::<u32>().ok());
-        let code = code.ok_or(HttpFailure::StatusQuery {
-            error: Some(HTTP_HEADER_NOT_FOUND),
-        })?;
-        if code != 200 {
-            return Err(HttpFailure::Status { code });
-        }
-        let length = lines.find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.trim()
-                .eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<u32>().ok())?
-        });
-        let length = length.ok_or(HttpFailure::ContentLength {
-            error: Some(HTTP_HEADER_NOT_FOUND),
-        })?;
-        if length as usize > REGISTRATION_RESPONSE_CAPACITY {
-            return Err(HttpFailure::TooLarge { length });
-        }
-        let mut content = received[header_end + 4..].to_vec();
-        while content.len() < length as usize {
-            let mut chunk = [0u8; 512];
-            match stream.read(&mut chunk) {
-                Ok(0) => {
-                    let received = content.len() as u32;
-                    return Err(HttpFailure::Truncated {
-                        received,
-                        expected: length - received,
-                    });
-                }
-                Ok(count) => content.extend_from_slice(&chunk[..count]),
-                Err(error) => return Err(request_error(5, &error)),
-            }
-        }
-        content.truncate(length as usize);
-        Ok(content)
-    }
-}
-
-/// Address record of the reference console's debug interface.
-const DEBUG_ADDRESS: [u8; NETWORK_ADDRESS_SIZE] = [
-    0xc0, 0xa8, 0x01, 0x1a, 0, 0, 0, 0, 0, 0, 0x7c, 0xed, 0x8d, 0x74, 0xf5, 0xd7, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0, 0,
-];
-/// Address record of the reference console's title interface.
-const TITLE_ADDRESS: [u8; NETWORK_ADDRESS_SIZE] = [
-    0xc0, 0xa8, 0x01, 0x19, 0, 0, 0, 0, 0, 0, 0x7c, 0xed, 0x8d, 0x74, 0xf5, 0xd6, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0, 0,
-];
-/// Address query flags reported for a configured interface.
-const ADDRESS_READY: u32 = 0x66;
-
 impl Default for Mock {
     fn default() -> Self {
+        /// Address record of the reference console's debug interface.
+        const DEBUG_ADDRESS: [u8; NETWORK_ADDRESS_SIZE] = [
+            0xc0, 0xa8, 0x01, 0x1a, 0, 0, 0, 0, 0, 0, 0x7c, 0xed, 0x8d, 0x74, 0xf5, 0xd7, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0, 0,
+        ];
+        /// Address record of the reference console's title interface.
+        const TITLE_ADDRESS: [u8; NETWORK_ADDRESS_SIZE] = [
+            0xc0, 0xa8, 0x01, 0x19, 0, 0, 0, 0, 0, 0, 0x7c, 0xed, 0x8d, 0x74, 0xf5, 0xd6, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0, 0,
+        ];
+        /// Address query flags reported for a configured interface.
+        const ADDRESS_READY: u32 = 0x66;
+
         Self {
             features: KitFeatures {
                 debugging: true,
@@ -345,6 +132,94 @@ impl Default for Mock {
     }
 }
 
+/// Simulated console configuration settings.
+#[derive(Debug)]
+pub struct XConfig {
+    /// Stored values. A setting never written reads as zero bytes of the
+    /// requested length, as the fixed-layout settings of a new console do.
+    pub settings: BTreeMap<ConfigSetting, Vec<u8>>,
+    /// Failure of every read, write, or modify of a setting.
+    pub failures: BTreeMap<ConfigSetting, KernelError>,
+    /// Whether the kernel provides the modify export (ordinal 700).
+    pub modify_export: bool,
+}
+
+impl Default for XConfig {
+    fn default() -> Self {
+        Self {
+            settings: BTreeMap::new(),
+            failures: BTreeMap::new(),
+            modify_export: true,
+        }
+    }
+}
+
+impl XConfig {
+    /// The stored value of a setting, if written.
+    pub fn value(&self, category: u16, index: u16) -> Option<&[u8]> {
+        self.settings
+            .get(&ConfigSetting::new(category, index))
+            .map(Vec::as_slice)
+    }
+
+    /// The first four stored bytes of a setting as a big-endian dword; zero
+    /// if never written.
+    pub fn dword(&self, category: u16, index: u16) -> u32 {
+        let mut bytes = [0u8; 4];
+        if let Some(value) = self.value(category, index) {
+            let length = value.len().min(4);
+            bytes[..length].copy_from_slice(&value[..length]);
+        }
+
+        u32::from_be_bytes(bytes)
+    }
+
+    fn check(&self, setting: ConfigSetting) -> Result<(), KernelError> {
+        match self.failures.get(&setting) {
+            Some(&error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Simulated system network service (data-center configuration).
+#[derive(Debug, Default)]
+pub struct NetworkRaService {
+    pub record: NetworkRaRecord,
+    /// Failure of every request while set.
+    pub failure: Option<NetworkRaError>,
+    pub resets: u32,
+}
+
+/// Server state the console publishes to other threads.
+#[derive(Debug)]
+pub struct PublishedState {
+    pub name: Vec<u8>,
+    pub dump_mode: u32,
+    /// Export 119 block.
+    pub dump_settings: Vec<u8>,
+    pub event_defer: u32,
+    pub trace_mask: u32,
+    /// Export 194 view of the lab server registration.
+    pub registration: console::RegistrationResult,
+}
+
+impl Default for PublishedState {
+    /// The server's initial state.
+    fn default() -> Self {
+        let state = console::State::new();
+
+        Self {
+            name: Vec::new(),
+            dump_mode: state.dump_mode.raw(),
+            dump_settings: state.dump_settings.to_block().to_vec(),
+            event_defer: state.event_defer.bits(),
+            trace_mask: state.trace_mask.bits(),
+            registration: console::RegistrationResult::EMPTY,
+        }
+    }
+}
+
 impl console::Backend for MockBackend {
     fn kit_features(&mut self) -> KitFeatures {
         self.console.features
@@ -357,23 +232,26 @@ impl console::Backend for MockBackend {
     ) -> Result<usize, KernelError> {
         let xconfig = &self.console.xconfig;
         xconfig.check(setting)?;
+
         output.fill(0);
-        match xconfig.settings.get(&setting) {
-            Some(value) => {
-                let length = value.len().min(output.len());
-                output[..length].copy_from_slice(&value[..length]);
-                Ok(value.len())
-            }
-            None => Ok(output.len()),
-        }
+        let Some(value) = xconfig.settings.get(&setting) else {
+            return Ok(output.len());
+        };
+
+        let length = value.len().min(output.len());
+        output[..length].copy_from_slice(&value[..length]);
+
+        Ok(value.len())
     }
 
     fn xconfig_set(&mut self, setting: ConfigSetting, value: &[u8]) -> Result<(), KernelError> {
         self.console.xconfig.check(setting)?;
+
         self.console
             .xconfig
             .settings
             .insert(setting, value.to_vec());
+
         Ok(())
     }
 
@@ -387,11 +265,14 @@ impl console::Backend for MockBackend {
         if !xconfig.modify_export {
             return Err(KernelError::OrdinalNotFound);
         }
+
         xconfig.check(setting)?;
+
         let value = (xconfig.dword(setting.category, setting.index) & and_mask) | or_mask;
         xconfig
             .settings
             .insert(setting, value.to_be_bytes().to_vec());
+
         Ok(())
     }
 
@@ -403,7 +284,9 @@ impl console::Backend for MockBackend {
         if self.console.i2c_failure {
             return false;
         }
+
         self.console.settings_block = *block;
+
         true
     }
 
@@ -436,11 +319,13 @@ impl console::Backend for MockBackend {
         if let Some(error) = service.failure {
             return Err(error);
         }
+
         match request {
             NetworkRaRequest::Get(record) => *record = service.record,
             NetworkRaRequest::Set(record) => service.record = *record,
             NetworkRaRequest::Reset => service.resets += 1,
         }
+
         Ok(())
     }
 
@@ -467,38 +352,17 @@ impl console::Backend for MockBackend {
     }
 
     fn http_begin(&mut self, request: &HttpRequest<'_>) -> Result<(), HttpStartFailure> {
-        let server = String::from_utf8_lossy(request.server).into_owned();
-        let (port, path) = (request.port, request.path.to_vec());
-        let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            let _ = sender.send(HttpClient::exchange(&server, port, &path));
-        });
-        self.console.http.pending = Some(receiver);
+        self.console.http.begin(request);
+
         Ok(())
     }
 
     fn http_poll(&mut self) -> HttpProgress {
-        let Some(receiver) = &self.console.http.pending else {
-            return HttpProgress::Failed(HttpFailure::Work { error: None });
-        };
-        match receiver.try_recv() {
-            Err(TryRecvError::Empty) => HttpProgress::Pending,
-            Err(TryRecvError::Disconnected) => {
-                HttpProgress::Failed(HttpFailure::Work { error: None })
-            }
-            Ok(Err(failure)) => HttpProgress::Failed(failure),
-            Ok(Ok(content)) => {
-                let body = &mut self.console.http.body;
-                body.fill(0);
-                body[..content.len()].copy_from_slice(&content);
-                HttpProgress::Complete(content.len())
-            }
-        }
+        self.console.http.poll()
     }
 
     fn http_close(&mut self) {
-        self.console.http.pending = None;
-        self.console.http.closes += 1;
+        self.console.http.close();
     }
 
     fn publish(&mut self, value: Published<'_>) {

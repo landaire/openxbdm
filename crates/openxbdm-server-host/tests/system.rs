@@ -9,10 +9,10 @@ use std::io::Write;
 use std::net::TcpListener;
 use std::time::Duration;
 
-use common::TestServer;
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::Win32Error;
+use openxbdm_server::commands::console::ConfigSetting;
 use openxbdm_server::commands::console::TraceMask;
 use openxbdm_server::commands::system::BootFlags;
 use openxbdm_server::commands::system::BootWait;
@@ -37,6 +37,8 @@ use openxbdm_server::reply::CommandError;
 use openxbdm_server::reply::Reply;
 use openxbdm_server_host::Host;
 use xbox360_sys::xboxkrnl::HardwareFlags;
+
+use common::TestServer;
 
 const GAME: &str = "\\Device\\Harddisk0\\Partition1\\DEVKIT\\game.xex";
 
@@ -90,12 +92,16 @@ fn reboot_replies_then_closes_every_connection() {
     let server = TestServer::start();
     let mut other = server.raw();
     other.line();
+
     let mut session = server.raw();
     session.line();
+
     assert_eq!(session.command("reboot wait smcreset title=x"), "200- OK");
+
     let mut rest = Vec::new();
     session.reader.read_to_end(&mut rest).unwrap();
     assert!(rest.is_empty());
+
     other.reader.read_to_end(&mut rest).unwrap();
     assert!(rest.is_empty());
 
@@ -107,11 +113,13 @@ fn reboot_replies_then_closes_every_connection() {
 #[test]
 fn reboot_keeps_the_first_boot_wait_request() {
     let server = TestServer::start();
+
     for command in ["reboot stop", "reboot wait"] {
         let mut session = server.raw();
         session.line();
         assert_eq!(session.command(command), "200- OK");
     }
+
     let host = server.host.lock();
     assert_eq!(
         host.backend.system.reboots,
@@ -125,18 +133,23 @@ fn systime_fails_until_the_clock_is_set() {
     let server = TestServer::start();
     let mut session = server.raw();
     session.line();
+
     assert_eq!(session.command("systime"), "406- ");
     assert_eq!(session.command("setsystime clockhi=0x01da3411"), "406- ");
+
     assert_eq!(
         session.command("setsystime clockhi=0x01da3411 clocklo=0x9a2b8200"),
         "200- OK"
     );
+
     let reply = session.command("systime");
     let rest = reply
         .strip_prefix("200- high=0x1da3411 low=0x")
         .expect("stock format");
+
     let low = u32::from_str_radix(rest, 16).unwrap();
     assert!(low.wrapping_sub(0x9a2b_8200) < 10_000_000 * 60);
+
     assert_eq!(
         server.host.lock().backend.system.clock_sets,
         [0x01da_3411_9a2b_8200]
@@ -148,10 +161,12 @@ fn setsystime_with_tz_writes_the_default_zone_once() {
     let server = TestServer::start();
     let mut session = server.raw();
     session.line();
+
     assert_eq!(
         session.command("setsystime clockhi=1 clocklo=2 tz=0"),
         "200- OK"
     );
+
     {
         let host = server.host.lock();
         let xconfig = &host.backend.console.xconfig;
@@ -163,15 +178,19 @@ fn setsystime_with_tz_writes_the_default_zone_once() {
         assert_eq!(xconfig.value(3, 5), Some(&[0x04, 0x01, 0, 0][..]));
         assert_eq!(xconfig.dword(3, 9), 1);
     }
-    server.host.lock().backend.console.xconfig.settings.clear();
-    server.host.lock().backend.console.xconfig.settings.insert(
-        openxbdm_server::commands::console::ConfigSetting::new(3, 2),
-        b"CET\0".to_vec(),
-    );
+
+    {
+        let mut host = server.host.lock();
+        let settings = &mut host.backend.console.xconfig.settings;
+        settings.clear();
+        settings.insert(ConfigSetting::new(3, 2), b"CET\0".to_vec());
+    }
+
     assert_eq!(
         session.command("setsystime clockhi=1 clocklo=2 tz=0"),
         "200- OK"
     );
+
     let host = server.host.lock();
     assert_eq!(host.backend.console.xconfig.value(3, 1), None);
     assert_eq!(host.backend.console.xconfig.dword(3, 9), 1);
@@ -182,16 +201,25 @@ fn setreset_stores_and_reports_the_chord() {
     let server = TestServer::start();
     let mut session = server.raw();
     session.line();
+
     assert_eq!(session.command("setreset chord=ABCDEF"), "200- OK");
+
     assert_eq!(
         server.host.lock().backend.console.xconfig.value(2, 5),
         Some(&b"ABCD\0"[..])
     );
+
     assert_eq!(session.command("setreset"), "200- ABCD");
-    server.host.lock().backend.console.xconfig.failures.insert(
-        openxbdm_server::commands::console::ConfigSetting::new(2, 5),
-        KernelError::Unsuccessful,
-    );
+
+    server
+        .host
+        .lock()
+        .backend
+        .console
+        .xconfig
+        .failures
+        .insert(ConfigSetting::new(2, 5), KernelError::Unsuccessful);
+
     assert_eq!(
         session.command("setreset"),
         "400- Could not change reset key"
@@ -203,18 +231,24 @@ fn setdiscboot_selects_the_boot_device_bits() {
     let server = TestServer::start();
     let mut session = server.raw();
     session.line();
+
     assert_eq!(session.command("setdiscboot"), "400- missing enable");
     assert_eq!(session.command("setdiscboot enable=2"), "400- ");
+
     server.host.lock().backend.console.xconfig.settings.insert(
-        openxbdm_server::commands::console::ConfigSetting::new(3, 0xc),
+        ConfigSetting::new(3, 0xc),
         0xffff_ffffu32.to_be_bytes().to_vec(),
     );
+
     assert_eq!(session.command("setdiscboot enable=1"), "200- OK");
+
     assert_eq!(
         server.host.lock().backend.console.xconfig.dword(3, 0xc),
         0xfffd_f77f
     );
+
     server.host.lock().backend.console.xconfig.modify_export = false;
+
     assert_eq!(
         session.command("setdiscboot enable=0"),
         "400- Modify failed: 0xc0000138"
@@ -226,25 +260,33 @@ fn title_checks_the_image_and_persists_both_lines() {
     let server = TestServer::start();
     let mut session = server.raw();
     session.line();
+
     assert_eq!(session.command("title dir=e:\\"), "400- missing name");
+
     assert_eq!(
         session.command("title name=game.xex dir=e:\\"),
         "402- file not found"
     );
+
     server.host.lock().backend.filesystem.write(GAME, b"xex");
+
     assert_eq!(
         session.command("title name=game.xex dir=e:\\ persist cmdline=a \"b\" c"),
         "200- OK"
     );
+
     let host = server.host.lock();
     let lines = settings_lines(&host);
+
     assert_eq!(lines[0], "[xbdm]");
+
     assert_eq!(
         lines[1],
         format!(
             "title persist name=\"{GAME}\" dir=\"\\Device\\Harddisk0\\Partition1\\DEVKIT\\\" cmdline=\"a \"b\" c\""
         )
     );
+
     assert_eq!(
         lines[2],
         format!(
@@ -259,21 +301,26 @@ fn settings_file_follows_the_stock_order_and_reloads() {
     server.host.lock().backend.filesystem.write(GAME, b"xex");
     let mut session = server.raw();
     session.line();
+
     assert_eq!(session.command("title name=game.xex dir=e:\\"), "200- OK");
     assert_eq!(session.command("reboot stop"), "200- OK");
+
     let (file, filesystem) = {
         let mut host = server.host.lock();
         let lines = settings_lines(&host);
+
         let order: Vec<&str> = lines
             .iter()
             .map(|line| line.split(' ').next().unwrap())
             .collect();
+
         let rank = |word: &str| {
             order
                 .iter()
-                .position(|&w| w == word)
+                .position(|&candidate| candidate == word)
                 .unwrap_or_else(|| panic!("{word} line in {lines:?}"))
         };
+
         assert_eq!(&order[..3], ["[xbdm]", "wait", "title"]);
         assert_eq!(lines[1], "wait stop");
         assert!(rank("title") < rank("dbgname"));
@@ -282,6 +329,7 @@ fn settings_file_follows_the_stock_order_and_reloads() {
         assert!(rank("gateway") < rank("memtrack"));
         assert!(rank("memtrack") < rank("dumpsettings"));
         assert!(rank("dumpsettings") < rank("dumpmode"));
+
         let filesystem = std::mem::take(&mut host.backend.filesystem);
         (host.backend.system.settings.clone(), filesystem)
     };
@@ -290,6 +338,7 @@ fn settings_file_follows_the_stock_order_and_reloads() {
     host.backend.system.settings = file;
     host.backend.filesystem = filesystem;
     let restarted = TestServer::with_host(host);
+
     let host = restarted.host.lock();
     assert_eq!(
         host.server.state.system.title.image.as_bytes(),
@@ -299,6 +348,7 @@ fn settings_file_follows_the_stock_order_and_reloads() {
         host.server.state.system.title.drive.as_bytes(),
         b"\\Device\\Harddisk0\\Partition1\\DEVKIT\\"
     );
+
     // A one-time boot-wait mode is consumed at startup and the file rewritten.
     assert_eq!(host.server.state.system.boot_wait, None);
     assert!(
@@ -315,6 +365,7 @@ fn settings_loader_quirks() {
     let server = TestServer::with_host(host);
     let host = server.host.lock();
     assert_eq!(host.server.state.system.boot_wait, Some(BootWait::Forever));
+
     // The unterminated last line loses its final byte.
     assert_eq!(host.server.state.console.debug_name.as_bytes(), b"abc");
 
@@ -331,6 +382,7 @@ fn settings_are_skipped_when_the_read_buffer_cannot_be_allocated() {
     host.backend.filesystem.pool_exhausted = true;
     let server = TestServer::with_host(host);
     let host = server.host.lock();
+
     assert_eq!(host.server.state.system.boot_wait, None);
     assert!(!host.server.state.system.settings_loaded);
 }
@@ -343,6 +395,7 @@ fn settings_are_not_written_before_load_completes_or_on_cd_boot() {
     host.backend.system.settings = Some(saved.clone());
     host.backend.system.recint = Some(b"wait forever\r\n".to_vec());
     let server = TestServer::with_host(host);
+
     {
         let host = server.host.lock();
         assert_eq!(
@@ -351,10 +404,14 @@ fn settings_are_not_written_before_load_completes_or_on_cd_boot() {
         );
         assert_eq!(host.backend.system.settings.as_deref(), Some(&saved[..]));
     }
+
     server.host.lock().backend.system.cd_boot = true;
+
     let mut session = server.raw();
     session.line();
+
     assert_eq!(session.command("title nopersist"), "200- OK");
+
     assert_eq!(
         server.host.lock().backend.system.settings.as_deref(),
         Some(&saved[..])
@@ -366,6 +423,7 @@ fn magicboot_relaunches_in_place_or_reboots() {
     let server = TestServer::start();
     let mut session = server.raw();
     session.line();
+
     assert_eq!(
         session.command("magicboot title=q:\\missing.xex"),
         "402- file not found"
@@ -378,15 +436,18 @@ fn magicboot_relaunches_in_place_or_reboots() {
         session.command("magicboot directory=nodrive"),
         "430- path not found"
     );
+
     {
         let mut host = server.host.lock();
         host.backend.filesystem.write(GAME, b"xex");
         host.backend.system.relaunch_routine = true;
     }
+
     assert_eq!(
         session.command("magicboot title=e:\\game.xex wait"),
         "200- OK"
     );
+
     {
         let host = server.host.lock();
         assert_eq!(host.backend.system.relaunches, 1);
@@ -396,6 +457,7 @@ fn magicboot_relaunches_in_place_or_reboots() {
             GAME.as_bytes()
         );
     }
+
     assert_eq!(session.command("magicboot"), "200- OK");
     assert_eq!(server.host.lock().backend.system.relaunches, 1);
 
@@ -403,11 +465,14 @@ fn magicboot_relaunches_in_place_or_reboots() {
     // cold boot.
     server.host.lock().backend.console.i2c_failure = true;
     assert_eq!(session.command("magicboot stop"), "200- OK");
+
     let mut rest = Vec::new();
     session.reader.read_to_end(&mut rest).unwrap();
+
     let host = server.host.lock();
     assert_eq!(host.backend.system.reboots, [RebootKind::Normal]);
     assert_eq!(host.server.state.system.boot_wait, Some(BootWait::Stop));
+
     assert!(settings_lines(&host).contains(&format!("title flags=0x00000008 name=\"{GAME}\"")));
 }
 
@@ -416,11 +481,15 @@ fn recovery_reboots_and_records_the_request() {
     let server = TestServer::start();
     let mut session = server.raw();
     session.line();
+
     assert_eq!(session.command("recovery"), "200- OK");
+
     let mut rest = Vec::new();
     session.reader.read_to_end(&mut rest).unwrap();
+
     let host = server.host.lock();
     assert_eq!(host.backend.system.reboots, [RebootKind::Normal]);
+
     assert_eq!(
         settings_lines(&host).last().map(String::as_str),
         Some("recovery")
@@ -432,18 +501,23 @@ fn deftitle_writes_and_deletes_the_default_title_file() {
     let server = TestServer::start();
     let mut session = server.raw();
     session.line();
+
     assert_eq!(session.command("deftitle"), "400- missing dir");
     assert_eq!(session.command("deftitle dir=e:\\"), "400- missing name");
     assert_eq!(session.command("deftitle launcher"), "402- file not found");
+
     server
         .host
         .lock()
         .backend
         .filesystem
         .write("\\SystemRoot\\xshell.xex", b"xex");
+
     assert_eq!(session.command("deftitle launcher"), "200- OK");
+
     let mut expected = b"\\SystemRoot;xshell.xex".to_vec();
     expected.resize(0x100, 0);
+
     assert_eq!(
         server
             .host
@@ -453,7 +527,9 @@ fn deftitle_writes_and_deletes_the_default_title_file() {
             .read("\\SystemRoot\\dashboard.xbx"),
         Some(&expected[..])
     );
+
     assert_eq!(session.command("deftitle none"), "200- OK");
+
     assert_eq!(
         server
             .host
@@ -463,6 +539,7 @@ fn deftitle_writes_and_deletes_the_default_title_file() {
             .read("\\SystemRoot\\dashboard.xbx"),
         None
     );
+
     assert_eq!(session.command("deftitle none"), "200- OK");
 }
 
@@ -471,6 +548,7 @@ fn flash_receives_the_image_for_this_hardware() {
     let server = TestServer::start();
     let mut session = server.raw();
     session.line();
+
     assert_eq!(
         session.command("flash size_f=0x10"),
         "400- unsupported hardware type, requires t"
@@ -479,8 +557,10 @@ fn flash_receives_the_image_for_this_hardware() {
         session.command("flash size_t=0x5000 stockimage"),
         "204- send=t"
     );
+
     session.stream.write_all(&[0x5a; 0x5000]).unwrap();
     assert_eq!(session.line(), "200- Done, new image flashed");
+
     {
         let host = server.host.lock();
         let write = &host.backend.system.flash_writes[0];
@@ -489,16 +569,24 @@ fn flash_receives_the_image_for_this_hardware() {
         assert!(write.image[0x5000..].iter().all(|&byte| byte == 0));
         assert!(write.options.stock_image && !write.options.ignore_version_checking);
     }
+
     server.host.lock().backend.system.flash_result = Err(Win32Error::new(0xb).unwrap());
+
     assert_eq!(
         session.command("flash size_t=1 ignoreversionchecking=1"),
         "204- send=t"
     );
+
     session.stream.write_all(&[1]).unwrap();
+
     assert_eq!(session.line(), "400- Flash failed with HRESULT 0x8007000b");
+
     server.host.lock().backend.system.flash_memory = 0;
+
     assert_eq!(session.command("flash size_t=1"), "400- Not enough memory");
+
     server.host.lock().backend.system.hardware_flags = HardwareFlags::from_bits_retain(0x7000_0003);
+
     assert_eq!(
         session.command("flash size_t=1"),
         "400- unsupported hardware type, requires (null)"
@@ -510,10 +598,13 @@ fn flash_with_a_wrapped_size_releases_the_connection() {
     let server = TestServer::start();
     let mut session = server.raw();
     session.line();
+
     // The rounded size wraps to zero, as in the monitor.
     assert_eq!(session.command("flash size_t=0xffffffff"), "204- send=t");
     session.stream.write_all(&[0x5a; 0x100]).unwrap();
+
     drop(session);
+
     server.wait_until(|host| host.server.connections().next().is_none());
 }
 
@@ -522,15 +613,19 @@ fn settings_copies_append_sysset_and_recovery() {
     let server = TestServer::start();
     let mut session = server.raw();
     session.line();
+
     server.host.lock().backend.filesystem.write(GAME, b"xex");
     assert_eq!(session.command("title name=e:\\game.xex"), "200- OK");
+
     let mut host = server.host.lock();
     let Host {
         server: core,
         backend,
         network,
     } = &mut *host;
+
     core.execute_settings_line(b"sysset videostd=5", backend, network);
+
     let saved = backend.system.settings.clone().unwrap();
     let mut expected = saved.clone();
     expected.extend_from_slice(b"sysset videostd=0x00000005\r\nrecovery\r\n");
@@ -543,12 +638,14 @@ fn settings_copies_append_sysset_and_recovery() {
         copy_settings(&core.state, backend, memory),
         Some(expected.len() as u32)
     );
+
     // A memory copy that does not fit keeps its first bytes.
     let short = SettingsCopy::Memory {
         address: 0x4000_0000,
         capacity: 10,
     };
     assert_eq!(copy_settings(&core.state, backend, short), Some(10));
+
     let padded = SettingsCopy::File {
         handle: 7,
         pad: true,
@@ -557,6 +654,7 @@ fn settings_copies_append_sysset_and_recovery() {
         copy_settings(&core.state, backend, padded),
         Some(expected.len() as u32)
     );
+
     let copies = &backend.system.copies;
     assert_eq!(copies[0].bytes, expected);
     assert_eq!(copies[1].bytes, expected[..10]);
@@ -577,14 +675,18 @@ fn settings_copies_append_sysset_and_recovery() {
 #[test]
 fn wipe_empties_the_settings_file_even_on_cd_boot() {
     let server = TestServer::start();
+
     let mut host = server.host.lock();
     host.backend.system.cd_boot = true;
+
     let Host {
         server: core,
         backend,
         ..
     } = &mut *host;
+
     wipe_settings(&core.state, backend);
+
     assert_eq!(host.backend.system.settings.as_deref(), Some(&b""[..]));
 }
 
@@ -593,20 +695,25 @@ fn prepare_reboot_announces_writes_and_closes_connections() {
     let server = TestServer::start();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+
     let mut session = server.raw();
     session.line();
+
     assert_eq!(
         session.command(&format!("notifyat port={port} addr=1.0.0.127")),
         "200- OK"
     );
+
     let (target, _) = listener.accept().unwrap();
     target
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
+
     let mut target = BufReader::new(target);
     let mut line = String::new();
     target.read_line(&mut line).unwrap();
     assert_eq!(line, "execution started\r\n");
+
     {
         let mut host = server.host.lock();
         host.backend.system.settings = None;
@@ -618,16 +725,20 @@ fn prepare_reboot_announces_writes_and_closes_connections() {
         prepare_reboot(core, backend, network);
         assert_eq!(core.state.debugger.kernel_debugger, Some(true));
     }
+
     line.clear();
     target.read_line(&mut line).unwrap();
     assert_eq!(line, "execution rebooting\r\n");
+
     let mut rest = Vec::new();
     session.reader.read_to_end(&mut rest).unwrap();
     assert!(rest.is_empty());
+
     assert!(
         settings_lines(&server.host.lock())
             .contains(&format!("notifyat addr=1.0.0.127 port={port}"))
     );
+
     let mut late = server.raw();
     assert_eq!(late.line(), "401- max number of connections exceeded");
 }
@@ -637,38 +748,44 @@ fn title_reboot_stops_by_reason_and_flags() {
     let server = TestServer::start();
     let mut session = server.raw();
     session.line();
-    let mut host = server.host.lock();
-    let Host {
-        server: core,
-        backend,
-        ..
-    } = &mut *host;
-    let state = &mut core.state;
-    state.system.boot_flags = BootFlags::WAIT | BootFlags::STOP;
-    assert_eq!(
-        title_reboot_stop(state, backend, LaunchReason(0)),
-        TitleRebootStop::Run
-    );
-    assert_eq!(
-        title_reboot_stop(state, backend, LaunchReason(1)),
-        TitleRebootStop::Run
-    );
-    // Reason 4 consumes `stop`, so its stop always times out.
-    assert_eq!(
-        title_reboot_stop(state, backend, LaunchReason(4)),
-        TitleRebootStop::Stop { forever: false }
-    );
-    assert_eq!(state.system.boot_flags, BootFlags::WAIT);
-    assert_eq!(
-        title_reboot_stop(state, backend, LaunchReason(4)),
-        TitleRebootStop::Stop { forever: false }
-    );
-    state.system.boot_flags = BootFlags::default();
-    assert_eq!(
-        title_reboot_stop(state, backend, LaunchReason(4)),
-        TitleRebootStop::Run
-    );
-    drop(host);
+
+    {
+        let mut host = server.host.lock();
+        let Host {
+            server: core,
+            backend,
+            ..
+        } = &mut *host;
+
+        let state = &mut core.state;
+
+        state.system.boot_flags = BootFlags::WAIT | BootFlags::STOP;
+        assert_eq!(
+            title_reboot_stop(state, backend, LaunchReason(0)),
+            TitleRebootStop::Run
+        );
+        assert_eq!(
+            title_reboot_stop(state, backend, LaunchReason(1)),
+            TitleRebootStop::Run
+        );
+        // Reason 4 consumes `stop`, so its stop always times out.
+        assert_eq!(
+            title_reboot_stop(state, backend, LaunchReason(4)),
+            TitleRebootStop::Stop { forever: false }
+        );
+        assert_eq!(state.system.boot_flags, BootFlags::WAIT);
+
+        assert_eq!(
+            title_reboot_stop(state, backend, LaunchReason(4)),
+            TitleRebootStop::Stop { forever: false }
+        );
+
+        state.system.boot_flags = BootFlags::default();
+        assert_eq!(
+            title_reboot_stop(state, backend, LaunchReason(4)),
+            TitleRebootStop::Run
+        );
+    }
 
     assert_eq!(session.command("stopon all"), "200- stop on all");
     let mut host = server.host.lock();
@@ -677,16 +794,20 @@ fn title_reboot_stops_by_reason_and_flags() {
         backend,
         ..
     } = &mut *host;
+
     let state = &mut core.state;
+
     assert_eq!(
         title_reboot_stop(state, backend, LaunchReason(1)),
         TitleRebootStop::Stop { forever: false }
     );
+
     state.system.boot_flags = BootFlags::STOP;
     assert_eq!(
         title_reboot_stop(state, backend, LaunchReason(1)),
         TitleRebootStop::Stop { forever: true }
     );
+
     assert_eq!(
         title_reboot_stop(state, backend, LaunchReason(0)),
         TitleRebootStop::Run
@@ -696,25 +817,32 @@ fn title_reboot_stops_by_reason_and_flags() {
 #[test]
 fn title_reboot_uses_up_the_launch_title() {
     const DEFAULT: &str = "\\Device\\Harddisk0\\Partition1\\DEVKIT\\default.xex";
+
     let server = TestServer::start();
+
     let mut session = server.raw();
     session.line();
+
     {
         let mut host = server.host.lock();
         host.backend.filesystem.write(GAME, b"xex");
         host.backend.filesystem.write(DEFAULT, b"xex");
     }
+
     assert_eq!(
         session.command("title name=e:\\default.xex persist"),
         "200- OK"
     );
+
     assert_eq!(session.command("title name=e:\\game.xex"), "200- OK");
+
     let mut host = server.host.lock();
     let Host {
         server: core,
         backend,
         ..
     } = &mut *host;
+
     let launch = launch_override(&core.state, LaunchReason(1)).unwrap();
     assert_eq!(launch.image.as_bytes(), GAME.as_bytes());
     assert_eq!(launch_override(&core.state, LaunchReason(1)), Some(launch));
@@ -723,12 +851,14 @@ fn title_reboot_uses_up_the_launch_title() {
         title_reboot_launch(&mut core.state, backend, LaunchReason(1)),
         Some(launch)
     );
+
     assert!(core.state.system.title.image.is_empty());
     assert!(
         !settings_lines(&host)
             .iter()
             .any(|line| line.starts_with("title name="))
     );
+
     let Host {
         server: core,
         backend,
@@ -739,6 +869,7 @@ fn title_reboot_uses_up_the_launch_title() {
         title_reboot_launch(&mut core.state, backend, LaunchReason(1)),
         None
     );
+
     let persistent = title_reboot_launch(&mut core.state, backend, LaunchReason(4)).unwrap();
     assert_eq!(persistent.image.as_bytes(), DEFAULT.as_bytes());
     assert_eq!(core.state.system.persistent_title, persistent);
@@ -758,12 +889,15 @@ fn hard_reboot_keeps_the_launch_title_for_the_next_boot() {
     let mut session = server.raw();
     session.line();
     server.host.lock().backend.filesystem.write(GAME, b"xex");
+
     assert_eq!(
         session.command("magicboot title=e:\\game.xex cold"),
         "200- OK"
     );
+
     let mut rest = Vec::new();
     session.reader.read_to_end(&mut rest).unwrap();
+
     let host = server.host.lock();
     assert!(host.server.state.system.hard_reboot_pending);
     assert_eq!(
@@ -777,16 +911,19 @@ fn hard_reboot_keeps_the_launch_title_for_the_next_boot() {
 fn set_title_export_sets_or_clears_titles() {
     let server = TestServer::start();
     let mut host = server.host.lock();
+
     let Host {
         server: core,
         backend,
         ..
     } = &mut *host;
     let state = &mut core.state;
+
     assert_eq!(
         set_title_from_paths(state, backend, None, None, None, TitleFlags::default()),
         Err(CommandError::InvalidArgument)
     );
+
     assert_eq!(
         set_title_from_paths(
             state,
@@ -798,7 +935,9 @@ fn set_title_export_sets_or_clears_titles() {
         ),
         Err(ErrorCode::FileNotFound.into())
     );
+
     backend.filesystem.write(GAME, b"xex");
+
     let flags = TitleFlags::PERSIST;
     assert_eq!(
         set_title_from_paths(
@@ -811,6 +950,7 @@ fn set_title_export_sets_or_clears_titles() {
         ),
         Ok(Reply::Ok)
     );
+
     assert_eq!(state.system.title.image.as_bytes(), GAME.as_bytes());
     assert_eq!(
         state.system.title.drive.as_bytes(),
@@ -818,6 +958,7 @@ fn set_title_export_sets_or_clears_titles() {
     );
     assert_eq!(state.system.title.command_line.as_bytes(), b"-x");
     assert_eq!(state.system.persistent_title, state.system.title);
+
     assert_eq!(
         set_title_from_paths(
             state,
@@ -829,6 +970,7 @@ fn set_title_export_sets_or_clears_titles() {
         ),
         Ok(Reply::Ok)
     );
+
     assert!(state.system.persistent_title.image.is_empty());
     assert_eq!(state.system.title.image.as_bytes(), GAME.as_bytes());
 }
@@ -836,63 +978,74 @@ fn set_title_export_sets_or_clears_titles() {
 #[test]
 fn launch_export_translates_relaunches_or_reboots() {
     let server = TestServer::start();
-    let mut host = server.host.lock();
-    let Host {
-        server: core,
-        backend,
-        network,
-    } = &mut *host;
-    let none = BootFlags::default();
-    assert_eq!(
-        launch_from_paths(core, backend, network, none, None, Some(b"e:\\"), None),
-        Err(CommandError::InvalidArgument)
-    );
-    assert_eq!(
-        launch_from_paths(core, backend, network, none, Some(b"nodrive"), None, None),
-        Err(ErrorCode::FileNotFound.into())
-    );
-    assert_eq!(
-        launch_from_paths(
-            core,
+    {
+        let mut host = server.host.lock();
+        let Host {
+            server: core,
             backend,
             network,
-            none,
-            Some(b"e:\\game.xex"),
-            Some(b"nodrive"),
-            None
-        ),
-        Err(ErrorCode::PathNotFound.into())
-    );
-    backend.filesystem.write(GAME, b"xex");
-    backend.system.relaunch_routine = true;
-    let object_paths = BootFlags::OBJECT_PATHS;
-    assert_eq!(
-        launch_from_paths(
-            core,
-            backend,
-            network,
-            object_paths,
-            Some(GAME.as_bytes()),
-            None,
-            None
-        ),
-        Ok(Reply::Ok)
-    );
-    assert_eq!(backend.system.relaunches, 1);
-    assert_eq!(core.state.system.boot_flags, object_paths);
+        } = &mut *host;
 
-    backend.system.relaunch_routine = false;
-    // Execution is at reboot_title now, so only a cold launch restarts.
-    let cold_wait = BootFlags::WAIT | BootFlags::COLD;
-    assert_eq!(
-        launch_without_connection(core, backend, network, cold_wait, None),
-        Ok(Reply::Sent)
-    );
-    assert_eq!(backend.system.reboots, [RebootKind::Normal]);
-    assert!(core.state.system.hard_reboot_pending);
-    assert_eq!(core.state.system.boot_wait, Some(BootWait::Wait));
-    drop(host);
+        let none = BootFlags::default();
+
+        assert_eq!(
+            launch_from_paths(core, backend, network, none, None, Some(b"e:\\"), None),
+            Err(CommandError::InvalidArgument)
+        );
+
+        assert_eq!(
+            launch_from_paths(core, backend, network, none, Some(b"nodrive"), None, None),
+            Err(ErrorCode::FileNotFound.into())
+        );
+
+        assert_eq!(
+            launch_from_paths(
+                core,
+                backend,
+                network,
+                none,
+                Some(b"e:\\game.xex"),
+                Some(b"nodrive"),
+                None
+            ),
+            Err(ErrorCode::PathNotFound.into())
+        );
+
+        backend.filesystem.write(GAME, b"xex");
+        backend.system.relaunch_routine = true;
+
+        let object_paths = BootFlags::OBJECT_PATHS;
+
+        assert_eq!(
+            launch_from_paths(
+                core,
+                backend,
+                network,
+                object_paths,
+                Some(GAME.as_bytes()),
+                None,
+                None
+            ),
+            Ok(Reply::Ok)
+        );
+
+        assert_eq!(backend.system.relaunches, 1);
+        assert_eq!(core.state.system.boot_flags, object_paths);
+
+        backend.system.relaunch_routine = false;
+        // Execution is at reboot_title now, so only a cold launch restarts.
+        let cold_wait = BootFlags::WAIT | BootFlags::COLD;
+        assert_eq!(
+            launch_without_connection(core, backend, network, cold_wait, None),
+            Ok(Reply::Sent)
+        );
+        assert_eq!(backend.system.reboots, [RebootKind::Normal]);
+        assert!(core.state.system.hard_reboot_pending);
+        assert_eq!(core.state.system.boot_wait, Some(BootWait::Wait));
+    }
+
     assert!(settings_lines(&server.host.lock()).contains(&"wait".to_owned()));
+
     let mut late = server.raw();
     assert_eq!(late.line(), "401- max number of connections exceeded");
 }
@@ -901,14 +1054,17 @@ fn launch_export_translates_relaunches_or_reboots() {
 fn settings_load_and_write_traces() {
     let settings = format!("title name={GAME}\r\n");
     let mut host = Host::default();
+
     host.backend.filesystem.write(GAME, b"xex");
     host.backend.system.settings = Some(settings.clone().into_bytes());
     host.backend.system.recint = Some(b"wait\r\n".to_vec());
     // The mask is set before the saved settings run.
     host.server.state.console.trace_mask = TraceMask::SETTINGS;
     host.backend.console.published.trace_mask = TraceMask::SETTINGS.bits();
+
     let server = TestServer::with_host(host);
     let lines = settings_traced(&server.host.lock());
+
     let head = [
         "XBDM: LoadIniFile\n".to_owned(),
         format!("XBDM: Handle: 0x00000000, File Size: {}\n", settings.len()),
@@ -927,7 +1083,9 @@ fn settings_load_and_write_traces() {
         echo("\""),
         echo("(null)"),
     ];
+
     assert_eq!(lines[..head.len()], head);
+
     assert_eq!(
         lines.last().map(String::as_str),
         Some("XBDM: WriteIniFileImpl - Done writing ini file...\n")
@@ -939,23 +1097,30 @@ fn settings_copy_wipe_and_gate_traces() {
     let server = TestServer::start();
     let mut host = server.host.lock();
     set_trace_mask(&mut host, 4);
+
     let Host {
         server: core,
         backend,
         network,
     } = &mut *host;
+
     core.execute_settings_line(b"sysset videostd=5", backend, network);
     backend.debug_output.clear();
+
     let memory = SettingsCopy::Memory {
         address: 0x4000_0000,
         capacity: 0x1000,
     };
+
     assert!(copy_settings(&core.state, backend, memory).is_some());
+
     let lines = settings_traced(&host);
+
     assert_eq!(
         lines[..2],
         ["XBDM: CaptureIniFile - start\n".to_owned(), echo("[xbdm]")]
     );
+
     assert_eq!(
         lines[lines.len() - 5..],
         [
@@ -972,8 +1137,11 @@ fn settings_copy_wipe_and_gate_traces() {
         backend,
         ..
     } = &mut *host;
+
     backend.debug_output.clear();
+
     backend.system.copy_buffer_available = false;
+
     assert_eq!(
         copy_settings(
             &core.state,
@@ -985,6 +1153,7 @@ fn settings_copy_wipe_and_gate_traces() {
         ),
         None
     );
+
     assert_eq!(settings_traced(&host), ["XBDM: WriteAltIniFile - start\n"]);
 
     let Host {
@@ -992,9 +1161,12 @@ fn settings_copy_wipe_and_gate_traces() {
         backend,
         ..
     } = &mut *host;
+
     backend.debug_output.clear();
     backend.system.title_process_caller = true;
+
     wipe_settings(&core.state, backend);
+
     assert_eq!(
         settings_traced(&host),
         [
@@ -1009,13 +1181,18 @@ fn settings_copy_wipe_and_gate_traces() {
         backend,
         ..
     } = &mut *host;
+
     backend.debug_output.clear();
+
     let clear = TitleFlags::CLEAR_PERSISTENT;
+
     assert_eq!(
         set_title_from_paths(&mut core.state, backend, None, None, None, clear),
         Ok(Reply::Ok)
     );
+
     let lines = settings_traced(&host);
+
     assert_eq!(
         lines[..3],
         [
@@ -1030,12 +1207,15 @@ fn settings_copy_wipe_and_gate_traces() {
         backend,
         ..
     } = &mut *host;
+
     backend.debug_output.clear();
     backend.system.cd_boot = true;
+
     assert_eq!(
         set_title_from_paths(&mut core.state, backend, None, None, None, clear),
         Ok(Reply::Ok)
     );
+
     assert_eq!(
         settings_traced(&host),
         ["XBDM: Cannot write xbdm.ini: CD boot\n"]
@@ -1048,14 +1228,19 @@ fn settings_copy_wipe_and_gate_traces() {
         backend,
         ..
     } = &mut *host;
+
     backend.system.cd_boot = false;
     backend.system.copy_buffer_available = true;
+
     wipe_settings(&core.state, backend);
+
     assert!(copy_settings(&core.state, backend, memory).is_some());
+
     assert_eq!(
         set_title_from_paths(&mut core.state, backend, None, None, None, clear),
         Ok(Reply::Ok)
     );
+
     assert!(settings_traced(&host).is_empty());
 }
 
@@ -1063,13 +1248,19 @@ fn settings_copy_wipe_and_gate_traces() {
 fn title_image_traces() {
     const PREFIXES: [&str; 2] = ["[xbdm] FGetImageAndDrive", "[xbdm] FTitleExists"];
     const DRIVE: &str = "\\Device\\Harddisk0\\Partition1\\DEVKIT\\";
+
     let server = TestServer::start();
     let mut session = server.raw();
     session.line();
+
     server.host.lock().backend.filesystem.write(GAME, b"xex");
+
     assert_eq!(session.command("verbose level=8"), "200- OK");
+
     server.host.lock().backend.debug_output.clear();
+
     assert_eq!(session.command("title name=e:\\game.xex"), "200- OK");
+
     assert_eq!(
         traced(&server.host.lock(), &PREFIXES),
         [
@@ -1084,12 +1275,16 @@ fn title_image_traces() {
     // A name past the end of the image buffer is cut, and the cut image is
     // still checked.
     server.host.lock().backend.debug_output.clear();
+
     let long = "a".repeat(0xe0);
+
     assert_eq!(
         session.command(&format!("title dir=e:\\ name={long}")),
         "402- file not found"
     );
+
     let image = format!("{DRIVE}{}", &long[..0x100 - DRIVE.len()]);
+
     assert_eq!(
         traced(&server.host.lock(), &PREFIXES),
         [
@@ -1104,7 +1299,9 @@ fn title_image_traces() {
     );
 
     server.host.lock().backend.debug_output.clear();
+
     assert_eq!(session.command("title name=nodrive"), "402- file not found");
+
     assert_eq!(
         traced(&server.host.lock(), &PREFIXES),
         [
@@ -1115,40 +1312,48 @@ fn title_image_traces() {
 
     // Before boot a disc image is taken without a check; after boot it is
     // opened.
-    let mut host = server.host.lock();
-    let Host {
-        server: core,
-        backend,
-        network,
-    } = &mut *host;
-    backend.debug_output.clear();
-    core.execute_settings_line(
-        b"title name=\\Device\\Cdrom0\\default.xex",
-        backend,
-        network,
-    );
-    assert!(launch_image_exists(&core.state, backend, GAME.as_bytes()));
-    assert_eq!(
-        traced(&host, &PREFIXES),
-        [
-            "[xbdm] FTitleExists(oszImage='\\Device\\Cdrom0\\default.xex',fPostBoot=FALSE)\n"
-                .to_owned(),
-            format!("[xbdm] FTitleExists(oszImage='{GAME}',fPostBoot=TRUE)\n"),
-            "[xbdm] FTitleExists() returning TRUE\n".to_owned(),
-        ]
-    );
-    drop(host);
+    {
+        let mut host = server.host.lock();
+        let Host {
+            server: core,
+            backend,
+            network,
+        } = &mut *host;
+
+        backend.debug_output.clear();
+        core.execute_settings_line(
+            b"title name=\\Device\\Cdrom0\\default.xex",
+            backend,
+            network,
+        );
+
+        assert!(launch_image_exists(&core.state, backend, GAME.as_bytes()));
+
+        assert_eq!(
+            traced(&host, &PREFIXES),
+            [
+                "[xbdm] FTitleExists(oszImage='\\Device\\Cdrom0\\default.xex',fPostBoot=FALSE)\n"
+                    .to_owned(),
+                format!("[xbdm] FTitleExists(oszImage='{GAME}',fPostBoot=TRUE)\n"),
+                "[xbdm] FTitleExists() returning TRUE\n".to_owned(),
+            ]
+        );
+    }
 
     assert_eq!(session.command("verbose level=0x37"), "200- OK");
+
     server.host.lock().backend.debug_output.clear();
     assert_eq!(session.command("title name=e:\\game.xex"), "200- OK");
+
     let mut host = server.host.lock();
     let Host {
         server: core,
         backend,
         ..
     } = &mut *host;
+
     assert!(launch_image_exists(&core.state, backend, GAME.as_bytes()));
+
     assert!(traced(&host, &PREFIXES).is_empty());
 }
 
@@ -1157,21 +1362,28 @@ fn title_reboot_traces() {
     let server = TestServer::start();
     let mut session = server.raw();
     session.line();
+
     server.host.lock().backend.filesystem.write(GAME, b"xex");
+
     assert_eq!(
         session.command("title name=e:\\game.xex persist cmdline=-x"),
         "200- OK"
     );
+
     let mut host = server.host.lock();
     set_trace_mask(&mut host, 0x10);
+
     let Host {
         server: core,
         backend,
         ..
     } = &mut *host;
+
     let state = &mut core.state;
+
     state.system.boot_flags = BootFlags::WAIT | BootFlags::STOP;
     trace_title_reboot(state, backend, LaunchReason(4));
+
     assert_eq!(
         title_reboot_stop(state, backend, LaunchReason(4)),
         TitleRebootStop::Stop { forever: false }
@@ -1180,6 +1392,7 @@ fn title_reboot_traces() {
         title_reboot_stop(state, backend, LaunchReason(0)),
         TitleRebootStop::Run
     );
+
     // Reasons other than 0 that do not stop say nothing.
     state.system.boot_flags = BootFlags::default();
     assert_eq!(
@@ -1190,9 +1403,12 @@ fn title_reboot_traces() {
         title_reboot_stop(state, backend, LaunchReason(1)),
         TitleRebootStop::Run
     );
+
     assert!(title_reboot_launch(state, backend, LaunchReason(4)).is_some());
     assert!(title_reboot_launch(state, backend, LaunchReason(4)).is_some());
+
     let fields = format!("  ImageName='{GAME}'\n   DDrive=''\n   CommandLine='-x'\n");
+
     assert_eq!(
         traced(&host, &["[xbdm] DmpTitleReboot"]),
         [
@@ -1211,17 +1427,23 @@ fn title_reboot_traces() {
         backend,
         ..
     } = &mut *host;
+
     let state = &mut core.state;
+
     state.system.boot_flags = BootFlags::WAIT;
     trace_title_reboot(state, backend, LaunchReason(4));
+
     assert_eq!(
         title_reboot_stop(state, backend, LaunchReason(4)),
         TitleRebootStop::Stop { forever: false }
     );
+
     assert_eq!(
         title_reboot_stop(state, backend, LaunchReason(0)),
         TitleRebootStop::Run
     );
+
     assert!(title_reboot_launch(state, backend, LaunchReason(0)).is_some());
+
     assert!(traced(&host, &["[xbdm] DmpTitleReboot"]).is_empty());
 }

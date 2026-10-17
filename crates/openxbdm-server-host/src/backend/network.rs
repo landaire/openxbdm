@@ -23,16 +23,11 @@ use openxbdm_server::network::Ipv4Address;
 
 use super::MockBackend;
 
-/// System version of the simulated console: the newest gate in this
-/// domain (`netsim`, 0x20278700) passes.
-pub const SYSTEM_VERSION: SystemVersion = SystemVersion(0x2047_4800);
-/// Link status of the simulated adapter: link up.
-pub const LINK_STATUS: u32 = 0x0000_0001;
-
 /// Simulated state of this domain.
 #[derive(Debug)]
 pub struct Mock {
     pub system_version: SystemVersion,
+
     pub sockets: Vec<network::SocketRecord>,
     pub keys: Vec<network::KeyRecord>,
     pub security_associations: Vec<network::SecurityAssociationRecord>,
@@ -43,6 +38,7 @@ pub struct Mock {
     pub exhausted: Vec<Table>,
     /// Snapshots held for connections.
     pub snapshots: HashMap<u8, Vec<Record>>,
+
     /// Link status bits before the forcing masks.
     pub link_status: u32,
     /// Forcing masks in effect.
@@ -53,6 +49,7 @@ pub struct Mock {
     /// `device_flags` of each `nic_stats` call.
     pub nic_queries: Vec<u32>,
     pub address: AddressSettings,
+
     pub netcap: netcap::Mock,
     pub netsim: netsim::Mock,
     pub ipproxy: ipproxy::Mock,
@@ -61,6 +58,12 @@ pub struct Mock {
 
 impl Default for Mock {
     fn default() -> Self {
+        /// System version of the simulated console: the newest gate in this
+        /// domain (`netsim`, 0x20278700) passes.
+        const SYSTEM_VERSION: SystemVersion = SystemVersion(0x2047_4800);
+        /// Link status of the simulated adapter: link up.
+        const LINK_STATUS: u32 = 0x0000_0001;
+
         Self {
             system_version: SYSTEM_VERSION,
             sockets: Vec::new(),
@@ -76,10 +79,10 @@ impl Default for Mock {
             nic_stats: NicStats::default(),
             nic_queries: Vec::new(),
             address: AddressSettings::default(),
-            netcap: Default::default(),
-            netsim: Default::default(),
-            ipproxy: Default::default(),
-            xhttpproxy: Default::default(),
+            netcap: netcap::Mock::default(),
+            netsim: netsim::Mock::default(),
+            ipproxy: ipproxy::Mock::default(),
+            xhttpproxy: xhttpproxy::Mock::default(),
         }
     }
 }
@@ -118,9 +121,11 @@ impl network::Backend for MockBackend {
         if mock.exhausted.contains(&table) {
             return Err(TableError::OutOfMemory);
         }
+
         let records = mock.records(table);
         let count = records.len() as u32;
         mock.snapshots.insert(connection.0, records);
+
         Ok(count)
     }
 
@@ -145,12 +150,15 @@ impl network::Backend for MockBackend {
         if let Some(error) = self.network.link_error.take() {
             return Err(error);
         }
+
         self.network.link_flags = flags;
+
         Ok(())
     }
 
     fn nic_stats(&mut self, device_flags: u32) -> NicStats {
         self.network.nic_queries.push(device_flags);
+
         self.network.nic_stats
     }
 

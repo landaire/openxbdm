@@ -4,8 +4,6 @@ mod common;
 
 use std::io::Write;
 
-use common::RawSession;
-use common::TestServer;
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::KernelError;
 use openxbdm_server::commands::console::ConfigSetting;
@@ -22,6 +20,9 @@ use openxbdm_server::commands::hardware::automation::Gamepad;
 use openxbdm_server::commands::hardware::automation::Poll;
 use openxbdm_server_host::backend::hardware::PgoRecord;
 use openxbdm_server_host::backend::hardware::UsbPortRequest;
+
+use common::RawSession;
+use common::TestServer;
 
 fn session(server: &TestServer) -> RawSession {
     let mut session = server.raw();
@@ -51,6 +52,39 @@ fn buttons(poll: Option<Poll>) -> u16 {
     match poll {
         Some(Poll::State { packet, .. }) => packet.buttons,
         other => panic!("unexpected poll result {other:?}"),
+    }
+}
+
+fn config(server: &TestServer, category: u16, index: u16) -> u32 {
+    server
+        .host
+        .lock()
+        .backend
+        .console
+        .xconfig
+        .dword(category, index)
+}
+
+fn set_config(server: &TestServer, category: u16, index: u16, value: u32) {
+    let mut host = server.host.lock();
+    host.backend.console.xconfig.settings.insert(
+        ConfigSetting::new(category, index),
+        value.to_be_bytes().to_vec(),
+    );
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02X}")).collect()
+}
+
+fn pgo_record(address: u32) -> PgoRecord {
+    PgoRecord {
+        address,
+        enabled: false,
+        counts_allocated: false,
+        allocation_scale: 0,
+        snapshots: Vec::new(),
+        resets: 0,
     }
 }
 
@@ -158,6 +192,7 @@ fn autoinput_setpacket_presents_a_fixed_state() {
         thumb_lx: -2,
         ..Gamepad::default()
     };
+
     assert_eq!(
         polled(&server, 2),
         Some(Poll::State {
@@ -211,12 +246,15 @@ fn autoinput_queuepackets_plays_back_timed_states() {
     for buttons in 1..=4u16 {
         bytes.extend_from_slice(&wire_packet(buttons, 0, 0));
     }
+
     for time in [100u32, 0, 0, 0] {
         bytes.extend_from_slice(&time.to_le_bytes());
     }
+
     for count in [1u32, 2, 0, 0] {
         bytes.extend_from_slice(&count.to_le_bytes());
     }
+
     assert_eq!(upload(&mut session, &bytes), "200- queued=0x00000003");
     server.host.lock().backend.hardware.input.now = 40;
     assert_eq!(
@@ -351,6 +389,7 @@ fn avatar_runs_test_hooks() {
             AvatarError::Hook(XamError::check(ErrorCode::NotStopped.hresult()).unwrap_err()),
         );
     }
+
     assert_eq!(
         session.command("avatar loadassetdelay=1"),
         "414- access denied"
@@ -367,24 +406,6 @@ fn avatar_runs_test_hooks() {
     assert_eq!(
         session.command("avatar simulateerrortype=1 simulateerrorvalue=9"),
         "200- OK"
-    );
-}
-
-fn config(server: &TestServer, category: u16, index: u16) -> u32 {
-    server
-        .host
-        .lock()
-        .backend
-        .console
-        .xconfig
-        .dword(category, index)
-}
-
-fn set_config(server: &TestServer, category: u16, index: u16, value: u32) {
-    let mut host = server.host.lock();
-    host.backend.console.xconfig.settings.insert(
-        ConfigSetting::new(category, index),
-        value.to_be_bytes().to_vec(),
     );
 }
 
@@ -439,6 +460,7 @@ fn configuration_flag_commands_always_succeed() {
         assert_eq!(session.command(command), "200- OK", "{command}");
         assert_eq!(config(&server, 3, index) & mask, mask, "{command}");
     }
+
     for (command, index, mask) in [
         ("bootanim", 0xd, 0x4),
         ("mdetect enabled=on", 0xd, 0x1),
@@ -450,6 +472,7 @@ fn configuration_flag_commands_always_succeed() {
         assert_eq!(session.command(command), "200- OK", "{command}");
         assert_eq!(config(&server, 3, index) & mask, 0, "{command}");
     }
+
     server
         .host
         .lock()
@@ -500,6 +523,7 @@ fn enablewirelesscontrollers_switches_the_radio_and_flag() {
             .collect();
         assert!(printed.contains(&b"[xbdm] EnableWirelessControllers, enabled=maybe\n".as_slice()));
     }
+
     server.host.lock().backend.test_kit = true;
     assert_eq!(
         session.command("enablewirelesscontrollers enabled=on"),
@@ -515,10 +539,6 @@ fn irtsweep_always_fails() {
         session.command("irtsweep anything"),
         "400- error status 0xc0000002"
     );
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02X}")).collect()
 }
 
 #[test]
@@ -564,6 +584,7 @@ fn mixcmd_reports_memory_statistics() {
         hardware.memory_statistics_result = Err(KernelError::Unsuccessful);
         hardware.xam_heap_count_result = Err(XamError::Fail);
     }
+
     assert_eq!(session.command("mixcmd querystats"), "400- ");
     assert_eq!(session.command("mixcmd countxamheaps"), "400- ");
     {
@@ -571,6 +592,7 @@ fn mixcmd_reports_memory_statistics() {
         host.backend.hardware.xam_heap_count_available = false;
         host.backend.hardware.xam_heap_info_available = false;
     }
+
     assert_eq!(
         session.command("mixcmd countxamheaps"),
         "414- access denied"
@@ -659,6 +681,7 @@ fn playto_queries_the_media_service() {
         xmp_heap: 0,
         play_to: 1,
     });
+
     assert_eq!(
         session.command("playto show"),
         "200- XMP_HEAP: OFF, PlayTo: ON [T:192.168.1.30 / D:192.168.1.31]"
@@ -693,17 +716,6 @@ fn playto_queries_the_media_service() {
     assert_eq!(session.command("playto show"), "407- unknown command");
 }
 
-fn pgo_record(address: u32) -> PgoRecord {
-    PgoRecord {
-        address,
-        enabled: false,
-        counts_allocated: false,
-        allocation_scale: 0,
-        snapshots: Vec::new(),
-        resets: 0,
-    }
-}
-
 #[test]
 fn pogoctrl_controls_instrumented_modules() {
     let server = TestServer::start();
@@ -719,6 +731,7 @@ fn pogoctrl_controls_instrumented_modules() {
         host.backend.hardware.pgo_records = vec![pgo_record(0x1000), pgo_record(0x2000)];
         host.backend.hardware.pgo_records[1].counts_allocated = true;
     }
+
     assert_eq!(
         session.command("pogoctrl start module=0x1000"),
         "200- HRESULT 0x02da0000"
@@ -794,6 +807,7 @@ fn usbportctrl_switches_port_power() {
         port: UsbPort(port),
         enable,
     };
+
     assert_eq!(
         server.host.lock().backend.hardware.usb_port_requests,
         [request(0, 1, true), request(1, 2, false)]

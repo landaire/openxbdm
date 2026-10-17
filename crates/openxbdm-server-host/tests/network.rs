@@ -9,9 +9,10 @@ mod netcap;
 mod netsim;
 
 use std::io::Write;
+use std::net::Shutdown;
+use std::thread;
+use std::time::Duration;
 
-use common::TestServer;
-use common::run;
 use openxbdm_client::commands::GetSocketInfo;
 use openxbdm_client::commands::SocketEntry;
 use openxbdm_server::commands::network::KeyRecord;
@@ -26,10 +27,26 @@ use openxbdm_server::commands::network::WsaError;
 use openxbdm_server::commands::network::XnAddr;
 use openxbdm_server::commands::network::Xnkid;
 use openxbdm_server::commands::network::xhttpproxy::ProxyFlags;
+use openxbdm_server::commands::system::load_settings;
+use openxbdm_server_host::Host;
 
-fn session(server: &TestServer) -> common::RawSession {
+use common::RawSession;
+use common::TestServer;
+use common::run;
+
+/// The observable fields of a proxy entry.
+#[derive(Debug, PartialEq, Eq)]
+struct Proxy {
+    flags: ProxyFlags,
+    name: Option<Vec<u8>>,
+    port: u32,
+    certificate: Vec<u8>,
+}
+
+fn session(server: &TestServer) -> RawSession {
     let mut session = server.raw();
     session.line();
+
     session
 }
 
@@ -49,11 +66,66 @@ fn listening_socket() -> SocketRecord {
     }
 }
 
+fn xnaddr() -> XnAddr {
+    let mut bytes = [0u8; 0x24];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = 0xa0 + index as u8;
+    }
+
+    XnAddr(bytes)
+}
+
+fn proxy(flags: ProxyFlags, name: Option<&[u8]>, port: u32, certificate: &[u8]) -> Proxy {
+    Proxy {
+        flags,
+        name: name.map(<[u8]>::to_vec),
+        port,
+        certificate: certificate.to_vec(),
+    }
+}
+
+fn proxies(server: &TestServer) -> Vec<Proxy> {
+    let host = server.host.lock();
+    host.backend
+        .network
+        .xhttpproxy
+        .entries
+        .iter()
+        .map(|entry| Proxy {
+            flags: entry.flags,
+            name: entry.name.clone(),
+            port: entry.port,
+            certificate: entry.certificate.clone(),
+        })
+        .collect()
+}
+
+fn load_settings_file(server: &TestServer) {
+    let mut host = server.host.lock();
+    let Host {
+        server,
+        backend,
+        network,
+    } = &mut *host;
+    load_settings(server, backend, network);
+}
+
+fn terminate_title(server: &TestServer) {
+    let mut host = server.host.lock();
+    let Host {
+        server,
+        backend,
+        network,
+    } = &mut *host;
+    server.title_terminated(backend, network);
+}
+
 #[test]
 fn getsockinfo_lists_the_snapshot() {
     let server = TestServer::start();
     server.host.lock().backend.network.sockets = vec![listening_socket(), SocketRecord::default()];
     let mut session = session(&server);
+
     assert_eq!(
         session.command("getsockinfo"),
         "202- multiline response follows"
@@ -74,10 +146,12 @@ fn getsockinfo_lists_the_snapshot() {
 fn getsockinfo_parses_with_the_client() {
     let server = TestServer::start();
     server.host.lock().backend.network.sockets = vec![listening_socket()];
+
     let sockets = run(async {
         let mut client = server.client().await;
         client.run(GetSocketInfo).await.unwrap()
     });
+
     assert_eq!(
         sockets,
         [SocketEntry {
@@ -100,8 +174,10 @@ fn getsockinfo_parses_with_the_client() {
 fn table_snapshot_failures() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     server.host.lock().backend.network.unavailable = vec![Table::Sockets];
     assert_eq!(session.command("getsockinfo"), "414- access denied");
+
     server.host.lock().backend.network.exhausted = vec![Table::Keys];
     assert_eq!(session.command("getxnkeyinfo"), "428- out of memory");
     assert_eq!(
@@ -116,9 +192,11 @@ fn xn_tables_require_the_system_version() {
     let server = TestServer::start();
     server.host.lock().backend.network.system_version = SystemVersion(0x200a_99ff);
     let mut session = session(&server);
+
     for command in ["getxnkeyinfo", "getxnqoslookupinfo", "getxnsecassocinfo"] {
         assert_eq!(session.command(command), "407- unknown command");
     }
+
     assert_eq!(
         session.command("getsockinfo"),
         "202- multiline response follows"
@@ -136,6 +214,7 @@ fn getxnkeyinfo_prints_the_key_identifier_in_upper_case() {
         qos_bits_per_second: 0xffff_ffff,
     }];
     let mut session = session(&server);
+
     assert_eq!(
         session.command("getxnkeyinfo"),
         "202- multiline response follows"
@@ -146,14 +225,6 @@ fn getxnkeyinfo_prints_the_key_identifier_in_upper_case() {
             "xnkid=\"0123456789ABCDEF\" ownertype=2 flags=0x00000010 qosdatasize=64 qosbps=4294967295"
         ]
     );
-}
-
-fn xnaddr() -> XnAddr {
-    let mut bytes = [0u8; 0x24];
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        *byte = 0xa0 + index as u8;
-    }
-    XnAddr(bytes)
 }
 
 #[test]
@@ -173,6 +244,7 @@ fn getxnsecassocinfo_prints_each_association() {
         nat_port: 0x1234,
     }];
     let mut session = session(&server);
+
     assert_eq!(
         session.command("getxnsecassocinfo"),
         "202- multiline response follows"
@@ -208,10 +280,12 @@ fn getxnqoslookupinfo_truncates_lines_to_the_monitor_buffer() {
     };
     server.host.lock().backend.network.qos_lookups = vec![lookup];
     let mut session = session(&server);
+
     assert_eq!(
         session.command("getxnqoslookupinfo"),
         "202- multiline response follows"
     );
+
     let full = "ownertype=-2147483648 flags=0xffffffff preq=4294967295 ptx=4294967295 prx=4294967295 \
                 datarx=4294967295 bps=4294967295 targetaddr=0xc0a80101 targetport=0x0c02 state=255 retry=255 \
                 secaddr=0x01020304 xnkid=\"1111111111111111\" \
@@ -223,6 +297,7 @@ fn getxnqoslookupinfo_truncates_lines_to_the_monitor_buffer() {
 fn linkstate_reports_and_forces_the_link() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     assert_eq!(session.command("linkstate"), "200- state=0x00000001");
     assert_eq!(
         session.command("linkstate disconnect"),
@@ -247,6 +322,7 @@ fn linkstate_reports_and_forces_the_link() {
 fn linkstate_errors() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     assert_eq!(
         session.command("linkstate setflags and=1"),
         "423- bad parameter"
@@ -259,8 +335,10 @@ fn linkstate_errors() {
         session.command("linkstate setflags and=1x or=2"),
         "423- bad parameter"
     );
+
     server.host.lock().backend.network.link_error = Some(WsaError::INVALID_ARGUMENT);
     assert_eq!(session.command("linkstate restore"), "407- err=10022");
+
     server.host.lock().backend.network.link_error = WsaError::new(10050);
     assert_eq!(session.command("linkstate disconnect"), "400- err=10050");
 }
@@ -288,6 +366,7 @@ fn nicstats_prints_counters() {
         receive_other_errors: 4_000_000_000,
     };
     let mut session = session(&server);
+
     let expected = "200- tb=0q1000000ab rub=0q0 ru1b=0q1 ru2b=0q2 rmb=0q3 rbb=0qffffffffffffffff tf=10 ruf=11 \
                     ru1f=12 ru2f=13 rmf=14 rbf=15 tue=16 toe=17 rfe=18 rce=19 roe=4000000000";
     assert_eq!(session.command("nicstats"), expected);
@@ -299,44 +378,11 @@ fn nicstats_prints_counters() {
     );
 }
 
-/// The observable fields of a proxy entry.
-#[derive(Debug, PartialEq, Eq)]
-struct Proxy {
-    flags: ProxyFlags,
-    name: Option<Vec<u8>>,
-    port: u32,
-    certificate: Vec<u8>,
-}
-
-fn proxy(flags: ProxyFlags, name: Option<&[u8]>, port: u32, certificate: &[u8]) -> Proxy {
-    Proxy {
-        flags,
-        name: name.map(<[u8]>::to_vec),
-        port,
-        certificate: certificate.to_vec(),
-    }
-}
-
-fn proxies(server: &TestServer) -> Vec<Proxy> {
-    let host = server.host.lock();
-    host.backend
-        .network
-        .xhttpproxy
-        .entries
-        .iter()
-        .map(|entry| Proxy {
-            flags: entry.flags,
-            name: entry.name.clone(),
-            port: entry.port,
-            certificate: entry.certificate.clone(),
-        })
-        .collect()
-}
-
 #[test]
 fn xhttpproxy_replaces_the_proxy_of_each_scope() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     assert_eq!(session.command("xhttpproxy"), "200- OK");
     assert_eq!(
         session.command("xhttpproxy name=proxy port=8080"),
@@ -367,12 +413,14 @@ fn xhttpproxy_replaces_the_proxy_of_each_scope() {
             ),
         ]
     );
+
     assert_eq!(session.command("xhttpproxy sys"), "200- cleared");
     assert_eq!(session.command("xhttpproxy force"), "200- cleared applied");
     assert_eq!(
         proxies(&server),
         [proxy(ProxyFlags::ACTIVE | ProxyFlags::FORCE, None, 0, &[])]
     );
+
     assert_eq!(
         session.command("xhttpproxy name=\"\" port=0 certsize=4"),
         "200- cleared"
@@ -384,6 +432,7 @@ fn xhttpproxy_replaces_the_proxy_of_each_scope() {
 fn xhttpproxy_validates_name_and_port() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     assert_eq!(
         session.command("xhttpproxy name=proxy"),
         "423- bad parameter"
@@ -396,8 +445,10 @@ fn xhttpproxy_validates_name_and_port() {
         session.command("xhttpproxy name=\"\" port=1"),
         "423- bad parameter"
     );
+
     // `port` and `certsize` are not read without `name`.
     assert_eq!(session.command("xhttpproxy port=1 certsize=2"), "200- OK");
+
     server
         .host
         .lock()
@@ -416,11 +467,13 @@ fn xhttpproxy_validates_name_and_port() {
 fn xhttpproxy_decodes_inline_certificates() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     assert_eq!(
         session.command("xhttpproxy name=p port=1 certsize=3 cert=\"00aBFf\""),
         "200-  applied"
     );
     assert_eq!(proxies(&server)[0].certificate, [0x00, 0xab, 0xff]);
+
     for command in [
         "xhttpproxy name=p port=1 certsize=3 cert=00ab",
         "xhttpproxy name=p port=1 certsize=3 cert=00abffee",
@@ -434,6 +487,7 @@ fn xhttpproxy_decodes_inline_certificates() {
         );
         assert_eq!(session.command("xhttpproxy name=p port=1"), "200-  applied");
     }
+
     // The decoder stops at a space; `cert` without certsize is ignored.
     assert_eq!(
         session.command("xhttpproxy name=p port=1 cert=zz"),
@@ -449,17 +503,16 @@ fn xhttpproxy_decodes_inline_certificates() {
 fn xhttpproxy_receives_an_uploaded_certificate() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     assert_eq!(
         session.command("xhttpproxy name=p port=443 certsize=4 sys"),
         "204-  applying"
     );
-    {
-        let entries = proxies(&server);
-        assert_eq!(
-            entries[0].flags & ProxyFlags::CERTIFICATE_PENDING,
-            ProxyFlags::CERTIFICATE_PENDING
-        );
-    }
+    assert_eq!(
+        proxies(&server)[0].flags & ProxyFlags::CERTIFICATE_PENDING,
+        ProxyFlags::CERTIFICATE_PENDING
+    );
+
     session.stream.write_all(&[1, 2]).unwrap();
     session.stream.write_all(&[3, 4]).unwrap();
     assert_eq!(session.line(), "200- OK");
@@ -472,6 +525,7 @@ fn xhttpproxy_receives_an_uploaded_certificate() {
             &[1, 2, 3, 4]
         )]
     );
+
     let host = server.host.lock();
     assert_eq!(host.backend.network.xhttpproxy.entries[0].references, 1);
 }
@@ -480,18 +534,23 @@ fn xhttpproxy_receives_an_uploaded_certificate() {
 fn xhttpproxy_drops_an_entry_whose_upload_is_cut_short() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     assert_eq!(
         session.command("xhttpproxy name=p port=443 certsize=4"),
         "204-  applying"
     );
+
     session.stream.write_all(&[1]).unwrap();
-    session.stream.shutdown(std::net::Shutdown::Both).unwrap();
+    session.stream.shutdown(Shutdown::Both).unwrap();
+
     for _ in 0..100 {
         if proxies(&server).is_empty() {
             return;
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        thread::sleep(Duration::from_millis(10));
     }
+
     panic!("entry kept: {:?}", proxies(&server));
 }
 
@@ -499,6 +558,7 @@ fn xhttpproxy_drops_an_entry_whose_upload_is_cut_short() {
 fn title_exit_drops_temporary_title_proxies() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     assert_eq!(
         session.command("xhttpproxy name=t port=1 temp"),
         "200-  applied"
@@ -507,6 +567,7 @@ fn title_exit_drops_temporary_title_proxies() {
         session.command("xhttpproxy name=s port=2 sys temp"),
         "200-  applied"
     );
+
     terminate_title(&server);
     assert_eq!(
         proxies(&server),
@@ -530,23 +591,27 @@ fn settings_file_round_trips_addresses_and_proxies() {
               xhttpproxy name=t port=1 temp\r\n"
                 .to_vec(),
         );
-        let openxbdm_server_host::Host {
-            server,
+        let Host {
+            server: core,
             backend,
             network,
         } = &mut *host;
-        openxbdm_server::commands::system::load_settings(server, backend, network);
+        load_settings(core, backend, network);
     }
+
     let mut session = session(&server);
+
     assert_eq!(
         session.command("xhttpproxy name=pending port=2 certsize=1"),
         "204- cleared applying"
     );
     session.stream.write_all(&[0x5a]).unwrap();
     assert_eq!(session.line(), "200- OK");
+
     let settings = server.host.lock().backend.system.settings.clone().unwrap();
     let settings = String::from_utf8(settings).unwrap();
     let lines: Vec<&str> = settings.lines().collect();
+
     let start = lines
         .iter()
         .position(|line| line.starts_with("staticip"))
@@ -559,6 +624,7 @@ fn settings_file_round_trips_addresses_and_proxies() {
             "gateway addr=0x0a0000fe"
         ]
     );
+
     let proxies: Vec<&str> = lines
         .iter()
         .copied()
@@ -576,21 +642,15 @@ fn settings_file_round_trips_addresses_and_proxies() {
 #[test]
 fn settings_file_writes_unnamed_proxies_and_skips_temporary_ones() {
     let server = TestServer::start();
-    {
-        let mut host = server.host.lock();
-        let openxbdm_server_host::Host {
-            server,
-            backend,
-            network,
-        } = &mut *host;
-        openxbdm_server::commands::system::load_settings(server, backend, network);
-    }
+    load_settings_file(&server);
     let mut session = session(&server);
+
     assert_eq!(session.command("xhttpproxy sys force"), "200-  applied");
     assert_eq!(
         session.command("xhttpproxy force name=n port=5 temp"),
         "200-  applied"
     );
+
     let settings = server.host.lock().backend.system.settings.clone().unwrap();
     let settings = String::from_utf8(settings).unwrap();
     let proxies: Vec<&str> = settings
@@ -600,20 +660,11 @@ fn settings_file_writes_unnamed_proxies_and_skips_temporary_ones() {
     assert_eq!(proxies, ["xhttpproxy sys force"]);
 }
 
-fn terminate_title(server: &TestServer) {
-    let mut host = server.host.lock();
-    let openxbdm_server_host::Host {
-        server,
-        backend,
-        network,
-    } = &mut *host;
-    server.title_terminated(backend, network);
-}
-
 #[test]
 fn title_exit_stops_a_capture_unless_it_is_persistent() {
     let server = TestServer::start();
     let mut session = session(&server);
+
     assert_eq!(
         session.command(r"netcap start file=e:\title.cap"),
         "200- started"

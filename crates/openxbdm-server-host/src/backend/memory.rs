@@ -1,6 +1,9 @@
 //! Simulated virtual memory, loaded modules, flash, and allocation
 //! tracking.
 
+pub mod detour;
+mod module;
+
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::Win32Error;
 use openxbdm_server::commands::filesystem;
@@ -20,7 +23,9 @@ use xbox360_sys::image::XexHeaderKey;
 
 use super::MockBackend;
 
-pub mod detour;
+pub use self::module::Module;
+pub use self::module::ModuleList;
+pub use self::module::XexField;
 
 /// Base of the primary simulated region.
 pub const MEMORY_BASE: u32 = 0x8000_0000;
@@ -47,56 +52,6 @@ impl Region {
     }
 }
 
-/// Loader list a module is linked into.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModuleList {
-    Primary,
-    Secondary,
-}
-
-/// An XEX optional header field.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum XexField {
-    /// Value stored in the key slot (key low byte 0).
-    Inline(u32),
-    Data(Vec<u8>),
-}
-
-/// A loaded module.
-#[derive(Debug, Clone)]
-pub struct Module {
-    pub name: String,
-    pub list: ModuleList,
-    /// Loader flag 0x100000; `modules` lists only flagged modules.
-    pub flagged: bool,
-    /// Whether the image has an NT header.
-    pub nt_header: bool,
-    pub base: u32,
-    pub size: u32,
-    pub checksum: u32,
-    pub timestamp: u32,
-    pub pdata: u32,
-    pub pdata_size: u32,
-    pub dll: bool,
-    pub image_size: u32,
-    pub sections: Vec<SectionInfo>,
-    pub code_view: Option<CodeView>,
-    pub xex_fields: Vec<(XexHeaderKey, XexField)>,
-}
-
-impl Module {
-    fn units(&self) -> impl Iterator<Item = u16> + '_ {
-        self.name.encode_utf16()
-    }
-
-    fn field(&self, key: XexHeaderKey) -> Option<&XexField> {
-        self.xex_fields
-            .iter()
-            .find(|(field, _)| *field == key)
-            .map(|(_, value)| value)
-    }
-}
-
 /// Simulated memory and module state.
 #[derive(Debug)]
 pub struct Mock {
@@ -106,29 +61,22 @@ pub struct Mock {
     pub title_module: Option<String>,
     /// Object path of the running executable.
     pub executable_path: Vec<u8>,
+
     /// Raw flash device content.
     pub flash: Vec<u8>,
     pub flash_read_failure: Option<KernelError>,
     pub flash_write_failure: Option<KernelError>,
+
     /// Module names the kernel accepts for import tracing.
     pub traceable_modules: Vec<String>,
     /// Import tracing requests the kernel accepted, in order.
     pub traced_modules: Vec<(Vec<u8>, bool)>,
+
     pub tracking_flags: TrackingFlags,
     /// Allocation tracking records, newest first, as written to a file.
     pub tracking_records: Vec<Vec<u8>>,
-    pub detour: detour::Mock,
-}
 
-fn section(name: &[u8], address: u32, size: u32, characteristics: u32) -> SectionInfo {
-    let mut padded = [0u8; memory::SECTION_NAME_LENGTH];
-    padded[..name.len()].copy_from_slice(name);
-    SectionInfo {
-        name: padded,
-        address,
-        size,
-        characteristics,
-    }
+    pub detour: detour::Mock,
 }
 
 impl Default for Mock {
@@ -136,6 +84,7 @@ impl Default for Mock {
         let mut flash = vec![0u8; 0x100];
         flash[memory::ADVANCED_MEMORY_FLASH_OFFSET as usize..][..2]
             .copy_from_slice(&0x0100u16.to_be_bytes());
+
         Self {
             regions: vec![
                 Region::patterned(0x3000_0000, 0x2000),
@@ -290,28 +239,11 @@ impl Mock {
     /// Whether every byte of the page holding `address` is mapped.
     fn page_mapped(&self, address: u32) -> bool {
         let page = address & !(PAGE_SIZE as u32 - 1);
+
         self.regions.iter().any(|region| {
             page.checked_sub(region.base)
                 .is_some_and(|offset| offset as usize + PAGE_SIZE <= region.bytes.len())
         })
-    }
-
-    /// Modules in loader order: the primary list, then the secondary list.
-    fn loader_order(&self) -> impl Iterator<Item = &Module> {
-        let primary = self
-            .modules
-            .iter()
-            .filter(|module| module.list == ModuleList::Primary);
-        primary.chain(
-            self.modules
-                .iter()
-                .filter(|module| module.list == ModuleList::Secondary),
-        )
-    }
-
-    fn find(&self, name: &[u8]) -> Option<&Module> {
-        self.loader_order()
-            .find(|module| memory::module_name_matches(module.units(), name, true))
     }
 }
 
@@ -324,6 +256,7 @@ impl memory::Backend for MockBackend {
         if memory::is_device_address(address) {
             return None;
         }
+
         self.memory.byte(address).copied()
     }
 
@@ -331,6 +264,7 @@ impl memory::Backend for MockBackend {
         if memory::is_device_address(address) {
             return false;
         }
+
         self.memory
             .byte_mut(address)
             .map(|byte| *byte = value)
@@ -356,6 +290,7 @@ impl memory::Backend for MockBackend {
             .loader_order()
             .filter(|module| module.flagged && module.nt_header)
             .nth(index.0 as usize)?;
+
         Some(ModuleInfo {
             name: ModuleName::from_units(module.units()),
             base: module.base,
@@ -379,6 +314,7 @@ impl memory::Backend for MockBackend {
             .find(name)
             .filter(|module| module.nt_header)
             .ok_or(NoSuchModule)?;
+
         Ok(usize::from(index.0)
             .checked_sub(1)
             .and_then(|index| module.sections.get(index))
@@ -401,6 +337,7 @@ impl memory::Backend for MockBackend {
             .memory
             .find(module)
             .ok_or(XexFieldError::NoSuchModule)?;
+
         match module.field(field) {
             Some(XexField::Inline(value)) if *value != 0 => Ok(*value),
             // Field data lives in the module's header page.
@@ -423,27 +360,33 @@ impl memory::Backend for MockBackend {
         let Some(XexField::Data(data)) = module.field(field) else {
             return Err(XexFieldError::FieldAbsent);
         };
+
         let bytes = data
             .get(offset as usize..offset as usize + output.len())
             .ok_or(XexFieldError::FieldAbsent)?;
         output.copy_from_slice(bytes);
+
         Ok(())
     }
 
     fn title_additional_memory(&mut self) -> Result<Option<u32>, NoSuchModule> {
-        let name = self.memory.title_module.clone().ok_or(NoSuchModule)?;
+        let name = self.memory.title_module.as_deref().ok_or(NoSuchModule)?;
         let module = self.memory.find(name.as_bytes()).ok_or(NoSuchModule)?;
-        Ok(match module.field(XexHeaderKey::ADDITIONAL_TITLE_MEMORY) {
+
+        let additional = match module.field(XexHeaderKey::ADDITIONAL_TITLE_MEMORY) {
             Some(XexField::Data(data)) => Some(u32::from_be_bytes(
                 data[..4].try_into().expect("field data holds a dword"),
             )),
             Some(XexField::Inline(_)) | None => None,
-        })
+        };
+
+        Ok(additional)
     }
 
     fn running_executable_path(&mut self, output: &mut [u8]) -> usize {
         let count = self.memory.executable_path.len().min(output.len());
         output[..count].copy_from_slice(&self.memory.executable_path[..count]);
+
         count
     }
 
@@ -451,7 +394,9 @@ impl memory::Backend for MockBackend {
         if let Some(error) = self.memory.flash_read_failure {
             return Err(error);
         }
+
         output.copy_from_slice(&self.memory.flash[offset as usize..][..output.len()]);
+
         Ok(())
     }
 
@@ -459,7 +404,9 @@ impl memory::Backend for MockBackend {
         if let Some(error) = self.memory.flash_write_failure {
             return Err(error);
         }
+
         self.memory.flash[offset as usize..][..data.len()].copy_from_slice(data);
+
         Ok(())
     }
 
@@ -472,6 +419,7 @@ impl memory::Backend for MockBackend {
         if accepted {
             self.memory.traced_modules.push((module.to_vec(), enable));
         }
+
         accepted
     }
 
@@ -484,11 +432,14 @@ impl memory::Backend for MockBackend {
     }
 
     fn write_tracking_records(&mut self, file: filesystem::FileHandle) -> Result<(), KernelError> {
-        let records = self.memory.tracking_records.clone();
-        for record in &records {
-            self.write_file(file, None, filesystem::FileData::Bytes(record))?;
-        }
-        Ok(())
+        // Taken for the writes, which borrow the backend, and put back after.
+        let records = std::mem::take(&mut self.memory.tracking_records);
+        let written = records.iter().try_for_each(|record| {
+            self.write_file(file, None, filesystem::FileData::Bytes(record))
+        });
+        self.memory.tracking_records = records;
+
+        written
     }
 
     /// The kernel table entries the simulated console produces.
@@ -501,6 +452,7 @@ impl memory::Backend for MockBackend {
             KernelError::DiskFull => 112,
             _ => 317,
         };
+
         Win32Error::new(code)
     }
 
@@ -518,5 +470,18 @@ impl memory::Backend for MockBackend {
 
     fn read_detour_record(&mut self, output: &mut [u8; engine::RECORD_SIZE]) -> bool {
         self.read_detour_log(output)
+    }
+}
+
+/// Section header entry with `name` zero-padded to the header width.
+fn section(name: &[u8], address: u32, size: u32, characteristics: u32) -> SectionInfo {
+    let mut padded = [0u8; memory::SECTION_NAME_LENGTH];
+    padded[..name.len()].copy_from_slice(name);
+
+    SectionInfo {
+        name: padded,
+        address,
+        size,
+        characteristics,
     }
 }

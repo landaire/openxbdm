@@ -153,10 +153,10 @@ extern "C" fn register_processor_ex(name: u32, handler: u32, dedicated: u32) -> 
         flags = flags.union(ProcessorFlags::DEDICATED_THREAD);
     }
     let handler = (handler != 0).then_some(ProcessorHandle(handler));
-    match REGISTRY.with(|processors| processors.register(name, handler, flags)) {
-        Ok(()) => Hresult::OK.0,
-        Err(error) => Hresult::from(error).0,
-    }
+    crate::exports::export_result(
+        REGISTRY.with(|processors| processors.register(name, handler, flags)),
+    )
+    .0
 }
 
 /// Monitor control code 0x1c (stock 0x91f3b6c0): register the `PIX`

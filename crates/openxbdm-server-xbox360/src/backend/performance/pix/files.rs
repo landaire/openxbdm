@@ -122,10 +122,7 @@ pub(super) fn open(name: u32, in_pix_directory: bool) -> Option<CaptureFile> {
         in_pix_directory,
         handle: NO_FILE,
     };
-    dispatcher::call_on_server(
-        open_on_server,
-        core::ptr::from_mut(&mut request) as usize as u32,
-    )?;
+    dispatcher::call_on_server_with(&mut request, open_on_server)?;
     Some(request.handle)
         .filter(|&handle| handle != NO_FILE)
         .map(CaptureFile)
@@ -144,10 +141,8 @@ fn open_on_server(
     server: &mut Server,
     console: &mut Console,
     _network: &mut XamNetwork,
-    argument: u32,
+    request: &mut OpenRequest,
 ) -> u32 {
-    // SAFETY: the poster waits in `call_on_server` while the request lives.
-    let request = unsafe { &mut *(argument as usize as *mut OpenRequest) };
     let name = c_string(request.name);
     let mut path = [0u8; PATH_CAPACITY];
     let mut length = 0;

@@ -330,10 +330,8 @@ fn drive_path_on_server(
     server: &mut Server,
     console: &mut Console,
     _network: &mut XamNetwork,
-    request: u32,
+    request: &mut DrivePath<'_>,
 ) -> u32 {
-    // SAFETY: the poster waits in `call_on_server` while the request lives.
-    let request = unsafe { &mut *(request as usize as *mut DrivePath<'_>) };
     request.length = server.state.filesystem.drives.object_path_to_drive_path(
         console,
         request.object,
@@ -353,8 +351,7 @@ pub(crate) fn executable_drive_path(output: &mut [u8; PATH_LIMIT + 2]) -> usize 
         output,
         length: 0,
     };
-    if dispatcher::call_on_server(drive_path_on_server, &raw mut request as usize as u32).is_some()
-    {
+    if dispatcher::call_on_server_with(&mut request, drive_path_on_server).is_some() {
         return request.length;
     }
     let length = object.len().min(PATH_LIMIT + 1);

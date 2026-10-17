@@ -108,26 +108,18 @@ impl Request {
 /// Run `service` on the server thread with `request`. On the server thread
 /// itself, above passive level, or after the server stopped, the server
 /// state is unreachable and the export fails with E_UNEXPECTED.
-fn run(service: ServerService, request: &mut Request) -> u32 {
-    dispatcher::call_on_server(service, core::ptr::from_mut(request) as u32)
-        .unwrap_or(Hresult::UNEXPECTED.0)
+fn run(service: ServerService<Request>, request: &mut Request) -> u32 {
+    dispatcher::call_on_server_with(request, service).unwrap_or(Hresult::UNEXPECTED.0)
 }
 
-fn on_server(service: ServerService, first: u32, second: u32, third: u32) -> u32 {
+fn on_server(service: ServerService<Request>, first: u32, second: u32, third: u32) -> u32 {
     run(service, &mut Request::new(first, second, third))
-}
-
-fn request<'a>(argument: u32) -> &'a mut Request {
-    // SAFETY: `run` passes a `Request` the caller does not touch until the
-    // call returns.
-    unsafe { &mut *(argument as usize as *mut Request) }
 }
 
 /// Stock export 8 (0x91f25c60): `(thread, exception) -> HRESULT`.
 extern "C" fn continue_thread(thread: u32, exception: u32) -> u32 {
     on_server(
-        |server, console, network, argument| {
-            let request = request(argument);
+        |server, console, network, request| {
             result_word(debugger::continue_stopped_thread(
                 &mut server.state,
                 console,
@@ -212,15 +204,16 @@ extern "C" fn is_thread_stopped(thread: u32, record: u32) -> u32 {
     }
     let mut stop = Request::new(thread, 0, 0);
     let result = run(
-        |server, console, _, argument| {
-            let request = request(argument);
-            match debugger::stop_reason(&server.state, console, ThreadId(request.first)) {
-                Ok(reason) => {
-                    (request.words, request.count) = reason.encode();
-                    Hresult::OK.0
-                }
-                Err(error) => error_word(error),
+        |server, console, _, request| match debugger::stop_reason(
+            &server.state,
+            console,
+            ThreadId(request.first),
+        ) {
+            Ok(reason) => {
+                (request.words, request.count) = reason.encode();
+                Hresult::OK.0
             }
+            Err(error) => error_word(error),
         },
         &mut stop,
     );
@@ -232,11 +225,11 @@ export!(22, is_thread_stopped);
 /// Stock export 34 (0x91f27258): `(address) -> HRESULT`.
 extern "C" fn remove_breakpoint(address: u32) -> u32 {
     on_server(
-        |server, console, _, argument| {
+        |server, console, _, request| {
             result_word(debugger::clear_software_breakpoint(
                 &mut server.state,
                 console,
-                request(argument).first,
+                request.first,
             ))
         },
         address,
@@ -255,11 +248,11 @@ export!(35, resume_thread);
 /// Stock export 37 (0x91f27140): `(address) -> HRESULT`.
 extern "C" fn set_breakpoint(address: u32) -> u32 {
     on_server(
-        |server, console, _, argument| {
+        |server, console, _, request| {
             result_word(debugger::set_software_breakpoint(
                 &mut server.state,
                 console,
-                request(argument).first,
+                request.first,
             ))
         },
         address,
@@ -273,8 +266,7 @@ export!(37, set_breakpoint);
 /// 0 clears, 1 write, 2 read/write, 5 read.
 extern "C" fn set_data_breakpoint(address: u32, kind: u32, size: u32) -> u32 {
     on_server(
-        |server, console, _, argument| {
-            let request = request(argument);
+        |server, console, _, request| {
             let target = DataTarget::from_type(request.second);
             result_word(debugger::set_data_breakpoint(
                 &mut server.state,
@@ -350,9 +342,9 @@ pub(crate) fn apply_pending_stop_on(state: &mut ServerState) {
 /// the word atomically at any level, so a caller that cannot reach the
 /// server thread queues the change for it.
 extern "C" fn stop_on(flags: u32, set: u32) -> u32 {
-    let applied = dispatcher::call_on_server(
-        |server, _, _, argument| {
-            let request = request(argument);
+    let applied = dispatcher::call_on_server_with(
+        &mut Request::new(flags, set, 0),
+        |server, _, _, request| {
             debugger::change_stop_on(
                 &mut server.state,
                 StopOn(request.first),
@@ -360,7 +352,6 @@ extern "C" fn stop_on(flags: u32, set: u32) -> u32 {
             );
             0
         },
-        core::ptr::from_mut(&mut Request::new(flags, set, 0)) as u32,
     );
     if applied.is_none() {
         let (add, remove) = if set != 0 {
@@ -408,8 +399,7 @@ export!(49, thread_debug_data);
 extern "C" fn breakpoint_kind(address: u32, kind: u32) -> u32 {
     let mut query = Request::new(address, 0, 0);
     let result = run(
-        |server, _, _, argument| {
-            let request = request(argument);
+        |server, _, _, request| {
             request.words[0] = debugger::breakpoint_kind(&server.state, request.first);
             request.count = 1;
             Hresult::OK.0
@@ -536,8 +526,7 @@ extern "C" fn load_extension(name: u32, handle: u32) -> u32 {
     }
     let mut load = Request::new(name, 0, length as u32);
     let result = run(
-        |server, console, _, argument| {
-            let request = request(argument);
+        |server, console, _, request| {
             // SAFETY: the caller measured the name before posting the request
             // and waits until it is answered.
             let name = unsafe {
@@ -567,11 +556,11 @@ export!(178, load_extension);
 /// Stock export 179 (0x91f2e6e0): `(handle) -> HRESULT`.
 extern "C" fn release_extension(handle: u32) -> u32 {
     on_server(
-        |server, console, _, argument| {
+        |server, console, _, request| {
             result_word(debugger::release_extension(
                 &mut server.state,
                 console,
-                ExtensionHandle(request(argument).first),
+                ExtensionHandle(request.first),
             ))
         },
         handle,

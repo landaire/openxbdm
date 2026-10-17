@@ -719,36 +719,29 @@ fn newer_system_software() -> bool {
 /// A server request that carries the caller's process type: stock writes
 /// or wipes the settings file on the calling thread unless it belongs to
 /// the title process, which hands the work to the server thread.
-#[repr(C)]
-struct CallerRequest {
-    service: dispatcher::ServerService,
-    argument: u32,
+struct CallerRequest<'a, T> {
+    service: dispatcher::ServerService<T>,
+    request: &'a mut T,
     title_process: bool,
 }
 
-fn call_for_caller(service: dispatcher::ServerService, argument: u32) -> Option<u32> {
-    let request = CallerRequest {
+fn call_for_caller<T>(request: &mut T, service: dispatcher::ServerService<T>) -> Option<u32> {
+    let mut request = CallerRequest {
         service,
-        argument,
+        request,
         title_process: xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE,
     };
-    dispatcher::call_on_server(
-        serve_for_caller,
-        &request as *const CallerRequest as usize as u32,
-    )
+    dispatcher::call_on_server_with(&mut request, serve_for_caller)
 }
 
-fn serve_for_caller(
+fn serve_for_caller<T>(
     server: &mut Server,
     console: &mut Console,
     network: &mut XamNetwork,
-    address: u32,
+    request: &mut CallerRequest<'_, T>,
 ) -> u32 {
-    // SAFETY: the caller waits on its stack request until the service
-    // returns.
-    let request = unsafe { &*(address as usize as *const CallerRequest) };
     console.system.title_caller = request.title_process;
-    let result = (request.service)(server, console, network, request.argument);
+    let result = (request.service)(server, console, network, request.request);
     console.system.title_caller = false;
     result
 }
@@ -756,7 +749,7 @@ fn serve_for_caller(
 /// Monitor control code 0x02 (stock 0x91f3b208): prepare for a restart
 /// and stop the server.
 pub(crate) fn service_prepare_reboot(_argument: u32) -> u32 {
-    call_for_caller(prepare_reboot_on_server, 0);
+    call_for_caller(&mut (), prepare_reboot_on_server);
     0
 }
 
@@ -764,7 +757,7 @@ fn prepare_reboot_on_server(
     server: &mut Server,
     console: &mut Console,
     network: &mut XamNetwork,
-    _argument: u32,
+    _request: &mut (),
 ) -> u32 {
     commands::system::prepare_reboot(server, console, network);
     dispatcher::stop_serving();
@@ -774,54 +767,48 @@ fn prepare_reboot_on_server(
 
 /// Monitor control code 0x17 (stock 0x91f321d8): empty the settings file.
 pub(crate) fn service_wipe_settings(_argument: u32) -> u32 {
-    call_for_caller(
-        |server, console, _, _| {
-            commands::system::wipe_settings(&server.state, console);
-            0
-        },
-        0,
-    );
+    call_for_caller(&mut (), |server, console, _, _| {
+        commands::system::wipe_settings(&server.state, console);
+        0
+    });
     0
 }
 
 /// Monitor control code 0x1d (stock 0x91f32110): write the settings text
 /// to the caller's file `{+0 handle, +4 length out, +8 u8 pad}`.
 pub(crate) fn service_write_settings_copy(argument: u32) -> u32 {
-    dispatcher::call_on_server(
-        |server, console, _, argument| {
-            // SAFETY: the caller's structure holds the pad byte at +8.
-            let pad =
-                unsafe { core::ptr::read_volatile((argument + 8) as usize as *const u8) } != 0;
-            let copy = SettingsCopy::File {
-                handle: read_u32(argument),
-                pad,
-            };
-            if let Some(length) = commands::system::copy_settings(&server.state, console, copy) {
-                write_u32(argument + 4, length);
-            }
-            0
-        },
-        argument,
-    );
+    let mut address = argument;
+    dispatcher::call_on_server_with(&mut address, |server, console, _, address: &mut u32| {
+        let argument = *address;
+        // SAFETY: the caller's structure holds the pad byte at +8.
+        let pad = unsafe { core::ptr::read_volatile((argument + 8) as usize as *const u8) } != 0;
+        let copy = SettingsCopy::File {
+            handle: read_u32(argument),
+            pad,
+        };
+        if let Some(length) = commands::system::copy_settings(&server.state, console, copy) {
+            write_u32(argument + 4, length);
+        }
+        0
+    });
     0
 }
 
 /// Monitor control code 0x22 (stock 0x91f32080): store the settings text
 /// in the caller's buffer `{+0 address, +4 size in, length out}`.
 pub(crate) fn service_capture_settings(argument: u32) -> u32 {
-    dispatcher::call_on_server(
-        |server, console, _, argument| {
-            let copy = SettingsCopy::Memory {
-                address: read_u32(argument),
-                capacity: read_u32(argument + 4),
-            };
-            if let Some(length) = commands::system::copy_settings(&server.state, console, copy) {
-                write_u32(argument + 4, length);
-            }
-            0
-        },
-        argument,
-    );
+    let mut address = argument;
+    dispatcher::call_on_server_with(&mut address, |server, console, _, address: &mut u32| {
+        let argument = *address;
+        let copy = SettingsCopy::Memory {
+            address: read_u32(argument),
+            capacity: read_u32(argument + 4),
+        };
+        if let Some(length) = commands::system::copy_settings(&server.state, console, copy) {
+            write_u32(argument + 4, length);
+        }
+        0
+    });
     1
 }
 
@@ -843,14 +830,11 @@ pub(crate) fn service_title_reboot(argument: u32) -> u32 {
         monitor::request_execution(ExecutionState::Started, true);
         return 0;
     }
-    let reason = read_u32(argument);
-    dispatcher::call_on_server(
-        |server, console, _, reason| {
-            commands::system::trace_title_reboot(&server.state, console, LaunchReason(reason));
-            0
-        },
-        reason,
-    );
+    let mut reason = read_u32(argument);
+    dispatcher::call_on_server_with(&mut reason, |server, console, _, reason: &mut u32| {
+        commands::system::trace_title_reboot(&server.state, console, LaunchReason(*reason));
+        0
+    });
     monitor::request_execution(ExecutionState::PendingTitle, false);
     if reason == 4
         && XAM_VERSION.load(Ordering::Acquire) < XAM_VERSION_DISC_WAIT
@@ -858,18 +842,18 @@ pub(crate) fn service_title_reboot(argument: u32) -> u32 {
     {
         wait_for_disc(argument + LAUNCH_IMAGE, DISC_WAIT_MS);
     }
-    let stop = dispatcher::call_on_server(
-        |server, console, _, reason| match commands::system::title_reboot_stop(
-            &mut server.state,
-            console,
-            LaunchReason(reason),
-        ) {
-            TitleRebootStop::Run => STOP_RUN,
-            TitleRebootStop::Stop { forever: false } => STOP_TIMED,
-            TitleRebootStop::Stop { forever: true } => STOP_FOREVER,
-        },
-        reason,
-    );
+    let stop =
+        dispatcher::call_on_server_with(&mut reason, |server, console, _, reason: &mut u32| {
+            match commands::system::title_reboot_stop(
+                &mut server.state,
+                console,
+                LaunchReason(*reason),
+            ) {
+                TitleRebootStop::Run => STOP_RUN,
+                TitleRebootStop::Stop { forever: false } => STOP_TIMED,
+                TitleRebootStop::Stop { forever: true } => STOP_FOREVER,
+            }
+        });
     let released = match stop {
         Some(STOP_TIMED) => monitor::stop_at_pending_title(false),
         Some(STOP_FOREVER) => monitor::stop_at_pending_title(true),
@@ -884,45 +868,43 @@ pub(crate) fn service_title_reboot(argument: u32) -> u32 {
     if !released {
         monitor::request_execution(ExecutionState::Started, true);
     }
-    call_for_caller(
-        |server, console, _, argument| {
-            let reason = LaunchReason(read_u32(argument));
-            let Some(title) =
-                commands::system::title_reboot_launch(&mut server.state, console, reason)
-            else {
-                return 0;
-            };
-            write_launch_info(argument, &title);
-            if newer_system_software() {
-                write_u32(argument + LAUNCH_EXTRA, 0);
-            }
-            u32::from(commands::system::launch_image_exists(
-                &server.state,
-                console,
-                title.image.as_bytes(),
-            ))
-        },
-        argument,
-    )
+    let mut address = argument;
+    call_for_caller(&mut address, |server, console, _, address: &mut u32| {
+        let argument = *address;
+        let reason = LaunchReason(read_u32(argument));
+        let Some(title) = commands::system::title_reboot_launch(&mut server.state, console, reason)
+        else {
+            return 0;
+        };
+        write_launch_info(argument, &title);
+        if newer_system_software() {
+            write_u32(argument + LAUNCH_EXTRA, 0);
+        }
+        u32::from(commands::system::launch_image_exists(
+            &server.state,
+            console,
+            title.image.as_bytes(),
+        ))
+    })
     .unwrap_or(0)
 }
 
 /// Monitor control code 0x77 (stock 0x91f52260): fill the launch
 /// information with the monitor's launch title, if any.
 pub(crate) fn service_launch_override(argument: u32) -> u32 {
-    let replaced = dispatcher::call_on_server(
-        |server, _, _, argument| match commands::system::launch_override(
-            &server.state,
-            LaunchReason(read_u32(argument)),
-        ) {
-            Some(title) => {
-                write_launch_info(argument, &title);
-                1
+    let mut address = argument;
+    let replaced =
+        dispatcher::call_on_server_with(&mut address, |server, _, _, address: &mut u32| {
+            let argument = *address;
+            match commands::system::launch_override(&server.state, LaunchReason(read_u32(argument)))
+            {
+                Some(title) => {
+                    write_launch_info(argument, &title);
+                    1
+                }
+                None => 0,
             }
-            None => 0,
-        },
-        argument,
-    );
+        });
     if replaced == Some(1) && newer_system_software() {
         if read_u32(argument) == 4 && is_disc_image(argument + LAUNCH_IMAGE) {
             wait_for_disc(argument + LAUNCH_IMAGE, DISC_WAIT_MS);
@@ -942,8 +924,7 @@ fn caller_string<'a>(address: u32) -> Option<&'a [u8]> {
     (address != 0).then(|| unsafe { CStr::from_ptr(address as usize as *const c_char) }.to_bytes())
 }
 
-/// Arguments of a title export, passed to the server thread by address.
-#[repr(C)]
+/// Arguments of a title export, passed to the server thread.
 struct TitleArguments {
     flags: u32,
     image: u32,
@@ -965,21 +946,20 @@ impl TitleArguments {
     }
 }
 
-fn call_with_arguments(service: dispatcher::ServerService, arguments: &TitleArguments) -> u32 {
-    call_for_caller(service, arguments as *const TitleArguments as usize as u32)
-        .unwrap_or(Hresult::from(SERVER_UNAVAILABLE).0)
-}
-
-fn title_arguments<'a>(address: u32) -> &'a TitleArguments {
-    // SAFETY: the export that posted the request waits on its stack
-    // structure until the service returns.
-    unsafe { &*(address as usize as *const TitleArguments) }
+fn call_with_arguments(
+    service: dispatcher::ServerService<TitleArguments>,
+    arguments: &mut TitleArguments,
+) -> u32 {
+    call_for_caller(arguments, service).unwrap_or(Hresult::from(SERVER_UNAVAILABLE).0)
 }
 
 /// Exports 28 and 125: run the launch on the server thread. Stock calls
 /// the relaunch routine on the caller's thread and then ends that thread
 /// when it belongs to the title process (0x91f278a8).
-fn launch_export(service: dispatcher::ServerService, arguments: &TitleArguments) -> u32 {
+fn launch_export(
+    service: dispatcher::ServerService<TitleArguments>,
+    arguments: &mut TitleArguments,
+) -> u32 {
     let result = call_with_arguments(service, arguments);
     if arguments.relaunched.load(Ordering::Acquire)
         && xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE
@@ -991,9 +971,9 @@ fn launch_export(service: dispatcher::ServerService, arguments: &TitleArguments)
     result
 }
 
-/// Report an in-place relaunch of the server request at `address`.
-fn note_relaunch(console: &mut Console, address: u32) {
-    title_arguments(address).relaunched.store(
+/// Report an in-place relaunch of the server request `arguments`.
+fn note_relaunch(console: &mut Console, arguments: &TitleArguments) {
+    arguments.relaunched.store(
         core::mem::take(&mut console.system.relaunched),
         Ordering::Release,
     );
@@ -1002,17 +982,17 @@ fn note_relaunch(console: &mut Console, address: u32) {
 /// Stock export 28 (0x91f27b80): `(flags) -> HRESULT`; launch the current
 /// title, relaunching in place when possible, else restart.
 extern "C" fn reboot_export(flags: u32) -> u32 {
-    let arguments = TitleArguments::new(flags, 0, 0, 0);
+    let mut arguments = TitleArguments::new(flags, 0, 0, 0);
     launch_export(
-        |server, console, network, address| {
+        |server, console, network, arguments| {
             console.system.relaunched = false;
-            let flags = BootFlags(title_arguments(address).flags);
+            let flags = BootFlags(arguments.flags);
             let result =
                 commands::system::launch_without_connection(server, console, network, flags, None);
-            note_relaunch(console, address);
+            note_relaunch(console, arguments);
             reply::hresult(result).0
         },
-        &arguments,
+        &mut arguments,
     )
 }
 export!(28, reboot_export);
@@ -1021,11 +1001,10 @@ export!(28, reboot_export);
 /// HRESULT`; launch a title by drive paths, or object paths with flag
 /// 0x10.
 extern "C" fn launch_title_export(flags: u32, image: u32, drive: u32, command_line: u32) -> u32 {
-    let arguments = TitleArguments::new(flags, image, drive, command_line);
+    let mut arguments = TitleArguments::new(flags, image, drive, command_line);
     launch_export(
-        |server, console, network, address| {
+        |server, console, network, arguments| {
             console.system.relaunched = false;
-            let arguments = title_arguments(address);
             let result = commands::system::launch_from_paths(
                 server,
                 console,
@@ -1035,10 +1014,10 @@ extern "C" fn launch_title_export(flags: u32, image: u32, drive: u32, command_li
                 caller_string(arguments.drive),
                 caller_string(arguments.command_line),
             );
-            note_relaunch(console, address);
+            note_relaunch(console, arguments);
             reply::hresult(result).0
         },
-        &arguments,
+        &mut arguments,
     )
 }
 export!(125, launch_title_export);
@@ -1046,10 +1025,9 @@ export!(125, launch_title_export);
 /// Stock export 81 (0x91f47140): `(dir, name, command line, flags) ->
 /// HRESULT`; set the launch title from drive paths.
 extern "C" fn set_title_export(dir: u32, name: u32, command_line: u32, flags: u32) -> u32 {
-    let arguments = TitleArguments::new(flags, name, dir, command_line);
+    let mut arguments = TitleArguments::new(flags, name, dir, command_line);
     call_with_arguments(
-        |server, console, _, address| {
-            let arguments = title_arguments(address);
+        |server, console, _, arguments| {
             let result = commands::system::set_title_from_paths(
                 &mut server.state,
                 console,
@@ -1060,7 +1038,7 @@ extern "C" fn set_title_export(dir: u32, name: u32, command_line: u32, flags: u3
             );
             reply::hresult(result).0
         },
-        &arguments,
+        &mut arguments,
     )
 }
 export!(81, set_title_export);

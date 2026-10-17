@@ -5,7 +5,9 @@
 //! queued for the server thread.
 
 use core::cell::UnsafeCell;
+use core::ptr::NonNull;
 use core::sync::atomic::AtomicBool;
+use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 use core::time::Duration;
@@ -77,10 +79,16 @@ fn passive() -> bool {
     processor::current_irql() == Irql::PASSIVE
 }
 
-/// A service run on the server thread with the server's state. The result
-/// is the export's or control code's return word: services convert typed
-/// results to it as their last step.
-pub(crate) type ServerService = fn(&mut Server, &mut Console, &mut XamNetwork, u32) -> u32;
+/// A service run on the server thread with the server's state and the
+/// request its caller posted. The result is the export's or control code's
+/// return word: services convert typed results to it as their last step.
+pub(crate) type ServerService<T> = fn(&mut Server, &mut Console, &mut XamNetwork, &mut T) -> u32;
+
+/// [`ServerService`] with the request type erased, as the request slots
+/// carry it. `&mut T` and `NonNull<()>` are ABI-compatible arguments for a
+/// sized `T`, so a `ServerService<T>` may be called through this type with
+/// a pointer to a live `T`.
+type ErasedService = fn(&mut Server, &mut Console, &mut XamNetwork, NonNull<()>) -> u32;
 
 const REQUEST_FREE: u32 = 0;
 const REQUEST_FILLING: u32 = 1;
@@ -89,11 +97,19 @@ const REQUEST_TAKEN: u32 = 3;
 const REQUEST_COMPLETED: u32 = 4;
 const REQUEST_SLOTS: usize = 4;
 
+/// Argument of control code 0x35: the thread to name and the address of
+/// the name.
+#[repr(C)]
+struct NameThreadRequest {
+    thread: u32,
+    name: u32,
+}
+
 /// A dispatcher request waiting for the server thread.
 struct Request {
     state: AtomicU32,
     service: AtomicU32,
-    argument: AtomicU32,
+    argument: AtomicPtr<()>,
     result: AtomicU32,
     done: kernel::KernelEvent,
 }
@@ -102,7 +118,7 @@ static REQUESTS: [Request; REQUEST_SLOTS] = [const {
     Request {
         state: AtomicU32::new(REQUEST_FREE),
         service: AtomicU32::new(0),
-        argument: AtomicU32::new(0),
+        argument: AtomicPtr::new(core::ptr::null_mut()),
         result: AtomicU32::new(0),
         done: kernel::KernelEvent::new(),
     }
@@ -206,18 +222,28 @@ pub(crate) fn begin_serving() -> Option<(&'static mut Server, &'static mut Conso
     result
 }
 
-/// Run `service` with the server's state and return its result: inline
-/// while the command loop has not started, otherwise on the server thread.
-/// `None` on the server thread, above passive level, before the state
-/// exists, when the startup lock stays busy, or once the server stopped.
-pub(crate) fn call_on_server(service: ServerService, argument: u32) -> Option<u32> {
+/// Run `service` with the server's state and `request` and return its
+/// result: inline while the command loop has not started, otherwise on the
+/// server thread. `None` on the server thread, above passive level, before
+/// the state exists, when the startup lock stays busy, or once the server
+/// stopped.
+#[inline(always)]
+pub(crate) fn call_on_server_with<T>(request: &mut T, service: ServerService<T>) -> Option<u32> {
+    // SAFETY: `ServerService<T>` and `ErasedService` differ only in the
+    // request argument, which is ABI-compatible; the service is called with
+    // the address of `request`, which outlives the call.
+    let service = unsafe { core::mem::transmute::<ServerService<T>, ErasedService>(service) };
+    call_on_server(service, NonNull::from(request).cast())
+}
+
+fn call_on_server(service: ErasedService, argument: NonNull<()>) -> Option<u32> {
     CALLERS.fetch_add(1, Ordering::AcqRel);
     let result = call_on_server_counted(service, argument);
     CALLERS.fetch_sub(1, Ordering::AcqRel);
     result
 }
 
-fn call_on_server_counted(service: ServerService, argument: u32) -> Option<u32> {
+fn call_on_server_counted(service: ErasedService, argument: NonNull<()>) -> Option<u32> {
     // The debugger backend records the server thread before startup work
     // (settings, extension loads) that may call in; this module's copy is
     // set only at the first pass.
@@ -284,7 +310,7 @@ fn call_on_server_counted(service: ServerService, argument: u32) -> Option<u32> 
     request
         .service
         .store(service as usize as u32, Ordering::Relaxed);
-    request.argument.store(argument, Ordering::Relaxed);
+    request.argument.store(argument.as_ptr(), Ordering::Relaxed);
     request.state.store(REQUEST_POSTED, Ordering::Release);
     while request.state.load(Ordering::Acquire) != REQUEST_COMPLETED {
         // SAFETY: `done` was initialized above and lives in a static slot.
@@ -345,15 +371,13 @@ fn serve_requests(server: &mut Server, console: &mut Console, network: &mut XamN
         {
             continue;
         }
-        // SAFETY: the poster stored a `ServerService` function pointer.
-        let service: ServerService =
+        // SAFETY: the poster stored an `ErasedService` function pointer.
+        let service: ErasedService =
             unsafe { core::mem::transmute(request.service.load(Ordering::Relaxed) as usize) };
-        let result = service(
-            server,
-            console,
-            network,
-            request.argument.load(Ordering::Relaxed),
-        );
+        // SAFETY: the poster stored a pointer to its request, which it keeps
+        // alive and untouched until the state reads completed.
+        let argument = unsafe { NonNull::new_unchecked(request.argument.load(Ordering::Relaxed)) };
+        let result = service(server, console, network, argument);
         request.result.store(result, Ordering::Relaxed);
         request.state.store(REQUEST_COMPLETED, Ordering::Release);
         request.done.set();
@@ -394,7 +418,10 @@ extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: u32) ->
             TRAP_PASSTHROUGH.store(0, Ordering::Relaxed);
             system::service_prepare_reboot(argument)
         }
-        0x03 => call_on_server(filesystem::service_set_drive_mapping, argument).unwrap_or(0),
+        0x03 => {
+            let mut request = argument;
+            call_on_server_with(&mut request, filesystem::service_set_drive_mapping).unwrap_or(0)
+        }
         0x08 => memory::service_memtrack_record_alloc(argument),
         0x09 => memory::service_memtrack_record_free(argument),
         0x0a => DEBUGGER_ATTACHED.load(Ordering::Relaxed),
@@ -434,15 +461,11 @@ extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: u32) ->
             0
         }
         0x35 => {
-            // SAFETY: the caller passes `{thread id, name}`.
-            let (thread, name) = unsafe {
-                let words = argument as usize as *const u32;
-                (
-                    core::ptr::read_volatile(words),
-                    core::ptr::read_volatile(words.add(1)),
-                )
+            // SAFETY: the caller passes the address of a `NameThreadRequest`.
+            let request = unsafe {
+                &*core::ptr::with_exposed_provenance::<NameThreadRequest>(argument as usize)
             };
-            monitor::name_thread(Some(debugger::ThreadId(thread)), name);
+            monitor::name_thread(Some(debugger::ThreadId(request.thread)), request.name);
             0
         }
         0x46 => hardware::service_odd_read_start(argument),

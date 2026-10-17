@@ -217,7 +217,7 @@ static TITLE_TERMINATED: AtomicBool = AtomicBool::new(false);
 /// notification sessions, frame counters, and file events go.
 extern "C" fn title_terminated() {
     super::image_device::dismount_all();
-    if dispatcher::call_on_server(release_title, 0).is_none() {
+    if dispatcher::call_on_server_with(&mut (), release_title).is_none() {
         TITLE_TERMINATED.store(true, Ordering::Release);
     }
     unlink_title_notification_sessions();
@@ -230,7 +230,7 @@ fn release_title(
     server: &mut Server,
     console: &mut Console,
     network: &mut XamNetwork,
-    _argument: u32,
+    _request: &mut (),
 ) -> u32 {
     server.title_terminated(console, network);
     0
@@ -373,15 +373,11 @@ pub(crate) fn post_notification(text: &[u8]) -> bool {
     if worker != 0 && worker == read_u32(current_thread() + THREAD_ID) {
         return false;
     }
-    let request = WaitingText {
+    let mut request = WaitingText {
         address: text.as_ptr() as usize as u32,
         length: text.len() as u32,
     };
-    dispatcher::call_on_server(
-        send_waiting_text,
-        &request as *const WaitingText as usize as u32,
-    )
-    .is_some()
+    dispatcher::call_on_server_with(&mut request, send_waiting_text).is_some()
 }
 
 /// A text whose poster waits for the server thread to send it.
@@ -395,13 +391,12 @@ fn send_waiting_text(
     server: &mut Server,
     console: &mut Console,
     network: &mut XamNetwork,
-    argument: u32,
+    request: &mut WaitingText,
 ) -> u32 {
     server.drain_posted_notifications(console, network);
-    // SAFETY: the poster waits in `call_on_server` while the request and
-    // its text are alive.
+    // SAFETY: the poster waits in `call_on_server_with` while its text is
+    // alive.
     let text = unsafe {
-        let request = &*(argument as usize as *const WaitingText);
         core::slice::from_raw_parts(
             request.address as usize as *const u8,
             request.length as usize,

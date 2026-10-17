@@ -50,6 +50,7 @@ use xbox360_sys::xboxkrnl::TimerType;
 
 use crate::exports::bridged;
 use crate::exports::export;
+use crate::exports::export_result;
 use crate::kernel;
 
 const COUNTER_DIRECTORY: &[u8] = b"\\DmCounters";
@@ -109,14 +110,6 @@ impl From<StatisticsError> for Hresult {
             StatisticsError::BadLength => Hresult::INVALID_ARGUMENT,
             StatisticsError::Kernel(error) => error.into(),
         }
-    }
-}
-
-/// The result word of the counter exports.
-fn export_result(result: Result<(), impl Into<Hresult>>) -> u32 {
-    match result {
-        Ok(()) => Hresult::OK.0,
-        Err(error) => Into::<Hresult>::into(error).0,
     }
 }
 
@@ -503,14 +496,14 @@ extern "C" fn read_frames(value: *mut u32, _rate: *mut u32) -> u32 {
             Ok(())
         }
     };
-    export_result(result)
+    export_result(result).0
 }
 
 /// Reader of `Frame Ticks` (stock 0x91f2a550).
 extern "C" fn read_frame_ticks(value: *mut u32, _rate: *mut u32) -> u32 {
     let pointer = TITLE_INTERFACE[FRAME_TICKS_COUNT].load(Ordering::Acquire);
     if TITLE_INTERFACE[0].load(Ordering::Acquire) <= 0x1c || pointer == 0 {
-        return export_result(Err(CounterError::DataNotAvailable));
+        return export_result(Err(CounterError::DataNotAvailable)).0;
     }
     write(value as usize as u32, 0);
     write(value as usize as u32 + 4, read(pointer));
@@ -680,17 +673,17 @@ extern "C" fn register_counter(name: *const u8, word: u32, source: u32) -> u32 {
     }
     // SAFETY: the caller passes a NUL-terminated name.
     let name = unsafe { CStr::from_ptr(name.cast()) };
-    export_result(register(name.to_bytes(), word, source))
+    export_result(register(name.to_bytes(), word, source)).0
 }
 export!(33, register_counter);
 
 /// Stock export 26: `(name, handle out) -> HRESULT`.
 extern "C" fn open_counter(name: *const u8, handle: *mut u32) -> u32 {
     let Some(directory) = directory() else {
-        return export_result(Err(CounterError::NoDirectory));
+        return export_result(Err(CounterError::NoDirectory)).0;
     };
     if name.is_null() {
-        return export_result(Err(CounterError::NoDirectory));
+        return export_result(Err(CounterError::NoDirectory)).0;
     }
     // SAFETY: the caller passes a NUL-terminated name.
     let name = kernel::ansi_string(unsafe { CStr::from_ptr(name.cast()) }.to_bytes());
@@ -708,7 +701,7 @@ extern "C" fn open_counter(name: *const u8, handle: *mut u32) -> u32 {
         status if failed(status.0) => Err(CounterError::NotFound),
         _ => Ok(()),
     };
-    export_result(result)
+    export_result(result).0
 }
 export!(26, open_counter);
 
@@ -721,7 +714,7 @@ extern "C" fn query_counter(handle: u32, query_type: u32, sample: *mut u32) -> u
     }
     let mut counter = match reference(CounterHandle(handle)) {
         Ok(counter) => counter,
-        Err(error) => return export_result(Err(CounterError::Kernel(error))),
+        Err(error) => return export_result(Err(CounterError::Kernel(error))).0,
     };
     let address = sample as usize as u32;
     let mut out = CounterSample {
@@ -754,7 +747,7 @@ extern "C" fn walk_counters(context: *mut u32, entry: *mut u8) -> u32 {
         return Hresult::INVALID_ARGUMENT.0;
     }
     if directory.is_none() {
-        return export_result(Err(CounterError::End));
+        return export_result(Err(CounterError::End)).0;
     }
     // SAFETY: the caller passes a context dword and an entry of
     // ENTRY_NAME + 4 bytes.
@@ -770,7 +763,7 @@ extern "C" fn walk_counters(context: *mut u32, entry: *mut u8) -> u32 {
             u32::from(counter.counter_type),
         );
     });
-    export_result(result)
+    export_result(result).0
 }
 export!(53, walk_counters);
 

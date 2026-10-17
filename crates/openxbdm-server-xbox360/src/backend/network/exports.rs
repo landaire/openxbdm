@@ -32,6 +32,7 @@ use xbox360_sys::xboxkrnl::ProcessType;
 use crate::backend::Console;
 use crate::backend::dispatcher;
 use crate::exports::export;
+use crate::exports::export_result;
 use crate::net::XamNetwork;
 
 /// A persistent capture requested from the title process.
@@ -42,8 +43,8 @@ const ALL: u32 = u32::MAX;
 /// Run `service` on the server thread with `request`. The server thread
 /// cannot serve a call made on itself or above passive level; those
 /// report a generic failure.
-fn on_server<T>(request: &mut T, service: dispatcher::ServerService) -> Hresult {
-    dispatcher::call_on_server(service, request as *mut T as usize as u32)
+fn on_server<T>(request: &mut T, service: dispatcher::ServerService<T>) -> Hresult {
+    dispatcher::call_on_server_with(request, service)
         .map_or(ErrorCode::Undefined.hresult(), Hresult)
 }
 
@@ -51,14 +52,6 @@ fn on_server<T>(request: &mut T, service: dispatcher::ServerService) -> Hresult 
 /// of the command status.
 fn reported(error: NetsimError) -> u32 {
     Hresult::from(NetworkError::Netsim(error)).0
-}
-
-/// # Safety
-///
-/// `argument` is the address of the `T` that [`on_server`] passed.
-unsafe fn posted<'a, T>(argument: u32) -> &'a mut T {
-    // SAFETY: guaranteed by the caller; the poster waits in `on_server`.
-    unsafe { &mut *(argument as usize as *mut T) }
 }
 
 fn direction(inbound: u32) -> Direction {
@@ -130,9 +123,10 @@ extern "C" fn capture_start(name: u32, data_limit: u32, buffer: u32, flags: u32)
     };
     on_server(
         &mut start,
-        |server: &mut Server, console: &mut Console, _: &mut XamNetwork, argument| {
-            // SAFETY: posted by `capture_start`.
-            let start = unsafe { posted::<CaptureStart<'_>>(argument) };
+        |server: &mut Server,
+         console: &mut Console,
+         _: &mut XamNetwork,
+         start: &mut CaptureStart<'_>| {
             let result = netcap::start_capture(
                 &mut server.state,
                 console,
@@ -141,10 +135,7 @@ extern "C" fn capture_start(name: u32, data_limit: u32, buffer: u32, flags: u32)
                 start.buffer,
                 start.flags,
             );
-            match result {
-                Ok(()) => Hresult::OK.0,
-                Err(error) => Hresult::from(error).0,
-            }
+            export_result(result).0
         },
     )
     .0
@@ -155,11 +146,12 @@ export!(163, capture_start);
 extern "C" fn capture_stop() -> u32 {
     on_server(
         &mut (),
-        |server: &mut Server, console: &mut Console, _: &mut XamNetwork, _| {
-            match netcap::stop_capture(&mut server.state.network.netcap, console) {
-                Ok(()) => Hresult::OK.0,
-                Err(error) => Hresult::from(error).0,
-            }
+        |server: &mut Server, console: &mut Console, _: &mut XamNetwork, _: &mut ()| {
+            export_result(netcap::stop_capture(
+                &mut server.state.network.netcap,
+                console,
+            ))
+            .0
         },
     )
     .0
@@ -204,9 +196,10 @@ struct RemoveQueues {
 fn remove_queues(request: &mut RemoveQueues) -> Hresult {
     on_server(
         request,
-        |server: &mut Server, console: &mut Console, _: &mut XamNetwork, argument| {
-            // SAFETY: posted by `remove_queues`.
-            let request = unsafe { posted::<RemoveQueues>(argument) };
+        |server: &mut Server,
+         console: &mut Console,
+         _: &mut XamNetwork,
+         request: &mut RemoveQueues| {
             let state = &server.state.network.netsim;
             let position = request.index.map(QueueIndex);
             match netsim::remove_queues(
@@ -278,9 +271,10 @@ extern "C" fn modify_queue(inbound: u32, index: u32, settings: u32) -> u32 {
     };
     on_server(
         &mut request,
-        |server: &mut Server, console: &mut Console, _: &mut XamNetwork, argument| {
-            // SAFETY: posted by `modify_queue`.
-            let request = unsafe { posted::<QueueRequest>(argument) };
+        |server: &mut Server,
+         console: &mut Console,
+         _: &mut XamNetwork,
+         request: &mut QueueRequest| {
             let blob = &request.blob[..request.length];
             let index = QueueIndex(request.index.unwrap_or(ALL));
             match netsim::modify_queue(
@@ -375,9 +369,10 @@ extern "C" fn insert_queue(
     }
     let result = on_server(
         &mut request,
-        |server: &mut Server, console: &mut Console, _: &mut XamNetwork, argument| {
-            // SAFETY: posted by `insert_queue`.
-            let request = unsafe { posted::<InsertRequest<Direction>>(argument) };
+        |server: &mut Server,
+         console: &mut Console,
+         _: &mut XamNetwork,
+         request: &mut InsertRequest<Direction>| {
             let blob = &request.blob[..request.length];
             let position = request.index.map(QueueIndex);
             let result = netsim::insert_queue(
@@ -433,9 +428,10 @@ extern "C" fn insert_redirect(
     }
     let result = on_server(
         &mut request,
-        |server: &mut Server, console: &mut Console, _: &mut XamNetwork, argument| {
-            // SAFETY: posted by `insert_redirect`.
-            let request = unsafe { posted::<InsertRequest<()>>(argument) };
+        |server: &mut Server,
+         console: &mut Console,
+         _: &mut XamNetwork,
+         request: &mut InsertRequest<()>| {
             let blob = &request.blob[..request.length];
             let position = request.index.map(RedirectIndex);
             let result = netsim::insert_redirect(
@@ -521,9 +517,10 @@ extern "C" fn remove_redirects(index: u32, removed: u32) -> u32 {
     };
     let result = on_server(
         &mut request,
-        |server: &mut Server, console: &mut Console, _: &mut XamNetwork, argument| {
-            // SAFETY: posted by `remove_redirects`.
-            let request = unsafe { posted::<RemoveRedirects>(argument) };
+        |server: &mut Server,
+         console: &mut Console,
+         _: &mut XamNetwork,
+         request: &mut RemoveRedirects| {
             let position = request.index.map(RedirectIndex);
             match netsim::remove_redirects(&server.state.network.netsim, console, position, true) {
                 Ok(removal) => {

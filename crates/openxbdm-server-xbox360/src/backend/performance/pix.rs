@@ -114,8 +114,8 @@ pub(crate) fn service_register_persistent_consumer(argument: u32) -> u32 {
 
 /// Monitor control code 0x45 operation 0: run the title's `pixcmd` line
 /// `{0x14, line, response, size, context}` on the server thread.
-fn run_command_line(request: u32) -> u32 {
-    dispatcher::call_on_server(title_command, request).unwrap_or(0)
+fn run_command_line(mut request: u32) -> u32 {
+    dispatcher::call_on_server_with(&mut request, title_command).unwrap_or(0)
 }
 
 /// Bytes of the title's line buffer the parser may read: the line, its
@@ -126,8 +126,9 @@ fn title_command(
     server: &mut Server,
     console: &mut Console,
     network: &mut XamNetwork,
-    request: u32,
+    request: &mut u32,
 ) -> u32 {
+    let request = *request;
     let line = read_u32(request + 4);
     let response = read_u32(request + 8);
     let size = read_u32(request + 0xc) as usize;

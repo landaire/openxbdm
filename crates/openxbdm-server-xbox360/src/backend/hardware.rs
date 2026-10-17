@@ -81,6 +81,7 @@ use super::dispatcher;
 use super::network::xam_procedure;
 use super::performance::pix;
 use crate::exports::export;
+use crate::exports::export_result;
 use crate::kernel;
 use crate::kernel::KernelEvent;
 use crate::net::XamNetwork;
@@ -983,11 +984,6 @@ fn query_input_focus(user: u32) -> Result<u32, ExportMissing> {
     Ok(unsafe { kernel::call_export(function, user, 0, 0, 0) })
 }
 
-/// The return word of an export.
-fn export_result<E: Into<Hresult>>(result: Result<(), E>) -> u32 {
-    result.map_or_else(|error| error.into().0, |()| Hresult::OK.0)
-}
-
 // Shared by the exports and the command backend.
 #[inline(never)]
 fn connect(user: u32) -> Result<(), AutomationError> {
@@ -1023,22 +1019,22 @@ extern "C" fn export_query_input_focus(user: u32, focus: *mut u32) -> u32 {
 
 /// Export 167 (stock 0x91f24c08): `autoinput bind`.
 extern "C" fn export_automation_bind(user: u32, queue_length: u32) -> u32 {
-    export_result(automation::bind(&mut XboxControllers, user, queue_length))
+    export_result(automation::bind(&mut XboxControllers, user, queue_length)).0
 }
 
 /// Export 168 (stock 0x91f24d60): `autoinput unbind`.
 extern "C" fn export_automation_unbind(user: u32) -> u32 {
-    export_result(automation::unbind(&mut XboxControllers, user))
+    export_result(automation::unbind(&mut XboxControllers, user)).0
 }
 
 /// Export 169 (stock 0x91f244c8): `autoinput connect`.
 extern "C" fn export_automation_connect(user: u32) -> u32 {
-    export_result(connect(user))
+    export_result(connect(user)).0
 }
 
 /// Export 170 (stock 0x91f24580): `autoinput disconnect`.
 extern "C" fn export_automation_disconnect(user: u32) -> u32 {
-    export_result(disconnect(user))
+    export_result(disconnect(user)).0
 }
 
 /// Export 171 (stock 0x91f24e20): `autoinput setpacket` with a gamepad
@@ -1053,7 +1049,7 @@ extern "C" fn export_automation_set_packet(
     // SAFETY: the caller passes a gamepad state.
     let packet = unsafe { packet.read_unaligned() };
     let packet = Gamepad::from_console(&packet);
-    export_result(automation::set_packet(&mut XboxControllers, user, packet))
+    export_result(automation::set_packet(&mut XboxControllers, user, packet)).0
 }
 
 /// Export 172 (stock 0x91f24f90): queue `count` gamepad states in console
@@ -1111,7 +1107,7 @@ extern "C" fn export_automation_queue(
 
 /// Export 173 (stock 0x91f24630): `autoinput clearqueue`.
 extern "C" fn export_automation_clear_queue(user: u32) -> u32 {
-    export_result(clear_queue(user))
+    export_result(clear_queue(user)).0
 }
 
 /// Export 174 (stock 0x91f246c8): `autoinput queryqueue`; every present
@@ -1160,10 +1156,8 @@ fn translate_on_server(
     server: &mut Server,
     console: &mut Console,
     _network: &mut XamNetwork,
-    request: u32,
+    request: &mut Translation<'_>,
 ) -> u32 {
-    // SAFETY: the poster waits in `call_on_server` while the request lives.
-    let request = unsafe { &mut *(request as usize as *mut Translation<'_>) };
     request.path = server
         .state
         .filesystem
@@ -1181,17 +1175,16 @@ extern "C" fn export_odd_log_start(path: *const core::ffi::c_char) -> u32 {
     // SAFETY: the caller passes a NUL-terminated name.
     let name = unsafe { core::ffi::CStr::from_ptr(path) }.to_bytes();
     let mut translation = Translation { name, path: None };
-    let translated =
-        dispatcher::call_on_server(translate_on_server, &raw mut translation as usize as u32)
-            .and(translation.path.as_ref())
-            .map(ObjectPath::as_bytes)
-            .ok_or(KernelError::NoSuchFile);
-    export_result(odd_log_start(translated))
+    let translated = dispatcher::call_on_server_with(&mut translation, translate_on_server)
+        .and(translation.path.as_ref())
+        .map(ObjectPath::as_bytes)
+        .ok_or(KernelError::NoSuchFile);
+    export_result(odd_log_start(translated)).0
 }
 
 /// Export 148 (stock 0x91f3d140): stop the optical disc log.
 extern "C" fn export_odd_log_stop() -> u32 {
-    export_result(odd_log_stop())
+    export_result(odd_log_stop()).0
 }
 
 export!(147, export_odd_log_start);

@@ -86,6 +86,7 @@ use super::Console;
 use super::HARDWARE_NOT_DEBUGGABLE;
 use crate::exports::bridged;
 use crate::exports::export;
+use crate::exports::export_result;
 use crate::kernel;
 use crate::kernel::version_words;
 use crate::net;
@@ -755,16 +756,14 @@ const BAD_PARAMETER: Hresult = xbdm_error(0x17);
 /// marks a hard disk.
 const HARDWARE_XCONFIG_QWORD: u32 = 0x10;
 
-/// Apply an exported setting on the server thread; `argument` points at
-/// the waiting caller's `ExportedSetting`.
+/// Apply an exported setting of a waiting caller on the server thread.
 fn service_apply_setting(
     server: &mut Server,
     console: &mut Console,
     _network: &mut XamNetwork,
-    argument: u32,
+    setting: &mut ExportedSetting,
 ) -> u32 {
-    // SAFETY: the caller waits in `apply_setting` while its value is read.
-    let setting = unsafe { *(argument as usize as *const ExportedSetting) };
+    let setting = *setting;
     commands::console::apply_exported_setting(&mut server.state, console, setting);
     0
 }
@@ -772,11 +771,8 @@ fn service_apply_setting(
 /// Exports 43, 118, 120, 122. Off the server thread at passive level the
 /// setting is applied before the export returns, as stock does; otherwise
 /// the server cannot be reached and the setting is dropped.
-fn apply_setting(setting: ExportedSetting) -> u32 {
-    let _ = super::dispatcher::call_on_server(
-        service_apply_setting,
-        &setting as *const ExportedSetting as usize as u32,
-    );
+fn apply_setting(mut setting: ExportedSetting) -> u32 {
+    let _ = super::dispatcher::call_on_server_with(&mut setting, service_apply_setting);
     Hresult::OK.0
 }
 
@@ -928,10 +924,7 @@ export!(161, export_get_system_info);
 /// Exports 175 and 176: a failed setting call returns its status with the
 /// NT facility bit.
 fn xconfig_result(status: u32) -> u32 {
-    match NtStatus(status).result() {
-        Ok(()) => Hresult::OK.0,
-        Err(error) => Hresult::from(error).0,
-    }
+    export_result(NtStatus(status).result()).0
 }
 
 /// Export 175: read the 8-byte setting (3, 8) into `output`.
@@ -1031,10 +1024,7 @@ extern "C" fn export_get_registration_response(transaction: u32, buffer: u32, si
     if size != 0 {
         write_word(size, response.length);
     }
-    match response.result {
-        Ok(()) => Hresult::OK.0,
-        Err(error) => Hresult::from(error).0,
-    }
+    export_result(response.result).0
 }
 export!(194, export_get_registration_response);
 

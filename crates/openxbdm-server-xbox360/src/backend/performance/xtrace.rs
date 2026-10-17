@@ -369,10 +369,8 @@ fn translate_on_server(
     server: &mut Server,
     console: &mut Console,
     _network: &mut XamNetwork,
-    request: u32,
+    request: &mut Translation<'_>,
 ) -> u32 {
-    // SAFETY: the poster waits in `call_on_server` while the request lives.
-    let request = unsafe { &mut *(request as usize as *mut Translation<'_>) };
     request.path = server
         .state
         .filesystem
@@ -386,7 +384,7 @@ fn translate_on_server(
 /// translate fails, where stock would use an uninitialized handle.
 fn open(name: &[u8], request: &CreateRequest) -> Option<u32> {
     let mut translation = Translation { name, path: None };
-    dispatcher::call_on_server(translate_on_server, &raw mut translation as usize as u32)?;
+    dispatcher::call_on_server_with(&mut translation, translate_on_server)?;
     filesystem::create_file(translation.path?.as_bytes(), request)
         .ok()
         .map(|handle| handle.0)

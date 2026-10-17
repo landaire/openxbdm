@@ -797,7 +797,7 @@ extern "C" fn register_notification_processor(session: u32, name: u32, handler: 
         // SAFETY: the block was allocated above and never linked.
         unsafe { xboxkrnl::ExFreePool(unused) };
     }
-    result.map_or_else(|error| Hresult::from(error).0, |()| Hresult::OK.0)
+    crate::exports::export_result(result).0
 }
 
 /// Why export 32 could not add a session processor.

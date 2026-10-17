@@ -13,7 +13,6 @@ use openxbdm_server::commands::security::Password;
 use openxbdm_server::commands::security::User;
 use openxbdm_server::commands::security::UserCreationFailed;
 use openxbdm_server::commands::security::UserName;
-use openxbdm_server::reply::CommandError;
 use xbox360::module::Ordinal;
 use xbox360::module::SystemModule;
 use xbox360::module::resolve_export;
@@ -303,15 +302,9 @@ struct Request {
 /// Called on the server thread itself, above passive level, or after the
 /// server stopped, the server state is unreachable and the export fails
 /// with E_UNEXPECTED.
-fn on_server(service: ServerService, first: u32, second: u32) -> u32 {
-    let request = Request { first, second };
-    dispatcher::call_on_server(service, core::ptr::from_ref(&request) as u32)
+fn on_server(service: ServerService<Request>, first: u32, second: u32) -> u32 {
+    dispatcher::call_on_server_with(&mut Request { first, second }, service)
         .unwrap_or(Hresult::UNEXPECTED.0)
-}
-
-fn request<'a>(argument: u32) -> &'a Request {
-    // SAFETY: `on_server` passes a `Request` that lives until the call returns.
-    unsafe { &*(argument as usize as *const Request) }
 }
 
 /// Bytes of the caller's NUL-terminated name; a null name is empty, as
@@ -342,24 +335,15 @@ fn save_settings(server: &mut Server, console: &mut Console) {
     server.save_settings_if_dirty(console);
 }
 
-/// The export's return word: `S_OK`, or the failure's result value.
-fn export_result(result: Result<(), CommandError>) -> u32 {
-    match result {
-        Ok(()) => Hresult::OK.0,
-        Err(error) => Hresult::from(error).0,
-    }
-}
-
 extern "C" fn set_user_access(user: u32, access: u32) -> u32 {
     on_server(
-        |_, console, _, argument| {
-            let request = request(argument);
+        |_, console, _, request| {
             let result = security::set_user_access(
                 console,
                 name(request.first),
                 Access::from_bits(request.second),
             );
-            export_result(result)
+            crate::exports::export_result(result).0
         },
         user,
         access,
@@ -369,11 +353,10 @@ export!(58, set_user_access);
 
 extern "C" fn get_user_access(user: u32, access: u32) -> u32 {
     on_server(
-        |_, console, _, argument| {
-            let request = request(argument);
+        |_, console, _, request| {
             let result = security::user_access(console, name(request.first))
                 .map(|found| write_u32(request.second, found.bits()));
-            export_result(result)
+            crate::exports::export_result(result).0
         },
         user,
         access,
@@ -387,8 +370,7 @@ extern "C" fn walk_users(walk: u32, record: u32) -> u32 {
         return Hresult::INVALID_ARGUMENT.0;
     }
     on_server(
-        |server, console, _, argument| {
-            let request = request(argument);
+        |server, console, _, request| {
             // SAFETY: the caller passes a writable walk position.
             let position = unsafe { &mut *(request.first as usize as *mut u32) };
             let result =
@@ -409,7 +391,7 @@ extern "C" fn walk_users(walk: u32, record: u32) -> u32 {
                     }
                     write_u32(record + USER_RECORD_ACCESS, access.bits());
                 });
-            export_result(result)
+            crate::exports::export_result(result).0
         },
         walk,
         record,
@@ -419,15 +401,14 @@ export!(60, walk_users);
 
 extern "C" fn add_user(user: u32, access: u32) -> u32 {
     on_server(
-        |server, console, _, argument| {
-            let request = request(argument);
+        |server, console, _, request| {
             let user = User {
                 password: None,
                 privileges: Access::from_bits(request.second),
             };
             let result = security::add_user(&mut server.state, console, name(request.first), user);
             save_settings(server, console);
-            export_result(result)
+            crate::exports::export_result(result).0
         },
         user,
         access,
@@ -437,8 +418,8 @@ export!(61, add_user);
 
 extern "C" fn enable_security(enable: u32) -> u32 {
     on_server(
-        |server, console, _, argument| {
-            security::enable_security(&mut server.state, console, request(argument).first != 0);
+        |server, console, _, request| {
+            security::enable_security(&mut server.state, console, request.first != 0);
             Hresult::OK.0
         },
         enable,
@@ -452,9 +433,9 @@ extern "C" fn is_security_enabled(enabled: u32) -> u32 {
         return Hresult::INVALID_ARGUMENT.0;
     }
     on_server(
-        |server, _, _, argument| {
+        |server, _, _, request| {
             write_u32(
-                request(argument).first,
+                request.first,
                 u32::from(security::security_enabled(&server.state)),
             );
             Hresult::OK.0
@@ -467,11 +448,10 @@ export!(63, is_security_enabled);
 
 extern "C" fn remove_user(user: u32) -> u32 {
     on_server(
-        |server, console, _, argument| {
-            let result =
-                security::remove_user(&mut server.state, console, name(request(argument).first));
+        |server, console, _, request| {
+            let result = security::remove_user(&mut server.state, console, name(request.first));
             save_settings(server, console);
-            export_result(result)
+            crate::exports::export_result(result).0
         },
         user,
         0,

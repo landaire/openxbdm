@@ -992,9 +992,9 @@ pub(crate) fn service_set_drive_mapping(
     server: &mut openxbdm_server::Server,
     console: &mut Console,
     _network: &mut crate::net::XamNetwork,
-    request: u32,
+    request: &mut u32,
 ) -> u32 {
-    commands::filesystem::map_title_drive(&mut server.state, console, request);
+    commands::filesystem::map_title_drive(&mut server.state, console, *request);
     0
 }
 

@@ -15,9 +15,7 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 use core::time::Duration;
 
-use openxbdm_core::status::Hresult;
 use openxbdm_core::status::NtStatus;
-use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::Server;
 use openxbdm_server::commands::filesystem::CreateDisposition;
 use openxbdm_server::commands::filesystem::CreateOptions;
@@ -1318,10 +1316,8 @@ fn translate_on_server(
     server: &mut Server,
     console: &mut Console,
     _network: &mut XamNetwork,
-    request: u32,
+    request: &mut Translation<'_>,
 ) -> u32 {
-    // SAFETY: the poster waits in `call_on_server` while the request lives.
-    let request = unsafe { &mut *(request as usize as *mut Translation<'_>) };
     let drives = &server.state.filesystem.drives;
     request.path = drives.translate(console, request.name);
     request.executable_length = drives.object_path_to_drive_path(
@@ -1343,32 +1339,25 @@ extern "C" fn export_start(name: u32, interval: u32, flags: u32) -> u32 {
         executable: [0; module_snapshot::PATH_LIMIT + 2],
         executable_length: 0,
     };
-    if dispatcher::call_on_server(translate_on_server, &raw mut request as usize as u32).is_none() {
+    if dispatcher::call_on_server_with(&mut request, translate_on_server).is_none() {
         let object = module_snapshot::executable_object_path();
         let length = object.len().min(request.executable.len());
         request.executable[..length].copy_from_slice(&object[..length]);
         request.executable_length = length;
     }
     let path = request.path.as_ref().map(|path| path.as_bytes());
-    export_result(start(
+    crate::exports::export_result(start(
         path,
         &request.executable[..request.executable_length],
         interval,
         ProfilerFlags(flags),
     ))
-}
-
-/// The result word of the profiler exports.
-fn export_result(result: Result<(), ProfilerError>) -> u32 {
-    match result {
-        Ok(()) => Hresult::OK.0,
-        Err(error) => Hresult::from(error).0,
-    }
+    .0
 }
 
 /// Export 150.
 extern "C" fn export_stop() -> u32 {
-    export_result(stop())
+    crate::exports::export_result(stop()).0
 }
 
 /// Export 151: elapsed seconds, total samples, and overhead interrupts;
@@ -1382,7 +1371,7 @@ extern "C" fn export_info(elapsed: *mut u32, samples: *mut u32, overhead: *mut u
             core::ptr::write_volatile(overhead, info.overhead_interrupts);
         }
     });
-    export_result(result)
+    crate::exports::export_result(result).0
 }
 
 export!(149, export_start);

@@ -1730,7 +1730,7 @@ extern "C" fn export_load_ini(path: *const core::ffi::c_char, node: u32) -> u32 
         node: Node(node),
         result: Ok(()),
     };
-    dispatcher::call_on_server(service_load_ini, &raw mut request as usize as u32);
+    dispatcher::call_on_server_with(&mut request, service_load_ini);
     match request.result {
         Ok(()) => {
             debugger::report_pogo_module_start(path as usize as u32, node);
@@ -1744,13 +1744,10 @@ fn service_load_ini(
     server: &mut Server,
     console: &mut Console,
     _network: &mut XamNetwork,
-    argument: u32,
+    request: &mut IniRequest,
 ) -> u32 {
-    // SAFETY: the poster waits with the request and its NUL-terminated
-    // path in place.
-    let request = unsafe { &mut *(argument as usize as *mut IniRequest) };
     let node = request.node;
-    // SAFETY: as above.
+    // SAFETY: the poster waits with its NUL-terminated path in place.
     let path = unsafe { core::ffi::CStr::from_ptr(request.path) }.to_bytes();
     let module = PgoModule::Record(node.0);
     // The results of the settings are not reported.
@@ -2200,12 +2197,12 @@ pub(super) fn initialize() {
 
 /// Export 108.
 extern "C" fn export_start(module: u32) -> u32 {
-    super::export_result(start_modules(PgoModule::from_value(module)))
+    crate::exports::export_result(start_modules(PgoModule::from_value(module))).0
 }
 
 /// Export 109.
 extern "C" fn export_stop(module: u32) -> u32 {
-    super::export_result(stop_modules(PgoModule::from_value(module)))
+    crate::exports::export_result(stop_modules(PgoModule::from_value(module))).0
 }
 
 /// Export 110 (stock 0x91f70918): profile one module or all; `phase` may
@@ -2215,12 +2212,13 @@ extern "C" fn export_snapshot(phase: *const core::ffi::c_char, reset: u32, modul
         // SAFETY: the caller passes a NUL-terminated phase name.
         unsafe { core::ffi::CStr::from_ptr(phase) }.to_bytes_with_nul()
     });
-    super::export_result(snapshot_modules(
+    crate::exports::export_result(snapshot_modules(
         phase,
         reset != 0,
         PgoModule::from_value(module),
         SweepKind::Export,
     ))
+    .0
 }
 
 /// Export 111 (stock 0x91f6cba8).

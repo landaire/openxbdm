@@ -1288,10 +1288,8 @@ fn start_on_server(
     server: &mut Server,
     console: &mut Console,
     _network: &mut XamNetwork,
-    request: u32,
+    request: &mut TitleStart<'_>,
 ) -> u32 {
-    // SAFETY: the poster waits in `call_on_server` while the request lives.
-    let request = unsafe { &*(request as usize as *const TitleStart<'_>) };
     let mut paths = DrivePaths {
         drives: &server.state.filesystem.drives,
         backend: console,
@@ -1306,10 +1304,10 @@ extern "C" fn title_start(name: *const u8, buffer_size: u32) -> u32 {
     // unbounded into a 0x141-byte stack buffer).
     let name = super::c_string(name as usize as u32, TITLE_NAME_LIMIT);
     let buffer = BufferRequest(buffer_size);
-    let request = TitleStart { name, buffer };
-    dispatcher::call_on_server(start_on_server, &raw const request as usize as u32).unwrap_or_else(
-        || export_result(start_for_title(&mut NoDriveTable, name, buffer).map(Reply::from)),
-    )
+    let mut request = TitleStart { name, buffer };
+    dispatcher::call_on_server_with(&mut request, start_on_server).unwrap_or_else(|| {
+        export_result(start_for_title(&mut NoDriveTable, name, buffer).map(Reply::from))
+    })
 }
 bridged!(title_start_entry, title_start);
 export_raw!(73, title_start_entry);
@@ -1329,7 +1327,7 @@ fn stop_on_server(
     server: &mut Server,
     console: &mut Console,
     _network: &mut XamNetwork,
-    _argument: u32,
+    _request: &mut (),
 ) -> u32 {
     export_result(stop(console, &server.state.filesystem.drives).map(|()| Reply::Ok))
 }
@@ -1337,7 +1335,7 @@ fn stop_on_server(
 /// Export 74: stop and write the capture file; the drive table is read on
 /// the server thread.
 extern "C" fn title_stop() -> u32 {
-    dispatcher::call_on_server(stop_on_server, 0).unwrap_or_else(|| {
+    dispatcher::call_on_server_with(&mut (), stop_on_server).unwrap_or_else(|| {
         export_result(capture::stop(&mut Engine, &mut NoDriveTable).map(|()| Reply::Ok))
     })
 }

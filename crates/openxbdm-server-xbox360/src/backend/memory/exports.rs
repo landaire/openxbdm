@@ -52,6 +52,7 @@ use super::untrack_allocation;
 use super::write_debug_byte;
 use crate::backend::dispatcher;
 use crate::exports::export;
+use crate::exports::export_result;
 
 /// Result of an export whose server part could not run (on the server
 /// thread or above passive level).
@@ -126,12 +127,6 @@ struct Transfer {
     count: u32,
 }
 
-fn transfer<'a>(argument: u32) -> &'a Transfer {
-    // SAFETY: the posting export waits on its stack structure until the
-    // service returns.
-    unsafe { &*(argument as usize as *const Transfer) }
-}
-
 /// The byte loop of exports 10 and 40: pages are checked when the loop
 /// enters a new page, and an invalid page or a byte that fails ends the
 /// copy before the next byte. Without a count pointer, stock reports
@@ -178,15 +173,15 @@ extern "C" fn get_memory(address: u32, length: u32, buffer: u32, count: u32) -> 
     if buffer == 0 {
         return Hresult::INVALID_ARGUMENT.0;
     }
-    let request = Transfer {
+    let mut request = Transfer {
         address,
         length,
         buffer,
         count,
     };
-    dispatcher::call_on_server(
-        |server, _console, _network, argument| {
-            let request = transfer(argument);
+    dispatcher::call_on_server_with(
+        &mut request,
+        |server, _console, _network, request: &mut Transfer| {
             reply::hresult(copy_bytes(request, |current, index| {
                 match server
                     .state
@@ -203,7 +198,6 @@ extern "C" fn get_memory(address: u32, length: u32, buffer: u32, count: u32) -> 
             }))
             .0
         },
-        &request as *const Transfer as usize as u32,
     )
     .unwrap_or(SERVER_UNAVAILABLE.0)
 }
@@ -216,22 +210,21 @@ extern "C" fn set_memory(address: u32, length: u32, buffer: u32, count: u32) -> 
     if buffer == 0 {
         return Hresult::INVALID_ARGUMENT.0;
     }
-    let request = Transfer {
+    let mut request = Transfer {
         address,
         length,
         buffer,
         count,
     };
-    dispatcher::call_on_server(
-        |server, _console, _network, argument| {
-            let request = transfer(argument);
+    dispatcher::call_on_server_with(
+        &mut request,
+        |server, _console, _network, request: &mut Transfer| {
             reply::hresult(copy_bytes(request, |current, index| {
                 let byte = read_u8(request.buffer + index);
                 server.state.debugger.shadow_write(current, byte) || write_debug_byte(current, byte)
             }))
             .0
         },
-        &request as *const Transfer as usize as u32,
     )
     .unwrap_or(SERVER_UNAVAILABLE.0)
 }
@@ -263,26 +256,25 @@ extern "C" fn get_xbe_info(_name: u32, info: u32) -> u32 {
     if info == 0 {
         return Hresult::INVALID_ARGUMENT.0;
     }
-    dispatcher::call_on_server(
-        |server, console, _network, info| {
-            let mut object = [0u8; memory::EXECUTABLE_PATH_CAPACITY];
-            let length = console.running_executable_path(&mut object);
-            let mut path = [0u8; XBE_PATH_CAPACITY];
-            let length = server.state.filesystem.drives.object_path_to_drive_path(
-                console,
-                &object[..length],
-                &mut path,
-            );
-            for (offset, byte) in path[..length].iter().chain(&[0]).enumerate() {
-                write_u8(info + offset as u32, *byte);
-            }
-            for offset in [0x108, 0x10c, 0x110] {
-                write_u32(info + offset, 0);
-            }
-            Hresult::OK.0
-        },
-        info,
-    )
+    let mut info = info;
+    dispatcher::call_on_server_with(&mut info, |server, console, _network, info: &mut u32| {
+        let info = *info;
+        let mut object = [0u8; memory::EXECUTABLE_PATH_CAPACITY];
+        let length = console.running_executable_path(&mut object);
+        let mut path = [0u8; XBE_PATH_CAPACITY];
+        let length = server.state.filesystem.drives.object_path_to_drive_path(
+            console,
+            &object[..length],
+            &mut path,
+        );
+        for (offset, byte) in path[..length].iter().chain(&[0]).enumerate() {
+            write_u8(info + offset as u32, *byte);
+        }
+        for offset in [0x108, 0x10c, 0x110] {
+            write_u32(info + offset, 0);
+        }
+        Hresult::OK.0
+    })
     .unwrap_or(SERVER_UNAVAILABLE.0)
 }
 export!(16, get_xbe_info);
@@ -382,14 +374,6 @@ impl From<ModuleWalkError> for Hresult {
     }
 }
 
-/// The export word of a module walk.
-fn walk_word(result: Result<(), ModuleWalkError>) -> u32 {
-    match result {
-        Ok(()) => Hresult::OK.0,
-        Err(error) => Hresult::from(error).0,
-    }
-}
-
 /// The next module of a snapshot taken on the first call. `record` starts
 /// with its size, at most 0x12c bytes are copied, and the size is replaced
 /// by the copied length.
@@ -425,7 +409,7 @@ fn next_loaded_module(walk: u32, record: u32) -> Result<(), ModuleWalkError> {
 /// Stock export 142 (0x91f338c0): `(walk, record) -> HRESULT`;
 /// [`next_loaded_module`].
 extern "C" fn walk_loaded_modules(walk: u32, record: u32) -> u32 {
-    walk_word(next_loaded_module(walk, record))
+    export_result(next_loaded_module(walk, record)).0
 }
 export!(142, walk_loaded_modules);
 
@@ -460,7 +444,7 @@ pub(crate) fn next_module(
 /// Stock export 51 (0x91f33af8): `(walk, record) -> HRESULT`;
 /// [`next_short_module`].
 extern "C" fn walk_modules(walk: u32, record: u32) -> u32 {
-    walk_word(next_short_module(walk, record))
+    export_result(next_short_module(walk, record)).0
 }
 export!(51, walk_modules);
 
@@ -836,24 +820,22 @@ extern "C" fn get_title_workspace_size(size: u32) -> u32 {
         return BAD_PARAMETER.0;
     }
     write_u32(size, 0);
-    dispatcher::call_on_server(
-        |_server, console, _network, size| {
-            if console::console_memory(console).value() & 2 == 0 {
-                return Hresult::OK.0;
+    let mut size = size;
+    dispatcher::call_on_server_with(&mut size, |_server, console, _network, size: &mut u32| {
+        let size = *size;
+        if console::console_memory(console).value() & 2 == 0 {
+            return Hresult::OK.0;
+        }
+        match console.title_xex_dword(memory::XexFieldKey(XexHeaderKey::ADDITIONAL_TITLE_MEMORY.0))
+        {
+            Ok(Some(value)) => {
+                write_u32(size, value);
+                Hresult::OK.0
             }
-            match console
-                .title_xex_dword(memory::XexFieldKey(XexHeaderKey::ADDITIONAL_TITLE_MEMORY.0))
-            {
-                Ok(Some(value)) => {
-                    write_u32(size, value);
-                    Hresult::OK.0
-                }
-                Ok(None) => Hresult::OK.0,
-                Err(memory::NoSuchModule) => NO_SUCH_MODULE.0,
-            }
-        },
-        size,
-    )
+            Ok(None) => Hresult::OK.0,
+            Err(memory::NoSuchModule) => NO_SUCH_MODULE.0,
+        }
+    })
     .unwrap_or(SERVER_UNAVAILABLE.0)
 }
 export!(212, get_title_workspace_size);

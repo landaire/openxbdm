@@ -15,6 +15,11 @@ use openxbdm_core::status::Win32Error;
 use openxbdm_core::status::XbdmHresult;
 use xbox360_sys::image::XexHeaderKey;
 use xbox360_sys::status::Facility;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::FileAttributes;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
 use crate::access::Access;
 use crate::commands::console;
@@ -36,11 +41,6 @@ use crate::reply::Reply;
 use crate::state::ServerState;
 use crate::text::Text;
 use crate::transfer_blocks::TransferBlock;
-use xbox360_sys::xboxkrnl::AccessMask;
-use xbox360_sys::xboxkrnl::CreateDisposition;
-use xbox360_sys::xboxkrnl::CreateOptions;
-use xbox360_sys::xboxkrnl::FileAttributes;
-use xbox360_sys::xboxkrnl::ShareAccess;
 
 /// Size of a small page in bytes.
 pub const PAGE_SIZE: u32 = 0x1000;

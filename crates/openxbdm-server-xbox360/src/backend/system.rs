@@ -43,6 +43,7 @@ use xbox360_sys::xam::XnCaller;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::AccessMask;
 use xbox360_sys::xboxkrnl::BugCheckCode;
+use xbox360_sys::xboxkrnl::CreateDisposition;
 use xbox360_sys::xboxkrnl::CreateOptions;
 use xbox360_sys::xboxkrnl::FileAttributes;
 use xbox360_sys::xboxkrnl::FileInformationClass;
@@ -68,7 +69,6 @@ use crate::exports::export;
 use crate::kernel;
 use crate::kernel::pool_tag;
 use crate::net::XamNetwork;
-use xbox360_sys::xboxkrnl::CreateDisposition;
 
 /// The settings file the monitor writes.
 const SAVED_SETTINGS_PATH: &[u8] = b"\\SystemRoot\\MobileJ.dat";

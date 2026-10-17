@@ -11,9 +11,8 @@
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 
-use crate::reply::CommandError;
-
 use super::HardwareError;
+use crate::reply::CommandError;
 
 /// Number of user slots.
 pub const USERS: u32 = 4;

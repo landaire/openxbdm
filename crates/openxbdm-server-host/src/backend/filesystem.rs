@@ -22,15 +22,15 @@ use openxbdm_server::commands::filesystem::ReadTarget;
 use openxbdm_server::commands::filesystem::ScratchBlock;
 use openxbdm_server::commands::filesystem::TransferDirection;
 use openxbdm_server::commands::filesystem::VolumeSize;
-
-use super::MockBackend;
-use super::POOL_LIMIT;
 use xbox360_sys::xboxkrnl::AccessMask;
 use xbox360_sys::xboxkrnl::CreateDisposition;
 use xbox360_sys::xboxkrnl::CreateOptions;
 use xbox360_sys::xboxkrnl::FileAttributes;
 use xbox360_sys::xboxkrnl::FileSystemAttributes;
 use xbox360_sys::xboxkrnl::ShareAccess;
+
+use super::MockBackend;
+use super::POOL_LIMIT;
 
 /// The development partition holding `E:` and `DEVKIT:`.
 pub const PARTITION1: &str = "\\Device\\Harddisk0\\Partition1";

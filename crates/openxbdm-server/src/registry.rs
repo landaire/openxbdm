@@ -1,9 +1,8 @@
 //! Built-in command table entries and lookup.
 
-use crate::reply::CommandResult;
-
 use crate::access::Access;
 use crate::invocation::Invocation;
+use crate::reply::CommandResult;
 
 xbox360_sys::flags! {
     /// Dispatch flags carried by a command table entry.

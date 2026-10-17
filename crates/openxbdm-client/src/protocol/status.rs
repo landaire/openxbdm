@@ -1,11 +1,11 @@
+use crate::error::FramingError;
+use crate::protocol::parse::run_framing;
+use crate::protocol::parse::three_digit_code;
+
 pub use openxbdm_core::status::Classified;
 pub use openxbdm_core::status::ErrorCode;
 pub use openxbdm_core::status::StatusCode;
 pub use openxbdm_core::status::SuccessCode;
-
-use crate::error::FramingError;
-use crate::protocol::parse::run_framing;
-use crate::protocol::parse::three_digit_code;
 
 /// A 4xx status the console returned for a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

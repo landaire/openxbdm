@@ -8,12 +8,6 @@ use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use tokio::net::TcpStream;
-use tokio::runtime::Builder;
-use tokio::runtime::Runtime;
-use tokio_util::compat::Compat;
-use tokio_util::compat::TokioAsyncReadCompatExt;
-
 use openxbdm_client::Client;
 use openxbdm_client::Connected;
 use openxbdm_client::Notifications;
@@ -24,6 +18,11 @@ use openxbdm_client::discovery::DiscoveryConfig;
 use openxbdm_client::discovery::NAP_PORT;
 use openxbdm_client::discovery::discover_all;
 use openxbdm_client::discovery::find_by_name;
+use tokio::net::TcpStream;
+use tokio::runtime::Builder;
+use tokio::runtime::Runtime;
+use tokio_util::compat::Compat;
+use tokio_util::compat::TokioAsyncReadCompatExt;
 
 type Transport = Compat<TcpStream>;
 

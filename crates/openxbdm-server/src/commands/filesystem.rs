@@ -8,6 +8,13 @@ use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::Win32Error;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::FileAttributes;
+#[cfg(feature = "smb")]
+use xbox360_sys::xboxkrnl::FileSystemAttributes;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
 use crate::access::Access;
 use crate::commands::console;
@@ -26,13 +33,6 @@ use crate::reply::CommandError;
 use crate::reply::CommandResult;
 use crate::reply::Reply;
 use crate::state::ServerState;
-use xbox360_sys::xboxkrnl::AccessMask;
-use xbox360_sys::xboxkrnl::CreateDisposition;
-use xbox360_sys::xboxkrnl::CreateOptions;
-use xbox360_sys::xboxkrnl::FileAttributes;
-#[cfg(feature = "smb")]
-use xbox360_sys::xboxkrnl::FileSystemAttributes;
-use xbox360_sys::xboxkrnl::ShareAccess;
 
 /// Most file name parameters are copied into 0x141-byte buffers.
 const NAME_BUFFER: usize = 0x141;

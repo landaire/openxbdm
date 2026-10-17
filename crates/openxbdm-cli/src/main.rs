@@ -16,6 +16,12 @@ use tokio::io::AsyncWriteExt;
 mod parity;
 mod ui;
 
+use std::net::IpAddr;
+use std::net::Ipv4Addr;
+use std::net::SocketAddr;
+
+use openxbdm_client::Client;
+use openxbdm_client::XBDM_PORT;
 use openxbdm_client::commands::AltAddr;
 use openxbdm_client::commands::Breakpoint;
 use openxbdm_client::commands::DataBreakKind;
@@ -76,19 +82,13 @@ use openxbdm_client::commands::pix::Notification;
 use openxbdm_client::commands::pix::PixCmd;
 #[cfg(feature = "capture")]
 use openxbdm_client::commands::pix::PixError;
-use openxbdm_client::error::Error;
-use openxbdm_client::transport::CaptureLog;
-use openxbdm_client::transport::RecordingTransport;
-use std::net::IpAddr;
-use std::net::Ipv4Addr;
-use std::net::SocketAddr;
-
-use openxbdm_client::Client;
-use openxbdm_client::XBDM_PORT;
 use openxbdm_client::discovery::DiscoveryConfig;
 use openxbdm_client::discovery::NAP_PORT;
 use openxbdm_client::discovery::discover_all;
 use openxbdm_client::discovery::find_by_name;
+use openxbdm_client::error::Error;
+use openxbdm_client::transport::CaptureLog;
+use openxbdm_client::transport::RecordingTransport;
 use openxbdm_client::transport::tokio::Target;
 use openxbdm_client::transport::tokio::connect_target_timeout;
 
@@ -2989,13 +2989,14 @@ async fn run_xbm_extract(
     concat: bool,
     raw: bool,
 ) -> Result<(), rootcause::Report<Error>> {
-    use openxbdm_client::commands::pix::FrameCursor;
-    use openxbdm_client::commands::pix::XbmHeader;
-    use openxbdm_client::commands::pix::detile_frame;
     use std::io::Read;
     use std::io::Seek;
     use std::io::SeekFrom;
     use std::io::Write;
+
+    use openxbdm_client::commands::pix::FrameCursor;
+    use openxbdm_client::commands::pix::XbmHeader;
+    use openxbdm_client::commands::pix::detile_frame;
 
     std::fs::create_dir_all(output_dir)
         .map_err(Error::from)
@@ -3165,15 +3166,16 @@ async fn encode_xbm_to_mp4(
     crf: u32,
     extra_args: &[String],
 ) -> Result<(), rootcause::Report<Error>> {
-    use openxbdm_client::commands::pix::FrameCursor;
-    use openxbdm_client::commands::pix::XbmHeader;
-    use openxbdm_client::commands::pix::detile_frame;
     use std::io::Read;
     use std::io::Seek;
     use std::io::SeekFrom;
     use std::io::Write;
     use std::process::Command;
     use std::process::Stdio;
+
+    use openxbdm_client::commands::pix::FrameCursor;
+    use openxbdm_client::commands::pix::XbmHeader;
+    use openxbdm_client::commands::pix::detile_frame;
 
     let mut f = std::fs::File::open(file)
         .map_err(Error::from)

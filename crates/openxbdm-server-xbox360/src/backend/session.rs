@@ -84,12 +84,20 @@ mod notifications;
 mod processors;
 mod swap;
 
-pub(crate) use file_events::service_file_event_begin;
-pub(crate) use file_events::service_file_event_end;
+use core::time::Duration;
 
 use log_engine::Engine;
 use notifications::send_notification;
 use notifications::unlink_title_notification_sessions;
+use xbox360::time::TickCount;
+use xbox360::time::Timebase;
+use xbox360::time::sleep;
+
+use crate::kernel;
+use crate::kernel::CriticalSection;
+
+pub(crate) use file_events::service_file_event_begin;
+pub(crate) use file_events::service_file_event_end;
 pub(crate) use processors::poll_processor_calls;
 pub(crate) use processors::release_processor_threads;
 pub(crate) use processors::service_register_pix_processor;
@@ -97,15 +105,6 @@ pub(crate) use processors::service_register_processor;
 pub(crate) use swap::register_swap_routine;
 pub(crate) use swap::remove_unflagged_swap_routines;
 pub(crate) use swap::unregister_swap_routine;
-
-use core::time::Duration;
-
-use xbox360::time::TickCount;
-use xbox360::time::Timebase;
-use xbox360::time::sleep;
-
-use crate::kernel;
-use crate::kernel::CriticalSection;
 
 /// Pool type the monitor allocates the ring from.
 const DEBUG_CAPTURE_POOL: PoolType = PoolType::System;

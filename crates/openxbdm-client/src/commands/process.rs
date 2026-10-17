@@ -1,7 +1,5 @@
 //! Commands for inspecting loaded modules and running threads.
 
-pub use openxbdm_core::status::Win32Error;
-
 use crate::commands::kv::KvLine;
 use crate::commands::kv::parse_kv_line;
 use crate::commands::kv::value_u32;
@@ -13,6 +11,8 @@ use crate::protocol::Command;
 use crate::protocol::ExpectedBody;
 use crate::protocol::Response;
 use crate::time::FileTime;
+
+pub use openxbdm_core::status::Win32Error;
 
 fn report_parse(err: ParseError) -> rootcause::Report<Error> {
     rootcause::Report::new(Error::from(err))

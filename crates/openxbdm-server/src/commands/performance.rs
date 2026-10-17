@@ -12,11 +12,16 @@ pub mod studio;
 pub mod xtrace;
 
 use core::fmt::Write as _;
-use xbox360_sys::xboxkrnl::HardwareFlags;
 
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::XbdmHresult;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::FileAttributes;
+use xbox360_sys::xboxkrnl::HardwareFlags;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
 use crate::access::Access;
 use crate::commands::console::ConfigSetting;
@@ -35,11 +40,6 @@ use crate::reply::CommandResult;
 use crate::reply::Reply;
 use crate::server::MAX_CONNECTIONS;
 use crate::text::Text;
-use xbox360_sys::xboxkrnl::AccessMask;
-use xbox360_sys::xboxkrnl::CreateDisposition;
-use xbox360_sys::xboxkrnl::CreateOptions;
-use xbox360_sys::xboxkrnl::FileAttributes;
-use xbox360_sys::xboxkrnl::ShareAccess;
 
 pub use counters::CounterSample;
 

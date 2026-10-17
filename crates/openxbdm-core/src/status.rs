@@ -1,6 +1,7 @@
 //! Status codes, monitor result codes, and their default reply text.
 
 use xbox360_sys::status::Facility;
+
 pub use xbox360_sys::status::Hresult;
 pub use xbox360_sys::status::KernelError;
 pub use xbox360_sys::status::NtStatus;

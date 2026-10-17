@@ -12,6 +12,10 @@ use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::XbdmHresult;
 
+use self::automation::AutomationError;
+use self::automation::Gamepad;
+use self::automation::QueueStatus;
+use self::automation::UploadLayout;
 use crate::access::Access;
 use crate::commands::console;
 use crate::commands::console::ConfigFlags;
@@ -31,11 +35,6 @@ use crate::reply::CommandError;
 use crate::reply::CommandResult;
 use crate::reply::Reply;
 use crate::text::Text;
-
-use self::automation::AutomationError;
-use self::automation::Gamepad;
-use self::automation::QueueStatus;
-use self::automation::UploadLayout;
 
 pub(crate) const COMMANDS: &[CommandEntry] = &[
     entry(

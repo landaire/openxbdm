@@ -33,9 +33,8 @@ pub(crate) const TABLES: &[&[CommandEntry]] = &[
 
 /// Helpers shared by command handlers.
 pub(crate) mod util {
-    use crate::reply::CommandError;
-
     use crate::invocation::Invocation;
+    use crate::reply::CommandError;
 
     /// A required dword parameter. When absent, the reply text becomes
     /// `missing <name>` and the caller fails with [`MISSING`].

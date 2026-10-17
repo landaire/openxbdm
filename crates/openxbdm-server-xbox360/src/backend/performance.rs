@@ -11,8 +11,6 @@ mod profiler;
 pub(crate) mod studio;
 pub(crate) mod xtrace;
 
-pub(crate) use counters::memory_statistics;
-
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
@@ -59,6 +57,8 @@ use xbox360_sys::xboxkrnl::VdWriteDVERegisterUlong;
 use super::Console;
 use super::dispatcher::ControlCode;
 use crate::kernel;
+
+pub(crate) use counters::memory_statistics;
 
 /// Bytes of an `SmcCommand::I2c` message.
 mod i2c {

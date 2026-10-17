@@ -16,14 +16,13 @@ use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::Win32Error;
 
+use super::Continuation as SessionContinuation;
 use crate::continuation::Continuation as AnyContinuation;
 use crate::continuation::ContinuationContext;
 use crate::invocation::Invocation;
 use crate::reply::CommandError;
 use crate::reply::CommandResult;
 use crate::reply::Reply;
-
-use super::Continuation as SessionContinuation;
 
 /// The only protocol version the monitor accepts.
 const RPC_VERSION: u32 = 4;

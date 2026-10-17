@@ -21,10 +21,6 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 use core::sync::atomic::Ordering::Relaxed;
 
-pub(crate) use ring::stream_active;
-pub(crate) use ring::write_tagged_record;
-pub(crate) use ring::write_tagged_words;
-
 use openxbdm_server::Server;
 use openxbdm_server::commands::performance::pix;
 use openxbdm_server::reply;
@@ -39,6 +35,10 @@ use crate::backend::Console;
 use crate::backend::dispatcher;
 use crate::kernel;
 use crate::net::XamNetwork;
+
+pub(crate) use ring::stream_active;
+pub(crate) use ring::write_tagged_record;
+pub(crate) use ring::write_tagged_words;
 
 /// Code 0x3f flag (stock 0x91fa2a50): capture file writes are discarded
 /// and the capture buffer wraps.

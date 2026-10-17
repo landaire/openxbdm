@@ -24,6 +24,7 @@ pub use error::FramingError;
 pub use error::ParseError;
 pub use error::Result;
 pub use error::TransportError;
+pub use openxbdm_core::XBDM_PORT;
 pub use protocol::ArgBuilder;
 pub use protocol::Command;
 pub use protocol::ErrorCode;
@@ -34,5 +35,3 @@ pub use protocol::Response;
 pub use protocol::StatusCode;
 pub use protocol::SuccessCode;
 pub use time::FileTime;
-
-pub use openxbdm_core::XBDM_PORT;

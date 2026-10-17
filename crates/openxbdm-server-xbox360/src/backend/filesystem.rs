@@ -32,9 +32,12 @@ use xbox360::module::Ordinal;
 use xbox360::module::SystemModule;
 use xbox360_sys::status::Win32ErrorCode;
 use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::AccessMask;
 use xbox360_sys::xboxkrnl::AnsiString;
+use xbox360_sys::xboxkrnl::CreateOptions;
 use xbox360_sys::xboxkrnl::DebugMonitorFlags;
 use xbox360_sys::xboxkrnl::DiskGeometry;
+use xbox360_sys::xboxkrnl::FileAttributes;
 use xbox360_sys::xboxkrnl::FileBasicInformation;
 use xbox360_sys::xboxkrnl::FileDeviceType;
 use xbox360_sys::xboxkrnl::FileDirectoryInformation;
@@ -44,6 +47,7 @@ use xbox360_sys::xboxkrnl::FileInformationClass;
 use xbox360_sys::xboxkrnl::FileNetworkOpenInformation;
 use xbox360_sys::xboxkrnl::FilePositionInformation;
 use xbox360_sys::xboxkrnl::FileRenameInformation;
+use xbox360_sys::xboxkrnl::FileSystemAttributes;
 use xbox360_sys::xboxkrnl::FsDeviceInformation;
 use xbox360_sys::xboxkrnl::FsInformationClass;
 use xbox360_sys::xboxkrnl::FsSizeInformation;
@@ -66,15 +70,11 @@ use xbox360_sys::xboxkrnl::PartitionInformation;
 use xbox360_sys::xboxkrnl::PoolTag;
 use xbox360_sys::xboxkrnl::ProcessType;
 use xbox360_sys::xboxkrnl::ProcessorMode;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
 use super::Console;
 use crate::exports::export;
 use crate::kernel;
-use xbox360_sys::xboxkrnl::AccessMask;
-use xbox360_sys::xboxkrnl::CreateOptions;
-use xbox360_sys::xboxkrnl::FileAttributes;
-use xbox360_sys::xboxkrnl::FileSystemAttributes;
-use xbox360_sys::xboxkrnl::ShareAccess;
 
 const POOL_TAG: PoolTag = PoolTag::new(*b"xdbm");
 /// Directory query buffer of the image.

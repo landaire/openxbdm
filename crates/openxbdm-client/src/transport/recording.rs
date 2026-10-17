@@ -97,10 +97,11 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for RecordingTransport<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use futures_util::io::AsyncReadExt;
     use futures_util::io::AsyncWriteExt;
     use futures_util::io::Cursor;
+
+    use super::*;
 
     #[test]
     fn captures_read_and_write_bytes() {

@@ -11,16 +11,18 @@ mod spnego;
 #[cfg(test)]
 mod tests;
 
-use crate::backend::Backend;
-use crate::backend::COMPUTER_NAME_CAPACITY;
-use crate::backend::UserKind;
-use crate::crypto::constant_time_eq;
-pub use error::AuthError;
-pub use error::NtlmMessage;
 use ntlm::Flags;
 use spnego::NegState;
 use spnego::NtlmPosition;
 use spnego::Reply;
+
+use crate::backend::Backend;
+use crate::backend::COMPUTER_NAME_CAPACITY;
+use crate::backend::UserKind;
+use crate::crypto::constant_time_eq;
+
+pub use error::AuthError;
+pub use error::NtlmMessage;
 
 /// Session key from NTLM: the ExportedSessionKey of MS-NLMP.
 #[derive(Clone, Copy, PartialEq, Eq)]

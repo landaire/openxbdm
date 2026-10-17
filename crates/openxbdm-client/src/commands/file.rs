@@ -12,16 +12,17 @@
 //! enforced by [`FileDownload`] borrowing the transport mutably from the
 //! client until it is fully consumed.
 
+use std::io;
+use std::pin::Pin;
+use std::task::Context;
+use std::task::Poll;
+
 use bytes::BytesMut;
 use futures_io::AsyncRead;
 use futures_io::AsyncWrite;
 use futures_util::io::AsyncReadExt;
 use futures_util::io::AsyncWriteExt;
 use rootcause::prelude::*;
-use std::io;
-use std::pin::Pin;
-use std::task::Context;
-use std::task::Poll;
 
 use crate::client::Client;
 use crate::client::ClientEngine;

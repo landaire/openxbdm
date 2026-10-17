@@ -63,6 +63,9 @@ use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::AccessMask;
 use xbox360_sys::xboxkrnl::AllocationType;
 use xbox360_sys::xboxkrnl::BugCheckCode;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::FileAttributes;
 use xbox360_sys::xboxkrnl::FileInformationClass;
 use xbox360_sys::xboxkrnl::Handle;
 use xbox360_sys::xboxkrnl::IoStatusBlock;
@@ -74,6 +77,7 @@ use xbox360_sys::xboxkrnl::MemoryRegion;
 use xbox360_sys::xboxkrnl::PageProtection;
 use xbox360_sys::xboxkrnl::ProcessType;
 use xbox360_sys::xboxkrnl::ProcessorMode;
+use xbox360_sys::xboxkrnl::ShareAccess;
 use xbox360_sys::xboxkrnl::TlsIndex;
 use xbox360_sys::xboxkrnl::XexPcToFileHeader;
 
@@ -87,10 +91,6 @@ use crate::kernel::CriticalSection;
 use crate::kernel::address_of;
 use crate::kernel::object_at;
 use crate::net::XamNetwork;
-use xbox360_sys::xboxkrnl::CreateDisposition;
-use xbox360_sys::xboxkrnl::CreateOptions;
-use xbox360_sys::xboxkrnl::FileAttributes;
-use xbox360_sys::xboxkrnl::ShareAccess;
 
 /// Entries of a module's probe dispatch table.
 const DISPATCH_ENTRIES: usize = 24;

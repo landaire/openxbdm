@@ -1,14 +1,14 @@
 //! Console identity and configuration commands.
 
 use core::fmt::Write as _;
-use xbox360_sys::xboxkrnl::HardwareFlags;
-use xbox360_sys::xboxkrnl::HardwareGeneration;
 
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::Win32Error;
 use openxbdm_core::status::XbdmHresult;
+use xbox360_sys::xboxkrnl::HardwareFlags;
+use xbox360_sys::xboxkrnl::HardwareGeneration;
 
 use crate::access::Access;
 use crate::backend::Backend as AnyBackend;

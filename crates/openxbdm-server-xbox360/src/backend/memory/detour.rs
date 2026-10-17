@@ -29,8 +29,12 @@ use xbox360::time::relative_interval;
 use xbox360_sys::status::Severity;
 use xbox360_sys::xam::INFINITE;
 use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
 use xbox360_sys::xboxkrnl::DispatcherObject;
 use xbox360_sys::xboxkrnl::EVENT_INCREMENT;
+use xbox360_sys::xboxkrnl::FileAttributes;
 use xbox360_sys::xboxkrnl::Handle;
 use xbox360_sys::xboxkrnl::IoStatusBlock;
 use xbox360_sys::xboxkrnl::Kevent;
@@ -38,6 +42,7 @@ use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
 use xbox360_sys::xboxkrnl::ObjectAttributes;
 use xbox360_sys::xboxkrnl::PoolType;
 use xbox360_sys::xboxkrnl::ProcessorMode;
+use xbox360_sys::xboxkrnl::ShareAccess;
 use xbox360_sys::xboxkrnl::ThreadCreationFlags;
 use xbox360_sys::xboxkrnl::WaitReason;
 use xbox360_sys::xboxkrnl::WaitType;
@@ -47,11 +52,6 @@ use crate::kernel;
 use crate::kernel::CriticalSection;
 use crate::kernel::KernelEvent;
 use crate::kernel::pool_tag;
-use xbox360_sys::xboxkrnl::AccessMask;
-use xbox360_sys::xboxkrnl::CreateDisposition;
-use xbox360_sys::xboxkrnl::CreateOptions;
-use xbox360_sys::xboxkrnl::FileAttributes;
-use xbox360_sys::xboxkrnl::ShareAccess;
 
 core::arch::global_asm!(
     ".section .text.openxbdm_detour,\"ax\",@progbits",

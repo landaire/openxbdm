@@ -25,6 +25,9 @@
 use core::future::Future;
 use std::time::Duration;
 
+use futures_util::io::AsyncRead;
+use futures_util::io::AsyncWrite;
+
 use crate::client::Client;
 use crate::client::Connected;
 use crate::commands::ModuleInfo;
@@ -43,8 +46,6 @@ use crate::commands::dangerous::sigscan::read_u32_be;
 use crate::commands::dangerous::sigscan::write_u32_be;
 use crate::commands::info::DriveList;
 use crate::error::Error;
-use futures_util::io::AsyncRead;
-use futures_util::io::AsyncWrite;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DrivemapError {

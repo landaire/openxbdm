@@ -1,11 +1,12 @@
 //! Generic primitives for paginated xbdm memory reads + byte scans.
 
+use futures_util::io::AsyncRead;
+use futures_util::io::AsyncWrite;
+
 use crate::client::Client;
 use crate::client::Connected;
 use crate::commands::memory::GetMem;
 use crate::error::Error;
-use futures_util::io::AsyncRead;
-use futures_util::io::AsyncWrite;
 
 /// `getmem` chunk size. xbdm on Xenon cleanly serves 0x10000-byte reads
 /// in a single response; larger requests split into additional response

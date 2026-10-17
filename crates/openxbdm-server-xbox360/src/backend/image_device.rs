@@ -387,7 +387,11 @@ extern "C" fn mount_thread(request: *mut MountRequest) -> u32 {
     if mounted && MOUNTED.fetch_sub(1, Ordering::Relaxed) == 1 {
         // SAFETY: `DISMOUNTED` is a static event built by `GlobalEvent::new`.
         result = unsafe {
-            xboxkrnl::KeSetEvent(DISMOUNTED.pointer().cast(), xboxkrnl::EVENT_INCREMENT, false)
+            xboxkrnl::KeSetEvent(
+                DISMOUNTED.pointer().cast(),
+                xboxkrnl::EVENT_INCREMENT,
+                false,
+            )
         };
     }
     result

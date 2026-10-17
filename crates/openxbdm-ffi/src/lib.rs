@@ -12,8 +12,9 @@ mod inner;
 #[allow(clippy::needless_lifetimes, clippy::too_many_arguments)]
 #[diplomat::bridge]
 mod ffi {
-    use diplomat_runtime::DiplomatWrite;
     use std::fmt::Write;
+
+    use diplomat_runtime::DiplomatWrite;
 
     /// Error returned by any fallible FFI entry point. Carries a
     /// human-readable message accessible via [`OpenxbdmError::message`].

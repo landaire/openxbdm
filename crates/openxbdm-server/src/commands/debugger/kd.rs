@@ -7,6 +7,7 @@ use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::XbdmHresult;
+use xbox360_sys::xboxkrnl::HardwareFlags;
 
 use super::ExtensionHandle;
 use super::context::strtoul;
@@ -20,7 +21,6 @@ use crate::reply::CommandResult;
 use crate::reply::Reply;
 use crate::state::ServerState;
 use crate::text::Text;
-use xbox360_sys::xboxkrnl::HardwareFlags;
 
 /// Offset of the kdnet settings record in the raw flash device.
 pub const KDNET_RECORD_OFFSET: u32 = 0x80;

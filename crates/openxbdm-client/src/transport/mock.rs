@@ -200,9 +200,10 @@ impl AsyncWrite for MockTransport {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use futures_util::io::AsyncReadExt;
     use futures_util::io::AsyncWriteExt;
+
+    use super::*;
 
     fn log_of(frames: &[(Direction, &[u8])]) -> CaptureLog {
         let mut log = CaptureLog::new();

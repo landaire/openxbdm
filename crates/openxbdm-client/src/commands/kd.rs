@@ -3,14 +3,14 @@
 use core::fmt::Write as _;
 use core::net::Ipv4Addr;
 
-pub use openxbdm_core::status::Hresult;
-
 use crate::error::Error;
 use crate::error::ParseError;
 use crate::protocol::ArgBuilder;
 use crate::protocol::Command;
 use crate::protocol::ExpectedBody;
 use crate::protocol::Response;
+
+pub use openxbdm_core::status::Hresult;
 
 fn report_parse(err: ParseError) -> rootcause::Report<Error> {
     rootcause::Report::new(Error::from(err))

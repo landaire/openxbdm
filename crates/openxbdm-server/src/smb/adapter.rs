@@ -33,6 +33,7 @@ use smb2_server::fs::VolumeSize;
 use smb2_server::path::SharePath;
 use smb2_server::server::MAX_HANDLES;
 use smb2_server::utf16::Utf16Le;
+use xbox360_sys::xboxkrnl;
 
 use super::shares;
 use super::shares::ObjectName;
@@ -44,7 +45,6 @@ use crate::commands::filesystem::DriveTarget;
 use crate::commands::filesystem::OBJECT_PATH_LIMIT;
 use crate::commands::security;
 use crate::state::ServerState;
-use xbox360_sys::xboxkrnl;
 
 /// NT one-way function of the empty password.
 const EMPTY_PASSWORD: NtOwf = NtOwf([

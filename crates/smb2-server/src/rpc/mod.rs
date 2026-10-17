@@ -15,13 +15,6 @@ mod srvsvc;
 #[cfg(test)]
 mod tests;
 
-pub use error::PduError;
-pub use error::PipeError;
-pub use pdu::CallId;
-pub use pdu::DataFormat;
-pub use pdu::PacketType;
-pub use pdu::RpcVersion;
-
 use ndr::Writer;
 use pdu::BindRequest;
 use pdu::CALL_HEADER_LENGTH;
@@ -40,6 +33,13 @@ use srvsvc::Opnum;
 use crate::backend::Backend;
 use crate::backend::UserKind;
 use crate::utf16::Utf16Le;
+
+pub use error::PduError;
+pub use error::PipeError;
+pub use pdu::CallId;
+pub use pdu::DataFormat;
+pub use pdu::PacketType;
+pub use pdu::RpcVersion;
 
 /// Bytes of a request stub or bind body the pipe holds.
 const DATA_CAPACITY: usize = 384;

@@ -10,9 +10,10 @@
 #![allow(unsafe_code)]
 
 use core::fmt::Write as _;
-use xbox360_sys::xboxkrnl::HardwareFlags;
 
 use openxbdm_core::status::NtStatus;
+use xbox360_sys::processor::Msr;
+use xbox360_sys::xboxkrnl::HardwareFlags;
 
 use super::Context;
 use super::ContextFlags;
@@ -47,7 +48,6 @@ use crate::notify::ExecutionState;
 use crate::state::ServerState;
 use crate::text::ResponseText;
 use crate::text::Text;
-use xbox360_sys::processor::Msr;
 
 /// Threads that can be stopped at once.
 const MAX_PENDING: usize = 16;

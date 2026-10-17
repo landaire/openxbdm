@@ -9,6 +9,10 @@
 //! [`DirectPolicy`] the server last published, applies the outcome, and
 //! queues the notification for the server.
 
+use openxbdm_core::status::NtStatus;
+use xbox360_sys::processor::Msr;
+use xbox360_sys::xboxkrnl::HardwareFlags;
+
 use super::DataBreakpoint;
 use super::Disposition;
 use super::ExceptionRecord;
@@ -20,9 +24,6 @@ use super::events::rewrite_trap;
 use super::trap;
 use crate::commands::console::DumpMode;
 use crate::commands::console::EventDeferMask;
-use openxbdm_core::status::NtStatus;
-use xbox360_sys::processor::Msr;
-use xbox360_sys::xboxkrnl::HardwareFlags;
 
 /// Monitor state the dispatch and the platform's event services read,
 /// copied by the server for use on any thread.

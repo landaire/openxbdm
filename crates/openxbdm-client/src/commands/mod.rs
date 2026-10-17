@@ -23,10 +23,6 @@ pub mod screenshot;
 pub mod security;
 pub mod system;
 
-pub use debug_ext::ExtensionHandle;
-pub use debug_ext::LoadDebuggerExtension;
-pub use debug_ext::UnloadDebuggerExtension;
-
 pub use context::ContextGroups;
 pub use context::ControlRegisters;
 pub use context::FloatingPointRegisters;
@@ -63,6 +59,9 @@ pub use debug::Stop;
 pub use debug::StopReason;
 pub use debug::StopState;
 pub use debug::Suspend;
+pub use debug_ext::ExtensionHandle;
+pub use debug_ext::LoadDebuggerExtension;
+pub use debug_ext::UnloadDebuggerExtension;
 pub use debugger::Debugger;
 pub use debugger::DebuggerAction;
 pub use debugger::DebuggerAttachment;

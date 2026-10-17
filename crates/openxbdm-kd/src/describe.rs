@@ -2,8 +2,6 @@
 
 use std::fmt::Write;
 
-use crate::client::Direction;
-
 use openxbdm_kd_core::debug_io::DebugIo;
 use openxbdm_kd_core::file_io::FileIoReply;
 use openxbdm_kd_core::file_io::FileIoRequest;
@@ -14,6 +12,8 @@ use openxbdm_kd_core::packet::Datagram;
 use openxbdm_kd_core::packet::PacketType;
 use openxbdm_kd_core::state_change::StateBody;
 use openxbdm_kd_core::state_change::StateChange;
+
+use crate::client::Direction;
 
 /// Describes a datagram. Host and kernel messages of one packet type differ
 /// for host file I/O, so the direction selects the decoder.

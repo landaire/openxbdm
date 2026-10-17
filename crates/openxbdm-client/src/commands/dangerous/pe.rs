@@ -7,12 +7,13 @@
 //! signature scanners can operate on authoritative ranges rather than
 //! guessing at text/data boundaries.
 
+use futures_util::io::AsyncRead;
+use futures_util::io::AsyncWrite;
+
 use crate::client::Client;
 use crate::client::Connected;
 use crate::commands::dangerous::sigscan::read;
 use crate::error::Error;
-use futures_util::io::AsyncRead;
-use futures_util::io::AsyncWrite;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PeError {

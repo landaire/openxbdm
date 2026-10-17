@@ -2,13 +2,13 @@
 //! `setcontext` register parameters.
 
 use core::fmt::Write as _;
+use core::mem::offset_of;
 
 use openxbdm_core::line::CommandLine;
-
-use crate::text::Text;
-use core::mem::offset_of;
 use xbox360_sys::processor::Msr;
 use xbox360_sys::xboxkrnl::Context as KernelContext;
+
+use crate::text::Text;
 
 pub use xbox360_sys::xboxkrnl::ContextFlags;
 

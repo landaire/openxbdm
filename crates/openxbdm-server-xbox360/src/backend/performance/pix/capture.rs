@@ -36,12 +36,12 @@ use super::session::FrameRecord;
 use super::session::FrameRecordFlags;
 use super::session::Part;
 use super::session::PixSession;
-pub(super) use video::RenderClient;
-pub(super) use video::VideoContext;
 
 pub(crate) use audio::service_samples;
 pub(crate) use timing::service_end;
 pub(crate) use timing::service_nuicam_begin;
+pub(super) use video::RenderClient;
+pub(super) use video::VideoContext;
 
 xbox360_sys::value_enum! {
     /// Identifiers of the data records in the per-thread buffers.

@@ -24,14 +24,14 @@ use openxbdm_server::commands::memory::detour::CallContext;
 use openxbdm_server::commands::memory::detour::Engine;
 use openxbdm_server::commands::memory::detour::RECORD_SIZE;
 use openxbdm_server::commands::memory::detour::ReturnValue;
-
-use super::Region;
-use crate::backend::MockBackend;
 use xbox360_sys::xboxkrnl::AccessMask;
 use xbox360_sys::xboxkrnl::CreateDisposition;
 use xbox360_sys::xboxkrnl::CreateOptions;
 use xbox360_sys::xboxkrnl::FileAttributes;
 use xbox360_sys::xboxkrnl::ShareAccess;
+
+use super::Region;
+use crate::backend::MockBackend;
 
 /// Address of trampoline 0, as in the stock image.
 pub const TRAMPOLINE_BASE: u32 = 0x91f1_3230;

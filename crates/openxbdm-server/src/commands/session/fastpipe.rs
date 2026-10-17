@@ -13,6 +13,11 @@
 
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::FileAttributes;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
 use crate::backend::Backend as AnyBackend;
 use crate::commands::filesystem;
@@ -34,11 +39,6 @@ use crate::reply::CommandResult;
 use crate::reply::Reply;
 use crate::state::ServerState;
 use crate::text::Text;
-use xbox360_sys::xboxkrnl::AccessMask;
-use xbox360_sys::xboxkrnl::CreateDisposition;
-use xbox360_sys::xboxkrnl::CreateOptions;
-use xbox360_sys::xboxkrnl::FileAttributes;
-use xbox360_sys::xboxkrnl::ShareAccess;
 
 xbox360_sys::value_enum! {
     /// First word of a pipe packet.

@@ -15,14 +15,14 @@ pub mod recording;
 #[cfg(feature = "tokio")]
 pub mod tokio;
 
+use futures_io::AsyncRead;
+use futures_io::AsyncWrite;
+
 pub use capture::CaptureEntry;
 pub use capture::CaptureLog;
 pub use capture::Direction;
 pub use mock::MockTransport;
 pub use recording::RecordingTransport;
-
-use futures_io::AsyncRead;
-use futures_io::AsyncWrite;
 
 /// A marker trait covering any full-duplex byte stream we can speak XBDM over.
 pub trait Transport: AsyncRead + AsyncWrite + Unpin + Send {}

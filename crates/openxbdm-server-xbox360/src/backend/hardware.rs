@@ -67,12 +67,17 @@ use xbox360_sys::xam;
 use xbox360_sys::xam::XnAddr;
 use xbox360_sys::xam::XnCaller;
 use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
 use xbox360_sys::xboxkrnl::DebugMonitorService;
+use xbox360_sys::xboxkrnl::FileAttributes;
 use xbox360_sys::xboxkrnl::Handle;
 use xbox360_sys::xboxkrnl::IoControlCode;
 use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
 use xbox360_sys::xboxkrnl::PoolTag;
 use xbox360_sys::xboxkrnl::PoolType;
+use xbox360_sys::xboxkrnl::ShareAccess;
 use xbox360_sys::xboxkrnl::ThreadCreationFlags;
 use xbox360_sys::xboxkrnl::XInputdSetRFPowerMode;
 
@@ -85,11 +90,6 @@ use crate::exports::export_result;
 use crate::kernel;
 use crate::kernel::KernelEvent;
 use crate::net::XamNetwork;
-use xbox360_sys::xboxkrnl::AccessMask;
-use xbox360_sys::xboxkrnl::CreateDisposition;
-use xbox360_sys::xboxkrnl::CreateOptions;
-use xbox360_sys::xboxkrnl::FileAttributes;
-use xbox360_sys::xboxkrnl::ShareAccess;
 
 /// XAM ordinal: heap information `(id, class, buffer) -> HRESULT`.
 const XAM_HEAP_INFO: Ordinal = Ordinal::new(0x827).unwrap();

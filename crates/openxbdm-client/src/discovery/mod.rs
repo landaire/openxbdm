@@ -19,6 +19,10 @@ pub mod runner;
 pub use engine::Discovery;
 pub use engine::DiscoveryAction;
 pub use engine::DiscoveryConfig;
+#[cfg(feature = "tokio")]
+pub use runner::discover_all;
+#[cfg(feature = "tokio")]
+pub use runner::find_by_name;
 pub use wire::DiscoveredConsole;
 pub use wire::MAX_NAME_LEN;
 pub use wire::NAP_PORT;
@@ -29,8 +33,3 @@ pub use wire::RESPONSE_OPCODE;
 pub use wire::RequestOpcode;
 pub use wire::encode_request;
 pub use wire::parse_response;
-
-#[cfg(feature = "tokio")]
-pub use runner::discover_all;
-#[cfg(feature = "tokio")]
-pub use runner::find_by_name;

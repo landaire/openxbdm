@@ -9,6 +9,13 @@ use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::Win32Error;
+use xbox360_sys::status::Facility;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::FileAttributes;
+use xbox360_sys::xboxkrnl::HardwareFlags;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
 use crate::access::Access;
 use crate::backend::Backend as AnyBackend;
@@ -37,13 +44,6 @@ use crate::reply::CommandResult;
 use crate::reply::Reply;
 use crate::server::Server;
 use crate::state::ServerState;
-use xbox360_sys::status::Facility;
-use xbox360_sys::xboxkrnl::AccessMask;
-use xbox360_sys::xboxkrnl::CreateDisposition;
-use xbox360_sys::xboxkrnl::CreateOptions;
-use xbox360_sys::xboxkrnl::FileAttributes;
-use xbox360_sys::xboxkrnl::HardwareFlags;
-use xbox360_sys::xboxkrnl::ShareAccess;
 
 /// Delay between the `200- OK` of a reboot and the reboot.
 const REBOOT_REPLY_DELAY_MS: u32 = 200;

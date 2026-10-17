@@ -8,6 +8,42 @@ mod notification;
 mod rpc;
 mod telllog;
 
+use core::fmt::Write as _;
+
+use openxbdm_core::status::ErrorCode;
+use openxbdm_core::status::KernelError;
+use openxbdm_core::status::XbdmHresult;
+use xbox360_sys::processor::HARDWARE_THREAD_COUNT;
+
+use crate::access::Access;
+use crate::backend::Backend as AnyBackend;
+use crate::commands::filesystem::FileHandle;
+use crate::commands::system;
+use crate::commands::system::SettingsFile;
+use crate::continuation::Continuation as AnyContinuation;
+use crate::continuation::ContinuationContext;
+use crate::invocation::DedicateTarget;
+use crate::invocation::Invocation;
+use crate::invocation::SessionRequest;
+use crate::network::Endpoint;
+use crate::network::Ipv4Address;
+use crate::network::Network;
+use crate::network::SocketId;
+use crate::network::send_line;
+use crate::notify::Event;
+use crate::notify::ExecutionState;
+use crate::notify::MAX_NOTIFICATION_TARGETS;
+use crate::notify::POSTED_TEXT_CAPACITY;
+use crate::notify::TargetFlags;
+use crate::registry::CommandEntry;
+use crate::registry::DispatchFlags;
+use crate::reply;
+use crate::reply::CommandError;
+use crate::reply::CommandResult;
+use crate::reply::Reply;
+use crate::state::ServerState;
+use crate::text::Text;
+
 pub use fastpipe::FastPipeBackend;
 pub use fastpipe::FastPipes;
 pub use fastpipe::PIPE_SLOTS;
@@ -53,42 +89,6 @@ pub use telllog::TellLogWriter;
 pub use telllog::WaitTrace;
 pub use telllog::WaitTraceLine;
 pub use telllog::format_wait_trace;
-
-use core::fmt::Write as _;
-use xbox360_sys::processor::HARDWARE_THREAD_COUNT;
-
-use openxbdm_core::status::ErrorCode;
-use openxbdm_core::status::KernelError;
-use openxbdm_core::status::XbdmHresult;
-
-use crate::access::Access;
-use crate::backend::Backend as AnyBackend;
-use crate::commands::filesystem::FileHandle;
-use crate::commands::system;
-use crate::commands::system::SettingsFile;
-use crate::continuation::Continuation as AnyContinuation;
-use crate::continuation::ContinuationContext;
-use crate::invocation::DedicateTarget;
-use crate::invocation::Invocation;
-use crate::invocation::SessionRequest;
-use crate::network::Endpoint;
-use crate::network::Ipv4Address;
-use crate::network::Network;
-use crate::network::SocketId;
-use crate::network::send_line;
-use crate::notify::Event;
-use crate::notify::ExecutionState;
-use crate::notify::MAX_NOTIFICATION_TARGETS;
-use crate::notify::POSTED_TEXT_CAPACITY;
-use crate::notify::TargetFlags;
-use crate::registry::CommandEntry;
-use crate::registry::DispatchFlags;
-use crate::reply;
-use crate::reply::CommandError;
-use crate::reply::CommandResult;
-use crate::reply::Reply;
-use crate::state::ServerState;
-use crate::text::Text;
 
 /// Bytes of the debug capture ring.
 pub const DEBUG_CAPTURE_SIZE: usize = 0x8000;

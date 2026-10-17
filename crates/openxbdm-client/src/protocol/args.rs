@@ -15,9 +15,9 @@
 
 use core::fmt::Write as _;
 
-pub use openxbdm_core::value::Qword;
-
 use crate::error::ArgumentError;
+
+pub use openxbdm_core::value::Qword;
 
 /// Builder for the right-hand side of an XBDM command line.
 ///

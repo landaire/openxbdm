@@ -24,23 +24,9 @@ mod tables;
 mod tree;
 mod wire;
 
-pub use self::shared::ConnectionId;
-pub use self::shared::SUPERSEDED_QUEUE;
-pub use self::shared::Server;
-pub use self::shared::SupersededSession;
-pub use self::tables::SessionId;
-pub use self::wire::Dialect;
-pub use self::wire::FileId;
-
 use core::time::Duration;
 
-use crate::auth::Authenticator;
-use crate::backend::Backend;
-use crate::backend::ShareId;
-use crate::fs::FileTime;
-use crate::status::NtStatus;
-use crate::transport;
-
+use self::credits::CreditWindow;
 use self::error::Completion;
 use self::error::RequestError;
 use self::negotiate::GlobalCapabilities;
@@ -48,8 +34,6 @@ use self::negotiate::Negotiated;
 use self::negotiate::SecurityMode;
 use self::security::PreauthHash;
 use self::security::SigningKey;
-
-use self::credits::CreditWindow;
 use self::shared::ChangeSequence;
 use self::shared::LockOwner;
 use self::tables::HeldEntry;
@@ -73,6 +57,20 @@ use self::wire::HEADER_SIZE;
 use self::wire::HeaderFlags;
 use self::wire::MessageId;
 use self::wire::header;
+use crate::auth::Authenticator;
+use crate::backend::Backend;
+use crate::backend::ShareId;
+use crate::fs::FileTime;
+use crate::status::NtStatus;
+use crate::transport;
+
+pub use self::shared::ConnectionId;
+pub use self::shared::SUPERSEDED_QUEUE;
+pub use self::shared::Server;
+pub use self::shared::SupersededSession;
+pub use self::tables::SessionId;
+pub use self::wire::Dialect;
+pub use self::wire::FileId;
 
 /// Sessions per connection.
 pub const MAX_SESSIONS: usize = 4;

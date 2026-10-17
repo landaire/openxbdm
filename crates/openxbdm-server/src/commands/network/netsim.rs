@@ -16,12 +16,15 @@ use openxbdm_core::status::Hresult;
 use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::Win32Error;
 use openxbdm_core::status::XbdmHresult;
+use xbox360_sys::xboxkrnl::AccessMask;
+use xbox360_sys::xboxkrnl::CreateDisposition;
+use xbox360_sys::xboxkrnl::CreateOptions;
+use xbox360_sys::xboxkrnl::FileAttributes;
+use xbox360_sys::xboxkrnl::ShareAccess;
 
 use self::classifier::CompileError;
-pub use self::classifier::Program;
 use self::classifier::ProgramError;
 use self::classifier::SerializeError;
-pub use self::classifier::Source;
 use super::NetworkError;
 use super::SystemVersion;
 use super::WsaError;
@@ -41,11 +44,9 @@ use crate::reply::CommandResult;
 use crate::reply::Reply;
 use crate::text::HEX_UPPER;
 use crate::text::ResponseText;
-use xbox360_sys::xboxkrnl::AccessMask;
-use xbox360_sys::xboxkrnl::CreateDisposition;
-use xbox360_sys::xboxkrnl::CreateOptions;
-use xbox360_sys::xboxkrnl::FileAttributes;
-use xbox360_sys::xboxkrnl::ShareAccess;
+
+pub use self::classifier::Program;
+pub use self::classifier::Source;
 
 /// First system version with the simulator.
 const NETSIM_VERSION: SystemVersion = SystemVersion(0x2027_8700);

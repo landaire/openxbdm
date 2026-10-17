@@ -5,16 +5,6 @@
 //! Passwords travel only after a key exchange
 //! ([`crate::Client::key_exchange`]), XORed with the [`SessionKey`].
 
-pub use openxbdm_core::auth::AuthResponse;
-pub use openxbdm_core::auth::BoxIdentifier;
-pub use openxbdm_core::auth::DH_LENGTH;
-pub use openxbdm_core::auth::DhValue;
-pub use openxbdm_core::auth::Nonce;
-pub use openxbdm_core::auth::Password;
-pub use openxbdm_core::auth::SessionKey;
-pub use openxbdm_core::auth::dh_mod_exp;
-pub use openxbdm_core::auth::response;
-
 use crate::commands::kv::parse_kv_line;
 use crate::commands::kv::value_qword;
 use crate::error::ArgumentError;
@@ -25,6 +15,16 @@ use crate::protocol::Command;
 use crate::protocol::ExpectedBody;
 use crate::protocol::Qword;
 use crate::protocol::Response;
+
+pub use openxbdm_core::auth::AuthResponse;
+pub use openxbdm_core::auth::BoxIdentifier;
+pub use openxbdm_core::auth::DH_LENGTH;
+pub use openxbdm_core::auth::DhValue;
+pub use openxbdm_core::auth::Nonce;
+pub use openxbdm_core::auth::Password;
+pub use openxbdm_core::auth::SessionKey;
+pub use openxbdm_core::auth::dh_mod_exp;
+pub use openxbdm_core::auth::response;
 
 fn report_argument(err: ArgumentError) -> rootcause::Report<Error> {
     rootcause::Report::new(Error::from(err))

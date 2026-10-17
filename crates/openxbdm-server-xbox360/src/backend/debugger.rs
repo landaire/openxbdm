@@ -10,8 +10,6 @@
 
 mod exports;
 
-pub(crate) use self::exports::apply_pending_stop_on;
-
 use core::cell::UnsafeCell;
 use core::ffi::CStr;
 use core::ffi::c_char;
@@ -118,6 +116,8 @@ use crate::kernel::RoutineVariable;
 use crate::kernel::address_of;
 use crate::kernel::object_at;
 use crate::kernel::thread_at;
+
+pub(crate) use self::exports::apply_pending_stop_on;
 
 /// Pool tag of monitor thread records ('Dmtd').
 const RECORD_TAG: PoolTag = PoolTag::new(*b"dtmD");

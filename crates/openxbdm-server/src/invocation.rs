@@ -2,10 +2,9 @@
 
 use openxbdm_core::line::CommandLine;
 
-use crate::commands::system::RebootKind;
-
 use crate::access::Access;
 use crate::backend::Backend;
+use crate::commands::system::RebootKind;
 use crate::continuation::Continuation;
 use crate::network::NetError;
 use crate::network::Network;

@@ -21,6 +21,9 @@
 //! and decide how to interpret them.
 
 use bytes::BytesMut;
+use futures_io::AsyncRead;
+use futures_io::AsyncWrite;
+use futures_util::io::AsyncReadExt;
 use rootcause::prelude::*;
 
 use crate::client::Client;
@@ -30,9 +33,6 @@ use crate::commands::kv::value_u32;
 use crate::error::Error;
 use crate::error::FramingError;
 use crate::error::ParseError;
-use futures_io::AsyncRead;
-use futures_io::AsyncWrite;
-use futures_util::io::AsyncReadExt;
 
 /// Metadata XBDM emits before the framebuffer bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

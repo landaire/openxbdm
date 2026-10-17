@@ -288,12 +288,14 @@ pub(super) fn reset_budget(session: Session) {
 }
 
 fn reference_device(path: &[u8], device: &mut u32) -> u32 {
+    // SAFETY: `data_imports_resolved` held at module load.
+    let object_type = unsafe { xboxkrnl::IoDeviceObjectType.get_unchecked() };
     // SAFETY: the name string and `device` are live for the call.
     unsafe {
         xboxkrnl::ObReferenceObjectByName(
             &kernel::ansi_string(path),
             ObjectAttributeFlags::CASE_INSENSITIVE,
-            core::ptr::from_ref(kernel::resolved(&xboxkrnl::IoDeviceObjectType)).addr() as u32,
+            core::ptr::from_ref(object_type).addr() as u32,
             0,
             device,
         )

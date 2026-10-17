@@ -9,8 +9,6 @@ use xbox360::module::SystemModule;
 use xbox360::sync::SpinLock;
 use xbox360_sys::xboxkrnl;
 
-use super::read_word;
-use super::write_word;
 use crate::kernel;
 
 /// Kernel ordinal: NuiCam control routine `(&{u32 code, u32 value})`.
@@ -240,4 +238,14 @@ pub(crate) fn service_set_capture_mode(request: u32) -> u32 {
 /// 0x91f653d0).
 pub(crate) fn title_ended() {
     flush();
+}
+
+fn read_word(address: u32) -> u32 {
+    // SAFETY: callers pass addresses the input system supplied for output.
+    unsafe { core::ptr::read_volatile(address as usize as *const u32) }
+}
+
+fn write_word(address: u32, value: u32) {
+    // SAFETY: as `read_word`.
+    unsafe { core::ptr::write_volatile(address as usize as *mut u32, value) }
 }

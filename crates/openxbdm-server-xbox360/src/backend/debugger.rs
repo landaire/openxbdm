@@ -1855,8 +1855,10 @@ impl debugger::Backend for Console {
     }
 
     fn thread_exit_status(&mut self, handle: ThreadHandle) -> Result<ExitStatus, KernelError> {
+        // SAFETY: `data_imports_resolved` held at module load.
         let object_type =
-            core::ptr::from_ref(kernel::resolved(&xboxkrnl::ExThreadObjectType)).addr() as u32;
+            core::ptr::from_ref(unsafe { xboxkrnl::ExThreadObjectType.get_unchecked() }).addr()
+                as u32;
         let mut object = 0u32;
         // SAFETY: `object` is a live local; the kernel validates the handle
         // against the thread object type.

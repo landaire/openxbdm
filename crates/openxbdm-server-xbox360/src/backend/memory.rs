@@ -2,13 +2,12 @@
 //! allocation tracking.
 
 use core::fmt::Write as _;
-use core::marker::PhantomData;
+use core::sync::atomic::AtomicU8;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
-use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::Win32Error;
 use openxbdm_server::commands::filesystem;
 use openxbdm_server::commands::filesystem::Backend as _;
@@ -36,11 +35,13 @@ use xbox360_sys::image::ImageNtHeaders;
 use xbox360_sys::image::ImageSectionHeader;
 use xbox360_sys::image::XexHeaderKey;
 use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::DebugMemoryStatistics;
 use xbox360_sys::xboxkrnl::DebugMonitorService;
 use xbox360_sys::xboxkrnl::ExLoadedImageName;
 use xbox360_sys::xboxkrnl::Irql;
 use xbox360_sys::xboxkrnl::KspinLock;
 use xbox360_sys::xboxkrnl::LdrDataTableEntry;
+use xbox360_sys::xboxkrnl::MmStatistics;
 use xbox360_sys::xboxkrnl::PoolTag;
 use xbox360_sys::xboxkrnl::RtlAssert;
 use xbox360_sys::xboxkrnl::RtlImageDirectoryEntryToData;
@@ -50,22 +51,19 @@ use xbox360_sys::xboxkrnl::XexExecutableModuleHandle;
 
 use super::Console;
 use crate::kernel;
+use crate::kernel::LoaderLock;
+use crate::kernel::ModuleList;
 
 mod detour;
 mod exports;
 
 pub(crate) use exports::MODULE_RECORD_SHORT_SIZE;
 pub(crate) use exports::ModuleWalkError;
-pub(crate) use exports::get_module_debug_directory;
+pub(crate) use exports::module_debug_directory;
 pub(crate) use exports::next_module;
 
 /// Debugger context the kernel fills for a writable mapping.
 const WRITE_CONTEXT_WORDS: usize = 14;
-
-/// Words of the service 8 reply, including its size and length header.
-const MEMORY_STATISTICS_REPLY_WORDS: usize = 0x90 / 4;
-/// Length of an `MmQueryStatistics` block.
-const MEMORY_STATISTICS_LENGTH: u32 = 0x68;
 
 /// Kernel export that configures import tracing for a module name.
 const TRACE_IMPORTS_ORDINAL: Ordinal = Ordinal::new(0x2cf).unwrap();
@@ -75,10 +73,23 @@ const TRACKING_POOL_TAG: PoolTag = PoolTag::new(*b"memx");
 const TRACKING_ASSERT_FILE: &core::ffi::CStr =
     c"e:\\xenon\\xdksep13\\core\\private\\xdk\\tools\\debug\\xbdm\\core\\alloctrk.c";
 const TRACKING_ASSERT_LINE: u32 = 0x73;
-/// Tracking flag that turns diagnostics into assertions.
-const TRACKING_ASSERT: u32 = 0x100;
 const TRACK_ASSERT_LINE: u32 = 0xac;
 const UNTRACK_ASSERT_LINE: u32 = 0xef;
+
+xbox360_sys::flags! {
+    /// Bits of the allocation tracking flags word that select types and
+    /// diagnostics.
+    pub struct TrackingOptions(u32) {
+        /// Track type 0 (heap).
+        HEAP = 0x1,
+        /// Track type 1 (virtual-mapped memory).
+        VIRTUAL_MAPPED = 0x2,
+        /// Track the types titles register.
+        REGISTERED = 0x80,
+        /// Report diagnostics as assertions.
+        ASSERT = 0x100,
+    }
+}
 
 /// Stock asserts a null allocation pointer whatever the tracking flags.
 fn assert_allocation_pointer(line: u32) {
@@ -94,7 +105,7 @@ fn assert_allocation_pointer(line: u32) {
 }
 
 /// A tracking hook call that did not fail.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum Tracked {
     /// The record was added or removed.
     Done,
@@ -102,8 +113,17 @@ enum Tracked {
     TypeNotTracked,
 }
 
+impl From<Tracked> for Hresult {
+    fn from(tracked: Tracked) -> Self {
+        match tracked {
+            Tracked::Done => Hresult::SUCCESS,
+            Tracked::TypeNotTracked => Hresult::FALSE,
+        }
+    }
+}
+
 /// A failed tracking hook call.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum TrackingError {
     /// No type is tracked.
     Off,
@@ -119,125 +139,46 @@ enum TrackingError {
     SizeMismatch,
 }
 
+impl core::fmt::Display for TrackingError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            TrackingError::Off => "allocation tracking is off",
+            TrackingError::UnknownType => "unknown allocation type",
+            TrackingError::OutOfMemory => "no memory for a tracking record",
+            TrackingError::NotFound => "no tracking record has the address",
+            TrackingError::TypeMismatch => "the tracking record has another type",
+            TrackingError::SizeMismatch => "the tracking record has another size",
+        })
+    }
+}
+
+impl core::error::Error for TrackingError {}
+
+impl From<TrackingError> for Hresult {
+    fn from(error: TrackingError) -> Self {
+        match error {
+            TrackingError::Off => Hresult::from_win32(Win32Error::SERVICE_NOT_ACTIVE),
+            TrackingError::UnknownType | TrackingError::TypeMismatch => Hresult::INVALID_ARGUMENT,
+            TrackingError::OutOfMemory => Hresult::OUT_OF_MEMORY,
+            TrackingError::NotFound => Hresult::from_win32(Win32Error::NOT_FOUND),
+            TrackingError::SizeMismatch => Hresult::from_win32(Win32Error::BAD_LENGTH),
+        }
+    }
+}
+
 type TrackingResult = Result<Tracked, TrackingError>;
 
 /// The HRESULT a tracking hook returns to the kernel or the title.
 fn tracking_hresult(result: TrackingResult) -> Hresult {
     match result {
-        // S_OK.
-        Ok(Tracked::Done) => Hresult(0),
-        // S_FALSE.
-        Ok(Tracked::TypeNotTracked) => Hresult(1),
-        // HRESULT_FROM_WIN32(ERROR_SERVICE_NOT_ACTIVE).
-        Err(TrackingError::Off) => Hresult(0x8007_0426),
-        Err(TrackingError::UnknownType | TrackingError::TypeMismatch) => Hresult::INVALID_ARGUMENT,
-        Err(TrackingError::OutOfMemory) => Hresult::OUT_OF_MEMORY,
-        // HRESULT_FROM_WIN32(ERROR_NOT_FOUND).
-        Err(TrackingError::NotFound) => Hresult(0x8007_0490),
-        // HRESULT_FROM_WIN32(ERROR_BAD_LENGTH).
-        Err(TrackingError::SizeMismatch) => Hresult(0x8007_0018),
+        Ok(tracked) => tracked.into(),
+        Err(error) => error.into(),
     }
-}
-
-fn read_u32(address: u32) -> u32 {
-    // SAFETY: callers pass addresses of kernel structures that stay mapped
-    // while the loader lock is held or that the kernel owns permanently.
-    unsafe { core::ptr::read_volatile(address as usize as *const u32) }
-}
-
-fn read_u16(address: u32) -> u16 {
-    // SAFETY: as `read_u32`.
-    unsafe { core::ptr::read_volatile(address as usize as *const u16) }
 }
 
 /// Module init of this domain: the detour trampolines and engine.
 pub(crate) fn initialize() {
     detour::initialize();
-}
-
-/// Holds the loader spin lock for its lifetime.
-struct LoaderLock {
-    lock: u32,
-    irql: Irql,
-}
-
-impl LoaderLock {
-    fn acquire() -> Self {
-        let lock = kernel::debug_monitor_data()
-            .loaded_module_list_lock
-            .load(Ordering::Relaxed);
-        // SAFETY: the debug monitor data holds the address of the kernel
-        // loader spin lock.
-        let irql = unsafe { xboxkrnl::KfAcquireSpinLock(lock as usize as *mut KspinLock) };
-        Self { lock, irql }
-    }
-}
-
-impl Drop for LoaderLock {
-    fn drop(&mut self) {
-        // SAFETY: `acquire` took this lock at `self.irql`.
-        unsafe { xboxkrnl::KfReleaseSpinLock(self.lock as usize as *mut KspinLock, self.irql) };
-    }
-}
-
-/// Loader data table entries of each list in `heads`, one list after the
-/// other; a zero head is an empty list. One iterator for both lists keeps
-/// the walks from being instantiated once per list.
-struct LoaderEntries<'a> {
-    heads: [u32; 2],
-    list: usize,
-    entry: u32,
-    _lock: PhantomData<&'a LoaderLock>,
-}
-
-impl LoaderEntries<'_> {
-    fn new(heads: [u32; 2]) -> Self {
-        Self {
-            heads,
-            list: 0,
-            entry: first_entry(heads[0]),
-            _lock: PhantomData,
-        }
-    }
-}
-
-fn first_entry(head: u32) -> u32 {
-    if head == 0 { 0 } else { read_u32(head) }
-}
-
-impl<'a> Iterator for LoaderEntries<'a> {
-    type Item = &'a LdrDataTableEntry;
-
-    fn next(&mut self) -> Option<&'a LdrDataTableEntry> {
-        loop {
-            let head = *self.heads.get(self.list)?;
-            if head != 0 && self.entry != head {
-                // SAFETY: `self.entry` is linked into a loader module list of
-                // the debug monitor data; callers hold the loader lock, which
-                // keeps the entry linked and mapped.
-                let current = unsafe {
-                    &*core::ptr::with_exposed_provenance::<LdrDataTableEntry>(self.entry as usize)
-                };
-                self.entry = current.in_load_order_links.flink.load(Ordering::Relaxed);
-                return Some(current);
-            }
-            self.list += 1;
-            self.entry = self
-                .heads
-                .get(self.list)
-                .map_or(0, |&head| first_entry(head));
-        }
-    }
-}
-
-/// Entries of both loader lists, in the order the monitor walks them,
-/// valid while `_lock` is held.
-fn all_entries(_lock: &LoaderLock) -> LoaderEntries<'_> {
-    let data = kernel::debug_monitor_data();
-    LoaderEntries::new([
-        data.loaded_module_list.load(Ordering::Relaxed),
-        data.loaded_usermode_module_list.load(Ordering::Relaxed),
-    ])
 }
 
 xbox360_sys::flags! {
@@ -254,23 +195,30 @@ fn is_reported(entry: &LdrDataTableEntry) -> bool {
         .contains(LoaderEntryFlags::REPORTED)
 }
 
-fn entry_name_units(entry: &LdrDataTableEntry) -> impl Iterator<Item = u16> {
-    let length = u32::from(entry.base_dll_name.length >> 1);
-    let buffer = entry.base_dll_name.buffer;
-    (0..length).map(move |index| read_u16(buffer + index * 2))
+/// The base name units of an entry from [`LoaderEntries`].
+fn entry_name_units<'a>(
+    _lock: &'a LoaderLock,
+    entry: &'a LdrDataTableEntry,
+) -> impl Iterator<Item = u16> + 'a {
+    let length = usize::from(entry.base_dll_name.length >> 1);
+    let buffer = core::ptr::with_exposed_provenance::<u16>(entry.base_dll_name.buffer as usize);
+    // SAFETY: the name buffer of a linked loader entry holds `length` units
+    // and stays mapped while `_lock` is held.
+    (0..length).map(move |index| unsafe { buffer.add(index).read() })
 }
 
 /// The entry whose base name exactly matches `name`, searching the first
-/// list and then the second. Callers hold the loader lock.
+/// list and then the second.
 fn find_entry<'a>(lock: &'a LoaderLock, name: &[u8]) -> Option<&'a LdrDataTableEntry> {
-    all_entries(lock).find(|entry| memory::module_name_matches(entry_name_units(entry), name, true))
+    lock.all_entries()
+        .find(|entry| memory::module_name_matches(entry_name_units(lock, entry), name, true))
 }
 
 /// The loader entry of the module whose base name exactly matches `name`
 /// (stock 0x91f33fb0 with exact matching), looked up under the loader lock.
 pub(crate) fn loader_entry(name: &[u8]) -> Option<u32> {
     let lock = LoaderLock::acquire();
-    find_entry(&lock, name).map(|entry| core::ptr::from_ref(entry).expose_provenance() as u32)
+    find_entry(&lock, name).map(kernel::address_of)
 }
 
 fn nt_header(entry: &LdrDataTableEntry) -> Option<&ImageNtHeaders> {
@@ -313,7 +261,9 @@ fn tracking_diagnostic(arguments: core::fmt::Arguments<'_>) {
     let _ = text.write_fmt(arguments);
     let mut message = [0u8; TRACKING_MESSAGE_LIMIT + 1];
     message[..text.as_bytes().len()].copy_from_slice(text.as_bytes());
-    if TRACKING.flags.load(Ordering::Relaxed) & TRACKING_ASSERT != 0 {
+    if TrackingOptions::from_bits_retain(TRACKING.flags.load(Ordering::Relaxed))
+        .contains(TrackingOptions::ASSERT)
+    {
         // SAFETY: `message` is NUL-terminated and the file name is a static literal.
         unsafe {
             RtlAssert(
@@ -340,43 +290,82 @@ fn tracking_diagnostic(arguments: core::fmt::Arguments<'_>) {
 
 /// Allocation tracking state shared with the debug service dispatcher.
 struct Tracking {
-    /// Flags in effect.
+    /// [`TrackingFlags`] in effect.
     flags: AtomicU32,
     /// Spin lock guarding the record list.
-    lock: AtomicU32,
-    /// Newest record; each record starts with the address of the next.
+    lock: KspinLock,
+    /// Address of the newest [`TrackingRecord`], or 0.
     head: AtomicU32,
     count: AtomicU32,
 }
 
 static TRACKING: Tracking = Tracking {
     flags: AtomicU32::new(0),
-    lock: AtomicU32::new(0),
+    lock: KspinLock::new(),
     head: AtomicU32::new(0),
     count: AtomicU32::new(0),
 };
 
-/// Record layout: next (+0), type (+4, u16), size (+6), address (+0xa),
-/// then the captured return addresses.
-const RECORD_TYPE: u32 = 4;
-const RECORD_SIZE: u32 = 6;
-const RECORD_ADDRESS: u32 = 0xa;
-const RECORD_STACK: u32 = 0xe;
+/// Holds the tracking spin lock for its lifetime.
+struct TrackingLock(Irql);
 
-fn record_length() -> u32 {
-    memory::ACTIVE_STACK_DEPTH
-        .0
-        .wrapping_sub(1)
-        .wrapping_shl(2)
-        .wrapping_add(0x12)
+impl TrackingLock {
+    fn acquire() -> Self {
+        // SAFETY: the static tracking spin lock.
+        Self(unsafe { xboxkrnl::KfAcquireSpinLock(TRACKING.lock.as_ptr()) })
+    }
 }
 
-fn tracking_type_enabled(kind: u16, flags: u32) -> bool {
+impl Drop for TrackingLock {
+    fn drop(&mut self) {
+        // SAFETY: `acquire` took the tracking lock at `self.0`.
+        unsafe { xboxkrnl::KfReleaseSpinLock(TRACKING.lock.as_ptr(), self.0) };
+    }
+}
+
+/// An allocation tracking record: a pool block of [`record_length`]
+/// bytes, this header followed by the captured return addresses. The
+/// `save` file holds the records as stored.
+#[repr(C, packed)]
+struct TrackingRecord {
+    /// Address of the next older record, or 0.
+    next: u32,
+    kind: u16,
+    size: u32,
+    address: u32,
+}
+
+const _: () = {
+    use core::mem::offset_of;
+    assert!(offset_of!(TrackingRecord, kind) == 4);
+    assert!(offset_of!(TrackingRecord, size) == 6);
+    assert!(offset_of!(TrackingRecord, address) == 0xa);
+    assert!(core::mem::size_of::<TrackingRecord>() == 0xe);
+};
+
+/// The record at `address`, or `None` for 0.
+///
+/// # Safety
+///
+/// `address` is 0 or a record linked into [`TRACKING`], the caller holds
+/// the tracking lock or otherwise keeps the list from changing for `'a`,
+/// and no other reference to the record exists for `'a`.
+unsafe fn linked_record<'a>(address: u32) -> Option<&'a mut TrackingRecord> {
+    // SAFETY: per the caller; records are pool blocks of this module.
+    unsafe { core::ptr::with_exposed_provenance_mut::<TrackingRecord>(address as usize).as_mut() }
+}
+
+fn record_length() -> u32 {
+    (core::mem::size_of::<TrackingRecord>() as u32)
+        .wrapping_add(memory::ACTIVE_STACK_DEPTH.0.wrapping_shl(2))
+}
+
+fn tracking_type_enabled(kind: u16, flags: TrackingOptions) -> bool {
     match kind {
-        0 => flags & 1 != 0,
-        1 => flags & 2 != 0,
-        2..=13 => true,
-        _ => flags & 0x80 != 0,
+        0 => flags.contains(TrackingOptions::HEAP),
+        1 => flags.contains(TrackingOptions::VIRTUAL_MAPPED),
+        kind if usize::from(kind) < memory::TRACKING_TYPE_NAMES.len() => true,
+        _ => flags.contains(TrackingOptions::REGISTERED),
     }
 }
 
@@ -418,25 +407,32 @@ fn tracking_type_count() -> u32 {
     TRACKING_TYPE_COUNT.load(Ordering::Acquire)
 }
 
-fn write_unaligned_u32(address: u32, value: u32) {
-    // SAFETY: the record was allocated with `record_length` bytes.
-    unsafe { core::ptr::write_unaligned(address as usize as *mut u32, value) }
+/// Argument block of control codes 8 and 9.
+#[repr(C)]
+struct TrackingRequest {
+    address: u32,
+    size: u32,
+    /// The type index is the low byte.
+    kind: u32,
 }
 
-fn read_unaligned_u32(address: u32) -> u32 {
-    // SAFETY: records are live while the tracking lock is held.
-    unsafe { core::ptr::read_unaligned(address as usize as *const u32) }
+impl TrackingRequest {
+    fn kind(&self) -> u16 {
+        u16::from(self.kind as u8)
+    }
 }
 
 /// Debug monitor control code 8 (stock 0x91f3b73c -> 0x91f23598): track an
-/// allocation. `arguments` points at the address, size, and type dwords.
-/// The stock return value is residual.
-pub(crate) fn service_memtrack_record_alloc(arguments: u32) -> u32 {
-    let _ = track_allocation(
-        read_u32(arguments),
-        read_u32(arguments + 4),
-        u16::from(read_u32(arguments + 8) as u8),
-    );
+/// allocation. The stock return value is residual.
+///
+/// # Safety
+///
+/// `arguments` must be the address of a `TrackingRequest` (the address,
+/// size, and type dwords) the caller keeps unchanged for the call.
+pub(crate) unsafe fn service_memtrack_record_alloc(arguments: u32) -> u32 {
+    // SAFETY: the caller's contract.
+    let request = unsafe { kernel::object_at::<TrackingRequest>(arguments) };
+    let _ = track_allocation(request.address, request.size, request.kind());
     0
 }
 
@@ -446,47 +442,42 @@ fn track_allocation(address: u32, size: u32, kind: u16) -> TrackingResult {
         assert_allocation_pointer(TRACK_ASSERT_LINE);
     }
     let flags = TRACKING.flags.load(Ordering::Relaxed);
-    if !TrackingFlags::from_bits_retain(flags).intersects(TrackingFlags::TYPE_MASK) {
+    if !TrackingFlags::from_bits_retain(flags).is_active() {
         return Err(TrackingError::Off);
     }
     if u32::from(kind) >= tracking_type_count() {
         return Err(TrackingError::UnknownType);
     }
-    if !tracking_type_enabled(kind, flags) {
+    if !tracking_type_enabled(kind, TrackingOptions::from_bits_retain(flags)) {
         return Ok(Tracked::TypeNotTracked);
     }
     let length = record_length();
     // SAFETY: pool allocation has no pointer arguments.
-    let record = unsafe { xboxkrnl::ExAllocatePoolWithTag(length, TRACKING_POOL_TAG) };
-    if record == 0 {
+    let block = unsafe { xboxkrnl::ExAllocatePoolWithTag(length, TRACKING_POOL_TAG) };
+    let record = core::ptr::with_exposed_provenance_mut::<TrackingRecord>(block as usize);
+    if record.is_null() {
         tracking_diagnostic(format_args!(
             "unable to allocate buffer for allocation tracking"
         ));
         return Err(TrackingError::OutOfMemory);
     }
-    write_unaligned_u32(record + RECORD_ADDRESS, address);
-    write_unaligned_u32(record + RECORD_SIZE, size);
-    // SAFETY: the record holds at least RECORD_STACK bytes.
-    unsafe { core::ptr::write_unaligned((record + RECORD_TYPE) as usize as *mut u16, kind) };
     let stack = memory::ACTIVE_STACK_DEPTH.0 << 2;
-    if stack != 0 {
-        // SAFETY: the record holds the stack area after RECORD_STACK.
-        unsafe {
-            core::ptr::write_bytes(
-                (record + RECORD_STACK) as usize as *mut u8,
-                0,
-                stack as usize,
-            )
-        };
+    // SAFETY: the new pool block holds `length` bytes: the header and the
+    // stack area after it. It is not linked yet.
+    unsafe {
+        (*record).address = address;
+        (*record).size = size;
+        (*record).kind = kind;
+        if stack != 0 {
+            core::ptr::write_bytes(record.add(1).cast::<u8>(), 0, stack as usize);
+        }
     }
-    let lock = TRACKING.lock.as_ptr();
-    // SAFETY: `lock` is the static tracking spin lock.
-    let irql = unsafe { xboxkrnl::KfAcquireSpinLock(lock.cast()) };
-    write_unaligned_u32(record, TRACKING.head.load(Ordering::Relaxed));
-    TRACKING.head.store(record, Ordering::Relaxed);
+    let lock = TrackingLock::acquire();
+    // SAFETY: the record is the block filled above; the lock guards the list.
+    unsafe { (*record).next = TRACKING.head.load(Ordering::Relaxed) };
+    TRACKING.head.store(block, Ordering::Relaxed);
     TRACKING.count.fetch_add(1, Ordering::Relaxed);
-    // SAFETY: the lock was acquired above at `irql`.
-    unsafe { xboxkrnl::KfReleaseSpinLock(lock.cast(), irql) };
+    drop(lock);
     Ok(Tracked::Done)
 }
 
@@ -494,12 +485,15 @@ fn track_allocation(address: u32, size: u32, kind: u16) -> TrackingResult {
 /// tracking an allocation. A size of 0 matches any recorded size. Returns
 /// the lookup HRESULT when the type is tracked; the stock value is residual
 /// otherwise.
-pub(crate) fn service_memtrack_record_free(arguments: u32) -> u32 {
-    match untrack_allocation(
-        read_u32(arguments),
-        read_u32(arguments + 4),
-        u16::from(read_u32(arguments + 8) as u8),
-    ) {
+///
+/// # Safety
+///
+/// `arguments` must be the address of a `TrackingRequest` the caller
+/// keeps unchanged for the call.
+pub(crate) unsafe fn service_memtrack_record_free(arguments: u32) -> u32 {
+    // SAFETY: the caller's contract.
+    let request = unsafe { kernel::object_at::<TrackingRequest>(arguments) };
+    match untrack_allocation(request.address, request.size, request.kind()) {
         Untracked::Lookup(result) => tracking_hresult(result).0,
         Untracked::Skipped(_) => 0,
     }
@@ -518,128 +512,164 @@ fn untrack_allocation(address: u32, size: u32, kind: u16) -> Untracked {
         assert_allocation_pointer(UNTRACK_ASSERT_LINE);
     }
     let flags = TRACKING.flags.load(Ordering::Relaxed);
-    if !TrackingFlags::from_bits_retain(flags).intersects(TrackingFlags::TYPE_MASK) {
+    if !TrackingFlags::from_bits_retain(flags).is_active() {
         return Untracked::Skipped(Err(TrackingError::Off));
     }
     if u32::from(kind) >= tracking_type_count() {
         return Untracked::Skipped(Err(TrackingError::UnknownType));
     }
-    if !tracking_type_enabled(kind, flags) {
+    if !tracking_type_enabled(kind, TrackingOptions::from_bits_retain(flags)) {
         return Untracked::Skipped(Ok(Tracked::TypeNotTracked));
     }
-    let lock = TRACKING.lock.as_ptr();
-    // SAFETY: `lock` is the static tracking spin lock.
-    let irql = unsafe { xboxkrnl::KfAcquireSpinLock(lock.cast()) };
-    let mut previous = None;
-    let mut record = TRACKING.head.load(Ordering::Relaxed);
-    while record != 0 && read_unaligned_u32(record + RECORD_ADDRESS) != address {
+    let lock = TrackingLock::acquire();
+    let mut previous: Option<&mut TrackingRecord> = None;
+    // SAFETY: the head is 0 or a linked record; `lock` is held and this
+    // walk holds the only references, one per record.
+    let mut current = unsafe { linked_record(TRACKING.head.load(Ordering::Relaxed)) };
+    let found = loop {
+        let Some(record) = current else {
+            break None;
+        };
+        if record.address == address {
+            break Some(record);
+        }
+        let next = record.next;
         previous = Some(record);
-        record = read_unaligned_u32(record);
-    }
-    let mut release = false;
-    let result = if record == 0 {
-        tracking_diagnostic(format_args!(
-            "no history tracking found freeing {} @ {:08X} size {}",
-            tracking_type_name(kind),
-            address,
-            size as i32
-        ));
-        Err(TrackingError::NotFound)
-    } else {
-        // SAFETY: the record is live under the lock.
-        let recorded_kind =
-            unsafe { core::ptr::read_unaligned((record + RECORD_TYPE) as usize as *const u16) };
-        if recorded_kind != kind {
+        // SAFETY: as above; `next` links a record after `record`.
+        current = unsafe { linked_record(next) };
+    };
+    let mut release = None;
+    let result = match found {
+        None => {
             tracking_diagnostic(format_args!(
-                "mismatch allocator @ {:08X} (was {}, expected {})",
-                address,
-                tracking_type_name(recorded_kind),
-                tracking_type_name(kind)
-            ));
-            Err(TrackingError::TypeMismatch)
-        } else if size == 0 || size == read_unaligned_u32(record + RECORD_SIZE) {
-            let next = read_unaligned_u32(record);
-            match previous {
-                Some(previous) => write_unaligned_u32(previous, next),
-                None => TRACKING.head.store(next, Ordering::Relaxed),
-            }
-            TRACKING.count.fetch_sub(1, Ordering::Relaxed);
-            release = true;
-            Ok(Tracked::Done)
-        } else {
-            tracking_diagnostic(format_args!(
-                "invalid size freeing {} @ {:08X}",
+                "no history tracking found freeing {} @ {:08X} size {}",
                 tracking_type_name(kind),
-                address
+                address,
+                size as i32
             ));
-            Err(TrackingError::SizeMismatch)
+            Err(TrackingError::NotFound)
+        }
+        Some(record) => {
+            let recorded_kind = record.kind;
+            if recorded_kind != kind {
+                tracking_diagnostic(format_args!(
+                    "mismatch allocator @ {:08X} (was {}, expected {})",
+                    address,
+                    tracking_type_name(recorded_kind),
+                    tracking_type_name(kind)
+                ));
+                Err(TrackingError::TypeMismatch)
+            } else if size == 0 || size == record.size {
+                let next = record.next;
+                match previous {
+                    Some(previous) => previous.next = next,
+                    None => TRACKING.head.store(next, Ordering::Relaxed),
+                }
+                TRACKING.count.fetch_sub(1, Ordering::Relaxed);
+                release = Some(core::ptr::from_mut(record).addr() as u32);
+                Ok(Tracked::Done)
+            } else {
+                tracking_diagnostic(format_args!(
+                    "invalid size freeing {} @ {:08X}",
+                    tracking_type_name(kind),
+                    address
+                ));
+                Err(TrackingError::SizeMismatch)
+            }
         }
     };
-    // SAFETY: the lock was acquired above at `irql`.
-    unsafe { xboxkrnl::KfReleaseSpinLock(lock.cast(), irql) };
-    if release {
+    drop(lock);
+    if let Some(record) = release {
         // SAFETY: the record is a pool block unlinked from the list above.
         unsafe { xboxkrnl::ExFreePool(record) };
     }
     Untracked::Lookup(result)
 }
 
+/// Argument block of control code 0x18.
+#[repr(C)]
+struct ProcAddressRequest {
+    /// Address of the NUL-terminated module name.
+    name: u32,
+    ordinal: u32,
+}
+
 /// Debug monitor control code 0x18 (stock 0x91f3b804 -> 0x91f33d38): the
-/// address of export `ordinal` of a loaded module, or 0. `argument` points
-/// at the module name pointer and the ordinal.
-pub(crate) fn service_get_module_proc_address(argument: u32) -> u32 {
-    let name = read_u32(argument) as usize as *const u8;
+/// address of export `ordinal` of a loaded module, or 0.
+///
+/// # Safety
+///
+/// `argument` must be the address of a `ProcAddressRequest` whose name is a
+/// NUL-terminated string, both unchanged for the call.
+pub(crate) unsafe fn service_get_module_proc_address(argument: u32) -> u32 {
+    // SAFETY: the caller's contract.
+    let request = unsafe { kernel::object_at::<ProcAddressRequest>(argument) };
     let mut module = 0u32;
-    // SAFETY: the caller passes a NUL-terminated module name; `module` is a
-    // live local.
-    if (unsafe { xboxkrnl::XexGetModuleHandle(name, &mut module) }.0 as i32) < 0 {
+    // SAFETY: the caller's contract for the name; `module` is a live local.
+    let status = unsafe {
+        xboxkrnl::XexGetModuleHandle(
+            core::ptr::with_exposed_provenance(request.name as usize),
+            &mut module,
+        )
+    };
+    if !status.is_success() {
         return 0;
     }
     let mut address = 0u32;
     // SAFETY: `module` was returned by the kernel; `address` is a live local.
-    let status =
-        unsafe { xboxkrnl::XexGetProcedureAddress(module, read_u32(argument + 4), &mut address) };
-    if (status.0 as i32) < 0 { 0 } else { address }
+    let status = unsafe { xboxkrnl::XexGetProcedureAddress(module, request.ordinal, &mut address) };
+    if status.is_success() { address } else { 0 }
 }
 
 /// Debug monitor control code 0x86 (stock 0x91f3ba40 -> 0x91f330f0):
 /// replace the `MmQueryStatistics` result at `argument` with the debug
 /// monitor's statistics when the lengths match, then correct the available
 /// page count and the total page count for debug memory.
-pub(crate) fn service_adjust_memory_statistics(argument: u32) -> u32 {
-    let mut reply = [0u32; MEMORY_STATISTICS_REPLY_WORDS];
-    reply[0] = (MEMORY_STATISTICS_REPLY_WORDS * 4) as u32;
-    reply[1] = MEMORY_STATISTICS_LENGTH;
-    // SAFETY: `reply` is a live local of the length stored in its first word.
+///
+/// # Safety
+///
+/// `argument` must be the address of the caller's `MmQueryStatistics`
+/// block, aligned or not, whose length field the caller set and which holds
+/// that many writable bytes, not otherwise accessed for the call.
+pub(crate) unsafe fn service_adjust_memory_statistics(argument: u32) -> u32 {
+    let mut reply = DebugMemoryStatistics::new();
+    // SAFETY: `reply` is a live block whose length fields give its size.
     let status = unsafe {
         xboxkrnl::ExDebugMonitorService(
             DebugMonitorService::MemoryStatistics,
-            reply.as_mut_ptr() as usize as u32,
+            &raw mut reply as usize as u32,
             0,
             0,
         )
     };
-    if (status.0 as i32) < 0 || reply[0] < (MEMORY_STATISTICS_REPLY_WORDS * 4) as u32 {
+    if !status.is_success() || !reply.is_complete() {
         return 0;
     }
-    let length = read_u32(argument);
-    let word = |offset: usize| reply[offset / 4];
-    if word(4) != length || word(0x84) == 0 {
+    // Stock stores to the caller's block without assuming alignment.
+    let statistics = core::ptr::with_exposed_provenance_mut::<MmStatistics>(argument as usize);
+    // SAFETY: the caller's contract.
+    let length = unsafe { (&raw const (*statistics).length).read_unaligned() };
+    if reply.statistics.length != length || reply.unknown_084 == 0 {
         return 0;
     }
-    // SAFETY: the caller's statistics block holds `length` bytes, which
-    // equals the length the kernel reported.
+    let title = &reply.statistics.title;
+    let free = title.available_pages.wrapping_sub(reply.unknown_06c);
+    let limit = reply
+        .unknown_080
+        .wrapping_sub(title.image_pages)
+        .wrapping_sub(title.physical_pages);
+    // SAFETY: the caller's contract; the length equals the one the service
+    // reported for the `MmStatistics` it filled.
     unsafe {
         core::ptr::copy_nonoverlapping(
-            reply.as_ptr().cast::<u8>().add(4),
-            argument as usize as *mut u8,
+            (&raw const reply.statistics).cast::<u8>(),
+            statistics.cast::<u8>(),
             length as usize,
-        )
-    };
-    let free = word(0x10).wrapping_sub(word(0x6c));
-    let limit = word(0x80).wrapping_sub(word(0x28)).wrapping_sub(word(0x1c));
-    write_unaligned_u32(argument + 0xc, free.min(limit));
-    write_unaligned_u32(argument + 4, word(0x88).wrapping_add(word(0x80)));
+        );
+        (&raw mut (*statistics).title.available_pages).write_unaligned(free.min(limit));
+        (&raw mut (*statistics).total_physical_pages)
+            .write_unaligned(reply.unknown_088.wrapping_add(reply.unknown_080));
+    }
     0
 }
 
@@ -655,8 +685,11 @@ fn read_debug_byte(address: u32) -> Option<u8> {
     if !debug_readable(address) {
         return None;
     }
-    // SAFETY: the kernel reported the address readable by the debugger.
-    Some(unsafe { core::ptr::read_volatile(address as usize as *const u8) })
+    // SAFETY: the kernel reported the address readable by the debugger and
+    // not a device; other threads may write it, so it is read atomically.
+    let byte =
+        unsafe { AtomicU8::from_ptr(core::ptr::with_exposed_provenance_mut(address as usize)) };
+    Some(byte.load(Ordering::Relaxed))
 }
 
 /// Write a byte through a writable debugger mapping and flush the
@@ -673,54 +706,37 @@ fn write_debug_byte(address: u32, value: u8) -> bool {
         unsafe { xboxkrnl::MmDbgReleaseAddress(mapped, context.as_mut_ptr()) };
         return false;
     }
-    let pointer = mapped as usize as *mut u8;
-    // SAFETY: the kernel mapped the address writable for the debugger;
-    // `mapped` and `context` come from `MmDbgWriteCheck` above.
+    let pointer = core::ptr::with_exposed_provenance_mut::<u8>(mapped as usize);
+    // SAFETY: the kernel mapped the address writable for the debugger and
+    // it is not a device; other threads may access it, so it is written
+    // atomically. `mapped` and `context` come from `MmDbgWriteCheck` above.
     unsafe {
-        core::ptr::write_volatile(pointer, value);
+        AtomicU8::from_ptr(pointer).store(value, Ordering::Relaxed);
         xboxkrnl::KeSweepIcacheRange(pointer, 1);
         xboxkrnl::MmDbgReleaseAddress(mapped, context.as_mut_ptr());
     }
     true
 }
 
-/// Whether the loader list at `head` has an entry for the module loaded at
+/// Whether the loader list `list` has an entry for the module loaded at
 /// `base`.
-fn list_has_base(head: u32, base: u32) -> bool {
-    if head == 0 {
-        return false;
-    }
-    let mut entry = read_u32(head);
-    while entry != head {
-        // SAFETY: `entry` is linked into a loader module list of the debug
-        // monitor data; the caller holds the loader lock.
-        let current =
-            unsafe { &*core::ptr::with_exposed_provenance::<LdrDataTableEntry>(entry as usize) };
-        if current.dll_base == base {
-            return true;
-        }
-        entry = current.in_load_order_links.flink.load(Ordering::Relaxed);
-    }
-    false
+fn list_has_base(lock: &LoaderLock, list: ModuleList, base: u32) -> bool {
+    lock.entries(list).any(|entry| entry.dll_base == base)
 }
 
 /// The CodeView record of the module loaded at `base` (0x91f280d8).
 fn code_view_of(base: u32) -> Option<CodeView> {
-    let _lock = LoaderLock::acquire();
-    let data = kernel::debug_monitor_data();
+    let lock = LoaderLock::acquire();
     let mut directory = 0u32;
     let mut size = 0u32;
-    if list_has_base(data.loaded_module_list.load(Ordering::Relaxed), base) {
+    if list_has_base(&lock, ModuleList::Loaded, base) {
         // SAFETY: `base` is a module in the loader list, held by the loader lock.
         directory =
             unsafe { RtlImageDirectoryEntryToData(base, true, ImageDirectory::Debug, &mut size) };
     }
     if directory == 0 || size == 0 {
         directory = 0;
-        if list_has_base(
-            data.loaded_usermode_module_list.load(Ordering::Relaxed),
-            base,
-        ) {
+        if list_has_base(&lock, ModuleList::Usermode, base) {
             // SAFETY: `base` is a module in the loader list, held by the loader lock.
             directory = unsafe {
                 RtlImageDirectoryEntryToData(base, true, ImageDirectory::Debug, &mut size)
@@ -748,14 +764,15 @@ fn code_view_of(base: u32) -> Option<CodeView> {
     }
     let record = base.wrapping_add(entries.first()?.address_of_raw_data.get());
     // SAFETY: the debug data of a mapped image lies in the image.
-    let record = unsafe { &*core::ptr::with_exposed_provenance::<CodeViewRsds>(record as usize) };
+    let record = unsafe { kernel::object_at::<CodeViewRsds>(record) };
     if record.signature != CodeViewRsds::SIGNATURE {
         return None;
     }
-    let path = core::ptr::from_ref(&record.path).addr();
+    let path = kernel::address_of(&record.path) as usize;
     Some(CodeView::read(record.guid, record.age.bytes(), |offset| {
-        // SAFETY: the path is NUL-terminated in the mapped image.
-        unsafe { core::ptr::read_volatile(core::ptr::with_exposed_provenance::<u8>(path + offset)) }
+        // SAFETY: the path is NUL-terminated in the image, which stays
+        // mapped under the loader lock.
+        unsafe { core::ptr::with_exposed_provenance::<u8>(path + offset).read() }
     }))
 }
 
@@ -797,7 +814,8 @@ impl memory::Backend for Console {
 
     fn module(&mut self, index: ModuleIndex) -> Option<ModuleInfo> {
         let lock = LoaderLock::acquire();
-        let (entry, header) = all_entries(&lock)
+        let (entry, header) = lock
+            .all_entries()
             .filter(|entry| is_reported(entry))
             .filter_map(|entry| nt_header(entry).map(|header| (entry, header)))
             .nth(index.0 as usize)?;
@@ -808,7 +826,7 @@ impl memory::Backend for Console {
             RtlImageDirectoryEntryToData(base, true, ImageDirectory::Exception, &mut pdata_size)
         };
         Some(ModuleInfo {
-            name: ModuleName::from_units(entry_name_units(entry)),
+            name: ModuleName::from_units(entry_name_units(&lock, entry)),
             base,
             size: entry.image_size,
             checksum: header.optional_header.check_sum.get(),
@@ -834,7 +852,9 @@ impl memory::Backend for Console {
         let Some(slot) = index.0.checked_sub(1) else {
             return Ok(None);
         };
-        // SAFETY: the headers of a loaded image, mapped under the loader lock.
+        // SAFETY: the headers of a loaded image, mapped under the loader
+        // lock; the linker emits an optional header whose size is a multiple
+        // of 4, so the section table is aligned.
         let sections = unsafe { header.sections() };
         Ok(sections
             .get(usize::from(slot))
@@ -888,7 +908,8 @@ impl memory::Backend for Console {
     }
 
     fn title_xex_dword(&mut self, field: XexFieldKey) -> Result<Option<u32>, NoSuchModule> {
-        let module = kernel::resolved(&XexExecutableModuleHandle).load(Ordering::Relaxed);
+        // SAFETY: `data_imports_resolved` held at module load.
+        let module = unsafe { XexExecutableModuleHandle.get_unchecked() }.load(Ordering::Relaxed);
         if module == 0 {
             return Err(NoSuchModule);
         }
@@ -900,12 +921,17 @@ impl memory::Backend for Console {
         let value = unsafe { RtlImageXexHeaderField(entry.xex_header_base, XexHeaderKey(field.0)) };
         match value {
             0 => Ok(None),
-            data => Ok(Some(read_u32(data))),
+            // SAFETY: a nonzero result addresses the field's dword in the
+            // XEX header, which stays mapped while the executable runs.
+            data => Ok(Some(unsafe {
+                core::ptr::with_exposed_provenance::<u32>(data as usize).read()
+            })),
         }
     }
 
     fn running_executable_path(&mut self, output: &mut [u8]) -> usize {
-        kernel::resolved(&ExLoadedImageName).copy_to(output)
+        // SAFETY: `data_imports_resolved` held at module load.
+        unsafe { ExLoadedImageName.get_unchecked() }.copy_to(output)
     }
 
     fn read_flash(&mut self, offset: u32, output: &mut [u8]) -> Result<(), KernelError> {
@@ -923,7 +949,8 @@ impl memory::Backend for Console {
         let Ok(function) = resolve_export(kernel_module, TRACE_IMPORTS_ORDINAL) else {
             return false;
         };
-        let mut name = [0u8; 0x104];
+        const NAME_CAPACITY: usize = 0x104;
+        let mut name = [0u8; NAME_CAPACITY];
         let count = module.len().min(name.len() - 1);
         name[..count].copy_from_slice(&module[..count]);
         // SAFETY: the export takes a module name and an enable flag.
@@ -950,18 +977,20 @@ impl memory::Backend for Console {
         let length = record_length() as usize;
         let mut record = TRACKING.head.load(Ordering::Relaxed);
         while record != 0 {
-            // SAFETY: records stay allocated while tracked; the title is
-            // stopped during the save.
-            let bytes =
-                unsafe { core::slice::from_raw_parts(record as usize as *const u8, length) };
+            let block = core::ptr::with_exposed_provenance::<u8>(record as usize);
+            // SAFETY: linked records are pool blocks of `length` bytes that
+            // stay allocated while linked; the title is stopped during the
+            // save, so the list does not change.
+            let bytes = unsafe { core::slice::from_raw_parts(block, length) };
             self.write_file(file, None, filesystem::FileData::Bytes(bytes))?;
-            record = read_unaligned_u32(record);
+            // SAFETY: as above.
+            record = unsafe { (*block.cast::<TrackingRecord>()).next };
         }
         Ok(())
     }
 
     fn dos_error_from_nt_status(&mut self, error: KernelError) -> Option<Win32Error> {
-        xboxkrnl::RtlNtStatusToDosError(NtStatus::from(error)).error()
+        xbox360::status::dos_error(error)
     }
 
     fn detour(

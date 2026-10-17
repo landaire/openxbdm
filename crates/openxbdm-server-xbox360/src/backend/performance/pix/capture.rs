@@ -230,10 +230,7 @@ pub(super) fn module_records() {
     let mut module = [0u32; crate::backend::memory::MODULE_RECORD_SHORT_SIZE / 4];
     let mut directory = [0u32; 0x118 / 4];
     while crate::backend::memory::next_module(&mut walk, &mut module).is_ok() {
-        crate::backend::memory::get_module_debug_directory(
-            module[0x104 / 4],
-            directory.as_mut_ptr() as usize as u32,
-        );
+        crate::backend::memory::module_debug_directory(module[0x104 / 4], &mut directory);
         timing::write_long_record(0x66, &module[..0x49]);
         timing::write_long_record(0x67, &directory[..0x46]);
     }

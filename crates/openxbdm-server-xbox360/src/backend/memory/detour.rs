@@ -12,8 +12,10 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
+use core::time::Duration;
 
 use openxbdm_core::status::KernelError;
+use openxbdm_core::status::NtStatus;
 use openxbdm_server::commands::filesystem::CreateDisposition;
 use openxbdm_server::commands::filesystem::CreateOptions;
 use openxbdm_server::commands::filesystem::CreateRequest;
@@ -28,14 +30,17 @@ use openxbdm_server::commands::memory::detour::RECORD_SIZE;
 use xbox360::time::FileTime;
 use xbox360::time::TickCount;
 use xbox360::time::Timebase;
+use xbox360::time::relative_interval;
+use xbox360_sys::status::Severity;
+use xbox360_sys::xam::INFINITE;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::DispatcherObject;
+use xbox360_sys::xboxkrnl::EVENT_INCREMENT;
 use xbox360_sys::xboxkrnl::Handle;
 use xbox360_sys::xboxkrnl::IoStatusBlock;
 use xbox360_sys::xboxkrnl::Kevent;
 use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
 use xbox360_sys::xboxkrnl::ObjectAttributes;
-use xbox360_sys::xboxkrnl::PoolTag;
 use xbox360_sys::xboxkrnl::PoolType;
 use xbox360_sys::xboxkrnl::ProcessorMode;
 use xbox360_sys::xboxkrnl::ThreadCreationFlags;
@@ -46,6 +51,7 @@ use crate::backend::filesystem::create_file;
 use crate::kernel;
 use crate::kernel::CriticalSection;
 use crate::kernel::KernelEvent;
+use crate::kernel::pool_tag;
 
 core::arch::global_asm!(
     ".section .text.openxbdm_detour,\"ax\",@progbits",
@@ -249,12 +255,12 @@ static RECORDS: AtomicU32 = AtomicU32::new(0);
 /// Stock passes a positive (absolute, already past) timeout, so these
 /// waits return at once.
 const ELAPSED_TIMEOUT: i64 = 1_000_000;
-const COMPLETION_POLL: i64 = -(detour::COMPLETION_POLL_MILLISECONDS as i64) * 10_000;
-const STATUS_TIMEOUT: u32 = 0x102;
+const COMPLETION_POLL: i64 = relative_interval(Duration::from_millis(
+    detour::COMPLETION_POLL_MILLISECONDS as u64,
+));
 const WORKER_STACK_SIZE: u32 = 0x8000;
-const WORKER_FLAGS: ThreadCreationFlags = ThreadCreationFlags::from_bits_retain(0x40002a6);
-const GENERIC_WRITE: u32 = 0x4000_0000;
-const GENERIC_READ_SYNCHRONIZE: u32 = 0x8010_0000;
+const WORKER_FLAGS: ThreadCreationFlags =
+    kernel::SYSTEM_THREAD_FLAGS.union(ThreadCreationFlags::EXEMPT_FROM_STOPS);
 /// Bytes of an object path the log name translates to.
 const LOG_PATH_CAPACITY: usize = 0x141;
 
@@ -317,12 +323,12 @@ impl detour::Platform for ConsolePlatform {
         TickCount::now().milliseconds()
     }
 
-    /// 0x91f72a58: `u32::MAX` sleeps forever.
+    /// 0x91f72a58: [`INFINITE`] sleeps forever.
     fn sleep(&self, milliseconds: u32) {
-        let interval = if milliseconds == u32::MAX {
+        let interval = if milliseconds == INFINITE {
             i64::MIN
         } else {
-            -(i64::from(milliseconds) * 10_000)
+            relative_interval(Duration::from_millis(milliseconds as u64))
         };
         // SAFETY: `interval` is a live local.
         unsafe { xboxkrnl::KeDelayExecutionThread(ProcessorMode::User, false, &interval) };
@@ -365,7 +371,7 @@ impl detour::Platform for ConsolePlatform {
         let base = unsafe {
             xboxkrnl::ExAllocatePoolTypeWithTag(
                 (detour::RECORD_STORAGE_WORDS * 4) as u32,
-                PoolTag::new(*b"Detr"),
+                pool_tag::DETOUR,
                 PoolType::System,
             )
         };
@@ -381,21 +387,28 @@ impl detour::Platform for ConsolePlatform {
         RECORD_FREED.set();
     }
 
+    // The engine passes addresses in the stub locals, the hooked call's
+    // stack parameters or register save area, which stay live during the
+    // hooked call, or the call's XOVERLAPPED, which the title keeps live
+    // until the completion worker has written it. The trait from
+    // openxbdm-server takes addresses and is safe, so these four rely on
+    // that engine contract instead of an `unsafe fn` signature.
+
     fn read_u32(&self, address: u32) -> u32 {
-        // SAFETY: the title supplied the address as stock reads it.
-        unsafe { core::ptr::read_unaligned(address as usize as *const u32) }
+        // SAFETY: the engine contract above; stock does not align them.
+        unsafe { core::ptr::with_exposed_provenance::<u32>(address as usize).read_unaligned() }
     }
 
     fn read_u64(&self, address: u32) -> u64 {
-        // SAFETY: as above.
-        unsafe { core::ptr::read_unaligned(address as usize as *const u64) }
+        // SAFETY: the engine contract above; stock does not align them.
+        unsafe { core::ptr::with_exposed_provenance::<u64>(address as usize).read_unaligned() }
     }
 
     fn read_block(&self, address: u32, output: &mut [u8; BLOCK_SIZE]) {
-        // SAFETY: as above.
+        // SAFETY: the engine contract above.
         unsafe {
             core::ptr::copy_nonoverlapping(
-                address as usize as *const u8,
+                core::ptr::with_exposed_provenance::<u8>(address as usize),
                 output.as_mut_ptr(),
                 BLOCK_SIZE,
             )
@@ -403,8 +416,14 @@ impl detour::Platform for ConsolePlatform {
     }
 
     fn write_u32(&self, address: u32, value: u32) {
-        // SAFETY: the address is the title's overlapped structure.
-        unsafe { core::ptr::write_volatile(address as usize as *mut u32, value) };
+        // SAFETY: the engine contract above: an aligned word of the title's
+        // XOVERLAPPED, which title threads may read concurrently.
+        let word = unsafe {
+            AtomicU32::from_ptr(core::ptr::with_exposed_provenance_mut::<u32>(
+                address as usize,
+            ))
+        };
+        word.store(value, Ordering::Relaxed);
     }
 
     fn reference_event(&self, handle: u32) -> Option<u32> {
@@ -416,7 +435,7 @@ impl detour::Platform for ConsolePlatform {
 
     fn signal_event(&self, event: u32) {
         // SAFETY: `event` is an event object referenced by `reference_event`.
-        unsafe { xboxkrnl::KeSetEvent(event as usize as *mut Kevent, 1, false) };
+        unsafe { xboxkrnl::KeSetEvent(event as usize as *mut Kevent, EVENT_INCREMENT, false) };
     }
 
     fn lock_completions(&self) {
@@ -432,14 +451,18 @@ impl detour::Platform for ConsolePlatform {
     }
 
     fn completions_idle(&self) {
-        // SAFETY: `COMPLETION_WORK` is a static event initialized by `initialize`.
-        unsafe { xboxkrnl::KeResetEvent(COMPLETION_WORK.pointer().cast()) };
+        COMPLETION_WORK.reset();
     }
 }
 
 /// Module init (0x91f2c458): link the entry table and write `li r12, id`
 /// and a branch to the entry stub at the start of every trampoline.
 pub(crate) fn initialize() {
+    /// `li r12, 0`; the entry id goes in the low half.
+    const LOAD_ENTRY_ID: u32 = 0x3980_0000;
+    /// `b 0`; the word offset goes in the masked bits.
+    const BRANCH: u32 = 0x4800_0000;
+    const BRANCH_OFFSET_MASK: u32 = 0x03ff_fffc;
     ENGINE.initialize();
     RECORD_FREED.initialize();
     RECORD_QUEUED.initialize();
@@ -451,10 +474,10 @@ pub(crate) fn initialize() {
     let entry = entry_stub();
     for id in 0..detour::ENTRY_COUNT {
         let trampoline = trampolines() + id * detour::TRAMPOLINE_SIZE;
-        write_code_word(trampoline, 0x3980_0000 | id);
+        write_code_word(trampoline, LOAD_ENTRY_ID | id);
         write_code_word(
             trampoline + 4,
-            0x4800_0000 | (entry.wrapping_sub(trampoline + 4) & 0x03ff_fffc),
+            BRANCH | (entry.wrapping_sub(trampoline + 4) & BRANCH_OFFSET_MASK),
         );
     }
 }
@@ -469,53 +492,82 @@ fn write_code_word(address: u32, value: u32) {
         return;
     }
     let pointer = mapped as usize as *mut u32;
-    // SAFETY: the kernel mapped the word writable for the debugger;
-    // `mapped` and `context` come from `MmDbgWriteCheck` above.
+    // SAFETY: the kernel mapped the aligned code word writable for the
+    // debugger; `mapped` and `context` come from `MmDbgWriteCheck` above.
+    // The sweep takes the pointer, so the store is kept before it.
     unsafe {
-        core::ptr::write_volatile(pointer, value);
+        pointer.write(value);
         xboxkrnl::KeSweepIcacheRange(pointer.cast(), 4);
         xboxkrnl::MmDbgReleaseAddress(mapped, context.as_mut_ptr());
     }
 }
 
-fn load_context(address: u32) -> CallContext {
-    let field = |offset: u32| ConsolePlatform.read_u32_at(address + offset);
-    let optional = |value: u32| (value != 0).then_some(value);
-    CallContext {
-        address,
-        hook: field(CallContext::HOOK),
-        sequence: field(CallContext::SEQUENCE),
-        flags: detour::HookFlags::from_bits_retain(field(CallContext::FLAGS)),
-        param_size: field(CallContext::PARAM_SIZE),
-        function: optional(field(CallContext::FUNCTION)),
-        return_value: detour::ReturnValue(field(CallContext::RETURN_VALUE)),
-        registers: core::array::from_fn(|index| {
-            detour::Platform::read_u64(
-                &ConsolePlatform,
-                address + CallContext::REGISTERS + index as u32 * 8,
-            )
-        }),
-        overlapped: optional(field(CallContext::OVERLAPPED)),
+/// The entry stub's locals (stub frame + 0x50) in the title's stack, up to
+/// the last field the logger uses. Stock accesses them without assuming
+/// alignment.
+#[repr(C, packed)]
+struct StubLocals {
+    hook: u32,
+    sequence: u32,
+    flags: u32,
+    param_size: u32,
+    function: u32,
+    return_value: u32,
+    registers: [u64; 8],
+    overlapped: u32,
+}
+
+const _: () = {
+    use core::mem::offset_of;
+    assert!(offset_of!(StubLocals, hook) == CallContext::HOOK as usize);
+    assert!(offset_of!(StubLocals, sequence) == CallContext::SEQUENCE as usize);
+    assert!(offset_of!(StubLocals, flags) == CallContext::FLAGS as usize);
+    assert!(offset_of!(StubLocals, param_size) == CallContext::PARAM_SIZE as usize);
+    assert!(offset_of!(StubLocals, function) == CallContext::FUNCTION as usize);
+    assert!(offset_of!(StubLocals, return_value) == CallContext::RETURN_VALUE as usize);
+    assert!(offset_of!(StubLocals, registers) == CallContext::REGISTERS as usize);
+    assert!(offset_of!(StubLocals, overlapped) == CallContext::OVERLAPPED as usize);
+};
+
+impl StubLocals {
+    /// The engine's view of the locals at `address`.
+    fn context(&self, address: u32) -> CallContext {
+        let optional = |value: u32| (value != 0).then_some(value);
+        CallContext {
+            address,
+            hook: self.hook,
+            sequence: self.sequence,
+            flags: detour::HookFlags::from_bits_retain(self.flags),
+            param_size: self.param_size,
+            function: optional(self.function),
+            return_value: detour::ReturnValue(self.return_value),
+            registers: self.registers,
+            overlapped: optional(self.overlapped),
+        }
+    }
+
+    /// Write back the fields the engine may change.
+    fn store(&mut self, call: &CallContext) {
+        self.sequence = call.sequence;
+        self.flags = call.flags.bits();
+        self.param_size = call.param_size;
+        // The stub reads 0 as a discarded call and no XOVERLAPPED.
+        self.function = call.function.unwrap_or(0);
+        self.return_value = call.return_value.0;
+        self.overlapped = call.overlapped.unwrap_or(0);
     }
 }
 
-fn store_context(call: &CallContext) {
-    let platform = ConsolePlatform;
-    let store = |offset: u32, value: u32| {
-        detour::Platform::write_u32(&platform, call.address + offset, value)
-    };
-    store(CallContext::SEQUENCE, call.sequence);
-    store(CallContext::FLAGS, call.flags.bits());
-    store(CallContext::PARAM_SIZE, call.param_size);
-    store(CallContext::FUNCTION, call.function.unwrap_or(0));
-    store(CallContext::RETURN_VALUE, call.return_value.0);
-    store(CallContext::OVERLAPPED, call.overlapped.unwrap_or(0));
-}
-
-impl ConsolePlatform {
-    fn read_u32_at(&self, address: u32) -> u32 {
-        detour::Platform::read_u32(self, address)
-    }
+/// Notification codes the stubs pass to the logger.
+mod notification {
+    /// Entry, with the stack parameters.
+    pub(super) const ENTER: u32 = 0;
+    /// f1-f13 saved.
+    pub(super) const FLOATING_POINT: u32 = 1;
+    /// v1-v13 saved.
+    pub(super) const VECTOR: u32 = 2;
+    /// The call returned.
+    pub(super) const EXIT: u32 = 3;
 }
 
 /// Logger entry from the stubs (0x91f2c6d0): `context` is the stub
@@ -523,15 +575,19 @@ impl ConsolePlatform {
 /// area (1, 2).
 #[unsafe(no_mangle)]
 extern "C" fn openxbdm_detour_notify_rust(context: u32, area: u32, notify: u32) {
-    let mut call = load_context(context);
+    let locals = core::ptr::with_exposed_provenance_mut::<StubLocals>(context as usize);
+    // SAFETY: the stubs pass the address of their locals, which stay live
+    // on the calling thread's stack for this call.
+    let mut call = unsafe { &*locals }.context(context);
     match notify {
-        0 => ENGINE.enter(&ConsolePlatform, &mut call, area),
-        1 => ENGINE.floating_point(&ConsolePlatform, &call, area),
-        2 => ENGINE.vector(&ConsolePlatform, &call, area),
-        3 => ENGINE.exit(&ConsolePlatform, &mut call),
+        notification::ENTER => ENGINE.enter(&ConsolePlatform, &mut call, area),
+        notification::FLOATING_POINT => ENGINE.floating_point(&ConsolePlatform, &call, area),
+        notification::VECTOR => ENGINE.vector(&ConsolePlatform, &call, area),
+        notification::EXIT => ENGINE.exit(&ConsolePlatform, &mut call),
         _ => return,
     }
-    store_context(&call);
+    // SAFETY: as above; the engine's accesses to the locals have ended.
+    unsafe { &mut *locals }.store(&call);
 }
 
 /// Run `operation` with the engine.
@@ -551,11 +607,10 @@ pub(super) fn start(log: Option<&[u8]>) -> Result<(), KernelError> {
     }
     let mut writer = 0u32;
     let mut completion = 0u32;
-    // SAFETY: the events are static and initialized by `initialize`; the
-    // thread entries are functions of this module and the handle outputs
-    // are live locals.
+    // SAFETY: the thread entries are functions of this module and the
+    // handle outputs are live locals.
     unsafe {
-        xboxkrnl::KeResetEvent(WRITER_DONE.pointer().cast());
+        WRITER_DONE.reset();
         let created = xboxkrnl::ExCreateThread(
             &mut writer,
             WORKER_STACK_SIZE,
@@ -584,7 +639,7 @@ pub(super) fn start(log: Option<&[u8]>) -> Result<(), KernelError> {
 /// The rest of `stop` (0x91f2cd54).
 pub(super) fn stop(log: Option<&[u8]>) {
     // SAFETY: `RECORD_QUEUED` is a static event initialized by `initialize`.
-    unsafe { xboxkrnl::KeSetEvent(RECORD_QUEUED.pointer().cast(), 1, true) };
+    unsafe { xboxkrnl::KeSetEvent(RECORD_QUEUED.pointer(), EVENT_INCREMENT, true) };
     WRITER_DONE.wait();
     if let Some(log) = log {
         let name = kernel::ansi_string(log);
@@ -596,10 +651,11 @@ pub(super) fn stop(log: Option<&[u8]>) {
         // SAFETY: `attributes` refers to `name`, which refers to `log`.
         unsafe { xboxkrnl::NtDeleteFile(&attributes) };
     }
-    // SAFETY: the events are static and initialized by `initialize`;
-    // `thread` is the referenced completion worker thread object.
+    // SAFETY: `COMPLETION_STOP` is a static event initialized by
+    // `initialize`; `thread` is the referenced completion worker thread
+    // object.
     unsafe {
-        xboxkrnl::KeSetEvent(COMPLETION_STOP.pointer().cast(), 1, true);
+        xboxkrnl::KeSetEvent(COMPLETION_STOP.pointer(), EVENT_INCREMENT, true);
         if let Some(thread) = COMPLETION_THREAD.take() {
             xboxkrnl::KeWaitForSingleObject(
                 thread as usize as *mut DispatcherObject,
@@ -610,9 +666,9 @@ pub(super) fn stop(log: Option<&[u8]>) {
             );
             xboxkrnl::ObDereferenceObject(thread);
         }
-        xboxkrnl::KeResetEvent(COMPLETION_STOP.pointer().cast());
-        xboxkrnl::KeResetEvent(COMPLETION_WORK.pointer().cast());
     }
+    COMPLETION_STOP.reset();
+    COMPLETION_WORK.reset();
     ENGINE.finish_stop(&ConsolePlatform);
 }
 
@@ -638,7 +694,7 @@ pub(super) fn read_record(output: &mut [u8; RECORD_SIZE]) -> bool {
             core::ptr::null(),
         )
     };
-    if status.0 & 0xc000_0000 == 0xc000_0000 {
+    if status.severity() == Severity::Error {
         return false;
     }
     ENGINE.note_read();
@@ -646,9 +702,9 @@ pub(super) fn read_record(output: &mut [u8; RECORD_SIZE]) -> bool {
 }
 
 /// Create request of the log with `access` and `disposition`.
-const fn log_request(access: u32, disposition: CreateDisposition) -> CreateRequest {
+const fn log_request(access: FileAccess, disposition: CreateDisposition) -> CreateRequest {
     CreateRequest {
-        access: FileAccess(access),
+        access,
         allocation_size: None,
         attributes: FileAttributes::NORMAL,
         share: ShareAccess::ALL,
@@ -660,8 +716,12 @@ const fn log_request(access: u32, disposition: CreateDisposition) -> CreateReque
 /// Create the log for writing and open it again for reading
 /// (0x91f2cb28).
 fn open_log() -> Result<(), KernelError> {
-    const WRITE: CreateRequest = log_request(GENERIC_WRITE, CreateDisposition::OverwriteIf);
-    const READ: CreateRequest = log_request(GENERIC_READ_SYNCHRONIZE, CreateDisposition::Open);
+    const WRITE: CreateRequest =
+        log_request(FileAccess::GENERIC_WRITE, CreateDisposition::OverwriteIf);
+    const READ: CreateRequest = log_request(
+        FileAccess::GENERIC_READ.union(FileAccess::SYNCHRONIZE),
+        CreateDisposition::Open,
+    );
     // SAFETY: the server thread wrote the path before creating this thread.
     let Some((bytes, length)) = (unsafe { &*LOG_PATH.0.get() }) else {
         return Err(KernelError::NoSuchFile);
@@ -700,15 +760,17 @@ fn write_record(record: &[u8; RECORD_SIZE]) -> bool {
             core::ptr::null(),
         )
     };
-    (status.0 as i32) >= 0
+    status.is_success()
 }
 
 /// Log writer (0x91f2d040).
 extern "C" fn writer_thread(_context: u32) -> u32 {
+    const EXIT_SUCCESS: u32 = 0;
+    const EXIT_FAILURE: u32 = 1;
     if !ENGINE.prepare_log(&ConsolePlatform) {
         ENGINE.abort_start();
         WRITER_DONE.set();
-        return 1;
+        return EXIT_FAILURE;
     }
     let opened = open_log();
     ENGINE.set_log_result(opened);
@@ -716,7 +778,7 @@ extern "C" fn writer_thread(_context: u32) -> u32 {
         close_log();
         ENGINE.abort_start();
         WRITER_DONE.set();
-        return 1;
+        return EXIT_FAILURE;
     }
     ENGINE.mark_running();
     while ENGINE.writing() {
@@ -737,7 +799,7 @@ extern "C" fn writer_thread(_context: u32) -> u32 {
     }
     close_log();
     WRITER_DONE.set();
-    0
+    EXIT_SUCCESS
 }
 
 /// Completion worker (0x91f2d2b8, 0x91f2c2f8). Stock's poll wait consumes
@@ -745,17 +807,19 @@ extern "C" fn writer_thread(_context: u32) -> u32 {
 /// completions pending never finishes; here the consumed signal ends the
 /// worker.
 extern "C" fn completion_thread(_context: u32) -> u32 {
-    let objects = [
-        COMPLETION_WORK.pointer() as usize as u32,
-        COMPLETION_STOP.pointer() as usize as u32,
+    /// Wait block storage stock passes for the two objects.
+    const WAIT_BLOCK_WORDS: usize = 0x10;
+    let objects: [*mut DispatcherObject; 2] = [
+        COMPLETION_WORK.pointer().cast(),
+        COMPLETION_STOP.pointer().cast(),
     ];
-    let mut wait_blocks = [0u32; 0x10];
-    // SAFETY: `objects` holds the addresses of two static events initialized
-    // by `initialize`; `wait_blocks` is a live local.
+    let mut wait_blocks = [0u32; WAIT_BLOCK_WORDS];
+    // SAFETY: `objects` holds two static events initialized by
+    // `initialize`; `wait_blocks` is a live local.
     while unsafe {
         xboxkrnl::KeWaitForMultipleObjects(
-            2,
-            objects.as_ptr().cast(),
+            objects.len() as u32,
+            objects.as_ptr(),
             WaitType::Any,
             WaitReason::Executive,
             ProcessorMode::Kernel,
@@ -763,8 +827,7 @@ extern "C" fn completion_thread(_context: u32) -> u32 {
             core::ptr::null(),
             wait_blocks.as_mut_ptr(),
         )
-    }
-    .0 == 0
+    } == NtStatus::WAIT_0
     {
         while ENGINE.service_completions(&ConsolePlatform) {
             // SAFETY: `COMPLETION_STOP` is a static event initialized by `initialize`.
@@ -777,7 +840,7 @@ extern "C" fn completion_thread(_context: u32) -> u32 {
                     &COMPLETION_POLL,
                 )
             };
-            if waited.0 != STATUS_TIMEOUT {
+            if waited != NtStatus::TIMEOUT {
                 return 0;
             }
         }

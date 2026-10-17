@@ -310,7 +310,9 @@ pub(crate) fn free(snapshot: Snapshot) {
 
 /// Object path of the running executable.
 pub(crate) fn executable_object_path() -> &'static [u8] {
-    let path = core::ptr::from_ref(kernel::resolved(&ExLoadedImageName)).expose_provenance() as u32;
+    // SAFETY: `data_imports_resolved` held at module load.
+    let path =
+        core::ptr::from_ref(unsafe { ExLoadedImageName.get_unchecked() }).expose_provenance() as u32;
     let mut length = 0;
     while read_u8(path + length) != 0 {
         length += 1;

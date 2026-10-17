@@ -1,32 +1,49 @@
 //! Kernel helpers over the `xbox360_sys` imports, and the imports whose
 //! signature is specific to the module.
 
+use core::marker::PhantomData;
+use core::num::NonZeroU32;
 use core::sync::atomic::Ordering;
 
 use xbox360::console::KernelVersion;
-use xbox360_sys::ImportedVariable;
 use xbox360_sys::xboxkrnl::AnsiString;
 use xbox360_sys::xboxkrnl::DebugMonitorData;
 use xbox360_sys::xboxkrnl::DebugMonitorService;
+use xbox360_sys::xboxkrnl::EVENT_INCREMENT;
+use xbox360_sys::xboxkrnl::EventType;
 use xbox360_sys::xboxkrnl::ExDebugMonitorService;
+use xbox360_sys::xboxkrnl::ExLoadedImageName;
+use xbox360_sys::xboxkrnl::ExThreadObjectType;
 use xbox360_sys::xboxkrnl::HardwareInfo;
+use xbox360_sys::xboxkrnl::IoDeviceObjectType;
+use xbox360_sys::xboxkrnl::Irql;
 use xbox360_sys::xboxkrnl::KeDebugMonitorData;
 use xbox360_sys::xboxkrnl::KeEnterCriticalRegion;
 use xbox360_sys::xboxkrnl::KeLeaveCriticalRegion;
 use xbox360_sys::xboxkrnl::KeQueryPerformanceFrequency;
 use xbox360_sys::xboxkrnl::KeResetEvent;
 use xbox360_sys::xboxkrnl::KeSetEvent;
+use xbox360_sys::xboxkrnl::KeTimeStampBundle;
 use xbox360_sys::xboxkrnl::KeWaitForSingleObject;
+use xbox360_sys::xboxkrnl::KernelU32;
 use xbox360_sys::xboxkrnl::Kevent;
+use xbox360_sys::xboxkrnl::KfAcquireSpinLock;
+use xbox360_sys::xboxkrnl::KfReleaseSpinLock;
+use xbox360_sys::xboxkrnl::KspinLock;
+use xbox360_sys::xboxkrnl::Kthread;
+use xbox360_sys::xboxkrnl::LdrDataTableEntry;
+use xbox360_sys::xboxkrnl::ListEntry;
 use xbox360_sys::xboxkrnl::ProcessorMode;
 use xbox360_sys::xboxkrnl::RtlCriticalSection;
 use xbox360_sys::xboxkrnl::RtlEnterCriticalSection;
 use xbox360_sys::xboxkrnl::RtlInitializeCriticalSection;
 use xbox360_sys::xboxkrnl::RtlLeaveCriticalSection;
 use xbox360_sys::xboxkrnl::RtlTryEnterCriticalSection;
+use xbox360_sys::xboxkrnl::ThreadCreationFlags;
 use xbox360_sys::xboxkrnl::WaitReason;
 use xbox360_sys::xboxkrnl::XboxHardwareInfo;
 use xbox360_sys::xboxkrnl::XboxKrnlBaseVersion;
+use xbox360_sys::xboxkrnl::XexExecutableModuleHandle;
 
 /// A counted string over `bytes`. The length is truncated to 16 bits; the
 /// names and paths the module passes are far shorter.
@@ -154,7 +171,7 @@ impl CriticalSection {
     }
 }
 
-/// A kernel synchronization event in static storage.
+/// A kernel event in static storage.
 pub struct KernelEvent(core::cell::UnsafeCell<[u32; 4]>);
 
 // SAFETY: the kernel synchronizes access to dispatcher objects.
@@ -165,54 +182,65 @@ impl KernelEvent {
         Self(core::cell::UnsafeCell::new([0; 4]))
     }
 
-    pub fn pointer(&self) -> *mut u32 {
+    /// The `KEVENT` for kernel calls that take one.
+    pub fn pointer(&self) -> *mut Kevent {
         self.0.get().cast()
     }
 
-    /// Initialize as an unsignaled synchronization event; the wait list
-    /// head at +8 points at itself.
-    pub fn initialize(&self) {
-        let list = self.pointer().wrapping_add(2) as usize as u32;
+    /// Write the dispatcher header: the type in the first byte, the signal
+    /// state, and a wait list head at +8 that points at itself.
+    #[inline(always)]
+    fn initialize_header(&self, kind: EventType, signaled: bool) {
+        let list = self.0.get().cast::<u32>().wrapping_add(2) as usize as u32;
         // SAFETY: called before any waiter or signaler uses the event.
-        unsafe { *self.0.get() = [0x0100_0000, 0, list, list] };
+        unsafe { *self.0.get() = [kind.raw() << 24, u32::from(signaled), list, list] };
+    }
+
+    /// Initialize as an unsignaled synchronization event.
+    pub fn initialize(&self) {
+        self.initialize_header(EventType::Synchronization, false);
     }
 
     /// Initialize as a notification event, signaled or not.
     pub fn initialize_notification(&self, signaled: bool) {
-        let list = self.pointer().wrapping_add(2) as usize as u32;
-        // SAFETY: called before any waiter or signaler uses the event.
-        unsafe { *self.0.get() = [0, u32::from(signaled), list, list] };
-    }
-
-    fn object(&self) -> *mut Kevent {
-        self.0.get().cast()
+        self.initialize_header(EventType::Notification, signaled);
     }
 
     pub fn reset(&self) {
         // SAFETY: the storage holds an initialized event.
-        unsafe { KeResetEvent(self.object()) };
+        unsafe { KeResetEvent(self.pointer()) };
     }
 
     pub fn set(&self) {
         // SAFETY: the storage holds an initialized event.
-        unsafe { KeSetEvent(self.object(), 1, false) };
+        unsafe { KeSetEvent(self.pointer(), EVENT_INCREMENT, false) };
     }
 
-    /// Wait without a timeout (executive reason, kernel mode).
-    pub fn wait(&self) -> u32 {
+    /// Wait without a timeout (executive reason, kernel mode). A wait
+    /// without a timeout or alert ends only when the event is signaled.
+    pub fn wait(&self) {
         // SAFETY: the storage holds an initialized event.
-        let status = unsafe {
+        unsafe {
             KeWaitForSingleObject(
-                self.object().cast(),
+                self.pointer().cast(),
                 WaitReason::Executive,
                 ProcessorMode::Kernel,
                 false,
                 core::ptr::null(),
             )
         };
-        status.0
     }
 }
+
+/// `ExCreateThread` flags that stock gives each of its system threads: the
+/// system process, a thread object result, hardware thread 2, priority
+/// class 13, and bit 0x4, which the kernel does not test. Each thread adds
+/// whether the monitor may stop or debug it.
+pub const SYSTEM_THREAD_FLAGS: ThreadCreationFlags = ThreadCreationFlags::SYSTEM_PROCESS
+    .union(ThreadCreationFlags::RETURN_THREAD_OBJECT)
+    .union(ThreadCreationFlags::PROCESSOR2)
+    .union(ThreadCreationFlags::PRIORITY_CLASS_13)
+    .union(ThreadCreationFlags::from_bits_retain(0x4));
 
 /// Pool tags shared by several services.
 pub mod pool_tag {
@@ -221,6 +249,10 @@ pub mod pool_tag {
     /// Monitor allocations of the generic pool exports and of copies made
     /// for callers.
     pub const MONITOR: PoolTag = PoolTag::new(*b"xbdm");
+    /// Settings text, debug capture buffers and flash images.
+    pub const BUFFER: PoolTag = PoolTag::new(*b"mdbX");
+    /// Detour log records and lockfree containers.
+    pub const DETOUR: PoolTag = PoolTag::new(*b"Detr");
 }
 
 /// `KeQueryPerformanceFrequency`. The console returns the quadword in one
@@ -274,7 +306,7 @@ static DEBUG_MONITOR_DATA: DebugMonitorData = DebugMonitorData::new();
 /// Register `module` as the debug monitor and keep the debug monitor data.
 /// Fails when either service fails, as stock module initialization does.
 pub fn register_debug_monitor(module: u32) -> bool {
-    // SAFETY: service 1 and 2 take scalar arguments or a 0x68-byte buffer.
+    // SAFETY: the register service takes the module handle as a scalar.
     if !unsafe { ExDebugMonitorService(DebugMonitorService::Register, module, 0, 0) }.is_success() {
         return false;
     }
@@ -298,40 +330,52 @@ pub fn debug_monitor_data() -> &'static DebugMonitorData {
 
 /// Store the control dispatcher in the data block and publish the block to
 /// the kernel, as stock initialization does.
-pub fn publish_debug_monitor_dispatcher(dispatcher: u32) {
-    // SAFETY: the dispatcher is the module's control routine entry, which
-    // the kernel may call once the block is published.
+///
+/// # Safety
+///
+/// `dispatcher` must be the address of a routine in the console ABI that
+/// takes a debug monitor control code and its argument and returns a word,
+/// and it must stay loaded while the block is published. The kernel calls
+/// it from any thread once the block is published.
+pub unsafe fn publish_debug_monitor_dispatcher(dispatcher: u32) {
+    // SAFETY: the caller guarantees the routine the kernel calls.
     unsafe {
         DEBUG_MONITOR_DATA
             .control_routine
             .store(dispatcher, Ordering::Release)
     };
     let block = core::ptr::from_ref(&DEBUG_MONITOR_DATA).expose_provenance() as u32;
-    // SAFETY: the block is a static that lives as long as the module, and
-    // its routine fields hold the kernel's values or this module's entries.
-    unsafe { resolved(&KeDebugMonitorData).store(block, Ordering::Relaxed) };
+    // SAFETY: `data_imports_resolved` held at module load. The block is a
+    // static that lives as long as the module, and its routine fields hold
+    // the kernel's values or this module's entries.
+    unsafe {
+        KeDebugMonitorData
+            .get_unchecked()
+            .store(block, Ordering::Relaxed)
+    };
 }
 
-/// The export of a data import. Stock uses its data imports without a
-/// check; a slot that the loader left unresolved stops the module.
-pub fn resolved<T: Sync>(variable: &ImportedVariable<T>) -> &'static T {
-    match variable.get() {
-        Some(export) => export,
-        None => unresolved_import(),
-    }
-}
-
-/// One shared copy keeps the stop out of every caller.
-#[cold]
-#[inline(never)]
-fn unresolved_import() -> ! {
-    panic!("unresolved data import")
+/// Whether the loader resolved every data import that the module reads
+/// with `get_unchecked`. Module load checks it once, before other module
+/// code runs, and fails when it does not hold; stock reads its data
+/// imports without a check. Each `get_unchecked` read in the module names
+/// an import of this list.
+pub fn data_imports_resolved() -> bool {
+    KeDebugMonitorData.get().is_some()
+        && XboxHardwareInfo.get().is_some()
+        && XboxKrnlBaseVersion.get().is_some()
+        && ExLoadedImageName.get().is_some()
+        && ExThreadObjectType.get().is_some()
+        && IoDeviceObjectType.get().is_some()
+        && KeTimeStampBundle.get().is_some()
+        && XexExecutableModuleHandle.get().is_some()
 }
 
 /// The debug monitor data block that the kernel reads, if one is
 /// published.
 pub fn published_debug_monitor_data() -> Option<&'static DebugMonitorData> {
-    let block = resolved(&KeDebugMonitorData).load(Ordering::Relaxed);
+    // SAFETY: `data_imports_resolved` held at module load.
+    let block = unsafe { KeDebugMonitorData.get_unchecked() }.load(Ordering::Relaxed);
     // SAFETY: a nonzero value is the address of a published debug monitor
     // block, which stays mapped while its module runs.
     (block != 0).then(|| unsafe {
@@ -341,7 +385,8 @@ pub fn published_debug_monitor_data() -> Option<&'static DebugMonitorData> {
 
 /// The hardware information export.
 pub fn hardware_info() -> &'static HardwareInfo {
-    resolved(&XboxHardwareInfo)
+    // SAFETY: `data_imports_resolved` held at module load.
+    unsafe { XboxHardwareInfo.get_unchecked() }
 }
 
 /// The version parts in export order.
@@ -351,7 +396,8 @@ pub const fn version_words(version: KernelVersion) -> [u16; 4] {
 
 /// `XboxKrnlBaseVersion`, which stock reads without a check.
 pub fn base_kernel_version() -> KernelVersion {
-    *resolved(&XboxKrnlBaseVersion)
+    // SAFETY: `data_imports_resolved` held at module load.
+    *unsafe { XboxKrnlBaseVersion.get_unchecked() }
 }
 
 /// Write a NUL-terminated message to the debug output.
@@ -406,6 +452,17 @@ pub unsafe fn object_at_mut<'a, T>(address: u32) -> &'a mut T {
     unsafe { &mut *core::ptr::with_exposed_provenance_mut::<T>(address as usize) }
 }
 
+/// The thread object at `address`.
+///
+/// # Safety
+///
+/// `address` must be a thread object that stays allocated for `'a`.
+#[inline(always)]
+pub unsafe fn thread_at<'a>(address: u32) -> &'a Kthread {
+    // SAFETY: the caller guarantees the object for `'a`.
+    unsafe { xbox360::thread::ThreadObject::from_raw(address) }.kthread()
+}
+
 /// Bytes before the NUL of the string at `address`; none for 0.
 ///
 /// # Safety
@@ -416,4 +473,172 @@ pub unsafe fn c_string<'a>(address: u32) -> Option<&'a [u8]> {
     let start = core::ptr::with_exposed_provenance::<core::ffi::c_char>(address as usize);
     // SAFETY: guaranteed by the caller.
     (!start.is_null()).then(|| unsafe { core::ffi::CStr::from_ptr(start) }.to_bytes())
+}
+
+/// Bytes before the NUL of the string at `address`, at most `limit`; none
+/// for 0.
+///
+/// # Safety
+///
+/// `address` must be 0, or readable up to its NUL or `limit` bytes,
+/// whichever comes first, and the bytes must stay unchanged for `'a`.
+#[inline(never)]
+pub unsafe fn bounded_c_string<'a>(address: u32, limit: usize) -> Option<&'a [u8]> {
+    let start = core::ptr::with_exposed_provenance::<u8>(address as usize);
+    if start.is_null() {
+        return None;
+    }
+    let mut length = 0;
+    // SAFETY: the caller guarantees the bytes up to the NUL or the limit.
+    while length < limit && unsafe { start.add(length).read() } != 0 {
+        length += 1;
+    }
+    // SAFETY: the `length` bytes were just read.
+    Some(unsafe { core::slice::from_raw_parts(start, length) })
+}
+
+/// A kernel routine variable whose address the query service stores in
+/// the debug monitor data.
+#[derive(Clone, Copy)]
+pub enum RoutineVariable {
+    /// `KiDebugRoutine`.
+    Debug,
+    /// `KiStackOverflowNotification`.
+    StackOverflow,
+    /// `KiContextSwapNotification`, called on each thread switch.
+    ContextSwap,
+    /// The kernel callback routine variable.
+    Callback,
+}
+
+/// The kernel variable `variable`, once the query service published its
+/// address.
+pub fn routine_variable(variable: RoutineVariable) -> Option<&'static KernelU32> {
+    let data = debug_monitor_data();
+    let address = match variable {
+        RoutineVariable::Debug => &data.debug_routine,
+        RoutineVariable::StackOverflow => &data.stack_overflow_notification,
+        RoutineVariable::ContextSwap => &data.context_swap_notification,
+        RoutineVariable::Callback => &data.callback_routine,
+    }
+    .load(Ordering::Relaxed);
+    // SAFETY: the query service stores the address of the kernel's
+    // word-aligned variable, which lives as long as the kernel, or leaves
+    // 0.
+    unsafe { core::ptr::with_exposed_provenance::<KernelU32>(address as usize).as_ref() }
+}
+
+/// A loader module list of the debug monitor data.
+#[derive(Clone, Copy)]
+pub enum ModuleList {
+    Loaded,
+    Usermode,
+}
+
+impl ModuleList {
+    /// The list head, if the kernel has the list.
+    fn head(self) -> Option<NonZeroU32> {
+        let data = debug_monitor_data();
+        NonZeroU32::new(
+            match self {
+                ModuleList::Loaded => &data.loaded_module_list,
+                ModuleList::Usermode => &data.loaded_usermode_module_list,
+            }
+            .load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// Holds the kernel loader spin lock, which guards both module lists, for
+/// its lifetime.
+pub struct LoaderLock {
+    lock: *mut KspinLock,
+    irql: Irql,
+}
+
+impl LoaderLock {
+    /// Inlined: two loads and the import call cost less than a call.
+    #[inline(always)]
+    pub fn acquire() -> Self {
+        let lock = core::ptr::with_exposed_provenance_mut::<KspinLock>(
+            debug_monitor_data()
+                .loaded_module_list_lock
+                .load(Ordering::Relaxed) as usize,
+        );
+        // SAFETY: the debug monitor data holds the address of the kernel
+        // loader spin lock; Drop releases it at the returned IRQL.
+        let irql = unsafe { KfAcquireSpinLock(lock) };
+        Self { lock, irql }
+    }
+
+    /// Entries of `list` in load order.
+    pub fn entries(&self, list: ModuleList) -> LoaderEntries<'_> {
+        LoaderEntries {
+            heads: [list.head(), None],
+            list: 0,
+            link: None,
+            _lock: PhantomData,
+        }
+    }
+
+    /// Entries of the loaded list, then of the user-mode list, in the
+    /// order the monitor walks them. One iterator for both lists keeps
+    /// the walks from being instantiated once per list.
+    pub fn all_entries(&self) -> LoaderEntries<'_> {
+        LoaderEntries {
+            heads: [ModuleList::Loaded.head(), ModuleList::Usermode.head()],
+            list: 0,
+            link: None,
+            _lock: PhantomData,
+        }
+    }
+}
+
+impl Drop for LoaderLock {
+    #[inline(always)]
+    fn drop(&mut self) {
+        // SAFETY: `acquire` took this lock at `self.irql`.
+        unsafe { KfReleaseSpinLock(self.lock, self.irql) };
+    }
+}
+
+/// Loader data table entries of up to two lists, one after the other;
+/// built only by [`LoaderLock`], whose borrow keeps the entries linked.
+pub struct LoaderEntries<'a> {
+    /// Heads of the lists; none for a list the kernel does not have.
+    heads: [Option<NonZeroU32>; 2],
+    list: usize,
+    /// The head or the last entry returned of the current list; none
+    /// before its first entry.
+    link: Option<NonZeroU32>,
+    _lock: PhantomData<&'a LoaderLock>,
+}
+
+impl<'a> Iterator for LoaderEntries<'a> {
+    type Item = &'a LdrDataTableEntry;
+
+    fn next(&mut self) -> Option<&'a LdrDataTableEntry> {
+        loop {
+            if let Some(head) = *self.heads.get(self.list)? {
+                let link = *self.link.get_or_insert(head);
+                // SAFETY: `link` is the kernel's list head, which lives as
+                // long as the system, or an entry linked into its list; the
+                // loader lock borrowed for `'a` keeps the links unchanged and
+                // the entries mapped.
+                let entry = unsafe { object_at::<ListEntry>(link.get()) }
+                    .flink
+                    .load(Ordering::Relaxed);
+                if entry != head.get() {
+                    // SAFETY: the link of a circular kernel list holds the
+                    // address of a mapped link, which is not 0.
+                    self.link = Some(unsafe { NonZeroU32::new_unchecked(entry) });
+                    // SAFETY: `entry` is linked into the list, as above; a
+                    // loader entry starts with its load order link.
+                    return Some(unsafe { object_at(entry) });
+                }
+            }
+            self.list += 1;
+            self.link = None;
+        }
+    }
 }

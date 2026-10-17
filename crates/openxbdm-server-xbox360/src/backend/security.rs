@@ -1,11 +1,12 @@
 //! User directory: users are permanent kernel objects of a private object
 //! type in an unnamed object directory, as the monitor keeps them.
 
+use core::mem::offset_of;
+use core::ptr::NonNull;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
 use openxbdm_core::status::Hresult;
-use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::Access;
 use openxbdm_server::Server;
 use openxbdm_server::commands::security;
@@ -13,6 +14,7 @@ use openxbdm_server::commands::security::Password;
 use openxbdm_server::commands::security::User;
 use openxbdm_server::commands::security::UserCreationFailed;
 use openxbdm_server::commands::security::UserName;
+use openxbdm_server::reply::CommandError;
 use xbox360::module::Ordinal;
 use xbox360::module::SystemModule;
 use xbox360::module::resolve_export;
@@ -23,21 +25,21 @@ use xbox360_sys::xboxkrnl::ObInsertObject;
 use xbox360_sys::xboxkrnl::ObMakeTemporaryObject;
 use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
 use xbox360_sys::xboxkrnl::ObjectAttributes;
+use xbox360_sys::xboxkrnl::PoolTag;
 
 use super::Console;
 use super::dispatcher;
-use super::dispatcher::ServerService;
 use crate::exports::export;
 use crate::kernel;
+use crate::net::XamNetwork;
 
 /// Kernel export ordinals of the pool routines the object type uses.
 const EX_ALLOCATE_POOL_TYPE_WITH_TAG: Ordinal = Ordinal::new(11).unwrap();
 const EX_FREE_POOL: Ordinal = Ordinal::new(15).unwrap();
-/// Body: password high, password low, privileges, password-set flag.
-const USER_BODY_SIZE: u32 = 0x10;
-/// Directory query buffer: counted name, type, then the name bytes.
-const QUERY_LENGTH: usize = 0x4c;
-const QUERY_NAME_OFFSET: usize = 0xc;
+/// Pool tag of user objects.
+const USER_POOL_TAG: PoolTag = PoolTag::new(*b"SUmd");
+/// `ObInsertObject` keeps the creation reference until the caller drops it.
+const INSERT_POINTER_BIAS: u32 = 1;
 
 /// Console object type descriptor.
 #[repr(C)]
@@ -48,7 +50,7 @@ struct ObjectType {
     delete: AtomicU32,
     parse: AtomicU32,
     default_object: AtomicU32,
-    pool_tag: AtomicU32,
+    pool_tag: PoolTag,
 }
 
 static USER_OBJECT_TYPE: ObjectType = ObjectType {
@@ -58,16 +60,118 @@ static USER_OBJECT_TYPE: ObjectType = ObjectType {
     delete: AtomicU32::new(0),
     parse: AtomicU32::new(0),
     default_object: AtomicU32::new(0),
-    pool_tag: AtomicU32::new(u32::from_be_bytes(*b"SUmd")),
+    pool_tag: USER_POOL_TAG,
 };
 
 /// Wait target of the object type; users are not waitable.
 static DEFAULT_OBJECT: AtomicU32 = AtomicU32::new(0);
 
+/// Body of a user object of [`USER_OBJECT_TYPE`].
+#[repr(C)]
+struct UserObject {
+    password_high: AtomicU32,
+    password_low: AtomicU32,
+    privileges: AtomicU32,
+    /// Nonzero when the password words hold a password.
+    password_set: AtomicU32,
+}
+
+const _: () = {
+    assert!(offset_of!(UserObject, password_low) == 0x4);
+    assert!(offset_of!(UserObject, privileges) == 0x8);
+    assert!(offset_of!(UserObject, password_set) == 0xc);
+    assert!(size_of::<UserObject>() == 0x10);
+};
+
+impl UserObject {
+    fn user(&self) -> User {
+        let high = self.password_high.load(Ordering::Relaxed);
+        let low = self.password_low.load(Ordering::Relaxed);
+        let privileges = self.privileges.load(Ordering::Relaxed);
+        let password_set = self.password_set.load(Ordering::Relaxed);
+        let password =
+            (password_set != 0).then_some(Password((u64::from(high) << 32) | u64::from(low)));
+        User {
+            password,
+            privileges: Access::from_bits_retain(privileges),
+        }
+    }
+
+    /// Body words of `user`, in field order.
+    fn words(user: User) -> [u32; 4] {
+        let (password, password_set) = match user.password {
+            Some(Password(password)) => (password, 1),
+            None => (0, 0),
+        };
+        [
+            (password >> 32) as u32,
+            password as u32,
+            user.privileges.bits(),
+            password_set,
+        ]
+    }
+
+    fn new(user: User) -> Self {
+        let [high, low, privileges, password_set] = Self::words(user);
+        Self {
+            password_high: AtomicU32::new(high),
+            password_low: AtomicU32::new(low),
+            privileges: AtomicU32::new(privileges),
+            password_set: AtomicU32::new(password_set),
+        }
+    }
+
+    fn set(&self, user: User) {
+        let [high, low, privileges, password_set] = Self::words(user);
+        self.password_high.store(high, Ordering::Relaxed);
+        self.password_low.store(low, Ordering::Relaxed);
+        self.privileges.store(privileges, Ordering::Relaxed);
+        self.password_set.store(password_set, Ordering::Relaxed);
+    }
+}
+
+/// A counted reference to a user object, released when dropped.
+struct UserReference(NonNull<UserObject>);
+
+impl UserReference {
+    fn object(&self) -> &UserObject {
+        // SAFETY: the reference this value holds keeps the object alive.
+        unsafe { self.0.as_ref() }
+    }
+
+    /// Object address as the object manager takes it.
+    fn address(&self) -> u32 {
+        self.0.as_ptr() as u32
+    }
+}
+
+impl Drop for UserReference {
+    fn drop(&mut self) {
+        // SAFETY: `Data::open` took this reference, released only here.
+        unsafe { xboxkrnl::ObDereferenceObject(self.address()) };
+    }
+}
+
+/// `NtQueryDirectoryObject` result: counted name, object type, then the
+/// name bytes the counted name points to.
+#[repr(C)]
+struct DirectoryQuery {
+    name_length: u16,
+    _name_maximum_length: u16,
+    _name_buffer: u32,
+    _object_type: u32,
+    name: [u8; 0x40],
+}
+
+const _: () = {
+    assert!(offset_of!(DirectoryQuery, name) == 0xc);
+    assert!(size_of::<DirectoryQuery>() == 0x4c);
+};
+
 #[derive(Debug, Clone, Copy)]
 enum Directory {
     Uncreated,
-    Created(u32),
+    Created(Handle),
     Unavailable,
 }
 
@@ -84,7 +188,7 @@ impl Data {
     }
 
     /// Handle of the user directory, created on first use.
-    fn directory(&mut self) -> Option<u32> {
+    fn directory(&mut self) -> Option<Handle> {
         if let Directory::Uncreated = self.directory {
             self.directory = create_directory().map_or(Directory::Unavailable, Directory::Created);
         }
@@ -95,11 +199,11 @@ impl Data {
     }
 
     /// Referenced user object reached by `name`.
-    fn open(&mut self, name: &[u8]) -> Option<u32> {
+    fn open(&mut self, name: &[u8]) -> Option<UserReference> {
         let directory = self.directory()?;
         let string = kernel::ansi_string(name);
         let attributes = ObjectAttributes {
-            root_directory: Handle::from_raw(directory),
+            root_directory: directory,
             object_name: &string,
             attributes: ObjectAttributeFlags::empty(),
         };
@@ -107,9 +211,9 @@ impl Data {
         let object_type = core::ptr::from_ref(&USER_OBJECT_TYPE) as u32;
         // SAFETY: `attributes`, its name and `handle` are live locals; the
         // object type is a static descriptor.
-        if failed(
-            unsafe { xboxkrnl::ObOpenObjectByName(&attributes, object_type, 0, &mut handle) }.0,
-        ) {
+        if !unsafe { xboxkrnl::ObOpenObjectByName(&attributes, object_type, 0, &mut handle) }
+            .is_success()
+        {
             return None;
         }
         let mut object = 0;
@@ -117,15 +221,19 @@ impl Data {
         let status = unsafe { xboxkrnl::ObReferenceObjectByHandle(handle, 0, &mut object) };
         // SAFETY: as above.
         unsafe { xboxkrnl::NtClose(handle) };
-        (!failed(status.0)).then_some(object)
+        if !status.is_success() {
+            return None;
+        }
+        // SAFETY: the open by name accepts only objects of the user type,
+        // whose body is a `UserObject`, and a successful reference returns
+        // its nonzero address.
+        Some(UserReference(unsafe {
+            NonNull::new_unchecked(core::ptr::with_exposed_provenance_mut(object as usize))
+        }))
     }
 }
 
-fn failed(status: u32) -> bool {
-    (status as i32) < 0
-}
-
-fn create_directory() -> Option<u32> {
+fn create_directory() -> Option<Handle> {
     let module = SystemModule::Kernel.handle().ok()?;
     let allocate = resolve_export(module, EX_ALLOCATE_POOL_TYPE_WITH_TAG)
         .ok()?
@@ -140,60 +248,22 @@ fn create_directory() -> Option<u32> {
     let mut handle = Handle::NULL;
     // SAFETY: `handle` is a live local; a null name creates an unnamed
     // directory.
-    (!failed(unsafe { xboxkrnl::NtCreateDirectoryObject(&mut handle, core::ptr::null()) }.0))
-        .then_some(handle.raw())
-}
-
-fn body(object: u32) -> *mut [u32; 4] {
-    object as usize as *mut [u32; 4]
-}
-
-fn read_user(object: u32) -> User {
-    // SAFETY: `object` is a referenced user object with a 0x10-byte body.
-    let [high, low, privileges, password_set] = unsafe { core::ptr::read_volatile(body(object)) };
-    let password =
-        (password_set != 0).then_some(Password((u64::from(high) << 32) | u64::from(low)));
-    User {
-        password,
-        privileges: Access::from_bits_retain(privileges),
-    }
-}
-
-fn write_user(object: u32, user: User) {
-    let (password, password_set) = match user.password {
-        Some(Password(password)) => (password, 1),
-        None => (0, 0),
-    };
-    // SAFETY: `object` is a referenced user object with a 0x10-byte body.
-    unsafe {
-        core::ptr::write_volatile(
-            body(object),
-            [
-                (password >> 32) as u32,
-                password as u32,
-                user.privileges.bits(),
-                password_set,
-            ],
-        );
-    }
+    unsafe { xboxkrnl::NtCreateDirectoryObject(&mut handle, core::ptr::null()) }
+        .is_success()
+        .then_some(handle)
 }
 
 impl security::Backend for Console {
     fn find_user(&mut self, name: &[u8]) -> Option<User> {
-        let object = self.security.open(name)?;
-        let user = read_user(object);
-        // SAFETY: `open` returned a referenced object.
-        unsafe { xboxkrnl::ObDereferenceObject(object) };
-        Some(user)
+        let reference = self.security.open(name)?;
+        Some(reference.object().user())
     }
 
     fn store_user(&mut self, name: &[u8], user: User) -> bool {
-        let Some(object) = self.security.open(name) else {
+        let Some(reference) = self.security.open(name) else {
             return false;
         };
-        write_user(object, user);
-        // SAFETY: `open` returned a referenced object.
-        unsafe { xboxkrnl::ObDereferenceObject(object) };
+        reference.object().set(user);
         true
     }
 
@@ -201,132 +271,236 @@ impl security::Backend for Console {
         let directory = self.security.directory().ok_or(UserCreationFailed)?;
         let string = kernel::ansi_string(name);
         let attributes = ObjectAttributes {
-            root_directory: Handle::from_raw(directory),
+            root_directory: directory,
             object_name: &string,
             attributes: ObjectAttributeFlags::PERMANENT,
         };
         let mut object = 0;
         // SAFETY: `attributes`, its name and `object` are live locals; the
         // object type is a static descriptor.
-        if failed(
-            unsafe {
-                ObCreateObject(
-                    core::ptr::from_ref(&USER_OBJECT_TYPE) as u32,
-                    &attributes,
-                    USER_BODY_SIZE,
-                    &mut object,
-                )
-            }
-            .0,
-        ) {
+        if !unsafe {
+            ObCreateObject(
+                core::ptr::from_ref(&USER_OBJECT_TYPE) as u32,
+                &attributes,
+                size_of::<UserObject>() as u32,
+                &mut object,
+            )
+        }
+        .is_success()
+        {
             return Err(UserCreationFailed);
         }
         let mut handle = Handle::NULL;
         // SAFETY: `object` was created above with these attributes.
-        let status = unsafe { ObInsertObject(object, &attributes, 1, &mut handle) };
+        let status =
+            unsafe { ObInsertObject(object, &attributes, INSERT_POINTER_BIAS, &mut handle) };
         // A failed insertion already released the creation reference.
         // Stock dereferences again here (0x91f40764), a double release.
-        if failed(status.0) {
+        if !status.is_success() {
             return Err(UserCreationFailed);
         }
         // Drops the pointer bias; the handle and the permanent directory
         // entry keep the object until the body is written.
         // SAFETY: the creation reference is held after a successful insert.
         unsafe { xboxkrnl::ObDereferenceObject(object) };
-        write_user(object, user);
+        // SAFETY: the object was created with an uninitialized `UserObject`
+        // body, written here without reading it; the open handle keeps the
+        // object alive.
+        unsafe { (object as usize as *mut UserObject).write(UserObject::new(user)) };
         // SAFETY: `handle` came from the insertion and is closed only here.
         unsafe { xboxkrnl::NtClose(handle) };
         Ok(())
     }
 
     fn remove_user(&mut self, name: &[u8]) -> bool {
-        let Some(object) = self.security.open(name) else {
+        let Some(reference) = self.security.open(name) else {
             return false;
         };
-        // SAFETY: `open` returned a referenced permanent object, so it holds
-        // both references released here.
+        let object = reference.address();
+        // SAFETY: a permanent object holds a reference of its own, which
+        // this releases after making it temporary; dropping `reference`
+        // then releases the one from the open.
         unsafe {
             ObMakeTemporaryObject(object);
-            // The reference from the open and the one the permanent object held.
-            xboxkrnl::ObDereferenceObject(object);
             xboxkrnl::ObDereferenceObject(object);
         }
+        drop(reference);
         true
     }
 
     fn user_name_at(&mut self, index: u32) -> Option<UserName> {
-        /// The kernel writes a counted name with a pointer at the start.
-        #[repr(C, align(4))]
-        struct Buffer([u8; QUERY_LENGTH]);
         let directory = self.security.directory()?;
-        let mut buffer = Buffer([0; QUERY_LENGTH]);
+        let mut query = DirectoryQuery {
+            name_length: 0,
+            _name_maximum_length: 0,
+            _name_buffer: 0,
+            _object_type: 0,
+            name: [0; 0x40],
+        };
         let mut context = index;
-        // SAFETY: `buffer` holds QUERY_LENGTH bytes and `context` is a live
+        // SAFETY: `query` holds the size passed and `context` is a live
         // local.
         let status = unsafe {
             xboxkrnl::NtQueryDirectoryObject(
-                Handle::from_raw(directory),
-                buffer.0.as_mut_ptr(),
-                QUERY_LENGTH as u32,
+                directory,
+                (&raw mut query).cast(),
+                size_of::<DirectoryQuery>() as u32,
                 index == 0,
                 &mut context,
                 core::ptr::null_mut(),
             )
         };
-        if failed(status.0) {
+        if !status.is_success() {
             return None;
         }
-        let bytes = &buffer.0;
-        let length = usize::from(u16::from_be_bytes([bytes[0], bytes[1]]));
-        UserName::new(bytes.get(QUERY_NAME_OFFSET..QUERY_NAME_OFFSET + length)?)
+        UserName::new(query.name.get(..usize::from(query.name_length))?)
     }
 }
 
 /// Longest name an export reads: an ANSI string counts at most 0xfffe
 /// bytes.
-const EXPORT_NAME_LIMIT: u32 = 0xfffe;
-/// Size of the `DM_USER` record the user walk fills: the name, then the
-/// access mask at +0x100.
-const USER_RECORD_SIZE: u32 = 0x104;
-const USER_RECORD_ACCESS: u32 = 0x100;
+const EXPORT_NAME_LIMIT: usize = 0xfffe;
 
-/// Arguments of a security export, passed to the server thread on the
-/// caller's stack.
+/// `DM_USER` record the user walk fills.
 #[repr(C)]
-struct Request {
-    first: u32,
-    second: u32,
+struct UserRecord {
+    name: [u8; 0x100],
+    access: u32,
 }
 
-/// Run `service` on the server thread with the caller's two arguments.
-/// Called on the server thread itself, above passive level, or after the
-/// server stopped, the server state is unreachable and the export fails
-/// with E_UNEXPECTED.
-fn on_server(service: ServerService<Request>, first: u32, second: u32) -> u32 {
-    dispatcher::call_on_server_with(&mut Request { first, second }, service)
-        .unwrap_or(Hresult::UNEXPECTED.0)
-}
+const _: () = {
+    assert!(offset_of!(UserRecord, access) == 0x100);
+    assert!(size_of::<UserRecord>() == 0x104);
+};
 
-/// Bytes of the caller's NUL-terminated name; a null name is empty, as
-/// RtlInitAnsiString makes it.
-fn name<'a>(address: u32) -> &'a [u8] {
-    if address == 0 {
-        return &[];
+impl UserRecord {
+    /// # Safety
+    ///
+    /// `record` is writable for a `DM_USER` at any alignment.
+    unsafe fn fill(record: *mut Self, name: &UserName, access: Access) {
+        let bytes = name.as_bytes();
+        // SAFETY: per the contract of this fn; the name is a byte array.
+        let slots = unsafe { &mut *(&raw mut (*record).name) };
+        *slots = [0; 0x100];
+        slots[..bytes.len()].copy_from_slice(bytes);
+        // SAFETY: per the contract of this fn.
+        unsafe { (&raw mut (*record).access).write_unaligned(access.bits()) };
     }
-    let mut length = 0;
-    // SAFETY: the caller passes a NUL-terminated string.
-    while length < EXPORT_NAME_LIMIT
-        && unsafe { core::ptr::read_volatile((address + length) as usize as *const u8) } != 0
-    {
-        length += 1;
-    }
-    // SAFETY: the `length` bytes before the terminator were just read.
-    unsafe { core::slice::from_raw_parts(address as usize as *const u8, length as usize) }
 }
 
-fn write_u32(address: u32, value: u32) {
-    // SAFETY: the caller passes a writable output location.
-    unsafe { core::ptr::write_volatile(address as usize as *mut u32, value) };
+/// A security export's arguments, passed to the server thread on the
+/// caller's stack. Caller addresses stay unread until the server step
+/// uses them, so an export whose server step does not run reads none. A
+/// name is the caller's string address.
+enum Request {
+    SetAccess {
+        name: u32,
+        access: Access,
+    },
+    GetAccess {
+        name: u32,
+        access: *mut u32,
+    },
+    Walk {
+        position: *mut u32,
+        record: *mut UserRecord,
+    },
+    Add {
+        name: u32,
+        access: Access,
+    },
+    Enable(bool),
+    IsEnabled(*mut u32),
+    Remove(u32),
+}
+
+/// Run `request` on the server thread. Called on the server thread itself,
+/// above passive level, or after the server stopped, the server state is
+/// unreachable and the export fails with E_UNEXPECTED.
+///
+/// # Safety
+/// The addresses in `request` follow the export contracts: a name is 0, a
+/// NUL-terminated string, or [`EXPORT_NAME_LIMIT`] readable bytes, an output
+/// pointer and the walk position are writable dwords, and the `DM_USER`
+/// record is writable, all at any alignment. They stay valid until this
+/// returns.
+unsafe fn on_server(mut request: Request) -> Hresult {
+    dispatcher::call_on_server_with(&mut request, serve).map_or(Hresult::UNEXPECTED, Hresult)
+}
+
+/// Posted only by [`on_server`], whose contract covers the pointers.
+fn serve(
+    server: &mut Server,
+    console: &mut Console,
+    _network: &mut XamNetwork,
+    request: &mut Request,
+) -> u32 {
+    let result = match *request {
+        Request::SetAccess { name, access } => {
+            // SAFETY: per the contract of `on_server`. A null name is empty,
+            // as RtlInitAnsiString makes it.
+            let name =
+                unsafe { kernel::bounded_c_string(name, EXPORT_NAME_LIMIT) }.unwrap_or_default();
+            security::set_user_access(console, name, access)
+        }
+        Request::GetAccess { name, access } => {
+            // SAFETY: per the contract of `on_server`; null as above.
+            let name =
+                unsafe { kernel::bounded_c_string(name, EXPORT_NAME_LIMIT) }.unwrap_or_default();
+            security::user_access(console, name).map(|found| {
+                // SAFETY: per the contract of `on_server`.
+                unsafe { access.write_unaligned(found.bits()) }
+            })
+        }
+        // The server walk reads the position only while the box is locked,
+        // so the caller's dword is read under the same condition.
+        Request::Walk { position, record } if security::security_enabled(&server.state) => {
+            // SAFETY: per the contract of `on_server`.
+            let start = unsafe { position.read_unaligned() };
+            let mut current = start;
+            let result = security::walk_users(&server.state, console, &mut current);
+            if current != start {
+                // SAFETY: per the contract of `on_server`.
+                unsafe { position.write_unaligned(current) };
+            }
+            result.map(|(user, access)| {
+                // SAFETY: per the contract of `on_server`.
+                unsafe { UserRecord::fill(record, &user, access) }
+            })
+        }
+        Request::Walk { .. } => Err(CommandError::EndOfData),
+        Request::Add { name, access } => {
+            let user = User {
+                password: None,
+                privileges: access,
+            };
+            // SAFETY: per the contract of `on_server`; null as above.
+            let name =
+                unsafe { kernel::bounded_c_string(name, EXPORT_NAME_LIMIT) }.unwrap_or_default();
+            let result = security::add_user(&mut server.state, console, name, user);
+            save_settings(server, console);
+            result
+        }
+        Request::Enable(enable) => {
+            security::enable_security(&mut server.state, console, enable);
+            Ok(())
+        }
+        Request::IsEnabled(enabled) => {
+            let value = u32::from(security::security_enabled(&server.state));
+            // SAFETY: per the contract of `on_server`.
+            unsafe { enabled.write_unaligned(value) };
+            Ok(())
+        }
+        Request::Remove(name) => {
+            // SAFETY: per the contract of `on_server`; null as above.
+            let name =
+                unsafe { kernel::bounded_c_string(name, EXPORT_NAME_LIMIT) }.unwrap_or_default();
+            let result = security::remove_user(&mut server.state, console, name);
+            save_settings(server, console);
+            result
+        }
+    };
+    crate::exports::export_result(result).0
 }
 
 /// Write the settings file before the export returns, as stock's writer
@@ -335,126 +509,74 @@ fn save_settings(server: &mut Server, console: &mut Console) {
     server.save_settings_if_dirty(console);
 }
 
-extern "C" fn set_user_access(user: u32, access: u32) -> u32 {
-    on_server(
-        |_, console, _, request| {
-            let result = security::set_user_access(
-                console,
-                name(request.first),
-                Access::from_bits_retain(request.second),
-            );
-            crate::exports::export_result(result).0
-        },
-        user,
-        access,
-    )
+// SAFETY (each export below): the export contract of its ordinal is the
+// contract of `on_server`.
+
+extern "C" fn set_user_access(user: u32, access: u32) -> Hresult {
+    // SAFETY: see above.
+    unsafe {
+        on_server(Request::SetAccess {
+            name: user,
+            access: Access::from_bits_retain(access),
+        })
+    }
 }
 export!(58, set_user_access);
 
-extern "C" fn get_user_access(user: u32, access: u32) -> u32 {
-    on_server(
-        |_, console, _, request| {
-            let result = security::user_access(console, name(request.first))
-                .map(|found| write_u32(request.second, found.bits()));
-            crate::exports::export_result(result).0
-        },
-        user,
-        access,
-    )
+extern "C" fn get_user_access(user: u32, access: u32) -> Hresult {
+    // SAFETY: see above.
+    unsafe {
+        on_server(Request::GetAccess {
+            name: user,
+            access: access as usize as *mut u32,
+        })
+    }
 }
 export!(59, get_user_access);
 
 /// `walk` holds the directory position; `record` receives a `DM_USER`.
-extern "C" fn walk_users(walk: u32, record: u32) -> u32 {
+extern "C" fn walk_users(walk: u32, record: u32) -> Hresult {
     if walk == 0 {
-        return Hresult::INVALID_ARGUMENT.0;
+        return Hresult::INVALID_ARGUMENT;
     }
-    on_server(
-        |server, console, _, request| {
-            // SAFETY: the caller passes a writable walk position.
-            let position = unsafe { &mut *(request.first as usize as *mut u32) };
-            let result =
-                security::walk_users(&server.state, console, position).map(|(user, access)| {
-                    let record = request.second;
-                    // SAFETY: the caller passes a `DM_USER` record.
-                    unsafe {
-                        core::ptr::write_bytes(
-                            record as usize as *mut u8,
-                            0,
-                            USER_RECORD_SIZE as usize,
-                        );
-                        core::ptr::copy_nonoverlapping(
-                            user.as_bytes().as_ptr(),
-                            record as usize as *mut u8,
-                            user.as_bytes().len(),
-                        );
-                    }
-                    write_u32(record + USER_RECORD_ACCESS, access.bits());
-                });
-            crate::exports::export_result(result).0
-        },
-        walk,
-        record,
-    )
+    // SAFETY: see above.
+    unsafe {
+        on_server(Request::Walk {
+            position: walk as usize as *mut u32,
+            record: record as usize as *mut UserRecord,
+        })
+    }
 }
 export!(60, walk_users);
 
-extern "C" fn add_user(user: u32, access: u32) -> u32 {
-    on_server(
-        |server, console, _, request| {
-            let user = User {
-                password: None,
-                privileges: Access::from_bits_retain(request.second),
-            };
-            let result = security::add_user(&mut server.state, console, name(request.first), user);
-            save_settings(server, console);
-            crate::exports::export_result(result).0
-        },
-        user,
-        access,
-    )
+extern "C" fn add_user(user: u32, access: u32) -> Hresult {
+    // SAFETY: see above.
+    unsafe {
+        on_server(Request::Add {
+            name: user,
+            access: Access::from_bits_retain(access),
+        })
+    }
 }
 export!(61, add_user);
 
-extern "C" fn enable_security(enable: u32) -> u32 {
-    on_server(
-        |server, console, _, request| {
-            security::enable_security(&mut server.state, console, request.first != 0);
-            Hresult::OK.0
-        },
-        enable,
-        0,
-    )
+extern "C" fn enable_security(enable: u32) -> Hresult {
+    // SAFETY: the request holds no pointer.
+    unsafe { on_server(Request::Enable(enable != 0)) }
 }
 export!(62, enable_security);
 
-extern "C" fn is_security_enabled(enabled: u32) -> u32 {
+extern "C" fn is_security_enabled(enabled: u32) -> Hresult {
     if enabled == 0 {
-        return Hresult::INVALID_ARGUMENT.0;
+        return Hresult::INVALID_ARGUMENT;
     }
-    on_server(
-        |server, _, _, request| {
-            write_u32(
-                request.first,
-                u32::from(security::security_enabled(&server.state)),
-            );
-            Hresult::OK.0
-        },
-        enabled,
-        0,
-    )
+    // SAFETY: see above.
+    unsafe { on_server(Request::IsEnabled(enabled as usize as *mut u32)) }
 }
 export!(63, is_security_enabled);
 
-extern "C" fn remove_user(user: u32) -> u32 {
-    on_server(
-        |server, console, _, request| {
-            let result = security::remove_user(&mut server.state, console, name(request.first));
-            save_settings(server, console);
-            crate::exports::export_result(result).0
-        },
-        user,
-        0,
-    )
+extern "C" fn remove_user(user: u32) -> Hresult {
+    // SAFETY: see above.
+    unsafe { on_server(Request::Remove(user)) }
 }
 export!(64, remove_user);

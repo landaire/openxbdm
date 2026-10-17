@@ -2,6 +2,21 @@
 //!
 //! Bytes 0x80..0x100 of flash and the patch block region are never written,
 //! so the patch block already on flash survives a reflash.
+//!
+//! Deviation: stock trusts the offsets and sizes in the image header and
+//! reads past the upload or boot loader buffer when they leave it. This
+//! writer checks them and fails instead:
+//! - An image shorter than its 0x80-byte header fails with
+//!   `ERROR_INVALID_PARAMETER` before any write.
+//! - A hardware identifier offset outside the image does not match, so the
+//!   write fails with `ERROR_REVISION_MISMATCH` unless version checking is
+//!   off.
+//! - A range that leaves its buffer fails with `ERROR_INVALID_PARAMETER`
+//!   when its write comes up; earlier writes stay. These are a patch block
+//!   offset past the end of the image, an image or boot loader that ends
+//!   before the body or the end of the patch block, a boot loader shorter
+//!   than the header, and a boot loader size from `XeKeysSaveBootLoader`
+//!   above the allocated size.
 
 use core::num::NonZeroU32;
 use core::ptr::NonNull;
@@ -19,13 +34,14 @@ use xbox360_sys::xboxkrnl::Handle;
 use xbox360_sys::xboxkrnl::HardwareFlags;
 use xbox360_sys::xboxkrnl::IoControlCode;
 use xbox360_sys::xboxkrnl::IoStatusBlock;
+use xbox360_sys::xboxkrnl::MemoryRegion;
 use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
 use xbox360_sys::xboxkrnl::ObjectAttributes;
 use xbox360_sys::xboxkrnl::PageProtection;
 use xbox360_sys::xboxkrnl::ShareAccess;
 
-use super::POOL_TAG;
 use crate::kernel;
+use crate::kernel::pool_tag;
 
 const DEVICE_NAME: &[u8] = b"\\Device\\Flash\0";
 /// Bytes of the `IoControlCode::FLASH_GEOMETRY` output.
@@ -165,7 +181,7 @@ impl FlashImage {
     /// Allocate `rounded_size` bytes (a multiple of 0x4000). None on allocation failure.
     pub fn allocate(rounded_size: u32) -> Option<Self> {
         // SAFETY: the allocation takes only a size and tag.
-        let address = unsafe { xboxkrnl::ExAllocatePoolWithTag(rounded_size, POOL_TAG) };
+        let address = unsafe { xboxkrnl::ExAllocatePoolWithTag(rounded_size, pool_tag::BUFFER) };
         NonNull::new(core::ptr::with_exposed_provenance_mut(address as usize)).map(|base| Self {
             base,
             size: rounded_size,
@@ -206,11 +222,23 @@ impl Drop for FlashImage {
     }
 }
 
+#[derive(Debug)]
 enum Failure {
     /// Reported through `RtlNtStatusToDosError`.
     Kernel(KernelError),
     Win32(Win32Error),
 }
+
+impl core::fmt::Display for Failure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Kernel(error) => core::fmt::Display::fmt(error, f),
+            Self::Win32(error) => core::fmt::Display::fmt(error, f),
+        }
+    }
+}
+
+impl core::error::Error for Failure {}
 
 impl From<KernelError> for Failure {
     fn from(error: KernelError) -> Self {
@@ -237,7 +265,9 @@ impl Buffers {
         }
         if let Some(boot_loader) = self.boot_loader {
             // SAFETY: `boot_loader` is the physical allocation of the writer.
-            unsafe { xboxkrnl::MmFreePhysicalMemory(xboxkrnl::MemoryRegion::CurrentProcess, boot_loader.get()) };
+            unsafe {
+                xboxkrnl::MmFreePhysicalMemory(MemoryRegion::CurrentProcess, boot_loader.get())
+            };
         }
     }
 }
@@ -297,7 +327,7 @@ fn flash_kernel_image(
             &mut patch_size,
             AllocationType::COMMIT,
             PageProtection::READWRITE,
-            xboxkrnl::MemoryRegion::CurrentProcess,
+            MemoryRegion::CurrentProcess,
         )
     };
     buffers.patch = NonZeroU32::new(patch_base);
@@ -617,7 +647,7 @@ impl Scratch {
                         &mut self.size,
                         AllocationType::COMMIT | AllocationType::RESERVE,
                         PageProtection::READWRITE,
-                        xboxkrnl::MemoryRegion::CurrentProcess,
+                        MemoryRegion::CurrentProcess,
                     )
                 };
                 self.base = NonZeroU32::new(base);

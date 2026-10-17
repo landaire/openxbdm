@@ -27,6 +27,7 @@ mod xbox360 {
     use core::sync::atomic::Ordering;
     use core::time::Duration;
 
+    use openxbdm_core::XBDM_PORT;
     use openxbdm_core::status::KernelError;
     use openxbdm_server::ConnectionIndex;
     use openxbdm_server::Server;
@@ -47,6 +48,7 @@ mod xbox360 {
     use xbox360_sys::xam::XnetStartupFlags;
     use xbox360_sys::xam::XnetStartupParams;
     use xbox360_sys::xboxkrnl;
+    use xbox360_sys::xboxkrnl::Boolean;
     use xbox360_sys::xboxkrnl::BugCheckCode;
     use xbox360_sys::xboxkrnl::DllEntryReason;
     use xbox360_sys::xboxkrnl::Handle;
@@ -64,31 +66,40 @@ mod xbox360 {
     use crate::net::FdSetExt as _;
     use crate::net::XamNetwork;
 
-    const XBDM_PORT: u16 = 730;
     const LISTEN_BACKLOG: i32 = 8;
     /// Stack of stock's server thread (docs framework notes). The server
     /// state is static, and no frame on this thread may hold large buffers.
     const SERVER_STACK_SIZE: u32 = 0x8000;
     /// `ExCreateThread` flags of stock's server thread (docs framework
-    /// notes); bit 0x400 makes it not debuggable, so its own thread
+    /// notes). The server thread is not debuggable, so its own thread
     /// notifications never wait for it.
     const SERVER_THREAD_FLAGS: ThreadCreationFlags =
-        ThreadCreationFlags::from_bits_retain(0x40004a6);
+        kernel::SYSTEM_THREAD_FLAGS.union(ThreadCreationFlags::NOT_DEBUGGABLE);
+    /// Exit code of the server and recovery threads.
+    const THREAD_EXIT_CODE: u32 = 0;
     /// Bug check code of a panic above passive level ('OXDP').
     const BUG_CHECK_PANIC: BugCheckCode = BugCheckCode(0x4f58_4450);
+    /// Delay between attempts of startup work that waits for the network or
+    /// the file system.
+    const RETRY_DELAY: Duration = Duration::from_secs(1);
     /// A failed listen is retried after LISTEN_RETRY_STEPS steps of
-    /// LISTEN_RETRY_STEP_MS; each step serves queued requests.
+    /// LISTEN_RETRY_STEP; each step serves queued requests.
     const LISTEN_RETRY_STEPS: u32 = 10;
-    const LISTEN_RETRY_STEP_MS: u32 = 100;
+    const LISTEN_RETRY_STEP: Duration = Duration::from_millis(100);
     /// Select timeout, which bounds the delay before a shutdown request is
     /// seen.
     const POLL_INTERVAL_MS: u32 = 1000;
     /// Longest wait before a thread posted at a debug event is processed.
     const DEBUG_EVENT_POLL_MS: u32 = 20;
     const OVERRIDE_REMOVAL_ATTEMPTS: u32 = 30;
+    /// Sleep of a thread parked after a panic.
+    const PARKED_SLEEP: Duration = Duration::from_secs(1);
+    /// Destination of a discovery reply to every host.
+    const BROADCAST: Ipv4Address = Ipv4Address([0xff; 4]);
 
     static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-    static THREAD_HANDLE: AtomicU32 = AtomicU32::new(0);
+    /// The server or recovery thread, or `Handle::NULL` when none runs.
+    static THREAD_HANDLE: AtomicU32 = AtomicU32::new(Handle::NULL.raw());
     static LISTENER_SOCKET: AtomicU32 = AtomicU32::new(Socket::INVALID.raw());
 
     fn shutting_down() -> bool {
@@ -182,6 +193,14 @@ mod xbox360 {
         crate::backend::debugger::end_event_service();
     }
 
+    /// A connection selected for one pass.
+    #[derive(Clone, Copy)]
+    struct ActiveConnection {
+        index: ConnectionIndex,
+        socket: SocketId,
+        wants_write: bool,
+    }
+
     #[inline(never)]
     fn serve_passes(
         server: &mut Server,
@@ -192,10 +211,14 @@ mod xbox360 {
     ) {
         let mut timer_ms = POLL_INTERVAL_MS;
         while !shutting_down() {
-            let mut active = [None::<(ConnectionIndex, SocketId, bool)>; MAX_CONNECTIONS];
+            let mut active = [None::<ActiveConnection>; MAX_CONNECTIONS];
             for (slot, (index, socket, owner)) in server.connections().enumerate() {
                 if owner != Owner::Unserviced && !server.awaits_processor(index) {
-                    active[slot] = Some((index, socket, server.wants_write(index)));
+                    active[slot] = Some(ActiveConnection {
+                        index,
+                        socket,
+                        wants_write: server.wants_write(index),
+                    });
                 }
             }
 
@@ -205,7 +228,12 @@ mod xbox360 {
             if let Some(discovery) = discovery {
                 read.insert(discovery);
             }
-            for &(_, socket, wants_write) in active.iter().flatten() {
+            for &ActiveConnection {
+                socket,
+                wants_write,
+                ..
+            } in active.iter().flatten()
+            {
                 if wants_write {
                     write.insert(net::socket_of(socket));
                 } else {
@@ -226,7 +254,12 @@ mod xbox360 {
                 return;
             }
 
-            for &(index, socket, wants_write) in active.iter().flatten() {
+            for &ActiveConnection {
+                index,
+                socket,
+                wants_write,
+            } in active.iter().flatten()
+            {
                 if wants_write && write.contains(net::socket_of(socket)) {
                     server.on_writable(index, console, network);
                 } else if !wants_write && read.contains(net::socket_of(socket)) {
@@ -279,7 +312,7 @@ mod xbox360 {
         let destination = match answer.destination {
             session::DiscoveryDestination::Sender => sender,
             session::DiscoveryDestination::Broadcast => Endpoint {
-                address: Ipv4Address([0xff; 4]),
+                address: BROADCAST,
                 port: sender.port,
             },
         };
@@ -292,7 +325,7 @@ mod xbox360 {
                 return;
             }
             kernel::debug_print(c"openxbdm: network initialization failed\n");
-            sleep(Duration::from_millis(1000));
+            sleep(RETRY_DELAY);
         }
 
         // Stock initializes the studio subsystem last, once the network runs.
@@ -314,7 +347,7 @@ mod xbox360 {
                         break;
                     }
                     crate::backend::dispatcher::drain(server, console, &mut network);
-                    sleep(Duration::from_millis(u64::from(LISTEN_RETRY_STEP_MS)));
+                    sleep(LISTEN_RETRY_STEP);
                 }
                 continue;
             };
@@ -322,6 +355,8 @@ mod xbox360 {
             if shutting_down() {
                 break;
             }
+            // The message names XBDM_PORT.
+            const _: () = assert!(XBDM_PORT == 730);
             kernel::debug_print(c"openxbdm: listening on TCP port 730\n");
             let discovery = net::bind_datagram(XBDM_PORT).ok();
             serve(server, console, &mut network, listener, discovery);
@@ -362,7 +397,7 @@ mod xbox360 {
             if removal != Removal::Failed || shutting_down() {
                 break;
             }
-            sleep(Duration::from_millis(1000));
+            sleep(RETRY_DELAY);
             removal = delete_file(OVERRIDE_MODULE_PATH);
         }
         kernel::debug_print(match removal {
@@ -384,7 +419,7 @@ mod xbox360 {
         }
         stop_server_services();
         // SAFETY: called on the server thread, which owns no further state.
-        unsafe { xboxkrnl::ExTerminateThread(0) }
+        unsafe { xboxkrnl::ExTerminateThread(THREAD_EXIT_CODE) }
     }
 
     /// Later calls and events take their default without waiting.
@@ -407,73 +442,89 @@ mod xbox360 {
         )
     }
 
-    extern "C" fn module_entry(module: u32, reason: u32, _reserved: u32) -> u32 {
-        match DllEntryReason::from_raw(reason) {
+    extern "C" fn module_entry(module: u32, reason: u32, _reserved: u32) -> Boolean {
+        let succeeded = match DllEntryReason::from_raw(reason) {
             Some(DllEntryReason::ProcessDetach) => {
-                SHUTDOWN.store(true, Ordering::SeqCst);
-                close_listener();
-                #[cfg(feature = "smb")]
-                crate::smb::close_listener();
-                let handle = THREAD_HANDLE.swap(0, Ordering::SeqCst);
-                if handle != 0 {
-                    // Commands on the server thread can arm engine hooks,
-                    // so the engines stop only after it has exited.
-                    // SAFETY: the handle came from `ExCreateThread` and the
-                    // swap above makes this the only owner.
-                    unsafe {
-                        xboxkrnl::NtWaitForSingleObjectEx(
-                            Handle::from_raw(handle),
-                            ProcessorMode::Kernel,
-                            false,
-                            core::ptr::null(),
-                        );
-                        xboxkrnl::NtClose(Handle::from_raw(handle));
-                    }
-                }
-                stop_server_services();
-                crate::backend::debugger::uninstall();
-                crate::backend::session::uninstall();
-                crate::backend::performance::shut_down();
-                crate::backend::dispatcher::wait_for_callers();
-                crate::backend::debugger::wait_for_event_waiters();
-                1
+                unload();
+                true
             }
-            Some(DllEntryReason::ProcessAttach) => {
-                // The recovery installs nothing, refuses every export, and
-                // never waits on the loader thread.
-                #[cfg(feature = "boot-guard")]
-                if delete_file(BOOT_MARKER_PATH) != Removal::Removed {
-                    crate::exports::RECOVERY.store(1, Ordering::SeqCst);
-                    return start_thread(recovery_thread).map_or(0, |()| 1);
-                }
-                crate::backend::dispatcher::initialize_host();
-                if !kernel::register_debug_monitor(module) {
-                    kernel::debug_print(c"openxbdm: debug monitor registration failed\n");
-                    return 0;
-                }
-                crate::backend::debugger::install();
-                crate::backend::network::xhttpproxy::initialize();
-                crate::backend::session::initialize();
-                crate::backend::hardware::initialize();
-                crate::backend::dispatcher::install();
-                crate::backend::performance::initialize();
-                crate::backend::memory::initialize();
-                // The hooks above point into the image, so it stays loaded
-                // without a server; calls and events take their defaults.
-                if start_thread(server_thread).is_err() {
-                    stop_server_services();
-                }
-                1
+            Some(DllEntryReason::ProcessAttach) => load(module),
+            // Other reasons need no work.
+            _ => true,
+        };
+        Boolean::from(succeeded)
+    }
+
+    #[inline(always)]
+    fn unload() {
+        SHUTDOWN.store(true, Ordering::SeqCst);
+        close_listener();
+        #[cfg(feature = "smb")]
+        crate::smb::close_listener();
+        let handle = Handle::from_raw(THREAD_HANDLE.swap(Handle::NULL.raw(), Ordering::SeqCst));
+        if !handle.is_null() {
+            // Commands on the server thread can arm engine hooks, so the
+            // engines stop only after it has exited.
+            // SAFETY: the handle came from `ExCreateThread` and the swap
+            // above makes this the only owner.
+            unsafe {
+                xboxkrnl::NtWaitForSingleObjectEx(
+                    handle,
+                    ProcessorMode::Kernel,
+                    false,
+                    core::ptr::null(),
+                );
+                xboxkrnl::NtClose(handle);
             }
-            _ => 1,
         }
+        stop_server_services();
+        crate::backend::debugger::uninstall();
+        crate::backend::session::uninstall();
+        crate::backend::performance::shut_down();
+        crate::backend::dispatcher::wait_for_callers();
+        crate::backend::debugger::wait_for_event_waiters();
+    }
+
+    /// Whether the module stays loaded.
+    #[inline(always)]
+    fn load(module: u32) -> bool {
+        // Every later read of these imports skips the check.
+        if !kernel::data_imports_resolved() {
+            kernel::debug_print(c"openxbdm: unresolved data import\n");
+            return false;
+        }
+        // The recovery installs nothing, refuses every export, and never
+        // waits on the loader thread.
+        #[cfg(feature = "boot-guard")]
+        if delete_file(BOOT_MARKER_PATH) != Removal::Removed {
+            crate::exports::RECOVERY.store(1, Ordering::SeqCst);
+            return start_thread(recovery_thread).is_ok();
+        }
+        crate::backend::dispatcher::initialize_host();
+        if !kernel::register_debug_monitor(module) {
+            kernel::debug_print(c"openxbdm: debug monitor registration failed\n");
+            return false;
+        }
+        crate::backend::debugger::install();
+        crate::backend::network::xhttpproxy::initialize();
+        crate::backend::session::initialize();
+        crate::backend::hardware::initialize();
+        crate::backend::dispatcher::install();
+        crate::backend::performance::initialize();
+        crate::backend::memory::initialize();
+        // The hooks above point into the image, so it stays loaded without
+        // a server; calls and events take their defaults.
+        if start_thread(server_thread).is_err() {
+            stop_server_services();
+        }
+        true
     }
 
     struct ThreadCreationFailed;
 
     fn start_thread(entry: extern "C" fn(u32) -> u32) -> Result<(), ThreadCreationFailed> {
         SHUTDOWN.store(false, Ordering::SeqCst);
-        let mut handle = 0u32;
+        let mut handle = Handle::NULL.raw();
         let entry = entry as *const () as usize as u32;
         // SAFETY: `handle` is a live local and `entry` is a thread routine
         // with the start signature.
@@ -508,7 +559,7 @@ mod xbox360 {
             unsafe { xboxkrnl::HalReturnToFirmware(xboxkrnl::FirmwareRequest::RebootQuiesce) };
         }
         // SAFETY: called on the recovery thread, which owns no further state.
-        unsafe { xboxkrnl::ExTerminateThread(0) }
+        unsafe { xboxkrnl::ExTerminateThread(THREAD_EXIT_CODE) }
     }
 
     #[cfg(feature = "boot-guard")]
@@ -526,11 +577,11 @@ mod xbox360 {
         if processor::current_thread() == crate::backend::debugger::server_thread() {
             stop_server_services();
             // SAFETY: the server thread has released every waiter above.
-            unsafe { xboxkrnl::ExTerminateThread(0) };
+            unsafe { xboxkrnl::ExTerminateThread(THREAD_EXIT_CODE) };
         }
         xboxkrnl::DbgBreakPoint();
         loop {
-            sleep(Duration::from_millis(1000));
+            sleep(PARKED_SLEEP);
         }
     }
 }

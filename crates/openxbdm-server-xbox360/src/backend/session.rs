@@ -243,7 +243,8 @@ pub(crate) fn take_title_terminated() -> bool {
 
 /// Title identifier of the running executable (stock 0x91f335c0).
 fn current_title_id() -> u32 {
-    let module = crate::kernel::resolved(&XexExecutableModuleHandle).load(Ordering::Relaxed);
+    // SAFETY: `data_imports_resolved` held at module load.
+    let module = unsafe { XexExecutableModuleHandle.get_unchecked() }.load(Ordering::Relaxed);
     if module == 0 {
         return 0;
     }
@@ -296,8 +297,9 @@ impl commands::session::Backend for Console {
 
     fn set_server_processor(&mut self, processor: ProcessorNumber) {
         let mut thread = 0u32;
+        // SAFETY: `data_imports_resolved` held at module load.
         let object_type =
-            core::ptr::from_ref(crate::kernel::resolved(&xboxkrnl::ExThreadObjectType)).addr()
+            core::ptr::from_ref(unsafe { xboxkrnl::ExThreadObjectType.get_unchecked() }).addr()
                 as u32;
         // SAFETY: `thread` is a local word; the pseudo handle names the
         // calling thread.

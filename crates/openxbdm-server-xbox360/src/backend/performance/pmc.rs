@@ -631,8 +631,9 @@ fn current_setup(index: u32) -> Option<Setup> {
 /// Run the calling thread on processor `processor` (stock 0x91f78a68).
 fn set_processor(processor: u8) {
     let mut thread = 0u32;
+    // SAFETY: `data_imports_resolved` held at module load.
     let object_type =
-        core::ptr::from_ref(kernel::resolved(&xboxkrnl::ExThreadObjectType)).addr() as u32;
+        core::ptr::from_ref(unsafe { xboxkrnl::ExThreadObjectType.get_unchecked() }).addr() as u32;
     // SAFETY: CURRENT_THREAD is the pseudo-handle of the calling thread,
     // `object_type` the kernel thread type, and `thread` a live u32.
     let status = unsafe {

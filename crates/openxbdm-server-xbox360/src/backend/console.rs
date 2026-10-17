@@ -15,6 +15,7 @@ use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::Platform;
 use openxbdm_server::Server;
 use openxbdm_server::commands;
+use openxbdm_server::commands::console::BufferTooSmall;
 use openxbdm_server::commands::console::CONSOLE_ID_LENGTH;
 use openxbdm_server::commands::console::ConfigSetting;
 use openxbdm_server::commands::console::ConsoleId;
@@ -45,6 +46,8 @@ use openxbdm_server::commands::console::SystemInformation;
 use openxbdm_server::commands::console::SystemSettings;
 use openxbdm_server::commands::console::TraceMask;
 use openxbdm_server::commands::console::Version;
+use openxbdm_server::commands::hardware::SystemApp;
+use openxbdm_server::commands::hardware::SystemMessage;
 use openxbdm_server::text::LineText;
 use xbox360::console::hardware_flags;
 use xbox360::console::kernel_version;
@@ -58,6 +61,7 @@ use xbox360::time::TickCount;
 use xbox360::time::sleep;
 use xbox360_sys::export_raw;
 use xbox360_sys::processor;
+use xbox360_sys::value_enum;
 use xbox360_sys::xam;
 use xbox360_sys::xam::NetDll_XHttpCloseHandle;
 use xbox360_sys::xam::NetDll_XHttpConnect;
@@ -76,15 +80,17 @@ use xbox360_sys::xam::XamSetInactivityTimeFromConfig;
 use xbox360_sys::xam::XnAddrStatus;
 use xbox360_sys::xam::XnCaller;
 use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::DebugMemoryStatistics;
 use xbox360_sys::xboxkrnl::DebugMonitorService;
+use xbox360_sys::xboxkrnl::HardwareFlags;
 use xbox360_sys::xboxkrnl::ImageFlags;
 use xbox360_sys::xboxkrnl::ImageVersion;
 use xbox360_sys::xboxkrnl::SmcCommand;
+use xbox360_sys::xboxkrnl::SmcI2cDevice;
 use xbox360_sys::xboxkrnl::SmcMessage;
 use xbox360_sys::xboxkrnl::XeKeysGetConsoleID;
 
 use super::Console;
-use super::HARDWARE_NOT_DEBUGGABLE;
 use crate::exports::bridged;
 use crate::exports::export;
 use crate::exports::export_result;
@@ -93,22 +99,13 @@ use crate::kernel::version_words;
 use crate::net;
 use crate::net::XamNetwork;
 
-/// Hardware flag: 1 GiB of memory is installed.
-const HARDWARE_ONE_GIGABYTE: u32 = 0x0001_0000;
 /// Kernel export that atomically modifies a configuration dword.
 const CONFIG_MODIFY_ORDINAL: Ordinal = Ordinal::new(700).unwrap();
 /// System UI library export that switches a feature.
-const FEATURE_SWITCH_ORDINAL: u32 = 515;
-/// Size of the memory statistics block of `ExDebugMonitorService` 8.
-const MEMORY_STATISTICS_SIZE: usize = 0x90;
+const FEATURE_SWITCH_ORDINAL: Ordinal = Ordinal::new(515).unwrap();
 /// System message service of the network configuration and its message.
-const NETWORK_SERVICE: u32 = 0xef;
-const NETWORK_RA_MESSAGE: u32 = 0x00a0_0004;
-/// Descriptor kinds of the network configuration message.
-const NETWORK_RA_RECORD: u32 = 5;
-const NETWORK_RA_RESET: u32 = 2;
-/// I2C device of the settings block.
-const SMC_I2C_DEVICE: u8 = 0xd4;
+const NETWORK_APP: SystemApp = SystemApp(0xef);
+const NETWORK_RA_MESSAGE: SystemMessage = SystemMessage(0x00a0_0004);
 /// Bytes per SMC I2C transfer.
 const SMC_I2C_CHUNK: usize = 8;
 /// Attempts per SMC I2C transfer.
@@ -141,25 +138,47 @@ impl Data {
     }
 }
 
+/// Operation of a [`NetworkRaMessage`].
+#[repr(u32)]
+#[derive(Clone, Copy)]
+enum NetworkRaOperation {
+    Get = 0,
+    Set = 1,
+}
+
 /// Request record of the network configuration message.
 #[repr(C)]
 struct NetworkRaMessage {
+    /// A [`NetworkRaOperation`]; the service may rewrite the record.
     operation: u32,
     flags: u32,
     custom_boot_address: u32,
 }
 
+/// Descriptor kind of the network configuration message.
+#[repr(u32)]
+#[derive(Clone, Copy)]
+enum NetworkRaKind {
+    Reset = 2,
+    Record = 5,
+}
+
 /// Descriptor passed with the network configuration message.
 #[repr(C)]
 struct NetworkRaDescriptor {
+    /// A [`NetworkRaKind`].
     kind: u32,
     record: u32,
     size: u32,
 }
 
-fn smc_i2c_message(address: usize) -> SmcMessage {
+/// An I2C transfer to the settings EEPROM at `address` that writes
+/// `written` data bytes after the address byte.
+fn smc_i2c_message(address: usize, written: usize) -> SmcMessage {
     let mut message = SmcMessage::new(SmcCommand::I2c);
-    message.0[3] = SMC_I2C_DEVICE;
+    // Bytes written, counting the address byte, in the high nibble.
+    message.0[1] = ((written + 1) << 4) as u8;
+    message.0[3] = SmcI2cDevice::SETTINGS_EEPROM.0;
     message.0[6] = address as u8;
     message
 }
@@ -169,8 +188,8 @@ fn send_network_ra(descriptor: &mut NetworkRaDescriptor) -> Result<(), NetworkRa
     // overlapped block is passed.
     let result = unsafe {
         xam::XMsgStartIORequest(
-            NETWORK_SERVICE,
-            NETWORK_RA_MESSAGE,
+            NETWORK_APP.0,
+            NETWORK_RA_MESSAGE.0,
             core::ptr::null_mut(),
             (descriptor as *mut NetworkRaDescriptor).cast(),
             size_of::<NetworkRaDescriptor>() as u32,
@@ -199,7 +218,11 @@ impl Console {
         let mut address = 0u32;
         // SAFETY: `address` is a live local.
         unsafe {
-            xboxkrnl::XexGetProcedureAddress(module.raw(), FEATURE_SWITCH_ORDINAL, &mut address)
+            xboxkrnl::XexGetProcedureAddress(
+                module.raw(),
+                u32::from(FEATURE_SWITCH_ORDINAL.get()),
+                &mut address,
+            )
         }
         .result()
         .ok()?;
@@ -218,35 +241,34 @@ impl Console {
 
 /// Stock 0x91f4cd60 (export 220, `consolefeatures`).
 fn kit_features() -> KitFeatures {
-    let flags = hardware_flags().bits();
+    let flags = hardware_flags();
     KitFeatures {
-        debugging: flags & HARDWARE_NOT_DEBUGGABLE == 0,
+        debugging: !flags.contains(HardwareFlags::TEST_KIT),
         secondary_nic: net::has_secondary_nic(),
-        one_gigabyte_ram: flags & HARDWARE_ONE_GIGABYTE != 0,
+        one_gigabyte_ram: flags.contains(HardwareFlags::ONE_GIGABYTE),
     }
 }
 
 /// `ExDebugMonitorService` 8; `None` when it fails or replies short.
 fn memory_statistics() -> Option<MemoryStatistics> {
-    let mut words = [0u32; MEMORY_STATISTICS_SIZE / 4];
-    words[0] = MEMORY_STATISTICS_SIZE as u32;
-    words[1] = 0x68;
-    // SAFETY: `words` is a live buffer whose first word gives its size.
+    let mut block = DebugMemoryStatistics::new();
+    // SAFETY: `block` is a live statistics block whose length fields give
+    // its size.
     let status = unsafe {
         xboxkrnl::ExDebugMonitorService(
             DebugMonitorService::MemoryStatistics,
-            words.as_mut_ptr() as usize as u32,
+            &mut block as *mut DebugMemoryStatistics as usize as u32,
             0,
             0,
         )
     };
-    if status.result().is_err() || (words[0] as usize) < MEMORY_STATISTICS_SIZE {
+    if status.result().is_err() || !block.is_complete() {
         return None;
     }
     Some(MemoryStatistics {
-        physical_pages: words[2],
-        debug_memory: words[0x70 / 4],
-        page_threshold: words[0x7c / 4],
+        physical_pages: block.statistics.total_physical_pages,
+        debug_memory: block.debug_memory,
+        page_threshold: block.page_threshold,
     })
 }
 
@@ -319,10 +341,9 @@ impl commands::console::Backend for Console {
     fn read_settings_block(&mut self) -> Option<[u8; SETTINGS_BLOCK_SIZE]> {
         let mut block = [0u8; SETTINGS_BLOCK_SIZE];
         for address in (0..SETTINGS_BLOCK_SIZE).step_by(SMC_I2C_CHUNK) {
-            let mut message = smc_i2c_message(address);
-            message.0[1] = 0x10;
+            let mut message = smc_i2c_message(address, 0);
             message.0[2] = SMC_I2C_CHUNK as u8;
-            message.0[5] = SMC_I2C_DEVICE;
+            message.0[5] = SmcI2cDevice::SETTINGS_EEPROM.0;
             let mut done = false;
             for _ in 0..SMC_I2C_ATTEMPTS {
                 let mut reply = SmcMessage::default();
@@ -346,8 +367,7 @@ impl commands::console::Backend for Console {
     /// 2 ms pause after a write and 3 ms after a failure.
     fn write_settings_block(&mut self, block: &[u8; SETTINGS_BLOCK_SIZE]) -> bool {
         for address in (0..SETTINGS_BLOCK_SIZE).step_by(SMC_I2C_CHUNK) {
-            let mut message = smc_i2c_message(address);
-            message.0[1] = ((SMC_I2C_CHUNK + 1) << 4) as u8;
+            let mut message = smc_i2c_message(address, SMC_I2C_CHUNK);
             message.0[7..7 + SMC_I2C_CHUNK]
                 .copy_from_slice(&block[address..address + SMC_I2C_CHUNK]);
             let mut done = false;
@@ -414,22 +434,22 @@ impl commands::console::Backend for Console {
         let (operation, record) = match request {
             NetworkRaRequest::Reset => {
                 let mut descriptor = NetworkRaDescriptor {
-                    kind: NETWORK_RA_RESET,
+                    kind: NetworkRaKind::Reset as u32,
                     record: 0,
                     size: 0,
                 };
                 return send_network_ra(&mut descriptor);
             }
-            NetworkRaRequest::Get(record) => (0, record),
-            NetworkRaRequest::Set(record) => (1, record),
+            NetworkRaRequest::Get(record) => (NetworkRaOperation::Get, record),
+            NetworkRaRequest::Set(record) => (NetworkRaOperation::Set, record),
         };
         let mut message = NetworkRaMessage {
-            operation,
+            operation: operation as u32,
             flags: record.flags.bits(),
             custom_boot_address: record.custom_boot_address,
         };
         let mut descriptor = NetworkRaDescriptor {
-            kind: NETWORK_RA_RECORD,
+            kind: NetworkRaKind::Record as u32,
             record: &mut message as *mut NetworkRaMessage as usize as u32,
             size: size_of::<NetworkRaMessage>() as u32,
         };
@@ -498,7 +518,7 @@ impl commands::console::Backend for Console {
                 0,
                 0,
                 0,
-                0x1000_0000,
+                http::SESSION_ASYNC,
             )
         };
         if data.http_session == 0 {
@@ -515,7 +535,7 @@ impl commands::console::Backend for Console {
                 data.http_session,
                 data.http_server.as_ptr(),
                 u32::from(request.port),
-                1,
+                http::CONNECT_FLAGS,
             )
         };
         if data.http_connection == 0 {
@@ -541,7 +561,7 @@ impl commands::console::Backend for Console {
         if data.http_request == 0 {
             return fail(data, HttpStartStage::Request);
         }
-        let mut value = 3u32;
+        let mut value = http::MAX_REDIRECTS;
         // SAFETY: `http_status_entry` has the status callback signature and
         // `value` is a live 4-byte option buffer.
         unsafe {
@@ -549,26 +569,26 @@ impl commands::console::Backend for Console {
                 XnCaller::DebugMonitor,
                 data.http_request,
                 http_status_entry as *const () as usize as u32,
-                u32::MAX,
+                http::ALL_NOTIFICATIONS,
                 0,
             );
             NetDll_XHttpSetOption(
                 XnCaller::DebugMonitor,
                 data.http_request,
-                0x59,
+                http::OPTION_MAX_REDIRECTS,
                 &mut value,
-                4,
+                size_of::<u32>() as u32,
             );
-            value = 8;
+            value = http::DISABLE_KEEP_ALIVE;
             NetDll_XHttpSetOption(
                 XnCaller::DebugMonitor,
                 data.http_request,
-                0x3f,
+                http::OPTION_DISABLE_FEATURE,
                 &mut value,
-                4,
+                size_of::<u32>() as u32,
             );
         }
-        HTTP_STATE.store(1, Ordering::Relaxed);
+        HttpState::Sending.store();
         // SAFETY: the request handle was opened above; no headers or body.
         if unsafe {
             NetDll_XHttpSendRequest(XnCaller::DebugMonitor, data.http_request, 0, 0, 0, 0, 0, 0)
@@ -589,8 +609,8 @@ impl commands::console::Backend for Console {
                 error: last_error(),
             });
         }
-        if HTTP_STATE.load(Ordering::Relaxed) == 2 {
-            HTTP_STATE.store(3, Ordering::Relaxed);
+        if HttpState::load() == HttpState::Sent as u32 {
+            HttpState::Receiving.store();
             // SAFETY: the request handle was opened by `http_begin`.
             if unsafe { NetDll_XHttpReceiveResponse(XnCaller::DebugMonitor, data.http_request, 0) }
                 == 0
@@ -600,15 +620,15 @@ impl commands::console::Backend for Console {
                 });
             }
         }
-        if HTTP_STATE.load(Ordering::Relaxed) == 4 {
+        if HttpState::load() == HttpState::HeadersAvailable as u32 {
             let mut code = 0u32;
-            let mut length = 4u32;
+            let mut length = size_of::<u32>() as u32;
             // SAFETY: `code` and `length` are live locals of the stated size.
             if unsafe {
                 NetDll_XHttpQueryHeaders(
                     XnCaller::DebugMonitor,
                     data.http_request,
-                    0x2000_fffe,
+                    http::QUERY_STATUS_CODE,
                     0,
                     &mut code,
                     &mut length,
@@ -620,17 +640,17 @@ impl commands::console::Backend for Console {
                     error: last_error(),
                 });
             }
-            if code != 200 {
+            if code != http::STATUS_OK {
                 return HttpProgress::Failed(HttpFailure::Status { code });
             }
             let mut content = 0u32;
-            length = 4;
+            length = size_of::<u32>() as u32;
             // SAFETY: `content` and `length` are live locals of the stated size.
             if unsafe {
                 NetDll_XHttpQueryHeaders(
                     XnCaller::DebugMonitor,
                     data.http_request,
-                    0x2000_0009,
+                    http::QUERY_CONTENT_LENGTH,
                     0,
                     &mut content,
                     &mut length,
@@ -648,15 +668,15 @@ impl commands::console::Backend for Console {
             body.fill(0);
             HTTP_REMAINING.store(content, Ordering::Relaxed);
             HTTP_RECEIVED.store(0, Ordering::Relaxed);
-            HTTP_STATE.store(6, Ordering::Relaxed);
+            HttpState::ReadComplete.store();
         }
-        if HTTP_STATE.load(Ordering::Relaxed) == 6 {
+        if HttpState::load() == HttpState::ReadComplete as u32 {
             let remaining = HTTP_REMAINING.load(Ordering::Relaxed);
             let received = HTTP_RECEIVED.load(Ordering::Relaxed);
             if remaining == 0 {
                 return HttpProgress::Complete(received as usize);
             }
-            HTTP_STATE.store(5, Ordering::Relaxed);
+            HttpState::Reading.store();
             let target = body[received as usize..].as_mut_ptr();
             // SAFETY: `target` has at least `remaining` bytes of `body`, which
             // the caller keeps for the whole transfer; `read` is not used.
@@ -675,13 +695,14 @@ impl commands::console::Backend for Console {
                 });
             }
         }
-        if HTTP_STATE.load(Ordering::Relaxed) == 7 {
-            let failure = match HTTP_FAILURE_KIND.load(Ordering::Relaxed) {
-                FAILURE_TRUNCATED => HttpFailure::Truncated {
+        if HttpState::load() == HttpState::Failed as u32 {
+            let kind = HttpFailureKind::from_raw(HTTP_FAILURE_KIND.load(Ordering::Relaxed));
+            let failure = match kind {
+                Some(HttpFailureKind::Truncated) => HttpFailure::Truncated {
                     received: HTTP_RECEIVED.load(Ordering::Relaxed),
                     expected: HTTP_REMAINING.load(Ordering::Relaxed),
                 },
-                _ => HttpFailure::Request {
+                Some(HttpFailureKind::Request) | None => HttpFailure::Request {
                     state: HTTP_FAILURE_STATE.load(Ordering::Relaxed),
                     error: Win32Error::new(HTTP_FAILURE_ERROR.load(Ordering::Relaxed)),
                 },
@@ -753,9 +774,11 @@ static REGISTRATION: SpinLock<RegistrationResult> = SpinLock::new(RegistrationRe
 
 /// Result of a NULL output pointer.
 const BAD_PARAMETER: Hresult = ErrorCode::BadParameter.hresult();
-/// Hardware flag that enables the setting of exports 175 and 176; 0x20
-/// marks a hard disk.
-const HARDWARE_XCONFIG_QWORD: u32 = 0x10;
+/// XConfig setting of exports 175 and 176.
+const XCONFIG_QWORD: ConfigSetting = ConfigSetting {
+    category: 3,
+    index: 8,
+};
 
 /// Apply an exported setting of a waiting caller on the server thread.
 fn service_apply_setting(
@@ -772,18 +795,19 @@ fn service_apply_setting(
 /// Exports 43, 118, 120, 122. Off the server thread at passive level the
 /// setting is applied before the export returns, as stock does; otherwise
 /// the server cannot be reached and the setting is dropped.
-fn apply_setting(mut setting: ExportedSetting) -> u32 {
+fn apply_setting(mut setting: ExportedSetting) -> Hresult {
     let _ = super::dispatcher::call_on_server_with(&mut setting, service_apply_setting);
-    Hresult::OK.0
+    Hresult::OK
 }
 
 /// Export 43: NULL clears the name; at most 20 bytes are kept.
-extern "C" fn export_set_debug_name(name: u32) -> u32 {
+extern "C" fn export_set_debug_name(name: *const u8) -> Hresult {
     let mut bytes = [0u8; DEBUG_NAME_CAPACITY - 1];
     let mut length = 0;
-    while name != 0 && length < bytes.len() {
-        // SAFETY: the caller passes a NUL-terminated string.
-        let byte = unsafe { core::ptr::read_volatile((name as usize + length) as *const u8) };
+    while !name.is_null() && length < bytes.len() {
+        // SAFETY: export 43 takes NULL or a NUL-terminated string, and the
+        // loop stops at its NUL.
+        let byte = unsafe { name.add(length).read() };
         if byte == 0 {
             break;
         }
@@ -794,180 +818,207 @@ extern "C" fn export_set_debug_name(name: u32) -> u32 {
 }
 export!(43, export_set_debug_name);
 
-extern "C" fn export_set_dump_mode(mode: u32) -> u32 {
+extern "C" fn export_set_dump_mode(mode: u32) -> Hresult {
     apply_setting(ExportedSetting::DumpMode(mode))
 }
 export!(118, export_set_dump_mode);
 
-extern "C" fn export_set_dump_settings(block: u32) -> u32 {
-    let mut copy = [0u8; DUMP_SETTINGS_SIZE];
-    // SAFETY: the caller passes a block of DUMP_SETTINGS_SIZE bytes.
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            block as usize as *const u8,
-            copy.as_mut_ptr(),
-            DUMP_SETTINGS_SIZE,
-        )
-    };
+extern "C" fn export_set_dump_settings(block: *const [u8; DUMP_SETTINGS_SIZE]) -> Hresult {
+    // SAFETY: export 120 takes a readable block of DUMP_SETTINGS_SIZE bytes.
+    let copy = unsafe { block.read() };
     apply_setting(ExportedSetting::DumpSettings(copy))
 }
 export!(120, export_set_dump_settings);
 
-extern "C" fn export_set_event_defer(mask: u32) -> u32 {
+extern "C" fn export_set_event_defer(mask: u32) -> Hresult {
     apply_setting(ExportedSetting::EventDefer(mask))
 }
 export!(122, export_set_event_defer);
-const HARDWARE_HDD: u32 = 0x20;
-/// XConfig setting of exports 175 and 176.
-const XCONFIG_QWORD: (u16, u16) = (3, 8);
 
-/// Store `value` through the caller's pointer; NULL fails (stock exports
-/// 117, 121, 140).
-fn store_word(output: u32, value: u32) -> u32 {
-    if output == 0 {
-        return BAD_PARAMETER.0;
+/// Store `value` through the caller's output; NULL fails (stock exports
+/// 117, 121, 140, 213, 214, 220).
+///
+/// # Safety
+///
+/// `output` is NULL or a writable dword at any alignment.
+unsafe fn write_output(output: *mut u32, value: u32) -> Hresult {
+    if output.is_null() {
+        return BAD_PARAMETER;
     }
-    write_word(output, value);
-    Hresult::OK.0
+    // SAFETY: per the contract of this fn.
+    unsafe { output.write_unaligned(value) };
+    Hresult::OK
 }
 
 /// Export 17: copy the debug name into `buffer` of `*size` bytes.
-extern "C" fn export_get_debug_name(buffer: u32, size: u32) -> u32 {
-    get_debug_name(buffer, size)
+extern "C" fn export_get_debug_name(buffer: *mut u8, size: *const u32) -> Hresult {
+    // SAFETY: export 17 takes NULL or a readable size, and NULL or a buffer
+    // of that many writable bytes.
+    let output = unsafe { debug_name_output(buffer, size) };
+    export_result(get_debug_name(output))
 }
 export!(17, export_get_debug_name);
 
 /// Export 91 returns its argument (stock returns the copy's destination).
 extern "C" fn export_get_system_settings(block: u32) -> u32 {
-    service_get_system_settings(block);
+    // SAFETY: export 91 takes the caller's settings block, with the
+    // contract of control code 0x1f.
+    unsafe { service_get_system_settings(block) };
     block
 }
 export!(91, export_get_system_settings);
 
 extern "C" fn export_set_system_settings(block: u32) -> u32 {
-    service_set_system_settings(block)
+    // SAFETY: export 92 takes the caller's settings block, with the
+    // contract of control code 0x1e.
+    unsafe { service_set_system_settings(block) }
 }
 export!(92, export_set_system_settings);
 
 /// Export 117: the crash dump mode.
-extern "C" fn export_get_dump_mode(output: u32) -> u32 {
-    store_word(output, DUMP_MODE.load(Ordering::Acquire))
+extern "C" fn export_get_dump_mode(output: *mut u32) -> Hresult {
+    // SAFETY: export 117 takes NULL or a writable dword, which stock does
+    // not align.
+    unsafe { write_output(output, DUMP_MODE.load(Ordering::Acquire)) }
 }
 export!(117, export_get_dump_mode);
 
 /// Export 119: copy the crash dump settings block; the pointer is not
 /// checked, as in stock.
-extern "C" fn export_get_dump_settings(output: u32) -> u32 {
+extern "C" fn export_get_dump_settings(output: *mut [u8; DUMP_SETTINGS_SIZE]) -> Hresult {
     let block = *DUMP_SETTINGS.lock();
-    // SAFETY: the caller passes a block of DUMP_SETTINGS_SIZE bytes.
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            block.as_ptr(),
-            output as usize as *mut u8,
-            DUMP_SETTINGS_SIZE,
-        )
-    };
-    Hresult::OK.0
+    // SAFETY: export 119 takes a writable block of DUMP_SETTINGS_SIZE bytes.
+    unsafe { output.write(block) };
+    Hresult::OK
 }
 export!(119, export_get_dump_settings);
 
 /// Export 121: the event defer mask.
-extern "C" fn export_get_event_defer(output: u32) -> u32 {
-    store_word(output, EVENT_DEFER.load(Ordering::Acquire))
+extern "C" fn export_get_event_defer(output: *mut u32) -> Hresult {
+    // SAFETY: as export 117.
+    unsafe { write_output(output, EVENT_DEFER.load(Ordering::Acquire)) }
 }
 export!(121, export_get_event_defer);
 
 /// Export 140: whether the console is a test kit (stock 0x91f9f680).
-extern "C" fn export_is_test_kit(output: u32) -> u32 {
-    let test_kit = hardware_flags().bits() & HARDWARE_NOT_DEBUGGABLE != 0 || test_kit_marked();
-    store_word(output, u32::from(test_kit))
+extern "C" fn export_is_test_kit(output: *mut u32) -> Hresult {
+    let test_kit = hardware_flags().contains(HardwareFlags::TEST_KIT) || test_kit_marked();
+    // SAFETY: as export 117.
+    unsafe { write_output(output, u32::from(test_kit)) }
 }
 export!(140, export_is_test_kit);
 
-/// Export 161: `{+0 size (>= 0x20, set to 0x20), +4 base kernel version,
-/// +0xc kernel version, +0x14 XDK version, +0x1c flags}`; the whole stated
-/// size is cleared first.
-extern "C" fn export_get_system_info(block: u32) -> u32 {
-    if block == 0 || (read_word(block) as i32) < 0x20 {
-        return BAD_PARAMETER.0;
-    }
-    let size = read_word(block) as usize;
-    // SAFETY: the caller's block holds the size it states.
-    let bytes = unsafe { core::slice::from_raw_parts_mut(block as usize as *mut u8, size) };
-    bytes.fill(0);
-    bytes[..4].copy_from_slice(&0x20u32.to_be_bytes());
-    let versions = [
-        version_words(kernel::base_kernel_version()),
-        version_words(kernel_version()),
-        commands::console::XDK_VERSION.0,
-    ];
-    for (index, version) in versions.iter().enumerate() {
-        for (part, value) in version.iter().enumerate() {
-            let offset = 4 + index * 8 + part * 2;
-            bytes[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
-        }
-    }
-    let hardware = hardware_flags().bits();
-    let generation = match hardware & 0xf000_0000 {
-        generation @ (0 | 0x1000_0000 | 0x2000_0000 | 0x3000_0000 | 0x4000_0000 | 0x5000_0000
-        | 0x6000_0000 | 0x8000_0000) => generation,
-        _ => 0xf000_0000,
+/// Block of export 161. The caller states its size, at least this
+/// structure's, and the export clears the whole stated size first.
+#[repr(C)]
+struct SystemInfo {
+    size: u32,
+    base_kernel: [u16; 4],
+    kernel: [u16; 4],
+    xdk: [u16; 4],
+    flags: HardwareFlags,
+}
+
+const _: () = {
+    assert!(core::mem::offset_of!(SystemInfo, base_kernel) == 0x4);
+    assert!(core::mem::offset_of!(SystemInfo, kernel) == 0xc);
+    assert!(core::mem::offset_of!(SystemInfo, xdk) == 0x14);
+    assert!(core::mem::offset_of!(SystemInfo, flags) == 0x1c);
+    assert!(size_of::<SystemInfo>() == 0x20);
+};
+
+/// The flags word of export 161: the unnamed low bits, the generation with
+/// unknown generations as 0xf, the hard disk flag, and the test kit flag.
+fn system_info_flags(hardware: HardwareFlags) -> HardwareFlags {
+    const LOW_BITS: u32 = 0x3;
+    const GENERATION_SHIFT: u32 = 28;
+    const UNKNOWN_GENERATION: u8 = 0xf;
+    let generation = match hardware.generation().get() {
+        generation @ (0..=6 | 8) => generation,
+        _ => UNKNOWN_GENERATION,
     };
-    let mut flags = (hardware & 3) | generation | (hardware & HARDWARE_HDD);
-    if hardware & HARDWARE_NOT_DEBUGGABLE != 0 || test_kit_marked() {
-        flags |= HARDWARE_NOT_DEBUGGABLE;
+    let mut flags = HardwareFlags::from_bits_retain(
+        hardware.bits() & LOW_BITS | u32::from(generation) << GENERATION_SHIFT,
+    );
+    if hardware.contains(HardwareFlags::HARD_DISK) {
+        flags.insert(HardwareFlags::HARD_DISK);
     }
-    bytes[0x1c..0x20].copy_from_slice(&flags.to_be_bytes());
-    Hresult::OK.0
+    if hardware.contains(HardwareFlags::TEST_KIT) || test_kit_marked() {
+        flags.insert(HardwareFlags::TEST_KIT);
+    }
+    flags
+}
+
+/// Export 161: fill the caller's [`SystemInfo`].
+extern "C" fn export_get_system_info(block: *mut SystemInfo) -> Hresult {
+    if block.is_null() {
+        return BAD_PARAMETER;
+    }
+    // SAFETY: export 161 takes NULL or a block whose first word states its
+    // size, and which holds that many writable bytes; stock does not align
+    // it.
+    let size = unsafe { block.cast::<u32>().read_unaligned() };
+    if (size as i32) < size_of::<SystemInfo>() as i32 {
+        return BAD_PARAMETER;
+    }
+    // SAFETY: as above; `size` covers a whole `SystemInfo`.
+    unsafe {
+        core::ptr::write_bytes(block.cast::<u8>(), 0, size as usize);
+        (&raw mut (*block).size).write_unaligned(size_of::<SystemInfo>() as u32);
+        (&raw mut (*block).base_kernel)
+            .write_unaligned(version_words(kernel::base_kernel_version()));
+        (&raw mut (*block).kernel).write_unaligned(version_words(kernel_version()));
+        (&raw mut (*block).xdk).write_unaligned(commands::console::XDK_VERSION.0);
+        (&raw mut (*block).flags).write_unaligned(system_info_flags(hardware_flags()));
+    }
+    Hresult::OK
 }
 export!(161, export_get_system_info);
 
 /// Exports 175 and 176: a failed setting call returns its status with the
 /// NT facility bit.
-fn xconfig_result(status: u32) -> u32 {
-    export_result(NtStatus(status).result()).0
+fn xconfig_result(status: NtStatus) -> Hresult {
+    export_result(status.result())
 }
 
-/// Export 175: read the 8-byte setting (3, 8) into `output`.
-extern "C" fn export_get_xconfig_qword(output: u32) -> u32 {
-    if hardware_flags().bits() & HARDWARE_XCONFIG_QWORD == 0 {
-        return ErrorCode::UnknownCommand.hresult().0;
+/// Export 175: read the 8-byte setting [`XCONFIG_QWORD`] into `output`.
+extern "C" fn export_get_xconfig_qword(output: Option<&mut [u8; 8]>) -> Hresult {
+    if !hardware_flags().contains(HardwareFlags::AUTO_PROFILE) {
+        return ErrorCode::UnknownCommand.hresult();
     }
-    if output == 0 {
-        return BAD_PARAMETER.0;
-    }
+    let Some(output) = output else {
+        return BAD_PARAMETER;
+    };
     let mut length = 0u16;
-    // SAFETY: the export contract requires `output` to address 8 writable
-    // bytes; `length` is a live local.
-    xconfig_result(
-        unsafe {
-            xboxkrnl::ExGetXConfigSetting(
-                XCONFIG_QWORD.0,
-                XCONFIG_QWORD.1,
-                output as usize as *mut u8,
-                8,
-                &mut length,
-            )
-        }
-        .0,
-    )
+    // SAFETY: `output` and `length` are live for the call.
+    xconfig_result(unsafe {
+        xboxkrnl::ExGetXConfigSetting(
+            XCONFIG_QWORD.category,
+            XCONFIG_QWORD.index,
+            output.as_mut_ptr(),
+            output.len() as u16,
+            &mut length,
+        )
+    })
 }
 export!(175, export_get_xconfig_qword);
 
 /// Export 176 with the 64-bit value split into its high and low words by
 /// [`export_set_xconfig_qword_entry`].
-extern "C" fn export_set_xconfig_qword(high: u32, low: u32) -> u32 {
-    if hardware_flags().bits() & HARDWARE_XCONFIG_QWORD == 0 {
-        return ErrorCode::UnknownCommand.hresult().0;
+extern "C" fn export_set_xconfig_qword(high: u32, low: u32) -> Hresult {
+    if !hardware_flags().contains(HardwareFlags::AUTO_PROFILE) {
+        return ErrorCode::UnknownCommand.hresult();
     }
     let value = (u64::from(high) << 32 | u64::from(low)).to_be_bytes();
     // SAFETY: `value` is a live 8-byte local.
-    xconfig_result(
-        unsafe {
-            xboxkrnl::ExSetXConfigSetting(XCONFIG_QWORD.0, XCONFIG_QWORD.1, value.as_ptr(), 8)
-        }
-        .0,
-    )
+    xconfig_result(unsafe {
+        xboxkrnl::ExSetXConfigSetting(
+            XCONFIG_QWORD.category,
+            XCONFIG_QWORD.index,
+            value.as_ptr(),
+            value.len() as u16,
+        )
+    })
 }
 
 /// The importer passes the 64-bit value in r3: copy it to r4, move its high
@@ -989,68 +1040,66 @@ export_raw!(176, export_set_xconfig_qword_entry);
 
 /// Export 194: `(transaction out, buffer, size in/out) -> HRESULT`; the
 /// response of the last accepted registration.
-extern "C" fn export_get_registration_response(transaction: u32, buffer: u32, size: u32) -> u32 {
-    let capacity = if size == 0 {
-        None
-    } else {
-        Some(read_word(size))
-    };
+extern "C" fn export_get_registration_response(
+    transaction: *mut u64,
+    buffer: *mut u8,
+    size: *mut u32,
+) -> Hresult {
+    // SAFETY: export 194 takes NULL or a size dword, which stock does not
+    // align.
+    let capacity = (!size.is_null()).then(|| unsafe { size.read_unaligned() });
     // A buffer needs a size pointer and a nonzero size needs a buffer.
     let rejected = match capacity {
-        Some(capacity) => capacity != 0 && buffer == 0,
-        None => buffer != 0,
+        Some(capacity) => capacity != 0 && buffer.is_null(),
+        None => !buffer.is_null(),
     };
     if rejected {
-        return BAD_PARAMETER.0;
+        return BAD_PARAMETER;
     }
     let registration = *REGISTRATION.lock();
     let output = capacity.map(|capacity| {
-        if buffer == 0 {
+        if buffer.is_null() {
             &mut [][..]
         } else {
-            // SAFETY: the caller's buffer holds `*size` bytes.
-            unsafe {
-                core::slice::from_raw_parts_mut(buffer as usize as *mut u8, capacity as usize)
-            }
+            // SAFETY: export 194 takes a buffer of `*size` writable bytes.
+            unsafe { core::slice::from_raw_parts_mut(buffer, capacity as usize) }
         }
     });
     let response = registration.export_response(output);
-    if transaction != 0 {
-        // SAFETY: the caller passes a 64-bit output; stock does not require
-        // 8-byte alignment.
-        unsafe {
-            core::ptr::write_unaligned(transaction as usize as *mut u64, response.transaction)
-        };
+    if !transaction.is_null() {
+        // SAFETY: export 194 takes NULL or a writable 64-bit output; stock
+        // does not require 8-byte alignment.
+        unsafe { transaction.write_unaligned(response.transaction) };
     }
-    if size != 0 {
-        write_word(size, response.length);
+    if !size.is_null() {
+        // SAFETY: as above.
+        unsafe { size.write_unaligned(response.length) };
     }
-    export_result(response.result).0
+    export_result(response.result)
 }
 export!(194, export_get_registration_response);
 
 /// Export 213: `(size out) -> HRESULT`; the debug memory size, 0 when the
 /// statistics query fails.
-extern "C" fn export_get_debug_memory_size(output: u32) -> u32 {
-    store_word(
-        output,
-        memory_statistics().map_or(0, |statistics| statistics.debug_memory_size()),
-    )
+extern "C" fn export_get_debug_memory_size(output: *mut u32) -> Hresult {
+    let size = memory_statistics().map_or(0, |statistics| statistics.debug_memory_size());
+    // SAFETY: as export 117.
+    unsafe { write_output(output, size) }
 }
 export!(213, export_get_debug_memory_size);
 
 /// Export 214: `(configuration out) -> HRESULT`; the `consolemem` value.
-extern "C" fn export_get_console_memory(output: u32) -> u32 {
-    store_word(
-        output,
-        ConsoleMemory::of(kit_features(), memory_statistics).value(),
-    )
+extern "C" fn export_get_console_memory(output: *mut u32) -> Hresult {
+    let memory = ConsoleMemory::of(kit_features(), memory_statistics).value();
+    // SAFETY: as export 117.
+    unsafe { write_output(output, memory) }
 }
 export!(214, export_get_console_memory);
 
 /// Export 220: `(features out) -> HRESULT`; the `consolefeatures` bits.
-extern "C" fn export_get_console_features(output: u32) -> u32 {
-    store_word(output, kit_features().mask())
+extern "C" fn export_get_console_features(output: *mut u32) -> Hresult {
+    // SAFETY: as export 117.
+    unsafe { write_output(output, kit_features().mask()) }
 }
 export!(220, export_get_console_features);
 
@@ -1064,22 +1113,26 @@ pub(crate) fn test_kit_marked() -> bool {
     TEST_KIT.load(Ordering::Acquire)
 }
 
-fn read_word(address: u32) -> u32 {
-    // SAFETY: callers pass the address of a caller structure.
-    unsafe { core::ptr::read_volatile(address as usize as *const u32) }
-}
-
-fn write_word(address: u32, value: u32) {
-    // SAFETY: callers pass the address of a caller structure.
-    unsafe { core::ptr::write_volatile(address as usize as *mut u32, value) }
-}
+/// Size field that leads a caller's settings block.
+const SETTINGS_SIZE_FIELD: usize = size_of::<u32>();
 
 /// Control code 0x1e (stock export 92): store the caller's settings block
 /// `{+0 size, +4 flags, +8 video standard}` and write the settings file.
-pub(crate) fn service_set_system_settings(argument: u32) -> u32 {
-    let length = (read_word(argument) as usize).min(SYSTEM_SETTINGS_SIZE);
-    // SAFETY: the caller's block holds at least the size it states.
-    let block = unsafe { core::slice::from_raw_parts(argument as usize as *const u8, length) };
+///
+/// # Safety
+///
+/// `argument` must be the address of an aligned block whose first word
+/// states its size and which holds at least that many readable bytes,
+/// unchanged for the call.
+pub(crate) unsafe fn service_set_system_settings(argument: u32) -> u32 {
+    // SAFETY: the caller's contract.
+    let block = unsafe {
+        let size = *kernel::object_at::<u32>(argument);
+        core::slice::from_raw_parts(
+            core::ptr::with_exposed_provenance::<u8>(argument as usize),
+            (size as usize).min(SYSTEM_SETTINGS_SIZE),
+        )
+    };
     SYSTEM_SETTINGS.lock().store(block);
     super::dispatcher::request_settings_write();
     0
@@ -1087,49 +1140,178 @@ pub(crate) fn service_set_system_settings(argument: u32) -> u32 {
 
 /// Control code 0x1f (stock export 91): copy the settings block into the
 /// caller's, at most the size it states; its size field is kept.
-pub(crate) fn service_get_system_settings(argument: u32) -> u32 {
-    let size = read_word(argument);
+///
+/// # Safety
+///
+/// `argument` must be the address of an aligned block whose first word
+/// states its size and which holds at least that many writable bytes, not
+/// otherwise accessed for the call.
+pub(crate) unsafe fn service_get_system_settings(argument: u32) -> u32 {
+    let block = core::ptr::with_exposed_provenance_mut::<u8>(argument as usize);
+    // SAFETY: the caller's contract.
+    let size = unsafe { *kernel::object_at::<u32>(argument) };
     let length = (size as usize).min(SYSTEM_SETTINGS_SIZE);
     let settings = *SYSTEM_SETTINGS.lock();
-    // SAFETY: the caller's block holds at least the size it states.
-    unsafe {
-        core::ptr::copy_nonoverlapping(settings.0.as_ptr(), argument as usize as *mut u8, length)
-    };
-    write_word(argument, size);
+    if length > SETTINGS_SIZE_FIELD {
+        // SAFETY: the caller's contract; the size field is not part of the
+        // slice.
+        let output = unsafe {
+            core::slice::from_raw_parts_mut(
+                block.add(SETTINGS_SIZE_FIELD),
+                length - SETTINGS_SIZE_FIELD,
+            )
+        };
+        output.copy_from_slice(&settings.0[SETTINGS_SIZE_FIELD..length]);
+    }
     0
 }
 
-/// Control code 0x33 (stock export 17): `{+0 buffer, +4 size pointer}`.
-pub(crate) fn service_get_debug_name(argument: u32) -> u32 {
-    get_debug_name(read_word(argument), read_word(argument + 4))
+/// Record of control code 0x33: the arguments of export 17.
+#[repr(C)]
+struct DebugNameRequest {
+    buffer: u32,
+    size: u32,
 }
 
-/// Stock export 17: copy the debug name into `buffer` of `*size` bytes.
-fn get_debug_name(buffer: u32, size: u32) -> u32 {
-    if buffer == 0 || size == 0 {
-        return Hresult::INVALID_ARGUMENT.0;
-    }
-    // SAFETY: the caller's buffer holds `*size` bytes.
+/// Control code 0x33 (stock export 17).
+///
+/// # Safety
+///
+/// `argument` must be the address of a readable `DebugNameRequest` that
+/// holds export 17's arguments, with that export's contract.
+pub(crate) unsafe fn service_get_debug_name(argument: u32) -> u32 {
+    // SAFETY: the caller's contract.
+    let request = unsafe { kernel::object_at::<DebugNameRequest>(argument) };
+    // SAFETY: the caller's contract.
     let output = unsafe {
-        core::slice::from_raw_parts_mut(buffer as usize as *mut u8, read_word(size) as usize)
+        debug_name_output(
+            core::ptr::with_exposed_provenance_mut(request.buffer as usize),
+            core::ptr::with_exposed_provenance(request.size as usize),
+        )
     };
-    match commands::console::copy_debug_name(&debug_name(), output) {
-        Ok(()) => Hresult::OK.0,
-        Err(error) => Hresult::from(error).0,
+    export_result(get_debug_name(output)).0
+}
+
+/// The output of stock export 17; `None` if either pointer is NULL.
+///
+/// # Safety
+///
+/// `size` is NULL or a readable dword at any alignment, and `buffer` is
+/// NULL or holds `*size` writable bytes that stay unaliased for `'a`.
+unsafe fn debug_name_output<'a>(buffer: *mut u8, size: *const u32) -> Option<&'a mut [u8]> {
+    if buffer.is_null() || size.is_null() {
+        return None;
+    }
+    // SAFETY: per the contract of this fn.
+    Some(unsafe { core::slice::from_raw_parts_mut(buffer, size.read_unaligned() as usize) })
+}
+
+/// Why stock export 17 failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DebugNameError {
+    /// The buffer or size pointer is NULL.
+    MissingBuffer,
+    BufferTooSmall,
+}
+
+impl core::fmt::Display for DebugNameError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::MissingBuffer => "missing buffer",
+            Self::BufferTooSmall => "buffer too small",
+        })
     }
 }
 
-/// Request state shared with the status callback (stock 0x91f9f638 states
-/// 1 to 7), the body bytes still expected and received, and the failure
-/// the callback recorded.
+impl core::error::Error for DebugNameError {}
+
+impl From<BufferTooSmall> for DebugNameError {
+    fn from(_: BufferTooSmall) -> Self {
+        Self::BufferTooSmall
+    }
+}
+
+impl From<DebugNameError> for Hresult {
+    fn from(error: DebugNameError) -> Self {
+        match error {
+            DebugNameError::MissingBuffer => Hresult::INVALID_ARGUMENT,
+            DebugNameError::BufferTooSmall => BufferTooSmall.into(),
+        }
+    }
+}
+
+/// Stock export 17: copy the debug name into `output`.
+fn get_debug_name(output: Option<&mut [u8]>) -> Result<(), DebugNameError> {
+    let output = output.ok_or(DebugNameError::MissingBuffer)?;
+    commands::console::copy_debug_name(&debug_name(), output)?;
+    Ok(())
+}
+
+/// Request state shared with the status callback (stock 0x91f9f638).
+#[repr(u32)]
+#[derive(Clone, Copy)]
+enum HttpState {
+    Idle = 0,
+    Sending = 1,
+    Sent = 2,
+    Receiving = 3,
+    HeadersAvailable = 4,
+    Reading = 5,
+    ReadComplete = 6,
+    Failed = 7,
+}
+
+impl HttpState {
+    /// The raw state; the failure record reports it as is.
+    fn load() -> u32 {
+        HTTP_STATE.load(Ordering::Relaxed)
+    }
+
+    fn store(self) {
+        HTTP_STATE.store(self as u32, Ordering::Relaxed);
+    }
+}
+
+value_enum! {
+    /// Failure the status callback recorded.
+    pub enum HttpFailureKind: u32 {
+        Request = 1,
+        Truncated = 2,
+    }
+}
+
+/// XHTTP values, which follow WinHTTP.
+mod http {
+    /// `XHttpOpen` flag of an asynchronous session.
+    pub const SESSION_ASYNC: u32 = 0x1000_0000;
+    /// `XHttpConnect` flags of the registration connection.
+    pub const CONNECT_FLAGS: u32 = 1;
+    /// Status callback notification mask: every notification.
+    pub const ALL_NOTIFICATIONS: u32 = u32::MAX;
+    pub const OPTION_MAX_REDIRECTS: u32 = 0x59;
+    pub const MAX_REDIRECTS: u32 = 3;
+    pub const OPTION_DISABLE_FEATURE: u32 = 0x3f;
+    pub const DISABLE_KEEP_ALIVE: u32 = 8;
+    /// Header queries with the number flag.
+    pub const QUERY_STATUS_CODE: u32 = 0x2000_fffe;
+    pub const QUERY_CONTENT_LENGTH: u32 = 0x2000_0009;
+    pub const STATUS_OK: u32 = 200;
+    /// Status callback notifications.
+    pub const HEADERS_AVAILABLE: u32 = 0x0002_0000;
+    pub const READ_COMPLETE: u32 = 0x0008_0000;
+    pub const REQUEST_ERROR: u32 = 0x0020_0000;
+    pub const SEND_REQUEST_COMPLETE: u32 = 0x0040_0000;
+}
+
+/// Raw [`HttpState`], the body bytes still expected and received, and the
+/// failure the callback recorded: a raw [`HttpFailureKind`], the state it
+/// failed in, and its Win32 error.
 static HTTP_STATE: AtomicU32 = AtomicU32::new(0);
 static HTTP_REMAINING: AtomicU32 = AtomicU32::new(0);
 static HTTP_RECEIVED: AtomicU32 = AtomicU32::new(0);
 static HTTP_FAILURE_KIND: AtomicU32 = AtomicU32::new(0);
 static HTTP_FAILURE_STATE: AtomicU32 = AtomicU32::new(0);
 static HTTP_FAILURE_ERROR: AtomicU32 = AtomicU32::new(0);
-const FAILURE_TRUNCATED: u32 = 2;
-const FAILURE_REQUEST: u32 = 1;
 
 bridged!(http_status_entry, http_status);
 
@@ -1143,30 +1325,30 @@ extern "C" fn http_status(
     length: u32,
 ) -> u32 {
     match status {
-        0x0002_0000 => HTTP_STATE.store(4, Ordering::Relaxed),
-        0x0008_0000 => {
+        http::HEADERS_AVAILABLE => HttpState::HeadersAvailable.store(),
+        http::READ_COMPLETE => {
             if length == 0 {
-                HTTP_FAILURE_KIND.store(FAILURE_TRUNCATED, Ordering::Relaxed);
-                HTTP_STATE.store(7, Ordering::Relaxed);
+                HTTP_FAILURE_KIND.store(HttpFailureKind::Truncated.raw(), Ordering::Relaxed);
+                HttpState::Failed.store();
             } else {
                 HTTP_REMAINING.fetch_sub(length, Ordering::Relaxed);
                 HTTP_RECEIVED.fetch_add(length, Ordering::Relaxed);
-                HTTP_STATE.store(6, Ordering::Relaxed);
+                HttpState::ReadComplete.store();
             }
         }
-        0x0020_0000 => {
-            HTTP_FAILURE_KIND.store(FAILURE_REQUEST, Ordering::Relaxed);
-            HTTP_FAILURE_STATE.store(HTTP_STATE.load(Ordering::Relaxed), Ordering::Relaxed);
-            // SAFETY: the request error information is {result, error}.
+        http::REQUEST_ERROR => {
+            HTTP_FAILURE_KIND.store(HttpFailureKind::Request.raw(), Ordering::Relaxed);
+            HTTP_FAILURE_STATE.store(HttpState::load(), Ordering::Relaxed);
             let error = if information.is_null() {
                 0
             } else {
-                unsafe { core::ptr::read_volatile(information.add(1)) }
+                // SAFETY: the request error information is {result, error}.
+                unsafe { information.add(1).read() }
             };
             HTTP_FAILURE_ERROR.store(error, Ordering::Relaxed);
-            HTTP_STATE.store(7, Ordering::Relaxed);
+            HttpState::Failed.store();
         }
-        0x0040_0000 => HTTP_STATE.store(2, Ordering::Relaxed),
+        http::SEND_REQUEST_COMPLETE => HttpState::Sent.store(),
         _ => {}
     }
     0
@@ -1192,6 +1374,6 @@ impl Data {
             // SAFETY: matches the successful startup recorded in `http_started`.
             unsafe { NetDll_XHttpShutdown(XnCaller::DebugMonitor) };
         }
-        HTTP_STATE.store(0, Ordering::Relaxed);
+        HttpState::Idle.store();
     }
 }

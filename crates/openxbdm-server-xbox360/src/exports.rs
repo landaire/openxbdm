@@ -24,9 +24,9 @@ pub(crate) use xbox360_sys::entry_bridge as export_bridge;
 #[cfg(feature = "boot-guard")]
 pub(crate) static RECOVERY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// E_FAIL.
+/// E_FAIL, as the raw word that the `naked_asm!` operands take.
 #[cfg(feature = "boot-guard")]
-const RECOVERY_RESULT: u32 = 0x8000_4005;
+const RECOVERY_RESULT: u32 = Hresult::FAIL.0;
 
 /// `xbox360_sys::entry_bridge` for exports and callbacks: refuses every
 /// call during the recovery. The module entry point keeps the unchecked bridge.

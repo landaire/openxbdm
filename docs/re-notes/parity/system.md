@@ -103,6 +103,7 @@ Texts without a counterpart: `[XBDM] Error, WriteIniFile no server thread to sig
 - Control codes 0x02, 0x17, 0x1d, 0x21, 0x22 and 0x77 and exports 28, 42, 81 and 125 run their server-state part through `dispatcher::call_on_server`. Before the command loop starts they run inline on the caller's thread; afterwards they wait for the server thread's next pass (at most about 20 ms). They fail (do nothing) when issued on the server thread or above passive level, before the server state exists, or after code 0x02 stopped the server. Stock runs them on the caller's thread; for 0x17 and WriteIniFile from the title process stock also defers to the server thread, with a 1 s limit.
 - Exports 28 and 125: the registered relaunch routine runs on the server thread; stock calls it on the caller's thread. A caller in the title process then ends its thread (`ExTerminateThread(0)`) as in stock.
 - Control code 0x21 does not re-initialize stock's critical section 0x91fadca0 (the debug routine's lock); the debugger domain has no equivalent lock.
+- `flash` writer (0x91f735d0): header offsets and sizes that leave the upload or boot loader buffer fail with `ERROR_INVALID_PARAMETER` (a hardware identifier offset outside the image fails the revision check); stock reads past the buffer. See `backend/system/flash.rs`.
 
 ## Remaining gaps
 

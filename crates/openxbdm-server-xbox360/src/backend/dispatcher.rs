@@ -404,6 +404,8 @@ unsafe extern "C" fn dispatch_entry() {
 }
 
 extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: u32) -> u32 {
+    // SAFETY: the caller of each control code passes the argument that the
+    // code defines.
     let result = match code {
         0x01 => {
             // Break-in poll: when threads are stopped by the monitor the
@@ -422,8 +424,8 @@ extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: u32) ->
             let mut request = argument;
             call_on_server_with(&mut request, filesystem::service_set_drive_mapping).unwrap_or(0)
         }
-        0x08 => memory::service_memtrack_record_alloc(argument),
-        0x09 => memory::service_memtrack_record_free(argument),
+        0x08 => unsafe { memory::service_memtrack_record_alloc(argument) },
+        0x09 => unsafe { memory::service_memtrack_record_free(argument) },
         0x0a => DEBUGGER_ATTACHED.load(Ordering::Relaxed),
         0x0b => network::service_apply_xnet_config(argument),
         0x0c => network::service_set_static_ip_enable(argument),
@@ -438,24 +440,24 @@ extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: u32) ->
         0x15 => network::service_config_status_2(argument),
         0x16 => network::service_config_status_3(argument),
         0x17 => system::service_wipe_settings(argument),
-        0x18 => memory::service_get_module_proc_address(argument),
+        0x18 => unsafe { memory::service_get_module_proc_address(argument) },
         0x19 => {
             let kd = KERNEL_DEBUGGER.load(Ordering::Relaxed)
                 && hardware_flags().contains(HardwareFlags::KERNEL_DEBUGGER);
             u32::from(passive() || kd)
         }
         0x1c => session::service_register_pix_processor(argument),
-        0x1d => system::service_write_settings_copy(argument),
-        0x1e => console::service_set_system_settings(argument),
-        0x1f => console::service_get_system_settings(argument),
-        0x20 => system::service_register_xam_globals(argument),
+        0x1d => unsafe { system::service_write_settings_copy(argument) },
+        0x1e => unsafe { console::service_set_system_settings(argument) },
+        0x1f => unsafe { console::service_get_system_settings(argument) },
+        0x20 => unsafe { system::service_register_xam_globals(argument) },
         0x21 => {
             hardware::service_automation_rebind(argument);
-            system::service_title_reboot(argument)
+            unsafe { system::service_title_reboot(argument) }
         }
-        0x22 => system::service_capture_settings(argument),
+        0x22 => unsafe { system::service_capture_settings(argument) },
         0x32 => session::service_register_processor(argument),
-        0x33 => console::service_get_debug_name(argument),
+        0x33 => unsafe { console::service_get_debug_name(argument) },
         0x34 => {
             monitor::name_thread(None, argument);
             0
@@ -468,10 +470,10 @@ extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: u32) ->
             monitor::name_thread(Some(debugger::ThreadId(request.thread)), request.name);
             0
         }
-        0x46 => hardware::service_odd_read_start(argument),
+        0x46 => unsafe { hardware::service_odd_read_start(argument) },
         0x47 => hardware::service_odd_read_complete(argument),
-        0x48 => hardware::service_odd_mount(argument),
-        0x49 => hardware::service_odd_speed_change(argument),
+        0x48 => unsafe { hardware::service_odd_mount(argument) },
+        0x49 => unsafe { hardware::service_odd_speed_change(argument) },
         0x4a => hardware::service_odd_auth_state(argument),
         0x64 => session::service_file_event_begin(argument),
         0x65 => session::service_file_event_end(argument),
@@ -488,15 +490,15 @@ extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: u32) ->
             }
             0
         }
-        0x77 => system::service_launch_override(argument),
-        0x7a => hardware::service_automation_get_state(argument),
-        0x7b => hardware::service_automation_get_status(argument),
-        0x7c => hardware::service_automation_get_capabilities(argument),
+        0x77 => unsafe { system::service_launch_override(argument) },
+        0x7a => unsafe { hardware::service_automation_get_state(argument) },
+        0x7b => unsafe { hardware::service_automation_get_status(argument) },
+        0x7c => unsafe { hardware::service_automation_get_capabilities(argument) },
         0x7e => match filesystem::service_dvd_emulator_state(argument) {
             0 => hardware::service_ignore_gdf_attributes(argument),
             emulator => emulator,
         },
-        0x86 => memory::service_adjust_memory_statistics(argument),
+        0x86 => unsafe { memory::service_adjust_memory_statistics(argument) },
         0x96 => hardware::nuicam::service_complete_raw_data_request(argument),
         0x97 => hardware::nuicam::service_queue_raw_data_request(argument),
         0x98 => hardware::nuicam::service_flush_raw_data_requests(argument),
@@ -505,8 +507,6 @@ extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: u32) ->
             TRAP_PASSTHROUGH.store(u32::from(argument != 0), Ordering::Relaxed);
             0
         }
-        // SAFETY: a caller of codes 0xa5 to 0xa7 passes the record that the
-        // code defines.
         0xa5 => unsafe { network::xhttpproxy::service_http_proxy_acquire(argument) },
         0xa6 => unsafe { network::xhttpproxy::service_http_proxy_release(argument) },
         0xa7 => unsafe { network::xhttpproxy::service_http_proxy_certificate(argument) },
@@ -519,7 +519,12 @@ extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: u32) ->
 
 /// Publish the dispatcher in the debug monitor data.
 pub(crate) fn install() {
-    kernel::publish_debug_monitor_dispatcher(dispatch_entry as *const () as usize as u32);
+    // SAFETY: the entry is the dispatcher with the kernel's calling
+    // convention, and its code stays loaded with the module, which outlives
+    // the published block.
+    unsafe {
+        kernel::publish_debug_monitor_dispatcher(dispatch_entry as *const () as usize as u32)
+    };
 }
 
 /// Apply queued requests on the server thread and refresh the mirrors the

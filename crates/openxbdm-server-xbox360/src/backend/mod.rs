@@ -20,12 +20,10 @@ use openxbdm_server::notify::ExecutionState;
 use xbox360::console::hardware_flags;
 use xbox360::time::FileTime;
 use xbox360::time::Timebase;
+use xbox360_sys::xboxkrnl::HardwareFlags;
 
 use crate::kernel;
 use crate::net;
-
-/// Hardware flag: the console is not debug capable.
-pub const HARDWARE_NOT_DEBUGGABLE: u32 = 0x0200_0000;
 
 /// Console services. Each domain keeps its platform state in its own field.
 pub struct Console {
@@ -66,7 +64,7 @@ impl Platform for Console {
     }
 
     fn is_test_kit(&self) -> bool {
-        hardware_flags().bits() & HARDWARE_NOT_DEBUGGABLE != 0 || console::test_kit_marked()
+        hardware_flags().contains(HardwareFlags::TEST_KIT) || console::test_kit_marked()
     }
 
     fn execution_state(&mut self) -> ExecutionState {

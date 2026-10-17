@@ -2,6 +2,7 @@
 
 use crate::commands;
 use crate::notify::Notifications;
+use crate::transfer_blocks::TransferBlocks;
 
 /// Lock mode, which requires authentication on new connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +42,7 @@ pub struct ServerState {
     /// Set by commands that change persisted settings; the server writes
     /// the settings file after the command.
     pub settings_dirty: bool,
+
     pub session: commands::session::State,
     pub security: commands::security::State,
     pub console: commands::console::State,
@@ -52,7 +54,7 @@ pub struct ServerState {
     pub performance: commands::performance::State,
     pub hardware: commands::hardware::State,
     pub services: commands::services::State,
-    pub transfer_blocks: crate::transfer_blocks::TransferBlocks,
+    pub transfer_blocks: TransferBlocks,
 }
 
 impl ServerState {
@@ -72,7 +74,7 @@ impl ServerState {
             performance: commands::performance::State::new(),
             hardware: commands::hardware::State::new(),
             services: commands::services::State::new(),
-            transfer_blocks: crate::transfer_blocks::TransferBlocks::new(),
+            transfer_blocks: TransferBlocks::new(),
         }
     }
 }

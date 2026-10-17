@@ -11,6 +11,8 @@
 // Pool blocks are freed through the unsafe `Backend::free_pool`.
 #![allow(unsafe_code)]
 
+use core::fmt::Write as _;
+
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use xbox360_sys::xboxkrnl::AccessMask;
@@ -40,18 +42,6 @@ use crate::reply::Reply;
 use crate::state::ServerState;
 use crate::text::Text;
 
-xbox360_sys::value_enum! {
-    /// First word of a pipe packet.
-    pub enum PacketMagic: u16 {
-        /// `AA`: file data.
-        Data = 0x4141,
-        /// `BB`: the result of a file.
-        Reply = 0x4242,
-        /// `CC`: create a file.
-        Create = 0x4343,
-    }
-}
-
 /// Pipes open at one time, all of one group.
 pub const PIPE_SLOTS: usize = 6;
 /// Largest packet.
@@ -75,6 +65,18 @@ const PIPE_SUCCESS: u32 = 0;
 const PIPE_FILE_ACCESS: AccessMask = AccessMask::GENERIC_WRITE
     .union(AccessMask::DELETE)
     .union(AccessMask::SYNCHRONIZE);
+
+xbox360_sys::value_enum! {
+    /// First word of a pipe packet.
+    pub enum PacketMagic: u16 {
+        /// `AA`: file data.
+        Data = 0x4141,
+        /// `BB`: the result of a file.
+        Reply = 0x4242,
+        /// `CC`: create a file.
+        Create = 0x4343,
+    }
+}
 
 /// Platform services of `fastpipe`.
 pub trait FastPipeBackend {
@@ -142,9 +144,7 @@ impl FastPipes {
             orphans: [None; MAX_ORPHANS],
         }
     }
-}
 
-impl FastPipes {
     /// Sockets owned by open pipes.
     pub fn sockets(&self) -> impl Iterator<Item = SocketId> + '_ {
         self.slots.iter().flatten().map(|pipe| pipe.socket)
@@ -166,10 +166,12 @@ pub(super) fn fast_pipe(invocation: &mut Invocation<'_>) -> CommandResult {
     else {
         return Err(CommandError::Fail);
     };
+
     // The engine requires the 1 GB memory configuration.
     if !invocation.backend.kit_features().one_gigabyte_ram {
         return Err(CommandError::Fail);
     }
+
     // An absent or malformed value requests a new group.
     let group = invocation.line.dword("group").unwrap_or(0);
     if !open_pipe(
@@ -182,9 +184,11 @@ pub(super) fn fast_pipe(invocation: &mut Invocation<'_>) -> CommandResult {
         invocation.text.set_bytes(b"fastpipe limit exceeded");
         return Err(CommandError::Fail);
     }
+
     if let Some(session) = invocation.session.as_deref_mut() {
         session.request(SessionRequest::ReleaseSocket);
     }
+
     Ok(Reply::Sent)
 }
 
@@ -201,38 +205,47 @@ fn open_pipe(
         if pipes.group_counter == 0 {
             pipes.group_counter = 1;
         }
+
         PipeGroup(pipes.group_counter)
     } else {
         PipeGroup(group)
     };
+
     let mut open = 0;
     let mut free = None;
+
     for (index, slot) in pipes.slots.iter().enumerate() {
         match slot {
             Some(pipe) if pipe.group != group => return false,
-            Some(_) => open += 1,
-            None if free.is_none() => free = Some(index),
+            Some(_) => {
+                open += 1;
+            }
+            None if free.is_none() => {
+                free = Some(index);
+            }
+            // A free slot after the first is not needed.
             None => {}
         }
     }
+
     let Some(free) = free else { return false };
     let Some(block) = backend.allocate_pool(PACKET_CAPACITY) else {
         return false;
     };
+
     let mut line = Text::<0x20>::new();
-    let _ = core::fmt::Write::write_fmt(
-        &mut line,
-        format_args!("209- result code {}", group.0 as i32),
-    );
+    let _ = write!(line, "209- result code {}", group.0 as i32);
     if send_line(network, socket, line.as_bytes()).is_err() {
         // SAFETY: the block is local and not used after.
         unsafe { backend.free_pool(block) };
         return false;
     }
+
     if open == 0 {
         pipes.saved_cache_elements = backend.file_cache_elements();
         backend.set_file_cache_elements(PIPE_CACHE_ELEMENTS);
     }
+
     pipes.slots[free] = Some(Pipe {
         socket,
         group,
@@ -240,6 +253,7 @@ fn open_pipe(
         received: 0,
         expected: FIRST_READ,
     });
+
     true
 }
 
@@ -255,21 +269,25 @@ pub fn on_readable(
         .fast_pipes
         .slots
         .iter()
-        .position(|pipe| matches!(pipe, Some(p) if p.socket == socket))
+        .position(|pipe| matches!(pipe, Some(open) if open.socket == socket))
     else {
         return;
     };
+
     let Some(mut pipe) = state.session.fast_pipes.slots[slot] else {
         return;
     };
+
     let Some(block) = pipe.block else {
         return close_pipe(state, backend, network, slot);
     };
+
     let range = pipe.received as usize..pipe.expected as usize;
     let received = match network.receive(socket, &mut backend.pool(block)[range]) {
         Ok(count @ 1..) => count as u32,
         _ => return close_pipe(state, backend, network, slot),
     };
+
     pipe.received += received;
     if pipe.received == FIRST_READ && pipe.expected == FIRST_READ {
         let header = &backend.pool(block)[..8];
@@ -280,12 +298,15 @@ pub fn on_readable(
         {
             return close_pipe(state, backend, network, slot);
         }
+
         pipe.expected = length;
     }
+
     if pipe.received < pipe.expected {
         state.session.fast_pipes.slots[slot] = Some(pipe);
         return;
     }
+
     // Bytes of a short packet beyond its length were padding.
     pipe.received = 0;
     pipe.expected = FIRST_READ;
@@ -294,6 +315,7 @@ pub fn on_readable(
         let header = backend.pool(block);
         u16::from_be_bytes([header[0], header[1]])
     };
+
     if magic == PacketMagic::Create.raw() {
         create(state, backend, network, slot as u8, block);
     } else if keeps_block(state, backend, network, block) {
@@ -302,6 +324,7 @@ pub fn on_readable(
         if let Some(Some(pipe)) = state.session.fast_pipes.slots.get_mut(slot) {
             pipe.block = replacement;
         }
+
         if replacement.is_none() {
             close_pipe(state, backend, network, slot);
         }
@@ -356,6 +379,7 @@ fn create(
     let Some(free) = pipes.files.iter().position(Option::is_none) else {
         return reply(state, network, Err(CommandError::OutOfMemory));
     };
+
     let request = CreateRequest {
         access: PIPE_FILE_ACCESS,
         allocation_size: Some(full_size),
@@ -364,6 +388,7 @@ fn create(
         disposition: CreateDisposition::OverwriteIf,
         options: CreateOptions::empty(),
     };
+
     let handle = match filesystem::open_path(state, backend, &path[..path_length], &request) {
         Ok(handle) => handle,
         Err(error) => {
@@ -374,6 +399,7 @@ fn create(
             );
         }
     };
+
     if size > BLOCK_SIZE
         && let Err(error) = backend.set_end_of_file(handle, full_size)
     {
@@ -385,24 +411,31 @@ fn create(
             Err(CommandError::from_kernel(error, CREATE_FALLBACK)),
         );
     }
+
     if BLOCK_SIZE.wrapping_sub(header_size) >= size {
         // The data follows the path; times and attributes are not applied.
-        let mut result = Ok(());
-        if size != 0 {
+        let result = if size == 0 {
+            Ok(())
+        } else {
             let end = (data_offset + size as usize).min(PACKET_CAPACITY as usize);
             let range = PoolRange {
                 buffer: block,
                 offset: data_offset as u32,
                 length: (end - data_offset.min(end)) as u32,
             };
-            if let Err(error) = backend.write_file(handle, Some(0), FileData::Pool(range)) {
-                let _ = backend.set_delete_disposition(handle, true);
-                result = Err(CommandError::from_kernel(error, CREATE_FALLBACK));
-            }
-        }
+
+            backend
+                .write_file(handle, Some(0), FileData::Pool(range))
+                .map_err(|error| {
+                    let _ = backend.set_delete_disposition(handle, true);
+                    CommandError::from_kernel(error, CREATE_FALLBACK)
+                })
+        };
+
         backend.close_file(handle);
         return reply(state, network, result);
     }
+
     let pipes = &mut state.session.fast_pipes;
     let order = pipes.next_order;
     pipes.next_order = pipes.next_order.wrapping_add(1);
@@ -419,22 +452,27 @@ fn create(
         attributes,
         order,
     });
+
     for index in 0..MAX_ORPHANS {
         let Some(orphan) = state.session.fast_pipes.orphans[index] else {
             continue;
         };
+
         let packet = backend.pool(orphan);
         if u16::from_be_bytes([packet[2], packet[3]]) != id {
             continue;
         }
+
         state.session.fast_pipes.orphans[index] = None;
         if state.session.fast_pipes.files[free].is_some() {
             write_block(state, backend, network, free, orphan);
         }
+
         // SAFETY: the orphan was removed from the list, which held the only
         // other copy.
         unsafe { backend.free_pool(orphan) };
     }
+
     compact_orphans(&mut state.session.fast_pipes);
 }
 
@@ -448,11 +486,15 @@ fn keeps_block(
     let packet = backend.pool(block);
     let id = u16::from_be_bytes([packet[2], packet[3]]);
     let pipes = &mut state.session.fast_pipes;
+
     let file = pipes
         .files
         .iter()
         .enumerate()
-        .filter_map(|(index, file)| file.filter(|f| f.id == id).map(|f| (index, f.order)))
+        .filter_map(|(index, file)| {
+            file.filter(|candidate| candidate.id == id)
+                .map(|candidate| (index, candidate.order))
+        })
         .min_by_key(|&(_, order)| order.wrapping_sub(pipes.next_order))
         .map(|(index, _)| index);
     match file {
@@ -473,6 +515,7 @@ fn keeps_block(
 
 fn compact_orphans(pipes: &mut FastPipes) {
     let mut kept = 0;
+
     for index in 0..MAX_ORPHANS {
         if let Some(orphan) = pipes.orphans[index].take() {
             pipes.orphans[kept] = Some(orphan);
@@ -492,12 +535,14 @@ fn write_block(
     let Some(mut file) = state.session.fast_pipes.files[index] else {
         return;
     };
+
     let offset = u32_at(backend.pool(block), 8);
     let length = if offset.wrapping_add(BLOCK_SIZE) > file.size {
         file.size & 0xffff
     } else {
         BLOCK_SIZE
     };
+
     let written = if offset >= file.size || offset & 0xffff != 0 {
         // The monitor's STATUS_INVALID_OFFSET has no reply mapping.
         Err(CommandError::Unexpected)
@@ -507,10 +552,12 @@ fn write_block(
             offset: 0xc,
             length,
         };
+
         backend
             .write_file(file.handle, Some(u64::from(offset)), FileData::Pool(range))
             .map_err(|error| CommandError::from_kernel(error, CommandError::Unexpected))
     };
+
     let result = match written {
         Err(error) => {
             let _ = backend.set_delete_disposition(file.handle, true);
@@ -522,9 +569,11 @@ fn write_block(
                 state.session.fast_pipes.files[index] = Some(file);
                 return;
             }
+
             finalize(backend, &file)
         }
     };
+
     state.session.fast_pipes.files[index] = None;
     send_reply(
         state,
@@ -548,6 +597,7 @@ fn finalize(backend: &mut dyn AnyBackend, file: &PipeFile) -> Result<(), Command
                 change_time: FileTime(0),
                 attributes: file.attributes,
             };
+
             let _ = backend.set_basic_information(file.handle, &information);
             Ok(())
         }
@@ -571,12 +621,15 @@ fn send_reply(
     let Some(Some(pipe)) = state.session.fast_pipes.slots.get(slot as usize) else {
         return;
     };
+
     let mut reply = [0u8; 12];
     reply[..2].copy_from_slice(&PacketMagic::Reply.raw().to_be_bytes());
     reply[2..4].copy_from_slice(&id.to_be_bytes());
     reply[4..8].copy_from_slice(&create_length.to_be_bytes());
+
     let word = result.map_or_else(|error| Hresult::from(error).0, |()| PIPE_SUCCESS);
     reply[8..].copy_from_slice(&word.to_be_bytes());
+
     let _ = send_all(network, pipe.socket, &reply);
 }
 
@@ -593,6 +646,7 @@ fn close_pipe(
     let Some(closing) = pipes.slots[slot] else {
         return;
     };
+
     for entry in &mut pipes.slots {
         if let Some(pipe) = entry
             && pipe.group == closing.group
@@ -603,18 +657,23 @@ fn close_pipe(
                 // return without using their copies.
                 unsafe { backend.free_pool(block) };
             }
+
             *entry = None;
         }
     }
+
     if pipes.slots.iter().any(Option::is_some) {
         return;
     }
+
     for file in pipes.files.iter_mut().filter_map(Option::take) {
         backend.close_file(file.handle);
     }
+
     for orphan in pipes.orphans.iter_mut().filter_map(Option::take) {
         // SAFETY: the orphan list held the only copy, taken out here.
         unsafe { backend.free_pool(orphan) };
     }
+
     backend.set_file_cache_elements(pipes.saved_cache_elements);
 }

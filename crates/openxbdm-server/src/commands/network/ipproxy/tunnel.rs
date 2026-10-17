@@ -39,12 +39,8 @@ pub const IPV4_HEADER_LENGTH: usize = 20;
 pub const UDP_DATAGRAM_HEADER_LENGTH: usize = 8;
 const PROTOCOL_TCP: u8 = Protocol::Tcp.raw() as u8;
 const PROTOCOL_UDP: u8 = Protocol::Udp.raw() as u8;
-/// Fragment offset and more-fragments bits of the IPv4 flags word.
-const FRAGMENT_MASK: u16 = 0x3fff;
 const BROADCAST: [u8; 4] = Ipv4Address::BROADCAST.octets();
 const LOOPBACK: [u8; 4] = Ipv4Address::LOOPBACK.octets();
-/// Time to live of injected packets.
-const INJECTED_TTL: u8 = 1;
 
 /// Endpoints of the tunnel socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,13 +80,18 @@ impl Outbound {
 /// The TCP checksum and urgent pointer are zeroed before the size check,
 /// so a TCP packet too large for the tunnel leaves with them zeroed.
 pub fn encapsulate(packet: &mut [u8], tunnel: &Tunnel) -> Option<Outbound> {
+    /// Fragment offset and more-fragments bits of the IPv4 flags word.
+    const FRAGMENT_MASK: u16 = 0x3fff;
+
     let header_length = usize::from(*packet.first()? & 0x0f) * 4;
     if header_length > IPV4_HEADER_LENGTH || packet.len() < IPV4_HEADER_LENGTH {
         return None;
     }
+
     if u16::from_be_bytes([packet[6], packet[7]]) & FRAGMENT_MASK != 0 {
         return None;
     }
+
     let [d0, d1, d2, d3] = [packet[16], packet[17], packet[18], packet[19]];
     let (message, message_length, payload) = match packet[9] {
         PROTOCOL_TCP => {
@@ -126,16 +127,19 @@ pub fn encapsulate(packet: &mut [u8], tunnel: &Tunnel) -> Option<Outbound> {
         }
         _ => return None,
     };
+
     let carried = message_length + payload.len();
     if carried > MESSAGE_LIMIT {
         return None;
     }
+
     packet[9] = PROTOCOL_UDP;
     packet[12..16].copy_from_slice(&tunnel.local.address.octets());
     packet[16..20].copy_from_slice(&tunnel.host.address.octets());
     let [s0, s1] = tunnel.local.port.to_be_bytes();
     let [h0, h1] = tunnel.host.port.to_be_bytes();
     let [l0, l1] = ((carried + UDP_DATAGRAM_HEADER_LENGTH) as u16).to_be_bytes();
+
     Some(Outbound {
         header_length,
         udp: [s0, s1, h0, h1, l0, l1, 0, 0],
@@ -168,6 +172,9 @@ pub struct Injected<'a> {
 /// 255.255.255.255 for 0x04; the UDP header has checksum 0. `None`: the
 /// message is ignored (unknown type or truncated).
 pub fn decapsulate(message: &[u8]) -> Option<Inbound<'_>> {
+    /// Time to live of injected packets.
+    const INJECTED_TTL: u8 = 1;
+
     let (protocol, udp, payload, destination) = match TunnelMessage::from_raw(*message.first()?)? {
         TunnelMessage::Keepalive => return Some(Inbound::Keepalive),
         TunnelMessage::Tcp if message.len() >= TCP_HEADER_LENGTH => {
@@ -188,6 +195,7 @@ pub fn decapsulate(message: &[u8]) -> Option<Inbound<'_>> {
         }
         _ => return None,
     };
+
     let udp_length = if udp.is_some() {
         UDP_DATAGRAM_HEADER_LENGTH
     } else {
@@ -218,6 +226,7 @@ pub fn decapsulate(message: &[u8]) -> Option<Inbound<'_>> {
         d2,
         d3,
     ];
+
     Some(Inbound::Packet(Injected { ip, udp, payload }))
 }
 

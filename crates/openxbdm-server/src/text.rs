@@ -93,6 +93,15 @@ impl<const N: usize> fmt::Write for Text<N> {
     }
 }
 
+impl<const N: usize> fmt::Debug for Text<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:?}", self.as_bytes().escape_ascii())
+    }
+}
+
+pub type ResponseText = Text<RESPONSE_TEXT_CAPACITY>;
+pub type LineText = Text<LINE_TEXT_CAPACITY>;
+
 /// The written length and storage of a `Text` of any capacity.
 struct Cursor<'a> {
     bytes: &'a mut [u8],
@@ -106,6 +115,7 @@ impl Cursor<'_> {
         let count = bytes.len().min(available);
         self.bytes[*self.len..*self.len + count].copy_from_slice(&bytes[..count]);
         *self.len += count;
+
         if count == bytes.len() {
             Ok(())
         } else {
@@ -119,6 +129,7 @@ impl Cursor<'_> {
         for (index, digit) in digits.iter_mut().enumerate() {
             *digit = b"0123456789abcdef"[(value >> (28 - 4 * index)) as usize & 0xf];
         }
+
         self.push(&digits)
     }
 
@@ -126,6 +137,7 @@ impl Cursor<'_> {
     fn push_decimal(&mut self, mut value: u32) -> fmt::Result {
         let mut digits = [0u8; 10];
         let mut start = digits.len();
+
         loop {
             start -= 1;
             digits[start] = b'0' + (value % 10) as u8;
@@ -134,6 +146,7 @@ impl Cursor<'_> {
                 break;
             }
         }
+
         self.push(&digits[start..])
     }
 
@@ -145,6 +158,7 @@ impl Cursor<'_> {
                 HEX_UPPER[usize::from(byte & 0xf)],
             ])?;
         }
+
         Ok(())
     }
 }
@@ -164,12 +178,3 @@ impl fmt::Write for Cursor<'_> {
         fmt::write(self, arguments)
     }
 }
-
-impl<const N: usize> fmt::Debug for Text<N> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{:?}", self.as_bytes().escape_ascii())
-    }
-}
-
-pub type ResponseText = Text<RESPONSE_TEXT_CAPACITY>;
-pub type LineText = Text<LINE_TEXT_CAPACITY>;

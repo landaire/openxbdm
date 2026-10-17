@@ -1,6 +1,6 @@
 # Debugger domain parity
 
-Stock XBDM 2.0.21256.0. Server: `crates/openxbdm-server/src/commands/debugger.rs` and `debugger/` (`breakpoints.rs`, `context.rs`, `events.rs`, `kd.rs`). Host simulation: `crates/openxbdm-server-host/src/backend/debugger.rs`. Console: `crates/openxbdm-server-xbox360/src/backend/debugger.rs` and `dispatcher.rs`. Tests: `crates/openxbdm-server-host/tests/debugger.rs`.
+Stock XBDM 2.0.21256.0. Server: `crates/openxbdm-server/src/commands/debugger.rs` and `debugger/` (`break_command.rs`, `breakpoints.rs`, `context.rs`, `direct.rs`, `error.rs`, `events.rs`, `execution.rs`, `identity.rs`, `kd.rs`, `stop_on.rs`, `thread_context.rs`, `threads.rs`). Host simulation: `crates/openxbdm-server-host/src/backend/debugger.rs`. Console: `crates/openxbdm-server-xbox360/src/backend/debugger.rs` and `dispatcher.rs`. Tests: `crates/openxbdm-server-host/tests/debugger.rs`.
 
 ## Commands
 

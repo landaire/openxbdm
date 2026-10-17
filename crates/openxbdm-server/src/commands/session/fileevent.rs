@@ -8,6 +8,11 @@ use core::fmt::Write as _;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::NtStatus;
 
+use super::notification::send_posted_notifications;
+use crate::invocation::Invocation;
+use crate::reply::CommandError;
+use crate::reply::CommandResult;
+use crate::reply::Reply;
 use crate::text::Text;
 
 /// Characters of an event text: the monitor formats into 0x200 bytes and
@@ -128,9 +133,11 @@ pub const fn pseudo_flags(options: PseudoOptions) -> FileEventFlags {
     if options.intersects(PseudoOptions::SYNCHRONOUS) {
         flags.insert(FileEventFlags::SYNCHRONOUS);
     }
+
     if options.intersects(PseudoOptions::BUFFERED) {
         flags.insert(FileEventFlags::BUFFERED);
     }
+
     flags
 }
 
@@ -142,6 +149,7 @@ pub const fn pseudo_io_type(operation: u32) -> u32 {
 
 const fn pseudo_io_flags(operation: u32, options: PseudoOptions) -> FileEventFlags {
     let flags = pseudo_flags(options);
+
     if matches!(operation, 2 | 3) {
         flags.union(FileEventFlags::SCATTER_GATHER)
     } else {
@@ -162,6 +170,7 @@ pub fn format_file_event_switch(enable: bool, id: FileEventId) -> FileEventSwitc
         if enable { "Start" } else { "Stop" },
         id.0
     );
+
     text
 }
 
@@ -174,9 +183,11 @@ fn append_path(text: &mut FileEventText, path: EventPath<'_>) {
     if length > PATH_LIMIT {
         return;
     }
+
     let room = (PATH_LIMIT - length).min(path.length as usize + PATH_PREFIX.len());
     let prefix = &PATH_PREFIX[..room.min(PATH_PREFIX.len())];
     let name = &path.text[..path.text.len().min(room - prefix.len())];
+
     let _ = text.push_bytes(prefix);
     let _ = text.push_bytes(name);
     if prefix.len() + name.len() == room {
@@ -201,9 +212,11 @@ pub fn format_file_event_begin(event: &FileEventBegin<'_>) -> FileEventText {
         event.bytes,
         event.flags.bits(),
     );
+
     if let Some(path) = event.path {
         append_path(&mut text, path);
     }
+
     text
 }
 
@@ -223,6 +236,7 @@ pub fn format_file_event_end(
         time_base as u32,
         result.0,
     );
+
     text
 }
 
@@ -233,6 +247,7 @@ pub fn format_marker(message: &[u8]) -> FileEventText {
         .push_bytes(b"XBDMFE!Marker \"Message=")
         .and_then(|()| text.push_bytes(message))
         .and_then(|()| text.push_bytes(b"\""));
+
     text
 }
 
@@ -252,9 +267,11 @@ pub fn format_pseudo_begin(event: &PseudoBegin<'_>) -> FileEventText {
                 pseudo_flags(event.options).bits(),
             )
         });
+
     if let Some(path) = event.path {
         append_path(&mut text, path);
     }
+
     text
 }
 
@@ -285,6 +302,7 @@ pub fn format_pseudo_begin_io(event: &PseudoBeginIo<'_>) -> FileEventText {
                 pseudo_io_flags(event.operation, event.options).bits(),
             )
         });
+
     text
 }
 
@@ -309,6 +327,7 @@ pub fn format_pseudo_end(
         None => Ok(()),
     })
     .and_then(|()| write!(text, " \"Result=0x{:08x}\"", result.0));
+
     text
 }
 
@@ -319,6 +338,7 @@ pub fn format_mark_thread(library: &[u8], thread_id: u32) -> FileEventText {
         .push_bytes(b"XBDMFE!MarkThread \"Library=")
         .and_then(|()| text.push_bytes(library))
         .and_then(|()| write!(text, "\" \"ThreadId=0x{thread_id:08x}\""));
+
     text
 }
 
@@ -327,7 +347,34 @@ pub fn format_mark_thread(library: &[u8], thread_id: u32) -> FileEventText {
 pub fn format_unmark_thread(thread_id: u32) -> FileEventText {
     let mut text = FileEventText::new();
     let _ = write!(text, "XBDMFE!UnmarkThread \"ThreadId=0x{thread_id:08x}\" ");
+
     text
+}
+
+/// `fileevent advise` | `fileevent unadvise`: switch file I/O event
+/// notifications and announce `XBDMFE!Start` or `XBDMFE!Stop` with a new
+/// sequence number on every notification channel.
+pub(super) fn file_event(invocation: &mut Invocation<'_>) -> CommandResult {
+    let enable = if invocation.line.has("advise") {
+        true
+    } else if invocation.line.has("unadvise") {
+        false
+    } else {
+        return Err(CommandError::Fail);
+    };
+
+    // Texts posted before the switch go out first, as the monitor sends
+    // them in their threads.
+    send_posted_notifications(invocation.state, invocation.backend, invocation.network);
+    let sequence = invocation.backend.switch_file_events(enable);
+    let line = format_file_event_switch(enable, sequence);
+
+    invocation
+        .state
+        .notifications
+        .send_text(line.as_bytes(), invocation.network);
+
+    Ok(Reply::Ok)
 }
 
 #[cfg(test)]
@@ -370,6 +417,7 @@ mod tests {
             options: PseudoOptions::empty(),
             path: Some(path),
         };
+
         format_pseudo_begin(&event)
     }
 

@@ -13,10 +13,10 @@
 use core::fmt::Write as _;
 
 use openxbdm_core::status::ErrorCode;
-use openxbdm_core::status::KernelError;
 use openxbdm_core::status::Win32Error;
 
 use super::Continuation as SessionContinuation;
+use super::error::RpcCreateError;
 use crate::continuation::Continuation as AnyContinuation;
 use crate::continuation::ContinuationContext;
 use crate::invocation::Invocation;
@@ -72,23 +72,6 @@ pub enum RpcThread<'a> {
     /// The title thread with this name runs the call when it drains the
     /// queue of named calls.
     Named(&'a [u8]),
-}
-
-/// Why a call block could not be created.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RpcCreateError {
-    OutOfMemory,
-    /// The call thread could not be created.
-    Thread(KernelError),
-}
-
-impl From<RpcCreateError> for CommandError {
-    fn from(error: RpcCreateError) -> Self {
-        match error {
-            RpcCreateError::OutOfMemory => ErrorCode::OutOfMemory.into(),
-            RpcCreateError::Thread(error) => Self::Kernel(error),
-        }
-    }
 }
 
 /// Platform services of `rpc`.
@@ -173,6 +156,7 @@ pub(super) fn rpc(invocation: &mut Invocation<'_>) -> CommandResult {
         ));
         return Ok(Reply::Ok);
     };
+
     if version != RPC_VERSION {
         invocation.set_text(format_args!(
             "error=Version mismatch, expected {RPC_VERSION} but got {}",
@@ -180,6 +164,7 @@ pub(super) fn rpc(invocation: &mut Invocation<'_>) -> CommandResult {
         ));
         return Ok(Reply::Ok);
     }
+
     let context = if invocation.line.has("system") {
         RpcContext::System
     } else if invocation.line.has("title") {
@@ -187,9 +172,11 @@ pub(super) fn rpc(invocation: &mut Invocation<'_>) -> CommandResult {
     } else {
         return Err(ErrorCode::BadParameter.into());
     };
+
     let Some(size) = invocation.line.dword("buf_size") else {
         return Err(ErrorCode::BadParameter.into());
     };
+
     // An absent or malformed value selects the default.
     let processor = invocation
         .line
@@ -200,11 +187,13 @@ pub(super) fn rpc(invocation: &mut Invocation<'_>) -> CommandResult {
         Some(value) => value.copy_into(&mut name),
         None => &[],
     };
+
     let thread = if name.is_empty() {
         RpcThread::Own { processor }
     } else {
         RpcThread::Named(name)
     };
+
     let call = invocation.backend.rpc_create(size, context, thread)?;
     let address = invocation.backend.rpc_buffer_address(call);
     let Some(session) = invocation.session.as_deref_mut() else {
@@ -213,6 +202,7 @@ pub(super) fn rpc(invocation: &mut Invocation<'_>) -> CommandResult {
         unsafe { invocation.backend.rpc_abort(call) };
         return Err(CommandError::Fail);
     };
+
     session.receive_remaining = Some(size);
     session.continuation =
         AnyContinuation::Session(SessionContinuation::Rpc(RpcTransfer::Upload {
@@ -222,6 +212,7 @@ pub(super) fn rpc(invocation: &mut Invocation<'_>) -> CommandResult {
         }));
     invocation.text.clear();
     let _ = write!(invocation.text, "buf_addr={address:08X}");
+
     Ok(Reply::SendBinary)
 }
 
@@ -254,6 +245,7 @@ fn upload(
         unsafe { cx.backend.rpc_abort(call) };
         return Ok(Reply::Ok);
     }
+
     // A buffered piece can run past the remaining count; stock writes it
     // past the end of the call buffer, here it stops at the end.
     let data = &cx.received[..cx
@@ -270,13 +262,16 @@ fn upload(
     if remaining != 0 {
         return Ok(Reply::Ok);
     }
+
     cx.backend.rpc_start(call);
     let next = RpcTransfer::Stream {
         call,
         size,
         phase: StreamPhase::Waiting,
     };
+
     cx.session.continuation = AnyContinuation::Session(SessionContinuation::Rpc(next));
+
     Ok(Reply::Binary)
 }
 
@@ -292,6 +287,7 @@ fn stream(
         unsafe { cx.backend.rpc_release(call) };
         return Err(CommandError::EndOfData);
     }
+
     match *phase {
         StreamPhase::Waiting => {
             let marker = if cx.backend.rpc_wait(call) {
@@ -300,13 +296,16 @@ fn stream(
                 } else {
                     StreamPhase::Buffer { offset: 0 }
                 };
+
                 DONE_MARKER
             } else {
                 if size == 0 {
                     *phase = StreamPhase::Sent;
                 }
+
                 PENDING_MARKER
             };
+
             cx.binary[..8].copy_from_slice(&marker);
             cx.binary_len = 8;
             Ok(Reply::Ok)
@@ -317,6 +316,7 @@ fn stream(
             if offset == 0 {
                 cx.backend.rpc_wait(call);
             }
+
             let count = (size - offset).min(cx.binary.len() as u32);
             // SAFETY: `offset + count` is at most `size`, the size the call
             // was created with.
@@ -324,6 +324,7 @@ fn stream(
                 cx.backend
                     .rpc_read(call, offset, &mut cx.binary[..count as usize])
             };
+
             cx.binary_len = count as usize;
             *phase = if offset + count == size {
                 StreamPhase::Sent
@@ -332,6 +333,7 @@ fn stream(
                     offset: offset + count,
                 }
             };
+
             Ok(Reply::Ok)
         }
         StreamPhase::Sent => {

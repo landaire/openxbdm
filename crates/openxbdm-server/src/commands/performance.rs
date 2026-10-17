@@ -5,6 +5,7 @@
 
 pub mod capture;
 pub mod counters;
+mod error;
 pub mod pix;
 pub mod pmc;
 pub mod profiler;
@@ -15,7 +16,6 @@ use core::fmt::Write as _;
 
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
-use openxbdm_core::status::XbdmHresult;
 use xbox360_sys::xboxkrnl::AccessMask;
 use xbox360_sys::xboxkrnl::CreateDisposition;
 use xbox360_sys::xboxkrnl::CreateOptions;
@@ -34,28 +34,17 @@ use crate::continuation::ContinuationContext;
 use crate::invocation::Invocation;
 use crate::registry::CommandEntry;
 use crate::registry::DispatchFlags;
+use crate::registry::Handler;
 use crate::reply;
 use crate::reply::CommandError;
 use crate::reply::CommandResult;
 use crate::reply::Reply;
 use crate::server::MAX_CONNECTIONS;
 use crate::text::Text;
+use crate::transfer_blocks::TransferBlock;
 
 pub use counters::CounterSample;
-
-const fn command(
-    name: &'static str,
-    any_of: Access,
-    handler: crate::registry::Handler,
-) -> CommandEntry {
-    CommandEntry::new(
-        name,
-        any_of,
-        Access::empty(),
-        DispatchFlags::empty(),
-        handler,
-    )
-}
+pub use error::DisplayError;
 
 pub(crate) const COMMANDS: &[CommandEntry] = &[
     command("autoprof", Access::CONTROL, auto_profile),
@@ -76,51 +65,12 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
 pub const COUNTER_NAME_CAPACITY: usize = 0x100;
 /// Path buffers of `capctrl` and `lopctrl`.
 const PROFILE_NAME_CAPACITY: usize = 0x141;
-/// `vd` command name buffer.
-const VD_COMMAND_CAPACITY: usize = 0x20;
-/// First register of the extended video encoder banks.
-const VD_EXTENDED_FIRST: u32 = 0x100;
-/// End of the video encoder register space.
-const VD_REGISTER_END: u32 = 0x300;
-/// Highest GPU register index `vd` accepts.
-const VD_GPU_LAST: u32 = 0xfffc;
 /// Bytes of one EDID block.
 pub const EDID_BLOCK_SIZE: usize = 0x80;
 /// Bytes of one framebuffer tile: 32 by 32 pixels of 4 bytes.
 pub const TILE_SIZE: u32 = 0x1000;
 /// Pixels along a tile edge.
 const TILE_EDGE: u32 = 32;
-
-/// A failed `vd` request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DisplayError {
-    BadParameter,
-    /// The extended video encoder banks are absent.
-    MemoryNotMapped,
-    /// The kernel lacks the EDID export.
-    Unsupported,
-    EdidFailed,
-    /// No transfer block holds the EDID block.
-    NoTransferBlock,
-}
-
-impl From<DisplayError> for Hresult {
-    fn from(error: DisplayError) -> Self {
-        match error {
-            DisplayError::BadParameter => ErrorCode::BadParameter.hresult(),
-            DisplayError::MemoryNotMapped => ErrorCode::MemoryNotMapped.hresult(),
-            DisplayError::Unsupported => ErrorCode::UnknownCommand.hresult(),
-            DisplayError::EdidFailed => Hresult::NO_RESPONSE,
-            DisplayError::NoTransferBlock => super::console::BufferTooSmall.into(),
-        }
-    }
-}
-
-impl From<DisplayError> for CommandError {
-    fn from(error: DisplayError) -> Self {
-        CommandError::Display(error)
-    }
-}
 
 /// Global state of this domain.
 #[derive(Debug)]
@@ -156,14 +106,9 @@ pub struct PixVersion {
 #[derive(Debug)]
 pub enum Continuation {
     CounterList,
-    CounterData {
-        sent: bool,
-    },
+    CounterData { sent: bool },
     Screenshot(ScreenshotTransfer),
-    Edid {
-        block: crate::transfer_blocks::TransferBlock,
-        sent: bool,
-    },
+    Edid { block: TransferBlock, sent: bool },
     Trace,
 }
 
@@ -225,6 +170,7 @@ impl PixMessage {
     pub fn new(code: u32, payload: &[u32]) -> Self {
         let mut words = [0; 12];
         words[..payload.len()].copy_from_slice(payload);
+
         Self {
             code,
             words,
@@ -258,6 +204,139 @@ pub enum CaptureValue {
 pub struct CounterEntry {
     pub name_len: usize,
     pub counter_type: u16,
+}
+
+/// Header and progress of a screenshot body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenshotTransfer {
+    pitch: u32,
+    width: u32,
+    height: u32,
+    format: u32,
+    offset_x: u32,
+    offset_y: u32,
+    scaled_width: u32,
+    scaled_height: u32,
+    colorspace: u8,
+    /// Framebuffer bytes not yet sent.
+    remaining: u32,
+    /// First tile of the current tile row.
+    source: u32,
+    header_sent: bool,
+    /// This command stopped the title and resumes it at the end.
+    stopped: bool,
+}
+
+impl ScreenshotTransfer {
+    fn new(capture: &DisplayCapture, stopped: bool) -> Self {
+        let display = capture.display;
+        let pitch = align_tile(u32::from(display.surface_width)) * 4;
+        let left = display.left & !(TILE_EDGE - 1);
+        let top = display.top & !(TILE_EDGE - 1);
+        let source = capture
+            .front_buffer
+            .wrapping_sub(0x4000_0000)
+            .wrapping_add(top.wrapping_mul(pitch))
+            .wrapping_add(display.left.wrapping_shl(7) & !(TILE_SIZE - 1));
+        let rows = align_tile(display.bottom).wrapping_sub(top);
+        let columns = align_tile(display.right).wrapping_sub(left);
+        let format = if capture.gamma {
+            0x1828_01b6
+        } else {
+            0x1828_0186
+        };
+
+        Self {
+            pitch,
+            width: display.right.wrapping_sub(display.left),
+            height: display.bottom.wrapping_sub(display.top),
+            format: 0x8000_0000 | format,
+            offset_x: display.left & (TILE_EDGE - 1),
+            offset_y: display.top & (TILE_EDGE - 1),
+            scaled_width: display.scaled_width,
+            scaled_height: display.scaled_height,
+            colorspace: display.colorspace,
+            remaining: rows.wrapping_mul(columns).wrapping_shl(2),
+            source,
+            header_sent: false,
+            stopped,
+        }
+    }
+
+    /// The header line first, then whole tiles in row-major order.
+    fn resume(&mut self, cx: &mut ContinuationContext<'_>) -> CommandResult {
+        if self.remaining == 0 || cx.aborted {
+            if self.stopped {
+                self.stopped = false;
+                let _ = debugger::go_execution(cx.state, cx.backend, cx.network);
+            }
+            return Err(CommandError::EndOfData);
+        }
+
+        if !self.header_sent {
+            self.header_sent = true;
+            let mut header: Text<0x100> = Text::new();
+            let _ = write!(
+                header,
+                "pitch=0x{:08x} width=0x{:08x} height=0x{:08x} format=0x{:08x} offsetx=0x{:08x} offsety=0x{:08x}, \
+                 framebuffersize=0x{:08x} sw=0x{:08x} sh=0x{:08x} colorspace=0x{:x}\r\n",
+                self.pitch,
+                self.width,
+                self.height,
+                self.format,
+                self.offset_x,
+                self.offset_y,
+                self.remaining,
+                self.scaled_width,
+                self.scaled_height,
+                self.colorspace
+            );
+            let bytes = header.as_bytes();
+            cx.binary[..bytes.len()].copy_from_slice(bytes);
+            cx.binary_len = bytes.len();
+            return Ok(Reply::Ok);
+        }
+
+        let chunk = self.remaining.min(cx.binary.len() as u32) & !(TILE_SIZE - 1);
+        let tiles_per_row = self
+            .offset_x
+            .wrapping_add(self.width)
+            .wrapping_add(TILE_EDGE - 1)
+            >> 5;
+        if chunk != 0 && tiles_per_row == 0 {
+            // The monitor divides by the tile count and traps.
+            return Err(CommandError::Unexpected);
+        }
+
+        let mut left = (self.remaining >> 12).wrapping_sub(1);
+
+        for page in cx.binary[..chunk as usize]
+            .as_chunks_mut::<{ TILE_SIZE as usize }>()
+            .0
+        {
+            let column = tiles_per_row - 1 - left % tiles_per_row;
+            // SAFETY: `new` starts `source` at the window's first tile row of
+            // the front buffer `capture_display` reported; `column` stays
+            // below the window's tile columns, `source` advances one tile
+            // row after the last column, and `remaining` ends the walk
+            // after the window's tile rows.
+            unsafe {
+                cx.backend.read_framebuffer_page(
+                    self.source.wrapping_add(column.wrapping_mul(TILE_SIZE)),
+                    page,
+                )
+            };
+            if (column + 1).is_multiple_of(tiles_per_row) {
+                self.source = self.source.wrapping_add(self.pitch.wrapping_mul(TILE_EDGE));
+            }
+            left = left.wrapping_sub(1);
+        }
+
+        cx.binary_len = chunk as usize;
+        self.remaining -= chunk;
+
+        Ok(Reply::Ok)
+    }
 }
 
 /// Platform services this domain needs.
@@ -395,6 +474,20 @@ pub trait Backend {
     fn pix_trace_read(&mut self, output: &mut [u8]) -> usize;
 }
 
+const fn command(name: &'static str, any_of: Access, handler: Handler) -> CommandEntry {
+    CommandEntry::new(
+        name,
+        any_of,
+        Access::empty(),
+        DispatchFlags::empty(),
+        handler,
+    )
+}
+
+const fn align_tile(value: u32) -> u32 {
+    value.wrapping_add(TILE_EDGE - 1) & !(TILE_EDGE - 1)
+}
+
 pub(crate) fn resume(
     continuation: &mut Continuation,
     cx: &mut ContinuationContext<'_>,
@@ -405,6 +498,7 @@ pub(crate) fn resume(
             if *sent {
                 return Err(CommandError::EndOfData);
             }
+
             *sent = true;
             let sample = cx.state.performance.scratch[usize::from(cx.session.index().0)];
             let _ = write!(
@@ -416,6 +510,7 @@ pub(crate) fn resume(
                 sample.rate as u32,
                 (sample.rate >> 32) as u32
             );
+
             Ok(Reply::Ok)
         }
         Continuation::Screenshot(transfer) => transfer.resume(cx),
@@ -426,22 +521,27 @@ pub(crate) fn resume(
                 unsafe { cx.state.transfer_blocks.release(cx.backend, *block) };
                 return Err(CommandError::EndOfData);
             }
+
             *sent = true;
             cx.binary[..EDID_BLOCK_SIZE].copy_from_slice(
                 &cx.state.transfer_blocks.bytes(cx.backend, *block)[..EDID_BLOCK_SIZE],
             );
             cx.binary_len = EDID_BLOCK_SIZE;
+
             Ok(Reply::Ok)
         }
         Continuation::Trace => {
             if cx.aborted {
                 return Err(CommandError::EndOfData);
             }
+
             let count = cx.backend.pix_trace_read(cx.binary);
             if count == 0 {
                 return Err(CommandError::EndOfData);
             }
+
             cx.binary_len = count;
+
             Ok(Reply::Ok)
         }
     }
@@ -453,6 +553,7 @@ fn auto_profile(invocation: &mut Invocation<'_>) -> CommandResult {
         .line
         .param("xuid")
         .and_then(|value| value.qword());
+
     if !invocation
         .backend
         .hardware_flags()
@@ -460,6 +561,7 @@ fn auto_profile(invocation: &mut Invocation<'_>) -> CommandResult {
     {
         return Err(ErrorCode::UnknownCommand.into());
     }
+
     match xuid {
         Some(xuid) => invocation
             .backend
@@ -472,21 +574,23 @@ fn auto_profile(invocation: &mut Invocation<'_>) -> CommandResult {
                 .backend
                 .xconfig_get(ConfigSetting::AUTO_PROFILE_XUID, &mut value)
                 .map_err(CommandError::Kernel)?;
-            invocation.set_text(format_args!("xuid==0q{:016x}", u64::from_be_bytes(value)));
+            let xuid = u64::from_be_bytes(value);
+            invocation.set_text(format_args!("xuid==0q{xuid:016x}"));
+
             Ok(Reply::Ok)
         }
     }
 }
 
-/// Copy a required path parameter, or set `missing name`.
+/// Copy the required `name` path parameter.
 fn profile_name<'b>(
     invocation: &mut Invocation<'_>,
     output: &'b mut [u8; PROFILE_NAME_CAPACITY],
 ) -> Option<&'b [u8]> {
-    match invocation.line.param("name") {
-        Some(value) => Some(value.copy_into(output)),
-        None => None,
-    }
+    invocation
+        .line
+        .param("name")
+        .map(|value| value.copy_into(output))
 }
 
 /// An optional dword parameter; a malformed value still stores its digits.
@@ -545,7 +649,10 @@ fn capture_control(invocation: &mut Invocation<'_>) -> CommandResult {
     } else {
         Err(ErrorCode::Undefined.into())
     };
-    invocation.set_text(format_args!("HRESULT 0x{:08x}", reply::hresult(result).0));
+
+    let hresult = reply::hresult(result).0;
+    invocation.set_text(format_args!("HRESULT 0x{hresult:08x}"));
+
     result
 }
 
@@ -564,6 +671,7 @@ fn start_capture(
         disposition: CreateDisposition::OverwriteIf,
         options: CreateOptions::SYNCHRONOUS_IO_NONALERT,
     };
+
     let Some(path) = invocation
         .state
         .filesystem
@@ -572,10 +680,12 @@ fn start_capture(
     else {
         return Err(capture::CaptureError::FileFailed);
     };
-    match invocation.backend.create_file(path.as_bytes(), &request) {
-        Ok(handle) => invocation.backend.close_file(handle),
-        Err(_) => return Err(capture::CaptureError::FileFailed),
-    }
+
+    let Ok(handle) = invocation.backend.create_file(path.as_bytes(), &request) else {
+        return Err(capture::CaptureError::FileFailed);
+    };
+    invocation.backend.close_file(handle);
+
     invocation
         .backend
         .capture_start(name, path.as_bytes(), buffer)
@@ -627,7 +737,10 @@ fn cpu_profiler_control(invocation: &mut Invocation<'_>) -> CommandResult {
     } else {
         Err(ErrorCode::Undefined.into())
     };
-    invocation.set_text(format_args!("HRESULT 0x{:08x}", reply::hresult(result).0));
+
+    let hresult = reply::hresult(result).0;
+    invocation.set_text(format_args!("HRESULT 0x{hresult:08x}"));
+
     result
 }
 
@@ -636,9 +749,11 @@ fn counter_list(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(session) = invocation.session.as_deref_mut() else {
         return Err(CommandError::Fail);
     };
+
     let scratch = &mut invocation.state.performance.scratch[usize::from(session.index().0)];
     scratch.value &= u64::from(u32::MAX);
     session.continuation = AnyContinuation::Performance(Continuation::CounterList);
+
     Ok(Reply::Multiline)
 }
 
@@ -649,9 +764,12 @@ fn next_counter_line(cx: &mut ContinuationContext<'_>) -> CommandResult {
     let result = cx.backend.next_counter(&mut context, &mut name);
     scratch.value = (u64::from(context) << 32) | (scratch.value & u64::from(u32::MAX));
     let entry = result?;
+
     let _ = cx.line.push_bytes(b"name=\"");
     let _ = cx.line.push_bytes(&name[..entry.name_len]);
-    let _ = write!(cx.line, "\" type=0x{:08x}", entry.counter_type);
+    let counter_type = entry.counter_type;
+    let _ = write!(cx.line, "\" type=0x{counter_type:08x}");
+
     Ok(Reply::Ok)
 }
 
@@ -659,13 +777,16 @@ fn next_counter_line(cx: &mut ContinuationContext<'_>) -> CommandResult {
 fn performance_status(invocation: &mut Invocation<'_>) -> CommandResult {
     let frequency = invocation.backend.performance_frequency();
     invocation.set_text(format_args!("PerfFreq=0x{frequency:X}"));
+
     Ok(Reply::Ok)
 }
 
 /// `pixpreview`: always fails.
 fn pix_preview(invocation: &mut Invocation<'_>) -> CommandResult {
     let error = CommandError::Status(ErrorCode::BadParameter);
-    invocation.set_text(format_args!("HRESULT 0x{:08x}", Hresult::from(error).0));
+    let hresult = Hresult::from(error).0;
+    invocation.set_text(format_args!("HRESULT 0x{hresult:08x}"));
+
     Err(error)
 }
 
@@ -678,6 +799,7 @@ fn query_counter(invocation: &mut Invocation<'_>) -> CommandResult {
     else {
         return Err(CommandError::Fail);
     };
+
     let mut name = [0u8; COUNTER_NAME_CAPACITY];
     let Some(name) = invocation
         .line
@@ -687,150 +809,24 @@ fn query_counter(invocation: &mut Invocation<'_>) -> CommandResult {
         invocation.set_text(format_args!("missing name"));
         return Err(CommandError::Fail);
     };
+
     let Some(query) = util::required_dword(invocation, "type") else {
         return Err(util::MISSING);
     };
+
     invocation.backend.query_counter(
         name,
         counters::CounterQuery(query),
         &mut invocation.state.performance.scratch[index],
     )?;
+
     if let Some(session) = invocation.session.as_deref_mut() {
         session.continuation =
             AnyContinuation::Performance(Continuation::CounterData { sent: false });
     }
     invocation.set_text(format_args!("counter data follows"));
+
     Ok(Reply::Multiline)
-}
-
-const fn align_tile(value: u32) -> u32 {
-    value.wrapping_add(TILE_EDGE - 1) & !(TILE_EDGE - 1)
-}
-
-/// Header and progress of a screenshot body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ScreenshotTransfer {
-    pitch: u32,
-    width: u32,
-    height: u32,
-    format: u32,
-    offset_x: u32,
-    offset_y: u32,
-    scaled_width: u32,
-    scaled_height: u32,
-    colorspace: u8,
-    /// Framebuffer bytes not yet sent.
-    remaining: u32,
-    /// First tile of the current tile row.
-    source: u32,
-    header_sent: bool,
-    /// This command stopped the title and resumes it at the end.
-    stopped: bool,
-}
-
-impl ScreenshotTransfer {
-    fn new(capture: &DisplayCapture, stopped: bool) -> Self {
-        let display = capture.display;
-        let pitch = align_tile(u32::from(display.surface_width)) * 4;
-        let left = display.left & !(TILE_EDGE - 1);
-        let top = display.top & !(TILE_EDGE - 1);
-        let source = capture
-            .front_buffer
-            .wrapping_sub(0x4000_0000)
-            .wrapping_add(top.wrapping_mul(pitch))
-            .wrapping_add(display.left.wrapping_shl(7) & !(TILE_SIZE - 1));
-        let rows = align_tile(display.bottom).wrapping_sub(top);
-        let columns = align_tile(display.right).wrapping_sub(left);
-        let format = if capture.gamma {
-            0x1828_01b6
-        } else {
-            0x1828_0186
-        };
-        Self {
-            pitch,
-            width: display.right.wrapping_sub(display.left),
-            height: display.bottom.wrapping_sub(display.top),
-            format: 0x8000_0000 | format,
-            offset_x: display.left & (TILE_EDGE - 1),
-            offset_y: display.top & (TILE_EDGE - 1),
-            scaled_width: display.scaled_width,
-            scaled_height: display.scaled_height,
-            colorspace: display.colorspace,
-            remaining: rows.wrapping_mul(columns).wrapping_shl(2),
-            source,
-            header_sent: false,
-            stopped,
-        }
-    }
-
-    /// The header line first, then whole tiles in row-major order.
-    fn resume(&mut self, cx: &mut ContinuationContext<'_>) -> CommandResult {
-        if self.remaining == 0 || cx.aborted {
-            if self.stopped {
-                self.stopped = false;
-                let _ = debugger::go_execution(cx.state, cx.backend, cx.network);
-            }
-            return Err(CommandError::EndOfData);
-        }
-        if !self.header_sent {
-            self.header_sent = true;
-            let mut header: Text<0x100> = Text::new();
-            let _ = write!(
-                header,
-                "pitch=0x{:08x} width=0x{:08x} height=0x{:08x} format=0x{:08x} offsetx=0x{:08x} offsety=0x{:08x}, \
-                 framebuffersize=0x{:08x} sw=0x{:08x} sh=0x{:08x} colorspace=0x{:x}\r\n",
-                self.pitch,
-                self.width,
-                self.height,
-                self.format,
-                self.offset_x,
-                self.offset_y,
-                self.remaining,
-                self.scaled_width,
-                self.scaled_height,
-                self.colorspace
-            );
-            let bytes = header.as_bytes();
-            cx.binary[..bytes.len()].copy_from_slice(bytes);
-            cx.binary_len = bytes.len();
-            return Ok(Reply::Ok);
-        }
-        let chunk = self.remaining.min(cx.binary.len() as u32) & !(TILE_SIZE - 1);
-        let tiles_per_row = self
-            .offset_x
-            .wrapping_add(self.width)
-            .wrapping_add(TILE_EDGE - 1)
-            >> 5;
-        if chunk != 0 && tiles_per_row == 0 {
-            // The monitor divides by the tile count and traps.
-            return Err(CommandError::Unexpected);
-        }
-        let mut left = (self.remaining >> 12).wrapping_sub(1);
-        for page in cx.binary[..chunk as usize]
-            .as_chunks_mut::<{ TILE_SIZE as usize }>()
-            .0
-        {
-            let column = tiles_per_row - 1 - left % tiles_per_row;
-            // SAFETY: `new` starts `source` at the window's first tile row of
-            // the front buffer `capture_display` reported; `column` stays
-            // below the window's tile columns, `source` advances one tile
-            // row after the last column, and `remaining` ends the walk
-            // after the window's tile rows.
-            unsafe {
-                cx.backend.read_framebuffer_page(
-                    self.source.wrapping_add(column.wrapping_mul(TILE_SIZE)),
-                    page,
-                )
-            };
-            if (column + 1).is_multiple_of(tiles_per_row) {
-                self.source = self.source.wrapping_add(self.pitch.wrapping_mul(TILE_EDGE));
-            }
-            left = left.wrapping_sub(1);
-        }
-        cx.binary_len = chunk as usize;
-        self.remaining -= chunk;
-        Ok(Reply::Ok)
-    }
 }
 
 /// `screenshot`: stop the title and send the front buffer tiles.
@@ -838,24 +834,37 @@ fn screenshot(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.session.is_none() {
         return Err(CommandError::Fail);
     }
+
     let stop = debugger::stop_execution(invocation.state, invocation.backend, invocation.network);
     let capture = invocation.backend.capture_display();
     let transfer = ScreenshotTransfer::new(&capture, stop.is_ok());
     if let Some(session) = invocation.session.as_deref_mut() {
         session.continuation = AnyContinuation::Performance(Continuation::Screenshot(transfer));
     }
+
     Ok(Reply::Binary)
 }
 
 /// Fail with the result as `HRESULT 0x%x` text.
 fn vd_failure(invocation: &mut Invocation<'_>, error: DisplayError) -> CommandResult {
-    invocation.set_text(format_args!("HRESULT 0x{:x}", Hresult::from(error).0));
+    let hresult = Hresult::from(error).0;
+    invocation.set_text(format_args!("HRESULT 0x{hresult:x}"));
+
     Err(error.into())
 }
 
 /// `vd cmd=<peek|poke|gpeek|gpoke|edid> ...`: video encoder, GPU register,
 /// and EDID access.
 fn video_display(invocation: &mut Invocation<'_>) -> CommandResult {
+    /// `vd` command name buffer.
+    const VD_COMMAND_CAPACITY: usize = 0x20;
+    /// First register of the extended video encoder banks.
+    const VD_EXTENDED_FIRST: u32 = 0x100;
+    /// End of the video encoder register space.
+    const VD_REGISTER_END: u32 = 0x300;
+    /// Highest GPU register index `vd` accepts.
+    const VD_GPU_LAST: u32 = 0xfffc;
+
     let mut buffer = [0u8; VD_COMMAND_CAPACITY];
     let Some(command) = invocation
         .line
@@ -864,12 +873,15 @@ fn video_display(invocation: &mut Invocation<'_>) -> CommandResult {
     else {
         return vd_failure(invocation, DisplayError::BadParameter);
     };
+
     let line = invocation.line;
     let dword = |name: &str| line.dword(name);
+
     if command.eq_ignore_ascii_case(b"peek") {
         let Some(register) = dword("addr").filter(|&register| register < VD_REGISTER_END) else {
             return vd_failure(invocation, DisplayError::BadParameter);
         };
+
         if register < VD_EXTENDED_FIRST {
             let value = invocation.backend.read_video_encoder(register);
             invocation.set_text(format_args!("0x{value:08x}"));
@@ -877,6 +889,7 @@ fn video_display(invocation: &mut Invocation<'_>) -> CommandResult {
             if !invocation.backend.video_encoder_extended() {
                 return vd_failure(invocation, DisplayError::MemoryNotMapped);
             }
+
             let value = invocation.backend.read_video_encoder(register) as u8;
             invocation.set_text(format_args!("0x{value:02x}"));
         }
@@ -890,12 +903,14 @@ fn video_display(invocation: &mut Invocation<'_>) -> CommandResult {
         if register > 0xff && value > 0xff {
             return vd_failure(invocation, DisplayError::BadParameter);
         }
+
         if register < VD_EXTENDED_FIRST {
             invocation.backend.write_video_encoder(register, value);
         } else {
             if !invocation.backend.video_encoder_extended() {
                 return vd_failure(invocation, DisplayError::MemoryNotMapped);
             }
+
             invocation
                 .backend
                 .write_video_encoder_extended(register, value as u8);
@@ -904,6 +919,7 @@ fn video_display(invocation: &mut Invocation<'_>) -> CommandResult {
         let Some(index) = dword("addr").filter(|&index| index <= VD_GPU_LAST) else {
             return vd_failure(invocation, DisplayError::BadParameter);
         };
+
         let value = invocation.backend.read_gpu_register(index);
         invocation.set_text(format_args!("0x{value:08x}"));
     } else if command.eq_ignore_ascii_case(b"gpoke") {
@@ -913,6 +929,7 @@ fn video_display(invocation: &mut Invocation<'_>) -> CommandResult {
         let Some(value) = dword("data") else {
             return vd_failure(invocation, DisplayError::BadParameter);
         };
+
         invocation.backend.write_gpu_register(index, value);
     } else if command.eq_ignore_ascii_case(b"edid") {
         let Some(block) = dword("block").filter(|&block| block <= 0xff) else {
@@ -921,6 +938,7 @@ fn video_display(invocation: &mut Invocation<'_>) -> CommandResult {
         let Some(socket) = invocation.session.as_ref().map(|session| session.socket()) else {
             return Err(CommandError::Fail);
         };
+
         // Stock allocates the block before the read (and leaks it when the
         // read fails).
         let Some(held) = invocation.state.transfer_blocks.acquire(
@@ -930,6 +948,7 @@ fn video_display(invocation: &mut Invocation<'_>) -> CommandResult {
         ) else {
             return vd_failure(invocation, DisplayError::NoTransferBlock);
         };
+
         let mut data = [0u8; EDID_BLOCK_SIZE];
         let read = invocation.backend.read_edid(block as u8, &mut data);
         if read != EdidRead::Read {
@@ -949,6 +968,7 @@ fn video_display(invocation: &mut Invocation<'_>) -> CommandResult {
                 },
             );
         }
+
         invocation
             .state
             .transfer_blocks
@@ -960,8 +980,10 @@ fn video_display(invocation: &mut Invocation<'_>) -> CommandResult {
                 sent: false,
             });
         }
+
         return Ok(Reply::Binary);
     }
+
     Ok(Reply::Ok)
 }
 
@@ -981,14 +1003,22 @@ fn studio(invocation: &mut Invocation<'_>) -> CommandResult {
         .position(|byte| !is_delimiter(byte))
         .unwrap_or(rest.len());
     let rest = &rest[start..];
-    let token = &rest[..rest.iter().position(is_delimiter).unwrap_or(rest.len())];
+    let token_len = rest.iter().position(is_delimiter).unwrap_or(rest.len());
+    let token = &rest[..token_len];
+
     if token != b"DedicateSocket" {
         invocation.text.set_bytes(b"NO");
         return Ok(Reply::Ok);
     }
+
     match invocation.backend.dedicate_studio_socket() {
-        Ok(port) => invocation.set_text(format_args!("OK {port}")),
-        Err(_) => invocation.text.set_bytes(b"NO"),
+        Ok(port) => {
+            invocation.set_text(format_args!("OK {port}"));
+        }
+        Err(_) => {
+            invocation.text.set_bytes(b"NO");
+        }
     }
+
     Ok(Reply::Ok)
 }

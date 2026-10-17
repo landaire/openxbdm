@@ -18,6 +18,8 @@ use xbox360_sys::xboxkrnl::CreateOptions;
 use xbox360_sys::xboxkrnl::FileAttributes;
 use xbox360_sys::xboxkrnl::ShareAccess;
 
+use super::error::LogEngineError;
+use super::error::TellLogFailed;
 use crate::backend::Backend as AnyBackend;
 use crate::commands::filesystem::CreateRequest;
 use crate::commands::filesystem::FileHandle;
@@ -66,28 +68,6 @@ pub struct TellLogCounters {
     pub missed: u32,
 }
 
-/// Why the platform log engine could not be created.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LogEngineError {
-    /// The engine or a queue cell could not be allocated.
-    OutOfMemory,
-    /// A lock-free queue call failed with this result.
-    Queue(Hresult),
-    /// The worker thread could not be created.
-    Thread(KernelError),
-}
-
-/// The engine's result word: a kernel status passes unchanged.
-impl From<LogEngineError> for Hresult {
-    fn from(error: LogEngineError) -> Self {
-        match error {
-            LogEngineError::OutOfMemory => Hresult::OUT_OF_MEMORY,
-            LogEngineError::Queue(result) => result,
-            LogEngineError::Thread(error) => Hresult(error.status().0),
-        }
-    }
-}
-
 /// A `dmtelllog` success result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TellLogReply {
@@ -113,17 +93,6 @@ impl From<TellLogReply> for Hresult {
             TellLogReply::NotOpen => TellLogReply::NOT_OPEN,
             TellLogReply::Started | TellLogReply::Stopped => Hresult::from_nt(NtStatus::SUCCESS),
         }
-    }
-}
-
-/// `dmtelllog start` could not start the log engine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TellLogFailed(pub LogEngineError);
-
-impl From<TellLogFailed> for Hresult {
-    fn from(TellLogFailed(error): TellLogFailed) -> Self {
-        // The engine result carries the NT bit as a kernel status would.
-        Hresult::from_nt(NtStatus(Hresult::from(error).0))
     }
 }
 
@@ -183,13 +152,16 @@ impl TellLogWriter {
         if closing {
             return self.flush(write);
         }
+
         if self.count + length > TELL_LOG_BUFFER_SIZE {
             self.flush(write)?;
         }
+
         // An entry larger than the buffer is cut to it.
         let length = length.min(TELL_LOG_BUFFER_SIZE - self.count);
         self.buffer[self.count..self.count + length].copy_from_slice(&entry[..length]);
         self.count += length;
+
         Ok(())
     }
 
@@ -200,7 +172,9 @@ impl TellLogWriter {
         if self.count == 0 {
             return Ok(());
         }
+
         let count = core::mem::take(&mut self.count);
+
         write(&self.buffer[..count])
     }
 }
@@ -253,6 +227,7 @@ pub fn format_wait_trace(
         WaitTrace::Enter => 'E',
         WaitTrace::Leave => 'L',
     };
+
     let _ = write!(
         text,
         "{letter}:{} 0x{:016x} 0x{:08x} 0x{:08x} 0x{:08x} 0x{:08x} {:02} | 0x{:08x} 0x{:08x} {:02} 0x{:08x} 0x{:08x} 0x{:08x}\r\n",
@@ -276,14 +251,17 @@ pub fn format_wait_trace(
         output[bytes.len()] = 0;
         return bytes.len() + 1;
     }
+
     if limit < 2 {
         // The monitor writes the LF before the buffer; only the NUL remains.
         output[..limit].fill(0);
         return limit;
     }
+
     output[..limit - 2].copy_from_slice(&bytes[..limit - 2]);
     output[limit - 2] = b'\n';
     output[limit - 1] = 0;
+
     limit
 }
 
@@ -300,6 +278,7 @@ pub(super) fn tell_log(invocation: &mut Invocation<'_>) -> CommandResult {
         else {
             return Err(ErrorCode::BadParameter.into());
         };
+
         let Some(area) = invocation
             .line
             .dword("area")
@@ -307,6 +286,7 @@ pub(super) fn tell_log(invocation: &mut Invocation<'_>) -> CommandResult {
         else {
             return Err(ErrorCode::BadParameter.into());
         };
+
         // Absent values select blocking off and the engine defaults.
         let block = invocation
             .line
@@ -325,8 +305,10 @@ pub(super) fn tell_log(invocation: &mut Invocation<'_>) -> CommandResult {
     } else {
         return Err(ErrorCode::UnknownCommand.into());
     };
+
     // A result of 0 sends no reply line.
     invocation.set_text(format_args!("hresult=0x{:x}", reply::hresult(result).0));
+
     result
 }
 
@@ -343,8 +325,10 @@ fn start(
             backend.set_tell_log_area(open.union(area));
             return Ok(Reply::Sent);
         }
+
         return Ok(Reply::TellLog(TellLogReply::AlreadyOpen));
     }
+
     let mut path = Text::<{ PATH_PREFIX.len() + FILE_NAME_CAPACITY }>::new();
     let _ = path.push_bytes(PATH_PREFIX);
     let _ = path.push_bytes(file);
@@ -361,6 +345,7 @@ fn start(
         disposition: CreateDisposition::OverwriteIf,
         options: CreateOptions::SYNCHRONOUS_IO_NONALERT.union(CreateOptions::NON_DIRECTORY_FILE),
     };
+
     let opened = backend.create_file(path.as_bytes(), &request);
     if let Err(error) = opened {
         debug_print(
@@ -368,11 +353,13 @@ fn start(
             format_args!("DmTellLog: Failed to open file 0x{:x}\n", error.status().0),
         );
     }
+
     debug_print(backend, format_args!("Logging mask = 0x{:x}\n", area.0));
     // An unopened file sends no reply line.
     let Ok(file) = opened else {
         return Ok(Reply::Sent);
     };
+
     let config = TellLogConfig {
         entry_size: if size == 0 { DEFAULT_ENTRY_SIZE } else { size },
         entries: if entries == 0 {
@@ -382,6 +369,7 @@ fn start(
         },
         block,
     };
+
     match backend.tell_log_start(file, area, config) {
         Ok(()) => Ok(Reply::TellLog(TellLogReply::Started)),
         Err(error) => {
@@ -397,14 +385,17 @@ fn stop(backend: &mut dyn AnyBackend, area: TellLogAreas) -> CommandResult {
     let Some(open) = backend.tell_log_area() else {
         return not_open;
     };
+
     let remaining = open.difference(area);
     backend.set_tell_log_area(remaining);
     if !remaining.is_empty() && !area.is_empty() {
         return Ok(Reply::Sent);
     }
+
     let Some(counters) = backend.tell_log_close() else {
         return not_open;
     };
+
     debug_print(
         backend,
         format_args!(
@@ -415,9 +406,11 @@ fn stop(backend: &mut dyn AnyBackend, area: TellLogAreas) -> CommandResult {
     let Some(file) = backend.tell_log_stop() else {
         return not_open;
     };
+
     // The monitor ignores the flush status.
     let _ = backend.flush_file(file);
     backend.close_file(file);
+
     Ok(Reply::TellLog(TellLogReply::Stopped))
 }
 
@@ -473,6 +466,7 @@ mod tests {
             writes += 1;
             Ok(())
         };
+
         let entry = [b'a'; 0x1000];
         writer.process(&entry, false, &mut write).unwrap();
         writer.process(&entry, false, &mut write).unwrap();

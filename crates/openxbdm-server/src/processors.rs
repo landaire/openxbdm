@@ -4,11 +4,15 @@
 // `ProcessorHandle` names code the platform calls.
 #![allow(unsafe_code)]
 
+mod error;
+
 use openxbdm_core::status::Hresult;
 
 use crate::invocation::ConnectionIndex;
 use crate::text::LineText;
 use crate::text::ResponseText;
+
+pub use self::error::RegisterError;
 
 pub const MAX_PROCESSORS: usize = 16;
 /// Longest accepted processor name.
@@ -59,24 +63,6 @@ impl Processor {
     }
 }
 
-/// Why a processor could not be registered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RegisterError {
-    /// Every registry slot is taken.
-    RegistryFull,
-    /// The name is longer than [`PROCESSOR_NAME_CAPACITY`].
-    NameTooLong,
-}
-
-impl From<RegisterError> for Hresult {
-    fn from(error: RegisterError) -> Self {
-        match error {
-            RegisterError::RegistryFull => Hresult::OUT_OF_MEMORY,
-            RegisterError::NameTooLong => Hresult::INVALID_ARGUMENT,
-        }
-    }
-}
-
 /// Processor registry.
 #[derive(Debug, Default)]
 pub struct Processors {
@@ -100,18 +86,21 @@ impl Processors {
     ) -> Result<(), RegisterError> {
         let Some(handle) = handle else {
             for slot in &mut self.slots {
-                if matches!(slot, Some(p) if p.name().eq_ignore_ascii_case(name)) {
+                if matches!(slot, Some(processor) if processor.name().eq_ignore_ascii_case(name)) {
                     *slot = None;
                 }
             }
+
             return Ok(());
         };
         let Some(index) = self.slots.iter().position(Option::is_none) else {
             return Err(RegisterError::RegistryFull);
         };
+
         if name.len() > PROCESSOR_NAME_CAPACITY {
             return Err(RegisterError::NameTooLong);
         }
+
         let mut stored = [0u8; PROCESSOR_NAME_CAPACITY];
         stored[..name.len()].copy_from_slice(name);
         self.slots[index] = Some(Processor {
@@ -120,14 +109,15 @@ impl Processors {
             handle,
             flags,
         });
+
         Ok(())
     }
 
     /// Find a processor by name, ignoring ASCII case.
     pub fn find(&self, name: &[u8]) -> Option<(u8, Processor)> {
         self.slots.iter().enumerate().find_map(|(index, slot)| {
-            slot.filter(|p| p.name().eq_ignore_ascii_case(name))
-                .map(|p| (index as u8, p))
+            slot.filter(|processor| processor.name().eq_ignore_ascii_case(name))
+                .map(|processor| (index as u8, processor))
         })
     }
 
@@ -138,7 +128,7 @@ impl Processors {
     /// Remove every processor registered from the title process.
     pub fn remove_title_processors(&mut self) {
         for slot in &mut self.slots {
-            if matches!(slot, Some(p) if p.flags.contains(ProcessorFlags::TITLE)) {
+            if matches!(slot, Some(processor) if processor.flags.contains(ProcessorFlags::TITLE)) {
                 *slot = None;
             }
         }

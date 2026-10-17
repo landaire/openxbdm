@@ -1,35 +1,30 @@
 //! System control commands: time, reboot, titles, flash, and the settings
 //! file.
 
-use core::fmt;
-use core::fmt::Write as _;
+mod default_title;
+mod error;
+mod flash;
+mod settings;
+mod title;
 
-use openxbdm_core::line::CommandLine;
 use openxbdm_core::status::ErrorCode;
-use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::Win32Error;
-use xbox360_sys::status::Facility;
-use xbox360_sys::xboxkrnl::AccessMask;
-use xbox360_sys::xboxkrnl::CreateDisposition;
-use xbox360_sys::xboxkrnl::CreateOptions;
-use xbox360_sys::xboxkrnl::FileAttributes;
 use xbox360_sys::xboxkrnl::HardwareFlags;
-use xbox360_sys::xboxkrnl::ShareAccess;
 
+use self::default_title::default_title;
+use self::flash::flash;
+use self::flash::resume_flash;
+use self::settings::reboot_from_settings;
+use self::title::launch;
+use self::title::magic_boot;
+use self::title::title;
 use crate::access::Access;
 use crate::backend::Backend as AnyBackend;
-use crate::commands;
 use crate::commands::console::ConfigFlags;
 use crate::commands::console::ConfigSetting;
 use crate::commands::console::RetailFlags;
-use crate::commands::console::TraceMask;
-use crate::commands::console::trace;
-use crate::commands::console::trace_text;
-use crate::commands::debugger::StopOn;
-use crate::commands::filesystem::BasicInformation;
-use crate::commands::filesystem::CreateRequest;
-use crate::commands::filesystem::FileData;
+use crate::commands::console::c_string;
 use crate::commands::util;
 use crate::continuation::ContinuationContext;
 use crate::invocation::Invocation;
@@ -43,23 +38,41 @@ use crate::reply::CommandError;
 use crate::reply::CommandResult;
 use crate::reply::Reply;
 use crate::server::Server;
-use crate::state::ServerState;
+
+pub use self::error::CreateSettingsError;
+pub use self::error::FlashFailed;
+pub use self::flash::FlashOptions;
+pub use self::flash::FlashUpload;
+pub use self::settings::SettingsCopy;
+pub use self::settings::SettingsFile;
+pub use self::settings::SettingsSource;
+pub use self::settings::copy_settings;
+pub(crate) use self::settings::end_line;
+pub use self::settings::load_settings;
+pub(crate) use self::settings::save_settings;
+pub(crate) use self::settings::settings_keyword;
+pub use self::settings::wipe_settings;
+pub(crate) use self::settings::write_bytes;
+pub(crate) use self::settings::write_line;
+pub(crate) use self::settings::write_text;
+pub use self::title::LaunchReason;
+pub use self::title::LaunchRequest;
+pub use self::title::LaunchTitle;
+pub use self::title::TITLE_TEXT_CAPACITY;
+pub use self::title::TitleFlags;
+pub use self::title::TitleRebootStop;
+pub use self::title::TitleText;
+pub use self::title::launch_from_paths;
+pub use self::title::launch_image_exists;
+pub use self::title::launch_override;
+pub use self::title::launch_without_connection;
+pub use self::title::set_title_from_paths;
+pub use self::title::title_reboot_launch;
+pub use self::title::title_reboot_stop;
+pub use self::title::trace_title_reboot;
 
 /// Delay between the `200- OK` of a reboot and the reboot.
 const REBOOT_REPLY_DELAY_MS: u32 = 200;
-/// Line terminator of the settings file.
-const LINE_END: &[u8] = b"\r\n";
-/// Read buffer of the settings loader; a line that fills it is cut.
-const SETTINGS_READ_CAPACITY: usize = 0x4000;
-
-const fn entry(
-    name: &'static str,
-    any_of: Access,
-    flags: DispatchFlags,
-    handler: fn(&mut Invocation<'_>) -> CommandResult,
-) -> CommandEntry {
-    CommandEntry::new(name, any_of, Access::empty(), flags, handler)
-}
 
 pub(crate) const COMMANDS: &[CommandEntry] = &[
     entry(
@@ -124,82 +137,6 @@ pub enum RebootKind {
     SmcReset,
 }
 
-/// Capacity of a title string: the monitor keeps each in a 0x100-byte
-/// buffer with a forced terminator.
-pub const TITLE_TEXT_CAPACITY: usize = 0xff;
-
-/// A title image path, drive path, or command line.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct TitleText {
-    bytes: [u8; TITLE_TEXT_CAPACITY],
-    len: u8,
-}
-
-impl TitleText {
-    pub const EMPTY: Self = Self {
-        bytes: [0; TITLE_TEXT_CAPACITY],
-        len: 0,
-    };
-
-    /// Replace the text with `bytes` up to the first NUL, truncated to the
-    /// capacity.
-    pub fn set(&mut self, bytes: &[u8]) {
-        let end = bytes
-            .iter()
-            .position(|&byte| byte == 0)
-            .unwrap_or(bytes.len())
-            .min(TITLE_TEXT_CAPACITY);
-        self.bytes[..end].copy_from_slice(&bytes[..end]);
-        // Bytes past the length are zero, as equality compares them.
-        self.bytes[end..].fill(0);
-        self.len = end as u8;
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes[..usize::from(self.len)]
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-}
-
-impl Default for TitleText {
-    fn default() -> Self {
-        Self::EMPTY
-    }
-}
-
-impl fmt::Debug for TitleText {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "\"{}\"", self.as_bytes().escape_ascii())
-    }
-}
-
-/// A title to launch: image object path, drive object path, and command
-/// line.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LaunchTitle {
-    pub image: TitleText,
-    pub drive: TitleText,
-    pub command_line: TitleText,
-}
-
-impl LaunchTitle {
-    pub const EMPTY: Self = Self {
-        image: TitleText::EMPTY,
-        drive: TitleText::EMPTY,
-        command_line: TitleText::EMPTY,
-    };
-
-    /// Replace the strings; an absent drive or command line is empty.
-    fn set(&mut self, image: &[u8], drive: Option<&[u8]>, command_line: Option<&[u8]>) {
-        self.image.set(image);
-        self.drive.set(drive.unwrap_or_default());
-        self.command_line.set(command_line.unwrap_or_default());
-    }
-}
-
 /// Global state of this domain.
 #[derive(Debug)]
 pub struct State {
@@ -252,66 +189,15 @@ pub enum Continuation {
     Flash(FlashUpload),
 }
 
-/// A `flash` image being received.
-#[derive(Debug, Clone, Copy)]
-pub struct FlashUpload {
-    /// Bytes received so far.
-    received: u32,
-    options: FlashOptions,
-}
-
-/// Options of a flash write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FlashOptions {
-    /// Skip the image hardware check.
-    pub ignore_version_checking: bool,
-    pub stock_image: bool,
-}
-
-/// Programming the flash failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FlashFailed(pub Win32Error);
-
-/// The `flash` result: the Win32 facility applied to the low word of any
-/// code, as the reply text prints it.
-impl From<FlashFailed> for Hresult {
-    fn from(FlashFailed(error): FlashFailed) -> Self {
-        Hresult::failure(Facility::WIN32, error.code() as u16)
+xbox360_sys::flags! {
+    /// Flags of a title launch (stock 0x91fa2324).
+    pub struct BootFlags(u32) {
+        WAIT = 0x1,
+        COLD = 0x4,
+        STOP = 0x8,
+        /// Export 125: the paths are object paths and are not translated.
+        OBJECT_PATHS = 0x10,
     }
-}
-
-/// An open settings file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SettingsFile(pub u32);
-
-/// Settings files read at startup.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SettingsSource {
-    /// `\SystemRoot\xbdm.ini` when it exists, else the file the monitor
-    /// writes, `\SystemRoot\MobileJ.dat`.
-    Saved,
-    /// `\SystemRoot\recint.ini`, executed after [`SettingsSource::Saved`].
-    Recint,
-}
-
-/// A copy of the settings text requested by the system software, besides
-/// the saved file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SettingsCopy {
-    /// Written to the caller's open file through a 0x1000-byte buffer;
-    /// with `pad`, the last write is a whole buffer.
-    File { handle: u32, pad: bool },
-    /// Stored in the caller's memory.
-    Memory { address: u32, capacity: u32 },
-}
-
-/// Why the settings file could not be created for writing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CreateSettingsError {
-    /// The write buffer could not be allocated.
-    NoBuffer,
-    /// The file could not be created.
-    Create(KernelError),
 }
 
 /// Platform services this domain needs.
@@ -364,6 +250,15 @@ pub trait Backend {
     fn flash_abort(&mut self);
 }
 
+const fn entry(
+    name: &'static str,
+    any_of: Access,
+    flags: DispatchFlags,
+    handler: fn(&mut Invocation<'_>) -> CommandResult,
+) -> CommandEntry {
+    CommandEntry::new(name, any_of, Access::empty(), flags, handler)
+}
+
 pub(crate) fn resume(
     continuation: &mut Continuation,
     cx: &mut ContinuationContext<'_>,
@@ -371,231 +266,6 @@ pub(crate) fn resume(
     match continuation {
         Continuation::Flash(upload) => resume_flash(upload, cx),
     }
-}
-
-/// Append formatted text and the line terminator to a settings file
-/// (stock WriteIniSz 0x91f31a50).
-pub(crate) fn write_line(
-    backend: &mut dyn AnyBackend,
-    file: SettingsFile,
-    arguments: fmt::Arguments<'_>,
-) {
-    write_text(backend, file, arguments);
-    end_line(backend, file);
-}
-
-/// Append formatted text to a settings file as one text (stock
-/// WriteIniSzNoCRLF 0x91f319c8).
-pub(crate) fn write_text(
-    backend: &mut dyn AnyBackend,
-    file: SettingsFile,
-    arguments: fmt::Arguments<'_>,
-) {
-    echo(backend, Echo::Format(arguments));
-    let _ = SettingsWriter { backend, file }.write_fmt(arguments);
-}
-
-/// Append raw bytes to a settings file as one text (stock
-/// WriteIniSzNoCRLF 0x91f319c8).
-pub(crate) fn write_bytes(backend: &mut dyn AnyBackend, file: SettingsFile, bytes: &[u8]) {
-    echo(backend, Echo::Bytes(bytes));
-    backend.write_settings(file, bytes);
-}
-
-/// [`write_bytes`] followed by the line terminator.
-pub(crate) fn write_bytes_line(backend: &mut dyn AnyBackend, file: SettingsFile, bytes: &[u8]) {
-    write_bytes(backend, file, bytes);
-    end_line(backend, file);
-}
-
-/// Append the line terminator to a settings file. It is not echoed.
-pub(crate) fn end_line(backend: &mut dyn AnyBackend, file: SettingsFile) {
-    backend.write_settings(file, LINE_END);
-}
-
-/// Append the line terminator as stock WriteIniSz with a null text does:
-/// the null text is echoed.
-fn end_null_line(backend: &mut dyn AnyBackend, file: SettingsFile) {
-    echo_null(backend);
-    end_line(backend, file);
-}
-
-/// Echo of a null text; the kernel formatter prints a null `%s` as
-/// `(null)`, as the `flash` reply shows for the same formatter.
-fn echo_null(backend: &mut dyn AnyBackend) {
-    echo(backend, Echo::Bytes(b"(null)"));
-}
-
-/// Text of a settings file write.
-enum Echo<'a> {
-    Bytes(&'a [u8]),
-    Format(fmt::Arguments<'a>),
-}
-
-/// Trace bit 4 echo of each text written to a settings file.
-fn echo(backend: &mut dyn AnyBackend, text: Echo<'_>) {
-    let mask = commands::console::Backend::trace_mask(backend);
-    trace_text(mask, backend, TraceMask::SETTINGS, |message| {
-        let _ = message.write_str("XBDM: WriteIniSzNoCRLF: '");
-        let _ = match text {
-            Echo::Bytes(bytes) => message.push_bytes(bytes),
-            Echo::Format(arguments) => message.write_fmt(arguments),
-        };
-        let _ = message.write_str("'\n");
-    });
-}
-
-struct SettingsWriter<'a> {
-    backend: &'a mut dyn AnyBackend,
-    file: SettingsFile,
-}
-
-impl fmt::Write for SettingsWriter<'_> {
-    fn write_str(&mut self, text: &str) -> fmt::Result {
-        self.backend.write_settings(self.file, text.as_bytes());
-        Ok(())
-    }
-}
-
-/// Write the settings file from the current state (stock WriteIniFile
-/// 0x91f31e48). Nothing is written on a disc boot or before the saved
-/// settings have been loaded. The wipe gate of stock never applies: its
-/// flag 0x91f9f664 has no writer.
-pub(crate) fn save_settings(state: &ServerState, backend: &mut dyn AnyBackend) {
-    if backend.booted_from_disc() {
-        trace(
-            state,
-            backend,
-            TraceMask::SETTINGS,
-            format_args!("XBDM: Cannot write xbdm.ini: CD boot\n"),
-        );
-        return;
-    }
-    if !state.system.settings_loaded {
-        trace(
-            state,
-            backend,
-            TraceMask::SETTINGS,
-            format_args!("XBDM: WriteIniFile - not finished loading\n"),
-        );
-        return;
-    }
-    if backend.title_process_caller() {
-        let text = format_args!("XBDM: WriteIniFile - called from title process - signal server\n");
-        trace(state, backend, TraceMask::SETTINGS, text);
-    }
-    write_settings_file(state, backend, SettingsContent::Text);
-}
-
-/// What [`write_settings_file`] leaves in the file.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SettingsContent {
-    Text,
-    Empty,
-}
-
-/// Stock WriteIniFileImpl 0x91f31d28: create the saved settings file and
-/// write the settings text, or leave it empty for a wipe.
-fn write_settings_file(
-    state: &ServerState,
-    backend: &mut dyn AnyBackend,
-    content: SettingsContent,
-) {
-    trace(
-        state,
-        backend,
-        TraceMask::SETTINGS,
-        format_args!("XBDM: WriteIniFileImpl - entry\n"),
-    );
-    let file = match backend.create_settings() {
-        Ok(file) => file,
-        Err(CreateSettingsError::NoBuffer) => return,
-        Err(CreateSettingsError::Create(error)) => {
-            let status = error.status().0;
-            let text = format_args!("XBDM: WriteIniFileImpl - Failed Create: 0x{status:08x}\n");
-            trace(state, backend, TraceMask::SETTINGS, text);
-            return;
-        }
-    };
-    if content == SettingsContent::Text {
-        settings_text(state, backend, file);
-    }
-    backend.close_settings(file);
-    trace(
-        state,
-        backend,
-        TraceMask::SETTINGS,
-        format_args!("XBDM: WriteIniFileImpl - Done writing ini file...\n"),
-    );
-}
-
-/// The lines of the settings file (stock 0x91f31a90).
-fn settings_text(state: &ServerState, backend: &mut dyn AnyBackend, file: SettingsFile) {
-    write_bytes_line(backend, file, b"[xbdm]");
-    commands::console::verbose_settings_lines(state, backend, file);
-    boot_wait_settings_lines(state, backend, file);
-    title_settings_lines(state, backend, file);
-    commands::console::debug_name_settings_lines(state, backend, file);
-    commands::network::address_settings_lines(state, backend, file);
-    commands::filesystem::dvdperf_settings_lines(state, backend, file);
-    commands::memory::memtrack_settings_lines(state, backend, file);
-    commands::session::notifyat_settings_lines(state, backend, file);
-    commands::security::settings_lines(state, backend, file);
-    commands::console::dump_settings_lines(state, backend, file);
-    commands::console::dump_mode_settings_lines(state, backend, file);
-    commands::debugger::settings_lines(state, backend, file);
-    commands::console::httpreg_settings_lines(state, backend, file);
-    commands::network::xhttpproxy_settings_lines(state, backend, file);
-    if state.system.recovery_requested {
-        write_bytes_line(backend, file, b"recovery");
-    }
-}
-
-/// Control code 0x17 (stock WipeIniFile 0x91f321d8, WriteIniFileImpl
-/// 0x91f31d28 with its wipe argument): truncate the saved settings file.
-/// Neither the disc boot nor the load gate of [`save_settings`] applies;
-/// the `already wiped` gate never does, as its flag has no writer.
-pub fn wipe_settings(state: &ServerState, backend: &mut dyn AnyBackend) {
-    if backend.title_process_caller() {
-        let text = format_args!("XBDM: WipeIniFile - signaling system thread to wipe ini file.\n");
-        trace(state, backend, TraceMask::SETTINGS, text);
-    }
-    write_settings_file(state, backend, SettingsContent::Empty);
-}
-
-/// Control codes 0x1d and 0x22 (stock WriteAltIniFile 0x91f32110 and
-/// CaptureIniFile 0x91f32080, text 0x91f31fb0): the settings text, a
-/// `sysset` line, and an unconditional `recovery` line. Returns the text
-/// length; `None` when the copy buffer cannot be allocated.
-pub fn copy_settings(
-    state: &ServerState,
-    backend: &mut dyn AnyBackend,
-    copy: SettingsCopy,
-) -> Option<u32> {
-    let name = match copy {
-        SettingsCopy::File { .. } => "WriteAltIniFile",
-        SettingsCopy::Memory { .. } => "CaptureIniFile",
-    };
-    trace(
-        state,
-        backend,
-        TraceMask::SETTINGS,
-        format_args!("XBDM: {name} - start\n"),
-    );
-    let file = backend.begin_settings_copy(copy)?;
-    settings_text(state, backend, file);
-    commands::console::sysset_settings_lines(state, backend, file);
-    // Stock ends the sysset line with an inlined WriteIniSz of a null text.
-    echo_null(backend);
-    write_bytes_line(backend, file, b"recovery");
-    let length = backend.end_settings_copy(file);
-    trace(
-        state,
-        backend,
-        TraceMask::SETTINGS,
-        format_args!("XBDM: {name} - end\n"),
-    );
-    Some(length)
 }
 
 /// Control code 0x02 (stock 0x91f3b208): the system is about to restart.
@@ -612,398 +282,16 @@ pub fn prepare_reboot(
     state.debugger.trap_passthrough = false;
     state.settings_dirty = false;
     save_settings(state, backend);
+
     state
         .notifications
         .deliver(&Event::Execution(ExecutionState::Rebooting), network);
+
     for index in 0..crate::server::MAX_CONNECTIONS {
         server.close(crate::ConnectionIndex(index as u8), network);
     }
+
     server.shut_down();
-}
-
-/// Reason of a title launch: the first dword of the system software's
-/// launch information.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LaunchReason(pub u32);
-
-impl LaunchReason {
-    /// Reasons that fall back to the persistent title.
-    fn takes_persistent_title(self) -> bool {
-        matches!(self.0, 0 | 4)
-    }
-}
-
-/// What a title reboot does with the launching thread.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TitleRebootStop {
-    /// Execution starts at once.
-    Run,
-    /// The thread stops at `execution pending_title` until resumed; the
-    /// stop ends after 15 seconds unless `forever`.
-    Stop { forever: bool },
-}
-
-/// Control code 0x21 (stock DmpTitleReboot 0x91f523a0) on entry with
-/// launch information: the reason and the launch flags.
-pub fn trace_title_reboot(state: &ServerState, backend: &mut dyn AnyBackend, reason: LaunchReason) {
-    let text = format_args!(
-        "[xbdm] DmpTitleReboot: Reason={}, g_XamGlobals.Flags=0x{:08x}\n",
-        reason.0 as i32,
-        state.system.boot_flags.bits()
-    );
-    trace(state, backend, TraceMask::TITLE_LAUNCH, text);
-}
-
-/// Control code 0x21 (stock 0x91f523a0): whether the launching thread
-/// stops. Reason 0 never stops; reason 4 stops for the `wait` and `stop`
-/// launch flags and consumes `stop`; other reasons stop after
-/// `stopon all`.
-pub fn title_reboot_stop(
-    state: &mut ServerState,
-    backend: &mut dyn AnyBackend,
-    reason: LaunchReason,
-) -> TitleRebootStop {
-    let stop = match reason.0 {
-        0 => {
-            trace(
-                state,
-                backend,
-                TraceMask::TITLE_LAUNCH,
-                format_args!("[xbdm] DmpTitleReboot: not stopping\n"),
-            );
-            return TitleRebootStop::Run;
-        }
-        4 => {
-            let flags = &mut state.system.boot_flags;
-            let stop = flags.intersects(BootFlags::WAIT | BootFlags::STOP);
-            flags.remove(BootFlags::STOP);
-            stop
-        }
-        _ => state.debugger.stop_on.contains(StopOn::TITLE_REBOOT),
-    };
-    if !stop {
-        return TitleRebootStop::Run;
-    }
-    trace(
-        state,
-        backend,
-        TraceMask::TITLE_LAUNCH,
-        format_args!("[xbdm] DmpTitleReboot: stopping\n"),
-    );
-    TitleRebootStop::Stop {
-        forever: state.system.boot_flags.contains(BootFlags::STOP),
-    }
-}
-
-/// Control code 0x77 (stock 0x91f52260): the title to launch instead of
-/// the system software's choice. The launch title applies unless a
-/// hardware reboot is pending; reasons 0 and 4 otherwise take the
-/// persistent title.
-pub fn launch_override(state: &ServerState, reason: LaunchReason) -> Option<LaunchTitle> {
-    let system = &state.system;
-    if !system.title.image.is_empty() && !system.hard_reboot_pending {
-        return Some(system.title);
-    }
-    (reason.takes_persistent_title() && !system.persistent_title.image.is_empty())
-        .then_some(system.persistent_title)
-}
-
-/// Control code 0x21 (stock 0x91f523a0) after the stop: as
-/// [`launch_override`], but a launch title is used up and the settings
-/// file rewritten.
-pub fn title_reboot_launch(
-    state: &mut ServerState,
-    backend: &mut dyn AnyBackend,
-    reason: LaunchReason,
-) -> Option<LaunchTitle> {
-    let consumed = !state.system.title.image.is_empty() && !state.system.hard_reboot_pending;
-    let title = launch_override(state, reason)?;
-    let kind: &[u8] = if consumed { b"" } else { b"[default] " };
-    trace_pieces(
-        state,
-        backend,
-        TraceMask::TITLE_LAUNCH,
-        &[
-            b"[xbdm] DmpTitleReboot: updating ",
-            kind,
-            b"launch info\n  ImageName='",
-            title.image.as_bytes(),
-            b"'\n   DDrive='",
-            title.drive.as_bytes(),
-            b"'\n   CommandLine='",
-            title.command_line.as_bytes(),
-            b"'\n",
-        ],
-    );
-    if consumed {
-        state.system.title = LaunchTitle::default();
-        save_settings(state, backend);
-    }
-    Some(title)
-}
-
-/// DbgPrint the concatenated `pieces` when `bits` are set in the trace
-/// mask.
-#[inline(never)]
-fn trace_pieces(
-    state: &ServerState,
-    backend: &mut dyn AnyBackend,
-    bits: TraceMask,
-    pieces: &[&[u8]],
-) {
-    trace_text(state.console.trace_mask, backend, bits, |message| {
-        for piece in pieces {
-            let _ = message.push_bytes(piece);
-        }
-    });
-}
-
-/// Stock FTitleExists 0x91f447c8 after boot: the image opens, disc images
-/// included.
-pub fn launch_image_exists(
-    state: &ServerState,
-    backend: &mut dyn AnyBackend,
-    image: &[u8],
-) -> bool {
-    title_exists(state, backend, image, TitleCheck::PostBoot)
-}
-
-fn boot_wait_settings_lines(state: &ServerState, backend: &mut dyn AnyBackend, file: SettingsFile) {
-    let line: &[u8] = match state.system.boot_wait {
-        None => return,
-        Some(BootWait::Wait) => b"wait",
-        Some(BootWait::Stop) => b"wait stop",
-        Some(BootWait::Forever) => b"wait forever",
-    };
-    write_bytes_line(backend, file, line);
-}
-
-/// `label` and `value` when `value` is not empty.
-fn write_title_field(
-    backend: &mut dyn AnyBackend,
-    file: SettingsFile,
-    label: &[u8],
-    value: &TitleText,
-) {
-    if !value.is_empty() {
-        write_bytes(backend, file, label);
-        write_bytes(backend, file, value.as_bytes());
-    }
-}
-
-/// Title lines (stock 0x91f51ed0). The command line of the persistent
-/// title is quoted but reloads with its quotes, since `cmdline` takes the
-/// rest of the line.
-fn title_settings_lines(state: &ServerState, backend: &mut dyn AnyBackend, file: SettingsFile) {
-    let persistent = &state.system.persistent_title;
-    if !persistent.image.is_empty() {
-        write_bytes(backend, file, b"title persist name=\"");
-        write_bytes(backend, file, persistent.image.as_bytes());
-        write_title_field(backend, file, b"\" dir=\"", &persistent.drive);
-        write_title_field(backend, file, b"\" cmdline=\"", &persistent.command_line);
-        write_bytes_line(backend, file, b"\"");
-    }
-    let current = &state.system.title;
-    if !current.image.is_empty() {
-        write_bytes(backend, file, b"title");
-        if !state.system.boot_flags.is_empty() {
-            write_text(
-                backend,
-                file,
-                format_args!(" flags=0x{:08x}", state.system.boot_flags.bits()),
-            );
-        }
-        write_bytes(backend, file, b" name=\"");
-        write_bytes(backend, file, current.image.as_bytes());
-        write_title_field(backend, file, b"\" dir=\"", &current.drive);
-        write_bytes(backend, file, b"\"");
-        write_title_field(backend, file, b" cmdline=", &current.command_line);
-        end_null_line(backend, file);
-    }
-}
-
-/// Startup: execute the saved settings file and then `recint.ini` (stock
-/// LoadIniFile 0x91f316b8), apply the settings that act at boot, and
-/// consume a one-time boot-wait mode.
-pub fn load_settings(server: &mut Server, backend: &mut dyn AnyBackend, network: &mut dyn Network) {
-    commands::console::initialize(&mut server.state, backend);
-    load_settings_files(server, backend, network);
-    if server.state.system.internal_drive_map {
-        server.state.filesystem.drives.map_internal_drives();
-    } else {
-        commands::console::check_settings_block(&mut server.state, backend);
-    }
-    commands::session::connect_persistent_targets(&mut server.state, backend, network);
-    let system = &mut server.state.system;
-    if matches!(system.boot_wait, Some(BootWait::Wait | BootWait::Stop)) {
-        system.boot_wait = None;
-        save_settings(&server.state, backend);
-    }
-}
-
-/// Stock LoadIniFile allocates its 0x4000-byte read buffer from pool
-/// memory first and does nothing at all when that fails: no file is read,
-/// nothing is traced, and the settings stay marked as not loaded.
-fn load_settings_files(
-    server: &mut Server,
-    backend: &mut dyn AnyBackend,
-    network: &mut dyn Network,
-) {
-    let Some(mut buffer) = backend.allocate_scratch(SETTINGS_READ_CAPACITY as u32) else {
-        return;
-    };
-    if let Some(file) = backend.open_settings(SettingsSource::Saved) {
-        if server
-            .state
-            .console
-            .trace_mask
-            .contains(TraceMask::SETTINGS)
-        {
-            trace_settings_file(&server.state, backend, file);
-        }
-        execute_settings_file(server, backend, network, file, &mut buffer);
-        backend.close_settings(file);
-    }
-    let text = format_args!("XBDM: g_fFinishedLoadingIniFile = TRUE\n");
-    trace(&server.state, backend, TraceMask::SETTINGS, text);
-    server.state.system.settings_loaded = true;
-    if let Some(file) = backend.open_settings(SettingsSource::Recint) {
-        execute_settings_file(server, backend, network, file, &mut buffer);
-        trace(
-            &server.state,
-            backend,
-            TraceMask::SETTINGS,
-            format_args!("XBDM: Finished loading recint.ini\n"),
-        );
-        backend.close_settings(file);
-    }
-    backend.free_scratch(buffer);
-}
-
-/// The saved settings file before it is executed (stock 0x91f31758 and
-/// 0x91f31538).
-fn trace_settings_file(state: &ServerState, backend: &mut dyn AnyBackend, file: SettingsFile) {
-    trace(
-        state,
-        backend,
-        TraceMask::SETTINGS,
-        format_args!("XBDM: LoadIniFile\n"),
-    );
-    let SettingsFile(handle) = file;
-    match backend.settings_file_size(file) {
-        Ok(size) => {
-            let text = format_args!("XBDM: Handle: 0x{handle:08x}, File Size: {}\n", size as i32);
-            trace(state, backend, TraceMask::SETTINGS, text);
-        }
-        Err(error) => {
-            let status = error.status().0;
-            let text = format_args!("XBDM: NtQueryInformationFile Failed: 0x{status:08x}\n");
-            trace(state, backend, TraceMask::SETTINGS, text);
-        }
-    }
-}
-
-/// Execute each line of a settings file (stock 0x91f315a0). Lines end at
-/// CR or LF. A line that starts with NUL ends the file, and text that
-/// reaches the end of the buffer without a terminator loses its last byte.
-fn execute_settings_file(
-    server: &mut Server,
-    backend: &mut dyn AnyBackend,
-    network: &mut dyn Network,
-    file: SettingsFile,
-    buffer: &mut [u8],
-) {
-    let mut count = 0;
-    loop {
-        if count != 0 {
-            let mut start = 0;
-            for position in 0..count {
-                if matches!(buffer[position], b'\n' | b'\r') {
-                    buffer[position] = 0;
-                    server.execute_settings_line(&buffer[start..position], backend, network);
-                    start = position + 1;
-                }
-            }
-            // Stock tests the byte at the remainder start, which lies past
-            // the data when the buffer ends in a terminator; that byte is
-            // taken as nonzero.
-            if start < count && buffer[start] == 0 {
-                return;
-            }
-            if start != 0 {
-                buffer.copy_within(start..count, 0);
-                count -= start;
-            } else {
-                buffer[count - 1] = 0;
-                server.execute_settings_line(&buffer[..count - 1], backend, network);
-                count = 0;
-            }
-        }
-        if let Some(read) = backend.read_settings(file, &mut buffer[count..]) {
-            count += read;
-        }
-        if count == 0 {
-            return;
-        }
-    }
-}
-
-/// Settings-file keywords handled before the command table (stock
-/// DoIniLine 0x91f311b8). Returns whether the line was consumed.
-pub(crate) fn settings_keyword(invocation: &mut Invocation<'_>) -> bool {
-    let word = invocation.line.command();
-    let is = |keyword: &str| word.eq_ignore_ascii_case(keyword.as_bytes());
-    if word.is_empty() {
-        return false;
-    }
-    if is("wait") {
-        invocation.state.system.boot_wait = Some(if invocation.line.has("forever") {
-            BootWait::Forever
-        } else if invocation.line.has("stop") {
-            BootWait::Stop
-        } else {
-            BootWait::Wait
-        });
-    } else if is("notify") {
-        // Notification channels need a connection; the line is ignored.
-    } else if is("notifyat") {
-        commands::session::ini_notifyat(invocation);
-    } else if is("staticip") {
-        commands::network::ini_staticip(invocation);
-    } else if is("gateway") {
-        commands::network::ini_gateway(invocation);
-    } else if is("subnet") {
-        commands::network::ini_subnet(invocation);
-    } else if is("memtrack") {
-        commands::memory::ini_memtrack(invocation);
-    } else if is("drivemap") {
-        if let Some(internal) = invocation.line.dword("internal") {
-            invocation.state.system.internal_drive_map = internal != 0;
-        }
-    } else if is("sysset") {
-        commands::console::ini_sysset(invocation);
-    } else if is("httpreg") {
-        commands::console::ini_httpreg(invocation);
-    } else if is("netsim") {
-        commands::network::ini_netsim(invocation);
-    } else if is("xhttpproxy") {
-        commands::network::ini_xhttpproxy(invocation);
-    } else {
-        return false;
-    }
-    true
-}
-
-/// Restart without a connection to report to: write settings, announce
-/// `execution rebooting`, close the notification channels, and reboot.
-fn reboot_from_settings(invocation: &mut Invocation<'_>, kind: RebootKind) {
-    save_settings(invocation.state, invocation.backend);
-    invocation.state.notifications.deliver(
-        &Event::Execution(ExecutionState::Rebooting),
-        invocation.network,
-    );
-    invocation.state.notifications.close_all(invocation.network);
-    invocation.backend.reboot(kind);
 }
 
 /// `reboot [stop] [wait] [smcreset]`: reply, then restart. The server
@@ -1013,23 +301,30 @@ fn reboot(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(session) = invocation.session.as_deref_mut() else {
         return Ok(Reply::Sent);
     };
+
     let kind = if invocation.line.has("smcreset") {
         RebootKind::SmcReset
     } else {
         RebootKind::Normal
     };
+
     session.request(SessionRequest::Reboot(kind));
     let _ = invocation.send_line(b"200- OK");
     invocation.backend.sleep_milliseconds(REBOOT_REPLY_DELAY_MS);
+
     let system = &mut invocation.state.system;
     if system.boot_wait.is_none() {
-        if invocation.line.has("stop") {
-            system.boot_wait = Some(BootWait::Stop);
+        system.boot_wait = if invocation.line.has("stop") {
+            Some(BootWait::Stop)
         } else if invocation.line.has("wait") {
-            system.boot_wait = Some(BootWait::Wait);
-        }
+            Some(BootWait::Wait)
+        } else {
+            None
+        };
     }
+
     invocation.state.settings_dirty = true;
+
     Ok(Reply::Sent)
 }
 
@@ -1040,19 +335,10 @@ fn recovery(invocation: &mut Invocation<'_>) -> CommandResult {
         invocation.state.system.recovery_boot = true;
         return Err(CommandError::Fail);
     }
-    invocation.state.system.recovery_requested = true;
-    launch(invocation, BootFlags::COLD, None)
-}
 
-xbox360_sys::flags! {
-    /// Flags of a title launch (stock 0x91fa2324).
-    pub struct BootFlags(u32) {
-        WAIT = 0x1,
-        COLD = 0x4,
-        STOP = 0x8,
-        /// Export 125: the paths are object paths and are not translated.
-        OBJECT_PATHS = 0x10,
-    }
+    invocation.state.system.recovery_requested = true;
+
+    launch(invocation, BootFlags::COLD, None)
 }
 
 /// The hardware reboot of stock 0x91f278a8: reply, wait, record the
@@ -1062,7 +348,9 @@ fn hard_reboot(invocation: &mut Invocation<'_>, flags: BootFlags) {
         let _ = invocation.send_line(b"200- OK");
         invocation.backend.sleep_milliseconds(REBOOT_REPLY_DELAY_MS);
     }
+
     record_hard_reboot(&mut invocation.state.system, flags);
+
     match invocation.session.as_deref_mut() {
         Some(session) => {
             session.request(SessionRequest::Reboot(RebootKind::Normal));
@@ -1076,12 +364,15 @@ fn hard_reboot(invocation: &mut Invocation<'_>, flags: BootFlags) {
 /// the flags ask for, unless one is set.
 fn record_hard_reboot(system: &mut State, flags: BootFlags) {
     system.hard_reboot_pending = true;
+
     if system.boot_wait.is_none() {
-        if flags.contains(BootFlags::STOP) {
-            system.boot_wait = Some(BootWait::Stop);
+        system.boot_wait = if flags.contains(BootFlags::STOP) {
+            Some(BootWait::Stop)
         } else if flags.contains(BootFlags::WAIT) {
-            system.boot_wait = Some(BootWait::Wait);
-        }
+            Some(BootWait::Wait)
+        } else {
+            None
+        };
     }
 }
 
@@ -1091,12 +382,14 @@ fn system_time(invocation: &mut Invocation<'_>) -> CommandResult {
     if !invocation.state.system.clock_set {
         return Err(ErrorCode::ClockNotSet.into());
     }
+
     let time = invocation.backend.system_time();
     invocation.set_text(format_args!(
         "high=0x{:x} low=0x{:x}",
         (time >> 32) as u32,
         time as u32
     ));
+
     Ok(Reply::Ok)
 }
 
@@ -1107,6 +400,7 @@ fn set_system_time(invocation: &mut Invocation<'_>) -> CommandResult {
     let (Some(high), Some(low)) = (dword("clockhi"), dword("clocklo")) else {
         return Err(ErrorCode::ClockNotSet.into());
     };
+
     let has_zone = dword("tz").is_some();
     let backend = &mut *invocation.backend;
     backend.set_system_time(u64::from(high) << 32 | u64::from(low));
@@ -1114,6 +408,7 @@ fn set_system_time(invocation: &mut Invocation<'_>) -> CommandResult {
     if !has_zone {
         return Ok(Reply::Ok);
     }
+
     let mut standard_name = [0u8; 4];
     if backend
         .xconfig_get(ConfigSetting::new(3, 2), &mut standard_name)
@@ -1121,6 +416,7 @@ fn set_system_time(invocation: &mut Invocation<'_>) -> CommandResult {
     {
         return Ok(Reply::Ok);
     }
+
     if standard_name[0] == 0 {
         const DEFAULT_ZONE: [(u16, [u8; 4]); 7] = [
             (1, 0x1e0u32.to_be_bytes()),
@@ -1131,6 +427,7 @@ fn set_system_time(invocation: &mut Invocation<'_>) -> CommandResult {
             (4, [0x0a, 0x05, 0x00, 0x00]),
             (5, [0x04, 0x01, 0x00, 0x00]),
         ];
+
         for (index, value) in DEFAULT_ZONE {
             if backend
                 .xconfig_set(ConfigSetting::new(3, index), &value)
@@ -1140,12 +437,14 @@ fn set_system_time(invocation: &mut Invocation<'_>) -> CommandResult {
             }
         }
     }
+
     // A failed read leaves the value zero, as in stock.
     let mut enabled = [0u8; 4];
     let _ = backend.xconfig_get(ConfigSetting::new(3, 9), &mut enabled);
     if enabled != [0; 4] {
         return Ok(Reply::Ok);
     }
+
     match backend.xconfig_set(ConfigSetting::new(3, 9), &1u32.to_be_bytes()) {
         Ok(()) => Ok(Reply::Ok),
         Err(_) => Err(ErrorCode::ClockNotSet.into()),
@@ -1158,11 +457,13 @@ fn set_disc_boot(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(enable) = util::required_dword(invocation, "enable") else {
         return Err(util::MISSING);
     };
+
     let selected = match enable {
         0 => RetailFlags::DISC_BOOT_DISABLED,
         1 => RetailFlags::DISC_BOOT_ENABLED,
         _ => return Err(CommandError::Fail),
     };
+
     let (selected, field) = (selected.bits(), RetailFlags::BOOT_DEVICE.bits());
     match invocation
         .backend
@@ -1177,12 +478,12 @@ fn set_disc_boot(invocation: &mut Invocation<'_>) -> CommandResult {
     }
 }
 
-/// Size of the reset chord configuration setting (2, 5).
-const RESET_CHORD_SIZE: usize = 5;
-
 /// `setreset [chord=<string>]`: store the reset button chord (up to four
 /// characters), or report the stored one.
 fn set_reset(invocation: &mut Invocation<'_>) -> CommandResult {
+    /// Size of the reset chord configuration setting (2, 5).
+    const RESET_CHORD_SIZE: usize = 5;
+
     let setting = ConfigSetting::RESET_CHORD;
     let mut chord = [0u8; RESET_CHORD_SIZE];
     let result = match invocation.line.param("chord") {
@@ -1200,811 +501,17 @@ fn set_reset(invocation: &mut Invocation<'_>) -> CommandResult {
             .xconfig_get(setting, &mut chord)
             .map(Some),
     };
+
     match result {
         Ok(None) => Ok(Reply::Ok),
         Ok(Some(length)) => {
             let stored = &chord[..length.min(RESET_CHORD_SIZE)];
-            let end = stored
-                .iter()
-                .position(|&byte| byte == 0)
-                .unwrap_or(stored.len());
-            invocation.text.set_bytes(&stored[..end]);
+            invocation.text.set_bytes(c_string(stored));
             Ok(Reply::Ok)
         }
         Err(_) => {
             invocation.set_text(format_args!("Could not change reset key"));
             Err(CommandError::Fail)
-        }
-    }
-}
-
-/// Object path buffer of the title commands.
-const TITLE_PATH_CAPACITY: usize = 0x100;
-/// Buffer of a string parameter of the title commands.
-const TITLE_PARAMETER_BUFFER: usize = 0x100;
-/// Launch flags that rule out a relaunch without a hardware reboot. The
-/// meaning of bit 1 is not known.
-const HARD_REBOOT_FLAGS: BootFlags = BootFlags::COLD.union(BootFlags::from_bits_retain(0x2));
-/// Images under this prefix are launched without an existence check.
-const DISC_IMAGE_PREFIX: &[u8] = b"\\device\\cdrom0";
-const DEFAULT_TITLE_PATH: &[u8] = b"\\SystemRoot\\dashboard.xbx";
-const LAUNCHER_PATH: &[u8] = b"\\SystemRoot\\xshell.xex";
-/// Size of the default-title file: `<directory>;<file>` padded with NUL.
-const DEFAULT_TITLE_SIZE: usize = 0x100;
-/// Buffer of the `deftitle` `dir` parameter.
-const DEFAULT_TITLE_DIRECTORY_BUFFER: usize = 0x104;
-/// Flash images are programmed in whole 0x4000-byte blocks.
-const FLASH_BLOCK: u32 = 0x4000;
-
-/// An object path of at most [`TITLE_PATH_CAPACITY`] bytes.
-#[derive(Clone, Copy)]
-struct TitlePath {
-    bytes: [u8; TITLE_PATH_CAPACITY],
-    len: usize,
-}
-
-impl TitlePath {
-    const EMPTY: Self = Self {
-        bytes: [0; TITLE_PATH_CAPACITY],
-        len: 0,
-    };
-
-    fn as_bytes(&self) -> &[u8] {
-        &self.bytes[..self.len]
-    }
-
-    /// Append, dropping what does not fit.
-    fn push(&mut self, bytes: &[u8]) {
-        let count = bytes.len().min(TITLE_PATH_CAPACITY - self.len);
-        self.bytes[self.len..self.len + count].copy_from_slice(&bytes[..count]);
-        self.len += count;
-    }
-}
-
-/// A string parameter copied into a buffer the size stock uses.
-fn string_param<'b>(line: CommandLine<'_>, name: &str, buffer: &'b mut [u8]) -> Option<&'b [u8]> {
-    Some(line.param(name)?.copy_into(buffer))
-}
-
-/// Translate a drive path into `translated`, limited as stock's 0x100-byte
-/// destination buffers limit it.
-fn translate_title_path<'p>(
-    state: &mut ServerState,
-    backend: &mut dyn AnyBackend,
-    path: &[u8],
-    translated: &'p mut TitlePath,
-) -> Option<&'p TitlePath> {
-    let object = state.filesystem.drives.translate(backend, path)?;
-    translated.len = 0;
-    translated.push(object.as_bytes());
-    Some(translated)
-}
-
-/// When stock FTitleExists 0x91f447c8 runs.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TitleCheck {
-    /// Before a launch: disc images count as present.
-    PreBoot,
-    /// At the launch: every image must open.
-    PostBoot,
-}
-
-fn title_exists(
-    state: &ServerState,
-    backend: &mut dyn AnyBackend,
-    image: &[u8],
-    check: TitleCheck,
-) -> bool {
-    let post_boot: &[u8] = if check == TitleCheck::PostBoot {
-        b"TRUE"
-    } else {
-        b"FALSE"
-    };
-    trace_pieces(
-        state,
-        backend,
-        TraceMask::PATHS,
-        &[
-            b"[xbdm] FTitleExists(oszImage='",
-            image,
-            b"',fPostBoot=",
-            post_boot,
-            b")\n",
-        ],
-    );
-    if check == TitleCheck::PreBoot
-        && image.len() >= DISC_IMAGE_PREFIX.len()
-        && image[..DISC_IMAGE_PREFIX.len()].eq_ignore_ascii_case(DISC_IMAGE_PREFIX)
-    {
-        return true;
-    }
-    let request = CreateRequest::open(
-        AccessMask::SYNCHRONIZE,
-        ShareAccess::READ,
-        CreateOptions::SYNCHRONOUS_IO_NONALERT.union(CreateOptions::NON_DIRECTORY_FILE),
-    );
-    let exists = match backend.create_file(image, &request) {
-        Ok(handle) => {
-            backend.close_file(handle);
-            true
-        }
-        Err(_) => false,
-    };
-    let result = if exists { "TRUE" } else { "FALSE" };
-    trace(
-        state,
-        backend,
-        TraceMask::PATHS,
-        format_args!("[xbdm] FTitleExists() returning {result}\n"),
-    );
-    exists
-}
-
-/// Image and drive object paths of a title.
-struct TitlePaths {
-    image: TitlePath,
-    drive: TitlePath,
-}
-
-impl TitlePaths {
-    const EMPTY: Self = Self {
-        image: TitlePath::EMPTY,
-        drive: TitlePath::EMPTY,
-    };
-}
-
-/// Stock FGetImageAndDrive 0x91f44608: with a nonempty `dir`, the drive is
-/// the translated directory and the image is the drive, a backslash, and
-/// `name`; otherwise the image is the translated `name`. Returns whether
-/// `paths` were filled.
-fn image_and_drive(
-    state: &mut ServerState,
-    backend: &mut dyn AnyBackend,
-    name: &[u8],
-    dir: Option<&[u8]>,
-    paths: &mut TitlePaths,
-) -> bool {
-    trace_pieces(
-        state,
-        backend,
-        TraceMask::PATHS,
-        &[
-            b"[xbdm] FGetImageAndDrive(\n   szTitle='",
-            name,
-            b"',\n   szDir='",
-            dir.unwrap_or(b"(null)"),
-            b"',\n   ...)\n",
-        ],
-    );
-    let joined = join_image_and_drive(state, backend, name, dir, paths);
-    if joined {
-        trace_pieces(
-            state,
-            backend,
-            TraceMask::PATHS,
-            &[
-                b"[xbdm] FGetImageAndDrive succeeded:\n   oszImage='",
-                paths.image.as_bytes(),
-                b"'\n   oszDrive='",
-                paths.drive.as_bytes(),
-                b"'\n",
-            ],
-        );
-    } else {
-        trace(
-            state,
-            backend,
-            TraceMask::PATHS,
-            format_args!("[xbdm] FGetImageAndDrive failed:\n"),
-        );
-    }
-    joined
-}
-
-fn join_image_and_drive(
-    state: &mut ServerState,
-    backend: &mut dyn AnyBackend,
-    name: &[u8],
-    dir: Option<&[u8]>,
-    paths: &mut TitlePaths,
-) -> bool {
-    let Some(dir) = dir.filter(|dir| !dir.is_empty()) else {
-        paths.drive.len = 0;
-        return translate_title_path(state, backend, name, &mut paths.image).is_some();
-    };
-    if translate_title_path(state, backend, dir, &mut paths.drive).is_none() {
-        return false;
-    }
-    let overflow = |state: &ServerState, backend: &mut dyn AnyBackend, what: &str| {
-        trace(
-            state,
-            backend,
-            TraceMask::PATHS,
-            format_args!("[xbdm] FGetImageAndDrive buffer overflow {what}\n"),
-        );
-    };
-    // The copy needs room for its terminator, and a missing separator for
-    // one more byte.
-    if paths.drive.len == TITLE_PATH_CAPACITY {
-        overflow(state, backend, "copying path");
-        return false;
-    }
-    paths.image = paths.drive;
-    let image = &mut paths.image;
-    if image.as_bytes().last() != Some(&b'\\') {
-        if image.len + 1 == TITLE_PATH_CAPACITY {
-            overflow(state, backend, "appending '\\'");
-            return false;
-        }
-        image.push(b"\\");
-    }
-    // A name that leaves no room for the terminator is cut and still
-    // succeeds.
-    if image.len + name.len() >= TITLE_PATH_CAPACITY {
-        overflow(state, backend, "appending title");
-    }
-    image.push(name);
-    true
-}
-
-/// Stock 0x91f46ff0: check the image, then store the launch title and,
-/// with `persist`, the default title, and write the settings file.
-fn set_title(
-    state: &mut ServerState,
-    backend: &mut dyn AnyBackend,
-    image: &[u8],
-    drive: Option<&[u8]>,
-    command_line: Option<&[u8]>,
-    persist: bool,
-) -> CommandResult {
-    if !title_exists(state, backend, image, TitleCheck::PreBoot) {
-        return Err(ErrorCode::FileNotFound.into());
-    }
-    let system = &mut state.system;
-    system.title.set(image, drive, command_line);
-    if persist {
-        system.persistent_title = system.title;
-    }
-    save_settings(state, backend);
-    Ok(Reply::Ok)
-}
-
-xbox360_sys::flags! {
-    /// Flags of export 81.
-    pub struct TitleFlags(u32) {
-        /// The title also becomes the persistent title.
-        PERSIST = 0x1,
-        /// Clear the persistent title first.
-        CLEAR_PERSISTENT = 0x2,
-    }
-}
-
-/// Export 81 (stock 0x91f47140), and export 42 with no flags: set the
-/// launch title from the drive paths `dir` and `name`. With
-/// [`TitleFlags::CLEAR_PERSISTENT`] and no `name`, only the persistent
-/// title is cleared. The exports return the result as an HRESULT.
-pub fn set_title_from_paths(
-    state: &mut ServerState,
-    backend: &mut dyn AnyBackend,
-    dir: Option<&[u8]>,
-    name: Option<&[u8]>,
-    command_line: Option<&[u8]>,
-    flags: TitleFlags,
-) -> CommandResult {
-    if flags.contains(TitleFlags::CLEAR_PERSISTENT) {
-        state.system.persistent_title = LaunchTitle::default();
-        if name.is_none() {
-            save_settings(state, backend);
-            return Ok(Reply::Ok);
-        }
-    }
-    let Some(name) = name else {
-        return Err(CommandError::InvalidArgument);
-    };
-    let mut paths = TitlePaths::EMPTY;
-    if !image_and_drive(state, backend, name, dir, &mut paths) {
-        return Err(ErrorCode::FileNotFound.into());
-    }
-    set_title(
-        state,
-        backend,
-        paths.image.as_bytes(),
-        Some(paths.drive.as_bytes()),
-        command_line,
-        flags.contains(TitleFlags::PERSIST),
-    )
-}
-
-/// `title nopersist` | `title name=<s> [dir=<s>] [persist] [cmdline=<rest>]`:
-/// set the title for the next launch. From the settings file `flags=` is
-/// honored and `name`/`dir` are object paths taken as given; from a
-/// connection they are drive paths, as for export 81. The settings file
-/// is written again after the title is set.
-fn title(invocation: &mut Invocation<'_>) -> CommandResult {
-    let line = invocation.line;
-    let loading = invocation.session.is_none();
-    if loading && let Some(flags) = line.dword("flags") {
-        invocation.state.system.boot_flags = BootFlags::from_bits_retain(flags);
-    }
-    if line.has("nopersist") {
-        invocation.state.system.persistent_title = LaunchTitle::default();
-        // Stock writes the settings file twice here.
-        save_settings(invocation.state, invocation.backend);
-        save_settings(invocation.state, invocation.backend);
-        return Ok(Reply::Ok);
-    }
-    let mut dir_buffer = [0u8; TITLE_PARAMETER_BUFFER];
-    let dir = string_param(line, "dir", &mut dir_buffer);
-    let mut name_buffer = [0u8; TITLE_PARAMETER_BUFFER];
-    let Some(name) = string_param(line, "name", &mut name_buffer) else {
-        invocation.set_text(format_args!("missing name"));
-        return Err(CommandError::Fail);
-    };
-    let persist = line.has("persist");
-    let command_line = line.param("cmdline").map(|value| value.raw());
-    let result = if loading {
-        set_title(
-            invocation.state,
-            invocation.backend,
-            name,
-            dir,
-            command_line,
-            persist,
-        )
-    } else {
-        let flags = if persist {
-            TitleFlags::PERSIST
-        } else {
-            TitleFlags::default()
-        };
-        set_title_from_paths(
-            invocation.state,
-            invocation.backend,
-            dir,
-            Some(name),
-            command_line,
-            flags,
-        )
-    };
-    save_settings(invocation.state, invocation.backend);
-    result
-}
-
-/// Title strings of a launch request.
-#[derive(Debug, Clone, Copy)]
-pub struct LaunchRequest<'a> {
-    pub image: &'a [u8],
-    pub drive: Option<&'a [u8]>,
-    pub command_line: Option<&'a [u8]>,
-}
-
-/// How a launch continues after [`begin_launch`].
-enum LaunchOutcome {
-    Done(CommandResult),
-    /// Restart the console with these flags.
-    HardReboot(BootFlags),
-}
-
-/// Stock 0x91f278a8 up to the hardware reboot: record the launch, then
-/// relaunch the title in place when the flags and console allow it.
-fn begin_launch(
-    state: &mut ServerState,
-    backend: &mut dyn AnyBackend,
-    network: &mut dyn Network,
-    flags: BootFlags,
-    request: Option<LaunchRequest<'_>>,
-) -> LaunchOutcome {
-    if let Some(request) = &request
-        && !title_exists(state, backend, request.image, TitleCheck::PreBoot)
-    {
-        return LaunchOutcome::Done(Err(ErrorCode::FileNotFound.into()));
-    }
-    let execution = backend.execution_state();
-    let system = &mut state.system;
-    system.boot_flags = flags;
-    if let Some(request) = request {
-        system
-            .title
-            .set(request.image, request.drive, request.command_line);
-    }
-    let mut effective = flags;
-    if !state.system.internal_drive_map
-        && commands::console::trinity_or_later(backend.hardware_flags())
-        && !backend.is_test_kit()
-        && !commands::console::settings_block_readable(backend)
-    {
-        effective.insert(BootFlags::COLD);
-    }
-    if !effective.intersects(HARD_REBOOT_FLAGS) {
-        if execution == ExecutionState::RebootTitle {
-            return LaunchOutcome::Done(Ok(Reply::Ok));
-        }
-        if backend.title_launch_registered()
-            && !commands::debugger::threads_block_relaunch(state, backend)
-        {
-            let _ = commands::debugger::change_execution(
-                state,
-                backend,
-                network,
-                ExecutionState::RebootTitle,
-            );
-            state.system.boot_flags = effective;
-            backend.launch_title();
-            return LaunchOutcome::Done(Ok(Reply::Ok));
-        }
-    }
-    LaunchOutcome::HardReboot(effective)
-}
-
-/// Stock 0x91f278a8 for a command: the hardware reboot replies first.
-fn launch(
-    invocation: &mut Invocation<'_>,
-    flags: BootFlags,
-    request: Option<LaunchRequest<'_>>,
-) -> CommandResult {
-    match begin_launch(
-        invocation.state,
-        invocation.backend,
-        invocation.network,
-        flags,
-        request,
-    ) {
-        LaunchOutcome::Done(result) => result,
-        LaunchOutcome::HardReboot(effective) => {
-            hard_reboot(invocation, effective);
-            Ok(Reply::Sent)
-        }
-    }
-}
-
-/// Exports 28 and 125 (stock 0x91f278a8 with no connection): launch a
-/// title, relaunching in place when possible; otherwise prepare the
-/// restart as control code 0x02 does and restart, which on a console
-/// does not return. The exports return the result as an HRESULT.
-pub fn launch_without_connection(
-    server: &mut Server,
-    backend: &mut dyn AnyBackend,
-    network: &mut dyn Network,
-    flags: BootFlags,
-    request: Option<LaunchRequest<'_>>,
-) -> CommandResult {
-    match begin_launch(&mut server.state, backend, network, flags, request) {
-        LaunchOutcome::Done(result) => result,
-        LaunchOutcome::HardReboot(effective) => {
-            record_hard_reboot(&mut server.state.system, effective);
-            prepare_reboot(server, backend, network);
-            backend.reboot(RebootKind::Normal);
-            Ok(Reply::Sent)
-        }
-    }
-}
-
-/// Export 125 (stock 0x91f27ab8): launch with drive paths, or with object
-/// paths when `flags` has [`BootFlags::OBJECT_PATHS`]. Without an image,
-/// a drive or command line is an invalid argument.
-pub fn launch_from_paths(
-    server: &mut Server,
-    backend: &mut dyn AnyBackend,
-    network: &mut dyn Network,
-    flags: BootFlags,
-    image: Option<&[u8]>,
-    drive: Option<&[u8]>,
-    command_line: Option<&[u8]>,
-) -> CommandResult {
-    let Some(image) = image else {
-        if drive.is_some() || command_line.is_some() {
-            return Err(CommandError::InvalidArgument);
-        }
-        return launch_without_connection(server, backend, network, flags, None);
-    };
-    if flags.contains(BootFlags::OBJECT_PATHS) {
-        let request = LaunchRequest {
-            image,
-            drive,
-            command_line,
-        };
-        return launch_without_connection(server, backend, network, flags, Some(request));
-    }
-    let mut paths = TitlePaths::EMPTY;
-    let Some(image) = translate_title_path(&mut server.state, backend, image, &mut paths.image)
-    else {
-        return Err(ErrorCode::FileNotFound.into());
-    };
-    let drive = translate_optional_path(
-        &mut server.state,
-        backend,
-        drive,
-        &mut paths.drive,
-        ErrorCode::PathNotFound,
-    )?;
-    let request = LaunchRequest {
-        image: image.as_bytes(),
-        drive,
-        command_line,
-    };
-    launch_without_connection(server, backend, network, flags, Some(request))
-}
-
-/// Translate `path` when present; the error reply when it does not
-/// translate.
-fn translate_optional_path<'p>(
-    state: &mut ServerState,
-    backend: &mut dyn AnyBackend,
-    path: Option<&[u8]>,
-    translated: &'p mut TitlePath,
-    error: ErrorCode,
-) -> Result<Option<&'p [u8]>, CommandError> {
-    let Some(path) = path else {
-        return Ok(None);
-    };
-    match translate_title_path(state, backend, path, translated) {
-        Some(translated) => Ok(Some(translated.as_bytes())),
-        None => Err(error.into()),
-    }
-}
-
-/// `magicboot [warm] [cold] [wait] [stop] [title=<s>] [directory=<s>]
-/// [cmdline=<s>]`: launch a title, relaunching in place when possible.
-fn magic_boot(invocation: &mut Invocation<'_>) -> CommandResult {
-    let line = invocation.line;
-    let mut flags = BootFlags::empty();
-    for (name, bit) in [
-        ("warm", BootFlags::COLD),
-        ("cold", BootFlags::COLD),
-        ("wait", BootFlags::WAIT),
-        ("stop", BootFlags::STOP),
-    ] {
-        if line.has(name) {
-            flags.insert(bit);
-        }
-    }
-    let mut paths = TitlePaths::EMPTY;
-    let mut buffer = [0u8; TITLE_PARAMETER_BUFFER];
-    let image = translate_optional_path(
-        invocation.state,
-        invocation.backend,
-        string_param(line, "title", &mut buffer),
-        &mut paths.image,
-        ErrorCode::FileNotFound,
-    )?;
-    let drive = translate_optional_path(
-        invocation.state,
-        invocation.backend,
-        string_param(line, "directory", &mut buffer),
-        &mut paths.drive,
-        ErrorCode::PathNotFound,
-    )?;
-    let mut command_line_buffer = [0u8; TITLE_PARAMETER_BUFFER];
-    let command_line = string_param(line, "cmdline", &mut command_line_buffer);
-    let request = image.map(|image| LaunchRequest {
-        image,
-        drive,
-        command_line,
-    });
-    launch(invocation, flags, request)
-}
-
-/// `deftitle none` | `deftitle launcher` | `deftitle dir=<s> name=<s>`:
-/// replace or delete the default title file `\SystemRoot\dashboard.xbx`.
-fn default_title(invocation: &mut Invocation<'_>) -> CommandResult {
-    let line = invocation.line;
-    let backend = &mut *invocation.backend;
-    let synchronous = CreateOptions::SYNCHRONOUS_IO_NONALERT;
-    // Clear attributes such as read-only first; failures do not matter.
-    let attributes = CreateRequest::open(
-        AccessMask::WRITE_ATTRIBUTES.union(AccessMask::SYNCHRONIZE),
-        ShareAccess::empty(),
-        synchronous,
-    );
-    if let Ok(handle) = backend.create_file(DEFAULT_TITLE_PATH, &attributes) {
-        let normal = BasicInformation {
-            attributes: FileAttributes::NORMAL,
-            ..BasicInformation::default()
-        };
-        let _ = backend.set_basic_information(handle, &normal);
-        backend.close_file(handle);
-    }
-    if line.has("none") {
-        let delete = CreateRequest::open(
-            AccessMask::DELETE.union(AccessMask::SYNCHRONIZE),
-            ShareAccess::empty(),
-            synchronous,
-        );
-        let Ok(handle) = backend.create_file(DEFAULT_TITLE_PATH, &delete) else {
-            return Ok(Reply::Ok);
-        };
-        let deleted = backend.set_delete_disposition(handle, true);
-        backend.close_file(handle);
-        return if deleted.is_ok() {
-            Ok(Reply::Ok)
-        } else {
-            Err(CommandError::Unexpected)
-        };
-    }
-
-    let mut content = [0u8; DEFAULT_TITLE_SIZE + 1];
-    let file_start = if line.has("launcher") {
-        content[..LAUNCHER_PATH.len()].copy_from_slice(LAUNCHER_PATH);
-        LAUNCHER_PATH
-            .iter()
-            .rposition(|&byte| byte == b'\\')
-            .map_or(0, |separator| separator + 1)
-    } else {
-        let mut dir_buffer = [0u8; DEFAULT_TITLE_DIRECTORY_BUFFER];
-        let Some(dir) = string_param(line, "dir", &mut dir_buffer) else {
-            invocation.set_text(format_args!("missing dir"));
-            return Err(CommandError::Fail);
-        };
-        let mut translated = TitlePath::EMPTY;
-        let Some(directory) =
-            translate_title_path(invocation.state, invocation.backend, dir, &mut translated)
-        else {
-            return Err(ErrorCode::FileNotFound.into());
-        };
-        let mut length = directory.len;
-        content[..length].copy_from_slice(directory.as_bytes());
-        if length == 0 || content[length - 1] != b'\\' {
-            content[length] = b'\\';
-            length += 1;
-        }
-        let Some(name) = line.param("name") else {
-            invocation.set_text(format_args!("missing name"));
-            return Err(CommandError::Fail);
-        };
-        let end = DEFAULT_TITLE_SIZE.max(length);
-        name.copy_into(&mut content[length..end]);
-        length
-    };
-
-    let backend = &mut *invocation.backend;
-    let path_end = content
-        .iter()
-        .position(|&byte| byte == 0)
-        .unwrap_or(DEFAULT_TITLE_SIZE);
-    let check = CreateRequest::open(
-        AccessMask::SYNCHRONIZE,
-        ShareAccess::READ,
-        synchronous.union(CreateOptions::NON_DIRECTORY_FILE),
-    );
-    match backend.create_file(&content[..path_end], &check) {
-        Ok(handle) => backend.close_file(handle),
-        Err(error) => {
-            return Err(CommandError::from_kernel(
-                error,
-                ErrorCode::AccessDenied.into(),
-            ));
-        }
-    }
-    content[file_start - 1] = b';';
-    let create = CreateRequest {
-        access: AccessMask::GENERIC_WRITE
-            .union(AccessMask::DELETE)
-            .union(AccessMask::SYNCHRONIZE),
-        allocation_size: None,
-        attributes: FileAttributes::empty(),
-        share: ShareAccess::empty(),
-        disposition: CreateDisposition::OverwriteIf,
-        options: synchronous,
-    };
-    let Ok(handle) = backend.create_file(DEFAULT_TITLE_PATH, &create) else {
-        return Err(CommandError::Fail);
-    };
-    let result = match backend.write_file(
-        handle,
-        None,
-        FileData::Bytes(&content[..DEFAULT_TITLE_SIZE]),
-    ) {
-        Ok(()) => Ok(Reply::Ok),
-        Err(_) => match backend.set_delete_disposition(handle, true) {
-            Ok(()) => Ok(Reply::Ok),
-            Err(_) => Err(CommandError::Unexpected),
-        },
-    };
-    backend.close_file(handle);
-    result
-}
-
-/// Hardware selector values (kernel hardware flags & 0xff000003) and the
-/// size parameter each requires; the parameter name after
-/// [`FLASH_SIZE_PREFIX`] is the suffix reported for it.
-const FLASH_HARDWARE: [(u32, &str); 16] = [
-    (0x0000_0003, "size_w2"),
-    (0x0200_0003, "size_tw2"),
-    (0x1000_0003, "size_z"),
-    (0x1200_0003, "size_zt"),
-    (0x2000_0003, "size_f"),
-    (0x2200_0003, "size_ft"),
-    (0x3000_0003, "size_j"),
-    (0x3200_0003, "size_jt"),
-    (0x4000_0003, "size_t"),
-    (0x4200_0003, "size_tt"),
-    (0x5000_0003, "size_c"),
-    (0x5200_0003, "size_ct"),
-    (0x6000_0003, "size_wi"),
-    (0x6200_0003, "size_wit"),
-    (0x8000_0003, "size_r"),
-    (0x8200_0003, "size_rt"),
-];
-const FLASH_SIZE_PREFIX: &str = "size_";
-const FLASH_HARDWARE_MASK: u32 = 0xff00_0003;
-
-/// `flash size_<hw>=<dword> [ignoreversionchecking=<dword>] [stockimage]`:
-/// receive a system flash image for this hardware and program it.
-fn flash(invocation: &mut Invocation<'_>) -> CommandResult {
-    if invocation.session.is_none() {
-        return Err(CommandError::Fail);
-    }
-    let line = invocation.line;
-    let selector = invocation.backend.hardware_flags().bits() & FLASH_HARDWARE_MASK;
-    let Some(&(_, parameter)) = FLASH_HARDWARE.iter().find(|(value, _)| *value == selector) else {
-        // Stock formats a null suffix, which the CRT prints as `(null)`.
-        invocation.set_text(format_args!("unsupported hardware type, requires (null)"));
-        return Err(CommandError::Fail);
-    };
-    let suffix = &parameter.as_bytes()[FLASH_SIZE_PREFIX.len()..];
-    let Some(size) = line.dword(parameter) else {
-        invocation.text.clear();
-        let _ = invocation
-            .text
-            .push_bytes(b"unsupported hardware type, requires ");
-        let _ = invocation.text.push_bytes(suffix);
-        return Err(CommandError::Fail);
-    };
-    // Stock reads this with the required-parameter getter; its `missing`
-    // text is always replaced below.
-    let ignore_version_checking = line
-        .param("ignoreversionchecking")
-        .is_some_and(|value| value.dword_prefix() != 0);
-    let options = FlashOptions {
-        ignore_version_checking,
-        stock_image: line.has("stockimage"),
-    };
-    let rounded = size.wrapping_add(FLASH_BLOCK - 1) & !(FLASH_BLOCK - 1);
-    if !invocation.backend.flash_begin(rounded) {
-        invocation.set_text(format_args!("Not enough memory"));
-        return Err(ErrorCode::Undefined.into());
-    }
-    invocation.text.clear();
-    let _ = invocation.text.push_bytes(b"send=");
-    let _ = invocation.text.push_bytes(suffix);
-    if let Some(session) = invocation.session.as_deref_mut() {
-        session.receive_remaining = Some(size);
-        session.continuation =
-            crate::continuation::Continuation::System(Continuation::Flash(FlashUpload {
-                received: 0,
-                options,
-            }));
-    }
-    Ok(Reply::SendBinary)
-}
-
-fn resume_flash(upload: &mut FlashUpload, cx: &mut ContinuationContext<'_>) -> CommandResult {
-    if cx.received.is_empty() {
-        cx.backend.flash_abort();
-        return Err(CommandError::Unexpected);
-    }
-    cx.backend.flash_write(upload.received, cx.received);
-    let count = cx.received.len() as u32;
-    upload.received += count;
-    let remaining = cx
-        .session
-        .receive_remaining
-        .unwrap_or(0)
-        .saturating_sub(count);
-    cx.session.receive_remaining = Some(remaining);
-    if remaining != 0 {
-        return Ok(Reply::Ok);
-    }
-    match cx.backend.flash_commit(upload.received, upload.options) {
-        Ok(()) => {
-            let _ = cx.line.write_str("Done, new image flashed");
-            Ok(Reply::Ok)
-        }
-        Err(error) => {
-            let error = FlashFailed(error);
-            let result = Hresult::from(error).0;
-            let _ = write!(cx.line, "Flash failed with HRESULT 0x{result:x}");
-            Err(CommandError::Flash(error))
         }
     }
 }

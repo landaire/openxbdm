@@ -12,6 +12,30 @@ use crate::text::Text;
 
 pub use xbox360_sys::xboxkrnl::ContextFlags;
 
+/// Bytes of the kernel context layout (`ContextFlags` word first).
+pub const CONTEXT_SIZE: usize = size_of::<KernelContext>();
+
+/// Lines in the `getcontext` format.
+const LINE_COUNT: usize = 72 + 128;
+
+mod offset {
+    use super::KernelContext;
+    use super::offset_of;
+
+    pub const FLAGS: usize = offset_of!(KernelContext, context_flags);
+    pub const MSR: usize = offset_of!(KernelContext, msr);
+    pub const IAR: usize = offset_of!(KernelContext, iar);
+    pub const LR: usize = offset_of!(KernelContext, lr);
+    pub const CTR: usize = offset_of!(KernelContext, ctr);
+    pub const GPR: usize = offset_of!(KernelContext, gpr);
+    pub const CR: usize = offset_of!(KernelContext, cr);
+    pub const XER: usize = offset_of!(KernelContext, xer);
+    pub const FPSCR: usize = offset_of!(KernelContext, fpscr);
+    pub const FPR: usize = offset_of!(KernelContext, fpr);
+    pub const VSCR: usize = offset_of!(KernelContext, vscr);
+    pub const VR: usize = offset_of!(KernelContext, vr);
+}
+
 /// Register state of a thread, in the layout groups of the kernel context.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Context {
@@ -52,53 +76,36 @@ impl Context {
         vscr: [0; 4],
         vr: [[0; 4]; 128],
     };
-}
 
-/// Bytes of the kernel context layout (`ContextFlags` word first).
-pub const CONTEXT_SIZE: usize = size_of::<KernelContext>();
-
-mod offset {
-    use super::KernelContext;
-    use super::offset_of;
-
-    pub const FLAGS: usize = offset_of!(KernelContext, context_flags);
-    pub const MSR: usize = offset_of!(KernelContext, msr);
-    pub const IAR: usize = offset_of!(KernelContext, iar);
-    pub const LR: usize = offset_of!(KernelContext, lr);
-    pub const CTR: usize = offset_of!(KernelContext, ctr);
-    pub const GPR: usize = offset_of!(KernelContext, gpr);
-    pub const CR: usize = offset_of!(KernelContext, cr);
-    pub const XER: usize = offset_of!(KernelContext, xer);
-    pub const FPSCR: usize = offset_of!(KernelContext, fpscr);
-    pub const FPR: usize = offset_of!(KernelContext, fpr);
-    pub const VSCR: usize = offset_of!(KernelContext, vscr);
-    pub const VR: usize = offset_of!(KernelContext, vr);
-}
-
-impl Context {
     /// Store every register in the big-endian kernel layout.
     pub fn encode(&self, out: &mut [u8; CONTEXT_SIZE]) {
         let mut put = |at: usize, bytes: &[u8]| out[at..at + bytes.len()].copy_from_slice(bytes);
+
         put(offset::FLAGS, &self.flags.bits().to_be_bytes());
         put(offset::MSR, &self.msr.bits().to_be_bytes());
         put(offset::IAR, &self.iar.to_be_bytes());
         put(offset::LR, &self.lr.to_be_bytes());
         put(offset::CTR, &self.ctr.to_be_bytes());
-        for (n, gpr) in self.gpr.iter().enumerate() {
-            put(offset::GPR + 8 * n, &gpr.to_be_bytes());
+
+        for (idx, gpr) in self.gpr.iter().enumerate() {
+            put(offset::GPR + 8 * idx, &gpr.to_be_bytes());
         }
+
         put(offset::CR, &self.cr.to_be_bytes());
         put(offset::XER, &self.xer.to_be_bytes());
         put(offset::FPSCR, &self.fpscr.to_be_bytes());
-        for (n, fpr) in self.fpr.iter().enumerate() {
-            put(offset::FPR + 8 * n, &fpr.to_be_bytes());
+
+        for (idx, fpr) in self.fpr.iter().enumerate() {
+            put(offset::FPR + 8 * idx, &fpr.to_be_bytes());
         }
-        for (n, word) in self.vscr.iter().enumerate() {
-            put(offset::VSCR + 4 * n, &word.to_be_bytes());
+
+        for (idx, word) in self.vscr.iter().enumerate() {
+            put(offset::VSCR + 4 * idx, &word.to_be_bytes());
         }
+
         for (index, vector) in self.vr.iter().enumerate() {
-            for (n, word) in vector.iter().enumerate() {
-                put(offset::VR + 0x10 * index + 4 * n, &word.to_be_bytes());
+            for (idx, word) in vector.iter().enumerate() {
+                put(offset::VR + 0x10 * index + 4 * idx, &word.to_be_bytes());
             }
         }
     }
@@ -109,20 +116,21 @@ impl Context {
             u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
         };
         let dword = |at: usize| (u64::from(word(at)) << 32) | u64::from(word(at + 4));
+
         Self {
             flags: ContextFlags::from_bits_retain(word(offset::FLAGS)),
             msr: Msr::from_bits_retain(word(offset::MSR)),
             iar: word(offset::IAR),
             lr: word(offset::LR),
             ctr: dword(offset::CTR),
-            gpr: core::array::from_fn(|n| dword(offset::GPR + 8 * n)),
+            gpr: core::array::from_fn(|idx| dword(offset::GPR + 8 * idx)),
             cr: word(offset::CR),
             xer: word(offset::XER),
             fpscr: dword(offset::FPSCR),
-            fpr: core::array::from_fn(|n| dword(offset::FPR + 8 * n)),
-            vscr: core::array::from_fn(|n| word(offset::VSCR + 4 * n)),
+            fpr: core::array::from_fn(|idx| dword(offset::FPR + 8 * idx)),
+            vscr: core::array::from_fn(|idx| word(offset::VSCR + 4 * idx)),
             vr: core::array::from_fn(|index| {
-                core::array::from_fn(|n| word(offset::VR + 0x10 * index + 4 * n))
+                core::array::from_fn(|idx| word(offset::VR + 0x10 * index + 4 * idx))
             }),
         }
     }
@@ -185,18 +193,30 @@ impl ContextLine {
             Self::Iar => write!(out, "Iar=0x{:08x}", context.iar),
             Self::Lr => write!(out, "Lr=0x{:08x}", context.lr),
             Self::Ctr => write!(out, "Ctr=0q{:016x}", context.ctr),
-            Self::Gpr(n) => write!(out, "Gpr{n}=0q{:016x}", context.gpr[usize::from(n)]),
+            Self::Gpr(number) => {
+                write!(
+                    out,
+                    "Gpr{number}=0q{:016x}",
+                    context.gpr[usize::from(number)]
+                )
+            }
             Self::Cr => write!(out, "Cr=0x{:08x}", context.cr),
             Self::Xer => write!(out, "Xer=0x{:08x}", context.xer),
             Self::Fpscr => write!(out, "Fpscr=0q{:016x}", context.fpscr),
-            Self::Fpr(n) => write!(out, "Fpr{n}=0q{:016x}", context.fpr[usize::from(n)]),
+            Self::Fpr(number) => {
+                write!(
+                    out,
+                    "Fpr{number}=0q{:016x}",
+                    context.fpr[usize::from(number)]
+                )
+            }
             Self::Vscr => write_vector(out, "Vscr", None, &context.vscr),
-            Self::Vr(n) => write_vector(out, "Vr", Some(n), &context.vr[usize::from(n)]),
+            Self::Vr(number) => {
+                write_vector(out, "Vr", Some(number), &context.vr[usize::from(number)])
+            }
         };
     }
 }
-
-const LINE_COUNT: usize = 72 + 128;
 
 fn write_vector<const N: usize>(
     out: &mut Text<N>,
@@ -208,6 +228,7 @@ fn write_vector<const N: usize>(
     if let Some(index) = index {
         write!(out, "{index}")?;
     }
+
     write!(
         out,
         "=0x{:08X},0x{:08X},0x{:08X},0x{:08X}",
@@ -221,37 +242,47 @@ pub fn apply_parameters(line: &CommandLine<'_>, context: &mut Context) {
     if let Some(value) = line.dword("Msr") {
         context.msr = Msr::from_bits_retain(value);
     }
+
     if let Some(value) = line.dword("Iar") {
         context.iar = value;
     }
+
     if let Some(value) = line.dword("Lr") {
         context.lr = value;
     }
+
     if let Some(value) = qword(line, "Ctr") {
         context.ctr = value;
     }
+
     if let Some(value) = line.dword("Cr") {
         context.cr = value;
     }
+
     if let Some(value) = line.dword("Xer") {
         context.xer = value;
     }
+
     if let Some(value) = qword(line, "Fpscr") {
         context.fpscr = value;
     }
+
     if let Some(words) = vector(line, "Vscr") {
         context.vscr = words;
     }
+
     let mut name = Text::<8>::new();
+
     for (prefix, registers) in [("Gpr", &mut context.gpr), ("Fpr", &mut context.fpr)] {
-        for (n, register) in registers.iter_mut().enumerate() {
-            if let Some(value) = qword(line, register_name(&mut name, prefix, n)) {
+        for (number, register) in registers.iter_mut().enumerate() {
+            if let Some(value) = qword(line, register_name(&mut name, prefix, number)) {
                 *register = value;
             }
         }
     }
-    for (n, register) in context.vr.iter_mut().enumerate() {
-        if let Some(words) = vector(line, register_name(&mut name, "Vr", n)) {
+
+    for (number, register) in context.vr.iter_mut().enumerate() {
+        if let Some(words) = vector(line, register_name(&mut name, "Vr", number)) {
             *register = words;
         }
     }
@@ -261,34 +292,39 @@ fn qword(line: &CommandLine<'_>, key: &str) -> Option<u64> {
     line.param(key).and_then(|value| value.qword())
 }
 
-/// `<prefix><n>`, the parameter name of register `n`.
-fn register_name<'a>(name: &'a mut Text<8>, prefix: &str, n: usize) -> &'a str {
+/// `<prefix><number>`, the parameter name of register `number`.
+fn register_name<'a>(name: &'a mut Text<8>, prefix: &str, number: usize) -> &'a str {
     name.clear();
     let _ = name.push_bytes(prefix.as_bytes());
-    let _ = name.push_decimal(n as u32);
+    let _ = name.push_decimal(number as u32);
+
     core::str::from_utf8(name.as_bytes()).unwrap_or_default()
 }
-
-/// Characters of a vector value the monitor copies before parsing.
-const VECTOR_TEXT_LIMIT: usize = 62;
 
 /// Four numbers with C `strtoul` base-0 rules, each followed by `,`,
 /// space, CR, or the end of the copied value.
 fn vector(line: &CommandLine<'_>, key: &str) -> Option<[u32; 4]> {
+    // Characters of a vector value the monitor copies before parsing.
+    const VECTOR_TEXT_LIMIT: usize = 62;
+
     let mut buffer = [0u8; VECTOR_TEXT_LIMIT + 1];
     let text = line.param(key)?.copy_into(&mut buffer);
+
     let mut words = [0u32; 4];
     let mut position = 0;
+
     for word in &mut words {
         let (value, consumed) = strtoul(&text[position.min(text.len())..]);
         position += consumed;
         match text.get(position) {
+            // End of the copied value.
             None => {}
             Some(b',' | b' ' | b'\r') => position += 1,
             Some(_) => return None,
         }
         *word = value;
     }
+
     Some(words)
 }
 
@@ -296,12 +332,14 @@ fn vector(line: &CommandLine<'_>, key: &str) -> Option<[u32; 4]> {
 /// (0 when no digits were parsed).
 pub(super) fn strtoul(text: &[u8]) -> (u32, usize) {
     let mut position = 0;
+
     while matches!(
         text.get(position),
         Some(b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r')
     ) {
         position += 1;
     }
+
     let negative = match text.get(position) {
         Some(b'-') => {
             position += 1;
@@ -313,22 +351,24 @@ pub(super) fn strtoul(text: &[u8]) -> (u32, usize) {
         }
         _ => false,
     };
-    let mut base = 10;
-    if text.get(position) == Some(&b'0') {
-        if matches!(text.get(position + 1), Some(b'x' | b'X'))
-            && text
-                .get(position + 2)
-                .is_some_and(|byte| byte.is_ascii_hexdigit())
-        {
-            base = 16;
-            position += 2;
-        } else {
-            base = 8;
-        }
-    }
+
+    let base = if text.get(position) != Some(&b'0') {
+        10
+    } else if matches!(text.get(position + 1), Some(b'x' | b'X'))
+        && text
+            .get(position + 2)
+            .is_some_and(|byte| byte.is_ascii_hexdigit())
+    {
+        position += 2;
+        16
+    } else {
+        8
+    };
+
     let start = position;
     let mut value: u32 = 0;
     let mut overflow = false;
+
     while let Some(digit) = text
         .get(position)
         .and_then(|&byte| (byte as char).to_digit(base))
@@ -342,9 +382,11 @@ pub(super) fn strtoul(text: &[u8]) -> (u32, usize) {
         }
         position += 1;
     }
+
     if position == start && base != 8 {
         return (0, 0);
     }
+
     let value = if overflow {
         u32::MAX
     } else if negative {
@@ -352,6 +394,7 @@ pub(super) fn strtoul(text: &[u8]) -> (u32, usize) {
     } else {
         value
     };
+
     (value, position)
 }
 

@@ -45,6 +45,7 @@ impl CommandEntry {
         handler: Handler,
     ) -> Self {
         assert!(any_of.bits() <= 0xff && all_of.bits() <= 0xff);
+
         Self {
             name,
             handler,
@@ -61,6 +62,7 @@ impl CommandEntry {
     /// The access rule of the monitor's table lookup.
     pub fn permits(&self, access: Access) -> bool {
         let all_of = Access::from_bits_retain(u32::from(self.all_of));
+
         if self.all_of != 0 {
             access.contains(all_of)
         } else if self.any_of == 0 {
@@ -76,6 +78,7 @@ pub fn lookup(word: &[u8]) -> Option<&'static CommandEntry> {
     if word.is_empty() {
         return None;
     }
+
     crate::commands::TABLES
         .iter()
         .flat_map(|table| table.iter())

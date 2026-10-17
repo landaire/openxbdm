@@ -1,5 +1,7 @@
 //! Socket operations the server needs from the platform.
 
+pub use crate::error::NetError;
+
 /// A platform socket handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SocketId(pub u32);
@@ -28,17 +30,6 @@ impl Ipv4Address {
 pub struct Endpoint {
     pub address: Ipv4Address,
     pub port: u16,
-}
-
-/// Failure of a socket operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NetError {
-    /// The peer closed the connection or the socket failed.
-    Closed,
-    /// A non-blocking operation could not proceed.
-    WouldBlock,
-    /// No resources for a new socket.
-    Exhausted,
 }
 
 pub trait Network {
@@ -70,6 +61,7 @@ pub fn send_all(
             sent => data = &data[sent..],
         }
     }
+
     Ok(())
 }
 

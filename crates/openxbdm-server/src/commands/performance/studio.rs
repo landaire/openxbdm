@@ -12,52 +12,11 @@
 
 use openxbdm_core::status::Hresult;
 
+pub use super::error::StudioError;
+
 /// Request slots of one transport.
 pub const REQUEST_SLOTS: usize = 4;
-
-/// A failed transport routine or request, as the studio service receives
-/// it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StudioError {
-    /// The request is still queued.
-    Pending,
-    /// The connection is closed.
-    NotConnected,
-    /// Removed by a cancel or a disconnect.
-    Aborted,
-    /// No request slot or memory is free.
-    OutOfMemory,
-    /// A message longer than the receive buffer, or an unknown request.
-    InvalidArgument,
-    NotImplemented,
-    Fail,
-}
-
-impl From<StudioError> for Hresult {
-    fn from(error: StudioError) -> Self {
-        match error {
-            StudioError::Pending => Hresult::PENDING,
-            StudioError::NotConnected => Hresult::NO_INTERFACE,
-            StudioError::Aborted => Hresult::ABORT,
-            StudioError::OutOfMemory => Hresult::OUT_OF_MEMORY,
-            StudioError::InvalidArgument => Hresult::INVALID_ARGUMENT,
-            StudioError::NotImplemented => Hresult::NOT_IMPLEMENTED,
-            StudioError::Fail => Hresult::FAIL,
-        }
-    }
-}
-
-/// The result word of a transport routine; success is 0.
-pub fn routine_result(result: Result<(), StudioError>) -> Hresult {
-    match result {
-        Ok(()) => Hresult::SUCCESS,
-        Err(error) => error.into(),
-    }
-}
-
 const LENGTH_SIZE: u32 = 4;
-/// Largest receive used to drop the body of a rejected message.
-const DISCARD_CHUNK: usize = 0x100;
 
 /// A request slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,26 +88,6 @@ pub trait Stream {
     fn short_buffer(&mut self);
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Queue {
-    Free,
-    Send,
-    Receive,
-    Completed,
-}
-
-#[derive(Clone, Copy)]
-struct Request {
-    queue: Queue,
-    /// The length prefix has been transferred.
-    framed: bool,
-    buffer: u32,
-    length: u32,
-    progress: u32,
-    /// `None` while queued.
-    status: Option<Result<(), StudioError>>,
-}
-
 /// State of one socket transport.
 pub struct Transport {
     requests: [Request; REQUEST_SLOTS],
@@ -175,6 +114,7 @@ impl Transport {
             progress: 0,
             status: Some(Ok(())),
         };
+
         Self {
             requests: [FREE; REQUEST_SLOTS],
             order: [Slot(0), Slot(1), Slot(2), Slot(3)],
@@ -199,6 +139,7 @@ impl Transport {
         if let Some(position) = self.order.iter().position(|&member| member == slot) {
             self.order[position..].rotate_left(1);
         }
+
         self.requests[slot.index()].queue = queue;
     }
 
@@ -213,6 +154,7 @@ impl Transport {
         if !self.connected {
             return Err(StudioError::NotConnected);
         }
+
         self.head(Queue::Free).ok_or(StudioError::OutOfMemory)
     }
 
@@ -239,10 +181,12 @@ impl Transport {
         request.length = buffer.length;
         request.progress = 0;
         request.status = None;
+
         let queue = match direction {
             Direction::Send => Queue::Send,
             Direction::Receive => Queue::Receive,
         };
+
         self.move_to(slot, queue);
         self.pump(stream);
     }
@@ -255,7 +199,9 @@ impl Transport {
     pub fn complete(&mut self, slot: Slot) -> Option<(Result<(), StudioError>, u32)> {
         let request = self.requests[slot.index()];
         let status = request.status?;
+
         self.move_to(slot, Queue::Free);
+
         Some((status, request.progress))
     }
 
@@ -283,10 +229,12 @@ impl Transport {
 
     /// Move queued data while the socket accepts it (0x91f83fe8).
     pub fn pump(&mut self, stream: &mut impl Stream) {
-        if self.connected {
-            self.pump_sends(stream);
-            self.pump_receives(stream);
+        if !self.connected {
+            return;
         }
+
+        self.pump_sends(stream);
+        self.pump_receives(stream);
     }
 
     fn pump_sends(&mut self, stream: &mut impl Stream) {
@@ -312,12 +260,15 @@ impl Transport {
                     ))
                 }
             };
+
             let Some(count) = sent else {
                 self.socket_error(stream);
                 return;
             };
+
             let request = &mut self.requests[slot.index()];
             request.progress = request.progress.wrapping_add(count);
+
             if !request.framed {
                 if request.progress >= LENGTH_SIZE {
                     request.framed = true;
@@ -335,15 +286,18 @@ impl Transport {
             if self.discard > 0 {
                 return;
             }
+
             let request = self.requests[slot.index()];
             if !request.framed && request.length < LENGTH_SIZE {
                 stream.short_buffer();
             }
+
             let end = if request.framed {
                 request.length
             } else {
                 LENGTH_SIZE
             };
+
             // SAFETY: a queued receive keeps `length` or 4 bytes, whichever
             // is more, valid (`submit`). Before framing `end` is 4; after,
             // it is a message length no larger than the buffer. `progress`
@@ -354,6 +308,7 @@ impl Transport {
                     length: end.wrapping_sub(request.progress),
                 }))
             };
+
             match received {
                 None => {
                     self.socket_error(stream);
@@ -368,16 +323,20 @@ impl Transport {
                 Some(count) => {
                     let request = &mut self.requests[slot.index()];
                     request.progress = request.progress.wrapping_add(count);
+
                     if request.progress < end {
                         continue;
                     }
+
                     if request.framed {
                         self.finish(slot, Ok(()), stream);
                         continue;
                     }
+
                     // SAFETY: the 4 prefix bytes just received lie in the
                     // valid part of the buffer (`submit`).
                     let length = unsafe { stream.read_length(request.buffer) };
+
                     if length <= request.length {
                         request.framed = true;
                         request.length = length;
@@ -397,7 +356,11 @@ impl Transport {
 
     /// Read and drop pending rejected bytes (0x91f83c00).
     fn drop_discarded(&mut self, stream: &mut impl Stream) {
+        /// Largest receive used to drop the body of a rejected message.
+        const DISCARD_CHUNK: usize = 0x100;
+
         let mut scratch = [0u8; DISCARD_CHUNK];
+
         while self.discard > 0 {
             let count = (self.discard as usize).min(DISCARD_CHUNK);
             // SAFETY: a local slice.
@@ -410,9 +373,39 @@ impl Transport {
                     self.disconnect(stream);
                     return;
                 }
-                Some(received) => self.discard = self.discard.wrapping_sub(received),
+                Some(received) => {
+                    self.discard = self.discard.wrapping_sub(received);
+                }
             }
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Queue {
+    Free,
+    Send,
+    Receive,
+    Completed,
+}
+
+#[derive(Clone, Copy)]
+struct Request {
+    queue: Queue,
+    /// The length prefix has been transferred.
+    framed: bool,
+    buffer: u32,
+    length: u32,
+    progress: u32,
+    /// `None` while queued.
+    status: Option<Result<(), StudioError>>,
+}
+
+/// The result word of a transport routine; success is 0.
+pub fn routine_result(result: Result<(), StudioError>) -> Hresult {
+    match result {
+        Ok(()) => Hresult::SUCCESS,
+        Err(error) => error.into(),
     }
 }
 

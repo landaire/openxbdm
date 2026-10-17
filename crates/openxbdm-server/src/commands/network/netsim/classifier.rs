@@ -8,13 +8,16 @@
 //! re-serializes it in canonical form for `getq` and the settings file.
 
 mod compile;
-pub(super) use self::compile::result as compile_result;
+mod error;
 mod grammar;
 pub mod variant;
 
 pub use self::compile::CompileError;
 pub use self::compile::Compiled;
 pub use self::compile::compile_text;
+pub(super) use self::compile::result as compile_result;
+pub use self::error::ProgramError;
+pub use self::error::SerializeError;
 
 /// Items a program may declare: the library allows 0x20 item objects and
 /// the stored copy takes one per item.
@@ -28,30 +31,6 @@ pub const TEXT_CAPACITY: usize = 0xdc;
 /// Distinct strings while parsing: every reference takes at least two bytes
 /// of the blob.
 const STRING_LIMIT: usize = TEXT_CAPACITY / 2;
-/// Parse-time limits: declared items, operators.
-const PARSE_ITEM_LIMIT: u32 = 0x20;
-const PARSE_NODE_LIMIT: u32 = 0x40;
-/// Names must be shorter than this (the library's first limit, 0x80).
-const NAME_LIMIT: usize = 0x80;
-
-/// Why a program is rejected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProgramError {
-    /// Malformed or not allowed (0x82da0017).
-    Invalid,
-    /// The stored copy exceeds the item or node objects (0x82da001c).
-    OutOfMemory,
-}
-
-/// Why a program cannot be serialized.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SerializeError {
-    /// The output does not fit (0x8007007a).
-    TooLarge,
-    /// An item holds a string, which the item encoder rejects
-    /// (0x80070545).
-    Unencodable,
-}
 
 /// Index of a field in the frame field table, 1..=0x55.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -164,12 +143,6 @@ pub enum Node {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-struct Span {
-    start: u8,
-    len: u8,
-}
-
 /// A parsed program.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Program {
@@ -194,68 +167,6 @@ impl core::fmt::Debug for Program {
             .field("strings", &self.string_count)
             .finish()
     }
-}
-
-struct Input<'a> {
-    bytes: &'a [u8],
-    little_endian: bool,
-}
-
-impl<'a> Input<'a> {
-    fn take(&mut self, count: usize) -> Result<&'a [u8], ProgramError> {
-        if self.bytes.len() < count {
-            return Err(ProgramError::Invalid);
-        }
-        let (head, rest) = self.bytes.split_at(count);
-        self.bytes = rest;
-        Ok(head)
-    }
-
-    fn byte(&mut self) -> Result<u8, ProgramError> {
-        Ok(self.take(1)?[0])
-    }
-
-    /// An unsigned number of `width` bytes in the program's byte order
-    /// (0x91f8a498 wire types 8..0xb).
-    fn unsigned(&mut self, width: usize) -> Result<u64, ProgramError> {
-        let bytes = self.take(width)?;
-        let mut value = 0u64;
-        for index in 0..width {
-            let byte = if self.little_endian {
-                bytes[width - 1 - index]
-            } else {
-                bytes[index]
-            };
-            value = (value << 8) | u64::from(byte);
-        }
-        Ok(value)
-    }
-
-    /// Big-endian header number; the header ignores the byte order flag.
-    fn header(&mut self, width: usize) -> Result<u32, ProgramError> {
-        let bytes = self.take(width)?;
-        Ok(bytes
-            .iter()
-            .fold(0u32, |value, &byte| (value << 8) | u32::from(byte)))
-    }
-}
-
-/// Bytes of a count or offset by the largest value it must hold.
-fn width_for(limit: u64) -> usize {
-    if limit <= 0xff {
-        1
-    } else if limit <= 0xffff {
-        2
-    } else {
-        4
-    }
-}
-
-struct Strings<'a> {
-    /// The string table of the blob.
-    table: &'a [u8],
-    /// Declared longest string; length prefixes use its width.
-    longest: u32,
 }
 
 impl Program {
@@ -297,6 +208,7 @@ impl Program {
     /// the opaque type has no value.
     pub fn variant(&self, value: Value) -> variant::Variant {
         use variant::Variant;
+
         match value {
             Value::Null | Value::Opaque => Variant::Null,
             Value::Bool(value) => Variant::Bool(value),
@@ -329,10 +241,12 @@ impl Program {
                 return Ok(StringId(index as u8));
             }
         }
+
         let start = usize::from(self.text_len);
         if usize::from(self.string_count) == STRING_LIMIT || start + bytes.len() > TEXT_CAPACITY {
             return Err(ProgramError::Invalid);
         }
+
         self.text[start..start + bytes.len()].copy_from_slice(bytes);
         self.text_len = (start + bytes.len()) as u8;
         self.strings[usize::from(self.string_count)] = Span {
@@ -340,6 +254,7 @@ impl Program {
             len: bytes.len() as u8,
         };
         self.string_count += 1;
+
         Ok(StringId(self.string_count - 1))
     }
 
@@ -357,6 +272,7 @@ impl Program {
         if offset >= table_len as u64 {
             return Err(ProgramError::Invalid);
         }
+
         let mut entry = Input {
             bytes: &strings.table[offset as usize..],
             little_endian: input.little_endian,
@@ -365,12 +281,13 @@ impl Program {
         if length > u64::from(strings.longest) || length > entry.bytes.len() as u64 {
             return Err(ProgramError::Invalid);
         }
+
         let length = length as usize;
         if length >= limit {
             return Err(ProgramError::Invalid);
         }
-        let bytes = &entry.bytes[..length];
-        self.intern(bytes)
+
+        self.intern(&entry.bytes[..length])
     }
 
     /// A value of wire type `kind` (0x91f8a498) as the netsim feature set
@@ -422,7 +339,14 @@ impl Program {
     /// and the stored copy of 0x91f871f8) into `program`, which the caller
     /// provides so that one copy exists.
     pub fn parse(blob: &[u8], program: &mut Program) -> Result<(), ProgramError> {
+        /// Parse-time limits: declared items, operators.
+        const PARSE_ITEM_LIMIT: u32 = 0x20;
+        const PARSE_NODE_LIMIT: u32 = 0x40;
+        /// Names must be shorter than this (the library's first limit, 0x80).
+        const NAME_LIMIT: usize = 0x80;
+
         *program = Program::EMPTY;
+
         let mut input = Input {
             bytes: blob,
             little_endian: false,
@@ -432,6 +356,7 @@ impl Program {
         if version & 0xf0 != 0x10 || flags & 1 != 0 {
             return Err(ProgramError::Invalid);
         }
+
         input.little_endian = flags & 2 != 0;
         let (table_len, longest) = match flags & 0xc {
             0x4 => (input.header(1)?, input.header(1)?),
@@ -449,6 +374,7 @@ impl Program {
         if table_len > input.bytes.len() || longest as usize > table_len {
             return Err(ProgramError::Invalid);
         }
+
         let table = input.take(table_len)?;
         let strings = Strings { table, longest };
         let rest = input.bytes.len() as u32;
@@ -459,6 +385,7 @@ impl Program {
         {
             return Err(ProgramError::Invalid);
         }
+
         // Entries past the stored limits are parsed and checked but not
         // kept; only the kind of each node is needed for the checks.
         let mut parsed_items = 0usize;
@@ -471,6 +398,7 @@ impl Program {
             if item_flags & 1 != 0 {
                 return Err(ProgramError::Invalid);
             }
+
             let tag = if item_flags & 2 != 0 {
                 Some(input.unsigned(8)?)
             } else {
@@ -486,6 +414,7 @@ impl Program {
             if field == 0 || field > u64::from(FIELD_COUNT) {
                 return Err(ProgramError::Invalid);
             }
+
             let value = program.read_value(kind, &mut input, &strings)?;
             if let Some(slot) = program.items.get_mut(parsed_items) {
                 *slot = Item {
@@ -502,11 +431,12 @@ impl Program {
         let mut stack = [0u8; PARSE_NODE_LIMIT as usize];
         let mut depth = 0usize;
         let mut parsed_nodes = 0usize;
+
         for _ in 0..node_count {
-            let op = input.byte()?;
-            let (node, operands) = match op {
+            let opcode = input.byte()?;
+            let (node, operands) = match opcode {
                 1..=0xb | 0xe..=0x10 | 0x12 => (
-                    Node::Constant(program.read_value(op, &mut input, &strings)?),
+                    Node::Constant(program.read_value(opcode, &mut input, &strings)?),
                     0,
                 ),
                 0x21 => (
@@ -518,10 +448,11 @@ impl Program {
                     if index >= u64::from(item_count) {
                         return Err(ProgramError::Invalid);
                     }
+
                     (Node::Item(index as u8), 0)
                 }
                 0x23..=0x26 | 0x28..=0x3c | 0x3e..=0x44 => {
-                    let operator = Operator(op - 0x20);
+                    let operator = Operator(opcode - 0x20);
                     let operands = match operator.0 {
                         4 | 5 => return Err(ProgramError::Invalid),
                         3 => {
@@ -532,6 +463,7 @@ impl Program {
                             if first != Some(NodeKind::Reference) {
                                 return Err(ProgramError::Invalid);
                             }
+
                             2
                         }
                         6 | 8 | 9 | 0x1e => 1,
@@ -543,11 +475,13 @@ impl Program {
                                 if count < minimum || count > maximum {
                                     return Err(ProgramError::Invalid);
                                 }
+
                                 count
                             }
                             None => 2,
                         },
                     };
+
                     (
                         Node::Operator {
                             operator,
@@ -561,6 +495,7 @@ impl Program {
             if depth < operands {
                 return Err(ProgramError::Invalid);
             }
+
             depth -= operands;
             kinds[parsed_nodes] = NodeKind::of(&node);
             if let Some(slot) = program.nodes.get_mut(parsed_nodes) {
@@ -570,25 +505,47 @@ impl Program {
             depth += 1;
             parsed_nodes += 1;
         }
+
         // An empty expression makes stock dereference a null node.
         if !input.bytes.is_empty() || depth != 1 {
             return Err(ProgramError::Invalid);
         }
+
         // A constant result is refused by 0x91f8bb08.
         if kinds[usize::from(stack[0])] == NodeKind::Constant {
             return Err(ProgramError::Invalid);
         }
+
         if parsed_items > ITEM_LIMIT || parsed_nodes > NODE_LIMIT {
             return Err(ProgramError::OutOfMemory);
         }
+
         program.item_count = parsed_items as u8;
         program.node_count = parsed_nodes as u8;
+
         Ok(())
     }
 
     /// Canonical form (0x91f87318). Returns the byte count.
     pub fn serialize(&self, output: &mut [u8]) -> Result<usize, SerializeError> {
         write_program(self.items(), self.nodes(), self, output)
+    }
+}
+
+/// The program a blob carries: parsed from a blob or compiled from text.
+#[derive(Clone, Copy)]
+pub enum Source<'a> {
+    Parsed(&'a Program),
+    Compiled(&'a Compiled<'a>),
+}
+
+impl Source<'_> {
+    /// Canonical form (0x91f87318). Returns the byte count.
+    pub fn serialize(self, output: &mut [u8]) -> Result<usize, SerializeError> {
+        match self {
+            Source::Parsed(program) => program.serialize(output),
+            Source::Compiled(program) => program.serialize(output),
+        }
     }
 }
 
@@ -611,21 +568,71 @@ impl NodeKind {
     }
 }
 
-/// The program a blob carries: parsed from a blob or compiled from text.
-#[derive(Clone, Copy)]
-pub enum Source<'a> {
-    Parsed(&'a Program),
-    Compiled(&'a Compiled<'a>),
+struct Input<'a> {
+    bytes: &'a [u8],
+    little_endian: bool,
 }
 
-impl Source<'_> {
-    /// Canonical form (0x91f87318). Returns the byte count.
-    pub fn serialize(self, output: &mut [u8]) -> Result<usize, SerializeError> {
-        match self {
-            Source::Parsed(program) => program.serialize(output),
-            Source::Compiled(program) => program.serialize(output),
+impl<'a> Input<'a> {
+    fn take(&mut self, count: usize) -> Result<&'a [u8], ProgramError> {
+        if self.bytes.len() < count {
+            return Err(ProgramError::Invalid);
         }
+
+        let (head, rest) = self.bytes.split_at(count);
+        self.bytes = rest;
+
+        Ok(head)
     }
+
+    fn byte(&mut self) -> Result<u8, ProgramError> {
+        Ok(self.take(1)?[0])
+    }
+
+    /// An unsigned number of `width` bytes in the program's byte order
+    /// (0x91f8a498 wire types 8..0xb).
+    fn unsigned(&mut self, width: usize) -> Result<u64, ProgramError> {
+        let bytes = self.take(width)?;
+        let mut value = 0u64;
+
+        for index in 0..width {
+            let byte = if self.little_endian {
+                bytes[width - 1 - index]
+            } else {
+                bytes[index]
+            };
+            value = (value << 8) | u64::from(byte);
+        }
+
+        Ok(value)
+    }
+
+    /// Big-endian header number; the header ignores the byte order flag.
+    fn header(&mut self, width: usize) -> Result<u32, ProgramError> {
+        let bytes = self.take(width)?;
+        Ok(bytes
+            .iter()
+            .fold(0u32, |value, &byte| (value << 8) | u32::from(byte)))
+    }
+}
+
+struct Strings<'a> {
+    /// The string table of the blob.
+    table: &'a [u8],
+    /// Declared longest string; length prefixes use its width.
+    longest: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+struct Span {
+    start: u8,
+    len: u8,
+}
+
+/// Distinct strings of a program in registration order.
+trait StringTable {
+    fn count(&self) -> usize;
+    fn bytes(&self, id: StringId) -> &[u8];
 }
 
 impl StringTable for Program {
@@ -638,10 +645,41 @@ impl StringTable for Program {
     }
 }
 
-/// Distinct strings of a program in registration order.
-trait StringTable {
-    fn count(&self) -> usize;
-    fn bytes(&self, id: StringId) -> &[u8];
+struct Writer<'a> {
+    output: &'a mut [u8],
+    len: usize,
+    overflow: bool,
+}
+
+impl Writer<'_> {
+    fn put(&mut self, bytes: &[u8]) {
+        if self.overflow || self.len + bytes.len() > self.output.len() {
+            self.overflow = true;
+            return;
+        }
+
+        self.output[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+    }
+
+    /// Value bytes after the type (0x91f89ee8).
+    fn value(&mut self, value: Value) {
+        match value {
+            // These carry no bytes after the type.
+            Value::Null | Value::Bool(_) | Value::Opaque | Value::Str(_) => {}
+            Value::I8(value) => self.put(&value.to_be_bytes()),
+            Value::I16(value) => self.put(&value.to_be_bytes()),
+            Value::I32(value) => self.put(&value.to_be_bytes()),
+            Value::I64(value) => self.put(&value.to_be_bytes()),
+            Value::U8(value) => self.put(&[value]),
+            Value::U16(value) => self.put(&value.to_be_bytes()),
+            Value::U32(value) => self.put(&value.to_be_bytes()),
+            Value::U64(value) => self.put(&value.to_be_bytes()),
+            Value::Mac(bytes) => self.put(&bytes),
+            Value::Ipv4(bytes) => self.put(&bytes),
+            Value::Ipv6(bytes) => self.put(&bytes),
+        }
+    }
 }
 
 /// Write a program in stock's canonical form (0x91f87318): big-endian,
@@ -657,6 +695,7 @@ fn write_program(
         len: 0,
         overflow: false,
     };
+
     let strings = table.count();
     let length = |index: usize| table.bytes(StringId(index as u8)).len() as u32;
     let longest = (0..strings).map(length).max().unwrap_or(0);
@@ -664,6 +703,7 @@ fn write_program(
     let table_len: u32 = (0..strings)
         .map(|index| length(index) + prefix as u32)
         .sum();
+
     let mut flags = 0u8;
     let mut header = [0u8; 8];
     let mut header_len = 0;
@@ -682,6 +722,7 @@ fn write_program(
         header[width..2 * width].copy_from_slice(&longest.to_be_bytes()[4 - width..]);
         header_len = 2 * width;
     }
+
     let mut counts = [0u8; 2];
     let counts_len = if !items.is_empty() {
         flags |= 0x10;
@@ -692,14 +733,17 @@ fn write_program(
         counts[0] = nodes.len() as u8;
         1
     };
+
     writer.put(&[0x10, flags]);
     writer.put(&header[..header_len]);
     writer.put(&counts[..counts_len]);
+
     // Strings, most recently registered first.
     for index in (0..strings).rev() {
         writer.put(&length(index).to_be_bytes()[4 - prefix..]);
         writer.put(table.bytes(StringId(index as u8)));
     }
+
     let offset_width = width_for(u64::from(table_len));
     let offset_of = |id: StringId| -> u32 {
         (usize::from(id.0) + 1..strings)
@@ -709,6 +753,7 @@ fn write_program(
     let put_string = |writer: &mut Writer<'_>, id: StringId| {
         writer.put(&offset_of(id).to_be_bytes()[4 - offset_width..]);
     };
+
     for item in items {
         let mut item_flags = 8u8;
         if item.tag.is_some() {
@@ -717,16 +762,20 @@ fn write_program(
         if item.fixed {
             item_flags |= 4;
         }
+
         writer.put(&[item.value.wire_type(), item_flags]);
         if let Some(tag) = item.tag {
             writer.put(&tag.to_be_bytes());
         }
         writer.put(&[item.field.0]);
+
         if matches!(item.value, Value::Str(_)) {
             return Err(SerializeError::Unencodable);
         }
+
         writer.value(item.value);
     }
+
     for node in nodes {
         match *node {
             Node::Constant(Value::Str(id)) => {
@@ -750,6 +799,7 @@ fn write_program(
             }
         }
     }
+
     if writer.overflow {
         Err(SerializeError::TooLarge)
     } else {
@@ -757,38 +807,14 @@ fn write_program(
     }
 }
 
-struct Writer<'a> {
-    output: &'a mut [u8],
-    len: usize,
-    overflow: bool,
-}
-
-impl Writer<'_> {
-    fn put(&mut self, bytes: &[u8]) {
-        if self.overflow || self.len + bytes.len() > self.output.len() {
-            self.overflow = true;
-            return;
-        }
-        self.output[self.len..self.len + bytes.len()].copy_from_slice(bytes);
-        self.len += bytes.len();
-    }
-
-    /// Value bytes after the type (0x91f89ee8).
-    fn value(&mut self, value: Value) {
-        match value {
-            Value::Null | Value::Bool(_) | Value::Opaque | Value::Str(_) => {}
-            Value::I8(value) => self.put(&value.to_be_bytes()),
-            Value::I16(value) => self.put(&value.to_be_bytes()),
-            Value::I32(value) => self.put(&value.to_be_bytes()),
-            Value::I64(value) => self.put(&value.to_be_bytes()),
-            Value::U8(value) => self.put(&[value]),
-            Value::U16(value) => self.put(&value.to_be_bytes()),
-            Value::U32(value) => self.put(&value.to_be_bytes()),
-            Value::U64(value) => self.put(&value.to_be_bytes()),
-            Value::Mac(bytes) => self.put(&bytes),
-            Value::Ipv4(bytes) => self.put(&bytes),
-            Value::Ipv6(bytes) => self.put(&bytes),
-        }
+/// Bytes of a count or offset by the largest value it must hold.
+fn width_for(limit: u64) -> usize {
+    if limit <= 0xff {
+        1
+    } else if limit <= 0xffff {
+        2
+    } else {
+        4
     }
 }
 

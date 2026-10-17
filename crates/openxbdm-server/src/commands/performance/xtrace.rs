@@ -70,88 +70,6 @@ pub struct Mismatch {
     pub found: u32,
 }
 
-/// A 64-bit count as two words, high word first.
-struct Count {
-    high: AtomicU32,
-    low: AtomicU32,
-}
-
-impl Count {
-    const fn new() -> Self {
-        Self {
-            high: AtomicU32::new(0),
-            low: AtomicU32::new(0),
-        }
-    }
-
-    fn load(&self) -> u64 {
-        u64::from(self.high.load(Relaxed)) << 32 | u64::from(self.low.load(Relaxed))
-    }
-
-    fn store(&self, value: u64) {
-        self.high.store((value >> 32) as u32, Relaxed);
-        self.low.store(value as u32, Relaxed);
-    }
-}
-
-/// An address word and whether it is present.
-struct OptionalAddress {
-    address: AtomicU32,
-    present: AtomicBool,
-}
-
-impl OptionalAddress {
-    const fn new() -> Self {
-        Self {
-            address: AtomicU32::new(0),
-            present: AtomicBool::new(false),
-        }
-    }
-
-    fn load(&self) -> Option<u32> {
-        self.present
-            .load(Relaxed)
-            .then(|| self.address.load(Relaxed))
-    }
-
-    fn store(&self, address: Option<u32>) {
-        if let Some(address) = address {
-            self.address.store(address, Relaxed);
-        }
-        self.present.store(address.is_some(), Relaxed);
-    }
-}
-
-struct MismatchSlot {
-    instruction: Count,
-    expected: AtomicU32,
-    found: AtomicU32,
-}
-
-impl MismatchSlot {
-    const fn new() -> Self {
-        Self {
-            instruction: Count::new(),
-            expected: AtomicU32::new(0),
-            found: AtomicU32::new(0),
-        }
-    }
-
-    fn load(&self) -> Mismatch {
-        Mismatch {
-            instruction: self.instruction.load(),
-            expected: self.expected.load(Relaxed),
-            found: self.found.load(Relaxed),
-        }
-    }
-
-    fn store(&self, mismatch: Mismatch) {
-        self.instruction.store(mismatch.instruction);
-        self.expected.store(mismatch.expected, Relaxed);
-        self.found.store(mismatch.found, Relaxed);
-    }
-}
-
 /// Encoder state (stock 0x91fa2e78-0x91fa30a0). The trace handler of each
 /// single-stepped thread updates it, and the threads that start, stop, and
 /// save a session read and reset it, without synchronization as in stock,
@@ -173,115 +91,6 @@ pub struct Encoder {
     deferred_address: AtomicU32,
     mismatch_count: AtomicU32,
     mismatches: [MismatchSlot; MISMATCH_CAPACITY],
-}
-
-impl Default for Encoder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Mark `address` most recently used in its set; true when it was absent
-/// (stock 0x91f67510).
-fn cache_miss(cache: &[AtomicU32; CACHE_WORDS], address: u32) -> bool {
-    let index = ((address & 0x7ffc) >> 1) as usize;
-    let (first, second) = (cache[index].load(Relaxed), cache[index + 1].load(Relaxed));
-    let (first_address, second_address) = (first & !1, second & !1);
-    let (first, second, miss) = if first_address == address {
-        (first | 1, second_address, false)
-    } else if second_address == address {
-        (first_address, second | 1, false)
-    } else if first & 1 == 0 {
-        (address | 1, second_address, true)
-    } else {
-        (first_address, address | 1, true)
-    };
-    cache[index].store(first, Relaxed);
-    cache[index + 1].store(second, Relaxed);
-    miss
-}
-
-fn sign_extend(word: u32) -> u32 {
-    word as u16 as i16 as i32 as u32
-}
-
-/// Extended opcodes of primary opcode 4 (masked with 0x7f3) that address
-/// storage with `RA|0 + RB`.
-const VECTOR_INDEXED: [u16; 14] = [
-    0x83, 0xc3, 0x183, 0x1c3, 0x2c3, 0x3c3, 0x403, 0x443, 0x503, 0x543, 0x603, 0x643, 0x703, 0x743,
-];
-
-/// Extended opcodes of primary opcode 31 that address storage with
-/// `RA|0 + RB`.
-const INDEXED: [u16; 70] = [
-    0x7, 0x14, 0x15, 0x17, 0x27, 0x35, 0x36, 0x37, 0x47, 0x54, 0x56, 0x57, 0x67, 0x77, 0x87, 0x95,
-    0x96, 0x97, 0xa7, 0xb5, 0xb7, 0xc7, 0xd6, 0xd7, 0xe7, 0xf6, 0xf7, 0x116, 0x117, 0x132, 0x137,
-    0x152, 0x155, 0x157, 0x167, 0x172, 0x175, 0x177, 0x197, 0x1b2, 0x1b7, 0x1d2, 0x1d6, 0x1e7,
-    0x1f2, 0x207, 0x216, 0x217, 0x227, 0x236, 0x237, 0x257, 0x277, 0x287, 0x296, 0x297, 0x2a7,
-    0x2b7, 0x2d7, 0x2f7, 0x307, 0x316, 0x327, 0x376, 0x387, 0x396, 0x3a7, 0x3d6, 0x3d7, 0x3f6,
-];
-
-/// Words of one instruction record: the instruction, then its storage
-/// operands.
-struct Operands {
-    words: [u32; 3],
-    count: usize,
-}
-
-enum Class {
-    /// Written when the next traced address is known.
-    Deferred,
-    Plain(Operands),
-}
-
-fn classify(word: u32, thread: &impl Thread) -> Class {
-    let opcode = word >> 26;
-    let extended = (word >> 1) & 0x3ff;
-    let ra = (word >> 16) & 0x1f;
-    let rb = (word >> 11) & 0x1f;
-    let base = || if ra != 0 { thread.gpr(ra) } else { 0 };
-    let indexed = || thread.gpr(rb).wrapping_add(base());
-    let mut operands = Operands {
-        words: [word, 0, 0],
-        count: 1,
-    };
-    let mut set = |values: &[u32]| {
-        operands.words[1..=values.len()].copy_from_slice(values);
-        operands.count = 1 + values.len();
-    };
-    match opcode {
-        2 | 3 | 0x10..=0x12 => return Class::Deferred,
-        0x13 if matches!(
-            extended,
-            0x4 | 0x10 | 0x12 | 0x32 | 0x33 | 0x44 | 0x52 | 0x210
-        ) =>
-        {
-            return Class::Deferred;
-        }
-        4 if VECTOR_INDEXED.contains(&((word & 0x7f3) as u16)) => set(&[indexed()]),
-        0x1f => match extended {
-            0x4 | 0x24 => return Class::Deferred,
-            // String forms carry the byte count from XER.
-            0x215 | 0x235 | 0x295 | 0x2b5 => set(&[indexed(), thread.xer() & 0x7f]),
-            0x156 | 0x176 => set(&[indexed(), 0]),
-            0x255 | 0x275 | 0x2d5 | 0x2f5 => set(&[base()]),
-            _ if INDEXED.contains(&(extended as u16)) => set(&[indexed()]),
-            _ => {}
-        },
-        0x20..=0x39 | 0x3c | 0x3d => set(&[base().wrapping_add(sign_extend(word))]),
-        0x3a | 0x3e => {
-            let offset = sign_extend(word) & !3;
-            // The update form adds RA even when it names r0.
-            let address = if word & 3 == 1 || ra != 0 {
-                thread.gpr(ra).wrapping_add(offset)
-            } else {
-                offset
-            };
-            set(&[address]);
-        }
-        _ => {}
-    }
-    Class::Plain(operands)
 }
 
 impl Encoder {
@@ -402,6 +211,7 @@ impl Encoder {
             let word = unsafe { thread.instruction(skipped) };
             self.encode(skipped, word, thread, cache, sink);
         }
+
         // SAFETY: the caller passes the thread's next instruction address.
         let word = unsafe { thread.instruction(iar) };
         self.after_trap.store(None);
@@ -426,18 +236,17 @@ impl Encoder {
         let mut expected = self.expected.load();
         let call_pending = self.call_pending.load(Relaxed);
         let return_pending = self.return_pending.load(Relaxed);
+
         if call_pending || return_pending {
             if expected == Some(iar) {
                 // The call or return was not taken.
                 let depth = self.depth.load(Relaxed);
-                self.depth.store(
-                    if call_pending {
-                        depth.wrapping_sub(1)
-                    } else {
-                        depth.wrapping_add(1)
-                    },
-                    Relaxed,
-                );
+                let depth = if call_pending {
+                    depth.wrapping_sub(1)
+                } else {
+                    depth.wrapping_add(1)
+                };
+                self.depth.store(depth, Relaxed);
             } else if return_pending && self.depth.load(Relaxed) == 0 {
                 if self.deferred.load(Relaxed)
                     && cache_miss(cache, self.deferred_address.load(Relaxed))
@@ -448,6 +257,7 @@ impl Encoder {
                 self.deferred_address.store(LEFT_RECORDED_FUNCTION, Relaxed);
                 self.deferred_word.store(LEFT_RECORDED_BRANCH, Relaxed);
             }
+
             self.call_pending.store(false, Relaxed);
             self.return_pending.store(false, Relaxed);
         }
@@ -460,14 +270,17 @@ impl Encoder {
                 depth = 1;
                 expected = Some(start);
             }
+
             if depth == 0 || (depth != 1 && !self.record_nested.load(Relaxed)) {
                 record = false;
             }
+
             if depth != 0 {
                 if opcode == 0x13 && extended == 0x10 {
                     self.return_pending.store(true, Relaxed);
                     depth = depth.wrapping_sub(1);
                 }
+
                 let branch = matches!(opcode, 0x10 | 0x12)
                     || (opcode == 0x13 && matches!(extended, 0x10 | 0x210));
                 if branch && word & 1 != 0 {
@@ -475,8 +288,10 @@ impl Encoder {
                     depth = depth.wrapping_add(1);
                 }
             }
+
             self.depth.store(depth, Relaxed);
         }
+
         let expected = expected.unwrap_or(iar);
         self.expected.store(Some(iar.wrapping_add(4)));
         if !record {
@@ -497,10 +312,12 @@ impl Encoder {
             }
             self.mismatch_count.store(count.wrapping_add(1), Relaxed);
         }
+
         if !self.first_written.load(Relaxed) {
             sink.push(iar);
             self.first_written.store(true, Relaxed);
         }
+
         if deferred {
             if cache_miss(cache, self.deferred_address.load(Relaxed)) {
                 sink.push(self.deferred_word.load(Relaxed));
@@ -521,11 +338,18 @@ impl Encoder {
                 } else {
                     &operands.words[1..operands.count]
                 };
+
                 for &word in words {
                     sink.push(word);
                 }
             }
         }
+    }
+}
+
+impl Default for Encoder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -547,6 +371,221 @@ pub trait AddressSpace {
     fn allocation_size(&mut self, address: u32) -> u32;
 }
 
+/// A 64-bit count as two words, high word first.
+struct Count {
+    high: AtomicU32,
+    low: AtomicU32,
+}
+
+impl Count {
+    const fn new() -> Self {
+        Self {
+            high: AtomicU32::new(0),
+            low: AtomicU32::new(0),
+        }
+    }
+
+    fn load(&self) -> u64 {
+        u64::from(self.high.load(Relaxed)) << 32 | u64::from(self.low.load(Relaxed))
+    }
+
+    fn store(&self, value: u64) {
+        self.high.store((value >> 32) as u32, Relaxed);
+        self.low.store(value as u32, Relaxed);
+    }
+}
+
+/// An address word and whether it is present.
+struct OptionalAddress {
+    address: AtomicU32,
+    present: AtomicBool,
+}
+
+impl OptionalAddress {
+    const fn new() -> Self {
+        Self {
+            address: AtomicU32::new(0),
+            present: AtomicBool::new(false),
+        }
+    }
+
+    fn load(&self) -> Option<u32> {
+        self.present
+            .load(Relaxed)
+            .then(|| self.address.load(Relaxed))
+    }
+
+    fn store(&self, address: Option<u32>) {
+        if let Some(address) = address {
+            self.address.store(address, Relaxed);
+        }
+        self.present.store(address.is_some(), Relaxed);
+    }
+}
+
+struct MismatchSlot {
+    instruction: Count,
+    expected: AtomicU32,
+    found: AtomicU32,
+}
+
+impl MismatchSlot {
+    const fn new() -> Self {
+        Self {
+            instruction: Count::new(),
+            expected: AtomicU32::new(0),
+            found: AtomicU32::new(0),
+        }
+    }
+
+    fn load(&self) -> Mismatch {
+        Mismatch {
+            instruction: self.instruction.load(),
+            expected: self.expected.load(Relaxed),
+            found: self.found.load(Relaxed),
+        }
+    }
+
+    fn store(&self, mismatch: Mismatch) {
+        self.instruction.store(mismatch.instruction);
+        self.expected.store(mismatch.expected, Relaxed);
+        self.found.store(mismatch.found, Relaxed);
+    }
+}
+
+/// Words of one instruction record: the instruction, then its storage
+/// operands.
+struct Operands {
+    words: [u32; 3],
+    count: usize,
+}
+
+enum Class {
+    /// Written when the next traced address is known.
+    Deferred,
+    Plain(Operands),
+}
+
+/// Mark `address` most recently used in its set; true when it was absent
+/// (stock 0x91f67510).
+fn cache_miss(cache: &[AtomicU32; CACHE_WORDS], address: u32) -> bool {
+    /// New contents of the two-way set, and whether `address` was absent.
+    struct SetUpdate {
+        first: u32,
+        second: u32,
+        miss: bool,
+    }
+
+    let index = ((address & 0x7ffc) >> 1) as usize;
+    let (first, second) = (cache[index].load(Relaxed), cache[index + 1].load(Relaxed));
+    let (first_address, second_address) = (first & !1, second & !1);
+    let update = if first_address == address {
+        SetUpdate {
+            first: first | 1,
+            second: second_address,
+            miss: false,
+        }
+    } else if second_address == address {
+        SetUpdate {
+            first: first_address,
+            second: second | 1,
+            miss: false,
+        }
+    } else if first & 1 == 0 {
+        SetUpdate {
+            first: address | 1,
+            second: second_address,
+            miss: true,
+        }
+    } else {
+        SetUpdate {
+            first: first_address,
+            second: address | 1,
+            miss: true,
+        }
+    };
+
+    cache[index].store(update.first, Relaxed);
+    cache[index + 1].store(update.second, Relaxed);
+
+    update.miss
+}
+
+fn sign_extend(word: u32) -> u32 {
+    word as u16 as i16 as i32 as u32
+}
+
+fn classify(word: u32, thread: &impl Thread) -> Class {
+    /// Extended opcodes of primary opcode 4 (masked with 0x7f3) that address
+    /// storage with `RA|0 + RB`.
+    const VECTOR_INDEXED: [u16; 14] = [
+        0x83, 0xc3, 0x183, 0x1c3, 0x2c3, 0x3c3, 0x403, 0x443, 0x503, 0x543, 0x603, 0x643, 0x703,
+        0x743,
+    ];
+
+    /// Extended opcodes of primary opcode 31 that address storage with
+    /// `RA|0 + RB`.
+    const INDEXED: [u16; 70] = [
+        0x7, 0x14, 0x15, 0x17, 0x27, 0x35, 0x36, 0x37, 0x47, 0x54, 0x56, 0x57, 0x67, 0x77, 0x87,
+        0x95, 0x96, 0x97, 0xa7, 0xb5, 0xb7, 0xc7, 0xd6, 0xd7, 0xe7, 0xf6, 0xf7, 0x116, 0x117,
+        0x132, 0x137, 0x152, 0x155, 0x157, 0x167, 0x172, 0x175, 0x177, 0x197, 0x1b2, 0x1b7, 0x1d2,
+        0x1d6, 0x1e7, 0x1f2, 0x207, 0x216, 0x217, 0x227, 0x236, 0x237, 0x257, 0x277, 0x287, 0x296,
+        0x297, 0x2a7, 0x2b7, 0x2d7, 0x2f7, 0x307, 0x316, 0x327, 0x376, 0x387, 0x396, 0x3a7, 0x3d6,
+        0x3d7, 0x3f6,
+    ];
+
+    let opcode = word >> 26;
+    let extended = (word >> 1) & 0x3ff;
+    let ra = (word >> 16) & 0x1f;
+    let rb = (word >> 11) & 0x1f;
+    let base = || if ra != 0 { thread.gpr(ra) } else { 0 };
+    let indexed = || thread.gpr(rb).wrapping_add(base());
+
+    let mut operands = Operands {
+        words: [word, 0, 0],
+        count: 1,
+    };
+    let mut set = |values: &[u32]| {
+        operands.words[1..=values.len()].copy_from_slice(values);
+        operands.count = 1 + values.len();
+    };
+
+    match opcode {
+        2 | 3 | 0x10..=0x12 => return Class::Deferred,
+        0x13 if matches!(
+            extended,
+            0x4 | 0x10 | 0x12 | 0x32 | 0x33 | 0x44 | 0x52 | 0x210
+        ) =>
+        {
+            return Class::Deferred;
+        }
+        4 if VECTOR_INDEXED.contains(&((word & 0x7f3) as u16)) => set(&[indexed()]),
+        0x1f => match extended {
+            0x4 | 0x24 => return Class::Deferred,
+            // String forms carry the byte count from XER.
+            0x215 | 0x235 | 0x295 | 0x2b5 => set(&[indexed(), thread.xer() & 0x7f]),
+            0x156 | 0x176 => set(&[indexed(), 0]),
+            0x255 | 0x275 | 0x2d5 | 0x2f5 => set(&[base()]),
+            _ if INDEXED.contains(&(extended as u16)) => set(&[indexed()]),
+            _ => {}
+        },
+        0x20..=0x39 | 0x3c | 0x3d => set(&[base().wrapping_add(sign_extend(word))]),
+        0x3a | 0x3e => {
+            let offset = sign_extend(word) & !3;
+            // The update form adds RA even when it names r0.
+            let address = if word & 3 == 1 || ra != 0 {
+                thread.gpr(ra).wrapping_add(offset)
+            } else {
+                offset
+            };
+            set(&[address]);
+        }
+        _ => {}
+    }
+
+    Class::Plain(operands)
+}
+
 /// Entries of the memory map record (stock 0x91f671e8): `{first page,
 /// page count, protection}` for committed user regions below 0x80000000,
 /// then runs of system allocations from 0xa0000000. System allocations
@@ -558,6 +597,7 @@ pub fn write_memory_map(space: &mut impl AddressSpace, sink: &mut impl Sink) {
         sink.push(count);
         sink.push(protect);
     };
+
     let mut page = 0u32;
     while page < 0x8_0000 {
         let mut step = 0x10;
@@ -572,7 +612,10 @@ pub fn write_memory_map(space: &mut impl AddressSpace, sink: &mut impl Sink) {
         page = page.wrapping_add(step);
     }
 
-    let (mut run_start, mut run_end, mut run_protect) = (0u32, 0u32, 0u32);
+    let mut run_start = 0u32;
+    let mut run_end = 0u32;
+    let mut run_protect = 0u32;
+
     let mut page = 0xa_0000u32;
     while page < 0x10_0000 {
         let address = page << 12;
@@ -587,7 +630,8 @@ pub fn write_memory_map(space: &mut impl AddressSpace, sink: &mut impl Sink) {
             if system { 1 } else { 0x10 }
         } else {
             let granule = if system { 1 } else { 0x10 };
-            let (mut done, mut cursor) = (0, page);
+            let mut done = 0;
+            let mut cursor = page;
             while done < pages {
                 let protect = space.protect(address);
                 if run_start != run_end && !(run_end == cursor && run_protect == protect) {
@@ -595,19 +639,24 @@ pub fn write_memory_map(space: &mut impl AddressSpace, sink: &mut impl Sink) {
                     run_start = 0;
                     run_end = 0;
                 }
+
                 if run_start == run_end {
                     run_protect = protect;
                     run_start = cursor;
                     run_end = cursor;
                 }
+
                 done += granule;
                 run_end = run_end.wrapping_add(granule);
                 cursor = cursor.wrapping_add(granule);
             }
+
             pages
         };
+
         page = page.wrapping_add(step);
     }
+
     if run_end != run_start {
         emit(run_start, run_end.wrapping_sub(run_start), run_protect);
     }

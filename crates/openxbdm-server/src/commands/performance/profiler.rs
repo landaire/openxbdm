@@ -8,58 +8,14 @@
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::Ordering;
 
-use openxbdm_core::status::ErrorCode;
-use openxbdm_core::status::Hresult;
-use openxbdm_core::status::XbdmHresult;
-
 use super::CpuProfilerInfo;
-use crate::reply::CommandError;
 
-/// A failed profiler operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProfilerError {
-    AlreadyRunning,
-    NotRunning,
-    /// `info` after a title ended while profiling.
-    Suspended,
-    /// The engine could not start its file writer thread (stock 0x91f90258).
-    PrologueFailed,
-    /// The kernel module cannot be found.
-    NoKernel,
-    /// The kernel lacks a profile interrupt export.
-    NoProfileExport,
-    /// The kernel refused to enable the profile interrupt.
-    ProfileInterruptRefused,
-    /// The sample buffers cannot be allocated.
-    NoBuffers,
-    /// The performance counters cannot be acquired or started.
-    NoCounters,
-    /// Another owner holds the performance counters.
-    NotCounterOwner,
-}
+pub use super::error::ProfilerError;
 
-impl From<ProfilerError> for Hresult {
-    fn from(error: ProfilerError) -> Self {
-        match error {
-            ProfilerError::AlreadyRunning => Hresult::ALREADY_STARTED,
-            ProfilerError::NotRunning => Hresult::NOT_STARTED,
-            ProfilerError::Suspended => Hresult::TITLE_TERMINATED,
-            ProfilerError::PrologueFailed => ErrorCode::Undefined.hresult(),
-            ProfilerError::NoKernel => ErrorCode::NoSuchModule.hresult(),
-            ProfilerError::NoProfileExport => ErrorCode::UnknownCommand.hresult(),
-            ProfilerError::ProfileInterruptRefused => ErrorCode::BadParameter.hresult(),
-            ProfilerError::NoBuffers => ErrorCode::OutOfMemory.hresult(),
-            ProfilerError::NoCounters => Hresult::NOT_ACQUIRED,
-            ProfilerError::NotCounterOwner => Hresult::NOT_OWNER,
-        }
-    }
-}
-
-impl From<ProfilerError> for CommandError {
-    fn from(error: ProfilerError) -> Self {
-        CommandError::Profiler(error)
-    }
-}
+/// Bytes of one sample block.
+pub const BLOCK_SIZE: u32 = 0x1_0000;
+/// Blocks a processor holds at most.
+pub const MAX_BLOCKS: u32 = 18;
 
 /// `lopctrl` flags word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,11 +50,6 @@ pub enum BufferMemory {
     System,
 }
 
-/// Bytes of one sample block.
-pub const BLOCK_SIZE: u32 = 0x1_0000;
-/// Blocks a processor holds at most.
-pub const MAX_BLOCKS: u32 = 18;
-
 /// Sample buffer layout: `blocks` blocks per sampled processor and as many
 /// for the writer's staging area.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,30 +69,6 @@ impl BufferLayout {
 /// count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NoProcessors;
-
-/// Size the sample buffers (stock 0x91f8f058).
-pub fn buffer_layout(flags: ProfilerFlags) -> Result<BufferLayout, NoProcessors> {
-    let processors = flags.processors().count_ones();
-    let default = match processors {
-        1 => 8,
-        2 => 6,
-        3 | 4 => 5,
-        5 | 6 => 4,
-        _ => return Err(NoProcessors),
-    };
-    Ok(match flags.buffer_megabytes() {
-        None => BufferLayout {
-            blocks: default,
-            processors,
-            memory: BufferMemory::System,
-        },
-        Some(megabytes) => BufferLayout {
-            blocks: ((megabytes << 20) / ((processors + 1) * BLOCK_SIZE)).min(MAX_BLOCKS),
-            processors,
-            memory: BufferMemory::Title,
-        },
-    })
-}
 
 /// The sampling engine; every method is a stock routine.
 pub trait Engine {
@@ -203,6 +130,7 @@ impl Control {
         if self.running.swap(true, Ordering::AcqRel) {
             return Err(ProfilerError::AlreadyRunning);
         }
+
         if !self.initialized.swap(true, Ordering::AcqRel)
             && let Err(error) = engine.initialize(flags)
         {
@@ -211,14 +139,18 @@ impl Control {
             self.running.store(false, Ordering::Release);
             return Err(error);
         }
+
         if let Some(path) = path {
             engine.create_directories(path);
         }
+
         if let Err(error) = engine.start(path, interval) {
             self.running.store(false, Ordering::Release);
             return Err(error);
         }
+
         self.suspended.store(false, Ordering::Release);
+
         Ok(())
     }
 
@@ -227,9 +159,11 @@ impl Control {
         if !self.running() {
             return Err(ProfilerError::NotRunning);
         }
+
         let result = engine.stop();
         self.running.store(false, Ordering::Release);
         self.initialized.store(false, Ordering::Release);
+
         result
     }
 
@@ -238,9 +172,11 @@ impl Control {
         if self.suspended.load(Ordering::Acquire) {
             return Err(ProfilerError::Suspended);
         }
+
         if !self.running() {
             return Err(ProfilerError::NotRunning);
         }
+
         Ok(engine.info())
     }
 
@@ -250,6 +186,31 @@ impl Control {
         let _ = self.stop(engine);
         self.suspended.store(true, Ordering::Release);
     }
+}
+
+/// Size the sample buffers (stock 0x91f8f058).
+pub fn buffer_layout(flags: ProfilerFlags) -> Result<BufferLayout, NoProcessors> {
+    let processors = flags.processors().count_ones();
+    let default = match processors {
+        1 => 8,
+        2 => 6,
+        3 | 4 => 5,
+        5 | 6 => 4,
+        _ => return Err(NoProcessors),
+    };
+
+    Ok(match flags.buffer_megabytes() {
+        None => BufferLayout {
+            blocks: default,
+            processors,
+            memory: BufferMemory::System,
+        },
+        Some(megabytes) => BufferLayout {
+            blocks: ((megabytes << 20) / ((processors + 1) * BLOCK_SIZE)).min(MAX_BLOCKS),
+            processors,
+            memory: BufferMemory::Title,
+        },
+    })
 }
 
 #[cfg(test)]

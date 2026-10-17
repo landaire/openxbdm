@@ -1,6 +1,6 @@
 # Session domain parity
 
-Stock XBDM 2.0.21256.0. Server: `crates/openxbdm-server/src/commands/session.rs` and `session/{rpc,telllog,fastpipe,fileevent}.rs`; notification tables in `crates/openxbdm-server/src/notify.rs`. Host mock: `crates/openxbdm-server-host/src/backend/session.rs`. Xbox: `crates/openxbdm-server-xbox360/src/backend/session.rs`. Tests: `crates/openxbdm-server-host/tests/session.rs`.
+Stock XBDM 2.0.21256.0. Server: `crates/openxbdm-server/src/commands/session.rs` and `session/{capture,discovery,error,fastpipe,fileevent,notification,rpc,telllog}.rs`; notification tables in `crates/openxbdm-server/src/notify.rs` and `notify/`. Host mock: `crates/openxbdm-server-host/src/backend/session.rs`. Xbox: `crates/openxbdm-server-xbox360/src/backend/session.rs`. Tests: `crates/openxbdm-server-host/tests/session.rs`.
 
 ## Commands
 

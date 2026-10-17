@@ -1,5 +1,7 @@
 //! SMB transport connections over the platform's sockets.
 
+mod error;
+
 use core::time::Duration;
 
 use smb2_server::Connection;
@@ -12,13 +14,16 @@ use smb2_server::transport;
 use smb2_server::transport::Frame;
 use smb2_server::transport::HEADER_LENGTH;
 
+use self::error::Closed;
 use super::adapter::Adapter;
 use super::adapter::ConnectionFiles;
 use super::limits;
 use super::limits::Activity;
+use super::limits::EvictionCandidate;
 use super::limits::Usage;
 use super::shares::Presence;
 use super::shares::ShareBindings;
+use crate::backend::Backend;
 use crate::commands::filesystem::ScratchBlock;
 use crate::network::NetError;
 use crate::network::Network;
@@ -28,67 +33,6 @@ use crate::state::ServerState;
 /// Bytes of each request and response buffer, transport header included:
 /// a 64 KiB read or write and the headers around it.
 pub const BUFFER_SIZE: usize = 0x1_0000 + 0x400;
-/// How often a directory watched by a change notification is compared
-/// with its last listing, to report changes made by titles and XBDM.
-const CHANGE_SCAN_INTERVAL: Duration = Duration::from_secs(2);
-
-/// Progress of the message being received.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Receive {
-    /// Bytes of the transport header received.
-    Header(usize),
-    /// Bytes received of a message of `length` bytes.
-    Message { length: usize, received: usize },
-}
-
-/// A reply in the response buffer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Sending {
-    length: usize,
-    sent: usize,
-}
-
-/// Pool blocks of a connection: the request, transport header first, and
-/// the response.
-struct Buffers {
-    input: ScratchBlock,
-    output: ScratchBlock,
-}
-
-/// The connection has ended.
-struct Closed;
-
-struct Slot {
-    socket: Option<SocketId>,
-    activity: Activity,
-    connection: Connection,
-    files: ConnectionFiles,
-    buffers: Option<Buffers>,
-    receive: Receive,
-    sending: Option<Sending>,
-}
-
-impl Slot {
-    fn usage(&self) -> Usage {
-        Usage {
-            session: self.connection.has_sessions(),
-            opens: self.connection.has_opens(),
-            in_transfer: self.receive != Receive::Header(0) || self.sending.is_some(),
-        }
-    }
-
-    const fn new() -> Self {
-        Self {
-            socket: None,
-            activity: Activity::new(FileTime(0)),
-            connection: Connection::new(),
-            files: ConnectionFiles::new(),
-            buffers: None,
-            receive: Receive::Header(0),
-            sending: None,
-        }
-    }
-}
 
 /// Up to `N` SMB connections. The platform reports readiness of their
 /// sockets: readable while [`SmbService::wants_write`] is false, writable
@@ -104,12 +48,6 @@ impl Slot {
 pub struct SmbService<const N: usize> {
     shared: Shared,
     slots: [Slot; N],
-}
-
-/// State the service's connections share.
-struct Shared {
-    server: Server,
-    shares: ShareBindings,
 }
 
 impl<const N: usize> SmbService<N> {
@@ -132,9 +70,14 @@ impl<const N: usize> SmbService<N> {
 
     /// Choose the server GUID and record the start time. Connections are
     /// accepted only after this.
-    pub fn start(&mut self, backend: &mut dyn crate::backend::Backend) {
+    pub fn start(&mut self, backend: &mut dyn Backend) {
+        // How often a directory watched by a change notification is compared
+        // with its last listing, to report changes made by titles and XBDM.
+        const CHANGE_SCAN_INTERVAL: Duration = Duration::from_secs(2);
+
         let mut guid = [0u8; 16];
         backend.random_bytes(&mut guid);
+
         self.shared.server.configure(ServerConfig {
             guid: Guid(guid),
             start_time: FileTime(backend.system_time()),
@@ -175,7 +118,7 @@ impl<const N: usize> SmbService<N> {
         &mut self,
         socket: SocketId,
         state: &ServerState,
-        backend: &mut dyn crate::backend::Backend,
+        backend: &mut dyn Backend,
         network: &mut dyn Network,
     ) {
         let index = match self.shared.server.config() {
@@ -186,10 +129,12 @@ impl<const N: usize> SmbService<N> {
             network.close(socket);
             return;
         };
+
         if network.set_blocking(socket, false).is_err() {
             network.close(socket);
             return;
         }
+
         let Some(input) = backend.allocate_scratch(BUFFER_SIZE as u32) else {
             network.close(socket);
             return;
@@ -199,6 +144,7 @@ impl<const N: usize> SmbService<N> {
             network.close(socket);
             return;
         };
+
         // Closing the slot's previous connection reset its state.
         let slot = &mut self.slots[index];
         slot.socket = Some(socket);
@@ -211,20 +157,26 @@ impl<const N: usize> SmbService<N> {
     fn free_slot(
         &mut self,
         state: &ServerState,
-        backend: &mut dyn crate::backend::Backend,
+        backend: &mut dyn Backend,
         network: &mut dyn Network,
     ) -> Option<usize> {
         if let Some(index) = self.slots.iter().position(|slot| slot.socket.is_none()) {
             return Some(index);
         }
+
         let now = FileTime(backend.system_time());
         let index = limits::eviction(
             self.slots
                 .iter()
                 .enumerate()
-                .map(|(index, slot)| (index, slot.activity, slot.connection.has_sessions())),
+                .map(|(index, slot)| EvictionCandidate {
+                    index,
+                    activity: slot.activity,
+                    session: slot.connection.has_sessions(),
+                }),
             now,
         )?;
+
         close_slot(
             &mut self.slots[index],
             &mut self.shared,
@@ -233,6 +185,7 @@ impl<const N: usize> SmbService<N> {
             network,
         );
         self.retain_shares();
+
         Some(index)
     }
 
@@ -243,23 +196,27 @@ impl<const N: usize> SmbService<N> {
     pub fn poll_timers(
         &mut self,
         state: &ServerState,
-        backend: &mut dyn crate::backend::Backend,
+        backend: &mut dyn Backend,
         network: &mut dyn Network,
     ) {
         if self.slots.iter().all(|slot| slot.socket.is_none()) {
             return;
         }
+
         let now = FileTime(backend.system_time());
+
         for slot in &mut self.slots {
             if slot.socket.is_some() && slot.activity.expiry(slot.usage(), now).is_some() {
                 close_slot(slot, &mut self.shared, state, backend, network);
             }
         }
+
         for slot in &mut self.slots {
             if complete(slot, &mut self.shared, state, backend, network, now).is_err() {
                 close_slot(slot, &mut self.shared, state, backend, network);
             }
         }
+
         self.retain_shares();
     }
 
@@ -269,24 +226,26 @@ impl<const N: usize> SmbService<N> {
         &mut self,
         socket: SocketId,
         state: &ServerState,
-        backend: &mut dyn crate::backend::Backend,
+        backend: &mut dyn Backend,
         network: &mut dyn Network,
     ) {
         let Some(index) = self.position(socket) else {
             return;
         };
+
         let slot = &mut self.slots[index];
         let now = FileTime(backend.system_time());
         if receive(slot, socket, &mut self.shared, state, backend, network, now).is_err() {
             close_slot(slot, &mut self.shared, state, backend, network);
         }
+
         self.end_superseded(state, backend);
         self.retain_shares();
     }
 
     /// End the sessions that logons replaced (MS-SMB2 PreviousSessionId),
     /// on whichever connection holds them.
-    fn end_superseded(&mut self, state: &ServerState, backend: &mut dyn crate::backend::Backend) {
+    fn end_superseded(&mut self, state: &ServerState, backend: &mut dyn Backend) {
         while let Some(superseded) = self.shared.server.take_superseded() {
             for slot in &mut self.slots {
                 let mut adapter = Adapter {
@@ -308,12 +267,13 @@ impl<const N: usize> SmbService<N> {
         &mut self,
         socket: SocketId,
         state: &ServerState,
-        backend: &mut dyn crate::backend::Backend,
+        backend: &mut dyn Backend,
         network: &mut dyn Network,
     ) {
         let Some(index) = self.position(socket) else {
             return;
         };
+
         let slot = &mut self.slots[index];
         let now = FileTime(backend.system_time());
         if send(slot, socket, network, now).is_err() {
@@ -326,7 +286,7 @@ impl<const N: usize> SmbService<N> {
         &mut self,
         socket: SocketId,
         state: &ServerState,
-        backend: &mut dyn crate::backend::Backend,
+        backend: &mut dyn Backend,
         network: &mut dyn Network,
     ) {
         if let Some(index) = self.position(socket) {
@@ -338,6 +298,7 @@ impl<const N: usize> SmbService<N> {
                 network,
             );
         }
+
         self.retain_shares();
     }
 
@@ -345,13 +306,76 @@ impl<const N: usize> SmbService<N> {
     pub fn close_all(
         &mut self,
         state: &ServerState,
-        backend: &mut dyn crate::backend::Backend,
+        backend: &mut dyn Backend,
         network: &mut dyn Network,
     ) {
         for slot in &mut self.slots {
             close_slot(slot, &mut self.shared, state, backend, network);
         }
+
         self.retain_shares();
+    }
+}
+
+/// State the service's connections share.
+struct Shared {
+    server: Server,
+    shares: ShareBindings,
+}
+
+/// Progress of the message being received.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Receive {
+    /// Bytes of the transport header received.
+    Header(usize),
+    /// Bytes received of a message of `length` bytes.
+    Message { length: usize, received: usize },
+}
+
+/// A reply in the response buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Sending {
+    length: usize,
+    sent: usize,
+}
+
+/// Pool blocks of a connection: the request, transport header first, and
+/// the response.
+struct Buffers {
+    input: ScratchBlock,
+    output: ScratchBlock,
+}
+
+struct Slot {
+    socket: Option<SocketId>,
+    activity: Activity,
+    connection: Connection,
+    files: ConnectionFiles,
+
+    buffers: Option<Buffers>,
+    receive: Receive,
+    sending: Option<Sending>,
+}
+
+impl Slot {
+    const fn new() -> Self {
+        Self {
+            socket: None,
+            activity: Activity::new(FileTime(0)),
+            connection: Connection::new(),
+            files: ConnectionFiles::new(),
+            buffers: None,
+            receive: Receive::Header(0),
+            sending: None,
+        }
+    }
+
+    fn usage(&self) -> Usage {
+        Usage {
+            session: self.connection.has_sessions(),
+            opens: self.connection.has_opens(),
+            in_transfer: self.receive != Receive::Header(0) || self.sending.is_some(),
+        }
     }
 }
 
@@ -363,16 +387,18 @@ fn receive(
     socket: SocketId,
     shared: &mut Shared,
     state: &ServerState,
-    backend: &mut dyn crate::backend::Backend,
+    backend: &mut dyn Backend,
     network: &mut dyn Network,
     now: FileTime,
 ) -> Result<(), Closed> {
     let Some(buffers) = slot.buffers.as_mut() else {
         return Ok(());
     };
+
     if slot.sending.is_some() {
         return Ok(());
     }
+
     loop {
         let target = match slot.receive {
             Receive::Header(received) => &mut buffers.input[received..HEADER_LENGTH],
@@ -391,6 +417,7 @@ fn receive(
             }
         };
         slot.activity.progress = now;
+
         slot.receive = match slot.receive {
             Receive::Header(received) if received + count < HEADER_LENGTH => {
                 Receive::Header(received + count)
@@ -415,27 +442,32 @@ fn receive(
                 received: received + count,
             },
         };
-        if let Receive::Message { length, received } = slot.receive
-            && received == length
-        {
-            slot.receive = Receive::Header(0);
-            slot.activity.request = now;
-            let mut adapter = Adapter {
-                state,
-                backend,
-                files: &mut slot.files,
-                shares: &mut shared.shares,
-                presence: Presence::default(),
-            };
-            let request = &mut buffers.input[HEADER_LENGTH..HEADER_LENGTH + length];
-            let reply = slot.connection.handle(
-                &mut shared.server,
-                &mut adapter,
-                request,
-                &mut buffers.output,
-            );
-            return start_sending(slot, socket, reply, network, now);
+
+        let Receive::Message { length, received } = slot.receive else {
+            continue;
+        };
+        if received != length {
+            continue;
         }
+
+        slot.receive = Receive::Header(0);
+        slot.activity.request = now;
+        let mut adapter = Adapter {
+            state,
+            backend,
+            files: &mut slot.files,
+            shares: &mut shared.shares,
+            presence: Presence::default(),
+        };
+        let request = &mut buffers.input[HEADER_LENGTH..HEADER_LENGTH + length];
+        let reply = slot.connection.handle(
+            &mut shared.server,
+            &mut adapter,
+            request,
+            &mut buffers.output,
+        );
+
+        return start_sending(slot, socket, reply, network, now);
     }
 }
 
@@ -445,7 +477,7 @@ fn complete(
     slot: &mut Slot,
     shared: &mut Shared,
     state: &ServerState,
-    backend: &mut dyn crate::backend::Backend,
+    backend: &mut dyn Backend,
     network: &mut dyn Network,
     now: FileTime,
 ) -> Result<(), Closed> {
@@ -455,9 +487,11 @@ fn complete(
     let Some(buffers) = slot.buffers.as_mut() else {
         return Ok(());
     };
+
     if slot.sending.is_some() {
         return Ok(());
     }
+
     let mut adapter = Adapter {
         state,
         backend,
@@ -468,6 +502,7 @@ fn complete(
     let reply = slot
         .connection
         .poll(&mut shared.server, &mut adapter, &mut buffers.output);
+
     start_sending(slot, socket, reply, network, now)
 }
 
@@ -483,6 +518,7 @@ fn start_sending(
         .buffers
         .as_ref()
         .map_or(0, |buffers| buffers.output.len());
+
     match reply {
         Reply::Send { length } if length <= capacity => {
             slot.sending = Some(Sending { length, sent: 0 });
@@ -503,6 +539,7 @@ fn send(
     let (Some(buffers), Some(sending)) = (slot.buffers.as_ref(), slot.sending.as_mut()) else {
         return Ok(());
     };
+
     while sending.sent < sending.length {
         match network.send(socket, &buffers.output[sending.sent..sending.length]) {
             Ok(0) => return Err(Closed),
@@ -514,7 +551,9 @@ fn send(
             Err(NetError::Closed | NetError::Exhausted) => return Err(Closed),
         }
     }
+
     slot.sending = None;
+
     Ok(())
 }
 
@@ -522,12 +561,15 @@ fn close_slot(
     slot: &mut Slot,
     shared: &mut Shared,
     state: &ServerState,
-    backend: &mut dyn crate::backend::Backend,
+    backend: &mut dyn Backend,
     network: &mut dyn Network,
 ) {
     let Some(socket) = slot.socket.take() else {
         return;
     };
+
+    // Closing returns the connection and its files to their initial state
+    // for the slot's next connection.
     let mut adapter = Adapter {
         state,
         backend: &mut *backend,
@@ -535,14 +577,14 @@ fn close_slot(
         shares: &mut shared.shares,
         presence: Presence::default(),
     };
-    // Closing returns the connection and its files to their initial state
-    // for the slot's next connection.
     slot.connection.close(&mut shared.server, &mut adapter);
     slot.files.reset(backend);
+
     if let Some(Buffers { input, output }) = slot.buffers.take() {
         backend.free_scratch(input);
         backend.free_scratch(output);
     }
+
     slot.receive = Receive::Header(0);
     slot.sending = None;
     network.close(socket);

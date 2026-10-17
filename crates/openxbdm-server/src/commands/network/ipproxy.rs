@@ -1,11 +1,13 @@
 //! `ipproxy`: tunnel the console's IP traffic to a host over UDP.
 
+mod error;
 pub mod tunnel;
 
 use core::num::NonZeroU32;
 
 use openxbdm_core::status::ErrorCode;
 
+use self::error::TunnelError;
 use super::NetworkError;
 use super::SystemVersion;
 use super::WsaError;
@@ -14,6 +16,10 @@ use crate::network::Endpoint;
 use crate::network::Ipv4Address;
 use crate::reply::CommandResult;
 use crate::reply::Reply;
+
+pub use self::error::RoutineMissing;
+pub use self::error::SocketFailed;
+pub use self::error::ThreadFailed;
 
 /// First system version with the packet intercept exports.
 const IPPROXY_VERSION: SystemVersion = SystemVersion(0x201c_7d00);
@@ -30,10 +36,6 @@ impl State {
         Self {}
     }
 }
-
-/// The register or inject export of the network stack is missing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RoutineMissing;
 
 /// Nonzero result of the register routine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,15 +55,6 @@ impl RegisterStatus {
         self.0.get() as i32
     }
 }
-
-/// The proxy socket could not be opened. The thread's last Winsock error
-/// may be unset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SocketFailed(pub Option<WsaError>);
-
-/// The receive thread could not be created.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ThreadFailed;
 
 /// Platform services `ipproxy` needs.
 pub trait Backend {
@@ -106,6 +99,7 @@ pub(super) fn ipproxy(invocation: &mut Invocation<'_>) -> CommandResult {
 
 fn start(invocation: &mut Invocation<'_>) -> CommandResult {
     let line = invocation.line;
+
     // Absent and unparsable values read as 0, which is rejected.
     let value = |name| line.dword(name).filter(|&value| value != 0);
     let (Some(_version), Some(address), Some(port)) = (value("ver"), value("addr"), value("port"))
@@ -115,16 +109,20 @@ fn start(invocation: &mut Invocation<'_>) -> CommandResult {
     let Ok(port) = u16::try_from(port) else {
         return Err(ErrorCode::BadParameter.into());
     };
+
     let backend = &mut *invocation.backend;
     if backend.proxy_started() {
         return Err(ErrorCode::FileAlreadyExists.into());
     }
+
     if backend.system_version() < IPPROXY_VERSION {
         return Err(ErrorCode::UnknownCommand.into());
     }
+
     if backend.resolve_proxy_routines().is_err() {
         return Err(ErrorCode::AccessDenied.into());
     }
+
     let host = Endpoint {
         address: Ipv4Address(address.to_be_bytes()),
         port,
@@ -145,16 +143,11 @@ fn start(invocation: &mut Invocation<'_>) -> CommandResult {
             return Ok(Reply::Ok);
         }
     };
+
     backend.release_proxy_routines();
     invocation.set_text(format_args!("err={error}"));
-    Err(ErrorCode::Undefined.into())
-}
 
-/// The step of [`open_tunnel`] that failed.
-enum TunnelError {
-    Socket(SocketFailed),
-    Register(RegisterStatus),
-    Thread,
+    Err(ErrorCode::Undefined.into())
 }
 
 /// Open the socket, install the hook, and start the receive thread,
@@ -163,12 +156,14 @@ fn open_tunnel(backend: &mut (impl Backend + ?Sized), host: Endpoint) -> Result<
     backend
         .open_proxy_socket(host)
         .map_err(TunnelError::Socket)?;
+
     backend.set_proxy_bypass(true);
     if let Err(status) = backend.install_proxy_hook() {
         backend.set_proxy_bypass(false);
         backend.close_proxy_socket();
         return Err(TunnelError::Register(status));
     }
+
     if backend.start_proxy_thread().is_err() {
         backend.set_proxy_bypass(false);
         // Stock ignores the result of unregistering here.
@@ -176,6 +171,7 @@ fn open_tunnel(backend: &mut (impl Backend + ?Sized), host: Endpoint) -> Result<
         backend.close_proxy_socket();
         return Err(TunnelError::Thread);
     }
+
     Ok(())
 }
 
@@ -184,13 +180,16 @@ fn stop(invocation: &mut Invocation<'_>) -> CommandResult {
     if !backend.proxy_started() {
         return Err(NetworkError::ProxyNotStarted.into());
     }
+
     if let Err(status) = backend.remove_proxy_hook() {
         invocation.set_text(format_args!("err={}", status.code()));
         return Err(ErrorCode::Undefined.into());
     }
+
     backend.stop_proxy_thread();
     backend.release_proxy_routines();
     backend.set_proxy_bypass(false);
     invocation.set_text(format_args!("stopped"));
+
     Ok(Reply::Ok)
 }

@@ -17,21 +17,6 @@ pub const SPARE_SIZE: usize = 0xa50;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransferBlock(Held);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Held {
-    Spare,
-    Pool(PoolBuffer),
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Holder {
-    socket: SocketId,
-    block: TransferBlock,
-    /// The transfer ended without its last call; the pool block is freed at
-    /// the next event pass.
-    abandoned: bool,
-}
-
 #[derive(Debug)]
 pub struct TransferBlocks {
     spare: [u8; SPARE_SIZE],
@@ -56,6 +41,7 @@ impl TransferBlocks {
         size: u32,
     ) -> Option<TransferBlock> {
         self.release_abandoned(backend);
+
         let free = self.holders.iter().position(Option::is_none)?;
         let spare_held = self
             .holders
@@ -67,11 +53,13 @@ impl TransferBlocks {
         } else {
             TransferBlock(Held::Pool(backend.allocate_pool(size)?))
         };
+
         self.holders[free] = Some(Holder {
             socket,
             block,
             abandoned: false,
         });
+
         Some(block)
     }
 
@@ -84,6 +72,7 @@ impl TransferBlocks {
     ) -> Option<TransferBlock> {
         let block = self.acquire(backend, socket, data.len() as u32)?;
         self.bytes(backend, block)[..data.len()].copy_from_slice(data);
+
         Some(block)
     }
 
@@ -114,6 +103,7 @@ impl TransferBlocks {
         {
             *slot = None;
         }
+
         if let Held::Pool(buffer) = block.0 {
             // SAFETY: the caller's contract; the holder is gone.
             unsafe { backend.free_pool(buffer) };
@@ -155,4 +145,19 @@ impl TransferBlocks {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    Spare,
+    Pool(PoolBuffer),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Holder {
+    socket: SocketId,
+    block: TransferBlock,
+    /// The transfer ended without its last call; the pool block is freed at
+    /// the next event pass.
+    abandoned: bool,
 }

@@ -3,17 +3,17 @@
 //! Users live in the platform's user directory (the monitor keeps them as
 //! kernel objects in an unnamed object directory); this module applies the
 //! monitor's rules on top of it.
-// The key exchange releases its transfer block through the unsafe
-// `TransferBlocks::release`.
-#![allow(unsafe_code)]
+
+mod error;
+mod key_exchange;
 
 use openxbdm_core::auth;
-use openxbdm_core::auth::DH_LENGTH;
-use openxbdm_core::auth::DhValue;
 use openxbdm_core::auth::SessionKey;
 use openxbdm_core::line::CommandLine;
 use openxbdm_core::status::ErrorCode;
 
+use self::key_exchange::key_exchange;
+use self::key_exchange::resume_key_exchange;
 use crate::access::Access;
 use crate::backend::Backend as AnyBackend;
 use crate::commands::system;
@@ -28,28 +28,14 @@ use crate::reply::Reply;
 use crate::state::LockMode;
 use crate::state::ServerState;
 use crate::text::Text;
-use crate::transfer_blocks::TransferBlock;
+
+pub use self::error::UserCreationFailed;
+pub use self::key_exchange::KeyExchange;
 
 /// Bytes of a stored user name, including the terminator.
 pub const USER_NAME_CAPACITY: usize = 0x40;
 /// Name buffers of `getuserpriv` and `setuserpriv`.
 const LOOKUP_NAME_CAPACITY: usize = 0x80;
-/// Name buffer of `authuser`.
-const AUTH_NAME_CAPACITY: usize = 0x100;
-
-const fn entry(
-    name: &'static str,
-    any_of: Access,
-    handler: crate::registry::Handler,
-) -> CommandEntry {
-    CommandEntry::new(
-        name,
-        any_of,
-        Access::empty(),
-        DispatchFlags::empty(),
-        handler,
-    )
-}
 
 pub(crate) const COMMANDS: &[CommandEntry] = &[
     entry("adminpw", Access::MANAGE, admin_password),
@@ -99,8 +85,10 @@ impl UserName {
         if name.len() > USER_NAME_CAPACITY {
             return None;
         }
+
         let mut bytes = [0; USER_NAME_CAPACITY];
         bytes[..name.len()].copy_from_slice(name);
+
         Some(Self {
             bytes,
             length: name.len() as u8,
@@ -117,10 +105,6 @@ impl core::fmt::Debug for UserName {
         write!(formatter, "{:?}", self.as_bytes().escape_ascii())
     }
 }
-
-/// The user directory could not create the user.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UserCreationFailed;
 
 /// Global state of this domain.
 #[derive(Debug)]
@@ -146,19 +130,13 @@ pub enum Continuation {
     KeyExchange(KeyExchange),
 }
 
-/// `keyxchg` transfer: the client value is received, then the server value
-/// is sent in the same block (stock allocates it from pool memory).
-#[derive(Debug)]
-pub struct KeyExchange {
-    value: TransferBlock,
-    phase: KeyExchangePhase,
-}
-
+/// How `authuser` uses its value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KeyExchangePhase {
-    Receiving,
-    Sending,
-    Sent,
+enum AuthMode {
+    /// The value is the response to the banner challenge.
+    Response,
+    /// The value is a new password (decrypted with the session key).
+    SetPassword,
 }
 
 /// The user directory. Names follow the console object manager: lookups
@@ -174,6 +152,20 @@ pub trait Backend {
     fn remove_user(&mut self, name: &[u8]) -> bool;
     /// Name of the directory entry at `index`, or `None` past the end.
     fn user_name_at(&mut self, index: u32) -> Option<UserName>;
+}
+
+const fn entry(
+    name: &'static str,
+    any_of: Access,
+    handler: crate::registry::Handler,
+) -> CommandEntry {
+    CommandEntry::new(
+        name,
+        any_of,
+        Access::empty(),
+        DispatchFlags::empty(),
+        handler,
+    )
 }
 
 pub(crate) fn resume(
@@ -200,6 +192,7 @@ pub(crate) fn settings_lines(
         } else {
             ""
         };
+
         system::write_line(
             backend,
             file,
@@ -209,6 +202,7 @@ pub(crate) fn settings_lines(
             ),
         );
     }
+
     if let Some(Password(password)) = state.security.admin_password {
         system::write_line(
             backend,
@@ -220,15 +214,19 @@ pub(crate) fn settings_lines(
             ),
         );
     }
+
     if !lock.is_locked() {
         return;
     }
+
     let mut index = 0;
+
     while let Some(name) = backend.user_name_at(index) {
         index += 1;
         let Some(user) = backend.find_user(name.as_bytes()) else {
             continue;
         };
+
         // Stock formats the line into one buffer (0x91f40ab0), so the
         // settings trace echoes it once.
         let mut line = crate::text::Text::<0x200>::new();
@@ -240,6 +238,7 @@ pub(crate) fn settings_lines(
             let _ = line.push_hex32((password >> 32) as u32);
             let _ = line.push_hex32(password as u32);
         }
+
         let _ = line.push_bytes(privilege_words(user.privileges).as_bytes());
         system::write_bytes(backend, file, line.as_bytes());
         system::end_line(backend, file);
@@ -258,12 +257,14 @@ fn parse_privileges(line: &CommandLine<'_>) -> Access {
 /// ` read`, ` write`, ... for each privilege held.
 fn privilege_words(privileges: Access) -> Text<48> {
     let mut words = Text::new();
+
     for &(bit, word) in &PRIVILEGE_WORDS {
         if privileges.intersects(bit) {
             let _ = words.push_bytes(b" ");
             let _ = words.push_bytes(word.as_bytes());
         }
     }
+
     words
 }
 
@@ -273,30 +274,36 @@ fn qword(words: [u32; 2]) -> u64 {
 
 /// `lockmode unlock` | `lockmode boxid=<qword> [encrypt]` | `lockmode encrypt`.
 fn lock_mode(invocation: &mut Invocation<'_>) -> CommandResult {
-    let mut result = Ok(Reply::Ok);
     let lock = &mut invocation.state.lock;
-    if invocation.line.has("unlock") {
+    let result = if invocation.line.has("unlock") {
         lock.mode = LockMode::Unlocked;
         remove_all_users(invocation.backend);
+        Ok(Reply::Ok)
     } else if lock.is_locked() {
         // Relocking keeps the box id and drops file encryption.
         lock.mode = LockMode::Locked;
+        Ok(Reply::Ok)
     } else if let Some(box_id) = invocation.line.qword("boxid") {
         lock.box_id = [(box_id >> 32) as u32, box_id as u32];
         lock.mode = LockMode::Locked;
+        Ok(Reply::Ok)
     } else {
         invocation.set_text(format_args!("missing parameters"));
-        result = Err(CommandError::Fail);
-    }
-    if invocation.line.has("encrypt") {
-        if invocation.state.lock.is_locked() {
-            invocation.state.lock.mode = LockMode::LockedEncrypted;
-            result = Ok(Reply::Ok);
-        } else {
-            invocation.set_text(format_args!("box not locked; file encryption not enabled"));
-        }
-    }
+        Err(CommandError::Fail)
+    };
+
+    let result = if !invocation.line.has("encrypt") {
+        result
+    } else if invocation.state.lock.is_locked() {
+        invocation.state.lock.mode = LockMode::LockedEncrypted;
+        Ok(Reply::Ok)
+    } else {
+        invocation.set_text(format_args!("box not locked; file encryption not enabled"));
+        result
+    };
+
     invocation.state.settings_dirty = true;
+
     result
 }
 
@@ -304,6 +311,7 @@ fn lock_mode(invocation: &mut Invocation<'_>) -> CommandResult {
 /// shift.
 fn remove_all_users(backend: &mut dyn AnyBackend) {
     let mut index = 0;
+
     while let Some(name) = backend.user_name_at(index) {
         if backend.remove_user(name.as_bytes()) {
             index = 0;
@@ -318,10 +326,12 @@ fn box_id(invocation: &mut Invocation<'_>) -> CommandResult {
     if !lock.is_locked() {
         return Err(ErrorCode::BoxNotLocked.into());
     }
+
     invocation.set_text(format_args!(
         "boxid=0q{:08x}{:08x}",
         lock.box_id[0], lock.box_id[1]
     ));
+
     Ok(Reply::Ok)
 }
 
@@ -334,6 +344,7 @@ fn admin_password(invocation: &mut Invocation<'_>) -> CommandResult {
         invocation.state.settings_dirty = true;
         return Ok(Reply::Ok);
     }
+
     let key = match invocation.session.as_deref() {
         // Settings lines carry the stored value unencrypted.
         None => SessionKey(0),
@@ -342,35 +353,33 @@ fn admin_password(invocation: &mut Invocation<'_>) -> CommandResult {
             None => return Err(ErrorCode::KeyExchangeRequired.into()),
         },
     };
+
     let Some(password) = invocation.line.qword("passwd") else {
         invocation.set_text(format_args!("missing passwd"));
         return Err(CommandError::Fail);
     };
+
     invocation.state.security.admin_password = Some(Password(password ^ key.0));
     invocation.state.settings_dirty = true;
-    Ok(Reply::Ok)
-}
 
-/// How `authuser` uses its value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuthMode {
-    /// The value is the response to the banner challenge.
-    Response,
-    /// The value is a new password (decrypted with the session key).
-    SetPassword,
+    Ok(Reply::Ok)
 }
 
 /// `authuser (resp=<qword> | passwd=<qword>) (admin | name=<string>)`.
 /// The resulting privileges replace the connection's, even when zero.
 fn authenticate_user(invocation: &mut Invocation<'_>) -> CommandResult {
+    /// Name buffer of `authuser`.
+    const AUTH_NAME_CAPACITY: usize = 0x100;
+
     let Some(session) = invocation.session.as_deref_mut() else {
         return Err(CommandError::Fail);
     };
+
     let line = invocation.line;
     let password = session
         .session_key
         .and_then(|key| line.qword("passwd").map(|password| password ^ key.0));
-    let (mut mode, value) = match password {
+    let (mode, value) = match password {
         Some(password) => (AuthMode::SetPassword, password),
         None => match line.qword("resp") {
             Some(response) => (AuthMode::Response, response),
@@ -380,42 +389,47 @@ fn authenticate_user(invocation: &mut Invocation<'_>) -> CommandResult {
             }
         },
     };
+
     let challenge = auth::Nonce(qword(session.nonce));
 
-    let privileges = if line.has("admin") {
+    let (privileges, mode) = if line.has("admin") {
         if mode == AuthMode::SetPassword {
             invocation.text.set_bytes(b"missing response");
             return Err(CommandError::Fail);
         }
-        match invocation.state.security.admin_password {
+
+        let privileges = match invocation.state.security.admin_password {
             Some(Password(secret))
                 if auth::response(auth::Password(secret), challenge).0 == value =>
             {
                 Access::UNRESTRICTED
             }
             _ => Access::empty(),
-        }
+        };
+
+        (privileges, mode)
     } else {
         let Some(name) = line.param("name") else {
             invocation.text.set_bytes(b"missing name");
             return Err(CommandError::Fail);
         };
+
         let mut buffer = [0u8; AUTH_NAME_CAPACITY];
         let name = name.copy_into(&mut buffer);
         match invocation.backend.find_user(name) {
-            None => Access::empty(),
+            None => (Access::empty(), mode),
             Some(user) => match (user.password, mode) {
                 (Some(Password(secret)), AuthMode::Response) => {
-                    if auth::response(auth::Password(secret), challenge).0 == value {
+                    let accepted = auth::response(auth::Password(secret), challenge).0 == value;
+                    let privileges = if accepted {
                         user.privileges
                     } else {
                         Access::empty()
-                    }
+                    };
+
+                    (privileges, AuthMode::Response)
                 }
-                (Some(_), AuthMode::SetPassword) => {
-                    mode = AuthMode::Response;
-                    Access::empty()
-                }
+                (Some(_), AuthMode::SetPassword) => (Access::empty(), AuthMode::Response),
                 (None, AuthMode::SetPassword) => {
                     let updated = User {
                         password: Some(Password(value)),
@@ -423,17 +437,16 @@ fn authenticate_user(invocation: &mut Invocation<'_>) -> CommandResult {
                     };
                     invocation.backend.store_user(name, updated);
                     invocation.state.settings_dirty = true;
-                    mode = AuthMode::Response;
-                    user.privileges
+
+                    (user.privileges, AuthMode::Response)
                 }
-                (None, AuthMode::Response) => {
-                    mode = AuthMode::SetPassword;
-                    Access::empty()
-                }
+                (None, AuthMode::Response) => (Access::empty(), AuthMode::SetPassword),
             },
         }
     };
+
     session.access = privileges;
+
     if privileges != Access::empty() {
         Ok(Reply::Ok)
     } else if mode == AuthMode::SetPassword {
@@ -450,15 +463,18 @@ fn get_user_privileges(invocation: &mut Invocation<'_>) -> CommandResult {
         if invocation.session.is_none() {
             return Err(CommandError::Fail);
         }
+
         access
     } else {
         if !access.intersects(Access::MANAGE) {
             return Err(ErrorCode::AccessDenied.into());
         }
+
         let Some(name) = invocation.line.param("name") else {
             invocation.text.set_bytes(b"missing name");
             return Err(CommandError::Fail);
         };
+
         let mut buffer = [0u8; LOOKUP_NAME_CAPACITY];
         let name = name.copy_into(&mut buffer);
         match invocation.backend.find_user(name) {
@@ -466,6 +482,7 @@ fn get_user_privileges(invocation: &mut Invocation<'_>) -> CommandResult {
             None => return Err(ErrorCode::FileNotFound.into()),
         }
     };
+
     invocation.text.clear();
     if privileges == Access::empty() {
         invocation.text.set_bytes(b"none");
@@ -477,6 +494,7 @@ fn get_user_privileges(invocation: &mut Invocation<'_>) -> CommandResult {
             .text
             .set_bytes(words.as_bytes().get(1..).unwrap_or_default());
     }
+
     Ok(Reply::Ok)
 }
 
@@ -487,9 +505,12 @@ fn set_user_privileges(invocation: &mut Invocation<'_>) -> CommandResult {
         invocation.text.set_bytes(b"missing name");
         return Err(CommandError::Fail);
     };
+
     let mut buffer = [0u8; LOOKUP_NAME_CAPACITY];
     let name = name.copy_into(&mut buffer);
+
     let privileges = parse_privileges(&invocation.line);
+
     set_user_access(invocation.backend, name, privileges).map(|()| Reply::Ok)
 }
 
@@ -530,15 +551,18 @@ fn user(invocation: &mut Invocation<'_>) -> CommandResult {
         invocation.text.set_bytes(b"missing name");
         return Err(CommandError::Fail);
     };
+
     let mut buffer = [0u8; USER_NAME_CAPACITY];
     let name = name.copy_into(&mut buffer);
     if invocation.line.has("remove") {
         return remove_user(invocation.state, invocation.backend, name).map(|()| Reply::Ok);
     }
+
     let password = match invocation.session {
         None => invocation.line.qword("passwd").map(Password),
         Some(_) => None,
     };
+
     let privileges = parse_privileges(&invocation.line);
     add_user(
         invocation.state,
@@ -562,13 +586,17 @@ pub fn add_user(
     if !state.lock.is_locked() {
         return Err(ErrorCode::BoxNotLocked.into());
     }
+
     if backend.find_user(name).is_some() {
         return Err(ErrorCode::FileAlreadyExists.into());
     }
+
     if backend.create_user(name, user).is_err() {
         return Err(CommandError::OutOfMemory);
     }
+
     state.settings_dirty = true;
+
     Ok(())
 }
 
@@ -581,7 +609,9 @@ pub fn remove_user(
     if !backend.remove_user(name) {
         return Err(ErrorCode::FileNotFound.into());
     }
+
     state.settings_dirty = true;
+
     Ok(())
 }
 
@@ -613,13 +643,16 @@ pub fn walk_users(
     if !state.lock.is_locked() {
         return Err(CommandError::EndOfData);
     }
+
     let name = backend
         .user_name_at(*position)
         .ok_or(CommandError::EndOfData)?;
     *position += 1;
+
     let user = backend
         .find_user(name.as_bytes())
         .ok_or(CommandError::Unexpected)?;
+
     Ok((name, user.privileges))
 }
 
@@ -627,10 +660,13 @@ fn user_list(invocation: &mut Invocation<'_>) -> CommandResult {
     if !invocation.state.lock.is_locked() {
         return Err(ErrorCode::BoxNotLocked.into());
     }
+
     let Some(session) = invocation.session.as_deref_mut() else {
         return Err(CommandError::Fail);
     };
+
     session.continuation = crate::continuation::Continuation::Security(Continuation::UserList(0));
+
     Ok(Reply::Multiline)
 }
 
@@ -640,93 +676,22 @@ fn resume_user_list(index: &mut u32, cx: &mut ContinuationContext<'_>) -> Comman
     if !cx.state.lock.is_locked() {
         return Err(CommandError::EndOfData);
     }
+
     let Some(name) = cx.backend.user_name_at(*index) else {
         return Err(CommandError::EndOfData);
     };
+
     *index += 1;
     let Some(user) = cx.backend.find_user(name.as_bytes()) else {
         return Err(CommandError::EndOfData);
     };
+
     let _ = cx.line.push_bytes(b"name=\"");
     let _ = cx.line.push_bytes(name.as_bytes());
     let _ = cx.line.push_bytes(b"\"");
     let _ = cx
         .line
         .push_bytes(privilege_words(user.privileges).as_bytes());
+
     Ok(Reply::Ok)
-}
-
-/// `keyxchg`: receives the client's 0x60-byte public value, replies with
-/// the server's, and sets the session key from the shared secret.
-fn key_exchange(invocation: &mut Invocation<'_>) -> CommandResult {
-    let Some(socket) = invocation.session.as_ref().map(|session| session.socket()) else {
-        return Err(CommandError::Fail);
-    };
-    let Some(value) =
-        invocation
-            .state
-            .transfer_blocks
-            .acquire(invocation.backend, socket, DH_LENGTH as u32)
-    else {
-        return Err(CommandError::OutOfMemory);
-    };
-    if let Some(session) = invocation.session.as_deref_mut() {
-        session.continuation =
-            crate::continuation::Continuation::Security(Continuation::KeyExchange(KeyExchange {
-                value,
-                phase: KeyExchangePhase::Receiving,
-            }));
-        session.receive_remaining = Some(DH_LENGTH as u32);
-    }
-    Ok(Reply::SendBinary)
-}
-
-fn resume_key_exchange(
-    exchange: &mut KeyExchange,
-    cx: &mut ContinuationContext<'_>,
-) -> CommandResult {
-    match exchange.phase {
-        KeyExchangePhase::Receiving => {
-            let remaining = cx.session.receive_remaining.unwrap_or(0) as usize;
-            if cx.received.is_empty() {
-                cx.session.receive_remaining = Some(0);
-                return Err(CommandError::Unexpected);
-            }
-            let offset = DH_LENGTH - remaining;
-            let count = cx.received.len().min(remaining);
-            let value =
-                &mut cx.state.transfer_blocks.bytes(cx.backend, exchange.value)[..DH_LENGTH];
-            value[offset..offset + count].copy_from_slice(&cx.received[..count]);
-            let remaining = remaining - count;
-            cx.session.receive_remaining = Some(remaining as u32);
-            if remaining != 0 {
-                return Ok(Reply::Ok);
-            }
-            let mut client = DhValue([0; DH_LENGTH]);
-            client.0.copy_from_slice(value);
-            let mut exponent = DhValue([0; DH_LENGTH]);
-            cx.backend.random_bytes(&mut exponent.0);
-            let shared = auth::dh_mod_exp(Some(&client), &exponent);
-            let server = auth::dh_mod_exp(None, &exponent);
-            cx.state.transfer_blocks.bytes(cx.backend, exchange.value)[..DH_LENGTH]
-                .copy_from_slice(&server.0);
-            exchange.phase = KeyExchangePhase::Sending;
-            cx.session.session_key = Some(SessionKey::derive(&shared));
-            Ok(Reply::Binary)
-        }
-        KeyExchangePhase::Sending => {
-            cx.binary[..DH_LENGTH].copy_from_slice(
-                &cx.state.transfer_blocks.bytes(cx.backend, exchange.value)[..DH_LENGTH],
-            );
-            cx.binary_len = DH_LENGTH;
-            exchange.phase = KeyExchangePhase::Sent;
-            Ok(Reply::Ok)
-        }
-        KeyExchangePhase::Sent => {
-            // SAFETY: the transfer ends with this result, so the server drops
-            // the continuation, the only other holder.
-            unsafe { cx.state.transfer_blocks.release(cx.backend, exchange.value) };
-            Err(CommandError::EndOfData)
-        }
-    }
 }

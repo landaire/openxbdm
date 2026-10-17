@@ -152,13 +152,6 @@ pub(super) struct Events {
     dump_in_progress: bool,
 }
 
-const fn process_index(process: ProcessKind) -> usize {
-    match process {
-        ProcessKind::Title => 0,
-        ProcessKind::System => 1,
-    }
-}
-
 impl Events {
     pub(super) const fn new() -> Self {
         Self {
@@ -180,6 +173,179 @@ impl Events {
     }
 }
 
+/// Registers of a thread in the monitor that the dispatch reads.
+#[derive(Clone, Copy)]
+struct Registers {
+    msr: Msr,
+    iar: u32,
+    gpr3: u64,
+    gpr4: u64,
+}
+
+#[derive(Clone, Copy)]
+// Keeps the variant fields word-aligned in the plan.
+#[repr(C)]
+enum Notice<'a> {
+    Break,
+    SingleStep,
+    NtAssert,
+    DebugString { address: u32, length: u16 },
+    Assert { address: u32, length: u16 },
+    Rip { address: u32, length: u16 },
+    Data { kind: u32, address: u32 },
+    ModuleLoad(&'a ModuleEvent),
+    ModuleUnload(&'a ModuleEvent),
+    Exception { first_chance: bool },
+}
+
+struct Plan<'a> {
+    notice: Option<Notice<'a>>,
+    stop: bool,
+    /// The event ends handled without a notification.
+    handled: bool,
+    resolution: Resolution,
+}
+
+impl<'a> Plan<'a> {
+    fn notify(notice: Notice<'a>, stop: bool, resolution: Resolution) -> Self {
+        Self {
+            notice: Some(notice),
+            stop,
+            handled: false,
+            resolution,
+        }
+    }
+
+    fn silent(resolution: Resolution) -> Self {
+        Self {
+            notice: None,
+            stop: false,
+            handled: false,
+            resolution,
+        }
+    }
+
+    fn handled(resolution: Resolution) -> Self {
+        Self {
+            notice: None,
+            stop: false,
+            handled: true,
+            resolution,
+        }
+    }
+
+    fn only_if(self, condition: bool) -> Self {
+        if condition {
+            self
+        } else {
+            Self::silent(self.resolution)
+        }
+    }
+}
+
+/// What a stopped thread is stopped at (the record of stock export 22,
+/// 0x91f26058). The stock reason code of each variant is in its comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// 0: no exception record, or a trap the record does not describe.
+    Unknown,
+    /// 2.
+    DebugString { thread: ThreadId },
+    /// 1: a breakpoint trap at `address`.
+    Breakpoint { address: u32, thread: ThreadId },
+    /// 0xc: assertion prompt text at `address` (r3) of `length` (r4) bytes.
+    Assert {
+        thread: ThreadId,
+        address: u32,
+        length: u16,
+    },
+    /// 0xe: rip message, as for an assertion.
+    Rip {
+        thread: ThreadId,
+        address: u32,
+        length: u16,
+    },
+    /// 4.
+    SingleStep { address: u32, thread: ThreadId },
+    /// 0xd: a single step exception without a trace parameter; the record
+    /// carries no access kind.
+    DataBreakpoint { address: u32, thread: ThreadId },
+    /// 0x15: exception code 0x15.
+    NtAssert { address: u32, thread: ThreadId },
+    /// 9.
+    Exception {
+        thread: ThreadId,
+        record: ExceptionRecord,
+        first_chance: bool,
+    },
+}
+
+impl StopReason {
+    /// The record words stock writes, in order; words past the count keep
+    /// the caller's values.
+    pub fn encode(&self) -> ([u32; 7], usize) {
+        let (head, count) = match *self {
+            Self::Unknown => ([0; 4], 1),
+            Self::DebugString { thread } => ([2, thread.0, 0, 0], 4),
+            Self::Breakpoint { address, thread } => ([1, address, thread.0, 0], 3),
+            Self::Assert {
+                thread,
+                address,
+                length,
+            } => ([0xc, thread.0, u32::from(length), address], 4),
+            Self::Rip {
+                thread,
+                address,
+                length,
+            } => ([0xe, thread.0, u32::from(length), address], 4),
+            Self::SingleStep { address, thread } => ([4, address, thread.0, 0], 3),
+            Self::DataBreakpoint { address, thread } => ([0xd, address, thread.0, 0], 3),
+            Self::NtAssert { address, thread } => ([0x15, address, thread.0, 0], 3),
+            Self::Exception {
+                thread,
+                record,
+                first_chance,
+            } => {
+                // Bit 0x1 has the same meaning in both words.
+                let mut flags = ExceptionNotificationFlags::from_bits_retain(
+                    (record.flags & ExceptionFlags::NONCONTINUABLE).bits(),
+                );
+
+                if first_chance {
+                    flags.insert(ExceptionNotificationFlags::FIRST_CHANCE);
+                }
+
+                let (first, second) = if record.code == NtStatus::ACCESS_VIOLATION {
+                    (record.parameters[0], record.parameters[1])
+                } else {
+                    (record.parameter_count, record.parameters_address())
+                };
+
+                let words = [
+                    9,
+                    thread.0,
+                    record.code.0,
+                    record.address,
+                    flags.bits(),
+                    first,
+                    second,
+                ];
+
+                return (words, 7);
+            }
+        };
+
+        ([head[0], head[1], head[2], head[3], 0, 0, 0], count)
+    }
+}
+
+const fn process_index(process: ProcessKind) -> usize {
+    match process {
+        ProcessKind::Title => 0,
+        ProcessKind::System => 1,
+    }
+}
+
 /// Process every event the platform has queued.
 pub fn process_events(
     state: &mut ServerState,
@@ -188,18 +354,22 @@ pub fn process_events(
 ) {
     state.transfer_blocks.release_abandoned(backend);
     expire_title_stops(state, backend);
+
     let mut text = [0u8; NOTICE_TEXT_CAPACITY];
     while let Some(notification) = backend.next_direct_notification(&mut text) {
         let length = notification.text_length.min(NOTICE_TEXT_CAPACITY);
         deliver_direct(state, backend, network, &notification, &text[..length]);
     }
+
     while let Some(event) = backend.next_event() {
         // Texts the event's thread posted before it raised the event go
         // out first.
         crate::commands::session::send_posted_notifications(state, backend, network);
         handle(state, backend, network, event);
     }
+
     super::send_held_reply(state, backend, network);
+
     let policy = direct_policy(state, backend);
     backend.publish_direct_policy(&policy);
 }
@@ -238,21 +408,25 @@ fn deliver_direct(
             let Some(module) = &notification.module else {
                 return;
             };
+
             state
                 .debugger
                 .breakpoints
                 .remove_range(module.base, module.size, backend);
+
             if !line {
                 return;
             }
+
             Notice::ModuleUnload(module)
         }
         DirectNotice::Assert { address, length } => Notice::Assert { address, length },
         DirectNotice::Rip { address, length } => Notice::Rip { address, length },
         DirectNotice::SingleStep => Notice::SingleStep,
-        DirectNotice::Data { kind, address } => Notice::Data(kind, address),
+        DirectNotice::Data { kind, address } => Notice::Data { kind, address },
         DirectNotice::Exception { first_chance } => Notice::Exception { first_chance },
     };
+
     deliver_notice(
         state,
         backend,
@@ -270,10 +444,12 @@ fn deliver_direct(
 /// thread starts execution itself (stock 0x91f523a0).
 fn expire_title_stops(state: &mut ServerState, backend: &mut dyn AnyBackend) {
     let now = backend.tick_milliseconds();
+
     for index in 0..MAX_PENDING {
         let Some(entry) = state.debugger.events.pending[index] else {
             continue;
         };
+
         let Resolution::PendingTitle {
             since,
             timeout: Some(timeout),
@@ -281,9 +457,11 @@ fn expire_title_stops(state: &mut ServerState, backend: &mut dyn AnyBackend) {
         else {
             continue;
         };
+
         if now.wrapping_sub(since) < timeout {
             continue;
         }
+
         state.debugger.events.pending[index] = None;
         backend.complete_event(entry.thread, Disposition::default());
     }
@@ -319,9 +497,13 @@ fn defer(state: &mut ServerState, backend: &mut dyn AnyBackend, event: DebugEven
         .iter_mut()
         .find(|slot| slot.is_none())
     {
-        Some(slot) => *slot = Some(event),
+        Some(slot) => {
+            *slot = Some(event);
+        }
         // No room to wait: the thread continues without the debugger.
-        None => backend.complete_event(event.thread(), Disposition::default()),
+        None => {
+            backend.complete_event(event.thread(), Disposition::default());
+        }
     }
 }
 
@@ -332,7 +514,9 @@ pub(super) fn handle(
     event: DebugEvent,
 ) {
     match event {
-        DebugEvent::Exception { .. } => exception(state, backend, network, event),
+        DebugEvent::Exception { .. } => {
+            exception(state, backend, network, event);
+        }
         DebugEvent::ThreadCreate {
             thread,
             process,
@@ -344,6 +528,7 @@ pub(super) fn handle(
                 defer(state, backend, event);
                 return;
             }
+
             let break_after =
                 title_entry && core::mem::take(&mut state.debugger.break_at_title_entry);
             let resolution = Resolution::Resume { break_after };
@@ -352,6 +537,7 @@ pub(super) fn handle(
                 start,
                 stopped: stop,
             };
+
             if stop {
                 begin_stop(
                     state,
@@ -400,15 +586,18 @@ pub(super) fn handle(
                 defer(state, backend, event);
                 return;
             }
+
             begin_stop(
                 state,
                 backend,
                 network,
                 Pending::new(thread, process, Resolution::Resume { break_after: false }),
             );
+
             let mut buffer = [0u8; MODULE_NAME_CAPACITY];
             let length = target_string(backend, name, &mut buffer);
             let name = core::str::from_utf8(&buffer[..length]).unwrap_or_default();
+
             notify(
                 state,
                 backend,
@@ -434,6 +623,7 @@ pub(super) fn handle(
                 defer(state, backend, event);
                 return;
             }
+
             transition(state, backend, network, target, send_line);
             backend.complete_event(
                 thread,
@@ -455,11 +645,13 @@ pub(super) fn handle(
                 network,
                 &Event::ExecutionStop(ExecutionState::PendingTitle),
             );
+
             let since = backend.tick_milliseconds();
             let entry = Pending {
                 debuggable,
                 ..Pending::new(thread, process, Resolution::PendingTitle { since, timeout })
             };
+
             match state
                 .debugger
                 .events
@@ -467,14 +659,18 @@ pub(super) fn handle(
                 .iter_mut()
                 .find(|slot| slot.is_none())
             {
-                Some(slot) => *slot = Some(entry),
-                None => backend.complete_event(
-                    thread,
-                    Disposition {
-                        handled: true,
-                        ..Disposition::default()
-                    },
-                ),
+                Some(slot) => {
+                    *slot = Some(entry);
+                }
+                None => {
+                    backend.complete_event(
+                        thread,
+                        Disposition {
+                            handled: true,
+                            ..Disposition::default()
+                        },
+                    );
+                }
             }
         }
         DebugEvent::StackOverflow {
@@ -483,17 +679,19 @@ pub(super) fn handle(
             address,
             record_address,
             can_stop,
-        } => stack_overflow(
-            state,
-            backend,
-            network,
-            event,
-            thread,
-            process,
-            address,
-            record_address,
-            can_stop,
-        ),
+        } => {
+            stack_overflow(
+                state,
+                backend,
+                network,
+                event,
+                thread,
+                process,
+                address,
+                record_address,
+                can_stop,
+            );
+        }
     }
 }
 
@@ -519,9 +717,11 @@ fn stack_overflow(
         backend.complete_event(thread, Disposition::default());
         return;
     }
+
     let dump_mode = state.console.dump_mode;
     let dump = dump_mode != DumpMode::Disabled;
     let can_stop = can_stop && (dump_mode != DumpMode::Enabled || state.debugger.debugger.attached);
+
     if !can_stop {
         backend.complete_event(
             thread,
@@ -532,10 +732,12 @@ fn stack_overflow(
         );
         return;
     }
+
     if stop_must_wait(backend) {
         defer(state, backend, event);
         return;
     }
+
     let record = ExceptionRecord {
         code: NtStatus::STACK_OVERFLOW,
         flags: ExceptionFlags::NONCONTINUABLE,
@@ -548,7 +750,9 @@ fn stack_overflow(
         dump,
         ..Pending::new(thread, process, Resolution::StackOverflow)
     };
+
     begin_stop(state, backend, network, entry);
+
     // The notification arguments carry no parameter array.
     let line = Event::Exception {
         code: NtStatus::STACK_OVERFLOW.0,
@@ -562,10 +766,12 @@ fn stack_overflow(
         noncontinuable: true,
         stopped: true,
     };
+
     if !notify(state, backend, network, &line) && dump_mode == DumpMode::Enabled {
         if let Some(index) = state.debugger.events.pending_index(thread) {
             state.debugger.events.pending[index] = None;
         }
+
         let _ = change_execution(state, backend, network, ExecutionState::Started);
         backend.complete_event(
             thread,
@@ -577,20 +783,12 @@ fn stack_overflow(
     }
 }
 
-/// Registers of a thread in the monitor that the dispatch reads.
-#[derive(Clone, Copy)]
-struct Registers {
-    msr: Msr,
-    iar: u32,
-    gpr3: u64,
-    gpr4: u64,
-}
-
 #[inline(never)]
 fn registers(backend: &mut dyn AnyBackend, thread: ThreadId) -> Registers {
     let mut context = Context::EMPTY;
     context.flags = ContextFlags::CONTROL.union(ContextFlags::INTEGER);
     let _ = backend.thread_context(thread, &mut context);
+
     Registers {
         msr: context.msr,
         iar: context.iar,
@@ -611,6 +809,7 @@ fn edit_registers(
     let mut context = Context::EMPTY;
     context.flags = ContextFlags::CONTROL.union(ContextFlags::INTEGER);
     let _ = backend.thread_context(thread, &mut context);
+
     if change(backend, &mut context) {
         context.flags = ContextFlags::CONTROL.union(ContextFlags::INTEGER);
         let _ = backend.set_thread_context(thread, &context);
@@ -636,18 +835,22 @@ pub(super) fn rewrite_trap(record: &mut ExceptionRecord) {
     ) {
         return;
     }
+
     let instruction = record.parameters[0];
     let immediate = match instruction >> 26 {
         2 | 3 => true,
         31 if matches!((instruction & 0x7fe) >> 1, 4 | 0x44) => false,
         _ => return,
     };
+
     record.code = NtStatus::BREAKPOINT;
     if !immediate {
         return;
     }
+
     let condition = (instruction & 0x03e0_0000) >> 21;
     let value = instruction as u16 as i16;
+
     if condition == 5 && value == -1 {
         record.code = NtStatus::INTEGER_OVERFLOW;
     } else if (condition == 6 || condition == 7) && value == 0 {
@@ -672,18 +875,22 @@ fn exception(
     else {
         return;
     };
+
     if !second_chance {
         rewrite_trap(&mut record);
     }
+
     let hardware_kd = backend
         .hardware_flags()
         .contains(HardwareFlags::KERNEL_DEBUGGER);
+
     if !second_chance && state.debugger.trap_passthrough && !hardware_kd {
         let passes = match record.code {
             NtStatus::BREAKPOINT => record.trap_code() == trap::BREAKPOINT,
             NtStatus::SINGLE_STEP => true,
             _ => false,
         };
+
         if passes {
             reprogram_data_breakpoint(state, backend);
             backend.complete_event(
@@ -696,6 +903,7 @@ fn exception(
             return;
         }
     }
+
     if state.debugger.events.dump_in_progress {
         // After a crash dump the monitor no longer dispatches exceptions.
         let entry = Pending {
@@ -705,6 +913,7 @@ fn exception(
         finish(state, backend, network, entry, false);
         return;
     }
+
     let kd = kernel_debugger_enabled(state, backend) && hardware_kd;
     let dump_mode = state.console.dump_mode;
     let mut dump = !hardware_kd && dump_mode != DumpMode::Disabled;
@@ -713,6 +922,7 @@ fn exception(
     if dump_mode == DumpMode::Enabled {
         can_stop &= state.debugger.debugger.attached;
     }
+
     let iar = context.iar;
     let gpr3 = context.gpr3;
     let gpr4 = context.gpr4 as u16;
@@ -817,7 +1027,10 @@ fn exception(
             match state.debugger.data_breakpoint {
                 Some(data) if data.overlaps(record.parameters[1], access_length(backend, iar)) => {
                     Plan::notify(
-                        Notice::Data(data.kind as u32, data.address),
+                        Notice::Data {
+                            kind: data.kind as u32,
+                            address: data.address,
+                        },
                         can_stop,
                         Resolution::DataBreakpoint,
                     )
@@ -829,9 +1042,14 @@ fn exception(
         NtStatus::SINGLE_STEP => {
             if let Some(step) = state.debugger.events.steps[process_index(process)].take() {
                 match step.target {
-                    StepTarget::Breakpoint(slot) => state.debugger.breakpoints.rearm(slot, backend),
+                    StepTarget::Breakpoint(slot) => {
+                        state.debugger.breakpoints.rearm(slot, backend);
+                    }
+                    // The data breakpoint register is reprogrammed when the
+                    // event ends.
                     StepTarget::DataBreakpoint => {}
                 }
+
                 if !step.saved_trace {
                     clear_single_step(backend, thread);
                     reprogram_data_breakpoint(state, backend);
@@ -845,6 +1063,7 @@ fn exception(
                     return;
                 }
             }
+
             clear_single_step(backend, thread);
             Plan::notify(Notice::SingleStep, !kd && can_stop, Resolution::SingleStep)
         }
@@ -859,6 +1078,7 @@ fn exception(
                 // until the event completes; parameter 1 is its name.
                 unsafe { backend.set_thread_name(target, record.parameters[1]) };
             }
+
             dump &= second_chance;
             let stop = !kd
                 && can_stop
@@ -877,6 +1097,7 @@ fn exception(
         defer(state, backend, event);
         return;
     }
+
     let pending = Pending {
         record: Some(record),
         debuggable,
@@ -884,26 +1105,32 @@ fn exception(
         dump,
         ..Pending::new(thread, process, plan.resolution)
     };
+
     if plan.handled {
         finish(state, backend, network, pending, true);
         return;
     }
+
     let Some(notice) = plan.notice else {
         finish(state, backend, network, pending, false);
         return;
     };
+
     if plan.stop {
         begin_stop(state, backend, network, pending);
     }
+
     let mut buffer = [0u8; NOTICE_TEXT_CAPACITY];
     let text = notice_text(backend, &notice, &mut buffer);
     let delivered = deliver_notice(
         state, backend, network, notice, &record, thread, iar, plan.stop, text,
     );
+
     if !plan.stop {
         finish(state, backend, network, pending, false);
         return;
     }
+
     if !delivered && dump_mode == DumpMode::Enabled {
         // Nobody listens and dumps are enabled: run on and let the
         // exception end unhandled.
@@ -915,67 +1142,6 @@ fn exception(
     }
 }
 
-#[derive(Clone, Copy)]
-// Keeps the variant fields word-aligned in the plan.
-#[repr(C)]
-enum Notice<'a> {
-    Break,
-    SingleStep,
-    NtAssert,
-    DebugString { address: u32, length: u16 },
-    Assert { address: u32, length: u16 },
-    Rip { address: u32, length: u16 },
-    Data(u32, u32),
-    ModuleLoad(&'a ModuleEvent),
-    ModuleUnload(&'a ModuleEvent),
-    Exception { first_chance: bool },
-}
-
-struct Plan<'a> {
-    notice: Option<Notice<'a>>,
-    stop: bool,
-    /// The event ends handled without a notification.
-    handled: bool,
-    resolution: Resolution,
-}
-
-impl<'a> Plan<'a> {
-    fn notify(notice: Notice<'a>, stop: bool, resolution: Resolution) -> Self {
-        Self {
-            notice: Some(notice),
-            stop,
-            handled: false,
-            resolution,
-        }
-    }
-
-    fn silent(resolution: Resolution) -> Self {
-        Self {
-            notice: None,
-            stop: false,
-            handled: false,
-            resolution,
-        }
-    }
-
-    fn handled(resolution: Resolution) -> Self {
-        Self {
-            notice: None,
-            stop: false,
-            handled: true,
-            resolution,
-        }
-    }
-
-    fn only_if(self, condition: bool) -> Self {
-        if condition {
-            self
-        } else {
-            Self::silent(self.resolution)
-        }
-    }
-}
-
 /// Mark the thread stopped, stop execution, and keep the event pending.
 fn begin_stop(
     state: &mut ServerState,
@@ -983,25 +1149,24 @@ fn begin_stop(
     network: &mut dyn Network,
     entry: Pending,
 ) {
-    match state
+    let Some(slot) = state
         .debugger
         .events
         .pending
         .iter_mut()
         .find(|slot| slot.is_none())
-    {
-        Some(slot) => *slot = Some(entry),
-        None => {
-            backend.complete_event(
-                entry.thread,
-                Disposition {
-                    handled: true,
-                    ..Disposition::default()
-                },
-            );
-            return;
-        }
-    }
+    else {
+        backend.complete_event(
+            entry.thread,
+            Disposition {
+                handled: true,
+                ..Disposition::default()
+            },
+        );
+        return;
+    };
+    *slot = Some(entry);
+
     let _ = change_execution(state, backend, network, ExecutionState::Stopped);
 }
 
@@ -1033,10 +1198,13 @@ pub(super) fn notify(
 fn target_string(backend: &mut dyn AnyBackend, address: u32, buffer: &mut [u8]) -> usize {
     for (offset, slot) in buffer.iter_mut().enumerate() {
         match backend.target_bytes(address.wrapping_add(offset as u32), 1) {
-            Some(&[byte]) if byte != 0 => *slot = byte,
+            Some(&[byte]) if byte != 0 => {
+                *slot = byte;
+            }
             _ => return offset,
         }
     }
+
     buffer.len()
 }
 
@@ -1052,6 +1220,7 @@ fn target_text<'a>(
     let Some(bytes) = backend.target_bytes(address, length) else {
         return &[];
     };
+
     let length = bytes.len();
     buffer[..length].copy_from_slice(bytes);
     &buffer[..length]
@@ -1087,6 +1256,7 @@ fn deliver_notice(
 ) -> bool {
     let id = thread.0;
     let mut padded = Text::<0x200>::new();
+
     let event = match &notice {
         Notice::Break => Event::Break {
             address: iar,
@@ -1119,7 +1289,7 @@ fn deliver_notice(
             text: (address != 0).then(|| pad_message(text, usize::from(length), &mut padded)),
             stopped,
         },
-        &Notice::Data(kind, address) => {
+        &Notice::Data { kind, address } => {
             let access = match kind {
                 1 => DataAccess::Write,
                 2 => DataAccess::Read,
@@ -1165,6 +1335,7 @@ fn deliver_notice(
             stopped,
         },
     };
+
     notify(state, backend, network, &event)
 }
 
@@ -1176,13 +1347,16 @@ fn pad_message<'a>(bytes: &[u8], length: usize, out: &'a mut Text<0x200>) -> &'a
         .position(|&byte| byte == 0)
         .unwrap_or(bytes.len())
         .min(length);
+
     out.clear();
     let _ = out.push_bytes(&bytes[..end]);
+
     for _ in end..length {
         if out.push_bytes(b" ").is_err() {
             break;
         }
     }
+
     let text = out.as_bytes();
     match core::str::from_utf8(text) {
         Ok(text) => text,
@@ -1216,15 +1390,19 @@ fn step_over(
             lifted = true;
             return true;
         }
+
         let word = backend
             .target_bytes(context.iar, 4)
             .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok());
+
         if word.map(u32::from_be_bytes) == Some(TRAP_INSTRUCTION) {
             context.iar = context.iar.wrapping_add(4);
             return true;
         }
+
         false
     });
+
     lifted
 }
 
@@ -1244,6 +1422,7 @@ fn finish(
     let mut advance = true;
     let mut resolved = continued && !entry.released;
     let mut disposition = Disposition::default();
+
     match entry.resolution {
         Resolution::Break { table } => {
             if table || resolved {
@@ -1310,7 +1489,9 @@ fn finish(
                 });
             }
         }
-        Resolution::Final => resolved = false,
+        Resolution::Final => {
+            resolved = false;
+        }
         Resolution::Resume { break_after } => {
             backend.complete_event(
                 thread,
@@ -1342,6 +1523,7 @@ fn finish(
                     .contains(HardwareFlags::KERNEL_DEBUGGER);
             let write_dump = !again && entry.dump && !kd;
             state.debugger.events.dump_in_progress |= write_dump;
+
             backend.complete_event(
                 thread,
                 Disposition {
@@ -1353,6 +1535,7 @@ fn finish(
             return;
         }
     }
+
     if !resolved {
         if entry.dump {
             state.debugger.events.dump_in_progress = true;
@@ -1369,6 +1552,7 @@ fn finish(
             handled = true;
         }
     }
+
     reprogram_data_breakpoint(state, backend);
     disposition.handled = handled;
     backend.complete_event(thread, disposition);
@@ -1391,20 +1575,25 @@ pub(super) fn continue_thread(
     ) {
         return Err(StoppedThreadError::NoSuchThread);
     }
+
     if !has_record {
         return Ok(());
     }
+
     let Some(index) = state.debugger.events.pending_index(thread) else {
         return Err(StoppedThreadError::NotStopped);
     };
     let Some(mut entry) = state.debugger.events.pending[index].take() else {
         return Err(StoppedThreadError::NotStopped);
     };
+
     if execution == ExecutionState::Stopped {
         backend.monitor_suspend(thread);
     }
+
     entry.pass_exception = pass_exception;
     finish(state, backend, network, entry, true);
+
     Ok(())
 }
 
@@ -1420,9 +1609,11 @@ pub(super) fn release_stopped(
         let Some(entry) = state.debugger.events.pending[index] else {
             continue;
         };
+
         if entry.process != process || !entry.debuggable {
             continue;
         }
+
         state.debugger.events.pending[index] = None;
         finish(state, backend, network, entry, true);
     }
@@ -1441,15 +1632,19 @@ pub(super) fn release_all(
             let Some(mut entry) = state.debugger.events.pending[index] else {
                 continue;
             };
+
             if entry.process != process {
                 continue;
             }
+
             state.debugger.events.pending[index] = None;
             entry.released = true;
             finish(state, backend, network, entry, true);
         }
+
         backend.resume_threads(process);
     }
+
     backend.set_execution_state(ExecutionState::Started);
     notify(
         state,
@@ -1485,11 +1680,13 @@ pub(super) fn relaunch_blocked(state: &ServerState, backend: &mut dyn AnyBackend
             .filter(|entry| entry.process == process)
         {
             let Some(record) = entry.record else { continue };
+
             if blocks_relaunch(state, backend, entry, &record) {
                 return true;
             }
         }
     }
+
     false
 }
 
@@ -1503,6 +1700,7 @@ fn blocks_relaunch(
     let outside_title_image = entry.process != ProcessKind::Title
         || !((0x8200_0000..=0x8bfe_ffff).contains(&iar)
             || (0x9200_0000..=0x9ffe_ffff).contains(&iar));
+
     match record.code {
         NtStatus::SINGLE_STEP => false,
         NtStatus::BREAKPOINT => match record.trap_code() {
@@ -1511,6 +1709,7 @@ fn blocks_relaunch(
                 if state.debugger.breakpoints.contains(iar) {
                     return false;
                 }
+
                 let word = backend
                     .target_bytes(iar, 4)
                     .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok());
@@ -1523,97 +1722,6 @@ fn blocks_relaunch(
     }
 }
 
-/// What a stopped thread is stopped at (the record of stock export 22,
-/// 0x91f26058). The stock reason code of each variant is in its comment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StopReason {
-    /// 0: no exception record, or a trap the record does not describe.
-    Unknown,
-    /// 2.
-    DebugString { thread: ThreadId },
-    /// 1: a breakpoint trap at `address`.
-    Breakpoint { address: u32, thread: ThreadId },
-    /// 0xc: assertion prompt text at `address` (r3) of `length` (r4) bytes.
-    Assert {
-        thread: ThreadId,
-        address: u32,
-        length: u16,
-    },
-    /// 0xe: rip message, as for an assertion.
-    Rip {
-        thread: ThreadId,
-        address: u32,
-        length: u16,
-    },
-    /// 4.
-    SingleStep { address: u32, thread: ThreadId },
-    /// 0xd: a single step exception without a trace parameter; the record
-    /// carries no access kind.
-    DataBreakpoint { address: u32, thread: ThreadId },
-    /// 0x15: exception code 0x15.
-    NtAssert { address: u32, thread: ThreadId },
-    /// 9.
-    Exception {
-        thread: ThreadId,
-        record: ExceptionRecord,
-        first_chance: bool,
-    },
-}
-
-impl StopReason {
-    /// The record words stock writes, in order; words past the count keep
-    /// the caller's values.
-    pub fn encode(&self) -> ([u32; 7], usize) {
-        let (head, count) = match *self {
-            Self::Unknown => ([0; 4], 1),
-            Self::DebugString { thread } => ([2, thread.0, 0, 0], 4),
-            Self::Breakpoint { address, thread } => ([1, address, thread.0, 0], 3),
-            Self::Assert {
-                thread,
-                address,
-                length,
-            } => ([0xc, thread.0, u32::from(length), address], 4),
-            Self::Rip {
-                thread,
-                address,
-                length,
-            } => ([0xe, thread.0, u32::from(length), address], 4),
-            Self::SingleStep { address, thread } => ([4, address, thread.0, 0], 3),
-            Self::DataBreakpoint { address, thread } => ([0xd, address, thread.0, 0], 3),
-            Self::NtAssert { address, thread } => ([0x15, address, thread.0, 0], 3),
-            Self::Exception {
-                thread,
-                record,
-                first_chance,
-            } => {
-                // Bit 0x1 has the same meaning in both words.
-                let mut flags = ExceptionNotificationFlags::from_bits_retain(
-                    (record.flags & ExceptionFlags::NONCONTINUABLE).bits(),
-                );
-                if first_chance {
-                    flags.insert(ExceptionNotificationFlags::FIRST_CHANCE);
-                }
-                let (first, second) = if record.code == NtStatus::ACCESS_VIOLATION {
-                    (record.parameters[0], record.parameters[1])
-                } else {
-                    (record.parameter_count, record.parameters_address())
-                };
-                let words = [
-                    9,
-                    thread.0,
-                    record.code.0,
-                    record.address,
-                    flags.bits(),
-                    first,
-                    second,
-                ];
-                return (words, 7);
-            }
-        };
-        ([head[0], head[1], head[2], head[3], 0, 0, 0], count)
-    }
-}
-
 /// The stop record of a thread (stock export 22, 0x91f26058).
 pub(super) fn stop_reason(
     state: &ServerState,
@@ -1621,6 +1729,7 @@ pub(super) fn stop_reason(
     thread: ThreadId,
 ) -> Result<StopReason, StoppedThreadError> {
     let has_record = backend.has_monitor_record(thread)?;
+
     let entry = state
         .debugger
         .events
@@ -1629,13 +1738,16 @@ pub(super) fn stop_reason(
     let Some(entry) = entry.filter(|_| has_record) else {
         return Err(StoppedThreadError::NotStopped);
     };
+
     let Some(record) = entry.record else {
         return Ok(StopReason::Unknown);
     };
+
     let context = registers(backend, thread);
     let iar = context.iar;
     let address = context.gpr3 as u32;
     let length = context.gpr4 as u16;
+
     Ok(match record.code {
         NtStatus::BREAKPOINT => match record.trap_code() {
             trap::DEBUG_STRING => StopReason::DebugString { thread },
@@ -1714,6 +1826,7 @@ pub(super) fn stop_description(
             let bytes = backend
                 .target_bytes(address, length.min(NOTICE_TEXT_CAPACITY))
                 .unwrap_or_default();
+
             let mut padded = Text::<0x200>::new();
             let text = pad_message(bytes, length, &mut padded);
             write!(out, "rip thread=0x{:08x} string={text}", thread.0)
@@ -1742,6 +1855,7 @@ pub(super) fn stop_description(
                 "exception code=0x{code:08x} thread=0x{:08x} address=0x{:08x}",
                 thread.0, record.address
             );
+
             if record.code == NtStatus::ACCESS_VIOLATION {
                 let kind = if record.parameters[0] == 0 {
                     "read"
@@ -1757,12 +1871,14 @@ pub(super) fn stop_description(
                     record.parameters_address()
                 );
             }
+
             if first_chance {
                 let _ = out.write_str(" first");
             }
             if record.flags.contains(ExceptionFlags::NONCONTINUABLE) {
                 let _ = out.write_str(" noncont");
             }
+
             Ok(())
         }
     };
@@ -1781,6 +1897,7 @@ mod tests {
         };
         rewrite_trap(&mut record);
         assert_eq!(record.code, NtStatus::INTEGER_OVERFLOW);
+
         let mut record = ExceptionRecord {
             code: NtStatus::INTEGER_DIVIDE_BY_ZERO,
             parameters: [0x0cc0_0000, 0, 0, 0],
@@ -1788,6 +1905,7 @@ mod tests {
         };
         rewrite_trap(&mut record);
         assert_eq!(record.code, NtStatus::INTEGER_DIVIDE_BY_ZERO);
+
         let mut record = ExceptionRecord {
             code: NtStatus::INTEGER_DIVIDE_BY_ZERO,
             parameters: [0x0fe0_0016, 0, 0, 0],
@@ -1795,6 +1913,7 @@ mod tests {
         };
         rewrite_trap(&mut record);
         assert_eq!(record.code, NtStatus::BREAKPOINT);
+
         let mut record = ExceptionRecord {
             code: NtStatus::INTEGER_DIVIDE_BY_ZERO,
             parameters: [0x7c00_0008, 0, 0, 0],

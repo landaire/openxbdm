@@ -1,5 +1,5 @@
 ---
-source: crates/openxbdm-server/src/notify.rs
+source: crates/openxbdm-server/src/notify/event.rs
 expression: lines
 ---
 break addr=0x00000001 thread=0x00000002

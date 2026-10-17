@@ -82,6 +82,7 @@ pub struct ContinuationContext<'a> {
     /// Set when the peer stopped accepting 203 data; the transfer ends after
     /// this call.
     pub aborted: bool,
+
     pub session: &'a mut Session,
     pub state: &'a mut ServerState,
     pub backend: &'a mut dyn Backend,
@@ -126,6 +127,7 @@ pub(crate) fn resume(
                 receive_remaining: &mut cx.session.receive_remaining,
                 aborted: cx.aborted,
             };
+
             match cx.backend.resume_processor(state, transfer) {
                 ProcessorProgress::Complete(result) => reply::from_processor(result),
                 ProcessorProgress::Unavailable => Err(CommandError::Fail),

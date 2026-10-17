@@ -3,6 +3,18 @@
 
 use smb2_server::fs::FileTime;
 
+/// A connection must complete a logon this long after it is accepted.
+pub(crate) const LOGON_LIMIT: TimeSpan = TimeSpan::seconds(30);
+/// A message or reply in progress may make no progress this long.
+pub(crate) const STALL_LIMIT: TimeSpan = TimeSpan::seconds(30);
+/// A connection without open files may send no request this long.
+pub(crate) const IDLE_LIMIT: TimeSpan = TimeSpan::seconds(15 * 60);
+/// When every slot holds a session, a connection that sent no request
+/// this long makes room for a new one. The console cannot detect a peer
+/// that vanished (XNet has no TCP keep-alive), so a vanished client
+/// holding open files would otherwise keep its slot.
+pub(crate) const RECLAIM_LIMIT: TimeSpan = TimeSpan::seconds(5 * 60);
+
 /// A length of time in FILETIME units (100 nanoseconds).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct TimeSpan(u64);
@@ -18,18 +30,6 @@ impl TimeSpan {
     }
 }
 
-/// A connection must complete a logon this long after it is accepted.
-pub(crate) const LOGON_LIMIT: TimeSpan = TimeSpan::seconds(30);
-/// A message or reply in progress may make no progress this long.
-pub(crate) const STALL_LIMIT: TimeSpan = TimeSpan::seconds(30);
-/// A connection without open files may send no request this long.
-pub(crate) const IDLE_LIMIT: TimeSpan = TimeSpan::seconds(15 * 60);
-/// When every slot holds a session, a connection that sent no request
-/// this long makes room for a new one. The console cannot detect a peer
-/// that vanished (XNet has no TCP keep-alive), so a vanished client
-/// holding open files would otherwise keep its slot.
-pub(crate) const RECLAIM_LIMIT: TimeSpan = TimeSpan::seconds(5 * 60);
-
 /// Times of a connection's events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Activity {
@@ -38,6 +38,32 @@ pub(crate) struct Activity {
     pub(crate) progress: FileTime,
     /// Last complete request.
     pub(crate) request: FileTime,
+}
+
+impl Activity {
+    pub(crate) const fn new(now: FileTime) -> Self {
+        Self {
+            accepted: now,
+            progress: now,
+            request: now,
+        }
+    }
+
+    /// The limit exceeded at `now`. Time before an event, as after the
+    /// clock was set back, counts as none.
+    pub(crate) fn expiry(&self, usage: Usage, now: FileTime) -> Option<Expiry> {
+        let since = |time: FileTime| TimeSpan::between(time, now);
+
+        if !usage.session && since(self.accepted) >= LOGON_LIMIT {
+            Some(Expiry::NoLogon)
+        } else if usage.in_transfer && since(self.progress) >= STALL_LIMIT {
+            Some(Expiry::Stalled)
+        } else if !usage.opens && since(self.request) >= IDLE_LIMIT {
+            Some(Expiry::Idle)
+        } else {
+            None
+        }
+    }
 }
 
 /// What a connection holds when its limits are checked.
@@ -59,50 +85,34 @@ pub(crate) enum Expiry {
     Idle,
 }
 
-impl Activity {
-    pub(crate) const fn new(now: FileTime) -> Self {
-        Self {
-            accepted: now,
-            progress: now,
-            request: now,
-        }
-    }
-
-    /// The limit exceeded at `now`. Time before an event, as after the
-    /// clock was set back, counts as none.
-    pub(crate) fn expiry(&self, usage: Usage, now: FileTime) -> Option<Expiry> {
-        let since = |time: FileTime| TimeSpan::between(time, now);
-        if !usage.session && since(self.accepted) >= LOGON_LIMIT {
-            Some(Expiry::NoLogon)
-        } else if usage.in_transfer && since(self.progress) >= STALL_LIMIT {
-            Some(Expiry::Stalled)
-        } else if !usage.opens && since(self.request) >= IDLE_LIMIT {
-            Some(Expiry::Idle)
-        } else {
-            None
-        }
-    }
+/// A connection slot considered by [`eviction`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EvictionCandidate {
+    pub(crate) index: usize,
+    pub(crate) activity: Activity,
+    /// A session completed its logon.
+    pub(crate) session: bool,
 }
 
 /// The connection to close for a new one when every slot is in use: the
 /// earliest accepted of those without a session, otherwise the one that
 /// sent no request for the longest time if that is at least
-/// [`RECLAIM_LIMIT`]. `connections` yields each slot's index, activity,
-/// and whether it has a session.
+/// [`RECLAIM_LIMIT`].
 pub(crate) fn eviction(
-    connections: impl Iterator<Item = (usize, Activity, bool)> + Clone,
+    connections: impl Iterator<Item = EvictionCandidate> + Clone,
     now: FileTime,
 ) -> Option<usize> {
     let without_session = connections
         .clone()
-        .filter(|&(_, _, session)| !session)
-        .min_by_key(|&(_, activity, _)| activity.accepted)
-        .map(|(index, _, _)| index);
+        .filter(|candidate| !candidate.session)
+        .min_by_key(|candidate| candidate.activity.accepted)
+        .map(|candidate| candidate.index);
+
     without_session.or_else(|| {
         connections
-            .filter(|&(_, activity, _)| TimeSpan::between(activity.request, now) >= RECLAIM_LIMIT)
-            .min_by_key(|&(_, activity, _)| activity.request)
-            .map(|(index, _, _)| index)
+            .filter(|candidate| TimeSpan::between(candidate.activity.request, now) >= RECLAIM_LIMIT)
+            .min_by_key(|candidate| candidate.activity.request)
+            .map(|candidate| candidate.index)
     })
 }
 
@@ -116,15 +126,23 @@ mod tests {
     const STALL_LIMIT: u64 = super::STALL_LIMIT.0;
     const IDLE_LIMIT: u64 = super::IDLE_LIMIT.0;
 
-    fn at(offset: u64) -> FileTime {
-        FileTime(START.0 + offset)
-    }
-
     const IDLE: Usage = Usage {
         session: true,
         opens: false,
         in_transfer: false,
     };
+
+    fn at(offset: u64) -> FileTime {
+        FileTime(START.0 + offset)
+    }
+
+    fn candidate(index: usize, activity: Activity, session: bool) -> EvictionCandidate {
+        EvictionCandidate {
+            index,
+            activity,
+            session,
+        }
+    }
 
     #[test]
     fn connections_without_a_logon_expire() {
@@ -185,9 +203,9 @@ mod tests {
     #[test]
     fn eviction_takes_the_oldest_connection_without_a_session() {
         let connections = [
-            (0, Activity::new(at(5)), false),
-            (1, Activity::new(at(1)), true),
-            (2, Activity::new(at(3)), false),
+            candidate(0, Activity::new(at(5)), false),
+            candidate(1, Activity::new(at(1)), true),
+            candidate(2, Activity::new(at(3)), false),
         ];
         assert_eq!(eviction(connections.into_iter(), at(10)), Some(2));
     }
@@ -199,7 +217,7 @@ mod tests {
         quiet.request = at(2 * SECOND);
         let mut busy = Activity::new(START);
         busy.request = at(4 * SECOND);
-        let connections = [(0, busy, true), (1, quiet, true)];
+        let connections = [candidate(0, busy, true), candidate(1, quiet, true)];
         assert_eq!(
             eviction(connections.into_iter(), at(2 * SECOND + RECLAIM_LIMIT - 1)),
             None

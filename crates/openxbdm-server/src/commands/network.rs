@@ -1,5 +1,6 @@
 //! Network inspection and simulation commands.
 
+mod error;
 pub mod ipproxy;
 pub mod netcap;
 pub mod netsim;
@@ -10,9 +11,7 @@ use core::num::NonZeroI32;
 
 use openxbdm_core::line::CommandLine;
 use openxbdm_core::status::ErrorCode;
-use openxbdm_core::status::Hresult;
 use openxbdm_core::status::Win32Error;
-use openxbdm_core::status::XbdmHresult;
 
 use crate::access::Access;
 use crate::backend::Backend as AnyBackend;
@@ -31,6 +30,9 @@ use crate::reply::Reply;
 use crate::state::ServerState;
 use crate::text::Text;
 
+pub use self::error::MissingLinkMask;
+pub use self::error::NetworkError;
+pub use self::error::TableError;
 pub(crate) use netsim::ini_netsim;
 pub(crate) use xhttpproxy::ini_xhttpproxy;
 pub(crate) use xhttpproxy::settings_lines as xhttpproxy_settings_lines;
@@ -176,58 +178,6 @@ impl From<WsaError> for Win32Error {
     }
 }
 
-/// `linkstate setflags` without both masks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MissingLinkMask;
-
-impl From<MissingLinkMask> for CommandError {
-    fn from(_: MissingLinkMask) -> Self {
-        ErrorCode::BadParameter.into()
-    }
-}
-
-/// A failed network command as its status reports it. A result of the
-/// monitor facility keeps its value; any other reads as 0x82da0000, the
-/// common exit of the stock handlers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NetworkError {
-    Netsim(netsim::NetsimError),
-    CaptureStart(netcap::StartError),
-    /// `ipproxy stop` without a running proxy (426, no default text).
-    ProxyNotStarted,
-    /// `netcap stop` without a capture (435, no default text).
-    NotCapturing,
-    /// Frames were lost to a full capture write buffer.
-    FramesLost,
-    /// A certificate upload was cut short by the connection.
-    UploadAborted,
-}
-
-impl From<NetworkError> for Hresult {
-    #[inline(never)]
-    fn from(error: NetworkError) -> Self {
-        let result = match error {
-            NetworkError::Netsim(error) => error.into(),
-            NetworkError::CaptureStart(error) => error.into(),
-            NetworkError::ProxyNotStarted => Hresult::ALREADY_STOPPED,
-            NetworkError::NotCapturing => Hresult::CAPTURE_NOT_ENABLED,
-            NetworkError::FramesLost => Hresult::BUFFER_FULL,
-            NetworkError::UploadAborted => Hresult::CONNECTION_LOST,
-        };
-        if result.facility() == Hresult::OK.facility() {
-            result
-        } else {
-            ErrorCode::Undefined.hresult()
-        }
-    }
-}
-
-impl From<NetworkError> for CommandError {
-    fn from(error: NetworkError) -> Self {
-        Self::Network(error)
-    }
-}
-
 /// Ethernet link status bits (`XNetGetEthernetLinkStatus`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinkStatus(pub u32);
@@ -262,15 +212,6 @@ pub enum Table {
     Keys,
     SecurityAssociations,
     QosLookups,
-}
-
-/// Why a table snapshot failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TableError {
-    /// The network stack does not provide the table or refused the query.
-    Unavailable,
-    /// No memory for the snapshot.
-    OutOfMemory,
 }
 
 /// A key exchange identifier.
@@ -434,6 +375,7 @@ fn open_xn_table(invocation: &mut Invocation<'_>, table: Table) -> CommandResult
     if invocation.backend.system_version() < XN_TABLES_VERSION {
         return Err(ErrorCode::UnknownCommand.into());
     }
+
     open_table(invocation, table)
 }
 
@@ -443,17 +385,20 @@ fn open_table(invocation: &mut Invocation<'_>, table: Table) -> CommandResult {
     let Some(session) = invocation.session.as_deref_mut() else {
         return Err(CommandError::Fail);
     };
+
     let count = match invocation.backend.open_table(session.index(), table) {
         Ok(count) => count,
         Err(TableError::Unavailable) => return Err(ErrorCode::AccessDenied.into()),
         Err(TableError::OutOfMemory) => return Err(ErrorCode::OutOfMemory.into()),
     };
+
     session.receive_remaining = None;
     session.continuation = AnyContinuation::Network(Continuation::Table {
         table,
         next: 0,
         count,
     });
+
     Ok(Reply::Multiline)
 }
 
@@ -463,14 +408,18 @@ fn table_line(next: &mut u32, count: u32, cx: &mut ContinuationContext<'_>) -> C
         cx.backend.close_table(connection);
         return Err(CommandError::EndOfData);
     }
+
     let record = cx.backend.table_record(connection, *next);
     *next += 1;
+
     let mut line = Text::<TABLE_LINE_LIMIT>::new();
     if let Some(record) = record {
         // Overflow truncates the line as the monitor's buffer does.
         let _ = write_record(&mut line, &record);
     }
+
     cx.line.set_bytes(line.as_bytes());
+
     Ok(Reply::Ok)
 }
 
@@ -585,6 +534,7 @@ pub(crate) fn execute_link_state(
         invocation.set_text(format_args!("state=0x{old:08x}"));
         return Ok(Reply::Ok);
     };
+
     match invocation.backend.set_link_flags(flags) {
         Ok(()) => {
             invocation.set_text(format_args!(
@@ -615,6 +565,7 @@ pub fn link_error(error: WsaError) -> CommandError {
 fn nic_stats(invocation: &mut Invocation<'_>) -> CommandResult {
     let device_flags = invocation.line.dword("deviceflags").unwrap_or(u32::MAX);
     let stats = invocation.backend.nic_stats(device_flags);
+
     invocation.set_text(format_args!(
         "tb=0q{:x} rub=0q{:x} ru1b=0q{:x} ru2b=0q{:x} rmb=0q{:x} rbb=0q{:x} tf={} ruf={} ru1f={} ru2f={} rmf={} \
          rbf={} tue={} toe={} rfe={} rce={} roe={}",
@@ -636,6 +587,7 @@ fn nic_stats(invocation: &mut Invocation<'_>) -> CommandResult {
         stats.receive_crc_errors,
         stats.receive_other_errors,
     ));
+
     Ok(Reply::Ok)
 }
 
@@ -650,6 +602,7 @@ pub fn decode_hex(text: &[u8], output: &mut [u8]) -> Option<usize> {
         Some(&byte) => byte,
     };
     let digit = |byte: u8| char::from(byte).to_digit(16).map(|value| value as u8);
+
     let mut count = 0;
     let mut position = 0;
     loop {
@@ -657,6 +610,7 @@ pub fn decode_hex(text: &[u8], output: &mut [u8]) -> Option<usize> {
         if matches!(high, 0 | b' ' | b'"') {
             return Some(count);
         }
+
         let slot = output.get_mut(count)?;
         *slot = (digit(high)? << 4) | digit(at(position + 1))?;
         count += 1;
@@ -678,6 +632,7 @@ pub(crate) fn address_settings_lines(
 ) {
     let address = backend.address_settings();
     let dword = |address: Ipv4Address| u32::from_be_bytes(address.octets());
+
     system::write_line(
         backend,
         file,

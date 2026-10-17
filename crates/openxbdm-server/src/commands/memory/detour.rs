@@ -18,6 +18,8 @@ use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::Win32Error;
 
+pub use super::error::DetourError;
+
 /// Hook entries, and trampolines (0x91f9f510).
 pub const ENTRY_COUNT: u32 = 0x2e8;
 /// Bytes per trampoline: `li r12, id`, a branch to the entry stub, then
@@ -32,6 +34,8 @@ pub const RECORD_SIZE: usize = 0x70;
 const RECORD_WORDS: usize = RECORD_SIZE / 4;
 /// Records in the pool (0x91f9f328).
 pub const RECORD_COUNT: usize = 0x40;
+/// Words of the record storage the platform provides.
+pub const RECORD_STORAGE_WORDS: usize = RECORD_COUNT * RECORD_WORDS;
 /// Bytes of title memory one parameter record carries.
 pub const BLOCK_SIZE: usize = 0x68;
 const COMPLETION_SLOTS: usize = 0x40;
@@ -48,17 +52,6 @@ impl ReturnValue {
     /// `ERROR_IO_PENDING`: the result of a discarded call that completes
     /// its overlapped request later.
     pub const IO_PENDING: Self = Self(Win32Error::IO_PENDING.code());
-}
-
-/// Why an engine request failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DetourError {
-    /// The engine is not running.
-    NotRunning,
-    /// The entry id is out of range.
-    BadEntry,
-    /// Every entry is in use.
-    NoFreeEntry,
 }
 
 /// Index of a hook entry and its trampoline.
@@ -153,17 +146,6 @@ pub struct Trampoline {
     pub scribble_size: u32,
 }
 
-/// A link of the entry lists: entry index + 1, or 0 for none.
-fn load_link(link: &AtomicU32) -> Option<usize> {
-    link.load(Ordering::Relaxed)
-        .checked_sub(1)
-        .map(|index| index as usize)
-}
-
-fn store_link(link: &AtomicU32, index: Option<usize>) {
-    link.store(index.map_or(0, |index| index as u32 + 1), Ordering::Relaxed);
-}
-
 /// One 0x34-byte hook entry.
 struct Entry {
     address: AtomicU32,
@@ -209,11 +191,6 @@ impl Entry {
     }
 }
 
-/// The stored and logged word of an extended error.
-fn win32_code(error: Option<Win32Error>) -> u32 {
-    error.map_or(0, Win32Error::code)
-}
-
 /// Hook entries on a free list and an in-use list (0x91f9f508,
 /// 0x91f9f50c). The list operations reproduce stock's pointer updates,
 /// including their effect when an entry that is not in use is released.
@@ -241,6 +218,7 @@ impl EntryTable {
                 Some(index + 1).filter(|&next| next < self.entries.len()),
             );
         }
+
         store_link(&self.free, Some(0));
         store_link(&self.used, None);
     }
@@ -250,17 +228,20 @@ impl EntryTable {
     fn acquire(&self) -> Option<usize> {
         let index = load_link(&self.free)?;
         let entry = &self.entries[index];
+
         let next = load_link(&entry.next);
         store_link(&self.free, next);
         if let Some(next) = next {
             store_link(&self.entries[next].previous, None);
         }
+
         let used = load_link(&self.used);
         store_link(&entry.next, used);
         if let Some(used) = used {
             store_link(&self.entries[used].previous, Some(index));
         }
         store_link(&self.used, Some(index));
+
         for field in [
             &entry.flags,
             &entry.sleep_milliseconds,
@@ -269,6 +250,7 @@ impl EntryTable {
         ] {
             field.store(0, Ordering::Relaxed);
         }
+
         Some(index)
     }
 
@@ -286,12 +268,14 @@ impl EntryTable {
         if load_link(&self.used) == Some(index) {
             store_link(&self.used, load_link(&entry.next));
         }
+
         if let Some(free) = load_link(&self.free) {
             store_link(&self.entries[free].previous, Some(index));
         }
         store_link(&entry.next, load_link(&self.free));
         store_link(&entry.previous, None);
         store_link(&self.free, Some(index));
+
         entry.flags.store(0, Ordering::Relaxed);
     }
 }
@@ -333,6 +317,7 @@ impl RecordQueue {
         for (index, cell) in self.cells.iter().enumerate() {
             cell.sequence.store(index as u32, Ordering::Relaxed);
         }
+
         self.head.store(0, Ordering::Relaxed);
         self.tail.store(0, Ordering::Release);
     }
@@ -345,6 +330,7 @@ impl RecordQueue {
             if lag < 0 {
                 return false;
             }
+
             if lag == 0
                 && self
                     .tail
@@ -375,6 +361,7 @@ impl RecordQueue {
             if lag < 0 {
                 return None;
             }
+
             if lag == 0
                 && self
                     .head
@@ -414,9 +401,6 @@ struct Record {
     index: RecordIndex,
     words: &'static [AtomicU32],
 }
-
-/// Words of the record storage the platform provides.
-pub const RECORD_STORAGE_WORDS: usize = RECORD_COUNT * RECORD_WORDS;
 
 /// The free and filled queues of the record pool, and the log counters
 /// (0x91f9f328..0x91f9f450). Records are reused without clearing, so a
@@ -466,15 +450,8 @@ impl RecordLog {
         for (chunk, word) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(record.words) {
             chunk.copy_from_slice(&word.load(Ordering::Relaxed).to_be_bytes());
         }
-        bytes
-    }
-}
 
-/// The words of record `index` in `storage`.
-fn record_in(storage: &'static [AtomicU32], index: RecordIndex) -> Record {
-    Record {
-        index,
-        words: &storage[index.0 * RECORD_WORDS..][..RECORD_WORDS],
+        bytes
     }
 }
 
@@ -676,6 +653,7 @@ impl Default for Engine {
     fn default() -> Self {
         let engine = Self::new();
         engine.initialize();
+
         engine
     }
 }
@@ -722,6 +700,7 @@ impl Engine {
         if !self.running() {
             return Err(DetourError::NotRunning);
         }
+
         // Stock accepts an id equal to the entry count and then reads past
         // the table.
         id.index().ok_or(DetourError::BadEntry)
@@ -732,6 +711,7 @@ impl Engine {
         if !self.running() {
             return Err(DetourError::NotRunning);
         }
+
         Ok(self
             .log
             .written
@@ -754,6 +734,7 @@ impl Engine {
         if !self.running() {
             return Err(DetourError::NotRunning);
         }
+
         self.table
             .acquire()
             .map(|index| EntryId(index as u32))
@@ -764,6 +745,7 @@ impl Engine {
     /// entry.
     pub fn release(&self, platform: &dyn Platform, id: EntryId) -> Result<(), DetourError> {
         let index = self.checked_entry(id)?;
+
         if let Some(record) = self.allocate(platform) {
             self.log.set_u32(record, 4, 0);
             self.log.set_u32(record, 0, RecordType::Release as u32);
@@ -771,13 +753,16 @@ impl Engine {
             self.log.set_u32(record, 0x18, id.0);
             self.submit(platform, record);
         }
+
         self.table.release(index);
+
         Ok(())
     }
 
     /// `entry query` (0x91f2bb30).
     pub fn query(&self, platform: &dyn Platform, id: EntryId) -> Result<Trampoline, DetourError> {
         self.checked_entry(id)?;
+
         let enter = platform.trampolines().wrapping_add(id.0 * TRAMPOLINE_SIZE);
         Ok(Trampoline {
             enter,
@@ -803,6 +788,7 @@ impl Engine {
         settings: &HookSettings,
     ) -> Result<(), DetourError> {
         let index = self.checked_entry(id)?;
+
         if let Some(record) = self.allocate(platform) {
             self.log.set_u32(record, 0x1c, settings.flags.bits());
             self.log.set_u32(record, 0x18, id.0);
@@ -815,6 +801,7 @@ impl Engine {
             self.log.set_u64(record, 0x10, platform.system_time());
             self.submit(platform, record);
         }
+
         let entry = &self.table.entries[index];
         entry.address.store(settings.address, Ordering::Relaxed);
         entry
@@ -836,6 +823,7 @@ impl Engine {
         entry
             .overlapped_offset
             .store(settings.overlapped_offset, Ordering::Relaxed);
+
         Ok(())
     }
 
@@ -845,6 +833,7 @@ impl Engine {
     pub fn release_range(&self, platform: &dyn Platform, base: u32, size: u32) {
         let end = base.wrapping_add(size);
         let mut cursor = load_link(&self.table.used);
+
         // Stock follows the list without a bound; a list corrupted by
         // releasing a free entry would loop forever.
         for _ in 0..ENTRY_COUNT {
@@ -853,10 +842,12 @@ impl Engine {
             };
             let entry = &self.table.entries[index];
             cursor = load_link(&entry.next);
+
             let address = Entry::get(&entry.address);
             if address < base || address >= end {
                 continue;
             }
+
             if let Some(record) = self.allocate(platform) {
                 self.log.set_u32(record, 4, 0);
                 self.log.set_u32(record, 0, RecordType::Release as u32);
@@ -865,6 +856,7 @@ impl Engine {
                 self.log.set_u32(record, 0x18, index as u32);
                 self.submit(platform, record);
             }
+
             self.table.release(index);
         }
     }
@@ -876,6 +868,7 @@ impl Engine {
         if started {
             self.status.store(0, Ordering::Relaxed);
         }
+
         started
     }
 
@@ -894,20 +887,25 @@ impl Engine {
         log.written.store(0, Ordering::Relaxed);
         log.read.store(0, Ordering::Relaxed);
         log.users.store(0, Ordering::Relaxed);
+
         if !platform.allocate_records() {
             return false;
         }
+
         let Some(storage) = platform.records() else {
             return false;
         };
+
         for word in storage {
             word.store(0, Ordering::Relaxed);
         }
+
         log.free.reset();
         log.filled.reset();
         for index in 0..RECORD_COUNT {
             log.free.push(RecordIndex(index));
         }
+
         true
     }
 
@@ -956,19 +954,23 @@ impl Engine {
         let Some(storage) = platform.records() else {
             return;
         };
+
         loop {
             log.users.fetch_add(1, Ordering::AcqRel);
             if !log.accepting.load(Ordering::Acquire) {
                 log.users.fetch_sub(1, Ordering::AcqRel);
                 return;
             }
+
             let Some(record) = log.filled.pop() else {
                 log.users.fetch_sub(1, Ordering::AcqRel);
                 return;
             };
+
             if write(&log.bytes(record_in(storage, record))) {
                 log.written.fetch_add(1, Ordering::AcqRel);
             }
+
             if log.free.push(record) {
                 log.users.fetch_sub(1, Ordering::AcqRel);
                 platform.record_freed();
@@ -983,10 +985,12 @@ impl Engine {
         if log.users.load(Ordering::Acquire) == 0 {
             return false;
         }
+
         while let Some(record) = log.filled.pop() {
             log.free.push(record);
             platform.record_freed();
         }
+
         true
     }
 
@@ -995,6 +999,7 @@ impl Engine {
         platform.lock_completions();
         self.completions.reset();
         platform.unlock_completions();
+
         self.state
             .store(EngineState::Stopped.code(), Ordering::Release);
     }
@@ -1004,6 +1009,7 @@ impl Engine {
     fn allocate(&self, platform: &dyn Platform) -> Option<Record> {
         let log = &self.log;
         log.users.fetch_add(1, Ordering::AcqRel);
+
         // Records are accepted only after the storage was obtained.
         let storage = platform
             .records()
@@ -1012,6 +1018,7 @@ impl Engine {
             log.users.fetch_sub(1, Ordering::AcqRel);
             return None;
         };
+
         loop {
             if let Some(record) = log.free.pop() {
                 return Some(record_in(storage, record));
@@ -1043,12 +1050,15 @@ impl Engine {
         let Some(record) = self.allocate(platform) else {
             return;
         };
+
         self.log.set_u32(record, 4, sequence);
         self.log.set_u32(record, 0, kind as u32);
+
         let mut block = [0u8; BLOCK_SIZE];
         // SAFETY: the caller's contract.
         unsafe { platform.read_block(source, &mut block) };
         self.log.set_bytes(record, 8, &block);
+
         self.submit(platform, record);
     }
 
@@ -1075,6 +1085,7 @@ impl Engine {
         let Some(entry) = self.entry_of(call) else {
             return;
         };
+
         let calls = entry.calls.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         let discard = if entry.flags().contains(HookFlags::CALL_ORIGINAL) {
             false
@@ -1084,6 +1095,7 @@ impl Engine {
                 frequency => calls % frequency == 0,
             }
         };
+
         call.param_size = Entry::get(&entry.param_size);
         call.flags = entry.flags();
         let enter = platform
@@ -1123,6 +1135,7 @@ impl Engine {
         if call.overlapped.is_none() {
             call.flags = call.flags.difference(HookFlags::OVERLAPPED);
         }
+
         if discard {
             call.function = None;
             call.flags = call.flags.union(HookFlags::DISCARDED);
@@ -1145,13 +1158,16 @@ impl Engine {
                     self.log
                         .set_u32(record, 0x60, Entry::get(&entry.sleep_milliseconds));
                 }
+
                 let parameters = entry.flags().contains(HookFlags::LOG_PARAMETERS);
                 if call.flags.contains(HookFlags::REGISTERS) && parameters {
                     for (index, register) in call.registers.iter().enumerate() {
                         self.log.set_u64(record, 0x20 + index * 8, *register);
                     }
                 }
+
                 self.submit(platform, record);
+
                 if call.flags.contains(HookFlags::STACK)
                     && entry.flags().contains(HookFlags::LOG_PARAMETERS)
                 {
@@ -1173,10 +1189,14 @@ impl Engine {
                         }
                     }
                 }
+
                 call.flags = call.flags.union(HookFlags::LOGGED);
             }
-            None => call.flags = call.flags.difference(HookFlags::LOGGED),
+            None => {
+                call.flags = call.flags.difference(HookFlags::LOGGED);
+            }
         }
+
         if entry.flags().contains(HookFlags::SLEEP_BEFORE) {
             platform.sleep(Entry::get(&entry.sleep_milliseconds));
         }
@@ -1241,6 +1261,7 @@ impl Engine {
         let Some(entry) = self.entry_of(call) else {
             return;
         };
+
         if call.flags.contains(HookFlags::DISCARDED) {
             match call.overlapped {
                 Some(overlapped) => {
@@ -1249,6 +1270,7 @@ impl Engine {
                     } else {
                         0
                     };
+
                     call.return_value = ReturnValue::IO_PENDING;
                     // SAFETY: words of the XOVERLAPPED of the caller's
                     // contract.
@@ -1261,6 +1283,7 @@ impl Engine {
                     } else {
                         None
                     };
+
                     self.defer_completion(
                         platform,
                         PendingCompletion {
@@ -1275,19 +1298,25 @@ impl Engine {
                         },
                     );
                 }
-                None => call.return_value = entry.return_value(),
+                None => {
+                    call.return_value = entry.return_value();
+                }
             }
         }
+
         if entry.flags().contains(HookFlags::SLEEP_AFTER) && call.overlapped.is_none() {
             platform.sleep(Entry::get(&entry.sleep_milliseconds));
         }
+
         if !entry.flags().contains(HookFlags::LOG_RETURN) || !call.flags.contains(HookFlags::LOGGED)
         {
             return;
         }
+
         let Some(record) = self.allocate(platform) else {
             return;
         };
+
         self.log.set_u32(record, 0, RecordType::Return as u32);
         self.log.set_u32(record, 4, call.sequence);
         self.log.set_u32(record, 0x14, call.flags.bits());
@@ -1298,6 +1327,7 @@ impl Engine {
             self.log
                 .set_u32(record, 0x1c, Entry::get(&entry.sleep_milliseconds));
         }
+
         self.submit(platform, record);
     }
 
@@ -1306,6 +1336,7 @@ impl Engine {
     fn defer_completion(&self, platform: &dyn Platform, pending: PendingCompletion) {
         let completions = &self.completions;
         platform.lock_completions();
+
         if let Some(index) = load_link(&completions.free) {
             let slot = &completions.slots[index];
             store_link(&completions.free, load_link(&slot.next));
@@ -1327,6 +1358,7 @@ impl Engine {
             slot.flags.store(pending.flags.bits(), Ordering::Relaxed);
             platform.completion_queued();
         }
+
         platform.unlock_completions();
     }
 
@@ -1337,18 +1369,22 @@ impl Engine {
         let now = platform.tick_count();
         let completions = &self.completions;
         platform.lock_completions();
+
         let mut pending = 0u32;
         for (index, slot) in completions.slots.iter().enumerate() {
             if !slot.in_use.load(Ordering::Relaxed) {
                 continue;
             }
+
             if slot.due.load(Ordering::Relaxed) > now {
                 pending += 1;
                 continue;
             }
+
             let overlapped = slot.overlapped.load(Ordering::Relaxed);
             let status = slot.status.load(Ordering::Relaxed);
             let extended_error = slot.extended_error.load(Ordering::Relaxed);
+
             // 0x91f2b8b8: the extended error and InternalHigh first, the
             // status last, then the event.
             // SAFETY: only `exit` queues completions; its contract keeps
@@ -1366,6 +1402,7 @@ impl Engine {
                     platform.signal_event(event);
                 }
             }
+
             // Stock reuses the previous record of this pass for an unlogged
             // call and queues it a second time; no record is written here.
             if HookFlags::from_bits_retain(slot.flags.load(Ordering::Relaxed))
@@ -1385,16 +1422,43 @@ impl Engine {
                 self.log.set_u64(record, 0x20, platform.system_time());
                 self.submit(platform, record);
             }
+
             slot.in_use.store(false, Ordering::Relaxed);
             slot.next
                 .store(completions.free.load(Ordering::Relaxed), Ordering::Relaxed);
             store_link(&completions.free, Some(index));
         }
+
         if pending == 0 {
             platform.completions_idle();
         }
         platform.unlock_completions();
+
         pending != 0
+    }
+}
+
+/// A link of the entry lists: entry index + 1, or 0 for none.
+fn load_link(link: &AtomicU32) -> Option<usize> {
+    link.load(Ordering::Relaxed)
+        .checked_sub(1)
+        .map(|index| index as usize)
+}
+
+fn store_link(link: &AtomicU32, index: Option<usize>) {
+    link.store(index.map_or(0, |index| index as u32 + 1), Ordering::Relaxed);
+}
+
+/// The stored and logged word of an extended error.
+fn win32_code(error: Option<Win32Error>) -> u32 {
+    error.map_or(0, Win32Error::code)
+}
+
+/// The words of record `index` in `storage`.
+fn record_in(storage: &'static [AtomicU32], index: RecordIndex) -> Record {
+    Record {
+        index,
+        words: &storage[index.0 * RECORD_WORDS..][..RECORD_WORDS],
     }
 }
 

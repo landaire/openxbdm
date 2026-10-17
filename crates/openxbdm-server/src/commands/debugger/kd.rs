@@ -6,11 +6,12 @@ use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
-use openxbdm_core::status::XbdmHresult;
 use xbox360_sys::xboxkrnl::HardwareFlags;
 
 use super::ExtensionHandle;
 use super::context::strtoul;
+use super::error::ExtensionError;
+use super::error::KdnetSetError;
 use super::events;
 use crate::backend::Backend as AnyBackend;
 use crate::commands::console::ConfigSetting;
@@ -25,13 +26,6 @@ use crate::text::Text;
 /// Offset of the kdnet settings record in the raw flash device.
 pub const KDNET_RECORD_OFFSET: u32 = 0x80;
 pub const KDNET_RECORD_SIZE: usize = 0x80;
-const KDNET_SIGNATURE: u16 = 0xca4a;
-/// Value of a successful flash access in the `kdnet` texts; a failure
-/// prints its status as an NT-facility result.
-const FLASH_SUCCESS: Hresult = Hresult::from_nt(NtStatus::SUCCESS);
-const EXTENSION_DIRECTORY: &[u8] = b"\\Device\\Harddisk0\\Partition1\\DEVKIT\\DMEXT\\";
-/// Characters kept of an extension path.
-const EXTENSION_PATH_LIMIT: usize = 0x6b;
 pub const EXTENSION_NAME_CAPACITY: usize = 0x3f;
 
 /// The loaded debugger extension.
@@ -40,87 +34,6 @@ pub struct Extension {
     pub name: Text<EXTENSION_NAME_CAPACITY>,
     pub handle: ExtensionHandle,
     pub references: u32,
-}
-
-fn improper(invocation: &mut Invocation<'_>) -> CommandResult {
-    invocation.set_text(format_args!("improper command"));
-    Err(CommandError::Fail)
-}
-
-/// `kd enable|disable|except|exceptif`.
-pub(super) fn kernel_debugger(invocation: &mut Invocation<'_>) -> CommandResult {
-    let line = invocation.line;
-    if line.has("enable") {
-        invocation.state.debugger.kernel_debugger = Some(true);
-        invocation.set_text(format_args!("kd enabled"));
-        return Ok(Reply::Ok);
-    }
-    if line.has("disable") {
-        invocation.state.debugger.kernel_debugger = Some(false);
-        invocation.set_text(format_args!("kd disabled"));
-        return Ok(Reply::Ok);
-    }
-    let except = if line.has("except") {
-        true
-    } else if line.has("exceptif") {
-        invocation
-            .backend
-            .hardware_flags()
-            .contains(HardwareFlags::KERNEL_DEBUGGER_ENABLED)
-    } else {
-        return improper(invocation);
-    };
-    if except {
-        invocation.state.debugger.kernel_debugger = Some(true);
-        events::release_all(invocation.state, invocation.backend, invocation.network);
-    }
-    Ok(Reply::Ok)
-}
-
-/// `kdlite enable|disable`.
-pub(super) fn kernel_debugger_lite(invocation: &mut Invocation<'_>) -> CommandResult {
-    // Kd lite exists only on test kits.
-    if !invocation
-        .backend
-        .hardware_flags()
-        .contains(HardwareFlags::TEST_KIT)
-    {
-        return improper(invocation);
-    }
-    let enable = if invocation.line.has("enable") {
-        true
-    } else if invocation.line.has("disable") {
-        false
-    } else {
-        return improper(invocation);
-    };
-    let mut value = [0u8; 4];
-    if invocation
-        .backend
-        .xconfig_get(ConfigSetting::CONSOLE_FLAGS, &mut value)
-        .is_err()
-    {
-        return improper(invocation);
-    }
-    let mut flags = ConsoleConfigFlags::from_bits_retain(u32::from_be_bytes(value));
-    if enable {
-        flags.insert(ConsoleConfigFlags::KD_LITE);
-    } else {
-        flags.remove(ConsoleConfigFlags::KD_LITE);
-    }
-    if invocation
-        .backend
-        .xconfig_set(ConfigSetting::CONSOLE_FLAGS, &flags.bits().to_be_bytes())
-        .is_err()
-    {
-        return improper(invocation);
-    }
-    invocation.state.debugger.kd_lite = enable;
-    invocation.set_text(format_args!(
-        "kd lite {}",
-        if enable { "enabled" } else { "disabled" }
-    ));
-    Ok(Reply::Ok)
 }
 
 /// The kdnet settings record.
@@ -162,8 +75,104 @@ impl KdnetRecord {
     }
 }
 
+fn improper(invocation: &mut Invocation<'_>) -> CommandResult {
+    invocation.set_text(format_args!("improper command"));
+
+    Err(CommandError::Fail)
+}
+
+/// `kd enable|disable|except|exceptif`.
+pub(super) fn kernel_debugger(invocation: &mut Invocation<'_>) -> CommandResult {
+    let line = invocation.line;
+    if line.has("enable") {
+        invocation.state.debugger.kernel_debugger = Some(true);
+        invocation.set_text(format_args!("kd enabled"));
+        return Ok(Reply::Ok);
+    }
+
+    if line.has("disable") {
+        invocation.state.debugger.kernel_debugger = Some(false);
+        invocation.set_text(format_args!("kd disabled"));
+        return Ok(Reply::Ok);
+    }
+
+    let except = if line.has("except") {
+        true
+    } else if line.has("exceptif") {
+        invocation
+            .backend
+            .hardware_flags()
+            .contains(HardwareFlags::KERNEL_DEBUGGER_ENABLED)
+    } else {
+        return improper(invocation);
+    };
+
+    if except {
+        invocation.state.debugger.kernel_debugger = Some(true);
+        events::release_all(invocation.state, invocation.backend, invocation.network);
+    }
+
+    Ok(Reply::Ok)
+}
+
+/// `kdlite enable|disable`.
+pub(super) fn kernel_debugger_lite(invocation: &mut Invocation<'_>) -> CommandResult {
+    // Kd lite exists only on test kits.
+    if !invocation
+        .backend
+        .hardware_flags()
+        .contains(HardwareFlags::TEST_KIT)
+    {
+        return improper(invocation);
+    }
+
+    let enable = if invocation.line.has("enable") {
+        true
+    } else if invocation.line.has("disable") {
+        false
+    } else {
+        return improper(invocation);
+    };
+
+    let mut value = [0u8; 4];
+    if invocation
+        .backend
+        .xconfig_get(ConfigSetting::CONSOLE_FLAGS, &mut value)
+        .is_err()
+    {
+        return improper(invocation);
+    }
+
+    let mut flags = ConsoleConfigFlags::from_bits_retain(u32::from_be_bytes(value));
+    if enable {
+        flags.insert(ConsoleConfigFlags::KD_LITE);
+    } else {
+        flags.remove(ConsoleConfigFlags::KD_LITE);
+    }
+
+    if invocation
+        .backend
+        .xconfig_set(ConfigSetting::CONSOLE_FLAGS, &flags.bits().to_be_bytes())
+        .is_err()
+    {
+        return improper(invocation);
+    }
+
+    invocation.state.debugger.kd_lite = enable;
+    invocation.set_text(format_args!(
+        "kd lite {}",
+        if enable { "enabled" } else { "disabled" }
+    ));
+
+    Ok(Reply::Ok)
+}
+
 /// A flash access result as the `kdnet` texts print it.
 fn flash_code(result: Result<(), KernelError>) -> Hresult {
+    /// Value of a successful flash access in the `kdnet` texts; a failure
+    /// prints its status as an NT-facility result.
+    const FLASH_SUCCESS: Hresult = Hresult::from_nt(NtStatus::SUCCESS);
+
     match result {
         Ok(()) => FLASH_SUCCESS,
         Err(error) => Hresult::from(error),
@@ -179,10 +188,12 @@ pub(super) fn kernel_debugger_network(invocation: &mut Invocation<'_>) -> Comman
             .set_bytes(b"kdnet is not supported on this flash version.\x1e");
         return Err(ErrorCode::UnknownCommand.into());
     }
+
     let mut record = KdnetRecord([0; KDNET_RECORD_SIZE]);
     let load = invocation
         .backend
         .read_flash(KDNET_RECORD_OFFSET, &mut record.0);
+
     let line = invocation.line;
     if line.has("enable") || line.has("disable") {
         let enable = line.has("enable");
@@ -193,12 +204,14 @@ pub(super) fn kernel_debugger_network(invocation: &mut Invocation<'_>) -> Comman
             ));
             return Ok(Reply::Ok);
         }
+
         if enable && !record.is_valid() {
             invocation.set_text(format_args!(
                 "kdnet: can't enable kdnet without setting the parameters."
             ));
             return Err(ErrorCode::UnknownCommand.into());
         }
+
         record.set_word(KdnetRecord::ENABLE, u32::from(enable));
         let save = invocation
             .backend
@@ -208,8 +221,10 @@ pub(super) fn kernel_debugger_network(invocation: &mut Invocation<'_>) -> Comman
             if enable { "enabled" } else { "disabled" },
             flash_code(save).0
         ));
+
         return Ok(Reply::Ok);
     }
+
     if line.has("show") {
         if load.is_err() {
             invocation.set_text(format_args!(
@@ -218,32 +233,35 @@ pub(super) fn kernel_debugger_network(invocation: &mut Invocation<'_>) -> Comman
             ));
             return Ok(Reply::Ok);
         }
-        let r = &record.0;
-        let t = KdnetRecord::TARGET_IP;
-        let m = KdnetRecord::TARGET_MAC;
-        let h = KdnetRecord::HOST_IP;
+
+        let bytes = &record.0;
+        let target_ip = KdnetRecord::TARGET_IP;
+        let target_mac = KdnetRecord::TARGET_MAC;
+        let host_ip = KdnetRecord::HOST_IP;
         invocation.set_text(format_args!(
             "kdnet settings:\x1e\tEnable={}\x1e\tTarget IP: {}.{}.{}.{}\x1e\tTarget MAC: {:02X}-{:02X}-{:02X}-{:02X}-{:02X}-{:02X}\x1e\tHost IP: {}.{}.{}.{}\x1e\tHost Port: {}\x1e\tEncrypted: {}\x1e",
             record.word(KdnetRecord::ENABLE) as i32,
-            r[t],
-            r[t + 1],
-            r[t + 2],
-            r[t + 3],
-            r[m],
-            r[m + 1],
-            r[m + 2],
-            r[m + 3],
-            r[m + 4],
-            r[m + 5],
-            r[h],
-            r[h + 1],
-            r[h + 2],
-            r[h + 3],
+            bytes[target_ip],
+            bytes[target_ip + 1],
+            bytes[target_ip + 2],
+            bytes[target_ip + 3],
+            bytes[target_mac],
+            bytes[target_mac + 1],
+            bytes[target_mac + 2],
+            bytes[target_mac + 3],
+            bytes[target_mac + 4],
+            bytes[target_mac + 5],
+            bytes[host_ip],
+            bytes[host_ip + 1],
+            bytes[host_ip + 2],
+            bytes[host_ip + 3],
             record.port(),
             record.word(KdnetRecord::ENCRYPTED) as i32,
         ));
+
         return Ok(Reply::Ok);
     }
+
     if line.has("set") {
         return match kdnet_set(invocation, &mut record) {
             Ok(()) => {
@@ -262,28 +280,8 @@ pub(super) fn kernel_debugger_network(invocation: &mut Invocation<'_>) -> Comman
             }
         };
     }
+
     Err(ErrorCode::BadParameter.into())
-}
-
-/// Why `kdnet set` failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KdnetSetError {
-    /// A parameter is malformed, or the settings are incomplete.
-    BadParameter,
-    /// The console MAC address for a default target address is unreadable.
-    ConsoleAddress(KernelError),
-    /// The settings record could not be written.
-    Save(KernelError),
-}
-
-impl KdnetSetError {
-    /// The error code the failure text prints.
-    fn code(self) -> Hresult {
-        match self {
-            Self::BadParameter => ErrorCode::BadParameter.hresult(),
-            Self::ConsoleAddress(error) | Self::Save(error) => Hresult::from(error),
-        }
-    }
 }
 
 /// Apply the `set` parameters and save. The last failing step decides the
@@ -292,13 +290,17 @@ fn kdnet_set(
     invocation: &mut Invocation<'_>,
     record: &mut KdnetRecord,
 ) -> Result<(), KdnetSetError> {
+    const KDNET_SIGNATURE: u16 = 0xca4a;
+
     let line = invocation.line;
     record.0[0..2].copy_from_slice(&KDNET_SIGNATURE.to_be_bytes());
     record.set_word(8, 0x10);
     record.set_word(0xc, 0x48);
     record.set_word(KdnetRecord::ENABLE, 1);
+
     let mut error = None;
     let mut supplied = false;
+
     if let Some(value) = line.param("IP") {
         supplied = true;
         let mut buffer = [0u8; 0x20];
@@ -309,6 +311,7 @@ fn kdnet_set(
             None => error = Some(KdnetSetError::BadParameter),
         }
     }
+
     if line.has("Port") {
         supplied = true;
         match line.dword("Port").filter(|&port| port <= 0xffff) {
@@ -317,28 +320,30 @@ fn kdnet_set(
             None => error = Some(KdnetSetError::BadParameter),
         }
     }
-    let mac = line.param("Mac");
-    let mut default_mac = false;
-    match mac {
+
+    let default_mac = match line.param("Mac") {
         Some(value) => {
             supplied = true;
             let mut buffer = [0u8; 0x20];
             let text = value.copy_into(&mut buffer);
             if text.is_empty() {
-                default_mac = true;
-            } else if let Some(failed) = parse_mac(
-                text,
-                &mut record.0[KdnetRecord::TARGET_MAC..KdnetRecord::TARGET_MAC + 6],
-            ) {
-                if failed {
-                    error = Some(KdnetSetError::BadParameter);
-                }
+                true
             } else {
-                error = Some(KdnetSetError::BadParameter);
+                match parse_mac(
+                    text,
+                    &mut record.0[KdnetRecord::TARGET_MAC..KdnetRecord::TARGET_MAC + 6],
+                ) {
+                    // Every octet parsed cleanly.
+                    Some(false) => {}
+                    Some(true) | None => error = Some(KdnetSetError::BadParameter),
+                }
+
+                false
             }
         }
-        None => default_mac = record.mac().iter().all(|&byte| byte == 0),
-    }
+        None => record.mac().iter().all(|&byte| byte == 0),
+    };
+
     if default_mac {
         let mut console_mac = [0u8; 6];
         match invocation
@@ -353,12 +358,15 @@ fn kdnet_set(
             Err(failure) => error = Some(KdnetSetError::ConsoleAddress(failure)),
         }
     }
+
     if !supplied || !record.is_valid() {
         error = Some(KdnetSetError::BadParameter);
     }
+
     if let Some(error) = error {
         return Err(error);
     }
+
     invocation
         .backend
         .write_flash(KDNET_RECORD_OFFSET, &record.0)
@@ -371,10 +379,12 @@ fn kdnet_set(
 fn parse_mac(text: &[u8], out: &mut [u8]) -> Option<bool> {
     let mut parts = text.split(|&byte| byte == b'-');
     let mut failed = false;
+
     for slot in out.iter_mut() {
         let part = parts.next()?;
         let mut value: u32 = 0;
         let mut consumed = 0;
+
         for &byte in part {
             let Some(digit) = (byte as char).to_digit(16) else {
                 break;
@@ -382,11 +392,13 @@ fn parse_mac(text: &[u8], out: &mut [u8]) -> Option<bool> {
             value = value.wrapping_mul(16).wrapping_add(digit);
             consumed += 1;
         }
+
         if consumed != part.len() || value > 0xff {
             failed = true;
         }
         *slot = value as u8;
     }
+
     Some(failed)
 }
 
@@ -396,11 +408,13 @@ fn inet_addr(text: &[u8]) -> Option<[u8; 4]> {
     let mut parts = [0u32; 4];
     let mut count = 0;
     let mut position = 0;
+
     loop {
         let rest = &text[position..];
         if !rest.first().is_some_and(u8::is_ascii_digit) || count == 4 {
             return None;
         }
+
         let (value, consumed) = strtoul(rest);
         parts[count] = value;
         count += 1;
@@ -412,6 +426,7 @@ fn inet_addr(text: &[u8]) -> Option<[u8; 4]> {
             Some(_) => return None,
         }
     }
+
     let value = match count {
         1 => parts[0],
         2 if parts[0] <= 0xff && parts[1] <= 0xff_ffff => parts[0] << 24 | parts[1],
@@ -423,36 +438,8 @@ fn inet_addr(text: &[u8]) -> Option<[u8; 4]> {
         }
         _ => return None,
     };
+
     (value != u32::MAX).then_some(value.to_be_bytes())
-}
-
-/// A debugger extension load or release failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExtensionError {
-    /// `443-`: another extension is loaded.
-    OtherLoaded,
-    /// The handle is not the loaded extension's.
-    UnknownHandle,
-    /// The loader or the unload failed.
-    Kernel(KernelError),
-}
-
-impl From<ExtensionError> for Hresult {
-    fn from(error: ExtensionError) -> Self {
-        match error {
-            ExtensionError::OtherLoaded => Hresult::EXTENSION_LOADED,
-            ExtensionError::UnknownHandle => ErrorCode::BadParameter.hresult(),
-            ExtensionError::Kernel(error) => {
-                CommandError::from_kernel(error, CommandError::Fail).into()
-            }
-        }
-    }
-}
-
-impl From<ExtensionError> for CommandError {
-    fn from(error: ExtensionError) -> Self {
-        Self::Extension(error)
-    }
 }
 
 /// Load the extension `name` from the DMEXT directory, or count another
@@ -463,13 +450,19 @@ pub fn load_extension(
     backend: &mut dyn AnyBackend,
     name: &[u8],
 ) -> Result<u32, ExtensionError> {
+    const EXTENSION_DIRECTORY: &[u8] = b"\\Device\\Harddisk0\\Partition1\\DEVKIT\\DMEXT\\";
+    // Characters kept of an extension path.
+    const EXTENSION_PATH_LIMIT: usize = 0x6b;
+
     if let Some(extension) = state.debugger.extension.as_mut() {
         if !extension.name.as_bytes().eq_ignore_ascii_case(name) {
             return Err(ExtensionError::OtherLoaded);
         }
+
         extension.references += 1;
         return Ok(extension.handle.raw());
     }
+
     let mut path = Text::<EXTENSION_PATH_LIMIT>::new();
     let _ = path.push_bytes(EXTENSION_DIRECTORY);
     let _ = path.push_bytes(name);
@@ -477,6 +470,7 @@ pub fn load_extension(
         .load_extension(path.as_bytes())
         .map_err(ExtensionError::Kernel)?;
     let module = handle.raw();
+
     let mut stored = Text::new();
     stored.set_bytes(name);
     state.debugger.extension = Some(Extension {
@@ -484,6 +478,7 @@ pub fn load_extension(
         handle,
         references: 1,
     });
+
     Ok(module)
 }
 
@@ -502,13 +497,16 @@ pub fn release_extension(
     else {
         return Err(ExtensionError::UnknownHandle);
     };
+
     extension.references -= 1;
     if extension.references != 0 {
         return Ok(());
     }
+
     let Some(extension) = state.debugger.extension.take() else {
         return Ok(());
     };
+
     backend
         .unload_extension(extension.handle)
         .map_err(ExtensionError::Kernel)
@@ -522,17 +520,21 @@ pub(super) fn debugger_extension(invocation: &mut Invocation<'_>) -> CommandResu
             invocation.set_text(format_args!("missing module"));
             return Err(ErrorCode::BadParameter.into());
         };
+
         release_extension(invocation.state, invocation.backend, module)?;
         return Ok(Reply::Ok);
     }
+
     let Some(value) = line.param("name") else {
         invocation.set_text(format_args!("missing name"));
         return Err(ErrorCode::BadParameter.into());
     };
+
     let mut buffer = [0u8; EXTENSION_NAME_CAPACITY + 1];
     let name = value.copy_into(&mut buffer);
     let module = load_extension(invocation.state, invocation.backend, name)?;
-    invocation.set_text(format_args!("module=0x{:08x}", module));
+    invocation.set_text(format_args!("module=0x{module:08x}"));
+
     Ok(Reply::Ok)
 }
 
@@ -544,6 +546,7 @@ pub(super) fn flag_number(line: &CommandLine<'_>, buffer: &[u8], name: &str) -> 
     if !line.has(name) {
         return None;
     }
+
     let end = buffer
         .iter()
         .position(|&byte| byte == 0)
@@ -556,18 +559,22 @@ pub(super) fn flag_number(line: &CommandLine<'_>, buffer: &[u8], name: &str) -> 
         .position(|&byte| separator(byte))
         .unwrap_or(bytes.len());
     let mut quoted = false;
+
     while position < bytes.len() {
         while position < bytes.len() && separator(bytes[position]) {
             position += 1;
         }
+
         let start = position;
         while position < bytes.len() && !separator(bytes[position]) && bytes[position] != b'=' {
             position += 1;
         }
+
         if bytes[start..position].eq_ignore_ascii_case(key) && !quoted {
             let value = bytes.get(position + 1..).unwrap_or_default();
             return Some(strtoul(value).0);
         }
+
         while position < bytes.len() && (quoted || !separator(bytes[position])) {
             if bytes[position] == b'"' {
                 quoted = !quoted;
@@ -575,6 +582,7 @@ pub(super) fn flag_number(line: &CommandLine<'_>, buffer: &[u8], name: &str) -> 
             position += 1;
         }
     }
+
     None
 }
 

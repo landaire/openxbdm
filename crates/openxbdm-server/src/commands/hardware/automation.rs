@@ -8,14 +8,13 @@
 //! advances it once its deadline has passed; the timer runs after the
 //! operation that started the entry releases the controller lock.
 
-use openxbdm_core::status::ErrorCode;
-use openxbdm_core::status::Hresult;
-
-use super::HardwareError;
-use crate::reply::CommandError;
+pub use super::error::AutomationError;
 
 /// Number of user slots.
 pub const USERS: u32 = 4;
+
+/// Guide button; pressing it is reported to the input system separately.
+pub const BUTTON_GUIDE: u16 = 0x400;
 
 /// Gamepad state of a virtual controller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -29,9 +28,6 @@ pub struct Gamepad {
     pub thumb_ry: i16,
 }
 
-/// Guide button; pressing it is reported to the input system separately.
-pub const BUTTON_GUIDE: u16 = 0x400;
-
 impl Gamepad {
     /// Bytes of one gamepad state on the wire and in console memory.
     pub const WIRE_SIZE: usize = 12;
@@ -39,6 +35,7 @@ impl Gamepad {
     /// Decode the little-endian wire layout.
     pub fn from_wire(bytes: &[u8; Self::WIRE_SIZE]) -> Self {
         let word = |offset: usize| u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
+
         Self {
             buttons: word(0),
             left_trigger: bytes[2],
@@ -53,6 +50,7 @@ impl Gamepad {
     /// Decode the big-endian console layout.
     pub fn from_console(bytes: &[u8; Self::WIRE_SIZE]) -> Self {
         let word = |offset: usize| u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
+
         Self {
             buttons: word(0),
             left_trigger: bytes[2],
@@ -74,6 +72,7 @@ impl Gamepad {
         bytes[6..8].copy_from_slice(&self.thumb_ly.to_be_bytes());
         bytes[8..10].copy_from_slice(&self.thumb_rx.to_be_bytes());
         bytes[10..12].copy_from_slice(&self.thumb_ry.to_be_bytes());
+
         bytes
     }
 }
@@ -86,25 +85,6 @@ pub struct QueueEntry {
     pub time: u32,
     /// Minimum number of polls that present the entry.
     pub count: u32,
-}
-
-/// Bytes the monitor allocates for a controller with `queue_length`
-/// entries: the controller header holds the first entry.
-pub const fn allocation_size(queue_length: u32) -> u64 {
-    if queue_length == 0 {
-        0x48
-    } else {
-        0x48 + (queue_length as u64 - 1) * 0x14
-    }
-}
-
-/// Entries of storage a controller with `queue_length` entries needs.
-pub const fn storage_entries(queue_length: u32) -> usize {
-    if queue_length == 0 {
-        1
-    } else {
-        queue_length as usize
-    }
 }
 
 /// Content of a `queuepackets` upload: `count` packets, then `count` time
@@ -123,37 +103,8 @@ impl UploadLayout {
         let size = count * 12
             + if self.times { count * 4 } else { 0 }
             + if self.counts { count * 4 } else { 0 };
+
         u32::try_from(size).ok()
-    }
-}
-
-/// Why a controller operation failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AutomationError {
-    /// User slot out of range, or a malformed queue request.
-    BadParameter,
-    /// No controller in the slot, or it is not connected.
-    NotConnected,
-    OutOfMemory,
-    /// The input system refused to bind or unbind the controller.
-    Refused,
-}
-
-impl From<AutomationError> for CommandError {
-    fn from(error: AutomationError) -> Self {
-        match error {
-            AutomationError::BadParameter => Self::Status(ErrorCode::BadParameter),
-            AutomationError::NotConnected => HardwareError::NotConnected.into(),
-            AutomationError::OutOfMemory => Self::Status(ErrorCode::OutOfMemory),
-            AutomationError::Refused => Self::Status(ErrorCode::UnknownCommand),
-        }
-    }
-}
-
-/// Result of the automation exports 167 to 174.
-impl From<AutomationError> for Hresult {
-    fn from(error: AutomationError) -> Self {
-        CommandError::from(error).into()
     }
 }
 
@@ -215,6 +166,7 @@ pub trait InputPlatform {
 /// controller lock: allocation, binding, and debugger extension messages.
 pub trait Controllers {
     type Storage: AsRef<[QueueEntry]> + AsMut<[QueueEntry]>;
+
     /// Run `operation` with the controller lock held.
     fn locked<R>(
         &mut self,
@@ -226,75 +178,6 @@ pub trait Controllers {
     fn bind_controller(&mut self, user: u32) -> bool;
     fn unbind_controller(&mut self, user: u32) -> bool;
     fn tell_debugger(&mut self, message: DebuggerMessage);
-}
-
-fn check_user(user: u32) -> Result<(), AutomationError> {
-    if user < USERS {
-        Ok(())
-    } else {
-        Err(AutomationError::BadParameter)
-    }
-}
-
-/// Install a connected controller with a queue of `queue_length` entries,
-/// replacing the slot's controller, then bind it to the input system.
-pub fn bind<C: Controllers>(
-    controllers: &mut C,
-    user: u32,
-    queue_length: u32,
-) -> Result<(), AutomationError> {
-    check_user(user)?;
-    let entries = controllers
-        .allocate(queue_length)
-        .ok_or(AutomationError::OutOfMemory)?;
-    let controller = Controller::new(queue_length, entries);
-    drop(controllers.locked(|automation, _| automation.users[user as usize].replace(controller)));
-    if !controllers.bind_controller(user) {
-        drop(controllers.locked(|automation, _| automation.users[user as usize].take()));
-        return Err(AutomationError::Refused);
-    }
-    controllers.tell_debugger(DebuggerMessage::Binding { user, bound: true });
-    Ok(())
-}
-
-/// Unbind the slot from the input system and remove its controller.
-pub fn unbind<C: Controllers>(controllers: &mut C, user: u32) -> Result<(), AutomationError> {
-    check_user(user)?;
-    if !controllers.unbind_controller(user) {
-        return Err(AutomationError::Refused);
-    }
-    drop(controllers.locked(|automation, _| automation.users[user as usize].take()));
-    controllers.tell_debugger(DebuggerMessage::Binding { user, bound: false });
-    Ok(())
-}
-
-/// Present a fixed state and stop playback. The debugger extension is
-/// told about the state whenever the slot is in range.
-pub fn set_packet<C: Controllers>(
-    controllers: &mut C,
-    user: u32,
-    packet: Gamepad,
-) -> Result<(), AutomationError> {
-    check_user(user)?;
-    let result =
-        controllers.locked(|automation, platform| automation.set_packet(user, packet, platform));
-    controllers.tell_debugger(DebuggerMessage::Packet {
-        user: user as u8,
-        packet,
-    });
-    result
-}
-
-/// Bind every installed controller again, as the monitor does when the
-/// input system restarts.
-pub fn rebind_all<C: Controllers>(controllers: &mut C) {
-    let installed: [bool; USERS as usize] = controllers
-        .locked(|automation, _| core::array::from_fn(|user| automation.users[user].is_some()));
-    for (user, installed) in installed.into_iter().enumerate() {
-        if installed {
-            controllers.bind_controller(user as u32);
-        }
-    }
 }
 
 /// Result of a poll by the input system.
@@ -314,18 +197,24 @@ pub struct Controller<S> {
     connected: bool,
     playing: bool,
     guide_latched: bool,
+
     queue_length: u32,
     queued: u32,
     head: u32,
     packet_number: u32,
+
     remaining_count: u32,
     deadline: u32,
     time_sum: u64,
     count_sum: u64,
+
     entries: S,
 }
 
-impl<S: AsRef<[QueueEntry]> + AsMut<[QueueEntry]>> Controller<S> {
+impl<S> Controller<S>
+where
+    S: AsRef<[QueueEntry]> + AsMut<[QueueEntry]>,
+{
     /// A connected controller over zeroed storage of
     /// [`storage_entries`]`(queue_length)` entries.
     pub fn new(queue_length: u32, entries: S) -> Self {
@@ -378,12 +267,14 @@ impl<S: AsRef<[QueueEntry]> + AsMut<[QueueEntry]>> Controller<S> {
             self.deadline = 0;
             return false;
         }
+
         let entry = self.entry(self.head);
         self.time_sum = self.time_sum.wrapping_sub(u64::from(entry.time));
         self.count_sum = self.count_sum.wrapping_sub(u64::from(entry.count));
         self.remaining_count = entry.count;
         self.deadline = now.wrapping_add(entry.time);
         self.update_guide(user, entry.packet, platform);
+
         self.remaining_count == 0
     }
 
@@ -391,6 +282,7 @@ impl<S: AsRef<[QueueEntry]> + AsMut<[QueueEntry]>> Controller<S> {
     /// are used up. Returns whether the advance timer was armed.
     fn advance(&mut self, user: u32, now: u32, platform: &mut dyn InputPlatform) -> bool {
         let mut armed = false;
+
         while self.queued != 0
             && now.wrapping_sub(self.deadline) as i32 >= 0
             && self.remaining_count == 0
@@ -399,6 +291,7 @@ impl<S: AsRef<[QueueEntry]> + AsMut<[QueueEntry]>> Controller<S> {
             self.queued -= 1;
             armed |= self.start_entry(user, now, platform);
         }
+
         armed
     }
 }
@@ -426,7 +319,10 @@ impl<S> Default for Automation<S> {
     }
 }
 
-impl<S: AsRef<[QueueEntry]> + AsMut<[QueueEntry]>> Automation<S> {
+impl<S> Automation<S>
+where
+    S: AsRef<[QueueEntry]> + AsMut<[QueueEntry]>,
+{
     fn slot(&mut self, user: u32) -> Result<&mut Option<Controller<S>>, AutomationError> {
         self.users
             .get_mut(user as usize)
@@ -445,22 +341,28 @@ impl<S: AsRef<[QueueEntry]> + AsMut<[QueueEntry]>> Automation<S> {
         while self.timer_armed {
             self.timer_armed = false;
             let now = platform.tick();
+
             for (user, slot) in self.users.iter_mut().enumerate() {
-                if let Some(controller) = slot.as_mut().filter(|controller| controller.playing) {
-                    self.timer_armed |= controller.advance(user as u32, now, platform);
-                }
+                let Some(controller) = slot.as_mut().filter(|controller| controller.playing) else {
+                    continue;
+                };
+
+                self.timer_armed |= controller.advance(user as u32, now, platform);
             }
         }
     }
 
     pub fn connect(&mut self, user: u32) -> Result<(), AutomationError> {
         let controller = self.controller(user)?;
-        if !controller.connected {
-            controller.connected = true;
-            controller.playing = false;
-            controller.reset();
-            controller.entry_mut(0).packet = Gamepad::default();
+        if controller.connected {
+            return Ok(());
         }
+
+        controller.connected = true;
+        controller.playing = false;
+        controller.reset();
+        controller.entry_mut(0).packet = Gamepad::default();
+
         Ok(())
     }
 
@@ -470,6 +372,7 @@ impl<S: AsRef<[QueueEntry]> + AsMut<[QueueEntry]>> Automation<S> {
         controller.playing = false;
         controller.reset();
         controller.entry_mut(0).packet = Gamepad::default();
+
         Ok(())
     }
 
@@ -478,7 +381,9 @@ impl<S: AsRef<[QueueEntry]> + AsMut<[QueueEntry]>> Automation<S> {
         if !controller.connected {
             return Err(AutomationError::NotConnected);
         }
+
         controller.reset();
+
         Ok(())
     }
 
@@ -492,19 +397,24 @@ impl<S: AsRef<[QueueEntry]> + AsMut<[QueueEntry]>> Automation<S> {
             queue_length: controller.queue_length,
             ..QueueStatus::default()
         };
-        if controller.connected && controller.playing {
-            status.queued = controller.queued;
-            let left = controller.deadline.wrapping_sub(platform.tick()) as i32;
-            let remaining_ms = if left > 0 {
-                controller.time_sum.wrapping_add(left as u64)
-            } else {
-                controller.time_sum
-            };
-            status.remaining_ms = u32::try_from(remaining_ms).unwrap_or(u32::MAX);
-            let remaining_count =
-                u64::from(controller.remaining_count).wrapping_add(controller.count_sum);
-            status.remaining_count = u32::try_from(remaining_count).unwrap_or(u32::MAX);
+        if !(controller.connected && controller.playing) {
+            return Ok(status);
         }
+
+        status.queued = controller.queued;
+
+        let left = controller.deadline.wrapping_sub(platform.tick()) as i32;
+        let remaining_ms = if left > 0 {
+            controller.time_sum.wrapping_add(left as u64)
+        } else {
+            controller.time_sum
+        };
+        status.remaining_ms = u32::try_from(remaining_ms).unwrap_or(u32::MAX);
+
+        let remaining_count =
+            u64::from(controller.remaining_count).wrapping_add(controller.count_sum);
+        status.remaining_count = u32::try_from(remaining_count).unwrap_or(u32::MAX);
+
         Ok(status)
     }
 
@@ -514,24 +424,24 @@ impl<S: AsRef<[QueueEntry]> + AsMut<[QueueEntry]>> Automation<S> {
         packet: Gamepad,
         platform: &mut dyn InputPlatform,
     ) -> Result<(), AutomationError> {
-        match self
+        let Some(controller) = self
             .slot(user)?
             .as_mut()
             .filter(|controller| controller.connected)
-        {
-            Some(controller) => {
-                controller.playing = false;
-                controller.reset();
-                *controller.entry_mut(0) = QueueEntry {
-                    packet,
-                    time: 0,
-                    count: 0,
-                };
-                controller.update_guide(user, packet, platform);
-                Ok(())
-            }
-            None => Err(AutomationError::NotConnected),
-        }
+        else {
+            return Err(AutomationError::NotConnected);
+        };
+
+        controller.playing = false;
+        controller.reset();
+        *controller.entry_mut(0) = QueueEntry {
+            packet,
+            time: 0,
+            count: 0,
+        };
+        controller.update_guide(user, packet, platform);
+
+        Ok(())
     }
 
     /// Queue the entries of an upload in wire layout. Returns the number
@@ -554,12 +464,14 @@ impl<S: AsRef<[QueueEntry]> + AsMut<[QueueEntry]>> Automation<S> {
                 upload[offset + 3],
             ])
         };
+
         self.queue_entries(
             user,
             layout,
             |item| {
                 let mut packet = [0u8; Gamepad::WIRE_SIZE];
                 packet.copy_from_slice(&upload[item * 12..item * 12 + 12]);
+
                 QueueEntry {
                     packet: Gamepad::from_wire(&packet),
                     time: if layout.times {
@@ -591,10 +503,12 @@ impl<S: AsRef<[QueueEntry]> + AsMut<[QueueEntry]>> Automation<S> {
         if !(layout.times || layout.counts) {
             return Err(AutomationError::BadParameter);
         }
+
         let controller = self.controller(user)?;
         if !controller.connected || controller.queue_length == 0 {
             return Err(AutomationError::NotConnected);
         }
+
         let accepted = layout
             .count
             .min(controller.queue_length - controller.queued);
@@ -602,6 +516,7 @@ impl<S: AsRef<[QueueEntry]> + AsMut<[QueueEntry]>> Automation<S> {
         let now = platform.tick();
         let mut index = (controller.head + controller.queued) % controller.queue_length;
         let mut armed = false;
+
         for item in 0..accepted as usize {
             let queued = entry(item);
             controller.time_sum = controller.time_sum.wrapping_add(u64::from(queued.time));
@@ -613,8 +528,10 @@ impl<S: AsRef<[QueueEntry]> + AsMut<[QueueEntry]>> Automation<S> {
             }
             index = (index + 1) % controller.queue_length;
         }
+
         self.timer_armed |= armed;
         self.run_timer(platform);
+
         Ok(accepted)
     }
 
@@ -625,12 +542,14 @@ impl<S: AsRef<[QueueEntry]> + AsMut<[QueueEntry]>> Automation<S> {
         if !controller.connected {
             return Some(Poll::NotConnected);
         }
+
         if !controller.playing {
             return Some(Poll::State {
                 packet_number: controller.packet_number,
                 packet: controller.entry(0).packet,
             });
         }
+
         let now = platform.tick();
         let mut armed = controller.advance(user, now, platform);
         let packet_number = controller.packet_number;
@@ -643,10 +562,13 @@ impl<S: AsRef<[QueueEntry]> + AsMut<[QueueEntry]>> Automation<S> {
             if remaining <= 1 {
                 armed |= controller.advance(user, now, platform);
             }
+
             packet
         };
+
         self.timer_armed |= armed;
         self.run_timer(platform);
+
         Some(Poll::State {
             packet_number,
             packet,
@@ -657,6 +579,104 @@ impl<S: AsRef<[QueueEntry]> + AsMut<[QueueEntry]>> Automation<S> {
     /// or is out of range.
     pub fn is_connected(&self, user: u32) -> Option<bool> {
         Some(self.users.get(user as usize)?.as_ref()?.connected)
+    }
+}
+
+/// Bytes the monitor allocates for a controller with `queue_length`
+/// entries: the controller header holds the first entry.
+pub const fn allocation_size(queue_length: u32) -> u64 {
+    if queue_length == 0 {
+        0x48
+    } else {
+        0x48 + (queue_length as u64 - 1) * 0x14
+    }
+}
+
+/// Entries of storage a controller with `queue_length` entries needs.
+pub const fn storage_entries(queue_length: u32) -> usize {
+    if queue_length == 0 {
+        1
+    } else {
+        queue_length as usize
+    }
+}
+
+/// Install a connected controller with a queue of `queue_length` entries,
+/// replacing the slot's controller, then bind it to the input system.
+pub fn bind<C: Controllers>(
+    controllers: &mut C,
+    user: u32,
+    queue_length: u32,
+) -> Result<(), AutomationError> {
+    check_user(user)?;
+
+    let entries = controllers
+        .allocate(queue_length)
+        .ok_or(AutomationError::OutOfMemory)?;
+    let controller = Controller::new(queue_length, entries);
+    drop(controllers.locked(|automation, _| automation.users[user as usize].replace(controller)));
+
+    if !controllers.bind_controller(user) {
+        drop(controllers.locked(|automation, _| automation.users[user as usize].take()));
+        return Err(AutomationError::Refused);
+    }
+
+    controllers.tell_debugger(DebuggerMessage::Binding { user, bound: true });
+
+    Ok(())
+}
+
+/// Unbind the slot from the input system and remove its controller.
+pub fn unbind<C: Controllers>(controllers: &mut C, user: u32) -> Result<(), AutomationError> {
+    check_user(user)?;
+
+    if !controllers.unbind_controller(user) {
+        return Err(AutomationError::Refused);
+    }
+
+    drop(controllers.locked(|automation, _| automation.users[user as usize].take()));
+    controllers.tell_debugger(DebuggerMessage::Binding { user, bound: false });
+
+    Ok(())
+}
+
+/// Present a fixed state and stop playback. The debugger extension is
+/// told about the state whenever the slot is in range.
+pub fn set_packet<C: Controllers>(
+    controllers: &mut C,
+    user: u32,
+    packet: Gamepad,
+) -> Result<(), AutomationError> {
+    check_user(user)?;
+
+    let result =
+        controllers.locked(|automation, platform| automation.set_packet(user, packet, platform));
+    controllers.tell_debugger(DebuggerMessage::Packet {
+        user: user as u8,
+        packet,
+    });
+
+    result
+}
+
+/// Bind every installed controller again, as the monitor does when the
+/// input system restarts.
+pub fn rebind_all<C: Controllers>(controllers: &mut C) {
+    let installed: [bool; USERS as usize] = controllers
+        .locked(|automation, _| core::array::from_fn(|user| automation.users[user].is_some()));
+
+    for (user, installed) in installed.into_iter().enumerate() {
+        if installed {
+            controllers.bind_controller(user as u32);
+        }
+    }
+}
+
+fn check_user(user: u32) -> Result<(), AutomationError> {
+    if user < USERS {
+        Ok(())
+    } else {
+        Err(AutomationError::BadParameter)
     }
 }
 

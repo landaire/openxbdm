@@ -46,12 +46,14 @@ pub enum SessionRequest {
 pub struct Session {
     pub(crate) index: ConnectionIndex,
     pub(crate) socket: SocketId,
+
     /// Privileges of the connection.
     pub access: Access,
     /// Session key established by a completed `keyxchg`.
     pub session_key: Option<openxbdm_core::auth::SessionKey>,
     /// Lock-mode challenge sent in the banner.
     pub nonce: [u32; 2],
+
     /// Continuation of a 202, 203, or 204 transfer.
     pub continuation: Continuation,
     /// Bytes still expected in a 204 upload. The continuation decrements it.
@@ -123,12 +125,14 @@ impl Invocation<'_> {
             .as_ref()
             .map(|session| session.socket)
             .ok_or(NetError::Closed)?;
+
         send_line(self.network, socket, text)
     }
 
     /// Replace the reply text with formatted output.
     pub fn set_text(&mut self, arguments: core::fmt::Arguments<'_>) {
         use core::fmt::Write as _;
+
         self.text.clear();
         let _ = self.text.write_fmt(arguments);
     }

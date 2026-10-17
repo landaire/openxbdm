@@ -10,8 +10,7 @@
 //! string literals, address literals, the built-in string functions and no
 //! other functions.
 
-use openxbdm_core::status::Hresult;
-use openxbdm_core::status::XbdmHresult;
+mod error;
 
 use super::FieldId;
 use super::Item as WireItem;
@@ -25,157 +24,21 @@ use super::grammar;
 use super::variant;
 use super::variant::Text;
 use super::variant::Variant;
-use super::variant::VariantError;
 use super::write_program;
+
+pub use self::error::CompileError;
+pub(crate) use self::error::result;
 
 /// Node objects (library limit 0x40); freed nodes are reused.
 const NODE_LIMIT: usize = 0x40;
 /// Items (library limit 0x20); items are never freed during a compile.
 const ITEM_LIMIT: usize = 0x20;
-/// Names must be shorter than this (library limit 0x80).
-const NAME_LIMIT: usize = 0x80;
 /// String references: one per node, one per item name, and the result of
 /// a fold.
 const REFERENCE_LIMIT: usize = NODE_LIMIT + ITEM_LIMIT + 1;
-/// Parser state stack entries (YYSTACKSIZE).
-const STACK_DEPTH: usize = 500;
-
-/// Why classifier text did not compile. Titles receive the result value
-/// through the simulator exports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompileError {
-    Syntax,
-    StackOverflow,
-    OutOfMemory,
-    InvalidCharacter,
-    UnterminatedComment,
-    TruncatedNumber,
-    NumberOverflow,
-    SuffixOverflow,
-    MissingOperand,
-    EmptyName,
-    NameTooLong,
-    TooManyItems,
-    NotScalar,
-    WrongItemKind,
-    NegativeIndex,
-    IndexOutOfRange,
-    TooFewArguments,
-    TooManyArguments,
-    /// The program is a constant false: it would match nothing.
-    AlwaysFalse,
-    /// A name that is not in the field table.
-    UnknownField,
-    /// Constant folding failed.
-    Value(VariantError),
-}
-
-impl From<VariantError> for CompileError {
-    fn from(error: VariantError) -> Self {
-        Self::Value(error)
-    }
-}
-
-/// Stock results of the compile errors, named here by the error they
-/// report.
-pub(crate) mod result {
-    use openxbdm_core::status::Hresult;
-    use openxbdm_core::status::xbdm_error;
-    use xbox360_sys::status::Facility;
-
-    const fn win32(code: u16) -> Hresult {
-        Hresult::failure(Facility::WIN32, code)
-    }
-
-    const fn dispatch(code: u16) -> Hresult {
-        Hresult::failure(Facility::new(2), code)
-    }
-
-    pub const SYNTAX: Hresult = win32(0x545);
-    pub const STACK_OVERFLOW: Hresult = win32(0x3e9);
-    pub const OUT_OF_MEMORY: Hresult = Hresult::OUT_OF_MEMORY;
-    pub const INVALID_CHARACTER: Hresult = win32(0xd);
-    pub const UNTERMINATED_COMMENT: Hresult = win32(0x26);
-    pub const TRUNCATED_NUMBER: Hresult = win32(0x44c);
-    pub const NUMBER_OVERFLOW: Hresult = win32(0x216);
-    pub const SUFFIX_OVERFLOW: Hresult = win32(0xea);
-    pub const MISSING_OPERAND: Hresult = win32(0x10d2);
-    pub const EMPTY_NAME: Hresult = win32(0x7b);
-    pub const NAME_TOO_LONG: Hresult = win32(0x9a);
-    pub const TOO_MANY_ITEMS: Hresult = win32(0x44);
-    pub const NOT_SCALAR: Hresult = win32(0x99);
-    pub const WRONG_ITEM_KIND: Hresult = win32(0x48a);
-    pub const NEGATIVE_INDEX: Hresult = win32(0x83);
-    pub const INDEX_OUT_OF_RANGE: Hresult = win32(0x585);
-    pub const TOO_FEW_ARGUMENTS: Hresult = dispatch(0x4);
-    pub const TOO_MANY_ARGUMENTS: Hresult = dispatch(0xe);
-    /// Stock returns the monitor's facility 0x2da code 0x10 for a
-    /// constant-false program, the value of status 416 "not debuggable".
-    pub const ALWAYS_FALSE: Hresult = xbdm_error(0x10);
-}
-
-impl From<CompileError> for Hresult {
-    fn from(error: CompileError) -> Self {
-        match error {
-            CompileError::Syntax => result::SYNTAX,
-            CompileError::StackOverflow => result::STACK_OVERFLOW,
-            CompileError::OutOfMemory => result::OUT_OF_MEMORY,
-            CompileError::InvalidCharacter => result::INVALID_CHARACTER,
-            CompileError::UnterminatedComment => result::UNTERMINATED_COMMENT,
-            CompileError::TruncatedNumber => result::TRUNCATED_NUMBER,
-            CompileError::NumberOverflow => result::NUMBER_OVERFLOW,
-            CompileError::SuffixOverflow => result::SUFFIX_OVERFLOW,
-            CompileError::MissingOperand => result::MISSING_OPERAND,
-            CompileError::EmptyName => result::EMPTY_NAME,
-            CompileError::NameTooLong => result::NAME_TOO_LONG,
-            CompileError::TooManyItems => result::TOO_MANY_ITEMS,
-            CompileError::NotScalar => result::NOT_SCALAR,
-            CompileError::WrongItemKind => result::WRONG_ITEM_KIND,
-            CompileError::NegativeIndex => result::NEGATIVE_INDEX,
-            CompileError::IndexOutOfRange => result::INDEX_OUT_OF_RANGE,
-            CompileError::TooFewArguments => result::TOO_FEW_ARGUMENTS,
-            CompileError::TooManyArguments => result::TOO_MANY_ARGUMENTS,
-            CompileError::AlwaysFalse => result::ALWAYS_FALSE,
-            CompileError::UnknownField => Hresult::NO_SUCH_FIELD,
-            CompileError::Value(error) => error.into(),
-        }
-    }
-}
-
-const IDENTIFIER: i16 = 0x101;
-const CONSTANT: i16 = 0x102;
-
-/// Operators of the builder that the grammar does not name directly.
-const COMMA: Operator = Operator(0x1d);
-const STRING_COMPARE: Operator = Operator(0x1f);
-const STRING_INDEX_OF: Operator = Operator(0x20);
-const STRING_CONTAINS: Operator = Operator(0x21);
-const STRING_STARTS_WITH: Operator = Operator(0x22);
-const STRING_ENDS_WITH: Operator = Operator(0x23);
-const STRING_SUBSTRING: Operator = Operator(0x24);
-
-/// Keywords and their bool values (0x91f0c120).
-const KEYWORDS: [(&[u8], bool); 4] = [
-    (b"TRUE", true),
-    (b"FALSE", false),
-    (b"true", true),
-    (b"false", false),
-];
-
-/// Built-in functions (0x91f0c158); [`Operator::count_range`] holds their
-/// operand counts.
-const FUNCTIONS: [(&[u8], Operator); 7] = [
-    (b"String.Length", Operator::STRING_LENGTH),
-    (b"String.Compare", STRING_COMPARE),
-    (b"String.IndexOf", STRING_INDEX_OF),
-    (b"String.Contains", STRING_CONTAINS),
-    (b"String.StartsWith", STRING_STARTS_WITH),
-    (b"String.EndsWith", STRING_ENDS_WITH),
-    (b"String.Substring", STRING_SUBSTRING),
-];
 
 /// Frame field names (0x91f99660); a field's id is its position plus one.
-/// Only [`FIELD_NAMES`] and [`FIELD_ENDS`] are stored.
+/// Only the packed copy in `field_id` is stored.
 const FIELDS: [&[u8]; super::FIELD_COUNT as usize] = [
     b"Ethernet",
     b"Ethernet.SourceAddress",
@@ -264,143 +127,6 @@ const FIELDS: [&[u8]; super::FIELD_COUNT as usize] = [
     b"Kerberosv5",
 ];
 
-/// The field names back to back.
-const FIELD_NAMES: [u8; field_names_length()] = pack_field_names();
-/// End of each name in [`FIELD_NAMES`]; a name starts where the previous
-/// one ends.
-const FIELD_ENDS: [u16; super::FIELD_COUNT as usize] = field_name_ends();
-
-const fn field_names_length() -> usize {
-    let mut length = 0;
-    let mut field = 0;
-    while field < FIELDS.len() {
-        length += FIELDS[field].len();
-        field += 1;
-    }
-    length
-}
-
-const fn pack_field_names() -> [u8; field_names_length()] {
-    let mut names = [0u8; field_names_length()];
-    let mut position = 0;
-    let mut field = 0;
-    while field < FIELDS.len() {
-        let mut byte = 0;
-        while byte < FIELDS[field].len() {
-            names[position] = FIELDS[field][byte];
-            position += 1;
-            byte += 1;
-        }
-        field += 1;
-    }
-    names
-}
-
-const fn field_name_ends() -> [u16; super::FIELD_COUNT as usize] {
-    let mut ends = [0u16; super::FIELD_COUNT as usize];
-    let mut end = 0;
-    let mut field = 0;
-    while field < FIELDS.len() {
-        end += FIELDS[field].len();
-        ends[field] = end as u16;
-        field += 1;
-    }
-    ends
-}
-
-/// The id of the field named `name` (0x91f75370: ASCII case-insensitive).
-fn field_id(name: &[u8]) -> Option<FieldId> {
-    let mut start = 0;
-    for (position, &end) in FIELD_ENDS.iter().enumerate() {
-        let end = usize::from(end);
-        if name.eq_ignore_ascii_case(&FIELD_NAMES[start..end]) {
-            return Some(FieldId(position as u8 + 1));
-        }
-        start = end;
-    }
-    None
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct NodeId(u8);
-
-/// Position of an item in declaration order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ItemIndex(u8);
-
-#[derive(Debug, Clone, Copy)]
-enum Kind {
-    Constant(Variant),
-    /// An undeclared name; the builder turns names into items.
-    Name(Text),
-    Item(ItemIndex),
-    /// Builder operator 3..=0x24 over its operand list.
-    Operator {
-        operator: Operator,
-        operands: Option<NodeId>,
-    },
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Node {
-    kind: Kind,
-    /// The next node of the operand stack, an operand list or the free list.
-    next: Option<NodeId>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Item {
-    /// Cleared once the item is bound to its field.
-    name: Option<Text>,
-    /// Element index of an array element; none for a scalar or an array.
-    index: Option<u64>,
-    /// Declared by `name[...]` (variant type 0xf).
-    array: bool,
-}
-
-/// The owner of a string reference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Holder {
-    Node(NodeId),
-    Item(ItemIndex),
-    /// The result of a fold before it is copied into its node.
-    Fold,
-}
-
-/// A string reference (stock string reference, 0x14 bytes).
-#[derive(Debug, Clone, Copy)]
-struct Reference {
-    holder: Holder,
-    text: Text,
-}
-
-/// The pending token of the lexer.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Pending {
-    Identifier,
-    Number,
-}
-
-struct Compiler<'a> {
-    text: &'a [u8],
-    cursor: usize,
-    /// First syntax error, or the latest lexer or builder error.
-    status: Option<CompileError>,
-    nodes: [Node; NODE_LIMIT],
-    allocated: u8,
-    free: Option<NodeId>,
-    /// Operand stack, most recent first.
-    stack: Option<NodeId>,
-    items: [Item; ITEM_LIMIT],
-    item_count: u8,
-    /// Stock keeps one entry per distinct string, newest first, each with
-    /// its first reference and the later ones newest first. Here: entries
-    /// oldest first, each as a run of equal strings `[first, newest, ...,
-    /// oldest]`. The serializer writes the entries newest first.
-    references: [Reference; REFERENCE_LIMIT],
-    reference_count: u8,
-}
-
 /// A program compiled from text: what the stock compiler hands to the
 /// serializer (0x91f87318).
 pub struct Compiled<'a> {
@@ -410,99 +136,64 @@ pub struct Compiled<'a> {
     fields: [FieldId; ITEM_LIMIT],
 }
 
-/// Compile classifier text (0x91f8bdd0). `Ok(None)` is a constant true
-/// program, which classifies every frame.
-pub fn compile_text(text: &[u8]) -> Result<Option<Compiled<'_>>, CompileError> {
-    let mut compiler = Compiler::new(text);
-    compiler.parse();
-    if let Some(error) = compiler.status {
-        return Err(error);
-    }
-    // An accepted program leaves exactly its root on the stack.
-    let root = compiler.stack.ok_or(CompileError::Syntax)?;
-    if let Kind::Constant(value) = compiler.node(root).kind {
-        return if variant::to_bool(&value)? {
-            Ok(None)
-        } else {
-            Err(CompileError::AlwaysFalse)
-        };
-    }
-    // Every item carries a name until it is bound (stock skips unnamed
-    // items, which this compiler never declares).
-    let mut fields = [FieldId(0); ITEM_LIMIT];
-    for (position, bound) in fields
-        .iter_mut()
-        .enumerate()
-        .take(usize::from(compiler.item_count))
-    {
-        let Some(name) = compiler.items[position].name.take() else {
-            continue;
-        };
-        *bound = field_id(&text[name.start..name.end]).ok_or(CompileError::UnknownField)?;
-        compiler.release(Holder::Item(ItemIndex(position as u8)));
-    }
-    Ok(Some(Compiled {
-        compiler,
-        root,
-        fields,
-    }))
-}
-
 impl Compiled<'_> {
     /// Canonical form (0x91f87318). Returns the byte count.
     pub fn serialize(&self, output: &mut [u8]) -> Result<usize, SerializeError> {
         let compiler = &self.compiler;
+        let item_count = usize::from(compiler.item_count);
+
         let mut items = [WireItem {
             field: FieldId(0),
             value: Value::Null,
             fixed: false,
             tag: None,
         }; ITEM_LIMIT];
-        let count = usize::from(compiler.item_count);
         for ((wire, item), &field) in items
             .iter_mut()
-            .zip(&compiler.items[..count])
+            .zip(&compiler.items[..item_count])
             .zip(&self.fields)
         {
+            let value = if item.array {
+                Value::Opaque
+            } else {
+                Value::Null
+            };
             *wire = WireItem {
                 field,
-                value: if item.array {
-                    Value::Opaque
-                } else {
-                    Value::Null
-                },
+                value,
                 fixed: false,
                 tag: item.index,
             };
         }
+
         let mut nodes = [WireNode::Constant(Value::Null); NODE_LIMIT];
-        let mut count = 0;
-        compiler.postfix(self.root, &mut nodes, &mut count);
-        write_program(
-            &items[..usize::from(compiler.item_count)],
-            &nodes[..count],
-            compiler,
-            output,
-        )
+        let node_count = compiler.postfix(self.root, &mut nodes);
+
+        write_program(&items[..item_count], &nodes[..node_count], compiler, output)
     }
 }
 
-impl StringTable for Compiler<'_> {
-    fn count(&self) -> usize {
-        (0..usize::from(self.reference_count))
-            .filter(|&position| self.starts_entry(position))
-            .count()
-    }
+struct Compiler<'a> {
+    text: &'a [u8],
+    cursor: usize,
+    /// First syntax error, or the latest lexer or builder error.
+    status: Option<CompileError>,
 
-    fn bytes(&self, id: StringId) -> &[u8] {
-        let text = (0..usize::from(self.reference_count))
-            .filter(|&position| self.starts_entry(position))
-            .nth(usize::from(id.0))
-            .map_or(Text { start: 0, end: 0 }, |position| {
-                self.references[position].text
-            });
-        &self.text[text.start..text.end]
-    }
+    nodes: [Node; NODE_LIMIT],
+    allocated: u8,
+    free: Option<NodeId>,
+    /// Operand stack, most recent first.
+    stack: Option<NodeId>,
+
+    items: [Item; ITEM_LIMIT],
+    item_count: u8,
+
+    /// Stock keeps one entry per distinct string, newest first, each with
+    /// its first reference and the later ones newest first. Here: entries
+    /// oldest first, each as a run of equal strings `[first, newest, ...,
+    /// oldest]`. The serializer writes the entries newest first.
+    references: [Reference; REFERENCE_LIMIT],
+    reference_count: u8,
 }
 
 impl<'a> Compiler<'a> {
@@ -572,20 +263,24 @@ impl<'a> Compiler<'a> {
                 Some(first) => (first + 1, self.references[first].text),
                 None => (count, text),
             };
+
         self.references.copy_within(position..count, position + 1);
         self.references[position] = Reference { holder, text };
         self.reference_count += 1;
+
         text
     }
 
     /// Drop a reference (0x91f849f8). The next reference of the entry takes
     /// over the entry and its position; the last one removes the entry.
     fn release(&mut self, holder: Holder) {
+        let Some(position) = self.reference_position(holder) else {
+            return;
+        };
+
         let count = usize::from(self.reference_count);
-        if let Some(position) = self.reference_position(holder) {
-            self.references.copy_within(position + 1..count, position);
-            self.reference_count -= 1;
-        }
+        self.references.copy_within(position + 1..count, position);
+        self.reference_count -= 1;
     }
 
     /// Whether the stock reference of `holder` has a null link: the first
@@ -594,10 +289,13 @@ impl<'a> Compiler<'a> {
         let Some(position) = self.reference_position(holder) else {
             return false;
         };
+
         if self.starts_entry(position) {
             return position == 0;
         }
+
         let next = position + 1;
+
         next == usize::from(self.reference_count) || self.starts_entry(next)
     }
 
@@ -614,20 +312,44 @@ impl<'a> Compiler<'a> {
             }
             None => return None,
         };
+
         *self.node_mut(id) = Node { kind, next: None };
+
         Some(id)
     }
 
-    /// Free a node list with every operand below it (0x91f85188).
+    /// Free a node list with every operand below it (0x91f85188). An
+    /// operator is freed after its operands.
     fn free_list(&mut self, mut list: Option<NodeId>) {
-        while let Some(id) = list {
-            let node = *self.node(id);
-            list = node.next;
-            match node.kind {
-                Kind::Constant(Variant::Str(_)) | Kind::Name(_) => self.release(Holder::Node(id)),
-                Kind::Constant(_) | Kind::Item(_) => {}
-                Kind::Operator { operands, .. } => self.free_list(operands),
+        // Operators whose operands are being freed, innermost last.
+        let mut open = [NodeId(0); NODE_LIMIT];
+        let mut depth = 0;
+
+        loop {
+            let id = match list {
+                Some(id) => {
+                    if let Kind::Operator { operands, .. } = self.node(id).kind {
+                        open[depth] = id;
+                        depth += 1;
+                        list = operands;
+                        continue;
+                    }
+
+                    id
+                }
+                // The operands of the innermost open operator are freed.
+                None if depth > 0 => {
+                    depth -= 1;
+                    open[depth]
+                }
+                None => return,
+            };
+
+            list = self.next(id);
+            if let Kind::Constant(Variant::Str(_)) | Kind::Name(_) = self.node(id).kind {
+                self.release(Holder::Node(id));
             }
+
             *self.node_mut(id) = Node {
                 kind: Kind::Constant(Variant::Null),
                 next: self.free,
@@ -646,6 +368,7 @@ impl<'a> Compiler<'a> {
         let id = self.stack?;
         self.stack = self.next(id);
         self.node_mut(id).next = None;
+
         Some(id)
     }
 
@@ -653,6 +376,7 @@ impl<'a> Compiler<'a> {
     /// node is allocated before its string is registered.
     fn push_new(&mut self, kind: Kind) -> Result<(), CompileError> {
         let id = self.allocate(kind).ok_or(CompileError::OutOfMemory)?;
+
         let kind = match kind {
             Kind::Constant(Variant::Str(text)) => {
                 Kind::Constant(Variant::Str(self.intern(Holder::Node(id), text)))
@@ -662,17 +386,16 @@ impl<'a> Compiler<'a> {
         };
         self.node_mut(id).kind = kind;
         self.push(id);
+
         Ok(())
     }
 
     /// The yacc driver (0x91f86688). The value stack is omitted: the rules
     /// work on the operand stack only.
     fn parse(&mut self) {
-        let mut states = [0u8; STACK_DEPTH];
-        let mut top = 0usize;
-        let mut state = 0u8;
-        let mut lookahead: Option<i16> = None;
-        let mut recovering = 0u8;
+        // Parser state stack entries (YYSTACKSIZE).
+        const STACK_DEPTH: usize = 500;
+
         let row = |base: i16, symbol: i16| -> Option<usize> {
             let index = base.checked_add(symbol)?;
             (base != 0
@@ -680,63 +403,83 @@ impl<'a> Compiler<'a> {
                 && grammar::CHECK[index as usize] == grammar::check_symbol(symbol))
             .then_some(index as usize)
         };
+
+        let mut states = [0u8; STACK_DEPTH];
+        let mut top = 0usize;
+        let mut state = 0u8;
+        let mut lookahead: Option<i16> = None;
+        let mut recovering = 0u8;
+
         loop {
-            let mut rule = grammar::DEFAULT_REDUCTION[usize::from(state)];
-            if rule == 0 {
-                let token = match lookahead {
-                    Some(token) => token,
-                    None => *lookahead.insert(self.lex()),
-                };
-                if let Some(index) = row(grammar::SHIFT_BASE[usize::from(state)], token) {
-                    if top >= STACK_DEPTH - 1 {
-                        return self.syntax_error(CompileError::StackOverflow);
-                    }
-                    state = grammar::TABLE[index];
-                    top += 1;
-                    states[top] = state;
-                    lookahead = None;
-                    recovering = recovering.saturating_sub(1);
-                    continue;
-                }
-                if let Some(index) = row(grammar::REDUCE_BASE[usize::from(state)], token) {
-                    rule = grammar::TABLE[index];
-                } else {
-                    if recovering == 0 {
-                        self.syntax_error(CompileError::Syntax);
-                    }
-                    if recovering == 3 {
-                        if token == 0 {
-                            return;
+            let rule = match grammar::DEFAULT_REDUCTION[usize::from(state)] {
+                0 => {
+                    let token = match lookahead {
+                        Some(token) => token,
+                        None => *lookahead.insert(self.lex()),
+                    };
+                    if let Some(index) = row(grammar::SHIFT_BASE[usize::from(state)], token) {
+                        if top >= STACK_DEPTH - 1 {
+                            return self.syntax_error(CompileError::StackOverflow);
                         }
+
+                        state = grammar::TABLE[index];
+                        top += 1;
+                        states[top] = state;
                         lookahead = None;
+                        recovering = recovering.saturating_sub(1);
                         continue;
                     }
-                    recovering = 3;
-                    loop {
-                        if let Some(index) = row(
-                            grammar::SHIFT_BASE[usize::from(states[top])],
-                            grammar::ERROR_TOKEN,
-                        ) {
-                            if top >= STACK_DEPTH - 1 {
-                                return self.syntax_error(CompileError::StackOverflow);
+
+                    let Some(index) = row(grammar::REDUCE_BASE[usize::from(state)], token) else {
+                        if recovering == 0 {
+                            self.syntax_error(CompileError::Syntax);
+                        }
+
+                        if recovering == 3 {
+                            if token == 0 {
+                                return;
                             }
-                            state = grammar::TABLE[index];
-                            top += 1;
-                            states[top] = state;
-                            break;
+
+                            lookahead = None;
+                            continue;
                         }
-                        if top == 0 {
-                            return;
+
+                        recovering = 3;
+
+                        loop {
+                            if let Some(index) = row(
+                                grammar::SHIFT_BASE[usize::from(states[top])],
+                                grammar::ERROR_TOKEN,
+                            ) {
+                                if top >= STACK_DEPTH - 1 {
+                                    return self.syntax_error(CompileError::StackOverflow);
+                                }
+
+                                state = grammar::TABLE[index];
+                                top += 1;
+                                states[top] = state;
+                                break;
+                            }
+
+                            if top == 0 {
+                                return;
+                            }
+
+                            top -= 1;
                         }
-                        top -= 1;
-                    }
-                    continue;
+
+                        continue;
+                    };
+
+                    usize::from(grammar::TABLE[index])
                 }
-            }
-            let rule = usize::from(rule);
+                rule => usize::from(rule),
+            };
+
             if let Some(action) = grammar::ACTION[rule] {
                 self.emit(action.operator, action.operands);
             }
+
             top -= usize::from(grammar::LENGTH[rule]);
             state = states[top];
             let symbol = grammar::LHS[rule];
@@ -751,8 +494,10 @@ impl<'a> Compiler<'a> {
                 if token == 0 {
                     return;
                 }
+
                 continue;
             }
+
             let symbol = symbol as usize;
             state = match row(grammar::GOTO_BASE[symbol], i16::from(state)) {
                 Some(index) => grammar::TABLE[index],
@@ -761,6 +506,7 @@ impl<'a> Compiler<'a> {
             if top >= STACK_DEPTH - 1 {
                 return self.syntax_error(CompileError::StackOverflow);
             }
+
             top += 1;
             states[top] = state;
         }
@@ -768,18 +514,22 @@ impl<'a> Compiler<'a> {
 
     /// The parser's error report (0x91f89238): only the first error is kept.
     fn syntax_error(&mut self, code: CompileError) {
-        if self.status.is_none() {
-            self.status = Some(code);
-            self.cursor = self.text.len();
+        if self.status.is_some() {
+            return;
         }
+
+        self.status = Some(code);
+        self.cursor = self.text.len();
     }
 
     /// A rule action (0x91f89260): a builder error replaces the status.
     fn emit(&mut self, operator: Operator, arity: u8) {
-        if let Err(code) = self.apply(operator, arity) {
-            self.status = Some(code);
-            self.cursor = self.text.len();
-        }
+        let Err(code) = self.apply(operator, arity) else {
+            return;
+        };
+
+        self.status = Some(code);
+        self.cursor = self.text.len();
     }
 
     /// The next token (0x91f85af0); 0 at the end or after an error.
@@ -798,18 +548,30 @@ impl<'a> Compiler<'a> {
     }
 
     fn scan(&mut self) -> Result<(i16, usize), CompileError> {
+        const IDENTIFIER: i16 = 0x101;
+        const CONSTANT: i16 = 0x102;
+        // Keywords and their bool values (0x91f0c120).
+        const KEYWORDS: [(&[u8], bool); 4] = [
+            (b"TRUE", true),
+            (b"FALSE", false),
+            (b"true", true),
+            (b"false", false),
+        ];
+
         let text = self.text;
         let end = text.len();
-        let at = |position: usize| (position < end).then(|| text[position]);
-        let mut p = self.cursor;
+        let byte_at = |index: usize| (index < end).then(|| text[index]);
+
+        let mut position = self.cursor;
         let mut pending: Option<Pending> = None;
-        let mut start = p;
+        let mut start = position;
         let mut base = 10u64;
         let mut value = 0u64;
         let mut suffix: Option<usize> = None;
-        while p < end {
-            let c = text[p];
-            let simple = match c {
+
+        while position < end {
+            let byte = text[position];
+            let simple = match byte {
                 b'(' => Some(0x10a),
                 b')' => Some(0x10b),
                 b'[' => Some(0x104),
@@ -828,9 +590,11 @@ impl<'a> Compiler<'a> {
                 if pending.is_some() {
                     break;
                 }
-                return Ok((token, p + 1));
+
+                return Ok((token, position + 1));
             }
-            match c {
+
+            match byte {
                 b'<' | b'>' | b'=' | b'|' | b'&' | b'!' | b':' | b'/' | b'"' | b' ' | b'\t'
                 | b'\r' | b'\n'
                     if pending.is_some() =>
@@ -838,126 +602,137 @@ impl<'a> Compiler<'a> {
                     break;
                 }
                 b'<' => {
-                    return Ok(match at(p + 1) {
-                        Some(b'<') => (0x110, p + 2),
-                        Some(b'=') => (0x117, p + 2),
-                        _ => (0x116, p + 1),
+                    return Ok(match byte_at(position + 1) {
+                        Some(b'<') => (0x110, position + 2),
+                        Some(b'=') => (0x117, position + 2),
+                        _ => (0x116, position + 1),
                     });
                 }
                 b'>' => {
-                    return Ok(match at(p + 1) {
-                        Some(b'>') => (0x111, p + 2),
-                        Some(b'=') => (0x119, p + 2),
-                        _ => (0x118, p + 1),
+                    return Ok(match byte_at(position + 1) {
+                        Some(b'>') => (0x111, position + 2),
+                        Some(b'=') => (0x119, position + 2),
+                        _ => (0x118, position + 1),
                     });
                 }
                 b'=' => {
-                    return match at(p + 1) {
-                        Some(b'=') => Ok((0x11a, p + 2)),
+                    return match byte_at(position + 1) {
+                        Some(b'=') => Ok((0x11a, position + 2)),
                         _ => Err(CompileError::InvalidCharacter),
                     };
                 }
                 b'|' => {
-                    return Ok(if at(p + 1) == Some(b'|') {
-                        (0x11d, p + 2)
+                    return Ok(if byte_at(position + 1) == Some(b'|') {
+                        (0x11d, position + 2)
                     } else {
-                        (0x115, p + 1)
+                        (0x115, position + 1)
                     });
                 }
                 b'&' => {
-                    return Ok(if at(p + 1) == Some(b'&') {
-                        (0x11c, p + 2)
+                    return Ok(if byte_at(position + 1) == Some(b'&') {
+                        (0x11c, position + 2)
                     } else {
-                        (0x113, p + 1)
+                        (0x113, position + 1)
                     });
                 }
                 b'!' => {
-                    return Ok(if at(p + 1) == Some(b'=') {
-                        (0x11b, p + 2)
+                    return Ok(if byte_at(position + 1) == Some(b'=') {
+                        (0x11b, position + 2)
                     } else {
-                        (0x108, p + 1)
+                        (0x108, position + 1)
                     });
                 }
-                b':' => return Ok((0x106, p + 1)),
-                b'/' => match at(p + 1) {
+                b':' => return Ok((0x106, position + 1)),
+                b'/' => match byte_at(position + 1) {
                     Some(b'/') => {
-                        p += 2;
-                        while p < end && !matches!(text[p], b'\r' | b'\n') {
-                            p += 1;
+                        position += 2;
+                        while position < end && !matches!(text[position], b'\r' | b'\n') {
+                            position += 1;
                         }
-                        if p < end {
-                            p += 1;
+
+                        if position < end {
+                            position += 1;
                         }
                     }
                     Some(b'*') => {
-                        let mut q = p + 2;
+                        let mut close = position + 2;
                         loop {
-                            if q >= end {
+                            if close >= end {
                                 return Err(CompileError::UnterminatedComment);
                             }
-                            if text[q] == b'*' && at(q + 1) == Some(b'/') {
+
+                            if text[close] == b'*' && byte_at(close + 1) == Some(b'/') {
                                 break;
                             }
-                            q += 1;
+
+                            close += 1;
                         }
-                        p = q + 2;
+
+                        position = close + 2;
                     }
-                    _ => return Ok((0x10f, p + 1)),
+                    _ => return Ok((0x10f, position + 1)),
                 },
                 b'"' => {
-                    let open = p;
+                    let open = position;
                     loop {
-                        p += 1;
-                        if p >= end {
+                        position += 1;
+                        if position >= end {
                             return Err(CompileError::InvalidCharacter);
                         }
-                        if text[p] == b'"' {
+
+                        if text[position] == b'"' {
                             break;
                         }
                     }
-                    p += 1;
+
+                    position += 1;
                     self.push_new(Kind::Constant(Variant::Str(Text {
                         start: open + 1,
-                        end: p - 1,
+                        end: position - 1,
                     })))?;
-                    return Ok((CONSTANT, p));
+
+                    return Ok((CONSTANT, position));
                 }
                 0 | b'\\' | b'\'' => return Err(CompileError::InvalidCharacter),
-                b' ' | b'\t' | b'\r' | b'\n' => p += 1,
+                b' ' | b'\t' | b'\r' | b'\n' => position += 1,
                 _ => {
                     if pending.is_none() {
-                        if let Some((address, cursor)) = address_literal(&text[p..]) {
+                        if let Some((address, length)) = address_literal(&text[position..]) {
                             self.push_new(Kind::Constant(address))?;
-                            return Ok((CONSTANT, p + cursor));
+                            return Ok((CONSTANT, position + length));
                         }
-                        pending = Some(match c {
-                            b'0' if at(p + 1) == Some(b'x') => {
-                                p += 2;
-                                if p >= end {
+
+                        pending = Some(match byte {
+                            b'0' if byte_at(position + 1) == Some(b'x') => {
+                                position += 2;
+                                if position >= end {
                                     return Err(CompileError::TruncatedNumber);
                                 }
+
                                 base = 16;
                                 Pending::Number
                             }
                             b'0'..=b'9' => Pending::Number,
-                            b'.' => match at(p + 1) {
+                            b'.' => match byte_at(position + 1) {
                                 None => return Err(CompileError::TruncatedNumber),
                                 Some(b'0'..=b'9') => Pending::Number,
                                 Some(_) => return Err(CompileError::InvalidCharacter),
                             },
                             _ => Pending::Identifier,
                         });
-                        start = p;
+                        start = position;
                     }
+
                     if pending == Some(Pending::Number) {
-                        let c = text[p];
-                        let digit = match c {
-                            b'0'..=b'9' => Some(c - b'0'),
-                            b'a'..=b'f' if base == 16 => Some(c - b'a' + 10),
-                            b'A'..=b'F' if base == 16 => Some(c - b'A' + 10),
+                        // A `0x` prefix has moved `position` past `byte`.
+                        let byte = text[position];
+                        let digit = match byte {
+                            b'0'..=b'9' => Some(byte - b'0'),
+                            b'a'..=b'f' if base == 16 => Some(byte - b'a' + 10),
+                            b'A'..=b'F' if base == 16 => Some(byte - b'A' + 10),
                             _ => None,
                         };
-                        match (c, digit) {
+                        match (byte, digit) {
                             (_, Some(_)) | (b'a'..=b'f' | b'A'..=b'F', None)
                                 if suffix.is_some() =>
                             {
@@ -968,39 +743,49 @@ impl<'a> Compiler<'a> {
                                 if value > product {
                                     return Err(CompileError::NumberOverflow);
                                 }
+
                                 value = product.wrapping_add(u64::from(digit));
                             }
                             // `f` and `.` start a float literal, which netsim disables.
                             (b'f' | b'F' | b'.', None) => return Err(CompileError::Syntax),
                             (b'l' | b'L', None) => {
-                                if !valid_long_suffix(text, suffix, p) {
+                                if !valid_long_suffix(text, suffix, position) {
                                     return Err(CompileError::InvalidCharacter);
                                 }
-                                suffix.get_or_insert(p);
+
+                                suffix.get_or_insert(position);
                             }
-                            (b'u' | b'U', None) if suffix.is_none() => suffix = Some(p),
+                            (b'u' | b'U', None) if suffix.is_none() => suffix = Some(position),
                             _ => return Err(CompileError::InvalidCharacter),
                         }
                     }
-                    p += 1;
+
+                    position += 1;
                 }
             }
         }
+
         match pending {
-            None => Ok((0, p)),
+            None => Ok((0, position)),
             Some(Pending::Identifier) => {
-                let bytes = &text[start..p];
+                let bytes = &text[start..position];
                 if let Some(&(_, truth)) = KEYWORDS.iter().find(|(keyword, _)| *keyword == bytes) {
                     self.push_new(Kind::Constant(Variant::Bool(truth)))?;
-                    return Ok((CONSTANT, p));
+                    return Ok((CONSTANT, position));
                 }
-                self.push_new(Kind::Name(Text { start, end: p }))?;
-                Ok((IDENTIFIER, p))
+
+                self.push_new(Kind::Name(Text {
+                    start,
+                    end: position,
+                }))?;
+
+                Ok((IDENTIFIER, position))
             }
             Some(Pending::Number) => {
-                let number = number_value(text, start, p, suffix, base, value)?;
+                let number = number_value(text, start, position, suffix, base, value)?;
                 self.push_new(Kind::Constant(number))?;
-                Ok((CONSTANT, p))
+
+                Ok((CONSTANT, position))
             }
         }
     }
@@ -1010,25 +795,29 @@ impl<'a> Compiler<'a> {
     fn apply(&mut self, operator: Operator, arity: u8) -> Result<(), CompileError> {
         let mut list = None;
         let mut constant = true;
+
         for _ in 0..arity {
             let Some(id) = self.pop() else {
                 self.free_list(list);
                 return Err(CompileError::MissingOperand);
             };
+
             constant &= matches!(self.node(id).kind, Kind::Constant(_));
             self.node_mut(id).next = list;
             list = Some(id);
         }
+
         let Some(first) = list else {
             return Ok(());
         };
-        match self.build(operator, first, constant) {
-            Ok(()) => Ok(()),
-            Err((code, remaining)) => {
-                self.free_list(remaining);
-                Err(code)
-            }
-        }
+
+        let Err((code, remaining)) = self.build(operator, first, constant) else {
+            return Ok(());
+        };
+
+        self.free_list(remaining);
+
+        Err(code)
     }
 
     /// Build one operator over the operand list starting at `first`. On
@@ -1046,6 +835,7 @@ impl<'a> Compiler<'a> {
             Some(Kind::Constant(value)) => value,
             _ => Variant::Null,
         };
+
         let result = match operator.0 {
             // Rule 1 (a constant) and unary plus.
             0 | 7 => {
@@ -1061,10 +851,12 @@ impl<'a> Compiler<'a> {
                 let Kind::Constant(left) = self.node(first).kind else {
                     return self.generic(operator, first);
                 };
+
                 let truth = variant::to_bool(&left).map_err(|error| fail(error.into()))?;
                 if truth == (operator.0 == 0x1a) {
                     return self.generic(operator, first);
                 }
+
                 Variant::Bool(truth)
             }
             0x1c => return self.select(first),
@@ -1077,7 +869,9 @@ impl<'a> Compiler<'a> {
             // Operator 5 and the comma are never folded.
             _ => return self.generic(operator, first),
         };
+
         self.fold(first, result);
+
         Ok(())
     }
 
@@ -1086,6 +880,7 @@ impl<'a> Compiler<'a> {
         let Kind::Constant(condition) = self.node(first).kind else {
             return self.generic(Operator::CONDITIONAL, first);
         };
+
         let truth = variant::to_bool(&condition)
             .map_err(|error| (CompileError::Value(error), Some(first)))?;
         let (Some(then), Some(otherwise)) = (
@@ -1094,6 +889,7 @@ impl<'a> Compiler<'a> {
         ) else {
             return Err((CompileError::MissingOperand, Some(first)));
         };
+
         let (chosen, other) = if truth {
             (then, otherwise)
         } else {
@@ -1104,6 +900,7 @@ impl<'a> Compiler<'a> {
         self.keep(chosen, None);
         self.free_list(Some(first));
         self.free_list(Some(other));
+
         Ok(())
     }
 
@@ -1124,6 +921,7 @@ impl<'a> Compiler<'a> {
         if let Kind::Constant(Variant::Str(_)) = self.node(first).kind {
             self.release(Holder::Node(first));
         }
+
         let result = match result {
             Variant::Str(text) => {
                 let text = self.intern(Holder::Node(first), text);
@@ -1132,6 +930,7 @@ impl<'a> Compiler<'a> {
             }
             other => other,
         };
+
         let rest = self.next(first);
         self.node_mut(first).kind = Kind::Constant(result);
         self.keep(first, rest);
@@ -1150,6 +949,7 @@ impl<'a> Compiler<'a> {
             })
             .ok_or((CompileError::OutOfMemory, Some(first)))?;
         self.push(id);
+
         Ok(())
     }
 
@@ -1164,25 +964,33 @@ impl<'a> Compiler<'a> {
 
     /// Declare an item (0x91f84f88).
     fn create_item(&mut self, name: Text, index: Option<u64>) -> Result<ItemIndex, CompileError> {
+        // Names must be shorter than this (library limit 0x80).
+        const NAME_LIMIT: usize = 0x80;
+
         let length = name.end - name.start;
         if length == 0 {
             return Err(CompileError::EmptyName);
         }
+
         if length >= NAME_LIMIT {
             return Err(CompileError::NameTooLong);
         }
+
         let position = usize::from(self.item_count);
         if position >= ITEM_LIMIT {
             return Err(CompileError::TooManyItems);
         }
-        let name = self.intern(Holder::Item(ItemIndex(position as u8)), name);
+
+        let item = ItemIndex(position as u8);
+        let name = self.intern(Holder::Item(item), name);
         self.items[position] = Item {
             name: Some(name),
             index,
             array: false,
         };
         self.item_count += 1;
-        Ok(ItemIndex(position as u8))
+
+        Ok(item)
     }
 
     /// Rule 3: a name becomes a reference to its item, declared on first
@@ -1193,6 +1001,7 @@ impl<'a> Compiler<'a> {
             self.keep(first, None);
             return Ok(());
         };
+
         let item = match self.find_item(name, None) {
             Some(item) if self.items[usize::from(item.0)].array => {
                 return Err(CompileError::NotScalar);
@@ -1203,6 +1012,7 @@ impl<'a> Compiler<'a> {
         self.release(Holder::Node(first));
         self.node_mut(first).kind = Kind::Item(item);
         self.keep(first, None);
+
         Ok(())
     }
 
@@ -1214,6 +1024,7 @@ impl<'a> Compiler<'a> {
         second: NodeId,
     ) -> Result<(), (CompileError, Option<NodeId>)> {
         let fail = |code: CompileError| (code, Some(first));
+
         let array = match self.node(first).kind {
             Kind::Name(name) => {
                 let array = match self.find_item(name, None) {
@@ -1229,6 +1040,7 @@ impl<'a> Compiler<'a> {
                 };
                 self.release(Holder::Node(first));
                 self.node_mut(first).kind = Kind::Item(array);
+
                 array
             }
             // After an earlier builder error the operand can be another node.
@@ -1245,9 +1057,11 @@ impl<'a> Compiler<'a> {
             // pointer, which stock dereferences as an item and faults.
             Kind::Item(_) | Kind::Operator { .. } => return Err(fail(CompileError::WrongItemKind)),
         };
+
         let Kind::Constant(index) = self.node(second).kind else {
             return self.generic(Operator::INDEX, first);
         };
+
         let index = match index {
             Variant::I8(_) | Variant::I16(_) | Variant::I32(_) | Variant::I64(_) => {
                 // Signed values always convert.
@@ -1259,6 +1073,7 @@ impl<'a> Compiler<'a> {
         if index == u64::MAX {
             return Err(fail(CompileError::IndexOutOfRange));
         }
+
         let array_name = self.items[usize::from(array.0)]
             .name
             .ok_or(fail(CompileError::WrongItemKind))?;
@@ -1266,13 +1081,16 @@ impl<'a> Compiler<'a> {
             Some(item) => item,
             None => self.create_item(array_name, Some(index)).map_err(fail)?,
         };
+
         // Stock drops the operand's value as a string reference; for any
         // other constant it follows the value bytes as links and faults.
         if let Kind::Constant(Variant::Str(_)) = self.node(first).kind {
             self.release(Holder::Node(first));
         }
+
         self.node_mut(first).kind = Kind::Item(element);
         self.keep(first, Some(second));
+
         Ok(())
     }
 
@@ -1281,7 +1099,8 @@ impl<'a> Compiler<'a> {
     /// position) or the first four bytes of a value stored with at least
     /// that size. Narrower integers leave stale bytes in the word.
     fn value_word(&self, id: NodeId, value: Variant) -> Option<u32> {
-        let bytes = |bytes: &[u8]| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let word = |bytes: &[u8]| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+
         match value {
             Variant::Str(_) => self.link_is_null(Holder::Node(id)).then_some(0),
             Variant::Bool(value) => Some(u32::from(value)),
@@ -1289,9 +1108,9 @@ impl<'a> Compiler<'a> {
             Variant::U32(value) => Some(value),
             Variant::I64(value) => Some((value as u64 >> 32) as u32),
             Variant::U64(value) => Some((value >> 32) as u32),
-            Variant::Mac(value) => Some(bytes(&value)),
-            Variant::Ipv4(value) => Some(bytes(&value)),
-            Variant::Ipv6(value) => Some(bytes(&value)),
+            Variant::Mac(value) => Some(word(&value)),
+            Variant::Ipv4(value) => Some(word(&value)),
+            Variant::Ipv6(value) => Some(word(&value)),
             Variant::Null | Variant::I8(_) | Variant::I16(_) | Variant::U8(_) | Variant::U16(_) => {
                 None
             }
@@ -1301,21 +1120,46 @@ impl<'a> Compiler<'a> {
     /// Rules 5 and 6, `name(arguments)` (builder operator 4): a built-in
     /// function over its flattened arguments.
     fn call(&mut self, first: NodeId) -> Result<(), (CompileError, Option<NodeId>)> {
+        // Builder operators that the grammar does not name directly.
+        const COMMA: Operator = Operator(0x1d);
+        const STRING_COMPARE: Operator = Operator(0x1f);
+        const STRING_INDEX_OF: Operator = Operator(0x20);
+        const STRING_CONTAINS: Operator = Operator(0x21);
+        const STRING_STARTS_WITH: Operator = Operator(0x22);
+        const STRING_ENDS_WITH: Operator = Operator(0x23);
+        const STRING_SUBSTRING: Operator = Operator(0x24);
+        // Built-in functions (0x91f0c158); `Operator::count_range` holds
+        // their operand counts.
+        const FUNCTIONS: [(&[u8], Operator); 7] = [
+            (b"String.Length", Operator::STRING_LENGTH),
+            (b"String.Compare", STRING_COMPARE),
+            (b"String.IndexOf", STRING_INDEX_OF),
+            (b"String.Contains", STRING_CONTAINS),
+            (b"String.StartsWith", STRING_STARTS_WITH),
+            (b"String.EndsWith", STRING_ENDS_WITH),
+            (b"String.Substring", STRING_SUBSTRING),
+        ];
+
         let fail = |code: CompileError| (code, Some(first));
+
         // As in `index`, stock reads the item of any other node; such an
         // item is never a function.
         let Kind::Name(name) = self.node(first).kind else {
             return Err(fail(CompileError::WrongItemKind));
         };
+
         if self.find_item(name, None).is_some() {
             return Err(fail(CompileError::WrongItemKind));
         }
+
         let bytes = &self.text[name.start..name.end];
         let (_, function) = *FUNCTIONS
             .iter()
             .find(|(name, _)| *name == bytes)
             .ok_or(fail(CompileError::Syntax))?;
         let (minimum, maximum) = function.count_range().ok_or(fail(CompileError::Syntax))?;
+
+        // Splice the operands of comma operators into the argument list.
         let mut count = 0u32;
         let mut constant = true;
         let mut previous = first;
@@ -1331,9 +1175,11 @@ impl<'a> Compiler<'a> {
                 while let Some(child) = last.and_then(|child| self.next(child)) {
                     last = Some(child);
                 }
+
                 if let Some(last) = last {
                     self.node_mut(last).next = node.next;
                 }
+
                 self.node_mut(id).kind = Kind::Operator {
                     operator: COMMA,
                     operands: None,
@@ -1344,22 +1190,28 @@ impl<'a> Compiler<'a> {
                 current = operands;
                 continue;
             }
+
             constant &= matches!(node.kind, Kind::Constant(_));
             previous = id;
             current = node.next;
             count += 1;
         }
+
         if count < minimum {
             return Err(fail(CompileError::TooFewArguments));
         }
+
         if count > maximum {
             return Err(fail(CompileError::TooManyArguments));
         }
+
         let Some(arguments) = self.next(first) else {
             return Err(fail(CompileError::TooFewArguments));
         };
+
         self.node_mut(first).next = None;
         self.free_list(Some(first));
+
         self.function(function, arguments, count, constant)
     }
 
@@ -1374,6 +1226,7 @@ impl<'a> Compiler<'a> {
         if !constant {
             return self.generic(operator, first);
         }
+
         let mut values = [Variant::Null; 5];
         let mut id = Some(first);
         for slot in values.iter_mut().take(count as usize) {
@@ -1381,36 +1234,78 @@ impl<'a> Compiler<'a> {
             if let Kind::Constant(value) = self.node(node).kind {
                 *slot = value;
             }
+
             id = self.next(node);
         }
+
         let result = variant::apply(self.text, operator, &values[..count as usize])
             .map_err(|error| (CompileError::Value(error), Some(first)))?;
         self.fold(first, result);
+
         Ok(())
     }
 
-    /// Append the subtree of `id` in postfix order.
-    fn postfix(&self, id: NodeId, nodes: &mut [WireNode; NODE_LIMIT], count: &mut usize) {
-        let wire = match self.node(id).kind {
+    /// Write the subtree of `root` in postfix order. Returns the node count.
+    fn postfix(&self, root: NodeId, nodes: &mut [WireNode; NODE_LIMIT]) -> usize {
+        // Operators whose operands are being written, innermost last.
+        let mut open = [NodeId(0); NODE_LIMIT];
+        let mut depth = 0;
+        let mut count = 0;
+        let mut id = root;
+
+        loop {
+            if let Kind::Operator {
+                operands: Some(first),
+                ..
+            } = self.node(id).kind
+            {
+                open[depth] = id;
+                depth += 1;
+                id = first;
+                continue;
+            }
+
+            // Write `id`, then each open operator whose last operand it is.
+            loop {
+                nodes[count] = self.wire_node(id);
+                count += 1;
+
+                // The root's own link is outside its subtree.
+                if depth == 0 {
+                    return count;
+                }
+
+                if let Some(sibling) = self.next(id) {
+                    id = sibling;
+                    break;
+                }
+
+                depth -= 1;
+                id = open[depth];
+            }
+        }
+    }
+
+    /// The wire form of one node; an operator counts its operands.
+    fn wire_node(&self, id: NodeId) -> WireNode {
+        match self.node(id).kind {
             Kind::Constant(value) => WireNode::Constant(self.wire_value(value)),
             Kind::Name(text) => WireNode::Name(self.string_id(text)),
             Kind::Item(item) => WireNode::Item(item.0),
             Kind::Operator { operator, operands } => {
                 let mut operand_count = 0u16;
-                let mut child = operands;
-                while let Some(id) = child {
-                    self.postfix(id, nodes, count);
+                let mut operand = operands;
+                while let Some(id) = operand {
                     operand_count += 1;
-                    child = self.next(id);
+                    operand = self.next(id);
                 }
+
                 WireNode::Operator {
                     operator,
                     operands: operand_count,
                 }
             }
-        };
-        nodes[*count] = wire;
-        *count += 1;
+        }
     }
 
     /// Position of the entry of `text` among the entries, oldest first.
@@ -1419,6 +1314,7 @@ impl<'a> Compiler<'a> {
             .take_while(|&position| !self.equal(self.references[position].text, text))
             .filter(|&position| self.starts_entry(position))
             .count();
+
         StringId(count as u8)
     }
 
@@ -1442,12 +1338,209 @@ impl<'a> Compiler<'a> {
     }
 }
 
+impl StringTable for Compiler<'_> {
+    fn count(&self) -> usize {
+        (0..usize::from(self.reference_count))
+            .filter(|&position| self.starts_entry(position))
+            .count()
+    }
+
+    fn bytes(&self, id: StringId) -> &[u8] {
+        let text = (0..usize::from(self.reference_count))
+            .filter(|&position| self.starts_entry(position))
+            .nth(usize::from(id.0))
+            .map_or(Text { start: 0, end: 0 }, |position| {
+                self.references[position].text
+            });
+
+        &self.text[text.start..text.end]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NodeId(u8);
+
+/// Position of an item in declaration order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ItemIndex(u8);
+
+#[derive(Debug, Clone, Copy)]
+enum Kind {
+    Constant(Variant),
+    /// An undeclared name; the builder turns names into items.
+    Name(Text),
+    Item(ItemIndex),
+    /// Builder operator 3..=0x24 over its operand list.
+    Operator {
+        operator: Operator,
+        operands: Option<NodeId>,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Node {
+    kind: Kind,
+    /// The next node of the operand stack, an operand list or the free list.
+    next: Option<NodeId>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Item {
+    /// Cleared once the item is bound to its field.
+    name: Option<Text>,
+    /// Element index of an array element; none for a scalar or an array.
+    index: Option<u64>,
+    /// Declared by `name[...]` (variant type 0xf).
+    array: bool,
+}
+
+/// The owner of a string reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Holder {
+    Node(NodeId),
+    Item(ItemIndex),
+    /// The result of a fold before it is copied into its node.
+    Fold,
+}
+
+/// A string reference (stock string reference, 0x14 bytes).
+#[derive(Debug, Clone, Copy)]
+struct Reference {
+    holder: Holder,
+    text: Text,
+}
+
+/// The pending token of the lexer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pending {
+    Identifier,
+    Number,
+}
+
+/// The group layout of an address literal.
+struct AddressFormat {
+    separator: u8,
+    /// Separators between the groups.
+    separators: u8,
+    /// Digit base of a group.
+    base: u32,
+    /// Largest group value.
+    maximum: u32,
+    /// Bytes a group stores.
+    group_bytes: usize,
+}
+
+/// Compile classifier text (0x91f8bdd0). `Ok(None)` is a constant true
+/// program, which classifies every frame.
+pub fn compile_text(text: &[u8]) -> Result<Option<Compiled<'_>>, CompileError> {
+    let mut compiler = Compiler::new(text);
+    compiler.parse();
+    if let Some(error) = compiler.status {
+        return Err(error);
+    }
+
+    // An accepted program leaves exactly its root on the stack.
+    let root = compiler.stack.ok_or(CompileError::Syntax)?;
+    if let Kind::Constant(value) = compiler.node(root).kind {
+        return if variant::to_bool(&value)? {
+            Ok(None)
+        } else {
+            Err(CompileError::AlwaysFalse)
+        };
+    }
+
+    // Every item carries a name until it is bound (stock skips unnamed
+    // items, which this compiler never declares).
+    let mut fields = [FieldId(0); ITEM_LIMIT];
+    for (position, bound) in fields
+        .iter_mut()
+        .enumerate()
+        .take(usize::from(compiler.item_count))
+    {
+        let Some(name) = compiler.items[position].name.take() else {
+            continue;
+        };
+
+        *bound = field_id(&text[name.start..name.end]).ok_or(CompileError::UnknownField)?;
+        compiler.release(Holder::Item(ItemIndex(position as u8)));
+    }
+
+    Ok(Some(Compiled {
+        compiler,
+        root,
+        fields,
+    }))
+}
+
+/// The id of the field named `name` (0x91f75370: ASCII case-insensitive).
+fn field_id(name: &[u8]) -> Option<FieldId> {
+    // The field names back to back, and the end of each; a name starts
+    // where the previous one ends.
+    const FIELD_NAMES: [u8; field_names_length()] = pack_field_names();
+    const FIELD_ENDS: [u16; super::FIELD_COUNT as usize] = field_name_ends();
+
+    let mut start = 0;
+    for (position, &end) in FIELD_ENDS.iter().enumerate() {
+        let end = usize::from(end);
+        if name.eq_ignore_ascii_case(&FIELD_NAMES[start..end]) {
+            return Some(FieldId(position as u8 + 1));
+        }
+
+        start = end;
+    }
+
+    None
+}
+
+const fn field_names_length() -> usize {
+    let mut length = 0;
+    let mut field = 0;
+    while field < FIELDS.len() {
+        length += FIELDS[field].len();
+        field += 1;
+    }
+
+    length
+}
+
+const fn pack_field_names() -> [u8; field_names_length()] {
+    let mut names = [0u8; field_names_length()];
+    let mut position = 0;
+    let mut field = 0;
+    while field < FIELDS.len() {
+        let mut byte = 0;
+        while byte < FIELDS[field].len() {
+            names[position] = FIELDS[field][byte];
+            position += 1;
+            byte += 1;
+        }
+
+        field += 1;
+    }
+
+    names
+}
+
+const fn field_name_ends() -> [u16; super::FIELD_COUNT as usize] {
+    let mut ends = [0u16; super::FIELD_COUNT as usize];
+    let mut end = 0;
+    let mut field = 0;
+    while field < FIELDS.len() {
+        end += FIELDS[field].len();
+        ends[field] = end as u16;
+        field += 1;
+    }
+
+    ends
+}
+
 /// Whether an `l` at `position` continues a valid integer suffix: the
 /// first suffix character, or after `l` (at most two) or `u`.
 fn valid_long_suffix(text: &[u8], suffix: Option<usize>, position: usize) -> bool {
     let Some(suffix) = suffix else {
         return true;
     };
+
     match text[position - 1] {
         b'l' | b'L' => {
             suffix >= position - 1
@@ -1470,6 +1563,7 @@ fn number_value(
     let wide = |digits: usize| {
         value > 0xffff_ffff || (base == 10 && digits > 10) || (base == 16 && digits > 8)
     };
+
     let Some(mut suffix) = suffix else {
         return Ok(if wide(end - start) {
             Variant::I64(value as i64)
@@ -1477,21 +1571,25 @@ fn number_value(
             Variant::I32(value as u32 as i32)
         });
     };
+
     let digits = suffix - start;
     let unsigned = matches!(text[suffix], b'u' | b'U');
     if unsigned {
         suffix += 1;
     }
+
     if suffix + 1 >= end {
         if wide(digits) {
             return Err(CompileError::SuffixOverflow);
         }
+
         return Ok(if unsigned {
             Variant::U32(value as u32)
         } else {
             Variant::I32(value as u32 as i32)
         });
     }
+
     Ok(if unsigned {
         Variant::U64(value)
     } else {
@@ -1508,44 +1606,68 @@ fn address_literal(text: &[u8]) -> Option<(Variant, usize)> {
     if text.len() < 7 {
         return None;
     }
-    let (separator, separators, base, maximum, group_bytes) = if text[2] == b'-' {
-        (b'-', 5, 16, 0xff, 1)
+
+    let format = if text[2] == b'-' {
+        AddressFormat {
+            separator: b'-',
+            separators: 5,
+            base: 16,
+            maximum: 0xff,
+            group_bytes: 1,
+        }
     } else if text[1] == b'.' || text[2] == b'.' || text[3] == b'.' {
-        (b'.', 3, 10, 0xff, 1)
+        AddressFormat {
+            separator: b'.',
+            separators: 3,
+            base: 10,
+            maximum: 0xff,
+            group_bytes: 1,
+        }
     } else if text[4] == b':' {
-        (b':', 7, 16, 0xffff, 2)
+        AddressFormat {
+            separator: b':',
+            separators: 7,
+            base: 16,
+            maximum: 0xffff,
+            group_bytes: 2,
+        }
     } else {
         return None;
     };
+    let group_bytes = format.group_bytes;
+
     let mut bytes = [0u8; 16];
     let mut written = 0;
-    let mut remaining = separators;
+    let mut remaining = format.separators;
     let mut group_start = 0;
     let mut group = 0u32;
     let mut position = 0;
+
     while position < text.len() {
-        let c = text[position];
-        let digit = match c {
-            b'0'..=b'9' => Some(u32::from(c - b'0')),
-            b'a'..=b'f' => Some(u32::from(c - b'a' + 10)),
-            b'A'..=b'F' => Some(u32::from(c - b'A' + 10)),
+        let byte = text[position];
+        let digit = match byte {
+            b'0'..=b'9' => Some(u32::from(byte - b'0')),
+            b'a'..=b'f' => Some(u32::from(byte - b'a' + 10)),
+            b'A'..=b'F' => Some(u32::from(byte - b'A' + 10)),
             _ => None,
         };
         match digit {
             Some(digit) => {
-                if digit >= base {
+                if digit >= format.base {
                     return None;
                 }
-                group = group * base + digit;
-                if group > maximum {
+
+                group = group * format.base + digit;
+                if group > format.maximum {
                     return None;
                 }
             }
             None if remaining == 0 => break,
             None => {
-                if c != separator || position <= group_start {
+                if byte != format.separator || position <= group_start {
                     return None;
                 }
+
                 bytes[written..written + group_bytes]
                     .copy_from_slice(&group.to_be_bytes()[4 - group_bytes..]);
                 written += group_bytes;
@@ -1554,22 +1676,28 @@ fn address_literal(text: &[u8]) -> Option<(Variant, usize)> {
                 group_start = position + 1;
             }
         }
+
         position += 1;
     }
+
     if remaining != 0 {
         return None;
     }
+
     bytes[written..written + group_bytes].copy_from_slice(&group.to_be_bytes()[4 - group_bytes..]);
-    let value = match separator {
+    let value = match format.separator {
         b'-' => Variant::Mac(bytes[..6].try_into().ok()?),
         b'.' => Variant::Ipv4(bytes[..4].try_into().ok()?),
         _ => Variant::Ipv6(bytes),
     };
+
     Some((value, position))
 }
 
 #[cfg(test)]
 mod tests {
+    use openxbdm_core::status::Hresult;
+
     use super::*;
     use crate::commands::network::netsim::classifier::Program;
     use crate::commands::network::netsim::classifier::ProgramError;
@@ -1578,7 +1706,6 @@ mod tests {
     // (0xdc output bytes), run on the stock image in an instruction-level
     // PowerPC emulator. A differential run of 60000 generated texts against
     // the same emulation matched this port wherever stock does not fault.
-
     /// Texts and their serialized programs.
     const PROGRAMS: [(&str, &str); 45] = [
         ("UDP", "101001010108252200"),
@@ -1739,10 +1866,12 @@ mod tests {
     fn hex(text: &str) -> ([u8; CAPACITY], usize) {
         let mut bytes = [0u8; CAPACITY];
         let digits = text.as_bytes();
+
         for (index, pair) in digits.chunks(2).enumerate() {
-            let digit = |c: u8| (c as char).to_digit(16).unwrap() as u8;
+            let digit = |byte: u8| (byte as char).to_digit(16).unwrap() as u8;
             bytes[index] = digit(pair[0]) << 4 | digit(pair[1]);
         }
+
         (bytes, digits.len() / 2)
     }
 
@@ -1770,9 +1899,11 @@ mod tests {
             buffer[length..length + bytes.len()].copy_from_slice(bytes);
             length += bytes.len();
         };
+
         (0..count).for_each(|_| put(prefix));
         put(middle);
         (0..count).for_each(|_| put(suffix));
+
         &buffer[..length]
     }
 
@@ -1838,6 +1969,7 @@ mod tests {
         // 20 element items of 11 bytes each exceed the output.
         let mut buffer = [0u8; 0x100];
         let mut length = 0;
+
         for index in 0..19 {
             let mut item = [0u8; 16];
             let mut cursor = 0;
@@ -1845,10 +1977,12 @@ mod tests {
                 item[cursor] = byte;
                 cursor += 1;
             }
+
             if index >= 10 {
                 item[cursor] = b'1';
                 cursor += 1;
             }
+
             item[cursor] = b'0' + (index % 10) as u8;
             item[cursor + 1] = b']';
             cursor += 2;
@@ -1856,9 +1990,11 @@ mod tests {
                 item[cursor..cursor + 4].copy_from_slice(b" || ");
                 cursor += 4;
             }
+
             buffer[length..length + cursor].copy_from_slice(&item[..cursor]);
             length += cursor;
         }
+
         let program = compile_text(&buffer[..length]).unwrap().unwrap();
         let mut output = [0u8; CAPACITY];
         assert_eq!(
@@ -1870,6 +2006,7 @@ mod tests {
     #[test]
     fn resource_limits() {
         let mut buffer = [0u8; 0x400];
+
         // The parser stack holds 500 states.
         assert!(
             compile(nested(&mut buffer, b"(", 300, b"UDP", b")"))
@@ -1884,12 +2021,14 @@ mod tests {
             compile(nested(&mut buffer, b"-", 499, b"UDP", b"")),
             Err(CompileError::StackOverflow)
         );
+
         // 498 negations fit the stack but exhaust the node objects; the
         // freed operand then leaves the next negation without one.
         assert_eq!(
             compile(nested(&mut buffer, b"-", 498, b"UDP", b"")),
             Err(CompileError::MissingOperand)
         );
+
         // 65 live nodes exceed the 0x40 node objects.
         assert_eq!(
             compile(nested(&mut buffer, b"UDP+", 32, b"UDP", b"")),

@@ -6,65 +6,36 @@
 //! header, frame bytes, 2-byte frame type), then a frame table of record
 //! offsets whose location the header holds at 0x18.
 
+mod error;
+
 use core::num::NonZeroU32;
 
-use openxbdm_core::status::Hresult;
-use openxbdm_core::status::KernelError;
-use openxbdm_core::status::Win32Error;
+pub use self::error::CaptureFileError;
 
 /// Bytes before the first record: the 0x80-byte file header and the
 /// 0x74-byte media block.
 pub const HEADER_SIZE: usize = 0xf4;
-const MEDIA_BLOCK_OFFSET: usize = 0x80;
-const MEDIA_BLOCK_SIZE: u32 = 0x74;
 /// Header offset of the frame table location: table offset, table bytes.
 pub const TABLE_LOCATION_OFFSET: u64 = 0x18;
 pub const RECORD_HEADER_SIZE: usize = 0x10;
 /// Frame type that ends every record (Ethernet).
 pub const RECORD_TRAILER: [u8; 2] = 1u16.to_le_bytes();
-/// Bytes a record adds to its frame, counted against the data limit.
-const RECORD_OVERHEAD: u32 = 0x12;
 /// Longest frame the context accepts: `netcap` creates it with frame length
 /// 0, which selects this default.
 pub const MAX_FRAME_LENGTH: u32 = 0x5ea;
 /// Largest single file write of the buffered writer.
 pub const WRITE_LIMIT: u32 = 0x1_0000;
 
-/// Why a capture file operation failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CaptureFileError {
-    /// A frame is longer than [`MAX_FRAME_LENGTH`], or a file transfer was
-    /// short.
-    BadLength,
-    /// The data limit is used up.
-    DataLimitReached,
-    /// The write buffer was full where the caller could not wait for it.
-    WriteFault,
-    /// A record header in the file is inconsistent.
-    InvalidData,
-    /// No memory for the context or the write buffer.
-    OutOfMemory,
-    /// A file operation failed.
-    Kernel(KernelError),
-}
-
-impl From<CaptureFileError> for Hresult {
-    fn from(error: CaptureFileError) -> Self {
-        match error {
-            CaptureFileError::BadLength => Win32Error::BAD_LENGTH.into(),
-            CaptureFileError::DataLimitReached => Win32Error::BUFFER_OVERFLOW.into(),
-            CaptureFileError::WriteFault => Win32Error::WRITE_FAULT.into(),
-            CaptureFileError::InvalidData => Win32Error::INVALID_DATA.into(),
-            CaptureFileError::OutOfMemory => Hresult::OUT_OF_MEMORY,
-            CaptureFileError::Kernel(error) => error.into(),
-        }
-    }
-}
-
-impl From<KernelError> for CaptureFileError {
-    fn from(error: KernelError) -> Self {
-        Self::Kernel(error)
-    }
+/// Positional access to an open capture file.
+pub trait CaptureIo {
+    /// Read exactly `buffer.len()` bytes; a short read is
+    /// [`CaptureFileError::BadLength`].
+    fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> Result<(), CaptureFileError>;
+    /// Write all of `data`; a short write is [`CaptureFileError::BadLength`].
+    fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), CaptureFileError>;
+    /// Set the end of file and the allocation size to `length`
+    /// (0x91f6a310).
+    fn truncate(&mut self, length: u64) -> Result<(), CaptureFileError>;
 }
 
 /// Local time of context creation, in `GetLocalTime` field order.
@@ -114,6 +85,7 @@ impl Clock {
     /// Stock stores `frequency * 0.001` truncated to 32 bits (0x91f698f0).
     pub fn new(origin: u64, frequency: u64) -> Self {
         let ticks = (frequency as f64 * 0.001) as i64 as u32;
+
         // Stock traps on a zero divisor; time base rates are in the MHz
         // range, so the minimum is never selected on hardware.
         Self {
@@ -130,44 +102,6 @@ impl Clock {
                 / u64::from(self.ticks_per_millisecond.get()),
         )
     }
-}
-
-/// The header and media block (0x91f6b4e8). The frame table location at
-/// [`TABLE_LOCATION_OFFSET`] stays zero until the capture is finished.
-pub fn file_header(start: &LocalTime) -> [u8; HEADER_SIZE] {
-    let mut header = [0u8; HEADER_SIZE];
-    header[..4].copy_from_slice(b"GMBU");
-    // Records carry the frame type trailer.
-    header[4] = 1;
-    header[5] = 2;
-    header[6..8].copy_from_slice(&1u16.to_le_bytes());
-    for (index, field) in start.fields().into_iter().enumerate() {
-        header[8 + index * 2..10 + index * 2].copy_from_slice(&field.to_le_bytes());
-    }
-    put(&mut header, 0x38, MEDIA_BLOCK_OFFSET as u32);
-    put(&mut header, 0x3c, MEDIA_BLOCK_SIZE);
-    let media = MEDIA_BLOCK_OFFSET;
-    put(&mut header, media + 0x1c, 100);
-    // Media type of the file object (+0x60), set when the file opens.
-    put(&mut header, media + 0x20, 1);
-    put(&mut header, media + 0x24, MAX_FRAME_LENGTH);
-    // File object +0x28, initialized to 1000.
-    put(&mut header, media + 0x2c, 1000);
-    put(&mut header, media + 0x50, 1);
-    header
-}
-
-fn put(buffer: &mut [u8], offset: usize, value: u32) {
-    buffer[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-}
-
-/// Header of a record (0x91f6a730): time, then the frame length twice.
-pub fn record_header(time: Microseconds, length: u32) -> [u8; RECORD_HEADER_SIZE] {
-    let mut header = [0u8; RECORD_HEADER_SIZE];
-    header[..8].copy_from_slice(&time.0.to_le_bytes());
-    put(&mut header, 8, length);
-    put(&mut header, 12, length);
-    header
 }
 
 /// What to do with a frame that passed [`Recorder::admit`].
@@ -188,6 +122,7 @@ pub struct Recorder {
     /// Records appended (+0x48); replaced by the records found when the
     /// file is finished.
     frames: u32,
+
     /// The data limit was hit (flag 0x01000000).
     exhausted: bool,
     /// A record failed with [`CaptureFileError::WriteFault`] (flag
@@ -217,12 +152,15 @@ impl Recorder {
         if length > MAX_FRAME_LENGTH {
             return Err(CaptureFileError::BadLength);
         }
+
         if self.exhausted {
             return Err(CaptureFileError::DataLimitReached);
         }
+
         if self.closing {
             return Ok(Admission::Discard);
         }
+
         // Unsigned like stock: the overhead of the last record can push
         // `used` past the limit, after which the remainder wraps and any
         // frame fits.
@@ -235,11 +173,15 @@ impl Recorder {
             self.exhausted = true;
             return Err(CaptureFileError::DataLimitReached);
         }
+
         Ok(Admission::Record)
     }
 
     /// A record of `length` frame bytes was written.
     pub fn recorded(&mut self, length: u32) {
+        /// Bytes a record adds to its frame, counted against the data limit.
+        const RECORD_OVERHEAD: u32 = 0x12;
+
         self.used = self.used.wrapping_add(length).wrapping_add(RECORD_OVERHEAD);
         self.frames = self.frames.wrapping_add(1);
     }
@@ -269,11 +211,14 @@ impl Recorder {
         if self.frames > 0 {
             self.frames = write_frame_table(file, end, &mut table)?;
         }
+
         file.truncate(end + u64::from(table.bytes))?;
+
         let mut location = [0u8; 8];
         put(&mut location, 0, table.offset);
         put(&mut location, 4, table.bytes);
         file.write_at(TABLE_LOCATION_OFFSET, &location)?;
+
         if self.write_fault {
             Err(CaptureFileError::WriteFault)
         } else {
@@ -282,21 +227,56 @@ impl Recorder {
     }
 }
 
-/// Positional access to an open capture file.
-pub trait CaptureIo {
-    /// Read exactly `buffer.len()` bytes; a short read is
-    /// [`CaptureFileError::BadLength`].
-    fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> Result<(), CaptureFileError>;
-    /// Write all of `data`; a short write is [`CaptureFileError::BadLength`].
-    fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), CaptureFileError>;
-    /// Set the end of file and the allocation size to `length`
-    /// (0x91f6a310).
-    fn truncate(&mut self, length: u64) -> Result<(), CaptureFileError>;
-}
-
 struct Table {
     offset: u32,
     bytes: u32,
+}
+
+/// The header and media block (0x91f6b4e8). The frame table location at
+/// [`TABLE_LOCATION_OFFSET`] stays zero until the capture is finished.
+pub fn file_header(start: &LocalTime) -> [u8; HEADER_SIZE] {
+    const MEDIA_BLOCK_OFFSET: usize = 0x80;
+    const MEDIA_BLOCK_SIZE: u32 = 0x74;
+
+    let mut header = [0u8; HEADER_SIZE];
+    header[..4].copy_from_slice(b"GMBU");
+
+    // Records carry the frame type trailer.
+    header[4] = 1;
+    header[5] = 2;
+    header[6..8].copy_from_slice(&1u16.to_le_bytes());
+
+    for (index, field) in start.fields().into_iter().enumerate() {
+        header[8 + index * 2..10 + index * 2].copy_from_slice(&field.to_le_bytes());
+    }
+
+    put(&mut header, 0x38, MEDIA_BLOCK_OFFSET as u32);
+    put(&mut header, 0x3c, MEDIA_BLOCK_SIZE);
+
+    let media = MEDIA_BLOCK_OFFSET;
+    put(&mut header, media + 0x1c, 100);
+    // Media type of the file object (+0x60), set when the file opens.
+    put(&mut header, media + 0x20, 1);
+    put(&mut header, media + 0x24, MAX_FRAME_LENGTH);
+    // File object +0x28, initialized to 1000.
+    put(&mut header, media + 0x2c, 1000);
+    put(&mut header, media + 0x50, 1);
+
+    header
+}
+
+/// Header of a record (0x91f6a730): time, then the frame length twice.
+pub fn record_header(time: Microseconds, length: u32) -> [u8; RECORD_HEADER_SIZE] {
+    let mut header = [0u8; RECORD_HEADER_SIZE];
+    header[..8].copy_from_slice(&time.0.to_le_bytes());
+    put(&mut header, 8, length);
+    put(&mut header, 12, length);
+
+    header
+}
+
+fn put(buffer: &mut [u8], offset: usize, value: u32) {
+    buffer[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
 /// Walk the records from the header to `end`, appending each record offset
@@ -308,25 +288,30 @@ fn write_frame_table(
 ) -> Result<u32, CaptureFileError> {
     let mut position = HEADER_SIZE as u64;
     let mut count = 0u32;
+
     while position < end {
         let mut header = [0u8; RECORD_HEADER_SIZE];
         file.read_at(position, &mut header)?;
+
         let original = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
         let captured = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
         let available = end as i64 - (position + RECORD_HEADER_SIZE as u64) as i64;
         if i64::from(captured) > available || captured != original {
             return Err(CaptureFileError::InvalidData);
         }
+
         let entry_offset = end + u64::from(count) * 4;
         file.write_at(entry_offset, &(position as u32).to_le_bytes())?;
         if count == 0 {
             table.offset = end as u32;
         }
         table.bytes = table.bytes.wrapping_add(4);
+
         position += u64::from(captured.wrapping_add(RECORD_HEADER_SIZE as u32))
             + RECORD_TRAILER.len() as u64;
         count += 1;
     }
+
     Ok(count)
 }
 

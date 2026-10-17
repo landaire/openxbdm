@@ -2,7 +2,6 @@
 //! 0x20-byte queue counters, and the blobs the exports build from them
 //! before calling the command helpers.
 
-use super::BLOB_VERSION;
 use super::CONFIG_CAPACITY;
 use super::ConfigMask;
 use super::InvalidConfig;
@@ -11,7 +10,8 @@ use super::QueueConfig;
 use super::QueueStats;
 use super::RedirectConfig;
 use super::Source;
-use super::append_program;
+use super::config::BLOB_VERSION;
+use super::config::append_program;
 
 /// Bytes of the queue settings structure; its first dword holds the size.
 pub const SETTINGS_SIZE: usize = 0x24;
@@ -48,8 +48,9 @@ pub fn decode_settings(
     if !declares_size(raw, SETTINGS_SIZE) {
         return Err(InvalidConfig);
     }
+
     QueueConfig {
-        mask: ConfigMask(dword(raw, 4)),
+        mask: ConfigMask::from_bits_retain(dword(raw, 4)),
         packet_limit: dword(raw, 8),
         byte_limit: dword(raw, 0xc),
         rate: dword(raw, 0x10),
@@ -66,8 +67,9 @@ pub fn decode_settings(
 /// the library never sets the size dword, so it reads 0.
 pub fn encode_settings(config: &QueueConfig) -> [u8; SETTINGS_SIZE] {
     let mut raw = [0u8; SETTINGS_SIZE];
+
     for (offset, value) in [
-        (4, config.mask.0),
+        (4, config.mask.bits()),
         (8, config.packet_limit),
         (0xc, config.byte_limit),
         (0x10, config.rate),
@@ -77,8 +79,10 @@ pub fn encode_settings(config: &QueueConfig) -> [u8; SETTINGS_SIZE] {
     ] {
         raw[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
     }
+
     raw[0x20..0x22].copy_from_slice(&config.latency_min.to_be_bytes());
     raw[0x22..0x24].copy_from_slice(&config.latency_max.to_be_bytes());
+
     raw
 }
 
@@ -91,6 +95,7 @@ pub fn encode_stats(stats: &QueueStats) -> [u8; STATS_SIZE] {
     raw[0x10..0x18].copy_from_slice(&stats.dropped_bytes.to_be_bytes());
     raw[0x18..0x1c].copy_from_slice(&stats.total_packets.to_be_bytes());
     raw[0x1c..0x20].copy_from_slice(&stats.dropped_packets.to_be_bytes());
+
     raw
 }
 
@@ -108,32 +113,40 @@ pub fn queue_blob(
         blob[length..length + bytes.len()].copy_from_slice(bytes);
         length += bytes.len();
     };
+
     put(&[BLOB_VERSION]);
     if kind != 0 {
         put(&[kind as u8]);
     }
+
     let mask = config.mask;
-    put(&mask.0.to_be_bytes());
+    put(&mask.bits().to_be_bytes());
     if mask.contains(ConfigMask::LIMITS) {
         put(&config.packet_limit.to_be_bytes());
         put(&config.byte_limit.to_be_bytes());
     }
+
     if mask.contains(ConfigMask::RATE) {
         put(&config.rate.to_be_bytes());
     }
+
     if mask.contains(ConfigMask::TOKEN_RATE) {
         put(&config.token_rate.to_be_bytes());
     }
+
     if mask.contains(ConfigMask::BUCKET) {
         put(&config.bucket_depth.to_be_bytes());
     }
+
     if mask.contains(ConfigMask::LOSS) {
         put(&config.loss.to_be_bytes());
     }
+
     if mask.contains(ConfigMask::LATENCY) {
         put(&config.latency_min.to_be_bytes());
         put(&config.latency_max.to_be_bytes());
     }
+
     append_program(program, blob, length)
 }
 
@@ -145,6 +158,7 @@ pub fn redirect_blob(
 ) -> Result<usize, NetsimError> {
     let fixed = config.serialize();
     blob[..fixed.len()].copy_from_slice(&fixed);
+
     append_program(program, blob, fixed.len())
 }
 
@@ -195,7 +209,7 @@ mod tests {
             (20, 40),
         )))
         .unwrap();
-        assert_eq!(config.mask, ConfigMask(0x63));
+        assert_eq!(config.mask, ConfigMask::from_bits_retain(0x63));
         assert_eq!(
             (config.packet_limit, config.byte_limit, config.rate),
             (10, 0x4000, 1_000_000)

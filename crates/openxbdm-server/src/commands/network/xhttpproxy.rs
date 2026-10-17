@@ -4,6 +4,8 @@
 //! pointers into them; the list keeps stock order (new entries at the head,
 //! settings written from the tail).
 
+mod error;
+
 use core::fmt::Write as _;
 
 use openxbdm_core::status::ErrorCode;
@@ -22,11 +24,12 @@ use crate::reply::CommandResult;
 use crate::reply::Reply;
 use crate::state::ServerState;
 use crate::text::HEX_UPPER;
+use crate::text::Text;
+
+pub use self::error::ProxyError;
 
 /// Bytes copied from `name=`, including the terminator.
 pub const NAME_CAPACITY: usize = 0x100;
-/// Certificate bytes per hex chunk of a settings line.
-const SETTINGS_CHUNK: u32 = 0x1ff;
 
 xbox360_sys::flags! {
     /// Flag bits of a proxy entry, as stored by the monitor.
@@ -81,23 +84,6 @@ pub enum Inserted {
     /// The entry is active and holds an extra reference until the upload
     /// completes.
     Pending(ProxyId),
-}
-
-/// Why a new entry was not inserted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProxyError {
-    /// The certificate hex is malformed or longer than `certsize`.
-    BadCertificate,
-    OutOfMemory,
-}
-
-impl From<ProxyError> for CommandError {
-    fn from(error: ProxyError) -> Self {
-        match error {
-            ProxyError::BadCertificate => ErrorCode::UnknownCommand.into(),
-            ProxyError::OutOfMemory => ErrorCode::OutOfMemory.into(),
-        }
-    }
 }
 
 /// Result of [`Backend::proxy_update`].
@@ -169,6 +155,7 @@ pub struct CertificateUpload {
 /// [sys | sysonly] [force] [temp]`: replace the proxy of a scope.
 pub(super) fn xhttpproxy(invocation: &mut Invocation<'_>) -> CommandResult {
     let line = invocation.line;
+
     let mut name_buffer = [0u8; NAME_CAPACITY];
     let (name, certificate_size) = match line.param("name") {
         None => (None, 0),
@@ -183,11 +170,13 @@ pub(super) fn xhttpproxy(invocation: &mut Invocation<'_>) -> CommandResult {
             if !valid {
                 return Err(ErrorCode::BadParameter.into());
             }
+
             let certificate_size = line.dword("certsize").unwrap_or(0);
             // An empty name stores no name, as a missing one does.
             ((!name.is_empty()).then_some((name, port)), certificate_size)
         }
     };
+
     let sys_only = line.has("sysonly");
     let sys = sys_only || line.has("sys");
     let force = line.has("force");
@@ -204,6 +193,7 @@ pub(super) fn xhttpproxy(invocation: &mut Invocation<'_>) -> CommandResult {
             flags.insert(bit);
         }
     }
+
     let new = (name.is_some() || force).then(|| {
         let certificate = if certificate_size == 0 {
             Certificate::None
@@ -222,6 +212,7 @@ pub(super) fn xhttpproxy(invocation: &mut Invocation<'_>) -> CommandResult {
                 },
             }
         };
+
         NewProxy {
             flags,
             name: name.map(|(name, _)| name),
@@ -260,9 +251,11 @@ pub(super) fn xhttpproxy(invocation: &mut Invocation<'_>) -> CommandResult {
             }
         },
     };
+
     if settings_changed && invocation.session.is_some() {
         invocation.state.settings_dirty = true;
     }
+
     let cleared = if outcome.cleared.is_some() {
         "cleared"
     } else {
@@ -275,6 +268,7 @@ pub(super) fn xhttpproxy(invocation: &mut Invocation<'_>) -> CommandResult {
         )),
         Ok(_) => invocation.set_text(format_args!("{cleared}{applied}")),
     }
+
     result
 }
 
@@ -290,15 +284,18 @@ pub(super) fn receive_certificate(
         cx.session.receive_remaining = Some(0);
         return Err(NetworkError::UploadAborted.into());
     }
+
     let count = (cx.received.len() as u32).min(size - *received);
     cx.backend
         .proxy_write_certificate(id, *received, &cx.received[..count as usize]);
     *received += count;
+
     let remaining = size - *received;
     cx.session.receive_remaining = Some(remaining);
     if remaining != 0 {
         return Ok(Reply::Ok);
     }
+
     if cx
         .backend
         .proxy_upload_complete(id)
@@ -306,6 +303,7 @@ pub(super) fn receive_certificate(
     {
         cx.state.settings_dirty = true;
     }
+
     Ok(Reply::Ok)
 }
 
@@ -323,9 +321,13 @@ pub(crate) fn settings_lines(
 
 /// The caller holds the list lock.
 fn write_entries(backend: &mut dyn AnyBackend, file: SettingsFile) {
+    /// Certificate bytes per hex chunk of a settings line.
+    const SETTINGS_CHUNK: u32 = 0x1ff;
+
     let mut position = 0;
     while let Some(entry) = backend.proxy_entry(position) {
         position += 1;
+
         let flags = entry.flags;
         if !flags.contains(ProxyFlags::ACTIVE)
             || flags.contains(ProxyFlags::TEMP)
@@ -333,6 +335,7 @@ fn write_entries(backend: &mut dyn AnyBackend, file: SettingsFile) {
         {
             continue;
         }
+
         let scope = if !flags.contains(ProxyFlags::SYS) {
             ""
         } else if flags.contains(ProxyFlags::SYS_ONLY) {
@@ -349,9 +352,10 @@ fn write_entries(backend: &mut dyn AnyBackend, file: SettingsFile) {
             system::write_line(backend, file, format_args!("xhttpproxy{scope}{force}"));
             continue;
         };
+
         // Stock formats the line up to the certificate into one 0x400-byte
         // buffer, so the settings trace echoes it once.
-        let mut line = crate::text::Text::<0x3ff>::new();
+        let mut line = Text::<0x3ff>::new();
         let _ = write!(line, "xhttpproxy{scope} name=\"");
         let _ = line.push_bytes(&entry.name[..name_len]);
         let _ = write!(line, "\" port={}{force}", entry.port);
@@ -360,22 +364,27 @@ fn write_entries(backend: &mut dyn AnyBackend, file: SettingsFile) {
             system::end_line(backend, file);
             continue;
         }
+
         let _ = write!(line, " certsize={} cert=", entry.certificate_size);
         system::write_bytes(backend, file, line.as_bytes());
+
         let mut offset = 0;
         while offset < entry.certificate_size {
             let count = (entry.certificate_size - offset).min(SETTINGS_CHUNK);
             let mut bytes = [0u8; SETTINGS_CHUNK as usize];
             let bytes = &mut bytes[..count as usize];
             backend.proxy_read_certificate(entry.id, offset, bytes);
+
             let mut hex = [0u8; 2 * SETTINGS_CHUNK as usize];
             for (index, &byte) in bytes.iter().enumerate() {
                 hex[2 * index] = HEX_UPPER[usize::from(byte >> 4)];
                 hex[2 * index + 1] = HEX_UPPER[usize::from(byte & 0xf)];
             }
+
             system::write_bytes(backend, file, &hex[..2 * count as usize]);
             offset += count;
         }
+
         system::end_line(backend, file);
     }
 }

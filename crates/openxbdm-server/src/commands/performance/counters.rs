@@ -20,12 +20,10 @@
 // CounterObject accesses raw counter object memory.
 #![allow(unsafe_code)]
 
-use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
-use openxbdm_core::status::KernelError;
 use openxbdm_core::status::XbdmHresult;
 
-use crate::reply::CommandError;
+pub use super::error::CounterError;
 
 /// Size of a counter object.
 pub const OBJECT_SIZE: usize = 0xc8;
@@ -52,21 +50,6 @@ xbox360_sys::flags! {
     }
 }
 
-/// Counter class: bits 4 and 5 of a counter type or query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CounterClass(u32);
-
-impl CounterClass {
-    const VALUE: Self = Self(0);
-    const RATE: Self = Self(0x10);
-    const RATIO: Self = Self(0x20);
-    const MASK: u32 = 0x30;
-
-    const fn of(word: u32) -> Self {
-        Self(word & Self::MASK)
-    }
-}
-
 xbox360_sys::flags! {
     /// Rate units of a history query and of a rate sample type, as the
     /// xbdm.h `DMCOUNT_PER*` bits.
@@ -76,11 +59,6 @@ xbox360_sys::flags! {
         PER_FRAME = 0x100,
         PER_TICK = 0x200,
     }
-}
-
-/// Sample type word of a history evaluation: `class` with `unit`.
-const fn sample_type(class: CounterClass, unit: RateUnit) -> u32 {
-    class.0 | unit.bits()
 }
 
 /// The `querypc type=` word: counter class bits, history selectors, and a
@@ -118,62 +96,11 @@ pub enum Evaluation {
     Routine(Hresult),
 }
 
-/// A failed counter enumeration, open, or query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CounterError {
-    /// The query does not match the counter type.
-    TypeInvalid,
-    /// No sample is available.
-    DataNotAvailable,
-    /// Failure result of the counter's reader or query routine.
-    Routine(Hresult),
-    /// The process has no counter directory.
-    NoDirectory,
-    /// The counter cannot be opened.
-    NotFound,
-    /// The counter object cannot be referenced.
-    Kernel(KernelError),
-    /// The end of the counter directory.
-    End,
-    /// A directory entry does not fit the enumeration buffer.
-    NameTooLong,
-    /// An enumerated counter cannot be opened.
-    Unexpected,
-}
-
 impl From<Evaluation> for Hresult {
     fn from(evaluation: Evaluation) -> Self {
         match evaluation {
             Evaluation::Sampled => Hresult::OK,
             Evaluation::Routine(result) => result,
-        }
-    }
-}
-
-impl From<CounterError> for CommandError {
-    fn from(error: CounterError) -> Self {
-        match error {
-            CounterError::Kernel(error) => CommandError::from_kernel(error, CommandError::Fail),
-            CounterError::End => CommandError::EndOfData,
-            CounterError::Unexpected => CommandError::Unexpected,
-            error => CommandError::Counter(error),
-        }
-    }
-}
-
-impl From<CounterError> for Hresult {
-    #[inline(never)]
-    fn from(error: CounterError) -> Self {
-        match error {
-            CounterError::TypeInvalid => ErrorCode::TypeInvalid.hresult(),
-            CounterError::DataNotAvailable => ErrorCode::DataNotAvailable.hresult(),
-            CounterError::Routine(result) => result,
-            CounterError::NoDirectory => ErrorCode::FileNotFound.hresult(),
-            CounterError::NotFound => ErrorCode::AccessDenied.hresult(),
-            CounterError::NameTooLong => Hresult::BUFFER_TOO_SMALL,
-            CounterError::Kernel(_) | CounterError::End | CounterError::Unexpected => {
-                CommandError::from(error).into()
-            }
         }
     }
 }
@@ -298,6 +225,21 @@ pub trait CounterObject {
     fn allow_sampler(&mut self);
 }
 
+/// Counter class: bits 4 and 5 of a counter type or query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CounterClass(u32);
+
+impl CounterClass {
+    const VALUE: Self = Self(0);
+    const RATE: Self = Self(0x10);
+    const RATIO: Self = Self(0x20);
+    const MASK: u32 = 0x30;
+
+    const fn of(word: u32) -> Self {
+        Self(word & Self::MASK)
+    }
+}
+
 fn registration(object: &impl CounterObject) -> CounterRegistration {
     // SAFETY: the registration word lies within the object.
     CounterRegistration(unsafe { object.read_u32(REGISTRATION_OFFSET) })
@@ -331,6 +273,11 @@ unsafe fn rate_at(object: &impl CounterObject, index: i32) -> u32 {
 unsafe fn frame_at(object: &impl CounterObject, index: i32) -> u32 {
     // SAFETY: slots -4 to 10 span offsets 0x84 to 0xc0.
     unsafe { object.read_u32(FRAMES_OFFSET + index * 4) }
+}
+
+/// Sample type word of a history evaluation: `class` with `unit`.
+const fn sample_type(class: CounterClass, unit: RateUnit) -> u32 {
+    class.0 | unit.bits()
 }
 
 /// Initialize a new object: registration word and an empty history.
@@ -384,6 +331,7 @@ fn read_source(object: &mut impl CounterObject, value: &mut u64, rate: Option<&m
 /// of the history.
 pub unsafe fn sample(object: &mut impl CounterObject, tick_count: u32, frame_number: u32) {
     let word = registration(object);
+
     let mut value = 0u64;
     let (valid, rate) = if word.class() != CounterClass::RATIO {
         (read_source(object, &mut value, None), tick_count)
@@ -397,6 +345,7 @@ pub unsafe fn sample(object: &mut impl CounterObject, tick_count: u32, frame_num
         unsafe { object.write_u32(INDEX_OFFSET, u32::MAX) };
         return;
     }
+
     let count = if history_index(object) < 0 {
         // SAFETY: as above.
         unsafe { object.write_u32(INDEX_OFFSET, 0) };
@@ -404,11 +353,13 @@ pub unsafe fn sample(object: &mut impl CounterObject, tick_count: u32, frame_num
     } else {
         word.period()
     };
+
     for _ in 0..count {
         if history_index(object) == HISTORY_LENGTH {
             // SAFETY: as above.
             unsafe { object.write_u32(INDEX_OFFSET, 0) };
         }
+
         let index = history_index(object);
         // SAFETY: by the contract and the resets above, `index` is a slot
         // from 0 to 10, whose words lie within the object.
@@ -433,6 +384,7 @@ pub unsafe fn query(
 ) -> Result<Evaluation, CounterError> {
     let word = registration(object);
     let class = word.class();
+
     if word.flags().contains(RegistrationFlags::COPIES_SAMPLE) {
         object.exclude_sampler();
         // SAFETY: the registration has the copied-sample flag.
@@ -442,42 +394,55 @@ pub unsafe fn query(
             out.sample_type = object.source_u32(0x10);
         }
         object.allow_sampler();
+
         return Ok(Evaluation::Sampled);
     }
+
     if word.flags().contains(RegistrationFlags::HAS_HANDLER) {
         // SAFETY: the registration has the handler flag.
         return unsafe { object.call_handler(query, out) };
     }
+
     if class != query.class() {
         return Err(CounterError::TypeInvalid);
     }
-    let mut count = query.count();
+
     if !query.history() && class != CounterClass::RATIO {
         if !read_source(object, &mut out.value, None) {
             return Err(CounterError::DataNotAvailable);
         }
+
         out.sample_type = class.0;
+
         return Ok(Evaluation::Sampled);
     }
+
     if class == CounterClass::VALUE {
-        if count == 0 {
-            count = 1;
-        }
+        let count = match query.count() {
+            0 => 1,
+            count => count,
+        };
         out.value = 0;
         out.rate = count as u64;
+
         object.exclude_sampler();
         // SAFETY: the caller upholds the same contract; `count` is 1 to 15.
         let result = unsafe { history_sum(object, count, out) };
         object.allow_sampler();
+
         return result;
     }
-    if count == 0 {
-        count = 10;
-    }
+
+    let count = match query.count() {
+        0 => 10,
+        count => count,
+    };
+
     object.exclude_sampler();
     // SAFETY: the caller upholds the same contract; `count` is 1 to 15.
     let result = unsafe { history_difference(object, query, count, out) };
     object.allow_sampler();
+
     result
 }
 
@@ -495,16 +460,20 @@ unsafe fn history_sum(
     if index < 0 {
         return Err(CounterError::DataNotAvailable);
     }
+
     for _ in 0..count {
         if index < 0 {
             index += HISTORY_LENGTH;
         }
+
         // SAFETY: by the contract `index` started as a slot from 0 to 10
         // and wraps to stay in that range.
         out.value = out.value.wrapping_add(unsafe { value_at(object, index) });
         index -= 1;
     }
+
     out.sample_type = u32::from(registration(object).counter_type());
+
     Ok(Evaluation::Sampled)
 }
 
@@ -520,20 +489,24 @@ unsafe fn history_difference(
     count: i32,
     out: &mut CounterSample,
 ) -> Result<Evaluation, CounterError> {
+    // A rate class per-frame query, tested with one mask as stock does.
+    const PER_FRAME_RATE: u32 = sample_type(CounterClass::RATE, RateUnit::PER_FRAME);
+
     let class = registration(object).class();
     let index = history_index(object);
     if index < 0 {
         return Err(CounterError::DataNotAvailable);
     }
-    let mut back = index - count;
-    if back < 0 {
-        back += HISTORY_LENGTH;
-    }
+
+    let back = match index - count {
+        back if back < 0 => back + HISTORY_LENGTH,
+        back => back,
+    };
+
     // SAFETY: by the contract `index` is a slot from 0 to 10; with `count`
     // from 1 to 15, `back` is from -4 to 10.
     out.value = unsafe { value_at(object, index).wrapping_sub(value_at(object, back)) };
-    // A rate class per-frame query, tested with one mask as stock does.
-    const PER_FRAME_RATE: u32 = sample_type(CounterClass::RATE, RateUnit::PER_FRAME);
+
     if query.0 & (CounterClass::MASK | RateUnit::PER_FRAME.bits()) == PER_FRAME_RATE {
         out.sample_type = PER_FRAME_RATE;
         // SAFETY: as above.
@@ -559,6 +532,7 @@ unsafe fn history_difference(
         };
     }
     out.sample_type |= count as u32;
+
     if out.rate == 0 {
         Err(CounterError::DataNotAvailable)
     } else {

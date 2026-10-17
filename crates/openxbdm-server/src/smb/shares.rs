@@ -14,8 +14,8 @@ use crate::commands::filesystem::DriveTable;
 use crate::commands::filesystem::DriveTarget;
 use crate::commands::filesystem::OBJECT_PATH_LIMIT;
 
-/// Characters share names exclude (MS-SRVS 2.2.4.102, `shi502_netname`).
-const EXCLUDED: &[u8] = b"\"/\\[]:|<>+=;,*?";
+/// Shares in use at once across the service's connections.
+const SHARE_BINDINGS: usize = 2 * MAX_TREES;
 
 /// A drive name offered as a share and the object directory it serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,12 +24,190 @@ pub(crate) struct Candidate<'a> {
     pub target: DriveTarget,
 }
 
+/// Presence of the candidates during one message, each tested once.
+#[derive(Debug, Default)]
+pub(crate) struct Presence {
+    tested: u128,
+    present: u128,
+}
+
+impl Presence {
+    /// Whether the candidate at list `position` exists; `probe` tests it.
+    fn test(
+        &mut self,
+        position: usize,
+        target: DriveTarget,
+        probe: &mut dyn FnMut(DriveTarget) -> bool,
+    ) -> bool {
+        let Some(bit) = u32::try_from(position)
+            .ok()
+            .and_then(|position| 1u128.checked_shl(position))
+        else {
+            return probe(target);
+        };
+
+        if self.tested & bit == 0 {
+            self.tested |= bit;
+            if probe(target) {
+                self.present |= bit;
+            }
+        }
+
+        self.present & bit != 0
+    }
+
+    /// The existing share at `index` of the share list.
+    pub(crate) fn nth<'a>(
+        &mut self,
+        drives: &'a DriveTable,
+        index: usize,
+        probe: &mut dyn FnMut(DriveTarget) -> bool,
+    ) -> Option<Candidate<'a>> {
+        candidates(drives)
+            .enumerate()
+            .filter(|&(position, candidate)| self.test(position, candidate.target, probe))
+            .map(|(_, candidate)| candidate)
+            .nth(index)
+    }
+}
+
+/// Share identifiers of the service: an identifier is a slot that binds a
+/// name to the target it had at a tree connect. The engine keys files,
+/// locks, and changes by identifier across connections, so every
+/// connection gets the same identifier for a share. The slot stays while
+/// a tree of any connection uses it; when the name's target changes, the
+/// share is gone for those trees.
+#[derive(Debug)]
+pub(crate) struct ShareBindings {
+    slots: [Option<Binding>; SHARE_BINDINGS],
+}
+
+impl ShareBindings {
+    pub(crate) const fn new() -> Self {
+        Self {
+            slots: [None; SHARE_BINDINGS],
+        }
+    }
+
+    /// The identifier of `candidate`: the slot that binds its name to its
+    /// target, or a free slot. `None` when every slot is bound otherwise.
+    pub(crate) fn bind(&mut self, candidate: Candidate<'_>) -> Option<ShareId> {
+        let binding = Binding {
+            name: DriveName::new(candidate.name),
+            target: candidate.target,
+        };
+
+        let slot = match self.slots.iter().position(|slot| *slot == Some(binding)) {
+            Some(slot) => slot,
+            None => {
+                let slot = self.slots.iter().position(Option::is_none)?;
+                self.slots[slot] = Some(binding);
+                slot
+            }
+        };
+
+        Some(ShareId(slot as u32))
+    }
+
+    /// Free the slots that no identifier in `used` names.
+    pub(crate) fn retain(&mut self, used: impl Iterator<Item = ShareId>) {
+        let mut kept = [false; SHARE_BINDINGS];
+        for ShareId(id) in used {
+            if let Some(keep) = kept.get_mut(id as usize) {
+                *keep = true;
+            }
+        }
+
+        for (slot, keep) in self.slots.iter_mut().zip(kept) {
+            if !keep {
+                *slot = None;
+            }
+        }
+    }
+
+    /// The current target of the share `id`; [`FsError::ShareRemoved`]
+    /// when its name is gone or now names another target.
+    pub(crate) fn resolve(&self, drives: &DriveTable, id: ShareId) -> Result<DriveTarget, FsError> {
+        let binding = self
+            .slots
+            .get(id.0 as usize)
+            .copied()
+            .flatten()
+            .ok_or(FsError::ShareRemoved)?;
+
+        match find(drives, binding.name.as_bytes()) {
+            Some(candidate) if candidate.target == binding.target => Ok(binding.target),
+            _ => Err(FsError::ShareRemoved),
+        }
+    }
+}
+
+/// The kernel object name of a path on a share: the share's target, `\`,
+/// and the path with each UTF-16 code unit as one byte.
+#[derive(Clone)]
+pub(crate) struct ObjectName {
+    bytes: [u8; OBJECT_PATH_LIMIT],
+    len: usize,
+}
+
+impl ObjectName {
+    /// Code units above 0xff and names longer than [`OBJECT_PATH_LIMIT`]
+    /// fail with [`FsError::NameInvalid`].
+    pub(crate) fn new(target: &[u8], path: SharePath<'_>) -> Result<Self, FsError> {
+        let mut name = Self {
+            bytes: [0; OBJECT_PATH_LIMIT],
+            len: 0,
+        };
+
+        name.push(target)?;
+        if !target.ends_with(b"\\") {
+            name.push(b"\\")?;
+        }
+
+        for unit in path.as_utf16().units() {
+            let byte = u8::try_from(unit).map_err(|_| FsError::NameInvalid)?;
+            name.push(&[byte])?;
+        }
+
+        Ok(name)
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> Result<(), FsError> {
+        let end = self.len + bytes.len();
+        self.bytes
+            .get_mut(self.len..end)
+            .ok_or(FsError::NameInvalid)?
+            .copy_from_slice(bytes);
+        self.len = end;
+
+        Ok(())
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+impl core::fmt::Debug for ObjectName {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(formatter, "\"{}\"", self.as_bytes().escape_ascii())
+    }
+}
+
+/// A share name and the target it had when a tree connected to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Binding {
+    name: DriveName,
+    target: DriveTarget,
+}
+
 /// Rows of the drive table, then the rows of the internal mapping.
 fn rows(drives: &DriveTable) -> impl Iterator<Item = Candidate<'_>> {
     let internal = filesystem::internal_drives().map(|(name, target)| Candidate {
         name,
         target: DriveTarget::Object(target),
     });
+
     drives
         .drives()
         .map(|drive| Candidate {
@@ -72,6 +250,9 @@ fn fallback(row: Candidate<'_>) -> DriveTarget {
 }
 
 pub(crate) fn is_share_name(name: &[u8]) -> bool {
+    // Characters share names exclude (MS-SRVS 2.2.4.102, `shi502_netname`).
+    const EXCLUDED: &[u8] = b"\"/\\[]:|<>+=;,*?";
+
     !name.is_empty()
         && name.len() <= SHARE_NAME_CAPACITY
         && name
@@ -90,15 +271,15 @@ pub(crate) fn find<'a>(drives: &'a DriveTable, name: &[u8]) -> Option<Candidate<
     candidates(drives).find(|candidate| candidate.name.eq_ignore_ascii_case(name))
 }
 
-/// Optical drive devices, whose media are read-only.
-const OPTICAL_DEVICES: &[&[u8]] = &[
-    b"\\Device\\Cdrom",
-    b"\\Device\\HdDvdRom",
-    b"\\Device\\HdDvdPlayer",
-];
-
 /// Whether `target` names an optical drive or a directory on one.
 pub(crate) fn is_optical(target: &[u8]) -> bool {
+    // Optical drive devices, whose media are read-only.
+    const OPTICAL_DEVICES: &[&[u8]] = &[
+        b"\\Device\\Cdrom",
+        b"\\Device\\HdDvdRom",
+        b"\\Device\\HdDvdPlayer",
+    ];
+
     OPTICAL_DEVICES.iter().any(|device| {
         target.len() >= device.len() && target[..device.len()].eq_ignore_ascii_case(device)
     })
@@ -110,176 +291,6 @@ pub(crate) fn fits(target: DriveTarget) -> bool {
     match target {
         DriveTarget::Mapped { length, .. } => length as usize <= OBJECT_PATH_LIMIT,
         DriveTarget::Object(_) | DriveTarget::NetworkShare => true,
-    }
-}
-
-/// Presence of the candidates during one message, each tested once.
-#[derive(Debug, Default)]
-pub(crate) struct Presence {
-    tested: u128,
-    present: u128,
-}
-
-impl Presence {
-    /// Whether the candidate at list `position` exists; `probe` tests it.
-    fn test(
-        &mut self,
-        position: usize,
-        target: DriveTarget,
-        probe: &mut dyn FnMut(DriveTarget) -> bool,
-    ) -> bool {
-        let Some(bit) = u32::try_from(position)
-            .ok()
-            .and_then(|position| 1u128.checked_shl(position))
-        else {
-            return probe(target);
-        };
-        if self.tested & bit == 0 {
-            self.tested |= bit;
-            if probe(target) {
-                self.present |= bit;
-            }
-        }
-        self.present & bit != 0
-    }
-
-    /// The existing share at `index` of the share list.
-    pub(crate) fn nth<'a>(
-        &mut self,
-        drives: &'a DriveTable,
-        index: usize,
-        probe: &mut dyn FnMut(DriveTarget) -> bool,
-    ) -> Option<Candidate<'a>> {
-        candidates(drives)
-            .enumerate()
-            .filter(|&(position, candidate)| self.test(position, candidate.target, probe))
-            .map(|(_, candidate)| candidate)
-            .nth(index)
-    }
-}
-
-/// A share name and the target it had when a tree connected to it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Binding {
-    name: DriveName,
-    target: DriveTarget,
-}
-
-/// Share identifiers of the service: an identifier is a slot that binds a
-/// name to the target it had at a tree connect. The engine keys files,
-/// locks, and changes by identifier across connections, so every
-/// connection gets the same identifier for a share. The slot stays while
-/// a tree of any connection uses it; when the name's target changes, the
-/// share is gone for those trees.
-#[derive(Debug)]
-pub(crate) struct ShareBindings {
-    slots: [Option<Binding>; SHARE_BINDINGS],
-}
-
-/// Shares in use at once across the service's connections.
-const SHARE_BINDINGS: usize = 2 * MAX_TREES;
-
-impl ShareBindings {
-    pub(crate) const fn new() -> Self {
-        Self {
-            slots: [None; SHARE_BINDINGS],
-        }
-    }
-
-    /// The identifier of `candidate`: the slot that binds its name to its
-    /// target, or a free slot. `None` when every slot is bound otherwise.
-    pub(crate) fn bind(&mut self, candidate: Candidate<'_>) -> Option<ShareId> {
-        let binding = Binding {
-            name: DriveName::new(candidate.name),
-            target: candidate.target,
-        };
-        let slot = match self.slots.iter().position(|slot| *slot == Some(binding)) {
-            Some(slot) => slot,
-            None => {
-                let slot = self.slots.iter().position(Option::is_none)?;
-                self.slots[slot] = Some(binding);
-                slot
-            }
-        };
-        Some(ShareId(slot as u32))
-    }
-
-    /// Free the slots that no identifier in `used` names.
-    pub(crate) fn retain(&mut self, used: impl Iterator<Item = ShareId>) {
-        let mut kept = [false; SHARE_BINDINGS];
-        for ShareId(id) in used {
-            if let Some(keep) = kept.get_mut(id as usize) {
-                *keep = true;
-            }
-        }
-        for (slot, keep) in self.slots.iter_mut().zip(kept) {
-            if !keep {
-                *slot = None;
-            }
-        }
-    }
-
-    /// The current target of the share `id`; [`FsError::ShareRemoved`]
-    /// when its name is gone or now names another target.
-    pub(crate) fn resolve(&self, drives: &DriveTable, id: ShareId) -> Result<DriveTarget, FsError> {
-        let binding = self
-            .slots
-            .get(id.0 as usize)
-            .copied()
-            .flatten()
-            .ok_or(FsError::ShareRemoved)?;
-        match find(drives, binding.name.as_bytes()) {
-            Some(candidate) if candidate.target == binding.target => Ok(binding.target),
-            _ => Err(FsError::ShareRemoved),
-        }
-    }
-}
-
-/// The kernel object name of a path on a share: the share's target, `\`,
-/// and the path with each UTF-16 code unit as one byte.
-#[derive(Clone)]
-pub(crate) struct ObjectName {
-    bytes: [u8; OBJECT_PATH_LIMIT],
-    len: usize,
-}
-
-impl ObjectName {
-    /// Code units above 0xff and names longer than [`OBJECT_PATH_LIMIT`]
-    /// fail with [`FsError::NameInvalid`].
-    pub(crate) fn new(target: &[u8], path: SharePath<'_>) -> Result<Self, FsError> {
-        let mut name = Self {
-            bytes: [0; OBJECT_PATH_LIMIT],
-            len: 0,
-        };
-        name.push(target)?;
-        if !target.ends_with(b"\\") {
-            name.push(b"\\")?;
-        }
-        for unit in path.as_utf16().units() {
-            let byte = u8::try_from(unit).map_err(|_| FsError::NameInvalid)?;
-            name.push(&[byte])?;
-        }
-        Ok(name)
-    }
-
-    fn push(&mut self, bytes: &[u8]) -> Result<(), FsError> {
-        let end = self.len + bytes.len();
-        self.bytes
-            .get_mut(self.len..end)
-            .ok_or(FsError::NameInvalid)?
-            .copy_from_slice(bytes);
-        self.len = end;
-        Ok(())
-    }
-
-    pub(crate) fn as_bytes(&self) -> &[u8] {
-        &self.bytes[..self.len]
-    }
-}
-
-impl core::fmt::Debug for ObjectName {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(formatter, "\"{}\"", self.as_bytes().escape_ascii())
     }
 }
 

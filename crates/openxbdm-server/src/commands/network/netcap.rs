@@ -1,6 +1,7 @@
 //! `netcap`: Ethernet frame capture to a file.
 
 pub mod capture_file;
+mod error;
 
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
@@ -16,11 +17,7 @@ use crate::reply::CommandError;
 use crate::reply::CommandResult;
 use crate::reply::Reply;
 
-/// Size of the `file=` buffer, terminator included.
-const FILE_PARAMETER_SIZE: usize = 0x104;
-/// Size of the translated path buffer; the translator stops at this many
-/// bytes.
-const OBJECT_PATH_SIZE: usize = 0x104;
+pub use self::error::StartError;
 
 xbox360_sys::flags! {
     /// `start` flags (0x91f9f694).
@@ -46,6 +43,7 @@ impl CaptureFlags {
         if !self.intersects(Self::SKIP_BROADCAST.union(Self::SKIP_MULTICAST)) || frame.len() <= 6 {
             return false;
         }
+
         if frame[..6] == [0xff; 6] {
             self.contains(Self::SKIP_BROADCAST)
         } else {
@@ -153,6 +151,7 @@ pub(super) fn netcap(invocation: &mut Invocation<'_>) -> CommandResult {
         )?;
         invocation.set_text(format_args!("{text}"));
         text.status()?;
+
         Ok(Reply::Ok)
     } else {
         Err(ErrorCode::BadParameter.into())
@@ -171,7 +170,11 @@ pub(super) fn title_exited(state: &mut State, backend: &mut dyn crate::backend::
 }
 
 fn start(invocation: &mut Invocation<'_>) -> CommandResult {
+    /// Size of the `file=` buffer, terminator included.
+    const FILE_PARAMETER_SIZE: usize = 0x104;
+
     let line = invocation.line;
+
     // Absent and unparsable values read as 0, which selects the defaults.
     let dword = |name| line.dword(name).unwrap_or(0);
     let data_limit = dword("maxframedata");
@@ -180,6 +183,7 @@ fn start(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(file) = line.param("file") else {
         return Err(ErrorCode::FilenameInvalid.into());
     };
+
     let mut name = [0u8; FILE_PARAMETER_SIZE];
     let name = file.copy_into(&mut name);
 
@@ -193,35 +197,12 @@ fn start(invocation: &mut Invocation<'_>) -> CommandResult {
     ) {
         Ok(()) => {
             invocation.set_text(format_args!("started"));
+
             Ok(Reply::Ok)
         }
         Err(error) => {
             invocation.set_text(format_args!("err=0x{:08x}", Hresult::from(error).0));
             Err(NetworkError::CaptureStart(error).into())
-        }
-    }
-}
-
-/// Why a capture did not start.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StartError {
-    /// A capture runs.
-    AlreadyCapturing,
-    /// The Ethernet intercept callbacks are owned by another client.
-    InterceptBusy,
-    /// Installing the intercept callbacks failed.
-    Intercept(WsaError),
-    /// Creating the capture context or file failed.
-    Open(CaptureFileError),
-}
-
-impl From<StartError> for Hresult {
-    fn from(error: StartError) -> Self {
-        match error {
-            StartError::AlreadyCapturing => ErrorCode::NotStopped.hresult(),
-            StartError::InterceptBusy => ErrorCode::NotDebuggable.hresult(),
-            StartError::Intercept(error) => intercept_result(error),
-            StartError::Open(error) => capture_result(error),
         }
     }
 }
@@ -235,9 +216,14 @@ pub fn start_capture(
     buffer: u32,
     mut flags: CaptureFlags,
 ) -> Result<(), StartError> {
+    /// Size of the translated path buffer; the translator stops at this
+    /// many bytes.
+    const OBJECT_PATH_SIZE: usize = 0x104;
+
     if state.network.netcap.capture.is_some() {
         return Err(StartError::AlreadyCapturing);
     }
+
     let translated = state.filesystem.drives.translate(&mut *backend, name);
     let path = match &translated {
         Some(object) => {
@@ -246,6 +232,7 @@ pub fn start_capture(
         }
         None => name,
     };
+
     let request = CaptureRequest {
         path,
         data_limit: capture_file::DataLimit(core::num::NonZeroU32::new(data_limit)),
@@ -256,9 +243,11 @@ pub fn start_capture(
         flags,
     };
     backend.open_capture(&request).map_err(StartError::Open)?;
+
     if flags.contains(CaptureFlags::PROMISCUOUS) && !backend.set_promiscuous(true) {
         flags.remove(CaptureFlags::PROMISCUOUS);
     }
+
     if let Err(error) = backend.attach_capture(flags) {
         // Stock leaves promiscuous mode on here.
         let _ = backend.close_capture();
@@ -268,7 +257,9 @@ pub fn start_capture(
             StartError::Intercept(error)
         });
     }
+
     state.network.netcap.capture = Some(flags);
+
     Ok(())
 }
 
@@ -288,6 +279,7 @@ fn capture_result(error: CaptureFileError) -> Hresult {
 /// negative intercept value with that bit reads as a kernel status.
 fn intercept_result(error: WsaError) -> Hresult {
     let result = Hresult::from(Win32Error::from(error));
+
     if result.is_failure()
         && result.0 & 0x1000_0000 != 0
         && let Some(status) = KernelError::from_status(NtStatus(result.0 & !0x1000_0000))
@@ -330,6 +322,7 @@ impl core::fmt::Display for StopText {
             Self::Failed { error, frames } => (capture_result(error), frames),
             Self::FramesLost { frames } => (NetworkError::FramesLost.into(), frames),
         };
+
         write!(formatter, "stopped err=0x{:08x} frames={frames}", error.0)
     }
 }
@@ -350,13 +343,16 @@ fn stop(
     let Some(flags) = state.capture.take() else {
         return Err(NetworkError::NotCapturing);
     };
+
     let callback_error = backend.capture_error();
     if flags.contains(CaptureFlags::PROMISCUOUS) {
         backend.set_promiscuous(false);
     }
+
     backend.detach_capture();
     let close = backend.close_capture();
     let frames = close.frames;
+
     Ok(match callback_error.or(close.result.err()) {
         Some(CaptureFileError::WriteFault) => StopText::FramesLost { frames },
         Some(error) => StopText::Failed { error, frames },

@@ -15,6 +15,7 @@ pub mod access;
 pub mod backend;
 pub mod commands;
 pub mod continuation;
+mod error;
 pub mod invocation;
 pub mod network;
 pub mod notify;

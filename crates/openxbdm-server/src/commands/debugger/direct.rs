@@ -162,6 +162,7 @@ pub fn dispatch_direct(
         rewrite_trap(&mut record);
     }
     outcome.record = record;
+
     let hardware_kd = event
         .hardware_flags
         .contains(HardwareFlags::KERNEL_DEBUGGER);
@@ -178,6 +179,7 @@ pub fn dispatch_direct(
             return outcome;
         }
     }
+
     let mut dump = !hardware_kd && policy.dump_mode != DumpMode::Disabled;
     let mut advance = true;
     if policy.dump_in_progress {
@@ -195,6 +197,7 @@ pub fn dispatch_direct(
         let queued = |defer_bit: EventDeferMask| {
             event.delivery == Delivery::Deferred && sent(Some(defer_bit))
         };
+
         let gpr3 = context.gpr3;
         let gpr4 = context.gpr4;
         match record.code {
@@ -248,6 +251,7 @@ pub fn dispatch_direct(
                     if sent(Some(bit)) {
                         outcome.notice = Some(notice);
                     }
+
                     if queued(bit) {
                         if code == trap::ASSERT_PROMPT {
                             context.gpr3 = ASSERT_IGNORE;
@@ -266,7 +270,9 @@ pub fn dispatch_direct(
                     return outcome;
                 }
             },
-            NtStatus::ASSERTION_FAILURE => {}
+            NtStatus::ASSERTION_FAILURE => {
+                // No notification; resolved by the common dump and continue below.
+            }
             NtStatus::SINGLE_STEP if record.parameters[0] == 0 => {
                 if let Some(data) = policy.data_breakpoint {
                     let length = instruction.map_or(8, access_length);
@@ -277,6 +283,7 @@ pub fn dispatch_direct(
                             address: data.address,
                         });
                     }
+
                     if !overlap || queued(EventDeferMask::DATA_BREAK) {
                         *step = Some(DirectStep {
                             saved_trace: context.msr.contains(Msr::SINGLE_STEP),
@@ -297,14 +304,17 @@ pub fn dispatch_direct(
                         return outcome;
                     }
                 }
+
                 context.msr.remove(Msr::SINGLE_STEP);
                 if sent(Some(EventDeferMask::SINGLE_STEP)) {
                     outcome.notice = Some(DirectNotice::SingleStep);
                 }
+
                 if queued(EventDeferMask::SINGLE_STEP) {
                     outcome.disposition.handled = true;
                     return outcome;
                 }
+
                 context.msr.insert(Msr::SINGLE_STEP);
             }
             _ => {
@@ -319,6 +329,7 @@ pub fn dispatch_direct(
                         address: record.parameters[1],
                     });
                 }
+
                 dump &= event.second_chance;
                 if sent(None) {
                     outcome.notice = Some(DirectNotice::Exception {
@@ -328,6 +339,7 @@ pub fn dispatch_direct(
             }
         }
     }
+
     outcome.disposition.write_dump = dump;
     if policy.kd_lite {
         outcome.disposition.chain_kernel_debugger = true;
@@ -337,5 +349,6 @@ pub fn dispatch_direct(
         outcome.disposition.handled = true;
     }
     outcome.data_breakpoint_register = reprogram;
+
     outcome
 }

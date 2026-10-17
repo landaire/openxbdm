@@ -3,64 +3,57 @@
 #![allow(unsafe_code)]
 
 pub mod detour;
+mod detour_commands;
+mod error;
+mod tracking;
 
 use core::fmt::Write as _;
 
-use openxbdm_core::line::Value;
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
-use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::Win32Error;
-use openxbdm_core::status::XbdmHresult;
 use xbox360_sys::image::XexHeaderKey;
-use xbox360_sys::status::Facility;
 use xbox360_sys::xboxkrnl::AccessMask;
 use xbox360_sys::xboxkrnl::CreateDisposition;
 use xbox360_sys::xboxkrnl::CreateOptions;
 use xbox360_sys::xboxkrnl::FileAttributes;
 use xbox360_sys::xboxkrnl::ShareAccess;
 
+use self::detour_commands::detour_command;
+use self::detour_commands::detour_log_record;
+use self::tracking::memory_tracking;
 use crate::access::Access;
 use crate::commands::console;
 use crate::commands::console::c_string;
-use crate::commands::debugger;
 use crate::commands::filesystem;
-use crate::commands::system::SettingsFile;
-use crate::commands::system::write_line;
 use crate::commands::util;
 use crate::continuation::Continuation as AnyContinuation;
 use crate::continuation::ContinuationContext;
 use crate::invocation::Invocation;
 use crate::registry::CommandEntry;
 use crate::registry::DispatchFlags;
-use crate::reply;
 use crate::reply::CommandError;
 use crate::reply::CommandResult;
 use crate::reply::Reply;
-use crate::state::ServerState;
 use crate::text::Text;
 use crate::transfer_blocks::TransferBlock;
 
+pub use self::detour_commands::DetourLogName;
+pub(crate) use self::detour_commands::module_unloaded;
+pub use self::error::MemoryError;
+pub use self::error::NoSuchModule;
+pub use self::error::XexFieldError;
+pub use self::tracking::ACTIVE_STACK_DEPTH;
+pub use self::tracking::StackDepth;
+pub use self::tracking::TRACKING_TYPE_NAMES;
+pub use self::tracking::TrackingFlags;
+pub use self::tracking::TrackingSettings;
+pub(crate) use self::tracking::ini_memtrack;
+pub(crate) use self::tracking::memtrack_settings_lines;
+
 /// Size of a small page in bytes.
 pub const PAGE_SIZE: u32 = 0x1000;
-const LARGE_PAGE_SIZE: u32 = 0x1_0000;
-const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
-/// `getmem` emits at most this many lines per continuation call.
-const GETMEM_LINES_PER_CALL: usize = 16;
-/// Bytes per `getmem` line.
-const GETMEM_BYTES_PER_LINE: u32 = 32;
-/// Data bytes per `getmemex` chunk.
-const GETMEMEX_CHUNK: u32 = 0x400;
-/// `getmemex` chunk header bit marking the final chunk.
-const GETMEMEX_LAST_CHUNK: u16 = 0x8000;
-/// `walkmem` stops starting regions at this address.
-const WALK_LIMIT: u32 = 0xa000_0000;
-/// Length of one `walkmem` line including CR LF.
-const WALK_LINE_LENGTH: usize = 52;
-/// Bytes per `xexfield` data line.
-const XEX_FIELD_BYTES_PER_LINE: u32 = 32;
-
 /// Bytes of a module base name buffer, including the terminator.
 pub const MODULE_NAME_CAPACITY: usize = 0x104;
 /// Bytes of a section name.
@@ -71,38 +64,8 @@ pub const PDB_PATH_CAPACITY: usize = 0x104;
 const NAME_PARAMETER_CAPACITY: usize = 0x141;
 /// Bytes of an executable path buffer, including the terminator.
 pub const EXECUTABLE_PATH_CAPACITY: usize = 0x105;
-/// Bytes of the `modulename` buffer of `traceimports`.
-const TRACE_MODULE_CAPACITY: usize = 0x104;
-/// Bytes of the `enabled` buffer of `traceimports`.
-const TRACE_ENABLED_CAPACITY: usize = 10;
-/// Bytes of the `cmd` buffer of `memtrack`.
-const MEMTRACK_COMMAND_CAPACITY: usize = 0x20;
-/// Bytes of the `filename` buffer of `memtrack save`.
-const MEMTRACK_FILENAME_CAPACITY: usize = 0x140;
-/// Largest stack depth `memtrack enable` accepts.
-const MEMTRACK_MAX_STACK_DEPTH: u32 = 0x20;
 /// Byte offset of the advanced memory flag word in the raw flash device.
 pub const ADVANCED_MEMORY_FLASH_OFFSET: u32 = 6;
-/// Flash flag word bit that disables advanced memory.
-const ADVANCED_MEMORY_DISABLED: u16 = 0x100;
-
-/// Physical ranges the debugger never reads (device registers). Bounds are
-/// inclusive.
-const DEVICE_RANGES: [(u32, u32); 6] = [
-    (0x7fc8_0000, 0x7fc9_ffff),
-    (0x7fd0_0000, 0x7fdf_ffff),
-    (0x7fea_0000, 0x7fea_ffff),
-    (0x7fed_0000, 0x7fed_ffff),
-    (0x8fff_0000, 0x8fff_0fff),
-    (0x8fff_1000, 0x8fff_1fff),
-];
-
-/// Whether `address` lies in a device range the debugger never accesses.
-pub fn is_device_address(address: u32) -> bool {
-    DEVICE_RANGES
-        .iter()
-        .any(|&(low, high)| (low..=high).contains(&address))
-}
 
 pub(crate) const COMMANDS: &[CommandEntry] = &[
     entry(
@@ -124,73 +87,6 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
     entry("xbeinfo", DispatchFlags::empty(), executable_info),
     entry("xexfield", DispatchFlags::empty(), xex_field),
 ];
-
-const fn entry(
-    name: &'static str,
-    flags: DispatchFlags,
-    handler: crate::registry::Handler,
-) -> CommandEntry {
-    CommandEntry::new(name, Access::CONTROL, Access::empty(), flags, handler)
-}
-
-xbox360_sys::flags! {
-    /// Allocation tracking type flags. The low eight bits select allocation
-    /// types, bit 8 turns tracking diagnostics into assertions, and bit 31 of
-    /// the saved value marks a pending `enableonce`.
-    pub struct TrackingFlags(u32) {
-        /// Allocation type selection; `enable` needs at least one.
-        TYPES = 0xff,
-        ASSERT = 0x100,
-        /// Set in the saved flags by `enableonce`; cleared when the settings
-        /// file is loaded.
-        ONCE = 0x8000_0000,
-    }
-}
-
-impl TrackingFlags {
-    /// Bits `enable` replaces and `disable` clears.
-    pub const TYPE_MASK: Self = Self::TYPES.union(Self::ASSERT);
-    /// Default `flags` value of `enable` and `enableonce`.
-    pub const DEFAULT: Self = Self::TYPE_MASK;
-
-    /// Whether any tracking type is selected.
-    pub fn is_active(self) -> bool {
-        self.intersects(Self::TYPE_MASK)
-    }
-}
-
-/// Number of return addresses captured per tracked allocation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct StackDepth(pub u32);
-
-/// Capture depth in effect for tracked allocations. Stock keeps it in a
-/// global that no code path writes, so it is always zero.
-pub const ACTIVE_STACK_DEPTH: StackDepth = StackDepth(0);
-
-/// Names of the built-in allocation tracking types, by type index.
-pub const TRACKING_TYPE_NAMES: [&str; 14] = [
-    "heap",
-    "virtual-mapped memory",
-    "contiguous memory",
-    "system memory",
-    "debugger memory",
-    "kernel pool",
-    "directory object",
-    "event",
-    "file",
-    "I/O completion",
-    "mutex",
-    "semaphore",
-    "timer",
-    "thread",
-];
-
-/// Persisted allocation tracking settings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct TrackingSettings {
-    pub flags: TrackingFlags,
-    pub stack_depth: StackDepth,
-}
 
 /// Global state of this domain.
 #[derive(Debug)]
@@ -214,27 +110,6 @@ impl State {
     }
 }
 
-/// Bytes of the `detour start` file name buffer.
-const DETOUR_LOG_NAME_CAPACITY: usize = 0x104;
-
-/// The `detour start` file name.
-#[derive(Debug, Clone, Copy)]
-pub struct DetourLogName {
-    bytes: [u8; DETOUR_LOG_NAME_CAPACITY],
-    len: usize,
-}
-
-impl DetourLogName {
-    pub const EMPTY: Self = Self {
-        bytes: [0; DETOUR_LOG_NAME_CAPACITY],
-        len: 0,
-    };
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes[..self.len]
-    }
-}
-
 /// A module base name as the monitor copies it: the low byte of each
 /// UTF-16 unit, at most `MODULE_NAME_CAPACITY - 1` bytes.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -250,10 +125,12 @@ impl ModuleName {
             bytes: [0; MODULE_NAME_CAPACITY],
             len: 0,
         };
+
         for unit in units.into_iter().take(MODULE_NAME_CAPACITY - 1) {
             name.bytes[name.len] = unit as u8;
             name.len += 1;
         }
+
         name
     }
 
@@ -266,24 +143,6 @@ impl core::fmt::Debug for ModuleName {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(formatter, "{:?}", self.as_bytes().escape_ascii())
     }
-}
-
-/// Whether a loader entry base name (as UTF-16 units) matches `query` the
-/// way the monitor's module lookup compares them: ASCII letters compare
-/// without case, only the low byte of each unit counts, and an inexact
-/// lookup also accepts `query` followed by an extension (`xam` for
-/// `xam.xex`).
-pub fn module_name_matches(name: impl IntoIterator<Item = u16>, query: &[u8], exact: bool) -> bool {
-    let mut position = 0;
-    for unit in name {
-        let expected = query.get(position).copied().unwrap_or(0);
-        let actual = unit as u8;
-        if !actual.eq_ignore_ascii_case(&expected) {
-            return !exact && expected == 0 && actual == b'.';
-        }
-        position += 1;
-    }
-    position == query.len()
 }
 
 /// A loaded module as `modules` reports it.
@@ -332,6 +191,7 @@ impl SectionInfo {
         if self.characteristics & 0x80 != 0 {
             flags |= 0x10;
         }
+
         flags
     }
 }
@@ -344,15 +204,12 @@ pub struct SectionIndex(pub u16);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModuleIndex(pub u32);
 
-/// The named module is not loaded or has no NT header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NoSuchModule;
-
 /// A CodeView `RSDS` record of a loaded module.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct CodeView {
     pub guid: [u8; 16],
     pub age: [u8; 4],
+
     path: [u8; PDB_PATH_CAPACITY],
     path_len: usize,
 }
@@ -373,14 +230,17 @@ impl CodeView {
             path: [0; PDB_PATH_CAPACITY],
             path_len: 0,
         };
+
         while view.path_len < PDB_PATH_CAPACITY - 1 {
             let byte = byte_at(view.path_len);
             if byte == 0 {
                 break;
             }
+
             view.path[view.path_len] = byte;
             view.path_len += 1;
         }
+
         view
     }
 
@@ -397,76 +257,6 @@ impl core::fmt::Debug for CodeView {
             .field("age", &self.age)
             .field("path", &self.path().escape_ascii())
             .finish()
-    }
-}
-
-/// Why an XEX optional header field cannot be read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum XexFieldError {
-    NoSuchModule,
-    /// The module's XEX header has no such field.
-    FieldAbsent,
-}
-
-impl From<XexFieldError> for CommandError {
-    fn from(error: XexFieldError) -> Self {
-        match error {
-            XexFieldError::NoSuchModule => ErrorCode::NoSuchModule.into(),
-            XexFieldError::FieldAbsent => Self::Memory(MemoryError::NoSuchField),
-        }
-    }
-}
-
-/// Failures of this domain that no other [`CommandError`] form reports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MemoryError {
-    /// 437: the XEX header has no such field.
-    NoSuchField,
-    /// 442: the detour engine is not running.
-    DetourNotRunning,
-    /// Saving the tracking records failed; the kernel's Win32 translation
-    /// of the status.
-    TrackingSave(Win32Error),
-}
-
-impl From<MemoryError> for Hresult {
-    fn from(error: MemoryError) -> Self {
-        match error {
-            MemoryError::NoSuchField => Hresult::NO_SUCH_FIELD,
-            MemoryError::DetourNotRunning => Hresult::INVALID_STATE,
-            // Stock moves the code to the Win32 facility without the sign
-            // test of HRESULT_FROM_WIN32.
-            MemoryError::TrackingSave(error) => {
-                Hresult::failure(Facility::WIN32, error.code() as u16)
-            }
-        }
-    }
-}
-
-impl From<detour::DetourError> for CommandError {
-    fn from(error: detour::DetourError) -> Self {
-        match error {
-            detour::DetourError::NotRunning => Self::Memory(MemoryError::DetourNotRunning),
-            detour::DetourError::BadEntry => ErrorCode::Undefined.into(),
-            detour::DetourError::NoFreeEntry => ErrorCode::OutOfMemory.into(),
-        }
-    }
-}
-
-/// Bytes `xexfield` reports for `field`; `data_length` reads the leading
-/// size word of its data. The key's low byte gives the form of the data:
-/// 0 a value in the key entry, 0xff a leading size word, else that many
-/// words.
-fn xex_field_size(
-    field: XexHeaderKey,
-    data_length: impl FnOnce() -> Result<u32, XexFieldError>,
-) -> Result<u32, XexFieldError> {
-    match field.0 & 0xff {
-        // The entry point is reported with its inline value as data.
-        0 if field == XexHeaderKey::ENTRY_POINT => Ok(4),
-        0 => Ok(0),
-        0xff => data_length(),
-        words => Ok(words << 2),
     }
 }
 
@@ -611,6 +401,98 @@ pub enum ExecutableInfoLine {
     End,
 }
 
+/// Raw output into the continuation buffer.
+struct RawWriter<'a> {
+    buffer: &'a mut [u8],
+    len: usize,
+}
+
+impl RawWriter<'_> {
+    fn push_bytes(&mut self, bytes: &[u8]) {
+        let end = (self.len + bytes.len()).min(self.buffer.len());
+        let count = end - self.len;
+        self.buffer[self.len..end].copy_from_slice(&bytes[..count]);
+        self.len = end;
+    }
+}
+
+impl core::fmt::Write for RawWriter<'_> {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        let end = self.len + text.len();
+        let target = self.buffer.get_mut(self.len..end).ok_or(core::fmt::Error)?;
+        target.copy_from_slice(text.as_bytes());
+        self.len = end;
+
+        Ok(())
+    }
+}
+
+/// A valid virtual address range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Region {
+    base: u32,
+    size: u32,
+    protect: u32,
+}
+
+/// Whether `address` lies in a device range the debugger never accesses.
+pub fn is_device_address(address: u32) -> bool {
+    /// Physical ranges the debugger never reads (device registers). Bounds
+    /// are inclusive.
+    const DEVICE_RANGES: [(u32, u32); 6] = [
+        (0x7fc8_0000, 0x7fc9_ffff),
+        (0x7fd0_0000, 0x7fdf_ffff),
+        (0x7fea_0000, 0x7fea_ffff),
+        (0x7fed_0000, 0x7fed_ffff),
+        (0x8fff_0000, 0x8fff_0fff),
+        (0x8fff_1000, 0x8fff_1fff),
+    ];
+
+    DEVICE_RANGES
+        .iter()
+        .any(|&(low, high)| (low..=high).contains(&address))
+}
+
+/// Whether a loader entry base name (as UTF-16 units) matches `query` the
+/// way the monitor's module lookup compares them: ASCII letters compare
+/// without case, only the low byte of each unit counts, and an inexact
+/// lookup also accepts `query` followed by an extension (`xam` for
+/// `xam.xex`).
+pub fn module_name_matches(name: impl IntoIterator<Item = u16>, query: &[u8], exact: bool) -> bool {
+    let mut position = 0;
+    for unit in name {
+        let expected = query.get(position).copied().unwrap_or(0);
+        let actual = unit as u8;
+        if !actual.eq_ignore_ascii_case(&expected) {
+            return !exact && expected == 0 && actual == b'.';
+        }
+
+        position += 1;
+    }
+
+    position == query.len()
+}
+
+/// The page after the one containing `address`: 4 KiB pages below
+/// 0x40000000 and in 0x90000000-0x9fffffff, 64 KiB pages elsewhere.
+pub fn next_page(address: u32) -> u32 {
+    const LARGE_PAGE_SIZE: u32 = 0x1_0000;
+
+    if address <= 0x3fff_ffff || (0x9000_0000..=0x9fff_ffff).contains(&address) {
+        (address & !(PAGE_SIZE - 1)).wrapping_add(PAGE_SIZE)
+    } else {
+        (address & !(LARGE_PAGE_SIZE - 1)).wrapping_add(LARGE_PAGE_SIZE)
+    }
+}
+
+const fn entry(
+    name: &'static str,
+    flags: DispatchFlags,
+    handler: crate::registry::Handler,
+) -> CommandEntry {
+    CommandEntry::new(name, Access::CONTROL, Access::empty(), flags, handler)
+}
+
 pub(crate) fn resume(
     continuation: &mut Continuation,
     cx: &mut ContinuationContext<'_>,
@@ -639,31 +521,6 @@ pub(crate) fn resume(
     }
 }
 
-/// Raw output into the continuation buffer.
-struct RawWriter<'a> {
-    buffer: &'a mut [u8],
-    len: usize,
-}
-
-impl core::fmt::Write for RawWriter<'_> {
-    fn write_str(&mut self, text: &str) -> core::fmt::Result {
-        let end = self.len + text.len();
-        let target = self.buffer.get_mut(self.len..end).ok_or(core::fmt::Error)?;
-        target.copy_from_slice(text.as_bytes());
-        self.len = end;
-        Ok(())
-    }
-}
-
-impl RawWriter<'_> {
-    fn push_bytes(&mut self, bytes: &[u8]) {
-        let end = (self.len + bytes.len()).min(self.buffer.len());
-        let count = end - self.len;
-        self.buffer[self.len..end].copy_from_slice(&bytes[..count]);
-        self.len = end;
-    }
-}
-
 /// Copy a string parameter the way the monitor does; `None` when absent.
 fn string_param<'b>(
     invocation: &Invocation<'_>,
@@ -676,18 +533,36 @@ fn string_param<'b>(
         .map(|value| value.copy_into(output))
 }
 
-/// The dword the monitor's getters store: the parsed prefix whenever the
-/// parameter is present. `None` in the flag means the getter reported it
-/// missing.
-fn dword_param(value: Option<Value<'_>>) -> (Option<u32>, bool) {
-    match value {
-        Some(value) => (Some(value.dword_prefix()), value.dword().is_some()),
-        None => (None, false),
+fn hex_digit(value: u8) -> u8 {
+    const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
+
+    HEX_UPPER[usize::from(value & 0xf)]
+}
+
+fn hex_value(digit: u8) -> Option<u8> {
+    match digit {
+        b'0'..=b'9' => Some(digit - b'0'),
+        b'a'..=b'f' => Some(digit - b'a' + 10),
+        b'A'..=b'F' => Some(digit - b'A' + 10),
+        _ => None,
     }
 }
 
-fn hex_digit(value: u8) -> u8 {
-    HEX_UPPER[usize::from(value & 0xf)]
+/// Bytes `xexfield` reports for `field`; `data_length` reads the leading
+/// size word of its data. The key's low byte gives the form of the data:
+/// 0 a value in the key entry, 0xff a leading size word, else that many
+/// words.
+fn xex_field_size(
+    field: XexHeaderKey,
+    data_length: impl FnOnce() -> Result<u32, XexFieldError>,
+) -> Result<u32, XexFieldError> {
+    match field.0 & 0xff {
+        // The entry point is reported with its inline value as data.
+        0 if field == XexHeaderKey::ENTRY_POINT => Ok(4),
+        0 => Ok(0),
+        0xff => data_length(),
+        words => Ok(words << 2),
+    }
 }
 
 /// `getmem addr=<dword> length=<dword>`: hex dump in 32-byte lines; bytes
@@ -696,6 +571,7 @@ fn get_memory(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.session.is_none() {
         return Err(CommandError::Fail);
     }
+
     let Some(address) = util::required_dword(invocation, "addr") else {
         return Err(util::MISSING);
     };
@@ -705,12 +581,14 @@ fn get_memory(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(session) = invocation.session.as_deref_mut() else {
         return Err(CommandError::Fail);
     };
+
     session.receive_remaining = None;
     session.continuation = AnyContinuation::Memory(Continuation::GetMemory {
         address,
         remaining: length,
     });
     invocation.set_text(format_args!("memory data follows"));
+
     Ok(Reply::Multiline)
 }
 
@@ -722,23 +600,33 @@ fn get_memory_lines(
     remaining: &mut u32,
     cx: &mut ContinuationContext<'_>,
 ) -> CommandResult {
+    /// Lines emitted per continuation call.
+    const LINES_PER_CALL: usize = 16;
+    /// Bytes per line.
+    const BYTES_PER_LINE: u32 = 32;
+
     if *remaining == 0 {
         return Err(CommandError::EndOfData);
     }
+
     let mut offset = 0usize;
     let mut page_valid = false;
     let mut checked_page = None;
-    for _ in 0..GETMEM_LINES_PER_CALL {
+
+    for _ in 0..LINES_PER_CALL {
         if *remaining == 0 {
             break;
         }
-        let count = (*remaining).min(GETMEM_BYTES_PER_LINE);
+
+        let count = (*remaining).min(BYTES_PER_LINE);
+
         for _ in 0..count {
             let page = *address & !(PAGE_SIZE - 1);
             if checked_page != Some(page) {
                 checked_page = Some(page);
                 page_valid = cx.backend.is_address_valid(*address);
             }
+
             if page_valid {
                 let byte = match cx.state.debugger.shadow_read(*address) {
                     Some(byte) => Some(byte),
@@ -749,19 +637,25 @@ fn get_memory_lines(
                         cx.binary[offset] = hex_digit(byte >> 4);
                         cx.binary[offset + 1] = hex_digit(byte);
                     }
-                    None => page_valid = false,
+                    None => {
+                        page_valid = false;
+                    }
                 }
             } else {
                 cx.binary[offset..offset + 2].copy_from_slice(b"??");
             }
+
             offset += 2;
             *address = address.wrapping_add(1);
         }
+
         cx.binary[offset..offset + 2].copy_from_slice(b"\r\n");
         offset += 2;
         *remaining -= count;
     }
+
     cx.binary_len = offset;
+
     Ok(Reply::Ok)
 }
 
@@ -771,49 +665,47 @@ fn set_memory(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(address) = util::required_dword(invocation, "addr") else {
         return Err(util::MISSING);
     };
+
     let mut digits = invocation.line.param("data").map(|value| value.bytes());
     let mut written = 0u32;
     let mut current = address;
     let mut checked_page = None;
-    let mut stopped = false;
-    while let Some(high) = digits.as_mut().and_then(Iterator::next) {
+
+    let stopped = loop {
+        let Some(high) = digits.as_mut().and_then(Iterator::next) else {
+            break false;
+        };
         let low = digits.as_mut().and_then(Iterator::next);
         let (Some(high), Some(low)) = (hex_value(high), low.and_then(hex_value)) else {
             invocation.text.set_bytes(b"400- syntax error in data");
             return Err(CommandError::Fail);
         };
+
         let page = current & !(PAGE_SIZE - 1);
         if checked_page != Some(page) {
             checked_page = Some(page);
             if !invocation.backend.is_address_valid(current) {
-                stopped = true;
-                break;
+                break true;
             }
         }
+
         let value = high << 4 | low;
         if !invocation.state.debugger.shadow_write(current, value)
             && !invocation.backend.write_byte(current, value)
         {
-            stopped = true;
-            break;
+            break true;
         }
+
         written += 1;
         current = current.wrapping_add(1);
-    }
+    };
+
     invocation.set_text(format_args!("set {written} bytes"));
+
     if stopped {
         Err(ErrorCode::MemoryNotMapped.into())
     } else {
         Ok(Reply::Ok)
-    }
-}
-
-fn hex_value(digit: u8) -> Option<u8> {
-    match digit {
-        b'0'..=b'9' => Some(digit - b'0'),
-        b'a'..=b'f' => Some(digit - b'a' + 10),
-        b'A'..=b'F' => Some(digit - b'A' + 10),
-        _ => None,
     }
 }
 
@@ -830,10 +722,12 @@ fn get_memory_binary(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(session) = invocation.session.as_deref_mut() else {
         return Err(CommandError::Fail);
     };
+
     session.continuation = AnyContinuation::Memory(Continuation::GetMemoryBinary {
         address,
         remaining: length,
     });
+
     Ok(Reply::Binary)
 }
 
@@ -846,40 +740,43 @@ fn get_memory_chunk(
     remaining: &mut u32,
     cx: &mut ContinuationContext<'_>,
 ) -> CommandResult {
+    /// Data bytes per chunk.
+    const CHUNK_SIZE: u32 = 0x400;
+    /// Chunk header bit marking the final chunk.
+    const LAST_CHUNK: u16 = 0x8000;
+
     if cx.aborted || *remaining == 0 {
         return Err(CommandError::EndOfData);
     }
+
     let start = *address;
-    let mut count = (*remaining).min(GETMEMEX_CHUNK);
+    let requested = (*remaining).min(CHUNK_SIZE);
     let first_page = start & !(PAGE_SIZE - 1);
-    let pages = ((start & (PAGE_SIZE - 1)) + count - 1) / PAGE_SIZE + 1;
-    let mut truncated = false;
-    for index in 0..pages {
-        let current = first_page.wrapping_add(index * PAGE_SIZE);
-        if !cx.backend.is_readable(current) {
-            count = if index == 0 {
-                0
-            } else {
-                current.wrapping_sub(start)
-            };
-            truncated = true;
-            break;
+    let pages = ((start & (PAGE_SIZE - 1)) + requested - 1) / PAGE_SIZE + 1;
+    let unreadable = (0..pages).find(|&index| {
+        !cx.backend
+            .is_readable(first_page.wrapping_add(index * PAGE_SIZE))
+    });
+    let (count, left) = match unreadable {
+        None => (requested, *remaining - requested),
+        Some(0) => (0, 0),
+        Some(index) => {
+            let page = first_page.wrapping_add(index * PAGE_SIZE);
+            (page.wrapping_sub(start), 0)
         }
-    }
+    };
     *address = start.wrapping_add(count);
-    *remaining = if truncated { 0 } else { *remaining - count };
-    let header = count as u16
-        | if *remaining == 0 {
-            GETMEMEX_LAST_CHUNK
-        } else {
-            0
-        };
+    *remaining = left;
+
+    let header = count as u16 | if *remaining == 0 { LAST_CHUNK } else { 0 };
     let data = &mut cx.binary[2..2 + count as usize];
-    // SAFETY: the loop above accepted every page of the `count` bytes.
+    // SAFETY: `is_readable` accepted every page of the `count` bytes.
     unsafe { cx.backend.read_memory(start, data) };
     cx.state.debugger.restore_saved(start, data);
+
     cx.binary[..2].copy_from_slice(&header.to_le_bytes());
     cx.binary_len = count as usize + 2;
+
     Ok(Reply::Ok)
 }
 
@@ -889,40 +786,28 @@ fn walk_memory(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(session) = invocation.session.as_deref_mut() else {
         return Err(CommandError::Fail);
     };
+
     session.continuation = AnyContinuation::Memory(Continuation::WalkMemory {
         cursor: 0,
         active: true,
     });
     invocation.set_text(format_args!("Valid Virtual Address Ranges Follow"));
+
     Ok(Reply::Multiline)
-}
-
-/// A valid virtual address range.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Region {
-    base: u32,
-    size: u32,
-    protect: u32,
-}
-
-/// The page after the one containing `address`: 4 KiB pages below
-/// 0x40000000 and in 0x90000000-0x9fffffff, 64 KiB pages elsewhere.
-pub fn next_page(address: u32) -> u32 {
-    if address <= 0x3fff_ffff || (0x9000_0000..=0x9fff_ffff).contains(&address) {
-        (address & !(PAGE_SIZE - 1)).wrapping_add(PAGE_SIZE)
-    } else {
-        (address & !(LARGE_PAGE_SIZE - 1)).wrapping_add(LARGE_PAGE_SIZE)
-    }
 }
 
 /// The next region at or after `cursor`. A region can extend past the walk
 /// limit; only its start is bounded.
 fn next_region(backend: &mut dyn crate::backend::Backend, cursor: &mut u32) -> Option<Region> {
+    /// No region starts at or above this address.
+    const WALK_LIMIT: u32 = 0xa000_0000;
+
     loop {
         let base = *cursor;
         if base >= WALK_LIMIT {
             return None;
         }
+
         let mut end = base;
         if backend.is_address_valid(base) {
             while !is_device_address(end) {
@@ -932,6 +817,7 @@ fn next_region(backend: &mut dyn crate::backend::Backend, cursor: &mut u32) -> O
                 }
             }
         }
+
         *cursor = next_page(end);
         if end > base {
             let protect = if (0x8000_0000..=0x9fff_ffff).contains(&base) {
@@ -953,26 +839,33 @@ fn walk_memory_lines(
     active: &mut bool,
     cx: &mut ContinuationContext<'_>,
 ) -> CommandResult {
+    /// Length of one line including CR LF.
+    const LINE_LENGTH: usize = 52;
+
     let mut writer = RawWriter {
         buffer: cx.binary,
         len: 0,
     };
-    while *active && writer.buffer.len() - writer.len >= WALK_LINE_LENGTH {
-        match next_region(cx.backend, cursor) {
-            Some(region) => {
-                let _ = write!(
-                    writer,
-                    "base=0x{:08x} size=0x{:08x} protect=0x{:08x}\r\n",
-                    region.base, region.size, region.protect
-                );
-            }
-            None => *active = false,
-        }
+
+    while *active && writer.buffer.len() - writer.len >= LINE_LENGTH {
+        let Some(region) = next_region(cx.backend, cursor) else {
+            *active = false;
+            break;
+        };
+
+        let _ = write!(
+            writer,
+            "base=0x{:08x} size=0x{:08x} protect=0x{:08x}\r\n",
+            region.base, region.size, region.protect
+        );
     }
+
     if writer.len == 0 {
         return Err(CommandError::EndOfData);
     }
+
     cx.binary_len = writer.len;
+
     Ok(Reply::Ok)
 }
 
@@ -981,9 +874,11 @@ fn modules(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(session) = invocation.session.as_deref_mut() else {
         return Err(CommandError::Fail);
     };
+
     session.continuation = AnyContinuation::Memory(Continuation::Modules {
         next: ModuleIndex(0),
     });
+
     Ok(Reply::Multiline)
 }
 
@@ -991,7 +886,9 @@ fn module_line(next: &mut ModuleIndex, cx: &mut ContinuationContext<'_>) -> Comm
     let Some(module) = cx.backend.module(*next) else {
         return Err(CommandError::EndOfData);
     };
+
     next.0 += 1;
+
     let mut writer = RawWriter {
         buffer: cx.binary,
         len: 0,
@@ -1012,6 +909,7 @@ fn module_line(next: &mut ModuleIndex, cx: &mut ContinuationContext<'_>) -> Comm
         module.image_size,
     );
     cx.binary_len = writer.len;
+
     Ok(Reply::Ok)
 }
 
@@ -1020,11 +918,13 @@ fn module_sections(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.session.is_none() {
         return Err(CommandError::Fail);
     }
+
     let mut name = [0u8; NAME_PARAMETER_CAPACITY];
     if string_param(invocation, "name", &mut name).is_none() {
         invocation.set_text(format_args!("missing name"));
         return Err(CommandError::Fail);
     }
+
     if invocation
         .backend
         .module_section(c_string(&name), SectionIndex(1))
@@ -1032,15 +932,18 @@ fn module_sections(invocation: &mut Invocation<'_>) -> CommandResult {
     {
         return Err(ErrorCode::NoSuchModule.into());
     }
+
     let Some(name) = hold(invocation, &name) else {
         return Err(CommandError::OutOfMemory);
     };
+
     if let Some(session) = invocation.session.as_deref_mut() {
         session.continuation = AnyContinuation::Memory(Continuation::Sections {
             name,
             next: SectionIndex(1),
         });
     }
+
     Ok(Reply::Multiline)
 }
 
@@ -1048,6 +951,7 @@ fn module_sections(invocation: &mut Invocation<'_>) -> CommandResult {
 /// allocates these copies from pool memory).
 fn hold(invocation: &mut Invocation<'_>, data: &[u8]) -> Option<TransferBlock> {
     let socket = invocation.session.as_ref()?.socket();
+
     invocation
         .state
         .transfer_blocks
@@ -1063,6 +967,7 @@ fn held_name(
     name.copy_from_slice(
         &cx.state.transfer_blocks.bytes(cx.backend, block)[..NAME_PARAMETER_CAPACITY],
     );
+
     name
 }
 
@@ -1078,8 +983,10 @@ fn section_line(
         unsafe { cx.state.transfer_blocks.release(cx.backend, held) };
         return Err(CommandError::EndOfData);
     };
+
     let index = next.0;
     next.0 = next.0.wrapping_add(1);
+
     let mut writer = RawWriter {
         buffer: cx.binary,
         len: 0,
@@ -1088,13 +995,13 @@ fn section_line(
     writer.push_bytes(c_string(&section.name));
     let _ = write!(
         writer,
-        "\" base=0x{:08x} size=0x{:08x} index={} flags={}\r\n",
+        "\" base=0x{:08x} size=0x{:08x} index={index} flags={}\r\n",
         section.address,
         section.size,
-        index,
         section.flags()
     );
     cx.binary_len = writer.len;
+
     Ok(Reply::Ok)
 }
 
@@ -1116,13 +1023,16 @@ fn pdb_info(invocation: &mut Invocation<'_>) -> CommandResult {
             return Err(error);
         }
     };
+
     invocation.text.clear();
     for byte in code_view.guid.iter().chain(&code_view.age) {
         let _ = invocation
             .text
             .push_bytes(&[hex_digit(byte >> 4), hex_digit(*byte)]);
     }
+
     let _ = invocation.text.push_bytes(code_view.path());
+
     Ok(Reply::Ok)
 }
 
@@ -1132,19 +1042,21 @@ fn xex_field(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.session.is_none() {
         return Err(CommandError::Fail);
     }
+
     let mut module = [0u8; NAME_PARAMETER_CAPACITY];
     if string_param(invocation, "module", &mut module).is_none() {
         invocation.set_text(format_args!("missing module"));
         return Err(CommandError::Fail);
     }
-    let Some(field) = invocation.line.dword("field") else {
+
+    let Some(field) = invocation.line.dword("field").map(XexHeaderKey) else {
         invocation.set_text(format_args!("missing field"));
         return Err(CommandError::Fail);
     };
-    let field = XexHeaderKey(field);
+
     let name = c_string(&module);
     let backend = &mut *invocation.backend;
-    let size = backend.xex_header_field(name, field).and_then(|value| {
+    let (value, size) = backend.xex_header_field(name, field).and_then(|value| {
         let size = xex_field_size(field, || {
             let mut length = [0u8; 4];
             backend
@@ -1152,14 +1064,15 @@ fn xex_field(invocation: &mut Invocation<'_>) -> CommandResult {
                 .map(|()| u32::from_be_bytes(length))
         })?;
         Ok((value, size))
-    });
-    let (value, size) = size?;
+    })?;
     if size == 0 {
         return Ok(Reply::Ok);
     }
+
     let Some(module) = hold(invocation, &module) else {
         return Err(CommandError::OutOfMemory);
     };
+
     if let Some(session) = invocation.session.as_deref_mut() {
         session.continuation = AnyContinuation::Memory(Continuation::XexField {
             module,
@@ -1169,6 +1082,7 @@ fn xex_field(invocation: &mut Invocation<'_>) -> CommandResult {
             remaining: size.wrapping_add(4),
         });
     }
+
     Ok(Reply::Multiline)
 }
 
@@ -1180,20 +1094,25 @@ fn xex_field_line(
     remaining: &mut u32,
     cx: &mut ContinuationContext<'_>,
 ) -> CommandResult {
+    /// Bytes per data line.
+    const BYTES_PER_LINE: u32 = 32;
+
     if *remaining > size {
         let _ = write!(cx.line, "fieldsize=0x{size:08x}");
         *remaining = remaining.wrapping_sub(4);
         return Ok(Reply::Ok);
     }
+
     if *remaining == 0 {
         // SAFETY: the transfer ends with this result, so the server drops the
         // continuation, the only other holder.
         unsafe { cx.state.transfer_blocks.release(cx.backend, held) };
         return Err(CommandError::EndOfData);
     }
+
     let offset = size - *remaining;
-    let count = (*remaining).min(XEX_FIELD_BYTES_PER_LINE);
-    let mut data = [0u8; XEX_FIELD_BYTES_PER_LINE as usize];
+    let count = (*remaining).min(BYTES_PER_LINE);
+    let mut data = [0u8; BYTES_PER_LINE as usize];
     let data = &mut data[..count as usize];
     if field.0 & 0xff == 0 {
         let inline = value.to_be_bytes();
@@ -1208,12 +1127,15 @@ fn xex_field_line(
             return Err(CommandError::Fail);
         }
     }
+
     for byte in data.iter() {
         let _ = cx
             .line
             .push_bytes(&[hex_digit(byte >> 4), hex_digit(*byte)]);
     }
+
     *remaining -= count;
+
     Ok(Reply::Ok)
 }
 
@@ -1224,12 +1146,14 @@ fn executable_info(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.session.is_none() {
         return Err(CommandError::Fail);
     }
+
     let mut name = [0u8; NAME_PARAMETER_CAPACITY];
     let running = invocation.line.has("running");
     if !running && string_param(invocation, "name", &mut name).is_none() {
         invocation.set_text(format_args!("missing name"));
         return Err(CommandError::Fail);
     }
+
     let Some(socket) = invocation.session.as_ref().map(|session| session.socket()) else {
         return Err(CommandError::Fail);
     };
@@ -1241,6 +1165,7 @@ fn executable_info(invocation: &mut Invocation<'_>) -> CommandResult {
     ) else {
         return Err(CommandError::OutOfMemory);
     };
+
     if !running && invocation.line.has("ondiskonly") {
         // Stock leaves the handle open and reports the file missing
         // whatever the open returned.
@@ -1258,6 +1183,7 @@ fn executable_info(invocation: &mut Invocation<'_>) -> CommandResult {
             c_string(&name),
             &request,
         );
+
         // SAFETY: the transfer was not started, so this command holds the only
         // copy.
         unsafe {
@@ -1268,6 +1194,7 @@ fn executable_info(invocation: &mut Invocation<'_>) -> CommandResult {
         };
         return Err(ErrorCode::FileNotFound.into());
     }
+
     let mut object_path = [0u8; EXECUTABLE_PATH_CAPACITY];
     let length = invocation.backend.running_executable_path(&mut object_path);
     let mut path = [0u8; EXECUTABLE_PATH_CAPACITY];
@@ -1281,6 +1208,7 @@ fn executable_info(invocation: &mut Invocation<'_>) -> CommandResult {
         .transfer_blocks
         .bytes(invocation.backend, held)[..path_len]
         .copy_from_slice(&path[..path_len]);
+
     if let Some(session) = invocation.session.as_deref_mut() {
         session.continuation = AnyContinuation::Memory(Continuation::ExecutableInfo {
             path: held,
@@ -1288,6 +1216,7 @@ fn executable_info(invocation: &mut Invocation<'_>) -> CommandResult {
             line: ExecutableInfoLine::Header,
         });
     }
+
     Ok(Reply::Multiline)
 }
 
@@ -1322,25 +1251,33 @@ fn executable_info_line(
             return Err(CommandError::EndOfData);
         }
     }
+
     Ok(Reply::Ok)
 }
 
 /// `addtitlemem`: the running title's additional title memory when the
 /// console runs its extra memory; 0 otherwise.
 fn additional_title_memory(invocation: &mut Invocation<'_>) -> CommandResult {
-    let mut value = 0;
-    if console::console_memory(invocation.backend).value() & 0x2 != 0 {
+    let value = if console::console_memory(invocation.backend).value() & 0x2 != 0 {
         match invocation.backend.title_additional_memory() {
-            Ok(field) => value = field.unwrap_or(0),
+            // A title without the header field has no additional memory.
+            Ok(field) => field.unwrap_or(0),
             Err(NoSuchModule) => return Err(ErrorCode::NoSuchModule.into()),
         }
-    }
+    } else {
+        0
+    };
+
     invocation.set_text(format_args!("addtitlemem=0x{value:x}"));
+
     Ok(Reply::Ok)
 }
 
 /// `advmem on|off|status`: the advanced memory flag in the raw flash.
 fn advanced_memory(invocation: &mut Invocation<'_>) -> CommandResult {
+    /// Flash flag word bit that disables advanced memory.
+    const DISABLED: u16 = 0x100;
+
     let mut word = [0u8; 2];
     if invocation
         .backend
@@ -1349,8 +1286,9 @@ fn advanced_memory(invocation: &mut Invocation<'_>) -> CommandResult {
     {
         return Err(CommandError::Unexpected);
     }
+
     let word = u16::from_be_bytes(word);
-    let disabled = word & ADVANCED_MEMORY_DISABLED != 0;
+    let disabled = word & DISABLED != 0;
     let text = if invocation.line.has("on") {
         if !disabled {
             invocation.set_text(format_args!("already enabled"));
@@ -1364,16 +1302,15 @@ fn advanced_memory(invocation: &mut Invocation<'_>) -> CommandResult {
         }
         "disabled"
     } else if invocation.line.has("status") {
-        invocation.set_text(format_args!(
-            "{}",
-            if disabled { "disabled" } else { "enabled" }
-        ));
+        let status = if disabled { "disabled" } else { "enabled" };
+        invocation.set_text(format_args!("{status}"));
         return Ok(Reply::Ok);
     } else {
         invocation.set_text(format_args!("improper command"));
         return Err(CommandError::Fail);
     };
-    let toggled = (word ^ ADVANCED_MEMORY_DISABLED).to_be_bytes();
+
+    let toggled = (word ^ DISABLED).to_be_bytes();
     if invocation
         .backend
         .write_flash(ADVANCED_MEMORY_FLASH_OFFSET, &toggled)
@@ -1381,21 +1318,29 @@ fn advanced_memory(invocation: &mut Invocation<'_>) -> CommandResult {
     {
         return Err(CommandError::Unexpected);
     }
+
     invocation.set_text(format_args!("{text}"));
+
     Ok(Reply::Ok)
 }
 
 /// `traceimports modulename=<str> [enabled=on]`: configure kernel import
 /// tracing for the next title launch.
 fn trace_imports(invocation: &mut Invocation<'_>) -> CommandResult {
-    let mut enabled = [0u8; TRACE_ENABLED_CAPACITY];
+    /// Bytes of the `modulename` buffer.
+    const MODULE_CAPACITY: usize = 0x104;
+    /// Bytes of the `enabled` buffer.
+    const ENABLED_CAPACITY: usize = 10;
+
+    let mut enabled = [0u8; ENABLED_CAPACITY];
     let enable = string_param(invocation, "enabled", &mut enabled)
         .is_some_and(|value| value.eq_ignore_ascii_case(b"on"));
-    let mut module = [0u8; TRACE_MODULE_CAPACITY];
+    let mut module = [0u8; MODULE_CAPACITY];
     let Some(module) = string_param(invocation, "modulename", &mut module) else {
         return Err(CommandError::Fail);
     };
-    let mut message = Text::<{ TRACE_MODULE_CAPACITY + 0x50 }>::new();
+
+    let mut message = Text::<{ MODULE_CAPACITY + 0x50 }>::new();
     let accepted = invocation.backend.trace_imports(module, enable);
     if accepted {
         let _ = message.push_bytes(b"[xbdm] ");
@@ -1409,535 +1354,12 @@ fn trace_imports(invocation: &mut Invocation<'_>) -> CommandResult {
         let _ = message.push_bytes(b"' is not a valid choice\n");
     }
     invocation.backend.debug_print(message.as_bytes());
+
     if accepted {
         Ok(Reply::Ok)
     } else {
         Err(CommandError::Fail)
     }
-}
-
-/// `detour log|entry|start|stop|getstate ...`: the function detour engine.
-/// Selectors are flags tested in that order.
-fn detour_command(invocation: &mut Invocation<'_>) -> CommandResult {
-    let line = invocation.line;
-    if line.has("log") {
-        if line.has("available") {
-            return detour_available(invocation);
-        }
-        if line.has("getentries") {
-            return detour_get_entries(invocation);
-        }
-        return Err(ErrorCode::UnknownCommand.into());
-    }
-    if line.has("entry") {
-        return detour_entry(invocation);
-    }
-    if line.has("start") {
-        return detour_start(invocation);
-    }
-    if line.has("stop") {
-        return detour_stop(invocation);
-    }
-    if line.has("getstate") {
-        let reply = run_detour(invocation.backend, DetourOperation::State);
-        let status = match reply.log_error {
-            Some(error) => NtStatus::from(error),
-            None => NtStatus::SUCCESS,
-        };
-        invocation.set_text(format_args!(
-            "state=0x{:x} status=0x{:x}",
-            reply.values[0], status.0
-        ));
-        return Ok(Reply::Ok);
-    }
-    Err(ErrorCode::UnknownCommand.into())
-}
-
-/// An operation of the detour engine.
-#[derive(Clone, Copy)]
-enum DetourOperation<'a> {
-    State,
-    Running,
-    Available,
-    Acquire,
-    Release(detour::EntryId),
-    Query(detour::EntryId),
-    Configure(detour::EntryId, &'a detour::HookSettings),
-    BeginStart,
-    CancelStart,
-    BeginStop,
-    ReleaseRange { base: u32, size: u32 },
-}
-
-/// Result of a [`DetourOperation`] and the values it reports.
-#[derive(Clone, Copy)]
-struct DetourReply {
-    result: Result<(), detour::DetourError>,
-    values: [u32; 3],
-    /// `State`: the error of the last log open.
-    log_error: Option<KernelError>,
-}
-
-impl DetourReply {
-    fn of(result: Result<(), detour::DetourError>) -> Self {
-        Self {
-            result,
-            values: [0; 3],
-            log_error: None,
-        }
-    }
-
-    fn of_values(values: Result<[u32; 3], detour::DetourError>) -> Self {
-        match values {
-            Ok(values) => Self {
-                values,
-                ..Self::of(Ok(()))
-            },
-            Err(error) => Self::of(Err(error)),
-        }
-    }
-
-    /// Fails with [`detour::DetourError::NotRunning`] unless `running`.
-    fn of_running(running: bool) -> Self {
-        Self::of(if running {
-            Ok(())
-        } else {
-            Err(detour::DetourError::NotRunning)
-        })
-    }
-
-    fn command_result(self) -> CommandResult {
-        self.result.map(|()| Reply::Ok).map_err(CommandError::from)
-    }
-}
-
-impl DetourOperation<'_> {
-    fn run(self, engine: &detour::Engine, platform: &dyn detour::Platform) -> DetourReply {
-        match self {
-            Self::State => DetourReply {
-                log_error: engine.log_error(),
-                ..DetourReply::of_values(Ok([engine.state().code(), 0, 0]))
-            },
-            Self::Running => {
-                DetourReply::of_running(engine.state() == detour::EngineState::Running)
-            }
-            Self::Available => {
-                DetourReply::of_values(engine.available().map(|count| [count, 0, 0]))
-            }
-            Self::Acquire => DetourReply::of_values(engine.acquire().map(|id| [id.0, 0, 0])),
-            Self::Release(id) => DetourReply::of(engine.release(platform, id)),
-            Self::Query(id) => {
-                DetourReply::of_values(engine.query(platform, id).map(|trampoline| {
-                    [
-                        trampoline.enter,
-                        trampoline.scribble,
-                        trampoline.scribble_size,
-                    ]
-                }))
-            }
-            Self::Configure(id, settings) => {
-                // SAFETY: the settings come from the debugger client's
-                // `detour entry setinfo`, which stock trusts to describe the
-                // hooked function (docs/re-notes/nuances.md, Memory).
-                DetourReply::of(unsafe { engine.configure(platform, id, settings) })
-            }
-            Self::BeginStart => DetourReply::of_running(engine.begin_start()),
-            Self::CancelStart => {
-                engine.cancel_start();
-                DetourReply::of(Ok(()))
-            }
-            Self::BeginStop => DetourReply::of_running(engine.begin_stop()),
-            Self::ReleaseRange { base, size } => {
-                engine.release_range(platform, base, size);
-                DetourReply::of(Ok(()))
-            }
-        }
-    }
-}
-
-/// Run `operation` through [`Backend::detour`]. Every operation shares one
-/// closure, so one closure body and vtable serve them all.
-fn run_detour(
-    backend: &mut dyn crate::backend::Backend,
-    operation: DetourOperation<'_>,
-) -> DetourReply {
-    let mut reply = DetourReply::of(Err(detour::DetourError::NotRunning));
-    backend.detour(&mut |engine, platform| reply = operation.run(engine, platform));
-    reply
-}
-
-/// Set the reply text `hresult=0x<result>` and return `result`.
-fn hresult_reply(invocation: &mut Invocation<'_>, result: CommandResult) -> CommandResult {
-    invocation.set_text(format_args!("hresult=0x{:x}", reply::hresult(result).0));
-    result
-}
-
-fn detour_available(invocation: &mut Invocation<'_>) -> CommandResult {
-    let reply = run_detour(invocation.backend, DetourOperation::Available);
-    reply.result?;
-    invocation.set_text(format_args!("available=0x{:x}", reply.values[0]));
-    Ok(Reply::Ok)
-}
-
-/// `log getentries [count=]`: up to `count` 0x70-byte records after a 203
-/// line, without a length; the stream ends early when the unread records
-/// run out.
-fn detour_get_entries(invocation: &mut Invocation<'_>) -> CommandResult {
-    // The getter's result is ignored: an absent count is 0 and a malformed
-    // one keeps its parsed prefix.
-    let count = invocation
-        .line
-        .param("count")
-        .map_or(0, |value| value.dword_prefix());
-    run_detour(invocation.backend, DetourOperation::Running).result?;
-    invocation.set_text(format_args!(
-        "OK count=0x{count:x} entrysize=0x{:x}",
-        detour::RECORD_SIZE
-    ));
-    let Some(session) = invocation.session.as_deref_mut() else {
-        return Err(CommandError::Fail);
-    };
-    session.continuation = AnyContinuation::Memory(Continuation::DetourLog {
-        remaining: count.wrapping_mul(detour::RECORD_SIZE as u32),
-    });
-    Ok(Reply::Binary)
-}
-
-fn detour_log_record(remaining: &mut u32, cx: &mut ContinuationContext<'_>) -> CommandResult {
-    if cx.aborted || *remaining == 0 {
-        return Err(CommandError::EndOfData);
-    }
-    let Some(record) = cx.binary.first_chunk_mut::<{ detour::RECORD_SIZE }>() else {
-        return Err(CommandError::EndOfData);
-    };
-    if !cx.backend.read_detour_record(record) {
-        return Err(CommandError::EndOfData);
-    }
-    *remaining = remaining.wrapping_sub(detour::RECORD_SIZE as u32);
-    cx.binary_len = detour::RECORD_SIZE;
-    Ok(Reply::Ok)
-}
-
-fn detour_entry(invocation: &mut Invocation<'_>) -> CommandResult {
-    let line = invocation.line;
-    let id = line.dword("Id").map(detour::EntryId);
-    let bad_parameter: CommandResult = Err(ErrorCode::BadParameter.into());
-    if line.has("acquire") {
-        let reply = run_detour(invocation.backend, DetourOperation::Acquire);
-        reply.result?;
-        invocation.set_text(format_args!(
-            "hresult=0x{:x} id=0x{:x}",
-            Hresult::OK.0,
-            reply.values[0]
-        ));
-        return Ok(Reply::Ok);
-    }
-    if line.has("release") {
-        let result = match id {
-            Some(id) => {
-                run_detour(invocation.backend, DetourOperation::Release(id)).command_result()
-            }
-            None => bad_parameter,
-        };
-        return hresult_reply(invocation, result);
-    }
-    if line.has("query") {
-        let (result, [enter, scribble, size]) = match id {
-            Some(id) => {
-                let reply = run_detour(invocation.backend, DetourOperation::Query(id));
-                (reply.command_result(), reply.values)
-            }
-            None => (bad_parameter, [0; 3]),
-        };
-        invocation.set_text(format_args!(
-            "hresult=0x{:x} enterdetour=0x{enter:x} scribble=0x{scribble:x} size=0x{size:x}",
-            reply::hresult(result).0
-        ));
-        return result;
-    }
-    if line.has("setinfo") {
-        let required = |name: &str| line.dword(name);
-        // Optional values the getter rejects or that are absent are 0.
-        let optional = |name: &str| required(name).unwrap_or(0);
-        let settings = (|| {
-            Some((
-                id?,
-                detour::HookSettings {
-                    address: required("addr")?,
-                    param_size: required("paramsize")?,
-                    flags: detour::HookFlags::from_bits_retain(required("flags")?),
-                    return_value: detour::ReturnValue(required("return")?),
-                    sleep_milliseconds: optional("sleep"),
-                    discard_frequency: optional("disccallfreq"),
-                    overlapped_offset: optional("OverlappedOffset"),
-                    extended_error: Win32Error::new(optional("ExtendedError")),
-                },
-            ))
-        })();
-        let result = match &settings {
-            Some((id, settings)) => run_detour(
-                invocation.backend,
-                DetourOperation::Configure(*id, settings),
-            )
-            .command_result(),
-            None => bad_parameter,
-        };
-        return hresult_reply(invocation, result);
-    }
-    Err(ErrorCode::UnknownCommand.into())
-}
-
-/// `start file=<name>`: open the log (truncating it) in the writer worker.
-/// The reply reports worker creation; a log that fails to open returns
-/// the engine to stopped with the open status in `getstate`.
-fn detour_start(invocation: &mut Invocation<'_>) -> CommandResult {
-    // Stock leaves the name buffer uninitialized when `file` is absent; an
-    // absent name is empty here and fails translation.
-    let mut name = DetourLogName::EMPTY;
-    if let Some(value) = invocation.line.param("file") {
-        name.len = value.copy_into(&mut name.bytes).len();
-    }
-    let mut result = run_detour(invocation.backend, DetourOperation::BeginStart).command_result();
-    if result.is_ok() {
-        let state = &mut *invocation.state;
-        state.memory.detour_log = name;
-        let path = state
-            .filesystem
-            .drives
-            .translate(invocation.backend, state.memory.detour_log.as_bytes());
-        if let Err(error) = invocation
-            .backend
-            .start_detour_log(path.as_ref().map(|path| path.as_bytes()))
-        {
-            run_detour(invocation.backend, DetourOperation::CancelStart);
-            result = Err(CommandError::from_kernel(
-                error,
-                ErrorCode::FileCannotBeCreated.into(),
-            ));
-        }
-    }
-    hresult_reply(invocation, result)
-}
-
-/// `stop`: stop the workers, dropping unwritten records and pending
-/// completions, and delete the log file.
-fn detour_stop(invocation: &mut Invocation<'_>) -> CommandResult {
-    let result = run_detour(invocation.backend, DetourOperation::BeginStop).command_result();
-    if result.is_ok() {
-        let state = &mut *invocation.state;
-        let path = state
-            .filesystem
-            .drives
-            .translate(invocation.backend, state.memory.detour_log.as_bytes());
-        invocation
-            .backend
-            .stop_detour_log(path.as_ref().map(|path| path.as_bytes()));
-    }
-    hresult_reply(invocation, result)
-}
-
-/// A module unloaded: release the detour entries hooking it (0x91f2c608).
-pub(crate) fn module_unloaded(backend: &mut dyn crate::backend::Backend, base: u32, size: u32) {
-    run_detour(backend, DetourOperation::ReleaseRange { base, size });
-}
-
-/// A `memtrack` command.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TrackingCommand {
-    Enable,
-    EnableOnce,
-    Disable,
-    Save,
-    QueryStackDepth,
-    QueryFlags,
-    QueryType,
-}
-
-const TRACKING_COMMANDS: [(&str, TrackingCommand); 7] = [
-    ("enable", TrackingCommand::Enable),
-    ("enableonce", TrackingCommand::EnableOnce),
-    ("disable", TrackingCommand::Disable),
-    ("save", TrackingCommand::Save),
-    ("querystackdepth", TrackingCommand::QueryStackDepth),
-    ("queryflags", TrackingCommand::QueryFlags),
-    ("querytype", TrackingCommand::QueryType),
-];
-
-/// `memtrack cmd=<command> ...`: allocation tracking settings, queries, and
-/// record dump.
-fn memory_tracking(invocation: &mut Invocation<'_>) -> CommandResult {
-    let mut command = [0u8; MEMTRACK_COMMAND_CAPACITY];
-    let command = string_param(invocation, "cmd", &mut command).and_then(|command| {
-        TRACKING_COMMANDS
-            .iter()
-            .find(|(name, _)| command.eq_ignore_ascii_case(name.as_bytes()))
-            .map(|&(_, command)| command)
-    });
-    let result = match command {
-        Some(command @ (TrackingCommand::Enable | TrackingCommand::EnableOnce)) => {
-            tracking_enable(invocation, command == TrackingCommand::EnableOnce)
-        }
-        Some(TrackingCommand::Disable) => {
-            invocation
-                .state
-                .memory
-                .tracking
-                .flags
-                .remove(TrackingFlags::TYPE_MASK);
-            invocation.state.settings_dirty = true;
-            Ok(Reply::Ok)
-        }
-        Some(TrackingCommand::Save) => {
-            let mut filename = [0u8; MEMTRACK_FILENAME_CAPACITY];
-            match string_param(invocation, "filename", &mut filename) {
-                Some(filename) => save_tracking_records(invocation, filename),
-                None => Err(CommandError::InvalidArgument),
-            }
-        }
-        Some(command @ (TrackingCommand::QueryStackDepth | TrackingCommand::QueryFlags)) => {
-            let value = if command == TrackingCommand::QueryFlags {
-                invocation.backend.tracking_flags().bits()
-            } else {
-                ACTIVE_STACK_DEPTH.0
-            };
-            invocation.set_text(format_args!("0x{value:x}"));
-            return Ok(Reply::Ok);
-        }
-        Some(TrackingCommand::QueryType) => {
-            match invocation
-                .line
-                .dword("type")
-                .and_then(|index| TRACKING_TYPE_NAMES.get(usize::from(index as u16)))
-            {
-                Some(name) => {
-                    invocation.text.set_bytes(name.as_bytes());
-                    return Ok(Reply::Ok);
-                }
-                None => Err(CommandError::InvalidArgument),
-            }
-        }
-        None => Err(CommandError::InvalidArgument),
-    };
-    if let Err(error) = result {
-        invocation.set_text(format_args!("HRESULT 0x{:x}", Hresult::from(error).0));
-    }
-    result
-}
-
-/// `enable` persists the settings; `enableonce` changes the flags in
-/// effect and marks the saved flags. The reply text names the last
-/// parameter that was missing.
-fn tracking_enable(invocation: &mut Invocation<'_>, once: bool) -> CommandResult {
-    let mut missing = None;
-    let (depth, depth_valid) = dword_param(invocation.line.param("stackdepth"));
-    if !depth_valid {
-        missing = Some("stackdepth");
-    }
-    let (flags, flags_valid) = dword_param(invocation.line.param("flags"));
-    if !flags_valid {
-        missing = Some("flags");
-    }
-    let depth = StackDepth(depth.unwrap_or(0));
-    let flags = TrackingFlags::from_bits_retain(flags.unwrap_or(TrackingFlags::DEFAULT.bits()));
-    if depth.0 > MEMTRACK_MAX_STACK_DEPTH || !flags.intersects(TrackingFlags::TYPES) {
-        return Err(CommandError::InvalidArgument);
-    }
-    let saved = &mut invocation.state.memory.tracking;
-    if once {
-        invocation.backend.set_tracking_flags(flags);
-        saved.flags.insert(TrackingFlags::ONCE);
-    } else {
-        saved.stack_depth = depth;
-        saved.flags = saved
-            .flags
-            .difference(TrackingFlags::TYPE_MASK)
-            .union(flags);
-        invocation.state.settings_dirty = true;
-    }
-    match missing {
-        Some(name) => invocation.set_text(format_args!("missing {name}")),
-        None => invocation.text.clear(),
-    }
-    Ok(Reply::Ok)
-}
-
-/// Write the tracking records to `filename` with the title stopped. A
-/// failed write deletes the file.
-fn save_tracking_records(invocation: &mut Invocation<'_>, filename: &[u8]) -> CommandResult {
-    if !invocation.backend.tracking_flags().is_active() {
-        // No allocation type is tracked.
-        return Err(CommandError::Win32(Win32Error::SERVICE_NOT_ACTIVE));
-    }
-    let request = filesystem::CreateRequest {
-        access: AccessMask::GENERIC_WRITE
-            .union(AccessMask::DELETE)
-            .union(AccessMask::SYNCHRONIZE),
-        allocation_size: None,
-        attributes: FileAttributes::NORMAL,
-        share: ShareAccess::READ,
-        disposition: CreateDisposition::OverwriteIf,
-        options: CreateOptions::SYNCHRONOUS_IO_NONALERT,
-    };
-    let written =
-        filesystem::open_translated(invocation.state, invocation.backend, filename, &request)
-            .and_then(|file| {
-                let stopped = debugger::stop_execution(
-                    invocation.state,
-                    invocation.backend,
-                    invocation.network,
-                );
-                let written = invocation.backend.write_tracking_records(file);
-                if stopped.is_ok() {
-                    let _ = debugger::go_execution(
-                        invocation.state,
-                        invocation.backend,
-                        invocation.network,
-                    );
-                }
-                if written.is_err() {
-                    let _ = invocation.backend.set_delete_disposition(file, true);
-                }
-                invocation.backend.close_file(file);
-                written
-            });
-    let Err(error) = written else {
-        return Ok(Reply::Ok);
-    };
-    match invocation.backend.dos_error_from_nt_status(error) {
-        Some(error) => Err(CommandError::Memory(MemoryError::TrackingSave(error))),
-        None => Ok(Reply::Ok),
-    }
-}
-
-/// Settings file line of the allocation tracking settings.
-pub(crate) fn memtrack_settings_lines(
-    state: &ServerState,
-    backend: &mut dyn crate::backend::Backend,
-    file: SettingsFile,
-) {
-    let tracking = state.memory.tracking;
-    write_line(
-        backend,
-        file,
-        format_args!(
-            "memtrack flags=0x{:x} stackdepth=0x{:x}",
-            tracking.flags.bits(),
-            tracking.stack_depth.0
-        ),
-    );
-}
-
-/// Settings file `memtrack` line: restore the saved settings without a
-/// pending one-time enable.
-pub(crate) fn ini_memtrack(invocation: &mut Invocation<'_>) {
-    let tracking = &mut invocation.state.memory.tracking;
-    if let Some(value) = invocation.line.param("flags") {
-        tracking.flags = TrackingFlags::from_bits_retain(value.dword_prefix());
-    }
-    if let Some(value) = invocation.line.param("stackdepth") {
-        tracking.stack_depth = StackDepth(value.dword_prefix());
-    }
-    tracking.flags.remove(TrackingFlags::ONCE);
 }
 
 #[cfg(test)]

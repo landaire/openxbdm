@@ -9,7 +9,6 @@
 //! per-processor data byte counts at +0xa91c, then for each processor in
 //! order the chunks of its records from first to last.
 
-use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::Win32Error;
@@ -23,8 +22,67 @@ use crate::commands::filesystem::DriveTable;
 use crate::commands::filesystem::ObjectPath;
 use crate::commands::memory::PAGE_SIZE;
 use crate::reply;
-use crate::reply::CommandError;
 use crate::reply::Reply;
+
+pub use super::error::CaptureError;
+
+/// Words kept free at the end of a chunk; records start below the limit.
+pub const CHUNK_RESERVE_WORDS: u32 = 0x21;
+/// Highest processor count of the flag word.
+pub const MAX_PROCESSORS: usize = 6;
+/// Byte offset of the per-processor data sizes in the capture file.
+pub const FILE_DATA_SIZES: usize = 0xa91c;
+/// Bytes of the module snapshot that opens the capture file.
+pub const FILE_HEADER_SIZE: u32 = 0xc000;
+
+/// Server state the capture file writer needs.
+pub trait Paths {
+    /// Object name of drive path `name` (stock 0x91f2e888).
+    fn object_path(&mut self, name: &[u8]) -> Option<ObjectPath>;
+    /// The running executable as a drive path (stock 0x91f33c38); returns
+    /// the length.
+    fn executable_drive_path(&mut self, output: &mut [u8]) -> usize;
+}
+
+/// Platform side of the engine; every method is a stock routine or global.
+pub trait Engine {
+    /// A loaded module carries `kind` (0x91f28ae0).
+    fn instrumented(&mut self, kind: Instrumentation) -> bool;
+    /// Kernel call-cap support (debug monitor service 2).
+    fn set_kernel_call_cap(&mut self, enable: bool) -> Result<(), KernelError>;
+    /// The title-terminated mark (0x91fae7e8).
+    fn set_title_terminated(&mut self, terminated: bool);
+    /// Hand the capture to the title through its control words (buffer
+    /// size bit 31).
+    fn request_title_capture(&mut self, megabytes: u8) -> Result<Started, CaptureError>;
+    /// Allocate the buffers and start recording (0x91f29210); `exclusive`
+    /// rejects a running capture.
+    fn begin(
+        &mut self,
+        name: &[u8],
+        buffer_size: u32,
+        exclusive: bool,
+    ) -> Result<Started, CaptureError>;
+    /// Stop recording (0x91f29830).
+    fn end(&mut self) -> Result<(), CaptureError>;
+    fn flags(&mut self) -> CaptureFlags;
+    /// Reset the flags to idle and keep `previous` (0x91fae800).
+    fn retire_flags(&mut self, previous: CaptureFlags);
+    /// Stop the counters of `flags` (0x91f27db8).
+    fn finish_counters(&mut self, flags: CaptureFlags) -> Result<(), CaptureError>;
+    /// Release the performance counters and mark them ready (0x91f96084).
+    fn release_counters(&mut self);
+    fn counters_ready(&mut self) -> bool;
+    /// Take the start/stop interlock (0x91f9e49c).
+    fn try_lock(&mut self) -> bool;
+    fn unlock(&mut self);
+    /// Write the capture file and free the buffers (0x91f28540).
+    fn write(&mut self, paths: &mut dyn Paths) -> Result<(), KernelError>;
+    /// The Win32 error of a failed write (`RtlNtStatusToDosError`).
+    fn dos_error(&mut self, error: KernelError) -> Option<Win32Error>;
+    /// Disable every processor and forget the buffers (title terminate).
+    fn discard(&mut self);
+}
 
 /// A capture that started.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,45 +95,6 @@ pub enum Started {
     Title(Reply),
 }
 
-/// Success results of the capture interface other than OK.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CaptureReply {
-    Continued,
-    FastCapEnabled,
-    CallCapEnabled,
-}
-
-/// A failed capture operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CaptureError {
-    /// The capture file cannot be created.
-    FileFailed,
-    FastCapDisabled,
-    CallCapDisabled,
-    /// No capture buffers exist, or the capture is stopped.
-    NoCapture,
-    AlreadyRunning,
-    NoBufferMemory,
-    TitleCaptureFailed,
-    NotInstrumented,
-    CallCapUnavailable,
-    /// A processor ran out of buffer space.
-    BufferFull,
-    TitleTerminated,
-    /// The capture ran longer than the 29-bit record timestamps cover.
-    TooLong,
-    CountersUnavailable,
-    CountersLost,
-    /// Another start or stop holds the engine.
-    Busy,
-    /// The kernel call-cap service failed.
-    Kernel(KernelError),
-    /// The capture file writer failed.
-    Write(Win32Error),
-    /// Failure result of a title that runs the capture.
-    Title(Hresult),
-}
-
 impl From<Started> for Reply {
     fn from(started: Started) -> Self {
         match started {
@@ -84,6 +103,14 @@ impl From<Started> for Reply {
             Started::Title(reply) => reply,
         }
     }
+}
+
+/// Success results of the capture interface other than OK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureReply {
+    Continued,
+    FastCapEnabled,
+    CallCapEnabled,
 }
 
 impl From<CaptureReply> for Hresult {
@@ -95,83 +122,6 @@ impl From<CaptureReply> for Hresult {
         }
     }
 }
-
-impl From<CaptureError> for Hresult {
-    #[inline(never)]
-    fn from(error: CaptureError) -> Self {
-        match error {
-            CaptureError::FileFailed => ErrorCode::FileCannotBeCreated.hresult(),
-            CaptureError::FastCapDisabled => Hresult::FAST_CAP_DISABLED,
-            CaptureError::CallCapDisabled => Hresult::CALL_CAP_DISABLED,
-            CaptureError::NoCapture => Hresult::NOT_STARTED,
-            CaptureError::AlreadyRunning => Hresult::ALREADY_STARTED,
-            CaptureError::NoBufferMemory => ErrorCode::OutOfMemory.hresult(),
-            CaptureError::TitleCaptureFailed => Hresult::NO_RESPONSE,
-            CaptureError::NotInstrumented => Hresult::CAPTURE_NOT_ENABLED,
-            CaptureError::CallCapUnavailable => Hresult::CALL_CAP_UNAVAILABLE,
-            CaptureError::BufferFull => Hresult::BUFFER_FULL,
-            CaptureError::TitleTerminated => Hresult::TITLE_TERMINATED,
-            CaptureError::TooLong => Hresult::DURATION_EXCEEDED,
-            CaptureError::CountersUnavailable => Hresult::NOT_ACQUIRED,
-            CaptureError::CountersLost => Hresult::NOT_OWNER,
-            CaptureError::Busy => Win32Error::BUSY.into(),
-            CaptureError::Kernel(error) => error.into(),
-            CaptureError::Write(error) => error.into(),
-            CaptureError::Title(result) => result,
-        }
-    }
-}
-
-impl From<CaptureError> for CommandError {
-    fn from(error: CaptureError) -> Self {
-        CommandError::Capture(error)
-    }
-}
-
-/// The typed form of the result word a title answers a capture request
-/// with: a success word is the handler result, 0 sends no status line.
-pub fn title_result(result: Hresult) -> Result<Started, CaptureError> {
-    if result == Hresult::NO_REPLY {
-        return Ok(Started::Title(Reply::Sent));
-    }
-    match reply::from_processor(result) {
-        Ok(reply) => Ok(Started::Title(reply)),
-        Err(_) => Err(CaptureError::Title(result)),
-    }
-}
-
-/// `capctrl fastcapenabled` and export 84.
-pub const fn fast_cap_state(present: bool) -> Result<CaptureReply, CaptureError> {
-    if present {
-        Ok(CaptureReply::FastCapEnabled)
-    } else {
-        Err(CaptureError::FastCapDisabled)
-    }
-}
-
-/// `capctrl callcapenabled`.
-pub const fn call_cap_state(present: bool) -> Result<CaptureReply, CaptureError> {
-    if present {
-        Ok(CaptureReply::CallCapEnabled)
-    } else {
-        Err(CaptureError::CallCapDisabled)
-    }
-}
-
-/// Ceiling of a requested buffer size.
-const BUFFER_SIZE_LIMIT: u32 = 0x1000_0000;
-/// Probe range of the default buffer size, in MiB.
-const PROBE_MEGABYTES: u32 = 0x100;
-/// Ceiling of the chunk size when several processors record.
-const CHUNK_SIZE_LIMIT: u32 = 0x4_0000;
-/// Words kept free at the end of a chunk; records start below the limit.
-pub const CHUNK_RESERVE_WORDS: u32 = 0x21;
-/// Highest processor count of the flag word.
-pub const MAX_PROCESSORS: usize = 6;
-/// Byte offset of the per-processor data sizes in the capture file.
-pub const FILE_DATA_SIZES: usize = 0xa91c;
-/// Bytes of the module snapshot that opens the capture file.
-pub const FILE_HEADER_SIZE: u32 = 0xc000;
 
 /// The capture flag word (stock 0x91f96078).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,11 +261,6 @@ pub enum ControlRecord {
     ThreadSwitch = 5,
 }
 
-/// First word of a record.
-pub const fn record_header(kind: RecordKind, timebase: u32) -> u32 {
-    (kind as u32) << 29 | timebase & 0x1fff_ffff
-}
-
 /// The `buffersize` word of `capctrl start` and export 73: a byte count,
 /// or with bit 31 set a capture the title runs, sized in MiB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,91 +284,58 @@ impl BufferRequest {
     }
 }
 
-/// Buffer size of `buffersize`: whole pages, at most 256 MiB; `None`
-/// (zero, or a size that wraps to zero) selects the default size.
-pub const fn requested_buffer_size(size: u32) -> Option<u32> {
-    match size.wrapping_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1) {
-        0 => None,
-        pages if pages > BUFFER_SIZE_LIMIT => Some(BUFFER_SIZE_LIMIT),
-        pages => Some(pages),
-    }
-}
-
-/// Largest whole MiB count below 256 that `fits` accepts, by bisection
-/// (stock probes physical allocations); 0 when none fits.
-pub fn probe_megabytes(fits: &mut dyn FnMut(u32) -> bool) -> u32 {
-    let (mut low, mut high) = (0i32, PROBE_MEGABYTES as i32);
-    let mut middle = high / 2;
-    loop {
-        if fits(middle as u32) {
-            low = middle;
-        } else {
-            high = middle;
-        }
-        middle = (high + low) / 2;
-        if high - low <= 1 {
-            return middle as u32;
-        }
-    }
-}
-
-/// Default buffer size: 95 percent of the probed size, in whole pages.
-pub const fn default_buffer_size(megabytes: u32) -> u32 {
-    let size = megabytes << 20;
-    let size = size - size / 100 * 5;
-    size.wrapping_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
-}
-
 /// Index of a processor counter setup (stock table 0x91f96088, 0xa0 bytes
 /// per setup); at most 0x10.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CounterSetup(u8);
 
-/// Event selections of the setups.
-const COUNTER_SETUP_SELECTS: [u64; 17] = [
-    0x0448_3a0d_0a56_2000,
-    0x14a9_be0d_2a2f_8000,
-    0x1499_bd8d_262f_6000,
-    0x3459_bacd_166e_b000,
-    0x3411_b88d_046e_2000,
-    0x0318_18c0_c606_3000,
-    0,
-    0x0528_2941_4a0a_5000,
-    0x0b58_5ac2_d616_b000,
-    0x2631_3189_8c4c_6000,
-    0x2739_39c9_ce4e_7000,
-    0x4b5b_5ad2_d696_b000,
-    0x4c63_6313_1898_c000,
-    0x4d6b_6b53_5a9a_d000,
-    0x4f7b_7bd3_de9e_f000,
-    0x0948_4a42_5212_9000,
-    0x0108_0840_4202_1000,
-];
-/// Counter routes (`source << 4 | lane`) of setups 0, 1 and 2, and 3 up.
-const COUNTER_SETUP_ROUTES: [[u8; COUNTERS]; 3] = [
-    [
-        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x34, 0x35, 0x36, 0x37, 0x30, 0x31, 0x32,
-        0x33,
-    ],
-    [
-        0x3c, 0x32, 0x33, 0x34, 0x20, 0x21, 0x22, 0x23, 0x10, 0x11, 0x12, 0x13, 0x00, 0x01, 0x02,
-        0x03,
-    ],
-    [
-        0x3c, 0x32, 0x33, 0x34, 0x25, 0x21, 0x20, 0x20, 0x15, 0x11, 0x10, 0x10, 0x05, 0x01, 0x00,
-        0x00,
-    ],
-];
-
 impl CounterSetup {
     pub fn setup(self) -> Setup {
-        let routes = &COUNTER_SETUP_ROUTES[match self.0 {
+        /// Event selections of the setups.
+        const SELECTS: [u64; 17] = [
+            0x0448_3a0d_0a56_2000,
+            0x14a9_be0d_2a2f_8000,
+            0x1499_bd8d_262f_6000,
+            0x3459_bacd_166e_b000,
+            0x3411_b88d_046e_2000,
+            0x0318_18c0_c606_3000,
+            0,
+            0x0528_2941_4a0a_5000,
+            0x0b58_5ac2_d616_b000,
+            0x2631_3189_8c4c_6000,
+            0x2739_39c9_ce4e_7000,
+            0x4b5b_5ad2_d696_b000,
+            0x4c63_6313_1898_c000,
+            0x4d6b_6b53_5a9a_d000,
+            0x4f7b_7bd3_de9e_f000,
+            0x0948_4a42_5212_9000,
+            0x0108_0840_4202_1000,
+        ];
+        /// Counter routes (`source << 4 | lane`) of setups 0, 1 and 2, and 3 up.
+        const ROUTES: [[u8; COUNTERS]; 3] = [
+            [
+                0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x34, 0x35, 0x36, 0x37, 0x30, 0x31,
+                0x32, 0x33,
+            ],
+            [
+                0x3c, 0x32, 0x33, 0x34, 0x20, 0x21, 0x22, 0x23, 0x10, 0x11, 0x12, 0x13, 0x00, 0x01,
+                0x02, 0x03,
+            ],
+            [
+                0x3c, 0x32, 0x33, 0x34, 0x25, 0x21, 0x20, 0x20, 0x15, 0x11, 0x10, 0x10, 0x05, 0x01,
+                0x00, 0x00,
+            ],
+        ];
+
+        let route_table = match self.0 {
             0 => 0,
             1 | 2 => 1,
             _ => 2,
-        }];
+        };
+        let routes = &ROUTES[route_table];
+
         Setup {
-            select: COUNTER_SETUP_SELECTS[usize::from(self.0)],
+            select: SELECTS[usize::from(self.0)],
             group: 0x1000_0000_0200_0000,
             trigger: 3,
             routes: core::array::from_fn(|counter| Route {
@@ -444,27 +356,6 @@ impl CounterSetup {
     }
 }
 
-/// Chunk size: the whole buffer for one processor, else a 32nd of it up
-/// to 256 KiB.
-pub const fn chunk_size(buffer_size: u32, processors: u32) -> u32 {
-    if processors == 1 {
-        buffer_size
-    } else if buffer_size >> 5 > CHUNK_SIZE_LIMIT {
-        CHUNK_SIZE_LIMIT
-    } else {
-        buffer_size >> 5
-    }
-}
-
-/// Server state the capture file writer needs.
-pub trait Paths {
-    /// Object name of drive path `name` (stock 0x91f2e888).
-    fn object_path(&mut self, name: &[u8]) -> Option<ObjectPath>;
-    /// The running executable as a drive path (stock 0x91f33c38); returns
-    /// the length.
-    fn executable_drive_path(&mut self, output: &mut [u8]) -> usize;
-}
-
 /// [`Paths`] through the drive table.
 pub struct DrivePaths<'a> {
     pub drives: &'a DriveTable,
@@ -479,49 +370,105 @@ impl Paths for DrivePaths<'_> {
     fn executable_drive_path(&mut self, output: &mut [u8]) -> usize {
         let mut object_path = [0u8; 0x104];
         let length = self.backend.running_executable_path(&mut object_path);
+
         self.drives
             .object_path_to_drive_path(self.backend, &object_path[..length], output)
     }
 }
 
-/// Platform side of the engine; every method is a stock routine or global.
-pub trait Engine {
-    /// A loaded module carries `kind` (0x91f28ae0).
-    fn instrumented(&mut self, kind: Instrumentation) -> bool;
-    /// Kernel call-cap support (debug monitor service 2).
-    fn set_kernel_call_cap(&mut self, enable: bool) -> Result<(), KernelError>;
-    /// The title-terminated mark (0x91fae7e8).
-    fn set_title_terminated(&mut self, terminated: bool);
-    /// Hand the capture to the title through its control words (buffer
-    /// size bit 31).
-    fn request_title_capture(&mut self, megabytes: u8) -> Result<Started, CaptureError>;
-    /// Allocate the buffers and start recording (0x91f29210); `exclusive`
-    /// rejects a running capture.
-    fn begin(
-        &mut self,
-        name: &[u8],
-        buffer_size: u32,
-        exclusive: bool,
-    ) -> Result<Started, CaptureError>;
-    /// Stop recording (0x91f29830).
-    fn end(&mut self) -> Result<(), CaptureError>;
-    fn flags(&mut self) -> CaptureFlags;
-    /// Reset the flags to idle and keep `previous` (0x91fae800).
-    fn retire_flags(&mut self, previous: CaptureFlags);
-    /// Stop the counters of `flags` (0x91f27db8).
-    fn finish_counters(&mut self, flags: CaptureFlags) -> Result<(), CaptureError>;
-    /// Release the performance counters and mark them ready (0x91f96084).
-    fn release_counters(&mut self);
-    fn counters_ready(&mut self) -> bool;
-    /// Take the start/stop interlock (0x91f9e49c).
-    fn try_lock(&mut self) -> bool;
-    fn unlock(&mut self);
-    /// Write the capture file and free the buffers (0x91f28540).
-    fn write(&mut self, paths: &mut dyn Paths) -> Result<(), KernelError>;
-    /// The Win32 error of a failed write (`RtlNtStatusToDosError`).
-    fn dos_error(&mut self, error: KernelError) -> Option<Win32Error>;
-    /// Disable every processor and forget the buffers (title terminate).
-    fn discard(&mut self);
+/// The typed form of the result word a title answers a capture request
+/// with: a success word is the handler result, 0 sends no status line.
+pub fn title_result(result: Hresult) -> Result<Started, CaptureError> {
+    if result == Hresult::NO_REPLY {
+        return Ok(Started::Title(Reply::Sent));
+    }
+
+    match reply::from_processor(result) {
+        Ok(reply) => Ok(Started::Title(reply)),
+        Err(_) => Err(CaptureError::Title(result)),
+    }
+}
+
+/// `capctrl fastcapenabled` and export 84.
+pub const fn fast_cap_state(present: bool) -> Result<CaptureReply, CaptureError> {
+    if present {
+        Ok(CaptureReply::FastCapEnabled)
+    } else {
+        Err(CaptureError::FastCapDisabled)
+    }
+}
+
+/// `capctrl callcapenabled`.
+pub const fn call_cap_state(present: bool) -> Result<CaptureReply, CaptureError> {
+    if present {
+        Ok(CaptureReply::CallCapEnabled)
+    } else {
+        Err(CaptureError::CallCapDisabled)
+    }
+}
+
+/// First word of a record.
+pub const fn record_header(kind: RecordKind, timebase: u32) -> u32 {
+    (kind as u32) << 29 | timebase & 0x1fff_ffff
+}
+
+/// Buffer size of `buffersize`: whole pages, at most 256 MiB; `None`
+/// (zero, or a size that wraps to zero) selects the default size.
+pub const fn requested_buffer_size(size: u32) -> Option<u32> {
+    /// Ceiling of a requested buffer size.
+    const BUFFER_SIZE_LIMIT: u32 = 0x1000_0000;
+
+    match size.wrapping_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1) {
+        0 => None,
+        pages if pages > BUFFER_SIZE_LIMIT => Some(BUFFER_SIZE_LIMIT),
+        pages => Some(pages),
+    }
+}
+
+/// Largest whole MiB count below 256 that `fits` accepts, by bisection
+/// (stock probes physical allocations); 0 when none fits.
+pub fn probe_megabytes(fits: &mut dyn FnMut(u32) -> bool) -> u32 {
+    /// Probe range of the default buffer size, in MiB.
+    const PROBE_MEGABYTES: u32 = 0x100;
+
+    let mut low = 0i32;
+    let mut high = PROBE_MEGABYTES as i32;
+    let mut middle = high / 2;
+
+    loop {
+        if fits(middle as u32) {
+            low = middle;
+        } else {
+            high = middle;
+        }
+        middle = (high + low) / 2;
+        if high - low <= 1 {
+            return middle as u32;
+        }
+    }
+}
+
+/// Default buffer size: 95 percent of the probed size, in whole pages.
+pub const fn default_buffer_size(megabytes: u32) -> u32 {
+    let size = megabytes << 20;
+    let size = size - size / 100 * 5;
+
+    size.wrapping_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+}
+
+/// Chunk size: the whole buffer for one processor, else a 32nd of it up
+/// to 256 KiB.
+pub const fn chunk_size(buffer_size: u32, processors: u32) -> u32 {
+    /// Ceiling of the chunk size when several processors record.
+    const CHUNK_SIZE_LIMIT: u32 = 0x4_0000;
+
+    if processors == 1 {
+        buffer_size
+    } else if buffer_size >> 5 > CHUNK_SIZE_LIMIT {
+        CHUNK_SIZE_LIMIT
+    } else {
+        buffer_size >> 5
+    }
 }
 
 /// Start after the file was validated (0x91f299c8, operation 1).
@@ -537,9 +484,11 @@ pub fn start(
     if !fast_cap && !call_cap {
         return Err(CaptureError::NotInstrumented);
     }
+
     if let Some(megabytes) = buffer.title_megabytes() {
         return engine.request_title_capture(megabytes);
     }
+
     if !fast_cap {
         engine
             .set_kernel_call_cap(true)
@@ -548,6 +497,7 @@ pub fn start(
                 error => CaptureError::Kernel(error),
             })?;
     }
+
     engine.begin(name, buffer.size(), exclusive)
 }
 
@@ -561,26 +511,32 @@ fn stop_recording(engine: &mut dyn Engine, writing: bool) -> Result<(), CaptureE
     {
         let _ = engine.set_kernel_call_cap(false);
     }
+
     let flags = engine.flags();
-    let mut result = stopped;
-    if flags.counters() {
+    let result = if flags.counters() {
         let finished = engine.finish_counters(flags);
-        if writing && stopped.is_ok() {
-            result = if engine.counters_ready() {
-                finished
-            } else {
-                Err(CaptureError::CountersUnavailable)
-            };
-        }
+        let result = if !writing || stopped.is_err() {
+            stopped
+        } else if engine.counters_ready() {
+            finished
+        } else {
+            Err(CaptureError::CountersUnavailable)
+        };
         engine.release_counters();
-    }
+        result
+    } else {
+        stopped
+    };
+
     let flags = engine.flags();
     let full = writing && result == Err(CaptureError::BufferFull);
-    engine.retire_flags(if full {
+    let retired = if full {
         flags.union(CaptureFlags::FULL_MARK)
     } else {
         flags
-    });
+    };
+    engine.retire_flags(retired);
+
     result
 }
 
@@ -593,12 +549,15 @@ pub fn stop(engine: &mut dyn Engine, paths: &mut dyn Paths) -> Result<(), Captur
     {
         return Err(error);
     }
+
     if !engine.try_lock() {
         return Err(CaptureError::Busy);
     }
+
     let written = engine.write(paths).map_err(|error| engine.dos_error(error));
     engine.unlock();
     recorded?;
+
     match written {
         Err(Some(error)) => Err(CaptureError::Write(error)),
         Ok(()) | Err(None) => Ok(()),
@@ -616,11 +575,13 @@ pub fn abort(engine: &mut dyn Engine) -> Result<(), CaptureError> {
 /// Capture part of the title terminate routine (0x91f28a10).
 pub fn title_terminated(engine: &mut dyn Engine) {
     engine.set_title_terminated(true);
+
     let flags = engine.flags();
     if flags.counters() {
         let _ = engine.finish_counters(flags);
         engine.release_counters();
     }
+
     let flags = engine.flags();
     engine.retire_flags(flags);
     engine.discard();

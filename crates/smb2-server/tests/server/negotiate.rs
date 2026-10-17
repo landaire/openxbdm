@@ -23,15 +23,18 @@ fn smb1_negotiate(dialects: &[&str]) -> Vec<u8> {
     message[4] = 0x72;
     message[9] = 0x18;
     message[10..12].copy_from_slice(&0xc853u16.to_le_bytes());
-    let mut bytes = Vec::new();
+
+    let mut dialect_bytes = Vec::new();
     for dialect in dialects {
-        bytes.push(0x02);
-        bytes.extend_from_slice(dialect.as_bytes());
-        bytes.push(0);
+        dialect_bytes.push(0x02);
+        dialect_bytes.extend_from_slice(dialect.as_bytes());
+        dialect_bytes.push(0);
     }
+
     message.push(0);
-    message.extend((bytes.len() as u16).to_le_bytes());
-    message.extend(bytes);
+    message.extend((dialect_bytes.len() as u16).to_le_bytes());
+    message.extend(dialect_bytes);
+
     message
 }
 
@@ -44,6 +47,7 @@ fn multi_protocol_wildcard_then_smb2_negotiate() {
     let mut client = new_client();
     let request = smb1_negotiate(&["NT LM 0.12", "SMB 2.002", "SMB 2.???"]);
     client.allocate_id();
+
     let wildcard = client.transmit(&request).single();
     wildcard.expect(NtStatus::Success);
     assert_eq!(wildcard.command(), command::NEGOTIATE);
@@ -67,6 +71,7 @@ fn multi_protocol_smb_2_002_completes_negotiation() {
     let reply = client
         .transmit(&smb1_negotiate(&["NT LM 0.12", "SMB 2.002"]))
         .single();
+
     assert_eq!(u16_at(reply.body(), 4), 0x0202);
     assert_eq!(client.connection.dialect(), Some(Dialect::SMB_2_0_2));
     client
@@ -158,13 +163,16 @@ fn highest_granted_message_id_is_accepted_out_of_order() {
 fn credits_never_exceed_128_outstanding() {
     let mut client = Client::negotiated(MemoryBackend::new(), config(false));
     client.credit_request = 1000;
+
     let mut reached = false;
     for _ in 0..300 {
         // Client::transmit asserts the bound after each reply.
         client.echo().expect(NtStatus::Success);
         reached |= client.credit_limit - client.next_message_id == 128;
     }
+
     assert!(reached, "the window fills to 128");
+
     let mut message = client.header(command::ECHO, client.credit_limit, 0);
     message.extend(empty_body());
     assert!(client.transmit(&message).is_disconnect());
@@ -174,9 +182,11 @@ fn credits_never_exceed_128_outstanding() {
 fn credit_charge_is_echoed_and_consumes_one_identifier() {
     let mut client = new_client();
     let reply = client.call(command::NEGOTIATE, &negotiate_body(&[0x0210]));
+
     // No SMB2_GLOBAL_CAP_LARGE_MTU: the server does not support
     // multi-credit requests, so CreditCharge does not reserve identifiers.
     assert_eq!(u32_at(reply.body(), 24) & 0x4, 0);
+
     for charge in [0u16, 1, 3] {
         let id = client.allocate_id();
         let mut message = client.header(command::ECHO, id, 0);
@@ -186,6 +196,7 @@ fn credit_charge_is_echoed_and_consumes_one_identifier() {
         reply.expect(NtStatus::Success);
         assert_eq!(u16_at(&reply.0, 6), charge);
     }
+
     // The identifier after a charge of 3 is still unused.
     client.echo().expect(NtStatus::Success);
 }
@@ -196,6 +207,7 @@ fn unused_lowest_identifier_holds_the_window() {
     client.credit_request = 1000;
     client.echo().expect(NtStatus::Success);
     assert_eq!(client.credit_limit - client.next_message_id, 128);
+
     let held = client.next_message_id;
     let limit = client.credit_limit;
     for id in held + 1..limit {
@@ -205,13 +217,16 @@ fn unused_lowest_identifier_holds_the_window() {
         reply.expect(NtStatus::Success);
         assert_eq!(reply.credits(), 0, "grant for message {id}");
     }
+
     assert_eq!(client.credit_limit, limit);
+
     client.next_message_id = limit;
     let mut message = client.header(command::ECHO, held, 0);
     message.extend(empty_body());
     let reply = client.transmit(&message).single();
     reply.expect(NtStatus::Success);
     assert_eq!(reply.credits(), 128);
+
     // Every identifier below the new grant is used.
     let mut message = client.header(command::ECHO, limit - 1, 0);
     message.extend(empty_body());

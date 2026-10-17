@@ -22,6 +22,7 @@ use super::EncryptionKeys;
 use super::Nonce;
 use super::PreauthHash;
 use super::SigningAlgorithm;
+use super::SigningKey;
 use super::TRANSFORM_HEADER;
 use super::decrypt;
 use super::derive_keys;
@@ -287,6 +288,30 @@ const PREAUTH_SETUP_RESPONSE: &str = concat!(
     "5d00000000",
 );
 
+/// An SMB 3.1.1 key derivation example.
+struct KeyExample {
+    session_key: &'static str,
+    preauth: &'static str,
+    cipher: Cipher,
+    signing: &'static str,
+    keys: EncryptionKeys,
+}
+
+/// A transformed request and its plain text.
+struct DecryptExample {
+    transformed: &'static str,
+    plain: &'static str,
+    keys: EncryptionKeys,
+}
+
+/// A plain response and its transformed form.
+struct EncryptExample {
+    plain: &'static str,
+    transformed: &'static str,
+    keys: EncryptionKeys,
+    session: u64,
+}
+
 fn bytes(text: &str) -> Vec<u8> {
     text.as_bytes()
         .as_chunks::<2>()
@@ -332,33 +357,34 @@ fn preauth_hash_follows_the_negotiate_and_session_setup_exchange() {
 
 #[test]
 fn smb_3_1_1_keys_of_the_examples() {
-    for (session_key, preauth, cipher, signing, keys) in [
-        (
-            "419fddf34c1e001909d362ae7fb6af79",
-            GCM_SESSION_HASH,
-            Cipher::Aes128Gcm,
-            "8765949dfeaee105ce9118b45be988f0",
-            gcm_keys(),
-        ),
-        (
-            "07b7f69c1e2581662df6987e88f9e891",
-            CCM_SESSION_HASH,
-            Cipher::Aes128Ccm,
-            "3dcc82c5795ae27f383242761078c59b",
-            ccm_keys(),
-        ),
+    for example in [
+        KeyExample {
+            session_key: "419fddf34c1e001909d362ae7fb6af79",
+            preauth: GCM_SESSION_HASH,
+            cipher: Cipher::Aes128Gcm,
+            signing: "8765949dfeaee105ce9118b45be988f0",
+            keys: gcm_keys(),
+        },
+        KeyExample {
+            session_key: "07b7f69c1e2581662df6987e88f9e891",
+            preauth: CCM_SESSION_HASH,
+            cipher: Cipher::Aes128Ccm,
+            signing: "3dcc82c5795ae27f383242761078c59b",
+            keys: ccm_keys(),
+        },
     ] {
         let (signing_key, encryption) = derive_keys(
             Dialect::SMB_3_1_1,
-            &SessionKey(decode_hex(session_key)),
-            &hash(preauth),
+            &SessionKey(decode_hex(example.session_key)),
+            &hash(example.preauth),
             SigningAlgorithm::AesCmac,
-            Some(cipher),
+            Some(example.cipher),
         );
-        assert_eq!(signing_key.key, decode_hex::<16>(signing));
+        assert_eq!(signing_key.key, decode_hex::<16>(example.signing));
         assert_eq!(signing_key.algorithm, SigningAlgorithm::AesCmac);
-        assert_eq!(encryption, Some(keys));
+        assert_eq!(encryption, Some(example.keys));
     }
+
     let (signing_key, encryption) = derive_keys(
         Dialect::SMB_3_1_1,
         &SessionKey(decode_hex("a8b3fcb8c96884ba9126132ae5b076af")),
@@ -406,12 +432,13 @@ fn final_session_setup_responses_carry_the_example_signatures() {
         (PREAUTH_SETUP_RESPONSE, "5756ac382298721282d4d9f61cf1195f"),
     ] {
         let response = bytes(response);
-        let key = super::SigningKey {
+        let key = SigningKey {
             key: decode_hex(key),
             algorithm: SigningAlgorithm::AesCmac,
         };
         assert_eq!(signature(&response, &key), response[48..64]);
         assert!(verify(&response, &key));
+
         let mut altered = response.clone();
         altered[64] ^= 1;
         assert!(!verify(&altered, &key));
@@ -420,12 +447,33 @@ fn final_session_setup_responses_carry_the_example_signatures() {
 
 #[test]
 fn decrypts_the_example_requests() {
-    for (transformed, plain, keys) in [
-        (GCM_WRITE_REQUEST_TRANSFORMED, GCM_WRITE_REQUEST, gcm_keys()),
-        (GCM_READ_REQUEST_TRANSFORMED, GCM_READ_REQUEST, gcm_keys()),
-        (CCM_WRITE_REQUEST_TRANSFORMED, CCM_WRITE_REQUEST, ccm_keys()),
-        (CCM_READ_REQUEST_TRANSFORMED, CCM_READ_REQUEST, ccm_keys()),
+    for example in [
+        DecryptExample {
+            transformed: GCM_WRITE_REQUEST_TRANSFORMED,
+            plain: GCM_WRITE_REQUEST,
+            keys: gcm_keys(),
+        },
+        DecryptExample {
+            transformed: GCM_READ_REQUEST_TRANSFORMED,
+            plain: GCM_READ_REQUEST,
+            keys: gcm_keys(),
+        },
+        DecryptExample {
+            transformed: CCM_WRITE_REQUEST_TRANSFORMED,
+            plain: CCM_WRITE_REQUEST,
+            keys: ccm_keys(),
+        },
+        DecryptExample {
+            transformed: CCM_READ_REQUEST_TRANSFORMED,
+            plain: CCM_READ_REQUEST,
+            keys: ccm_keys(),
+        },
     ] {
+        let DecryptExample {
+            transformed,
+            plain,
+            keys,
+        } = example;
         let plain = bytes(plain);
         let mut message = bytes(transformed);
         assert_eq!(decrypt(&mut message, &keys), Some(plain.len()));
@@ -443,32 +491,38 @@ fn decrypts_the_example_requests() {
 
 #[test]
 fn encrypts_the_example_responses() {
-    for (plain, transformed, keys, session) in [
-        (
-            GCM_WRITE_RESPONSE,
-            GCM_WRITE_RESPONSE_TRANSFORMED,
-            gcm_keys(),
-            GCM_SESSION,
-        ),
-        (
-            GCM_READ_RESPONSE,
-            GCM_READ_RESPONSE_TRANSFORMED,
-            gcm_keys(),
-            GCM_SESSION,
-        ),
-        (
-            CCM_WRITE_RESPONSE,
-            CCM_WRITE_RESPONSE_TRANSFORMED,
-            ccm_keys(),
-            CCM_SESSION,
-        ),
-        (
-            CCM_READ_RESPONSE,
-            CCM_READ_RESPONSE_TRANSFORMED,
-            ccm_keys(),
-            CCM_SESSION,
-        ),
+    for example in [
+        EncryptExample {
+            plain: GCM_WRITE_RESPONSE,
+            transformed: GCM_WRITE_RESPONSE_TRANSFORMED,
+            keys: gcm_keys(),
+            session: GCM_SESSION,
+        },
+        EncryptExample {
+            plain: GCM_READ_RESPONSE,
+            transformed: GCM_READ_RESPONSE_TRANSFORMED,
+            keys: gcm_keys(),
+            session: GCM_SESSION,
+        },
+        EncryptExample {
+            plain: CCM_WRITE_RESPONSE,
+            transformed: CCM_WRITE_RESPONSE_TRANSFORMED,
+            keys: ccm_keys(),
+            session: CCM_SESSION,
+        },
+        EncryptExample {
+            plain: CCM_READ_RESPONSE,
+            transformed: CCM_READ_RESPONSE_TRANSFORMED,
+            keys: ccm_keys(),
+            session: CCM_SESSION,
+        },
     ] {
+        let EncryptExample {
+            plain,
+            transformed,
+            keys,
+            session,
+        } = example;
         let expected = bytes(transformed);
         // The server's nonces are an 8-byte counter followed by zeros.
         assert!(expected[28..36].iter().all(|&byte| byte == 0));

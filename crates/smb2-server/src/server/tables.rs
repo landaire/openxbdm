@@ -5,6 +5,9 @@ use crate::backend::ShareId;
 use crate::backend::UserKind;
 use crate::fs::AccessMask;
 use crate::fs::CreateOptions;
+use crate::fs::DirectoryEntry;
+use crate::fs::FileAttributes;
+use crate::fs::FileInformation;
 use crate::fs::FileTime;
 use crate::fs::NAME_CAPACITY;
 use crate::rpc::Pipe;
@@ -68,14 +71,17 @@ pub struct Session {
     pub id: SessionId,
     pub state: SessionState,
     pub kind: UserKind,
+
     /// Signing key; `None` for guest and anonymous sessions.
     pub signing: Option<SigningKey>,
     /// Every message of the session is signed.
     pub signing_required: bool,
+
     /// Encryption keys when the dialect and client support encryption.
     pub encryption: Option<EncryptionKeys>,
     /// Every request of the session must be encrypted.
     pub encrypt_data: bool,
+
     /// Preauthentication integrity hash of the session's setup (SMB 3.1.1).
     pub preauth: PreauthHash,
     /// Nonce of the next message this session encrypts.
@@ -264,7 +270,7 @@ impl PatternSlot {
 #[derive(Debug, Clone, Copy)]
 pub struct HeldEntry {
     pub owner: Option<OpenSlot>,
-    pub entry: crate::fs::DirectoryEntry,
+    pub entry: DirectoryEntry,
     pub name: [u16; NAME_CAPACITY],
 }
 
@@ -272,15 +278,15 @@ impl HeldEntry {
     pub const fn new() -> Self {
         Self {
             owner: None,
-            entry: crate::fs::DirectoryEntry {
-                information: crate::fs::FileInformation {
-                    creation_time: crate::fs::FileTime(0),
-                    last_access_time: crate::fs::FileTime(0),
-                    last_write_time: crate::fs::FileTime(0),
-                    change_time: crate::fs::FileTime(0),
+            entry: DirectoryEntry {
+                information: FileInformation {
+                    creation_time: FileTime(0),
+                    last_access_time: FileTime(0),
+                    last_write_time: FileTime(0),
+                    change_time: FileTime(0),
                     allocation_size: 0,
                     end_of_file: 0,
-                    attributes: crate::fs::FileAttributes(0),
+                    attributes: FileAttributes(0),
                     index: None,
                 },
                 name_length: 0,

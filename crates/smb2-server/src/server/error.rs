@@ -4,8 +4,38 @@ use crate::auth::AuthError;
 use crate::fs::FsError;
 use crate::path::PathError;
 use crate::rpc::PipeError;
-use crate::server::shared::FileTableError;
 use crate::status::NtStatus;
+
+/// Why a lock or an access is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockRefusal {
+    /// Another lock covers part of the range.
+    Conflict,
+    /// The lock table is full.
+    Exhausted,
+}
+
+/// Why the file table cannot take a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileTableError {
+    /// Every entry is in use.
+    Full,
+    /// The path is longer than the whole path arena.
+    PathTooLong { length: usize },
+    /// The paths of open files fill the arena.
+    OutOfPathSpace,
+}
+
+impl From<FileTableError> for NtStatus {
+    fn from(error: FileTableError) -> Self {
+        match error {
+            FileTableError::Full | FileTableError::OutOfPathSpace => {
+                NtStatus::InsufficientResources
+            }
+            FileTableError::PathTooLong { .. } => NtStatus::ObjectNameInvalid,
+        }
+    }
+}
 
 /// A request that fails with an error reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,29 +170,5 @@ impl From<PipeError> for RequestError {
 impl From<FileTableError> for RequestError {
     fn from(error: FileTableError) -> Self {
         Self::FileTable(error)
-    }
-}
-
-/// A status of a reply with a regular body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Completion {
-    Success,
-    /// The output buffer held only part of the data.
-    BufferOverflow,
-    /// The authentication exchange continues.
-    MoreProcessingRequired,
-    /// The changes of a watched directory were not kept; the client lists
-    /// it again.
-    NotifyEnumDirectory,
-}
-
-impl From<Completion> for NtStatus {
-    fn from(completion: Completion) -> Self {
-        match completion {
-            Completion::Success => NtStatus::Success,
-            Completion::BufferOverflow => NtStatus::BufferOverflow,
-            Completion::MoreProcessingRequired => NtStatus::MoreProcessingRequired,
-            Completion::NotifyEnumDirectory => NtStatus::NotifyEnumDir,
-        }
     }
 }

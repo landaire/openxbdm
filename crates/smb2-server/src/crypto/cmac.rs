@@ -3,12 +3,6 @@
 use super::aes::Aes128;
 use super::chain::Chain;
 
-/// Multiply by x in GF(2^128) with the CMAC bit order.
-fn double(block: [u8; 16]) -> [u8; 16] {
-    let value = u128::from_be_bytes(block);
-    ((value << 1) ^ ((value >> 127) * 0x87)).to_be_bytes()
-}
-
 /// Streaming AES-128-CMAC.
 #[derive(Clone)]
 pub struct AesCmac {
@@ -35,15 +29,19 @@ impl AesCmac {
         let mut subkey = [0; 16];
         self.cipher.encrypt_block(&mut subkey);
         subkey = double(subkey);
+
         let used = self.chain.fold();
         if used < 16 {
             self.chain.state[used] ^= 0x80;
             subkey = double(subkey);
         }
+
         for (byte, key) in self.chain.state.iter_mut().zip(subkey) {
             *byte ^= key;
         }
+
         self.cipher.encrypt_block(&mut self.chain.state);
+
         self.chain.state
     }
 }
@@ -54,7 +52,14 @@ pub fn aes_cmac(key: &[u8; 16], parts: &[&[u8]]) -> [u8; 16] {
     for part in parts {
         mac.update(part);
     }
+
     mac.finalize()
+}
+
+/// Multiply by x in GF(2^128) with the CMAC bit order.
+fn double(block: [u8; 16]) -> [u8; 16] {
+    let value = u128::from_be_bytes(block);
+    ((value << 1) ^ ((value >> 127) * 0x87)).to_be_bytes()
 }
 
 #[cfg(test)]

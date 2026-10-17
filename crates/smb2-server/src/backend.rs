@@ -25,6 +25,14 @@ pub const COMPUTER_NAME_CAPACITY: usize = 15;
 /// Code units of a share name.
 pub const SHARE_NAME_CAPACITY: usize = 80;
 
+/// Create options the server passes to [`FileSystem::open`].
+pub const OPEN_OPTIONS: CreateOptions = CreateOptions(
+    CreateOptions::DIRECTORY_FILE.0
+        | CreateOptions::WRITE_THROUGH.0
+        | CreateOptions::NON_DIRECTORY_FILE.0
+        | CreateOptions::DELETE_ON_CLOSE.0,
+);
+
 /// Time, randomness, and the server's name.
 pub trait Platform {
     /// Current time.
@@ -116,14 +124,6 @@ pub struct OpenRequest {
     pub attributes: FileAttributes,
     pub allocation_size: Option<u64>,
 }
-
-/// Create options the server passes to [`FileSystem::open`].
-pub const OPEN_OPTIONS: CreateOptions = CreateOptions(
-    CreateOptions::DIRECTORY_FILE.0
-        | CreateOptions::WRITE_THROUGH.0
-        | CreateOptions::NON_DIRECTORY_FILE.0
-        | CreateOptions::DELETE_ON_CLOSE.0,
-);
 
 /// A successful open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

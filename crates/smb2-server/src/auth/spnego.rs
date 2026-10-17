@@ -5,8 +5,6 @@ use super::der::Tag;
 use super::der::Writer;
 use super::der::encoded_length;
 
-/// Content octets of OID 1.3.6.1.5.5.2.
-const SPNEGO_OID: [u8; 6] = [0x2b, 0x06, 0x01, 0x05, 0x05, 0x02];
 /// Content octets of OID 1.3.6.1.4.1.311.2.2.10.
 const NTLMSSP_OID: [u8; 10] = [0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a];
 
@@ -80,75 +78,6 @@ pub(super) struct NegTokenResp<'a> {
     pub mech_list_mic: Option<&'a [u8]>,
 }
 
-/// Parse an initial context token. `None` when malformed.
-pub(super) fn parse_init(input: &[u8]) -> Option<NegTokenInit<'_>> {
-    let mut token = Reader::new(Reader::new(input).expect(Tag::APPLICATION_0)?);
-    if token.expect(Tag::OID)? != SPNEGO_OID {
-        return None;
-    }
-    let choice = token.expect(NEG_TOKEN_INIT)?;
-    let mut fields = Reader::new(Reader::new(choice).expect(Tag::SEQUENCE)?);
-    let mut mech_types = None;
-    let mut mech_token = None;
-    while !fields.is_empty() {
-        let field = fields.read()?;
-        match field.tag {
-            MECH_TYPES => mech_types = Some(Reader::new(field.content).read()?),
-            MECH_TOKEN => mech_token = Some(Reader::new(field.content).expect(Tag::OCTET_STRING)?),
-            _ => {}
-        }
-    }
-    let mech_types = mech_types.filter(|list| list.tag == Tag::SEQUENCE)?;
-    let mut ntlm = NtlmPosition::Absent;
-    let mut mechanisms = Reader::new(mech_types.content);
-    let mut first = true;
-    while !mechanisms.is_empty() {
-        let oid = mechanisms.expect(Tag::OID)?;
-        if oid == NTLMSSP_OID && ntlm == NtlmPosition::Absent {
-            ntlm = if first {
-                NtlmPosition::First
-            } else {
-                NtlmPosition::Later
-            };
-        }
-        first = false;
-    }
-    Some(NegTokenInit {
-        mech_types: mech_types.encoding,
-        ntlm,
-        mech_token,
-    })
-}
-
-/// Parse a NegTokenResp. `None` when malformed.
-pub(super) fn parse_resp(input: &[u8]) -> Option<NegTokenResp<'_>> {
-    let choice = Reader::new(input).expect(NEG_TOKEN_RESP)?;
-    let mut fields = Reader::new(Reader::new(choice).expect(Tag::SEQUENCE)?);
-    let mut response = NegTokenResp {
-        state: None,
-        response_token: None,
-        mech_list_mic: None,
-    };
-    while !fields.is_empty() {
-        let field = fields.read()?;
-        match field.tag {
-            NEG_STATE => {
-                let value = Reader::new(field.content).expect(Tag::ENUMERATED)?;
-                response.state = Some(NegState::from_wire(value)?);
-            }
-            RESPONSE_TOKEN => {
-                response.response_token =
-                    Some(Reader::new(field.content).expect(Tag::OCTET_STRING)?)
-            }
-            MECH_LIST_MIC => {
-                response.mech_list_mic = Some(Reader::new(field.content).expect(Tag::OCTET_STRING)?)
-            }
-            _ => {}
-        }
-    }
-    Some(response)
-}
-
 /// NegTokenResp negState values.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum NegState {
@@ -183,8 +112,84 @@ pub(super) struct Reply<'a> {
     pub mech_list_mic: Option<&'a [u8]>,
 }
 
-const fn wrapped_octets(length: usize) -> usize {
-    encoded_length(encoded_length(length))
+/// Parse an initial context token. `None` when malformed.
+pub(super) fn parse_init(input: &[u8]) -> Option<NegTokenInit<'_>> {
+    /// Content octets of OID 1.3.6.1.5.5.2.
+    const SPNEGO_OID: [u8; 6] = [0x2b, 0x06, 0x01, 0x05, 0x05, 0x02];
+
+    let mut token = Reader::new(Reader::new(input).expect(Tag::APPLICATION_0)?);
+    if token.expect(Tag::OID)? != SPNEGO_OID {
+        return None;
+    }
+
+    let choice = token.expect(NEG_TOKEN_INIT)?;
+    let mut fields = Reader::new(Reader::new(choice).expect(Tag::SEQUENCE)?);
+
+    let mut mech_types = None;
+    let mut mech_token = None;
+    while !fields.is_empty() {
+        let field = fields.read()?;
+        match field.tag {
+            MECH_TYPES => mech_types = Some(Reader::new(field.content).read()?),
+            MECH_TOKEN => mech_token = Some(Reader::new(field.content).expect(Tag::OCTET_STRING)?),
+            // reqFlags and mechListMIC of the init are not used.
+            _ => {}
+        }
+    }
+
+    let mech_types = mech_types.filter(|list| list.tag == Tag::SEQUENCE)?;
+    let mut ntlm = NtlmPosition::Absent;
+    let mut mechanisms = Reader::new(mech_types.content);
+    let mut first = true;
+    while !mechanisms.is_empty() {
+        let oid = mechanisms.expect(Tag::OID)?;
+        if oid == NTLMSSP_OID && ntlm == NtlmPosition::Absent {
+            ntlm = if first {
+                NtlmPosition::First
+            } else {
+                NtlmPosition::Later
+            };
+        }
+        first = false;
+    }
+
+    Some(NegTokenInit {
+        mech_types: mech_types.encoding,
+        ntlm,
+        mech_token,
+    })
+}
+
+/// Parse a NegTokenResp. `None` when malformed.
+pub(super) fn parse_resp(input: &[u8]) -> Option<NegTokenResp<'_>> {
+    let choice = Reader::new(input).expect(NEG_TOKEN_RESP)?;
+    let mut fields = Reader::new(Reader::new(choice).expect(Tag::SEQUENCE)?);
+
+    let mut response = NegTokenResp {
+        state: None,
+        response_token: None,
+        mech_list_mic: None,
+    };
+    while !fields.is_empty() {
+        let field = fields.read()?;
+        match field.tag {
+            NEG_STATE => {
+                let value = Reader::new(field.content).expect(Tag::ENUMERATED)?;
+                response.state = Some(NegState::from_wire(value)?);
+            }
+            RESPONSE_TOKEN => {
+                response.response_token =
+                    Some(Reader::new(field.content).expect(Tag::OCTET_STRING)?)
+            }
+            MECH_LIST_MIC => {
+                response.mech_list_mic = Some(Reader::new(field.content).expect(Tag::OCTET_STRING)?)
+            }
+            // The initiator's supportedMech is not used.
+            _ => {}
+        }
+    }
+
+    Some(response)
 }
 
 /// Encode `reply`; returns its length, or `None` when `output` is too
@@ -203,15 +208,18 @@ pub(super) fn write_resp(reply: &Reply<'_>, output: &mut [u8]) -> Option<usize> 
         + reply
             .mech_list_mic
             .map_or(0, |mic| wrapped_octets(mic.len()));
+
     let mut writer = Writer::new(output);
     writer.header(NEG_TOKEN_RESP, encoded_length(fields))?;
     writer.header(Tag::SEQUENCE, fields)?;
     writer.header(NEG_STATE, encoded_length(1))?;
     writer.element(Tag::ENUMERATED, &[reply.state.wire()])?;
+
     if reply.supported_mech {
         writer.header(SUPPORTED_MECH, encoded_length(NTLMSSP_OID.len()))?;
         writer.element(Tag::OID, &NTLMSSP_OID)?;
     }
+
     for (tag, octets) in [
         (RESPONSE_TOKEN, reply.response_token),
         (MECH_LIST_MIC, reply.mech_list_mic),
@@ -221,7 +229,12 @@ pub(super) fn write_resp(reply: &Reply<'_>, output: &mut [u8]) -> Option<usize> 
             writer.element(Tag::OCTET_STRING, octets)?;
         }
     }
+
     Some(writer.position())
+}
+
+const fn wrapped_octets(length: usize) -> usize {
+    encoded_length(encoded_length(length))
 }
 
 #[cfg(test)]

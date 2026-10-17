@@ -9,7 +9,6 @@
 pub const EXPRESSION_CAPACITY: usize = 255;
 
 const STAR: u16 = b'*' as u16;
-const QUESTION: u16 = b'?' as u16;
 const DOS_STAR: u16 = b'<' as u16;
 const DOS_QM: u16 = b'>' as u16;
 const DOS_DOT: u16 = b'"' as u16;
@@ -40,20 +39,26 @@ impl States {
 /// Whether `name` matches `expression`. Expressions longer than
 /// [`EXPRESSION_CAPACITY`] match nothing.
 pub fn is_name_in_expression(expression: &[u16], name: &[u16]) -> bool {
+    const QUESTION: u16 = b'?' as u16;
+
     let end = expression.len();
     if end > EXPRESSION_CAPACITY {
         return false;
     }
+
     let last_dot = name.iter().rposition(|&unit| unit == DOT);
     let mut current = States::new();
     current.insert(0);
+
     for (index, &unit) in name.iter().enumerate() {
         close(&mut current, expression, Some(unit));
+
         let mut next = States::new();
         for (state, &token) in expression.iter().enumerate() {
             if !current.contains(state) {
                 continue;
             }
+
             let advance = match token {
                 STAR => {
                     next.insert(state);
@@ -71,16 +76,21 @@ pub fn is_name_in_expression(expression: &[u16], name: &[u16]) -> bool {
                 DOS_DOT => unit == DOT,
                 literal => fold(literal) == fold(unit),
             };
+
             if advance {
                 next.insert(state + 1);
             }
         }
+
         if next.is_empty() {
             return false;
         }
+
         current = next;
     }
+
     close(&mut current, expression, None);
+
     current.contains(end)
 }
 
@@ -91,12 +101,14 @@ fn close(states: &mut States, expression: &[u16], next: Option<u16>) {
         if !states.contains(state) {
             continue;
         }
+
         let empty = match token {
             STAR | DOS_STAR => true,
             DOS_QM => matches!(next, None | Some(DOT)),
             DOS_DOT => next.is_none(),
             _ => false,
         };
+
         if empty {
             states.insert(state + 1);
         }
@@ -116,19 +128,18 @@ pub const fn fold(unit: u16) -> u16 {
 mod tests {
     use super::*;
 
-    fn units<const N: usize>(text: &[u8; N]) -> [u16; N] {
-        text.map(u16::from)
-    }
-
     fn matches(expression: &[u8], name: &[u8]) -> bool {
         let mut expression_units = [0; 64];
         let mut name_units = [0; 64];
+
         for (unit, &byte) in expression_units.iter_mut().zip(expression) {
             *unit = u16::from(byte);
         }
+
         for (unit, &byte) in name_units.iter_mut().zip(name) {
             *unit = u16::from(byte);
         }
+
         is_name_in_expression(
             &expression_units[..expression.len()],
             &name_units[..name.len()],
@@ -177,7 +188,7 @@ mod tests {
     fn latin1_letters_compare_without_case() {
         let expression = [0xc9];
         let name = [0xe9];
+
         assert!(is_name_in_expression(&expression, &name));
-        let _ = units(b"x");
     }
 }

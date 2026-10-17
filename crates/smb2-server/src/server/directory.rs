@@ -6,12 +6,12 @@ use crate::fs::AccessMask;
 use crate::fs::DirectoryEntry;
 use crate::fs::NAME_CAPACITY;
 use crate::pattern;
-use crate::server::Body;
 use crate::server::Connection;
-use crate::server::Exchange;
-use crate::server::Failure;
-use crate::server::Handled;
-use crate::server::RequestError;
+use crate::server::error::RequestError;
+use crate::server::request::Body;
+use crate::server::request::Exchange;
+use crate::server::request::Failure;
+use crate::server::request::Handled;
 use crate::server::tables::OpenKind;
 use crate::server::tables::OpenSlot;
 use crate::server::tables::Pattern;
@@ -21,9 +21,6 @@ use crate::server::wire;
 use crate::server::wire::FileId;
 use crate::server::wire::HEADER_SIZE;
 use crate::utf16::Utf16Le;
-
-const REQUEST_FIXED: usize = 32;
-const REPLY_FIXED: usize = 8;
 
 /// Flags of a QUERY_DIRECTORY request (MS-SMB2 2.2.33).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,9 +77,6 @@ impl Class {
     }
 }
 
-/// Bytes the largest entry of any class takes, alignment included.
-const LARGEST_ENTRY: usize = wire::align8(104 + NAME_CAPACITY * 2);
-
 impl Connection {
     pub(super) fn query_directory(
         &mut self,
@@ -90,6 +84,11 @@ impl Connection {
         backend: &mut dyn Backend,
         output: &mut [u8],
     ) -> Handled {
+        const REQUEST_FIXED: usize = 32;
+        const REPLY_FIXED: usize = 8;
+        /// Bytes the largest entry of any class takes, alignment included.
+        const LARGEST_ENTRY: usize = wire::align8(104 + NAME_CAPACITY * 2);
+
         let body = exchange.fixed_body(33, REQUEST_FIXED)?;
         let class =
             Class::from_wire(wire::u8_at(body, 2)).ok_or(RequestError::UnknownInformationClass)?;
@@ -103,6 +102,7 @@ impl Connection {
         )
         .and_then(Utf16Le::new)
         .ok_or(RequestError::InvalidRequest)?;
+
         let open = *self.open(slot);
         let OpenKind::File(file) = open.kind else {
             return Err(Failure::Error(RequestError::InvalidRequest));
@@ -113,6 +113,7 @@ impl Connection {
         if !open.access.contains(AccessMask::READ_DATA) {
             return Err(Failure::Error(RequestError::AccessDenied));
         }
+
         let limit = (wire::u32_at(body, 28) as usize)
             .min(exchange.config.max_io())
             .min(output.len().saturating_sub(REPLY_FIXED));
@@ -135,6 +136,7 @@ impl Connection {
         let mut previous: Option<usize> = None;
         let mut name = [0u16; NAME_CAPACITY];
         let mut failure: Option<RequestError> = None;
+
         loop {
             let entry = if self.held.owner == Some(slot) {
                 self.held.owner = None;
@@ -144,6 +146,7 @@ impl Connection {
                 if search.exhausted {
                     break;
                 }
+
                 let start = wire::align8(written);
                 if previous.is_some() && start + LARGEST_ENTRY > limit {
                     break;
@@ -153,6 +156,7 @@ impl Connection {
                     failure = Some(RequestError::TableFull);
                     break;
                 }
+
                 if search.dots_listed < 2 {
                     // `.` and `..` lead every listing, with the directory's
                     // own information.
@@ -188,10 +192,12 @@ impl Connection {
                     }
                 }
             };
+
             let name = &name[..entry.name_length.min(NAME_CAPACITY)];
             if !self.pattern_matches(search.pattern, name) {
                 continue;
             }
+
             let start = wire::align8(written);
             let length = class.fixed() + name.len() * 2;
             if start + length > entries.len() {
@@ -201,6 +207,7 @@ impl Connection {
                 }
                 break;
             }
+
             entries[written..start].fill(0);
             encode_entry(class, &entry, name, &mut entries[start..start + length]);
             if let Some(previous) = previous {
@@ -208,15 +215,18 @@ impl Connection {
             }
             previous = Some(start);
             written = start + length;
+
             if flags.intersects(QueryFlags::RETURN_SINGLE_ENTRY) {
                 break;
             }
         }
+
         let first_query = !search.queried;
         search.queried = true;
         if let OpenKind::File(file) = &mut self.open_mut(slot).kind {
             file.search = Some(search);
         }
+
         // Entries already taken from the backend are returned; a failure
         // after them repeats on the next query.
         if let Some(error) = failure
@@ -224,9 +234,10 @@ impl Connection {
         {
             return Err(Failure::Error(error));
         }
+
+        // The first query of a scan that finds nothing reports that no file
+        // matches; later ones report the end of the scan.
         if previous.is_none() {
-            // The first query of a scan that finds nothing reports that no
-            // file matches; later ones report the end of the scan.
             let error = if first_query {
                 RequestError::NoMatchingFile
             } else {
@@ -234,10 +245,12 @@ impl Connection {
             };
             return Err(Failure::Error(error));
         }
+
         output[..REPLY_FIXED].fill(0);
         wire::put_u16(output, 0, 9);
         wire::put_u16(output, 2, (HEADER_SIZE + REPLY_FIXED) as u16);
         wire::put_u32(output, 4, written as u32);
+
         Ok(Body::success(REPLY_FIXED + written))
     }
 
@@ -251,12 +264,14 @@ impl Connection {
         if self.held.owner == Some(slot) {
             self.held.owner = None;
         }
+
         let pattern = if expression.is_empty() || expression.eq_ignore_ascii_case(b"*") {
             Pattern::All
         } else {
             if expression.len() > pattern::EXPRESSION_CAPACITY {
                 return Err(Failure::Error(RequestError::NameInvalid));
             }
+
             let index = self
                 .patterns
                 .iter()
@@ -268,8 +283,10 @@ impl Connection {
                 *unit = value;
             }
             stored.length = expression.len() as u16;
+
             Pattern::Stored(PatternIndex(index as u8))
         };
+
         Ok(Search {
             pattern,
             queried: false,
@@ -299,15 +316,18 @@ impl Connection {
 /// Write one entry of `class`; `output` is exactly the entry's length.
 fn encode_entry(class: Class, entry: &DirectoryEntry, name: &[u16], output: &mut [u8]) {
     output.fill(0);
+
     let fixed = class.fixed();
     for (index, unit) in name.iter().enumerate() {
         wire::put_u16(output, fixed + index * 2, *unit);
     }
+
     let name_length = (name.len() * 2) as u32;
     if class == Class::Names {
         wire::put_u32(output, 8, name_length);
         return;
     }
+
     let information = &entry.information;
     wire::put_u64(output, 8, information.creation_time.0);
     wire::put_u64(output, 16, information.last_access_time.0);
@@ -317,10 +337,14 @@ fn encode_entry(class: Class, entry: &DirectoryEntry, name: &[u16], output: &mut
     wire::put_u64(output, 48, information.allocation_size);
     wire::put_u32(output, 56, information.attributes.0);
     wire::put_u32(output, 60, name_length);
+
+    // A FileId of 0 tells the client the file system has no identifier for
+    // the file (MS-FSCC 2.4.17).
     let file_id = information.index.map_or(0, |index| index.0);
     match class {
         Class::IdBothDirectory => wire::put_u64(output, 96, file_id),
         Class::IdFullDirectory => wire::put_u64(output, 72, file_id),
+        // The other classes carry no FileId.
         _ => {}
     }
 }

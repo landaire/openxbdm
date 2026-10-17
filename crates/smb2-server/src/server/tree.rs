@@ -2,14 +2,15 @@
 
 use crate::backend::Backend;
 use crate::fs::AccessMask;
-use crate::server::Body;
 use crate::server::Connection;
-use crate::server::Exchange;
-use crate::server::Failure;
-use crate::server::Handled;
-use crate::server::RequestError;
 use crate::server::Server;
-use crate::server::empty_body;
+use crate::server::create::share_maximum;
+use crate::server::error::RequestError;
+use crate::server::request::Body;
+use crate::server::request::Exchange;
+use crate::server::request::Failure;
+use crate::server::request::Handled;
+use crate::server::request::empty_body;
 use crate::server::tables::Tree;
 use crate::server::tables::TreeId;
 use crate::server::tables::TreeKind;
@@ -32,12 +33,6 @@ impl ShareFlags {
     const NO_CACHING: Self = Self(0x30);
 }
 
-const REPLY_LENGTH: usize = 16;
-/// Rights of a read-only share: read data, attributes and extended
-/// attributes, execute, read control, synchronize.
-const READ_ONLY_ACCESS: AccessMask = AccessMask(0x0012_00a9);
-const SEPARATOR: u16 = b'\\' as u16;
-
 impl Connection {
     pub(super) fn tree_connect(
         &mut self,
@@ -45,6 +40,14 @@ impl Connection {
         backend: &mut dyn Backend,
         output: &mut [u8],
     ) -> Result<(Body, TreeId), Failure> {
+        const REPLY_LENGTH: usize = 16;
+
+        struct Target {
+            kind: TreeKind,
+            share_type: ShareType,
+            access: AccessMask,
+        }
+
         let body = exchange.fixed_body(9, 8)?;
         let path = wire::buffer(
             exchange.message,
@@ -60,26 +63,28 @@ impl Connection {
             .as_ref()
             .map(|session| session.kind)
             .ok_or(RequestError::SessionNotFound)?;
-        let (tree, share_type, access) = if share.eq_ignore_ascii_case(b"IPC$") {
-            (TreeKind::Pipe, ShareType::Pipe, AccessMask::FILE_ALL_ACCESS)
+
+        let target = if share.eq_ignore_ascii_case(b"IPC$") {
+            Target {
+                kind: TreeKind::Pipe,
+                share_type: ShareType::Pipe,
+                access: AccessMask::FILE_ALL_ACCESS,
+            }
         } else {
             let found = backend
                 .find_share(share, kind)
                 .ok_or(RequestError::ShareNotFound)?;
-            let access = if found.writable {
-                AccessMask::FILE_ALL_ACCESS
-            } else {
-                READ_ONLY_ACCESS
-            };
-            (
-                TreeKind::Disk {
+            let access = share_maximum(found.writable);
+            Target {
+                kind: TreeKind::Disk {
                     share: found.id,
                     writable: found.writable,
                 },
-                ShareType::Disk,
+                share_type: ShareType::Disk,
                 access,
-            )
+            }
         };
+
         let index = self
             .trees
             .iter()
@@ -89,13 +94,15 @@ impl Connection {
         self.trees[index] = Some(Tree {
             id,
             session,
-            kind: tree,
+            kind: target.kind,
         });
+
         output[..REPLY_LENGTH].fill(0);
         wire::put_u16(output, 0, REPLY_LENGTH as u16);
-        wire::put_u8(output, 2, share_type as u8);
+        wire::put_u8(output, 2, target.share_type as u8);
         wire::put_u32(output, 4, ShareFlags::NO_CACHING.0);
-        wire::put_u32(output, 12, access.0);
+        wire::put_u32(output, 12, target.access.0);
+
         Ok((Body::success(REPLY_LENGTH), id))
     }
 
@@ -107,10 +114,12 @@ impl Connection {
         output: &mut [u8],
     ) -> Handled {
         exchange.fixed_body(4, 4)?;
+
         if let Some(slot) = exchange.tree {
             self.close_opens_where(server, backend, |open| open.tree == slot);
             self.trees[usize::from(slot.0)] = None;
         }
+
         Ok(Body::success(empty_body(output)))
     }
 
@@ -133,9 +142,12 @@ impl Connection {
 
 /// The share of a `\\server\share` path.
 fn share_name(path: Utf16Le<'_>) -> Option<Utf16Le<'_>> {
+    const SEPARATOR: u16 = b'\\' as u16;
+
     if path.unit(0) != Some(SEPARATOR) || path.unit(1) != Some(SEPARATOR) {
         return None;
     }
+
     let server_end = 2 + path
         .slice(2, path.len())
         .units()
@@ -144,5 +156,6 @@ fn share_name(path: Utf16Le<'_>) -> Option<Utf16Le<'_>> {
     if share.is_empty() || share.units().any(|unit| unit == SEPARATOR) {
         return None;
     }
+
     Some(share)
 }

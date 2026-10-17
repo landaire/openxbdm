@@ -3,19 +3,19 @@
 use crate::auth::AuthStep;
 use crate::backend::Backend;
 use crate::backend::UserKind;
-use crate::server::Body;
-use crate::server::Completion;
 use crate::server::Connection;
-use crate::server::Exchange;
-use crate::server::Failure;
-use crate::server::Handled;
 use crate::server::MAX_SESSIONS;
-use crate::server::RequestError;
 use crate::server::Server;
 use crate::server::SupersededSession;
-use crate::server::check_signature;
-use crate::server::empty_body;
+use crate::server::error::RequestError;
 use crate::server::negotiate::SecurityMode;
+use crate::server::request::Body;
+use crate::server::request::Completion;
+use crate::server::request::Exchange;
+use crate::server::request::Failure;
+use crate::server::request::Handled;
+use crate::server::request::check_signature;
+use crate::server::request::empty_body;
 use crate::server::security;
 use crate::server::security::Nonce;
 use crate::server::security::SigningKey;
@@ -26,6 +26,8 @@ use crate::server::tables::SessionState;
 use crate::server::wire;
 use crate::server::wire::Dialect;
 use crate::server::wire::HEADER_SIZE;
+
+const _: () = assert!(MAX_SESSIONS <= u8::MAX as usize);
 
 /// Flags of a SESSION_SETUP request (MS-SMB2 2.2.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,9 +56,6 @@ impl SessionFlags {
     }
 }
 
-/// Fixed part of the reply body; the security buffer follows.
-const REPLY_FIXED: usize = 8;
-
 /// The session a SESSION_SETUP reply names, and the key that signs it.
 pub(super) type SetupSession = Option<(SessionId, Option<SigningKey>)>;
 
@@ -69,6 +68,16 @@ impl Connection {
         backend: &mut dyn Backend,
         output: &mut [u8],
     ) -> (Handled, SetupSession) {
+        // Fixed part of the reply body; the security buffer follows.
+        const REPLY_FIXED: usize = 8;
+
+        struct Outcome {
+            completion: Completion,
+            length: usize,
+            flags: SessionFlags,
+            key: Option<SigningKey>,
+        }
+
         let body = match exchange.fixed_body(25, 24) {
             Ok(body) => body,
             Err(failure) => return (Err(failure), None),
@@ -76,6 +85,7 @@ impl Connection {
         if SetupRequestFlags(wire::u8_at(body, 2)).contains(SetupRequestFlags::BINDING) {
             return (Err(Failure::Error(RequestError::BindingNotAccepted)), None);
         }
+
         let client_requires_signing =
             SecurityMode(u16::from(wire::u8_at(body, 3))).contains(SecurityMode::SIGNING_REQUIRED);
         let token = match wire::buffer(
@@ -97,6 +107,7 @@ impl Connection {
         if output.len() < REPLY_FIXED {
             return (Err(Failure::Disconnect), None);
         }
+
         let dialect = self.dialect();
         if dialect == Some(Dialect::SMB_3_1_1)
             && self.session(slot).state == SessionState::InProgress
@@ -104,14 +115,15 @@ impl Connection {
             let entry = self.session_mut(slot);
             entry.preauth = entry.preauth.update(exchange.message);
         }
+
         let step = self.auths[usize::from(slot.0)].step(token, &mut output[REPLY_FIXED..], backend);
-        let (completion, length, flags, key) = match step {
-            Ok(AuthStep::Continue { length }) => (
-                Completion::MoreProcessingRequired,
+        let outcome = match step {
+            Ok(AuthStep::Continue { length }) => Outcome {
+                completion: Completion::MoreProcessingRequired,
                 length,
-                SessionFlags::NONE,
-                None,
-            ),
+                flags: SessionFlags::NONE,
+                key: None,
+            },
             Ok(AuthStep::Complete { length, session }) => {
                 let config = exchange.config;
                 let negotiated = self.negotiated;
@@ -145,11 +157,14 @@ impl Connection {
                             Some((session_id, None)),
                         );
                     }
+                    // Re-authentication of the same kind of user.
                     SessionState::Valid => {}
                 }
+
                 if established && previous.0 != 0 && previous != session_id {
                     self.supersede(previous, session.kind, server, backend);
                 }
+
                 let entry = self.session(slot);
                 let mut flags = match session.kind {
                     UserKind::Authenticated => SessionFlags::NONE,
@@ -159,27 +174,35 @@ impl Connection {
                 if entry.encrypt_data {
                     flags = flags.union(SessionFlags::ENCRYPT_DATA);
                 }
+
                 // The final reply of an authenticated session is signed
                 // (MS-SMB2 3.3.5.5.3); guest and anonymous sessions have
                 // no key.
-                (Completion::Success, length, flags, entry.signing)
+                Outcome {
+                    completion: Completion::Success,
+                    length,
+                    flags,
+                    key: entry.signing,
+                }
             }
             Err(error) => {
                 self.remove_session(slot, server, backend);
                 return (Err(Failure::Error(error.into())), Some((session_id, None)));
             }
         };
+
         output[..REPLY_FIXED].fill(0);
         wire::put_u16(output, 0, 9);
-        wire::put_u16(output, 2, flags.0);
+        wire::put_u16(output, 2, outcome.flags.0);
         wire::put_u16(output, 4, (HEADER_SIZE + REPLY_FIXED) as u16);
-        wire::put_u16(output, 6, length as u16);
+        wire::put_u16(output, 6, outcome.length as u16);
+
         (
             Ok(Body {
-                completion,
-                length: REPLY_FIXED + length,
+                completion: outcome.completion,
+                length: REPLY_FIXED + outcome.length,
             }),
-            Some((session_id, key)),
+            Some((session_id, outcome.key)),
         )
     }
 
@@ -189,11 +212,13 @@ impl Connection {
         if self.dialect() != Some(Dialect::SMB_3_1_1) {
             return;
         }
-        if let Some(slot) = self.find_session(id) {
-            let entry = self.session_mut(slot);
-            if entry.state == SessionState::InProgress {
-                entry.preauth = entry.preauth.update(reply);
-            }
+
+        let Some(slot) = self.find_session(id) else {
+            return;
+        };
+        let entry = self.session_mut(slot);
+        if entry.state == SessionState::InProgress {
+            entry.preauth = entry.preauth.update(reply);
         }
     }
 
@@ -216,14 +241,17 @@ impl Connection {
                     }
                     check_signature(exchange, &session)?;
                 }
+
                 // A setup on a valid session starts a re-authentication
                 // unless one is under way.
                 if !self.auths[usize::from(slot.0)].in_progress() {
                     self.auths[usize::from(slot.0)].reset();
                 }
             }
+
             return Ok(slot);
         }
+
         let index = self
             .sessions
             .iter()
@@ -241,9 +269,9 @@ impl Connection {
             preauth: self.preauth,
             next_nonce: Nonce::FIRST,
         });
-        let slot = SessionSlot(index as u8);
         self.auths[index].reset();
-        Ok(slot)
+
+        Ok(SessionSlot(index as u8))
     }
 
     /// A random identifier that is nonzero and unused on this connection.
@@ -266,9 +294,11 @@ impl Connection {
         output: &mut [u8],
     ) -> Handled {
         exchange.fixed_body(4, 4)?;
+
         if let Some(slot) = exchange.session {
             self.remove_session(slot, server, backend);
         }
+
         Ok(Body::success(empty_body(output)))
     }
 
@@ -303,11 +333,13 @@ impl Connection {
         let Some(slot) = self.find_session(superseded.id) else {
             return false;
         };
+
         let session = self.session(slot);
         if session.state != SessionState::Valid || session.kind != superseded.kind {
             return false;
         }
         self.remove_session(slot, server, backend);
+
         true
     }
 
@@ -320,16 +352,19 @@ impl Connection {
         backend: &mut dyn Backend,
     ) {
         self.close_opens_where(server, backend, |open| open.session == slot);
+
         for pending in &mut self.pending {
             if pending.is_some_and(|pending| pending.session == slot) {
                 *pending = None;
             }
         }
+
         for tree in &mut self.trees {
             if tree.is_some_and(|tree| tree.session == slot) {
                 *tree = None;
             }
         }
+
         self.sessions[usize::from(slot.0)] = None;
         self.auths[usize::from(slot.0)].reset();
     }
@@ -346,5 +381,3 @@ impl Connection {
             .expect("session slot of a handled request is occupied")
     }
 }
-
-const _: () = assert!(MAX_SESSIONS <= u8::MAX as usize);

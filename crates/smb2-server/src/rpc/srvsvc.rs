@@ -12,6 +12,28 @@ use crate::backend::ShareIndex;
 use crate::utf16::Utf16Le;
 use crate::utf16::fold_ascii;
 
+const IPC_SHARE: &[u8] = b"IPC$";
+const IPC_REMARK: &[u8] = b"Remote IPC";
+const IPC_ENTRY: ShareEntry<'static> = ShareEntry {
+    name: Text::Ascii(IPC_SHARE),
+    share_type: ShareType::IPC.union(ShareType::SPECIAL),
+    remark: IPC_REMARK,
+};
+
+/// A decoded request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Call {
+    /// NetrShareEnum. `resume` is the index of the first share to return.
+    ShareEnum {
+        level: InfoLevel,
+        resume: Option<u32>,
+    },
+    /// NetrShareGetInfo; `name` lies in the retained request stub.
+    ShareGetInfo { level: InfoLevel, name: StubString },
+    /// NetrServerGetInfo.
+    ServerGetInfo { level: InfoLevel },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Opnum(pub u16);
 
@@ -50,9 +72,6 @@ impl ShareType {
     }
 }
 
-const IPC_SHARE: &[u8] = b"IPC$";
-const IPC_REMARK: &[u8] = b"Remote IPC";
-
 /// Platform identifier of a SERVER_INFO_100 or _101.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PlatformId(u32);
@@ -87,32 +106,35 @@ impl ServerType {
     }
 }
 
-const SERVER_TYPE: ServerType = ServerType::WORKSTATION
-    .union(ServerType::SERVER)
-    .union(ServerType::NT);
+/// Pointer referent identifiers in marshalling order.
+struct Referents(u32);
 
-/// A decoded request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Call {
-    /// NetrShareEnum. `resume` is the index of the first share to return.
-    ShareEnum {
-        level: InfoLevel,
-        resume: Option<u32>,
-    },
-    /// NetrShareGetInfo; `name` lies in the retained request stub.
-    ShareGetInfo { level: InfoLevel, name: StubString },
-    /// NetrServerGetInfo.
-    ServerGetInfo { level: InfoLevel },
+impl Referents {
+    fn next(&mut self) -> u32 {
+        let referent = 0x0002_0000 + 4 * self.0;
+        self.0 += 1;
+
+        referent
+    }
+}
+
+/// A share as listed to clients.
+struct ShareEntry<'a> {
+    name: Text<'a>,
+    share_type: ShareType,
+    remark: &'static [u8],
 }
 
 pub(super) fn parse(opnum: Opnum, stub: &[u8]) -> Result<Call, FaultStatus> {
     let mut reader = Reader::new(stub);
+
     match opnum {
         Opnum::SHARE_ENUM => parse_share_enum(&mut reader),
         Opnum::SHARE_GET_INFO => {
             reader.skip_unique_string().ok_or(FaultStatus::NDR)?;
             let name = reader.string().ok_or(FaultStatus::NDR)?;
             let level = InfoLevel(reader.u32().ok_or(FaultStatus::NDR)?);
+
             Ok(Call::ShareGetInfo { level, name })
         }
         Opnum::SERVER_GET_INFO => {
@@ -121,9 +143,31 @@ pub(super) fn parse(opnum: Opnum, stub: &[u8]) -> Result<Call, FaultStatus> {
             if !server_info_arm(level) {
                 return Err(FaultStatus::INVALID_TAG);
             }
+
             Ok(Call::ServerGetInfo { level })
         }
         _ => Err(FaultStatus::OPERATION_RANGE),
+    }
+}
+
+/// Render the response stub of `call`.
+#[inline(never)]
+pub(super) fn render(
+    call: &Call,
+    stub: &[u8],
+    context: &mut PipeContext<'_>,
+    writer: &mut Writer<'_>,
+) {
+    let mut referents = Referents(0);
+
+    match *call {
+        Call::ShareEnum { level, resume } => {
+            share_enum(level, resume, context, &mut referents, writer)
+        }
+        Call::ShareGetInfo { level, name } => {
+            share_get_info(level, name.bytes(stub), context, &mut referents, writer)
+        }
+        Call::ServerGetInfo { level } => server_get_info(level, context, &mut referents, writer),
     }
 }
 
@@ -136,9 +180,11 @@ fn parse_share_enum(reader: &mut Reader<'_>) -> Result<Call, FaultStatus> {
     if reader.u32() != Some(level.0) {
         return Err(FaultStatus::NDR);
     }
+
     if !matches!(level.0, 0 | 1 | 2 | 501 | 502 | 503) {
         return Err(FaultStatus::INVALID_TAG);
     }
+
     if reader.u32().ok_or(FaultStatus::NDR)? != 0 {
         let _entries_read = reader.u32().ok_or(FaultStatus::NDR)?;
         // Clients send an empty container; entries on input are not
@@ -147,12 +193,14 @@ fn parse_share_enum(reader: &mut Reader<'_>) -> Result<Call, FaultStatus> {
             return Err(FaultStatus::NDR);
         }
     }
+
     // All entries are returned whatever the preferred maximum length.
     let _preferred_maximum_length = reader.u32().ok_or(FaultStatus::NDR)?;
     let resume = match reader.u32().ok_or(FaultStatus::NDR)? {
         0 => None,
         _ => Some(reader.u32().ok_or(FaultStatus::NDR)?),
     };
+
     Ok(Call::ShareEnum { level, resume })
 }
 
@@ -180,50 +228,6 @@ fn server_info_arm(level: InfoLevel) -> bool {
     )
 }
 
-/// Pointer referent identifiers in marshalling order.
-struct Referents(u32);
-
-impl Referents {
-    fn next(&mut self) -> u32 {
-        let referent = 0x0002_0000 + 4 * self.0;
-        self.0 += 1;
-        referent
-    }
-}
-
-/// A share as listed to clients.
-struct ShareEntry<'a> {
-    name: Text<'a>,
-    share_type: ShareType,
-    remark: &'static [u8],
-}
-
-const IPC_ENTRY: ShareEntry<'static> = ShareEntry {
-    name: Text::Ascii(IPC_SHARE),
-    share_type: ShareType::IPC.union(ShareType::SPECIAL),
-    remark: IPC_REMARK,
-};
-
-/// Render the response stub of `call`.
-#[inline(never)]
-pub(super) fn render(
-    call: &Call,
-    stub: &[u8],
-    context: &mut PipeContext<'_>,
-    writer: &mut Writer<'_>,
-) {
-    let mut referents = Referents(0);
-    match *call {
-        Call::ShareEnum { level, resume } => {
-            share_enum(level, resume, context, &mut referents, writer)
-        }
-        Call::ShareGetInfo { level, name } => {
-            share_get_info(level, name.bytes(stub), context, &mut referents, writer)
-        }
-        Call::ServerGetInfo { level } => server_get_info(level, context, &mut referents, writer),
-    }
-}
-
 fn disk_share_count(context: &mut PipeContext<'_>) -> u32 {
     let mut name = [0; SHARE_NAME_CAPACITY];
     let mut count = 0;
@@ -234,6 +238,7 @@ fn disk_share_count(context: &mut PipeContext<'_>) -> u32 {
     {
         count += 1;
     }
+
     count
 }
 
@@ -248,12 +253,14 @@ fn share_at<'a>(
     if index >= disk_count {
         return IPC_ENTRY;
     }
+
     // A share removed since the list was counted is listed with an empty
     // name, which keeps the marshalled counts consistent.
     let length = context
         .backend
         .share_name(ShareIndex(index), context.user, name)
         .map_or(0, |length| length.min(SHARE_NAME_CAPACITY));
+
     ShareEntry {
         name: Text::Units(&name[..length]),
         share_type: ShareType::DISKTREE,
@@ -268,6 +275,7 @@ fn find_share<'a>(
     name: &'a mut [u16; SHARE_NAME_CAPACITY],
 ) -> Option<ShareEntry<'a>> {
     let requested = Utf16Le::new(requested)?;
+
     let mut index = 0;
     let mut found = None;
     while let Some(length) = context
@@ -279,13 +287,14 @@ fn find_share<'a>(
             && requested
                 .units()
                 .zip(units)
-                .all(|(a, &b)| fold_ascii(a) == fold_ascii(b))
+                .all(|(requested_unit, &unit)| fold_ascii(requested_unit) == fold_ascii(unit))
         {
             found = Some(units.len());
             break;
         }
         index += 1;
     }
+
     match found {
         Some(length) => Some(ShareEntry {
             name: Text::Units(&name[..length]),
@@ -318,6 +327,7 @@ fn share_enum(
 ) {
     writer.u32(level.0);
     writer.u32(level.0);
+
     let detailed = match level.0 {
         0 => false,
         1 => true,
@@ -334,12 +344,14 @@ fn share_enum(
             return;
         }
     };
+
     let disk_count = disk_share_count(context);
     let total = disk_count.saturating_add(1);
     // No resume handle starts at the beginning; one past the end returns
     // no entries.
     let first = resume.unwrap_or(0).min(total);
     let count = total - first;
+
     writer.u32(referents.next());
     writer.u32(count);
     if count == 0 {
@@ -359,6 +371,7 @@ fn share_enum(
                 writer.u32(referents.next());
             }
         }
+
         let mut name = [0; SHARE_NAME_CAPACITY];
         for index in first..total {
             let entry = share_at(context, index, disk_count, &mut name);
@@ -368,6 +381,7 @@ fn share_enum(
             }
         }
     }
+
     writer.u32(count);
     // All entries are returned, so the enumeration is complete.
     put_resume(writer, referents, resume.map(|_| 0));
@@ -384,6 +398,7 @@ fn share_get_info(
     writer: &mut Writer<'_>,
 ) {
     writer.u32(level.0);
+
     let mut name = [0; SHARE_NAME_CAPACITY];
     let status = match level.0 {
         0 | 1 | 501 | 1005 | 2 | 502 => match find_share(context, requested, &mut name) {
@@ -398,12 +413,14 @@ fn share_get_info(
         },
         _ => NetStatus::INVALID_LEVEL,
     };
+
     if matches!(
         level.0,
         0 | 1 | 2 | 501 | 502 | 503 | 1004 | 1005 | 1006 | 1501
     ) {
         writer.u32(0);
     }
+
     writer.u32(status.0);
 }
 
@@ -419,16 +436,19 @@ fn put_share_info(
         writer.u32(0);
         return;
     }
+
     writer.u32(referents.next());
     if level.0 == 0 {
         writer.string(entry.name);
         return;
     }
+
     writer.u32(entry.share_type.0);
     writer.u32(referents.next());
     if level.0 == 501 {
         writer.u32(0);
     }
+
     writer.string(entry.name);
     writer.string(Text::Ascii(entry.remark));
 }
@@ -440,18 +460,24 @@ fn server_get_info(
     referents: &mut Referents,
     writer: &mut Writer<'_>,
 ) {
+    const SERVER_TYPE: ServerType = ServerType::WORKSTATION
+        .union(ServerType::SERVER)
+        .union(ServerType::NT);
+
     writer.u32(level.0);
     if !matches!(level.0, 100 | 101) {
         writer.u32(0);
         writer.u32(NetStatus::INVALID_LEVEL.0);
         return;
     }
+
     let mut name = [0; COMPUTER_NAME_CAPACITY];
     let length = context
         .backend
         .computer_name(&mut name)
         .min(COMPUTER_NAME_CAPACITY);
     let name = Text::Ascii(&name[..length]);
+
     writer.u32(referents.next());
     writer.u32(PlatformId::NT.0);
     writer.u32(referents.next());
@@ -465,5 +491,6 @@ fn server_get_info(
         writer.string(name);
         writer.string(Text::Ascii(b""));
     }
+
     writer.u32(NetStatus::SUCCESS.0);
 }

@@ -1,11 +1,8 @@
 //! Message identifier window (MS-SMB2 3.3.1.1): the identifiers granted
 //! by credits that the client has not used yet.
 
-use super::wire::Credits;
-use super::wire::MessageId;
-
-/// Most identifiers granted and not yet used at any time.
-pub const WINDOW: u64 = 128;
+use crate::server::wire::Credits;
+use crate::server::wire::MessageId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CreditWindow {
@@ -35,20 +32,27 @@ impl CreditWindow {
         if id < self.base || id >= self.end {
             return false;
         }
+
         let bit = 1u128 << (id - self.base);
         if self.available & bit == 0 {
             return false;
         }
+
+        // Slide the window past the identifiers used at its start.
         self.available &= !bit;
         let shift = u64::from(self.available.trailing_zeros()).min(self.end - self.base);
         self.base += shift;
         self.available = self.available.checked_shr(shift as u32).unwrap_or(0);
+
         true
     }
 
     /// Grant up to `requested` new identifiers, at least one when the
     /// client holds none; returns the number granted.
     pub fn grant(&mut self, requested: Credits) -> Credits {
+        /// Most identifiers granted and not yet used at any time.
+        const WINDOW: u64 = 128;
+
         let requested = requested.0;
         let room = WINDOW - (self.end - self.base);
         let wanted = u64::from(requested.max(1));
@@ -57,15 +61,17 @@ impl CreditWindow {
         } else {
             wanted.min(room)
         };
+
         for index in self.end - self.base..self.end - self.base + granted {
             self.available |= 1 << index;
         }
         self.end += granted;
+
         Credits(granted as u16)
     }
 
-    #[cfg(test)]
     /// Identifiers granted and unused.
+    #[cfg(test)]
     pub fn outstanding(&self) -> u32 {
         self.available.count_ones()
     }

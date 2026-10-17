@@ -1,15 +1,16 @@
 //! NEGOTIATE (MS-SMB2 3.3.5.4) with the SMB 3.1.1 negotiate contexts, and
 //! the multi-protocol negotiate of SMB 1 clients (MS-SMB2 3.3.5.3).
 
+use crate::auth::negotiate_token;
 use crate::backend::Backend;
-use crate::server::Body;
 use crate::server::Connection;
-use crate::server::Exchange;
-use crate::server::Failure;
-use crate::server::Handled;
-use crate::server::Negotiation;
-use crate::server::RequestError;
 use crate::server::ServerConfig;
+use crate::server::connection::Negotiation;
+use crate::server::error::RequestError;
+use crate::server::request::Body;
+use crate::server::request::Exchange;
+use crate::server::request::Failure;
+use crate::server::request::Handled;
 use crate::server::security::Cipher;
 use crate::server::security::PreauthHash;
 use crate::server::security::SigningAlgorithm;
@@ -22,15 +23,6 @@ use crate::server::wire::HeaderFlags;
 use crate::server::wire::MessageId;
 use crate::server::wire::header;
 use crate::transport;
-
-/// Dialects in order of preference.
-const DIALECTS: [Dialect; 5] = [
-    Dialect::SMB_3_1_1,
-    Dialect::SMB_3_0_2,
-    Dialect::SMB_3_0,
-    Dialect::SMB_2_1,
-    Dialect::SMB_2_0_2,
-];
 
 /// SecurityMode of a NEGOTIATE (MS-SMB2 2.2.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -80,20 +72,6 @@ impl HashAlgorithm {
     const SHA_512: Self = Self(0x0001);
 }
 
-/// Fixed part of the request and reply bodies.
-const REQUEST_FIXED: usize = 36;
-const REPLY_FIXED: usize = 64;
-
-/// Salt bytes of the preauthentication integrity context.
-const SALT: usize = 32;
-
-/// SMB 1 header length and the offset of its command byte.
-const SMB1_HEADER: usize = 32;
-const SMB1_COMMAND: usize = 4;
-const SMB1_NEGOTIATE: u8 = 0x72;
-/// Dialect buffer format byte.
-const SMB1_DIALECT_FORMAT: u8 = 0x02;
-
 /// What the client's SMB 3.1.1 negotiate contexts asked for.
 #[derive(Debug, Clone, Copy, Default)]
 struct Contexts {
@@ -112,17 +90,6 @@ pub(super) struct Negotiated {
     pub signing: SigningAlgorithm,
 }
 
-/// The dialect the server picks from a list of dialect revisions.
-pub(super) fn select_dialect(offered: &[u8]) -> Option<Dialect> {
-    DIALECTS.into_iter().find(|dialect| {
-        offered
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .any(|pair| u16::from_le_bytes(*pair) == dialect.0)
-    })
-}
-
 impl Connection {
     pub(super) fn negotiate(
         &mut self,
@@ -130,6 +97,9 @@ impl Connection {
         backend: &mut dyn Backend,
         output: &mut [u8],
     ) -> Handled {
+        // Fixed part of the request body.
+        const REQUEST_FIXED: usize = 36;
+
         let body = exchange.fixed_body(36, REQUEST_FIXED)?;
         let count = usize::from(wire::u16_at(body, 2));
         let offered = body
@@ -138,6 +108,7 @@ impl Connection {
             .ok_or(RequestError::InvalidRequest)?;
         let dialect = select_dialect(offered).ok_or(RequestError::Unsupported)?;
         let capabilities = GlobalCapabilities(wire::u32_at(body, 8));
+
         let contexts = if dialect == Dialect::SMB_3_1_1 {
             let contexts = wire::buffer(
                 exchange.message,
@@ -153,10 +124,12 @@ impl Connection {
             if !contexts.preauth {
                 return Err(Failure::Error(RequestError::InvalidRequest));
             }
+
             contexts
         } else {
             Contexts::default()
         };
+
         let negotiated = Negotiated {
             dialect,
             cipher: match dialect {
@@ -169,16 +142,20 @@ impl Connection {
                 _ => None,
             },
             signing: match dialect {
+                // Without a signing context the connection signs with
+                // AES-CMAC (MS-SMB2 3.3.5.4).
                 Dialect::SMB_3_1_1 => contexts.signing.unwrap_or(SigningAlgorithm::AesCmac),
                 Dialect::SMB_3_0 | Dialect::SMB_3_0_2 => SigningAlgorithm::AesCmac,
                 _ => SigningAlgorithm::HmacSha256,
             },
         };
+
         self.client_guid.0.copy_from_slice(&body[12..28]);
         self.client_capabilities = capabilities;
         self.client_security_mode = SecurityMode(wire::u16_at(body, 4));
         self.negotiated = Some(negotiated);
         self.negotiation = Negotiation::Done(dialect);
+
         let length = negotiate_reply(
             &exchange.config,
             backend,
@@ -187,6 +164,7 @@ impl Connection {
             output,
         )
         .ok_or(Failure::Disconnect)?;
+
         Ok(Body::success(length))
     }
 
@@ -207,6 +185,13 @@ impl Connection {
         request: &[u8],
         response: &mut [u8],
     ) -> Option<usize> {
+        // SMB 1 header length and the offset of its command byte.
+        const SMB1_HEADER: usize = 32;
+        const SMB1_COMMAND: usize = 4;
+        const SMB1_NEGOTIATE: u8 = 0x72;
+        // Dialect buffer format byte.
+        const SMB1_DIALECT_FORMAT: u8 = 0x02;
+
         if self.negotiation != Negotiation::Initial
             || request.get(SMB1_COMMAND) != Some(&SMB1_NEGOTIATE)
             || request.len() < SMB1_HEADER + 3
@@ -214,20 +199,25 @@ impl Connection {
         {
             return None;
         }
+
         let byte_count = usize::from(wire::u16_at(request, SMB1_HEADER + 1));
         let dialects = request.get(SMB1_HEADER + 3..SMB1_HEADER + 3 + byte_count)?;
         let mut wildcard = false;
         let mut smb_2_0_2 = false;
         let mut rest = dialects;
+
         while let [SMB1_DIALECT_FORMAT, tail @ ..] = rest {
             let end = tail.iter().position(|&byte| byte == 0)?;
             match &tail[..end] {
                 b"SMB 2.???" => wildcard = true,
                 b"SMB 2.002" => smb_2_0_2 = true,
+                // Other dialects are SMB 1 dialects the server does not
+                // speak.
                 _ => {}
             }
             rest = &tail[end + 1..];
         }
+
         let dialect = if wildcard {
             self.negotiation = Negotiation::Wildcard;
             Dialect::WILDCARD
@@ -237,6 +227,7 @@ impl Connection {
         } else {
             return None;
         };
+
         let negotiated = Negotiated {
             dialect,
             cipher: None,
@@ -248,6 +239,7 @@ impl Connection {
         if !self.credits.consume(MessageId(0)) {
             return None;
         }
+
         let start = transport::HEADER_LENGTH;
         let output = &mut response[start..];
         let length = negotiate_reply(
@@ -257,14 +249,36 @@ impl Connection {
             None,
             &mut output[HEADER_SIZE..],
         )?;
+
         output[..HEADER_SIZE].fill(0);
         output[..4].copy_from_slice(&wire::PROTOCOL_ID);
         wire::put_u16(output, header::STRUCTURE_SIZE, HEADER_SIZE as u16);
         wire::put_u16(output, header::COMMAND, Command::NEGOTIATE.0);
         wire::put_u16(output, header::CREDITS, self.credits.grant(Credits(1)).0);
         wire::put_u32(output, header::FLAGS, HeaderFlags::SERVER_TO_REDIR.0);
+
         Some(start + HEADER_SIZE + length)
     }
+}
+
+/// The dialect the server picks from a list of dialect revisions.
+pub(super) fn select_dialect(offered: &[u8]) -> Option<Dialect> {
+    /// Dialects in order of preference.
+    const DIALECTS: [Dialect; 5] = [
+        Dialect::SMB_3_1_1,
+        Dialect::SMB_3_0_2,
+        Dialect::SMB_3_0,
+        Dialect::SMB_2_1,
+        Dialect::SMB_2_0_2,
+    ];
+
+    DIALECTS.into_iter().find(|dialect| {
+        offered
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .any(|pair| u16::from_le_bytes(*pair) == dialect.0)
+    })
 }
 
 /// The security mode the server announces.
@@ -290,20 +304,24 @@ pub(super) const fn capabilities(negotiated: &Negotiated) -> GlobalCapabilities 
 /// 2.2.3.1).
 fn parse_contexts(mut contexts: &[u8], count: usize) -> Result<Contexts, Failure> {
     let mut found = Contexts::default();
+
     for index in 0..count {
         if contexts.len() < 8 {
             return Err(Failure::Error(RequestError::InvalidRequest));
         }
+
         let kind = ContextType(wire::u16_at(contexts, 0));
         let length = usize::from(wire::u16_at(contexts, 2));
         let data = contexts
             .get(8..8 + length)
             .ok_or(RequestError::InvalidRequest)?;
+
         match kind {
             ContextType::PREAUTH_INTEGRITY_CAPABILITIES => {
                 if found.preauth || data.len() < 4 {
                     return Err(Failure::Error(RequestError::InvalidRequest));
                 }
+
                 let algorithms = usize::from(wire::u16_at(data, 0));
                 let list = data
                     .get(4..4 + algorithms * 2)
@@ -323,6 +341,7 @@ fn parse_contexts(mut contexts: &[u8], count: usize) -> Result<Contexts, Failure
                 if found.encryption.is_some() || data.len() < 2 {
                     return Err(Failure::Error(RequestError::InvalidRequest));
                 }
+
                 let ciphers = usize::from(wire::u16_at(data, 0));
                 let list = data
                     .get(2..2 + ciphers * 2)
@@ -344,6 +363,7 @@ fn parse_contexts(mut contexts: &[u8], count: usize) -> Result<Contexts, Failure
                 if found.signing.is_some() || data.len() < 2 {
                     return Err(Failure::Error(RequestError::InvalidRequest));
                 }
+
                 let algorithms = usize::from(wire::u16_at(data, 0));
                 let list = data
                     .get(2..2 + algorithms * 2)
@@ -372,11 +392,13 @@ fn parse_contexts(mut contexts: &[u8], count: usize) -> Result<Contexts, Failure
             // ask for nothing the server offers; the reply omits them.
             _ => {}
         }
+
         if index + 1 < count {
             let next = wire::align8(8 + length);
             contexts = contexts.get(next..).ok_or(RequestError::InvalidRequest)?;
         }
     }
+
     Ok(found)
 }
 
@@ -388,10 +410,16 @@ fn negotiate_reply(
     contexts: Option<&Contexts>,
     output: &mut [u8],
 ) -> Option<usize> {
+    // Fixed part of the reply body.
+    const REPLY_FIXED: usize = 64;
+    // Salt bytes of the preauthentication integrity context.
+    const SALT: usize = 32;
+
     if output.len() < REPLY_FIXED {
         return None;
     }
-    let token = crate::auth::negotiate_token(&mut output[REPLY_FIXED..])?;
+
+    let token = negotiate_token(&mut output[REPLY_FIXED..])?;
     let max_io = config.max_io() as u32;
     output[..REPLY_FIXED].fill(0);
     wire::put_u16(output, 0, 65);
@@ -406,13 +434,16 @@ fn negotiate_reply(
     wire::put_u64(output, 48, config.start_time.0);
     wire::put_u16(output, 56, (HEADER_SIZE + REPLY_FIXED) as u16);
     wire::put_u16(output, 58, token as u16);
+
     let mut length = REPLY_FIXED + token;
     let Some(contexts) = contexts.filter(|_| negotiated.dialect == Dialect::SMB_3_1_1) else {
         return Some(length);
     };
+
     // Contexts start 8-byte aligned from the SMB 2 header.
     let first = wire::align8(HEADER_SIZE + length) - HEADER_SIZE;
     let mut count = 0u16;
+
     let mut salt = [0; SALT];
     backend.random_bytes(&mut salt);
     let mut preauth = [0u8; 6 + SALT];
@@ -427,6 +458,8 @@ fn negotiate_reply(
         &preauth,
     )?;
     count += 1;
+
+    // Cipher 0 tells the client no cipher is common (MS-SMB2 2.2.4.1.2).
     if let Some(cipher) = contexts.encryption {
         let mut data = [0u8; 4];
         wire::put_u16(&mut data, 0, 1);
@@ -439,6 +472,7 @@ fn negotiate_reply(
         )?;
         count += 1;
     }
+
     if contexts.signing.is_some() {
         let mut data = [0u8; 4];
         wire::put_u16(&mut data, 0, 1);
@@ -451,9 +485,11 @@ fn negotiate_reply(
         )?;
         count += 1;
     }
+
     output[REPLY_FIXED + token..first].fill(0);
     wire::put_u16(output, 6, count);
     wire::put_u32(output, 60, (HEADER_SIZE + first) as u32);
+
     Some(length)
 }
 
@@ -466,9 +502,11 @@ fn append_context(
 ) -> Option<usize> {
     let end = start + 8 + data.len();
     let context = output.get_mut(start..end)?;
+
     context.fill(0);
     wire::put_u16(context, 0, kind.0);
     wire::put_u16(context, 2, data.len() as u16);
     context[8..].copy_from_slice(data);
+
     Some(end)
 }

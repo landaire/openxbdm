@@ -11,18 +11,23 @@ mod spnego;
 #[cfg(test)]
 mod tests;
 
+use crate::backend::Backend;
+use crate::backend::COMPUTER_NAME_CAPACITY;
+use crate::backend::UserKind;
+use crate::crypto::constant_time_eq;
 use ntlm::Flags;
 use spnego::NegState;
 use spnego::NtlmPosition;
 use spnego::Reply;
 
-use crate::backend::Backend;
-use crate::backend::COMPUTER_NAME_CAPACITY;
-use crate::backend::UserKind;
-use crate::crypto::constant_time_eq;
-
 pub use error::AuthError;
 pub use error::NtlmMessage;
+
+/// Longest NEGOTIATE kept for the MIC. Clients send 40 bytes or a few
+/// more with domain and workstation names.
+const NEGOTIATE_CAPACITY: usize = 256;
+/// Longest MechTypeList kept for mechListMIC; room for about ten OIDs.
+const MECH_TYPES_CAPACITY: usize = 128;
 
 /// Session key from NTLM: the ExportedSessionKey of MS-NLMP.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -54,21 +59,6 @@ pub enum AuthStep {
     },
 }
 
-/// SPNEGO NegTokenInit offering only NTLMSSP, for the security buffer of
-/// the SMB 2 NEGOTIATE response. Returns its length, or `None` when
-/// `output` is too small.
-pub fn negotiate_token(output: &mut [u8]) -> Option<usize> {
-    let token = &spnego::NEGOTIATE_TOKEN;
-    output.get_mut(..token.len())?.copy_from_slice(token);
-    Some(token.len())
-}
-
-/// Longest NEGOTIATE kept for the MIC. Clients send 40 bytes or a few
-/// more with domain and workstation names.
-const NEGOTIATE_CAPACITY: usize = 256;
-/// Longest MechTypeList kept for mechListMIC; room for about ten OIDs.
-const MECH_TYPES_CAPACITY: usize = 128;
-
 /// A bounded copy of a message.
 struct Record<const N: usize> {
     bytes: [u8; N],
@@ -88,15 +78,17 @@ impl<const N: usize> Record<N> {
             length: data.len(),
             capacity: N,
         };
+
         self.bytes
             .get_mut(..data.len())
             .ok_or(too_large)?
             .copy_from_slice(data);
         self.length = data.len();
+
         Ok(())
     }
 
-    fn get(&self) -> &[u8] {
+    fn as_bytes(&self) -> &[u8] {
         &self.bytes[..self.length]
     }
 }
@@ -143,20 +135,6 @@ pub struct Authenticator {
     mech_types: Record<MECH_TYPES_CAPACITY>,
 }
 
-fn write_reply(reply: &Reply<'_>, output: &mut [u8]) -> Result<usize, AuthError> {
-    spnego::write_resp(reply, output).ok_or(AuthError::OutputTooSmall)
-}
-
-/// Parse a NegTokenResp from the client; a client that rejects the
-/// negotiation ends it.
-fn client_resp(input: &[u8]) -> Result<spnego::NegTokenResp<'_>, AuthError> {
-    let response = spnego::parse_resp(input).ok_or(AuthError::MalformedToken)?;
-    if response.state == Some(NegState::Reject) {
-        return Err(AuthError::ClientRejected);
-    }
-    Ok(response)
-}
-
 impl Authenticator {
     pub const fn new() -> Self {
         Self {
@@ -185,9 +163,11 @@ impl Authenticator {
                 self.finish(input, output, backend, framing, challenge)
             }
         };
+
         if !matches!(result, Ok(AuthStep::Continue { .. })) {
             self.reset();
         }
+
         result
     }
 
@@ -212,7 +192,7 @@ impl Authenticator {
     ) -> Result<AuthStep, AuthError> {
         if input.starts_with(&ntlm::SIGNATURE) {
             let challenge = self.challenge(input, backend)?;
-            let token = self.challenge.get();
+            let token = self.challenge.as_bytes();
             output
                 .get_mut(..token.len())
                 .ok_or(AuthError::OutputTooSmall)?
@@ -225,13 +205,16 @@ impl Authenticator {
                 length: token.len(),
             });
         }
+
         let init = spnego::parse_init(input).ok_or(AuthError::MalformedToken)?;
         let mic_required = match init.ntlm {
             NtlmPosition::Absent => return Err(AuthError::MechanismNotOffered),
             NtlmPosition::First => false,
             NtlmPosition::Later => true,
         };
+
         self.mech_types.set(init.mech_types)?;
+
         // An optimistic token for another mechanism is ignored. When NTLMSSP
         // is not the preferred mechanism, the first reply demands a
         // mechListMIC (RFC 4178 section 3.2).
@@ -250,23 +233,27 @@ impl Authenticator {
                 },
                 output,
             )?;
+
             self.stage = Stage::SpnegoNegotiate { mic_required };
             return Ok(AuthStep::Continue { length });
         };
+
         let challenge = self.challenge(token, backend)?;
         let length = write_reply(
             &Reply {
                 state: NegState::AcceptIncomplete,
                 supported_mech: true,
-                response_token: Some(self.challenge.get()),
+                response_token: Some(self.challenge.as_bytes()),
                 mech_list_mic: None,
             },
             output,
         )?;
+
         self.stage = Stage::Authenticate {
             framing: Framing::Spnego { mic_required },
             challenge,
         };
+
         Ok(AuthStep::Continue { length })
     }
 
@@ -280,20 +267,24 @@ impl Authenticator {
         let token = client_resp(input)?
             .response_token
             .ok_or(AuthError::MalformedToken)?;
+
         let challenge = self.challenge(token, backend)?;
+
         let length = write_reply(
             &Reply {
                 state: NegState::AcceptIncomplete,
                 supported_mech: false,
-                response_token: Some(self.challenge.get()),
+                response_token: Some(self.challenge.as_bytes()),
                 mech_list_mic: None,
             },
             output,
         )?;
+
         self.stage = Stage::Authenticate {
             framing: Framing::Spnego { mic_required },
             challenge,
         };
+
         Ok(AuthStep::Continue { length })
     }
 
@@ -305,8 +296,10 @@ impl Authenticator {
     ) -> Result<Challenge, AuthError> {
         let flags = ntlm::challenge_flags(negotiate)?;
         self.negotiate.set(negotiate)?;
+
         let mut server_challenge = [0u8; 8];
         backend.random_bytes(&mut server_challenge);
+
         let mut name = [0u8; COMPUTER_NAME_CAPACITY];
         let name_length = backend.computer_name(&mut name);
         let name = name
@@ -314,7 +307,9 @@ impl Authenticator {
             .ok_or(AuthError::InvalidComputerName {
                 length: name_length,
             })?;
+
         let time = backend.system_time();
+
         // Cannot fail: the buffer holds a CHALLENGE for the longest name.
         self.challenge.length = ntlm::write_challenge(
             flags,
@@ -326,6 +321,7 @@ impl Authenticator {
         .ok_or(AuthError::InvalidComputerName {
             length: name_length,
         })?;
+
         Ok(Challenge {
             flags,
             server_challenge,
@@ -348,13 +344,16 @@ impl Authenticator {
                 (token, response.mech_list_mic)
             }
         };
+
         let exchange = ntlm::Exchange {
-            negotiate: self.negotiate.get(),
-            challenge: self.challenge.get(),
+            negotiate: self.negotiate.as_bytes(),
+            challenge: self.challenge.as_bytes(),
             flags: challenge.flags,
             server_challenge: challenge.server_challenge,
         };
+
         let outcome = ntlm::authenticate(token, &exchange, backend)?;
+
         let length = match framing {
             Framing::Raw => 0,
             Framing::Spnego { mic_required } => {
@@ -366,6 +365,7 @@ impl Authenticator {
                     }
                     None => None,
                 };
+
                 write_reply(
                     &Reply {
                         state: NegState::AcceptCompleted,
@@ -377,6 +377,7 @@ impl Authenticator {
                 )?
             }
         };
+
         Ok(AuthStep::Complete {
             length,
             session: AuthenticatedSession {
@@ -402,7 +403,8 @@ impl Authenticator {
                 Ok(None)
             };
         };
-        let mech_types = self.mech_types.get();
+
+        let mech_types = self.mech_types.as_bytes();
         let expected = ntlm::first_message_signature(
             session_key,
             flags,
@@ -410,9 +412,11 @@ impl Authenticator {
             mech_types,
         )
         .ok_or(AuthError::MechListMicUnsupported)?;
+
         if !constant_time_eq(&expected, client_mic) {
             return Err(AuthError::MechListMicMismatch);
         }
+
         ntlm::first_message_signature(
             session_key,
             flags,
@@ -422,4 +426,30 @@ impl Authenticator {
         .map(Some)
         .ok_or(AuthError::MechListMicUnsupported)
     }
+}
+
+/// SPNEGO NegTokenInit offering only NTLMSSP, for the security buffer of
+/// the SMB 2 NEGOTIATE response. Returns its length, or `None` when
+/// `output` is too small.
+pub fn negotiate_token(output: &mut [u8]) -> Option<usize> {
+    let token = &spnego::NEGOTIATE_TOKEN;
+    output.get_mut(..token.len())?.copy_from_slice(token);
+
+    Some(token.len())
+}
+
+fn write_reply(reply: &Reply<'_>, output: &mut [u8]) -> Result<usize, AuthError> {
+    spnego::write_resp(reply, output).ok_or(AuthError::OutputTooSmall)
+}
+
+/// Parse a NegTokenResp from the client; a client that rejects the
+/// negotiation ends it.
+fn client_resp(input: &[u8]) -> Result<spnego::NegTokenResp<'_>, AuthError> {
+    let response = spnego::parse_resp(input).ok_or(AuthError::MalformedToken)?;
+
+    if response.state == Some(NegState::Reject) {
+        return Err(AuthError::ClientRejected);
+    }
+
+    Ok(response)
 }

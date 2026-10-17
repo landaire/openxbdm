@@ -9,10 +9,13 @@ use crate::backend::PASSWORD;
 use crate::backend::PUBLIC;
 use crate::backend::USER;
 use crate::client::Client;
+use crate::client::PIPE_ACCESS;
+use crate::client::SIGNING_ENABLED;
 use crate::client::command;
 use crate::client::config;
 use crate::client::disposition;
 use crate::client::negotiate_body;
+use crate::ntlm::negotiate_message;
 
 #[test]
 fn logoff_closes_session_opens() {
@@ -20,9 +23,11 @@ fn logoff_closes_session_opens() {
     client.open("a.txt", disposition::CREATE);
     client.open("b.txt", disposition::CREATE);
     assert_eq!(client.backend.open_handles(), 2);
+
     client.logoff().expect(NtStatus::Success);
     assert_eq!(client.backend.open_handles(), 0);
     assert_eq!(client.backend.closed.len(), 2);
+
     client
         .tree_connect("Data")
         .expect(NtStatus::UserSessionDeleted);
@@ -34,13 +39,16 @@ fn logoff_leaves_other_sessions_open() {
     let first_session = client.session_id;
     let first_tree = client.tree_id;
     let kept = client.open("kept.txt", disposition::CREATE);
+
     client
         .logon(USER, PASSWORD, false)
         .expect(NtStatus::Success);
     client.tree_connect("Data").expect(NtStatus::Success);
     client.open("dropped.txt", disposition::CREATE);
+
     client.logoff().expect(NtStatus::Success);
     assert_eq!(client.backend.open_handles(), 1);
+
     client.session_id = first_session;
     client.tree_id = first_tree;
     client
@@ -53,6 +61,7 @@ fn tree_disconnect_closes_tree_opens() {
     let mut client = Client::connected("Data");
     let first_tree = client.tree_id;
     let first = client.open("first.txt", disposition::CREATE);
+
     client.tree_connect("Data").expect(NtStatus::Success);
     let second_tree = client.tree_id;
     let second = client.open("second.txt", disposition::CREATE);
@@ -78,8 +87,9 @@ fn connection_close_releases_everything_and_resets() {
     client.open("a.txt", disposition::OPEN);
     client.tree_connect("IPC$").expect(NtStatus::Success);
     client
-        .create("srvsvc", 0x0012_019f, disposition::OPEN, 0)
+        .create("srvsvc", PIPE_ACCESS, disposition::OPEN, 0)
         .expect(NtStatus::Success);
+
     client
         .connection
         .close(&mut client.server, &mut client.backend);
@@ -96,12 +106,14 @@ fn connection_close_releases_everything_and_resets() {
     client.session_id = 0;
     client.tree_id = 0;
     client.key = None;
+
     let reply = client.call(command::NEGOTIATE, &negotiate_body(&[0x0210]));
     reply.expect(NtStatus::Success);
     client
         .logon(USER, PASSWORD, false)
         .expect(NtStatus::Success);
     client.tree_connect("Data").expect(NtStatus::Success);
+
     let file = client.open("a.txt", disposition::OPEN);
     assert_eq!(client.read(file, 0, 1).data(), b"a");
 }
@@ -110,37 +122,43 @@ fn connection_close_releases_everything_and_resets() {
 fn connection_reports_sessions_opens_and_shares() {
     let mut client = Client::negotiated(MemoryBackend::new(), config(false));
     assert!(!client.connection.has_sessions());
-    let negotiate = crate::ntlm::negotiate_message();
-    let reply = client.session_setup(&negotiate, crate::client::SIGNING_ENABLED);
+
+    let negotiate = negotiate_message();
+    let reply = client.session_setup(&negotiate, SIGNING_ENABLED);
     reply.expect(NtStatus::MoreProcessingRequired);
     // A session in authentication does not count.
     assert!(!client.connection.has_sessions());
+
     client
         .logon(USER, PASSWORD, false)
         .expect(NtStatus::Success);
     assert!(client.connection.has_sessions());
 
     client.tree_connect("IPC$").expect(NtStatus::Success);
-    let ipc = client.tree_id;
+    let ipc_tree = client.tree_id;
     client
-        .create("srvsvc", 0x0012_019f, disposition::OPEN, 0)
+        .create("srvsvc", PIPE_ACCESS, disposition::OPEN, 0)
         .expect(NtStatus::Success);
     client.tree_connect("Public").expect(NtStatus::Success);
     client.tree_connect("Data").expect(NtStatus::Success);
-    let data = client.tree_id;
+    let data_tree = client.tree_id;
+
     let mut shares: Vec<ShareId> = client.connection.shares().collect();
     shares.sort_by_key(|share| share.0);
     assert_eq!(shares, [DATA, PUBLIC]);
     assert!(client.connection.has_opens());
 
-    client.tree_id = ipc;
+    client.tree_id = ipc_tree;
     client.tree_disconnect().expect(NtStatus::Success);
     assert!(!client.connection.has_opens());
-    client.tree_id = data;
+
+    client.tree_id = data_tree;
     let file = client.open("a.txt", disposition::CREATE);
     assert!(client.connection.has_opens());
+
     client.close(file, 0).expect(NtStatus::Success);
     assert!(!client.connection.has_opens());
+
     client.logoff().expect(NtStatus::Success);
     assert!(!client.connection.has_sessions());
     assert_eq!(client.connection.shares().count(), 0);

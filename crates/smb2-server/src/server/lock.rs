@@ -2,16 +2,16 @@
 //! table.
 
 use crate::fs::AccessMask;
-use crate::server::Body;
 use crate::server::Connection;
-use crate::server::Exchange;
-use crate::server::Failure;
-use crate::server::Handled;
-use crate::server::RequestError;
 use crate::server::Server;
-use crate::server::empty_body;
+use crate::server::error::LockRefusal;
+use crate::server::error::RequestError;
+use crate::server::request::Body;
+use crate::server::request::Exchange;
+use crate::server::request::Failure;
+use crate::server::request::Handled;
+use crate::server::request::empty_body;
 use crate::server::shared::ByteRange;
-use crate::server::shared::LockRefusal;
 use crate::server::shared::MAX_LOCKS;
 use crate::server::tables::OpenKind;
 use crate::server::tables::PendingKind;
@@ -50,6 +50,7 @@ struct Element {
 impl Element {
     fn read(body: &[u8], index: usize) -> Self {
         let at = REQUEST_FIXED + index * ELEMENT;
+
         Self {
             range: ByteRange {
                 offset: wire::u64_at(body, at),
@@ -72,6 +73,7 @@ impl Connection {
         if count == 0 || body.len() < REQUEST_FIXED + count * ELEMENT {
             return Err(Failure::Error(RequestError::InvalidRequest));
         }
+
         let slot = self.find_open(exchange, FileId::read(body, 8))?;
         let open = *self.open(slot);
         let OpenKind::File(file) = open.kind else {
@@ -80,6 +82,7 @@ impl Connection {
         if file.directory {
             return Err(Failure::Error(RequestError::InvalidRequest));
         }
+
         let owner = self.lock_owner(open.id);
         let first = Element::read(body, 0);
         if first.flags.contains(LockFlags::UNLOCK) {
@@ -92,14 +95,17 @@ impl Connection {
                     return Err(Failure::Error(RequestError::RangeNotLocked));
                 }
             }
+
             return Ok(Body::success(empty_body(output)));
         }
+
         if !open
             .access
             .intersects(AccessMask::READ_DATA.union(AccessMask::WRITE_DATA))
         {
             return Err(Failure::Error(RequestError::AccessDenied));
         }
+
         for index in 0..count {
             let element = Element::read(body, index);
             let mode = element.flags.without(LockFlags::FAIL_IMMEDIATELY);
@@ -118,6 +124,7 @@ impl Connection {
                 return Err(Failure::Error(RequestError::InvalidLockRange));
             }
         }
+
         // Each granted element holds a lock table entry, so a request takes
         // at most MAX_LOCKS of them.
         let mut taken = [None; MAX_LOCKS];
@@ -136,10 +143,12 @@ impl Connection {
                 }
                 Err(refusal) => refusal,
             };
+
             // The locks this request took are released before it fails.
             for lock in taken.into_iter().flatten() {
                 server.locks.release(lock);
             }
+
             return match refusal {
                 LockRefusal::Exhausted => Err(Failure::Error(RequestError::TableFull)),
                 LockRefusal::Conflict
@@ -160,10 +169,12 @@ impl Connection {
                             epoch: server.locks.epoch(),
                         },
                     )?;
+
                     Err(Failure::Pending { async_id })
                 }
             };
         }
+
         Ok(Body::success(empty_body(output)))
     }
 }

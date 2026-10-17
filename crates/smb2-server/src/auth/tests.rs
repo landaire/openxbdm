@@ -43,13 +43,51 @@ use crate::fs::VolumeInformation;
 use crate::path::SharePath;
 use crate::utf16::Utf16Le;
 
-pub(super) fn utf16(text: &str) -> Vec<u8> {
-    text.encode_utf16().flat_map(u16::to_le_bytes).collect()
-}
+const NTLMSSP_OID: &[u8] = &[0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a];
+const KERBEROS_OID: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02];
+const SPNEGO_OID: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x02];
 
-pub(super) fn nt_owf(password: &str) -> NtOwf {
-    NtOwf(md4(&utf16(password)))
-}
+/// What a Windows client requests, plus OEM and LM_KEY, which the server
+/// must not grant.
+const CLIENT_FLAGS: u32 = Flags::UNICODE.0
+    | 0x2
+    | Flags::REQUEST_TARGET.0
+    | Flags::SIGN.0
+    | Flags::SEAL.0
+    | 0x80
+    | Flags::NTLM.0
+    | Flags::ALWAYS_SIGN.0
+    | Flags::EXTENDED_SESSIONSECURITY.0
+    | Flags::VERSION.0
+    | Flags::NEGOTIATE_128.0
+    | Flags::KEY_EXCH.0
+    | Flags::NEGOTIATE_56.0;
+
+const RANDOM_SESSION_KEY: [u8; 16] = [0x55; 16];
+
+/// NTLMSSP_NEGOTIATE_ANONYMOUS, which the server does not interpret.
+const NEGOTIATE_ANONYMOUS: u32 = 0x800;
+
+const GOOD: Credentials = Credentials {
+    user: "user",
+    domain: "WORKGROUP",
+    key_domain: "WORKGROUP",
+    password: "Password",
+};
+
+const WRONG_PASSWORD: Credentials = Credentials {
+    user: "User",
+    domain: "WORKGROUP",
+    key_domain: "WORKGROUP",
+    password: "password",
+};
+
+const UNKNOWN_USER: Credentials = Credentials {
+    user: "nobody",
+    domain: "WORKGROUP",
+    key_domain: "WORKGROUP",
+    password: "Password",
+};
 
 /// Accounts are matched without case on the user name; the domain is
 /// ignored.
@@ -177,30 +215,44 @@ impl FileSystem for TestBackend {
     }
 }
 
-const NTLMSSP_OID: &[u8] = &[0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a];
-const KERBEROS_OID: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02];
-const SPNEGO_OID: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x02];
+#[derive(Debug, PartialEq, Eq)]
+struct ServerResp {
+    state: u8,
+    supported_mech: Option<Vec<u8>>,
+    token: Option<Vec<u8>>,
+    mic: Option<Vec<u8>>,
+}
 
-/// What a Windows client requests, plus OEM and LM_KEY, which the server
-/// must not grant.
-const CLIENT_FLAGS: u32 = Flags::UNICODE.0
-    | 0x2
-    | Flags::REQUEST_TARGET.0
-    | Flags::SIGN.0
-    | Flags::SEAL.0
-    | 0x80
-    | Flags::NTLM.0
-    | Flags::ALWAYS_SIGN.0
-    | Flags::EXTENDED_SESSIONSECURITY.0
-    | Flags::VERSION.0
-    | Flags::NEGOTIATE_128.0
-    | Flags::KEY_EXCH.0
-    | Flags::NEGOTIATE_56.0;
+struct Credentials {
+    user: &'static str,
+    /// Domain sent in the AUTHENTICATE.
+    domain: &'static str,
+    /// Domain the client puts into NTOWFv2; normally the one it sends.
+    key_domain: &'static str,
+    password: &'static str,
+}
 
-const RANDOM_SESSION_KEY: [u8; 16] = [0x55; 16];
+struct Options {
+    key_exch: bool,
+    mic: bool,
+}
 
-/// NTLMSSP_NEGOTIATE_ANONYMOUS, which the server does not interpret.
-const NEGOTIATE_ANONYMOUS: u32 = 0x800;
+/// A client AUTHENTICATE answering `challenge`, with the flags it
+/// negotiated and its ExportedSessionKey.
+#[derive(Debug)]
+struct ClientAuthenticate {
+    message: Vec<u8>,
+    flags: Flags,
+    session_key: [u8; 16],
+}
+
+pub(super) fn utf16(text: &str) -> Vec<u8> {
+    text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
+
+pub(super) fn nt_owf(password: &str) -> NtOwf {
+    NtOwf(md4(&utf16(password)))
+}
 
 fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
     let mut out = vec![tag];
@@ -243,18 +295,10 @@ fn neg_token_resp(token: Option<&[u8]>, mic: Option<&[u8]>) -> Vec<u8> {
     tlv(0xa1, &tlv(0x30, &fields))
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct ServerResp {
-    state: u8,
-    supported_mech: Option<Vec<u8>>,
-    token: Option<Vec<u8>>,
-    mic: Option<Vec<u8>>,
-}
-
 fn parse_server_resp(bytes: &[u8]) -> ServerResp {
     let outer = Reader::new(bytes).expect(Tag(0xa1)).unwrap();
     let mut fields = Reader::new(Reader::new(outer).expect(Tag(0x30)).unwrap());
-    let mut resp = ServerResp {
+    let mut parsed = ServerResp {
         state: 0xff,
         supported_mech: None,
         token: None,
@@ -264,14 +308,14 @@ fn parse_server_resp(bytes: &[u8]) -> ServerResp {
         let field = fields.read().unwrap();
         let mut inner = Reader::new(field.content);
         match field.tag.0 {
-            0xa0 => resp.state = inner.expect(Tag(0x0a)).unwrap()[0],
-            0xa1 => resp.supported_mech = Some(inner.expect(Tag(0x06)).unwrap().to_vec()),
-            0xa2 => resp.token = Some(inner.expect(Tag(0x04)).unwrap().to_vec()),
-            0xa3 => resp.mic = Some(inner.expect(Tag(0x04)).unwrap().to_vec()),
+            0xa0 => parsed.state = inner.expect(Tag(0x0a)).unwrap()[0],
+            0xa1 => parsed.supported_mech = Some(inner.expect(Tag(0x06)).unwrap().to_vec()),
+            0xa2 => parsed.token = Some(inner.expect(Tag(0x04)).unwrap().to_vec()),
+            0xa3 => parsed.mic = Some(inner.expect(Tag(0x04)).unwrap().to_vec()),
             tag => panic!("unexpected field {tag:#x}"),
         }
     }
-    resp
+    parsed
 }
 
 fn negotiate_message(flags: u32) -> Vec<u8> {
@@ -292,36 +336,6 @@ fn u16_at(data: &[u8], offset: usize) -> usize {
     usize::from(u16::from_le_bytes(
         data[offset..offset + 2].try_into().unwrap(),
     ))
-}
-
-struct Credentials {
-    user: &'static str,
-    /// Domain sent in the AUTHENTICATE.
-    domain: &'static str,
-    /// Domain the client puts into NTOWFv2; normally the one it sends.
-    key_domain: &'static str,
-    password: &'static str,
-}
-
-const GOOD: Credentials = Credentials {
-    user: "user",
-    domain: "WORKGROUP",
-    key_domain: "WORKGROUP",
-    password: "Password",
-};
-
-struct Options {
-    key_exch: bool,
-    mic: bool,
-}
-
-/// A client AUTHENTICATE answering `challenge`, with the flags it
-/// negotiated and its ExportedSessionKey.
-#[derive(Debug)]
-struct ClientAuthenticate {
-    message: Vec<u8>,
-    flags: Flags,
-    session_key: [u8; 16],
 }
 
 fn authenticate_message(
@@ -459,6 +473,21 @@ fn expect_complete(
     }
 }
 
+#[derive(Debug)]
+struct SpnegoExchange {
+    session: AuthenticatedSession,
+    output: Vec<u8>,
+    client: ClientAuthenticate,
+    mech_types: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct RawExchange {
+    session: AuthenticatedSession,
+    output: Vec<u8>,
+    client: ClientAuthenticate,
+}
+
 /// SPNEGO exchange with NTLMSSP as the only mechanism and the NEGOTIATE
 /// sent optimistically, as Windows does.
 fn spnego_exchange(
@@ -466,7 +495,7 @@ fn spnego_exchange(
     options: &Options,
     send_mic: bool,
     backend: &mut TestBackend,
-) -> Result<(AuthenticatedSession, Vec<u8>, ClientAuthenticate, Vec<u8>), AuthError> {
+) -> Result<SpnegoExchange, AuthError> {
     let mut authenticator = Authenticator::new();
     let negotiate = negotiate_message(CLIENT_FLAGS);
     let (init, mech_types) = neg_token_init(&[NTLMSSP_OID], Some(&negotiate));
@@ -483,14 +512,52 @@ fn spnego_exchange(
         &mech_types,
     )
     .unwrap();
-    let resp = neg_token_resp(Some(&client.message), send_mic.then_some(&client_mic[..]));
-    let result = step(&mut authenticator, backend, &resp);
+    let response = neg_token_resp(Some(&client.message), send_mic.then_some(&client_mic[..]));
+    let result = step(&mut authenticator, backend, &response);
     let (session, output) = match result {
         Ok((AuthStep::Complete { session, .. }, output)) => (session, output),
         Ok(other) => panic!("expected Complete, got {other:?}"),
         Err(status) => return Err(status),
     };
-    Ok((session, output, client, mech_types))
+    Ok(SpnegoExchange {
+        session,
+        output,
+        client,
+        mech_types,
+    })
+}
+
+fn raw_exchange(
+    credentials: &Credentials,
+    options: &Options,
+    backend: &mut TestBackend,
+    authenticator: &mut Authenticator,
+) -> Result<RawExchange, AuthError> {
+    let negotiate = negotiate_message(CLIENT_FLAGS);
+    let challenge = expect_continue(step(authenticator, backend, &negotiate));
+    let client = authenticate_message(credentials, options, &negotiate, &challenge);
+    let (step, output) = step(authenticator, backend, &client.message)?;
+    match step {
+        AuthStep::Complete { session, .. } => Ok(RawExchange {
+            session,
+            output,
+            client,
+        }),
+        other => panic!("expected Complete, got {other:?}"),
+    }
+}
+
+fn anonymous_message(lm: &[u8]) -> Vec<u8> {
+    authenticate_fields(CLIENT_FLAGS | NEGOTIATE_ANONYMOUS, lm, &[], &[], &[], &[])
+}
+
+fn hex_dump(bytes: &[u8]) -> String {
+    let mut text = String::new();
+    for (index, line) in bytes.chunks(16).enumerate() {
+        let hex: Vec<String> = line.iter().map(|byte| format!("{byte:02x}")).collect();
+        text.push_str(&format!("{:04x}: {}\n", index * 16, hex.join(" ")));
+    }
+    text
 }
 
 #[test]
@@ -514,8 +581,12 @@ fn spnego_key_exchange_with_mic_and_mech_list_mic() {
         key_exch: true,
         mic: true,
     };
-    let (session, output, client, mech_types) =
-        spnego_exchange(&GOOD, &options, true, &mut backend).unwrap();
+    let SpnegoExchange {
+        session,
+        output,
+        client,
+        mech_types,
+    } = spnego_exchange(&GOOD, &options, true, &mut backend).unwrap();
     assert_eq!(session.kind, UserKind::Authenticated);
     assert_eq!(session.session_key.unwrap().0, RANDOM_SESSION_KEY);
     let reply = parse_server_resp(&output);
@@ -544,8 +615,12 @@ fn spnego_without_key_exchange_exports_session_base_key() {
         key_exch: false,
         mic: true,
     };
-    let (session, output, client, _) =
-        spnego_exchange(&GOOD, &options, true, &mut backend).unwrap();
+    let SpnegoExchange {
+        session,
+        output,
+        client,
+        ..
+    } = spnego_exchange(&GOOD, &options, true, &mut backend).unwrap();
     assert_eq!(session.kind, UserKind::Authenticated);
     assert_ne!(client.session_key, RANDOM_SESSION_KEY);
     assert_eq!(session.session_key.unwrap().0, client.session_key);
@@ -559,7 +634,9 @@ fn spnego_without_mech_list_mic_when_ntlm_is_first() {
         key_exch: true,
         mic: false,
     };
-    let (session, output, _, _) = spnego_exchange(&GOOD, &options, false, &mut backend).unwrap();
+    let SpnegoExchange {
+        session, output, ..
+    } = spnego_exchange(&GOOD, &options, false, &mut backend).unwrap();
     assert_eq!(session.kind, UserKind::Authenticated);
     assert_eq!(
         parse_server_resp(&output),
@@ -588,12 +665,12 @@ fn wrong_mech_list_mic_fails() {
         mic: true,
     };
     let client = authenticate_message(&GOOD, &options, &negotiate, &reply.token.unwrap());
-    let resp = neg_token_resp(
+    let response = neg_token_resp(
         Some(&client.message),
         Some(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
     );
     assert_eq!(
-        step(&mut authenticator, &mut backend, &resp).unwrap_err(),
+        step(&mut authenticator, &mut backend, &response).unwrap_err(),
         AuthError::MechListMicMismatch
     );
 }
@@ -641,8 +718,8 @@ fn kerberos_first_requires_mech_list_mic() {
             &mech_types,
         )
         .unwrap();
-        let resp = neg_token_resp(Some(&client.message), send_mic.then_some(&client_mic[..]));
-        let result = step(&mut authenticator, &mut backend, &resp);
+        let response = neg_token_resp(Some(&client.message), send_mic.then_some(&client_mic[..]));
+        let result = step(&mut authenticator, &mut backend, &response);
         if send_mic {
             let (session, output) = expect_complete(result);
             assert_eq!(session.kind, UserKind::Authenticated);
@@ -663,22 +740,6 @@ fn mech_list_without_ntlm_is_refused() {
     );
 }
 
-fn raw_exchange(
-    credentials: &Credentials,
-    options: &Options,
-    backend: &mut TestBackend,
-    authenticator: &mut Authenticator,
-) -> Result<(AuthenticatedSession, Vec<u8>, ClientAuthenticate), AuthError> {
-    let negotiate = negotiate_message(CLIENT_FLAGS);
-    let challenge = expect_continue(step(authenticator, backend, &negotiate));
-    let client = authenticate_message(credentials, options, &negotiate, &challenge);
-    let (step, output) = step(authenticator, backend, &client.message)?;
-    match step {
-        AuthStep::Complete { session, .. } => Ok((session, output, client)),
-        other => panic!("expected Complete, got {other:?}"),
-    }
-}
-
 #[test]
 fn raw_ntlmssp_exchange() {
     for key_exch in [false, true] {
@@ -687,8 +748,11 @@ fn raw_ntlmssp_exchange() {
             key_exch,
             mic: true,
         };
-        let (session, output, client) =
-            raw_exchange(&GOOD, &options, &mut backend, &mut Authenticator::new()).unwrap();
+        let RawExchange {
+            session,
+            output,
+            client,
+        } = raw_exchange(&GOOD, &options, &mut backend, &mut Authenticator::new()).unwrap();
         assert_eq!(session.kind, UserKind::Authenticated);
         assert_eq!(session.session_key.unwrap().0, client.session_key);
         assert!(output.is_empty());
@@ -708,7 +772,7 @@ fn empty_domain_is_accepted() {
         key_exch: true,
         mic: true,
     };
-    let (session, _, _) = raw_exchange(
+    let RawExchange { session, .. } = raw_exchange(
         &credentials,
         &options,
         &mut backend,
@@ -744,7 +808,7 @@ fn empty_domain_retry_verifies_existing_account() {
             &mut backend,
             &mut Authenticator::new(),
         );
-        assert_eq!(result.map(|(session, _, _)| session.kind), expected);
+        assert_eq!(result.map(|exchange| exchange.session.kind), expected);
     }
 }
 
@@ -766,20 +830,6 @@ fn tampered_mic_fails() {
     );
 }
 
-const WRONG_PASSWORD: Credentials = Credentials {
-    user: "User",
-    domain: "WORKGROUP",
-    key_domain: "WORKGROUP",
-    password: "password",
-};
-
-const UNKNOWN_USER: Credentials = Credentials {
-    user: "nobody",
-    domain: "WORKGROUP",
-    key_domain: "WORKGROUP",
-    password: "Password",
-};
-
 #[test]
 fn failed_logons_without_guest() {
     let options = Options {
@@ -796,7 +846,7 @@ fn failed_logons_without_guest() {
             raw_exchange(credentials, &options, &mut backend, &mut authenticator).unwrap_err(),
             error
         );
-        let (session, _, _) =
+        let RawExchange { session, .. } =
             raw_exchange(&GOOD, &options, &mut backend, &mut authenticator).unwrap();
         assert_eq!(session.kind, UserKind::Authenticated);
         assert_eq!(
@@ -831,7 +881,7 @@ fn failed_logons_with_guest() {
         AuthError::WrongPassword
     );
 
-    let (session, _, _) = raw_exchange(
+    let RawExchange { session, .. } = raw_exchange(
         &UNKNOWN_USER,
         &options,
         &mut backend,
@@ -840,8 +890,9 @@ fn failed_logons_with_guest() {
     .unwrap();
     assert_eq!(session.kind, UserKind::Guest);
     assert!(session.session_key.is_none());
-    let (session, output, _, _) =
-        spnego_exchange(&UNKNOWN_USER, &options, true, &mut backend).unwrap();
+    let SpnegoExchange {
+        session, output, ..
+    } = spnego_exchange(&UNKNOWN_USER, &options, true, &mut backend).unwrap();
     assert_eq!(session.kind, UserKind::Guest);
     assert!(session.session_key.is_none());
     assert_eq!(
@@ -879,10 +930,6 @@ fn client_reject_fails_and_resets() {
     }
 }
 
-fn anonymous_message(lm: &[u8]) -> Vec<u8> {
-    authenticate_fields(CLIENT_FLAGS | NEGOTIATE_ANONYMOUS, lm, &[], &[], &[], &[])
-}
-
 #[test]
 fn anonymous_logon() {
     for allowed in [false, true] {
@@ -893,8 +940,8 @@ fn anonymous_logon() {
             let negotiate = negotiate_message(CLIENT_FLAGS);
             let (init, _) = neg_token_init(&[NTLMSSP_OID], Some(&negotiate));
             expect_continue(step(&mut authenticator, &mut backend, &init));
-            let resp = neg_token_resp(Some(&anonymous_message(lm)), None);
-            let result = step(&mut authenticator, &mut backend, &resp);
+            let response = neg_token_resp(Some(&anonymous_message(lm)), None);
+            let result = step(&mut authenticator, &mut backend, &response);
             if allowed {
                 let (session, output) = expect_complete(result);
                 assert_eq!(session.kind, UserKind::Anonymous);
@@ -1002,15 +1049,6 @@ fn oem_only_client_is_refused() {
         step(&mut Authenticator::new(), &mut backend, &negotiate).unwrap_err(),
         AuthError::NotUnicode
     );
-}
-
-fn hex_dump(bytes: &[u8]) -> String {
-    let mut text = String::new();
-    for (index, line) in bytes.chunks(16).enumerate() {
-        let hex: Vec<String> = line.iter().map(|byte| format!("{byte:02x}")).collect();
-        text.push_str(&format!("{:04x}: {}\n", index * 16, hex.join(" ")));
-    }
-    text
 }
 
 #[test]

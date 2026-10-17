@@ -41,6 +41,23 @@ pub const HEADER: usize = 64;
 /// ClientGuid of every NEGOTIATE the tests send.
 pub const CLIENT_GUID: [u8; 16] = *b"client-guid-0001";
 
+/// FILE_GENERIC_READ | FILE_GENERIC_WRITE.
+pub const PIPE_ACCESS: u32 = 0x0012_019f;
+
+/// SecurityMode of NEGOTIATE and SESSION_SETUP requests.
+pub const SIGNING_ENABLED: u8 = 0x1;
+pub const SIGNING_REQUIRED: u8 = 0x2;
+/// SMB2_GLOBAL_CAP_ENCRYPTION.
+pub const CAP_ENCRYPTION: u32 = 0x40;
+
+pub const SESSION_FLAG_IS_GUEST: u16 = 0x1;
+pub const SESSION_FLAG_IS_NULL: u16 = 0x2;
+pub const SESSION_FLAG_ENCRYPT_DATA: u16 = 0x4;
+
+/// Bytes of an SMB2 TRANSFORM_HEADER (MS-SMB2 2.2.41).
+pub const TRANSFORM_HEADER: usize = 52;
+const TRANSFORM_PROTOCOL_ID: &[u8; 4] = b"\xfdSMB";
+
 pub mod command {
     pub const NEGOTIATE: u16 = 0x00;
     pub const SESSION_SETUP: u16 = 0x01;
@@ -124,68 +141,6 @@ pub mod lock {
     pub const FAIL_IMMEDIATELY: u32 = 0x10;
 }
 
-/// SecurityMode of NEGOTIATE and SESSION_SETUP requests.
-pub const SIGNING_ENABLED: u8 = 0x1;
-pub const SIGNING_REQUIRED: u8 = 0x2;
-/// SMB2_GLOBAL_CAP_ENCRYPTION.
-pub const CAP_ENCRYPTION: u32 = 0x40;
-
-pub const SESSION_FLAG_IS_GUEST: u16 = 0x1;
-pub const SESSION_FLAG_IS_NULL: u16 = 0x2;
-pub const SESSION_FLAG_ENCRYPT_DATA: u16 = 0x4;
-
-/// Bytes of an SMB2 TRANSFORM_HEADER (MS-SMB2 2.2.41).
-pub const TRANSFORM_HEADER: usize = 52;
-const TRANSFORM_PROTOCOL_ID: &[u8; 4] = b"\xfdSMB";
-
-pub fn config(signing_required: bool) -> ServerConfig {
-    ServerConfig {
-        guid: SERVER_GUID,
-        start_time: START_TIME,
-        signing_required,
-        buffer_size: BUFFER_SIZE,
-        change_scan_interval: None,
-        encrypt_data: false,
-    }
-}
-
-pub fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
-    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
-}
-
-pub fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
-    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-}
-
-pub fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
-    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-}
-
-pub fn u16_at(bytes: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
-}
-
-pub fn u32_at(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
-}
-
-pub fn u64_at(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
-}
-
-pub fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut text = String::new();
-    for (index, line) in bytes.chunks(16).enumerate() {
-        write!(text, "{:04x}:", index * 16).unwrap();
-        for byte in line {
-            write!(text, " {byte:02x}").unwrap();
-        }
-        text.push('\n');
-    }
-    text
-}
-
 /// A signing algorithm (MS-SMB2 3.1.4.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signing {
@@ -208,99 +163,6 @@ pub struct EncryptionKeys {
     pub encryption: [u8; 16],
     /// Decrypts replies.
     pub decryption: [u8; 16],
-}
-
-/// SP800-108 counter-mode KDF with HMAC-SHA256, one iteration and L = 128
-/// (MS-SMB2 3.1.4.2). `label` includes its terminating NUL; a zero byte
-/// separates it from `context`.
-pub fn kdf(key: &[u8; 16], label: &[u8], context: &[u8]) -> [u8; 16] {
-    let mut mac = HmacSha256::new(key);
-    mac.update(&[0, 0, 0, 1]);
-    mac.update(label);
-    mac.update(&[0]);
-    mac.update(context);
-    mac.update(&[0, 0, 0, 0x80]);
-    mac.finalize()[..16].try_into().unwrap()
-}
-
-/// SHA-512 of `hash` followed by `message` (MS-SMB2 3.2.5.2).
-pub fn preauth_update(hash: &[u8; 64], message: &[u8]) -> [u8; 64] {
-    let mut sha = Sha512::new();
-    sha.update(hash);
-    sha.update(message);
-    sha.finalize()
-}
-
-/// Signature of a message (MS-SMB2 3.1.4.1) with the signature field taken
-/// as zero.
-pub fn sign_with(message: &[u8], key: &[u8; 16], signing: Signing) -> [u8; 16] {
-    let mut copy = message.to_vec();
-    copy[48..64].fill(0);
-    match signing {
-        Signing::HmacSha256 => hmac_sha256(key, &copy)[..16].try_into().unwrap(),
-        Signing::AesCmac => aes_cmac(key, &[&copy]),
-        Signing::AesGmac => {
-            // MessageId, then a word with bit 0 for a reply and bit 1 for
-            // a CANCEL.
-            let mut nonce = [0u8; 12];
-            nonce[..8].copy_from_slice(&copy[24..32]);
-            let mut role = u32_at(&copy, 16) & flags::SERVER_TO_REDIR;
-            if u16_at(&copy, 12) == command::CANCEL {
-                role |= 2;
-            }
-            nonce[8..].copy_from_slice(&role.to_le_bytes());
-            gmac(key, &nonce, &[&copy])
-        }
-    }
-}
-
-/// A TRANSFORM_HEADER and `plain` encrypted under `key` (MS-SMB2 3.1.4.3).
-/// `nonce` is the 16-byte Nonce field; the cipher uses its first 11 or 12
-/// bytes.
-pub fn seal(
-    plain: &[u8],
-    key: &[u8; 16],
-    cipher: Cipher,
-    session_id: u64,
-    nonce: [u8; 16],
-) -> Vec<u8> {
-    let mut header = vec![0u8; TRANSFORM_HEADER];
-    header[..4].copy_from_slice(TRANSFORM_PROTOCOL_ID);
-    header[20..36].copy_from_slice(&nonce);
-    put_u32(&mut header, 36, plain.len() as u32);
-    put_u16(&mut header, 42, 1);
-    put_u64(&mut header, 44, session_id);
-    let mut data = plain.to_vec();
-    let aad = header[20..].to_vec();
-    let tag = match cipher {
-        Cipher::Aes128Ccm => ccm_seal(key, nonce[..11].try_into().unwrap(), &aad, &mut data),
-        Cipher::Aes128Gcm => gcm_seal(key, nonce[..12].try_into().unwrap(), &aad, &mut data),
-    }
-    .unwrap();
-    header[4..20].copy_from_slice(&tag);
-    header.extend(data);
-    header
-}
-
-/// The message inside an encrypted frame, or `None` when its tag is wrong.
-pub fn unseal(frame: &[u8], key: &[u8; 16], cipher: Cipher) -> Option<Vec<u8>> {
-    assert_eq!(&frame[..4], TRANSFORM_PROTOCOL_ID);
-    assert_eq!(u16_at(frame, 42), 1, "transform flags");
-    assert_eq!(u32_at(frame, 36) as usize, frame.len() - TRANSFORM_HEADER);
-    let tag: [u8; 16] = frame[4..20].try_into().unwrap();
-    let aad = &frame[20..TRANSFORM_HEADER];
-    let mut data = frame[TRANSFORM_HEADER..].to_vec();
-    let opened = match cipher {
-        Cipher::Aes128Ccm => {
-            assert_eq!(frame[31..36], [0; 5], "reserved nonce bytes");
-            ccm_open(key, frame[20..31].try_into().unwrap(), aad, &mut data, &tag)
-        }
-        Cipher::Aes128Gcm => {
-            assert_eq!(frame[32..36], [0; 4], "reserved nonce bytes");
-            gcm_open(key, frame[20..32].try_into().unwrap(), aad, &mut data, &tag)
-        }
-    };
-    opened.then_some(data)
 }
 
 /// One response: header and body, with the padding that precedes the next
@@ -418,11 +280,13 @@ impl Message {
         let mut contexts = Vec::new();
         for _ in 0..count {
             assert_eq!(offset % 8, 0, "negotiate context alignment");
+
             let kind = u16_at(&self.0, offset);
             let length = usize::from(u16_at(&self.0, offset + 2));
             contexts.push((kind, self.0[offset + 8..offset + 8 + length].to_vec()));
             offset = (offset + 8 + length).next_multiple_of(8);
         }
+
         contexts
     }
 
@@ -434,6 +298,7 @@ impl Message {
             .into_iter()
             .find(|(found, _)| *found == kind)?;
         assert_eq!(u16_at(&data, 0), 1, "one identifier in context {kind:#06x}");
+
         Some(u16_at(&data, 2))
     }
 }
@@ -476,6 +341,7 @@ impl Outcome {
     pub fn single(self) -> Message {
         let mut replies = self.replies();
         assert_eq!(replies.len(), 1);
+
         replies.remove(0)
     }
 
@@ -553,6 +419,7 @@ impl Client {
     pub fn new(backend: MemoryBackend, config: ServerConfig) -> Self {
         let mut server = Box::new(Server::new());
         server.configure(config);
+
         Self {
             connection: Box::new(Connection::new()),
             server,
@@ -661,8 +528,10 @@ impl Client {
             "no credit for message {}",
             self.next_message_id
         );
+
         let id = self.next_message_id;
         self.next_message_id += 1;
+
         id
     }
 
@@ -679,18 +548,22 @@ impl Client {
         put_u32(&mut header, 32, 0xfeff);
         put_u32(&mut header, 36, self.tree_id);
         put_u64(&mut header, 40, self.session_id);
+
         header
     }
 
     /// Set the SIGNED flag and signature of `message` when the client signs
     /// and does not encrypt.
     pub fn sign_message(&self, message: &mut [u8]) {
-        if let (true, false, Some(key)) = (self.sign, self.encrypt, self.key) {
-            let flags = u32_at(message, 16) | flags::SIGNED;
-            put_u32(message, 16, flags);
-            let signature = sign_with(message, &key, self.signing);
-            message[48..64].copy_from_slice(&signature);
-        }
+        let (true, false, Some(key)) = (self.sign, self.encrypt, self.key) else {
+            return;
+        };
+
+        let flags = u32_at(message, 16) | flags::SIGNED;
+        put_u32(message, 16, flags);
+
+        let signature = sign_with(message, &key, self.signing);
+        message[48..64].copy_from_slice(&signature);
     }
 
     /// A complete request with the next message identifier.
@@ -707,9 +580,11 @@ impl Client {
     pub fn seal_request(&mut self, request: &[u8]) -> Vec<u8> {
         let keys = self.encryption.expect("session has encryption keys");
         let cipher = self.cipher.expect("connection has a cipher");
+
         let mut nonce = [0u8; 16];
         nonce[..8].copy_from_slice(&self.next_nonce.to_le_bytes());
         self.next_nonce += 1;
+
         seal(
             request,
             &keys.encryption,
@@ -727,6 +602,7 @@ impl Client {
         } else {
             request.to_vec()
         };
+
         self.deliver(&bytes)
     }
 
@@ -741,6 +617,7 @@ impl Client {
             &mut request,
             &mut response,
         );
+
         self.receive(reply, &response)
     }
 
@@ -750,6 +627,7 @@ impl Client {
         let reply = self
             .connection
             .poll(&mut self.server, &mut self.backend, &mut response);
+
         self.receive(reply, &response)
     }
 
@@ -764,19 +642,24 @@ impl Client {
             Reply::Nothing => return Outcome::Nothing,
             Reply::Disconnect => return Outcome::Disconnect,
         };
+
         let mut frames = Vec::new();
-        let mut at = 0;
-        while at < length {
-            let header: [u8; 4] = response[at..at + 4].try_into().unwrap();
-            let Ok(transport::Frame::Message { length: frame }) =
-                transport::parse_header(header, BUFFER_SIZE)
+        let mut offset = 0;
+        while offset < length {
+            let header: [u8; 4] = response[offset..offset + 4].try_into().unwrap();
+            let Ok(transport::Frame::Message {
+                length: frame_length,
+            }) = transport::parse_header(header, BUFFER_SIZE)
             else {
                 panic!("transport header {header:?}");
             };
-            frames.push(self.receive_frame(&response[at + 4..at + 4 + frame]));
-            at += 4 + frame;
+
+            frames.push(self.receive_frame(&response[offset + 4..offset + 4 + frame_length]));
+            offset += 4 + frame_length;
         }
-        assert_eq!(at, length, "frames fill the reply");
+
+        assert_eq!(offset, length, "frames fill the reply");
+
         Outcome::Replies(frames)
     }
 
@@ -786,16 +669,19 @@ impl Client {
             let cipher = self.cipher.expect("encrypted reply without a cipher");
             let bytes = unseal(frame, &keys.decryption, cipher).expect("reply decrypts");
             assert_eq!(u64_at(frame, 44), u64_at(&bytes, 40), "transform session");
+
             let nonce = u64_at(frame, 20);
             self.reply_nonces.push(nonce);
             (bytes, Some(nonce))
         } else {
             (frame.to_vec(), None)
         };
+
         let messages = split_chain(&bytes);
         for message in &messages {
             assert_eq!(&message.0[..4], b"\xfeSMB");
             assert_ne!(message.flags() & flags::SERVER_TO_REDIR, 0);
+
             if message.signed() {
                 assert!(nonce.is_none(), "encrypted reply is not signed");
                 let key = self.key.expect("signed reply without a session key");
@@ -806,12 +692,14 @@ impl Client {
                     message.command()
                 );
             }
+
             self.credit_limit += u64::from(message.credits());
             assert!(
                 self.credit_limit - self.next_message_id <= 128,
                 "more than 128 credits outstanding"
             );
         }
+
         Frame {
             messages,
             bytes,
@@ -840,6 +728,7 @@ impl Client {
                 chain.resize(start, 0);
                 put_u32(&mut chain, previous + 20, (start - previous) as u32);
             }
+
             let start = chain.len();
             let id = self.allocate_id();
             let flags = if request.related {
@@ -851,6 +740,7 @@ impl Client {
             chain.extend_from_slice(&request.body);
             previous = Some(start);
         }
+
         let mut start = 0;
         loop {
             let next = u32_at(&chain, start + 20) as usize;
@@ -859,8 +749,10 @@ impl Client {
             if next == 0 {
                 break;
             }
+
             start = end;
         }
+
         self.transmit(&chain)
     }
 
@@ -872,9 +764,11 @@ impl Client {
         if reply.status() != NtStatus::Success {
             return reply;
         }
+
         self.dialect = u16_at(reply.body(), 4);
         self.server_requires_signing = u16_at(reply.body(), 2) & u16::from(SIGNING_REQUIRED) != 0;
         let encryption_capable = u32_at(reply.body(), 24) & CAP_ENCRYPTION != 0;
+
         (self.signing, self.cipher) = match self.dialect {
             dialect::SMB_2_0_2 | dialect::SMB_2_1 => (Signing::HmacSha256, None),
             dialect::SMB_3_0 | dialect::SMB_3_0_2 => (
@@ -886,6 +780,7 @@ impl Client {
                     !encryption_capable,
                     "3.1.1 negotiates its cipher in a context"
                 );
+
                 self.preauth = preauth_update(&preauth_update(&[0; 64], &request), &reply.0);
                 let signing = match reply.negotiate_choice(context::SIGNING) {
                     None | Some(context::AES_CMAC) => Signing::AesCmac,
@@ -893,16 +788,19 @@ impl Client {
                     Some(context::HMAC_SHA256) => Signing::HmacSha256,
                     Some(other) => panic!("signing algorithm {other:#06x}"),
                 };
+
                 let cipher = match reply.negotiate_choice(context::ENCRYPTION) {
                     None | Some(0) => None,
                     Some(context::AES_128_CCM) => Some(Cipher::Aes128Ccm),
                     Some(context::AES_128_GCM) => Some(Cipher::Aes128Gcm),
                     Some(other) => panic!("cipher {other:#06x}"),
                 };
+
                 (signing, cipher)
             }
             other => panic!("dialect {other:#06x}"),
         };
+
         reply
     }
 
@@ -910,6 +808,7 @@ impl Client {
     fn setup_body(&self, token: &[u8], security_mode: u8) -> Vec<u8> {
         let mut body = session_setup_body(token, security_mode);
         put_u64(&mut body, 16, self.previous_session_id);
+
         body
     }
 
@@ -918,15 +817,18 @@ impl Client {
             command::SESSION_SETUP,
             &self.setup_body(token, security_mode),
         );
+
         if let Some(hash) = &mut self.session_preauth {
             *hash = preauth_update(hash, &request);
         }
+
         let reply = self.transmit(&request).single();
         if reply.status() == NtStatus::MoreProcessingRequired
             && let Some(hash) = &mut self.session_preauth
         {
             *hash = preauth_update(hash, &reply.0);
         }
+
         reply
     }
 
@@ -939,17 +841,22 @@ impl Client {
         } else {
             SIGNING_ENABLED
         };
+
         self.session_id = 0;
         self.encrypt = false;
         self.session_preauth = (self.dialect == dialect::SMB_3_1_1).then_some(self.preauth);
+
         let negotiate = ntlm::negotiate_message();
         let reply = self.session_setup(&negotiate, security_mode);
         reply.expect(NtStatus::MoreProcessingRequired);
         assert!(!reply.signed());
+
         self.session_id = reply.session_id();
+
         let challenge = reply.buffer16(4, 6, 16).to_vec();
         let authenticate =
             ntlm::authenticate_message(user, "WORKGROUP", password, &negotiate, &challenge);
+
         self.finish_logon(
             &authenticate.message,
             authenticate.session_key,
@@ -969,12 +876,15 @@ impl Client {
             command::SESSION_SETUP,
             &self.setup_body(token, security_mode),
         );
+
         if let Some(hash) = &mut self.session_preauth {
             *hash = preauth_update(hash, &request);
         }
+
         self.derive_keys(&session_key);
         let reply = self.transmit(&request).single();
         self.session_preauth = None;
+
         let session_flags = if reply.status() == NtStatus::Success {
             u16_at(reply.body(), 2)
         } else {
@@ -986,9 +896,11 @@ impl Client {
             self.key = None;
             self.encryption = None;
         }
+
         self.encrypt = session_flags & SESSION_FLAG_ENCRYPT_DATA != 0;
         self.sign = authenticated
             && (security_mode & SIGNING_REQUIRED != 0 || self.server_requires_signing);
+
         reply
     }
 
@@ -1022,9 +934,11 @@ impl Client {
         let reply = self.session_setup(&negotiate, SIGNING_ENABLED);
         reply.expect(NtStatus::MoreProcessingRequired);
         assert_eq!(reply.session_id(), self.session_id);
+
         let challenge = reply.buffer16(4, 6, 16).to_vec();
         let authenticate =
             ntlm::authenticate_message(user, "WORKGROUP", password, &negotiate, &challenge);
+
         self.session_setup(&authenticate.message, SIGNING_ENABLED)
     }
 
@@ -1033,6 +947,7 @@ impl Client {
         if reply.status() == NtStatus::Success {
             self.tree_id = reply.tree_id();
         }
+
         reply
     }
 
@@ -1075,6 +990,7 @@ impl Client {
         put_u64(&mut body, 8, offset);
         file.write(&mut body, 16);
         body.extend_from_slice(data);
+
         self.call(command::WRITE, &body)
     }
 
@@ -1082,6 +998,7 @@ impl Client {
         let mut body = vec![0u8; 24];
         put_u16(&mut body, 0, 24);
         file.write(&mut body, 8);
+
         self.call(command::FLUSH, &body)
     }
 
@@ -1109,6 +1026,7 @@ impl Client {
         put_u32(&mut body, 4, output_length);
         file.write(&mut body, 8);
         put_u32(&mut body, 24, filter);
+
         self.call_all(command::CHANGE_NOTIFY, &body)
     }
 
@@ -1119,6 +1037,7 @@ impl Client {
         put_u64(&mut message, 32, async_id);
         message.extend(empty_body());
         self.sign_message(&mut message);
+
         self.transmit(&message)
     }
 
@@ -1140,6 +1059,7 @@ impl Client {
         put_u16(&mut body, 26, pattern.len() as u16);
         put_u32(&mut body, 28, output_length);
         body.extend(pattern);
+
         self.call(command::QUERY_DIRECTORY, &body)
     }
 
@@ -1166,6 +1086,7 @@ impl Client {
         put_u16(&mut body, 8, (HEADER + 32) as u16);
         file.write(&mut body, 16);
         body.extend_from_slice(data);
+
         self.call(command::SET_INFO, &body)
     }
 
@@ -1187,6 +1108,157 @@ impl Client {
     }
 }
 
+pub fn config(signing_required: bool) -> ServerConfig {
+    ServerConfig {
+        guid: SERVER_GUID,
+        start_time: START_TIME,
+        signing_required,
+        buffer_size: BUFFER_SIZE,
+        change_scan_interval: None,
+        encrypt_data: false,
+    }
+}
+
+pub fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+pub fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+pub fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+pub fn u16_at(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
+}
+
+pub fn u32_at(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+}
+
+pub fn u64_at(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+
+pub fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut text = String::new();
+    for (index, line) in bytes.chunks(16).enumerate() {
+        write!(text, "{:04x}:", index * 16).unwrap();
+        for byte in line {
+            write!(text, " {byte:02x}").unwrap();
+        }
+        text.push('\n');
+    }
+
+    text
+}
+
+/// SP800-108 counter-mode KDF with HMAC-SHA256, one iteration and L = 128
+/// (MS-SMB2 3.1.4.2). `label` includes its terminating NUL; a zero byte
+/// separates it from `context`.
+pub fn kdf(key: &[u8; 16], label: &[u8], context: &[u8]) -> [u8; 16] {
+    let mut mac = HmacSha256::new(key);
+    mac.update(&[0, 0, 0, 1]);
+    mac.update(label);
+    mac.update(&[0]);
+    mac.update(context);
+    mac.update(&[0, 0, 0, 0x80]);
+    mac.finalize()[..16].try_into().unwrap()
+}
+
+/// SHA-512 of `hash` followed by `message` (MS-SMB2 3.2.5.2).
+pub fn preauth_update(hash: &[u8; 64], message: &[u8]) -> [u8; 64] {
+    let mut sha = Sha512::new();
+    sha.update(hash);
+    sha.update(message);
+    sha.finalize()
+}
+
+/// Signature of a message (MS-SMB2 3.1.4.1) with the signature field taken
+/// as zero.
+pub fn sign_with(message: &[u8], key: &[u8; 16], signing: Signing) -> [u8; 16] {
+    let mut copy = message.to_vec();
+    copy[48..64].fill(0);
+
+    match signing {
+        Signing::HmacSha256 => hmac_sha256(key, &copy)[..16].try_into().unwrap(),
+        Signing::AesCmac => aes_cmac(key, &[&copy]),
+        Signing::AesGmac => {
+            // MessageId, then a word with bit 0 for a reply and bit 1 for
+            // a CANCEL.
+            let mut nonce = [0u8; 12];
+            nonce[..8].copy_from_slice(&copy[24..32]);
+
+            let mut role = u32_at(&copy, 16) & flags::SERVER_TO_REDIR;
+            if u16_at(&copy, 12) == command::CANCEL {
+                role |= 2;
+            }
+            nonce[8..].copy_from_slice(&role.to_le_bytes());
+
+            gmac(key, &nonce, &[&copy])
+        }
+    }
+}
+
+/// A TRANSFORM_HEADER and `plain` encrypted under `key` (MS-SMB2 3.1.4.3).
+/// `nonce` is the 16-byte Nonce field; the cipher uses its first 11 or 12
+/// bytes.
+pub fn seal(
+    plain: &[u8],
+    key: &[u8; 16],
+    cipher: Cipher,
+    session_id: u64,
+    nonce: [u8; 16],
+) -> Vec<u8> {
+    let mut header = vec![0u8; TRANSFORM_HEADER];
+    header[..4].copy_from_slice(TRANSFORM_PROTOCOL_ID);
+    header[20..36].copy_from_slice(&nonce);
+    put_u32(&mut header, 36, plain.len() as u32);
+    put_u16(&mut header, 42, 1);
+    put_u64(&mut header, 44, session_id);
+
+    let mut data = plain.to_vec();
+    let aad = header[20..].to_vec();
+    let tag = match cipher {
+        Cipher::Aes128Ccm => ccm_seal(key, nonce[..11].try_into().unwrap(), &aad, &mut data),
+        Cipher::Aes128Gcm => gcm_seal(key, nonce[..12].try_into().unwrap(), &aad, &mut data),
+    }
+    .unwrap();
+
+    header[4..20].copy_from_slice(&tag);
+    header.extend(data);
+
+    header
+}
+
+/// The message inside an encrypted frame, or `None` when its tag is wrong.
+pub fn unseal(frame: &[u8], key: &[u8; 16], cipher: Cipher) -> Option<Vec<u8>> {
+    assert_eq!(&frame[..4], TRANSFORM_PROTOCOL_ID);
+    assert_eq!(u16_at(frame, 42), 1, "transform flags");
+    assert_eq!(u32_at(frame, 36) as usize, frame.len() - TRANSFORM_HEADER);
+
+    let tag: [u8; 16] = frame[4..20].try_into().unwrap();
+    let aad = &frame[20..TRANSFORM_HEADER];
+    let mut data = frame[TRANSFORM_HEADER..].to_vec();
+    let opened = match cipher {
+        Cipher::Aes128Ccm => {
+            assert_eq!(frame[31..36], [0; 5], "reserved nonce bytes");
+            ccm_open(key, frame[20..31].try_into().unwrap(), aad, &mut data, &tag)
+        }
+        Cipher::Aes128Gcm => {
+            assert_eq!(frame[32..36], [0; 4], "reserved nonce bytes");
+            gcm_open(key, frame[20..32].try_into().unwrap(), aad, &mut data, &tag)
+        }
+    };
+
+    opened.then_some(data)
+}
+
 /// Split a chain of responses at their NextCommand offsets, checking that
 /// each starts 8-byte aligned.
 pub fn split_chain(bytes: &[u8]) -> Vec<Message> {
@@ -1200,6 +1272,7 @@ pub fn split_chain(bytes: &[u8]) -> Vec<Message> {
         if next == 0 {
             return messages;
         }
+
         start = end;
     }
 }
@@ -1219,6 +1292,7 @@ pub fn negotiate_body(dialects: &[u16]) -> Vec<u8> {
     for dialect in dialects {
         body.extend(dialect.to_le_bytes());
     }
+
     body
 }
 
@@ -1234,10 +1308,12 @@ pub fn negotiate_body_with(
     if contexts.is_empty() {
         return body;
     }
+
     body.resize((HEADER + body.len()).next_multiple_of(8) - HEADER, 0);
     let offset = (HEADER + body.len()) as u32;
     put_u32(&mut body, 28, offset);
     put_u16(&mut body, 32, contexts.len() as u16);
+
     for (index, (kind, data)) in contexts.iter().enumerate() {
         if index > 0 {
             body.resize((HEADER + body.len()).next_multiple_of(8) - HEADER, 0);
@@ -1247,6 +1323,7 @@ pub fn negotiate_body_with(
         body.extend([0; 4]);
         body.extend(data);
     }
+
     body
 }
 
@@ -1259,7 +1336,9 @@ pub fn preauth_context(algorithms: &[u16]) -> (u16, Vec<u8>) {
     for algorithm in algorithms {
         data.extend(algorithm.to_le_bytes());
     }
+
     data.extend([0x5a; 32]);
+
     (context::PREAUTH_INTEGRITY, data)
 }
 
@@ -1271,6 +1350,7 @@ pub fn list_context(kind: u16, identifiers: &[u16]) -> (u16, Vec<u8>) {
     for identifier in identifiers {
         data.extend(identifier.to_le_bytes());
     }
+
     (kind, data)
 }
 
@@ -1289,17 +1369,20 @@ pub fn smb3_negotiate_body(dialect: u16, ciphers: &[u16], signing: &[u16]) -> Ve
             contexts.push(list_context(context::SIGNING, signing));
         }
     }
+
     negotiate_body_with(&[dialect], CAP_ENCRYPTION, &contexts)
 }
 
 /// TREE_CONNECT request (MS-SMB2 2.2.9) for `share` on the test server.
 pub fn tree_connect_body(share: &str) -> Vec<u8> {
     let path = utf16(&format!("\\\\TESTSRV\\{share}"));
+
     let mut body = vec![0u8; 8];
     put_u16(&mut body, 0, 9);
     put_u16(&mut body, 4, (HEADER + 8) as u16);
     put_u16(&mut body, 6, path.len() as u16);
     body.extend(path);
+
     body
 }
 
@@ -1311,6 +1394,7 @@ pub fn session_setup_body(token: &[u8], security_mode: u8) -> Vec<u8> {
     put_u16(&mut body, 12, (HEADER + 24) as u16);
     put_u16(&mut body, 14, token.len() as u16);
     body.extend_from_slice(token);
+
     body
 }
 
@@ -1324,6 +1408,7 @@ pub fn create_body(
     contexts: &[u8],
 ) -> Vec<u8> {
     let name = utf16(name);
+
     let mut body = vec![0u8; 56];
     put_u16(&mut body, 0, 57);
     put_u32(&mut body, 4, 2);
@@ -1334,18 +1419,22 @@ pub fn create_body(
     put_u16(&mut body, 44, (HEADER + 56) as u16);
     put_u16(&mut body, 46, name.len() as u16);
     body.extend(&name);
+
     if contexts.is_empty() {
         // The buffer holds at least one byte.
         if name.is_empty() {
             body.push(0);
         }
-    } else {
-        body.resize(body.len().next_multiple_of(8), 0);
-        let offset = (HEADER + body.len()) as u32;
-        put_u32(&mut body, 48, offset);
-        put_u32(&mut body, 52, contexts.len() as u32);
-        body.extend_from_slice(contexts);
+
+        return body;
     }
+
+    body.resize(body.len().next_multiple_of(8), 0);
+    let offset = (HEADER + body.len()) as u32;
+    put_u32(&mut body, 48, offset);
+    put_u32(&mut body, 52, contexts.len() as u32);
+    body.extend_from_slice(contexts);
+
     body
 }
 
@@ -1355,6 +1444,7 @@ pub fn create_context(name: &[u8; 4]) -> Vec<u8> {
     put_u16(&mut context, 4, 16);
     put_u16(&mut context, 6, 4);
     context[16..20].copy_from_slice(name);
+
     context
 }
 
@@ -1363,6 +1453,7 @@ pub fn close_body(file: FileId, flags: u16) -> Vec<u8> {
     put_u16(&mut body, 0, 24);
     put_u16(&mut body, 2, flags);
     file.write(&mut body, 8);
+
     body
 }
 
@@ -1373,6 +1464,7 @@ pub fn read_body(file: FileId, offset: u64, length: u32) -> Vec<u8> {
     put_u32(&mut body, 4, length);
     put_u64(&mut body, 8, offset);
     file.write(&mut body, 16);
+
     body
 }
 
@@ -1392,6 +1484,7 @@ pub fn query_info_body(
     file.write(&mut body, 24);
     // The buffer holds at least one byte.
     body.push(0);
+
     body
 }
 
@@ -1401,6 +1494,7 @@ pub fn lock_body(file: FileId, elements: &[LockElement]) -> Vec<u8> {
     put_u16(&mut body, 0, 48);
     put_u16(&mut body, 2, elements.len() as u16);
     file.write(&mut body, 8);
+
     for element in elements {
         let mut entry = [0u8; 24];
         put_u64(&mut entry, 0, element.offset);
@@ -1408,6 +1502,7 @@ pub fn lock_body(file: FileId, elements: &[LockElement]) -> Vec<u8> {
         put_u32(&mut entry, 16, element.flags);
         body.extend(entry);
     }
+
     body
 }
 
@@ -1423,6 +1518,7 @@ pub fn ioctl_body(file: FileId, code: u32, input: &[u8], max_output: u32) -> Vec
     // SMB2_0_IOCTL_IS_FSCTL.
     put_u32(&mut body, 48, 1);
     body.extend_from_slice(input);
+
     body
 }
 
@@ -1430,12 +1526,12 @@ pub fn ioctl_body(file: FileId, code: u32, input: &[u8], max_output: u32) -> Vec
 /// each.
 pub fn notify_records(output: &[u8]) -> Vec<(u32, String)> {
     let mut records = Vec::new();
-    let mut at = 0;
+    let mut offset = 0;
     loop {
-        let next = u32_at(output, at) as usize;
-        let action = u32_at(output, at + 4);
-        let length = u32_at(output, at + 8) as usize;
-        let units: Vec<u16> = output[at + 12..at + 12 + length]
+        let next = u32_at(output, offset) as usize;
+        let action = u32_at(output, offset + 4);
+        let length = u32_at(output, offset + 8) as usize;
+        let units: Vec<u16> = output[offset + 12..offset + 12 + length]
             .chunks(2)
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect();
@@ -1443,7 +1539,8 @@ pub fn notify_records(output: &[u8]) -> Vec<(u32, String)> {
         if next == 0 {
             return records;
         }
+
         assert_eq!(next % 4, 0, "record alignment");
-        at += next;
+        offset += next;
     }
 }

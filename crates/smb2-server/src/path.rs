@@ -1,51 +1,12 @@
 //! Validated paths relative to the root of a share.
 
-use crate::status::NtStatus;
+mod error;
+
 use crate::utf16::Utf16Le;
 
+pub use self::error::PathError;
+
 const SEPARATOR: u16 = b'\\' as u16;
-/// Suffix naming the default data stream, which the server accepts and
-/// removes.
-const DEFAULT_STREAM: &[u8] = b"::$DATA";
-
-/// Why a request path is not a valid share path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PathError {
-    /// The path starts with a separator; share paths are relative.
-    LeadingSeparator,
-    /// Two separators are adjacent, or the path ends with one.
-    EmptyComponent,
-    /// A component is `.` or `..`.
-    RelativeComponent,
-    /// A component holds a character NT file names exclude.
-    ExcludedCharacter { unit: u16 },
-}
-
-impl core::fmt::Display for PathError {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::LeadingSeparator => formatter.write_str("path starts with a separator"),
-            Self::EmptyComponent => formatter.write_str("path has an empty component"),
-            Self::RelativeComponent => formatter.write_str("path has a `.` or `..` component"),
-            Self::ExcludedCharacter { unit } => {
-                write!(formatter, "path has the excluded character {unit:#06x}")
-            }
-        }
-    }
-}
-
-impl core::error::Error for PathError {}
-
-impl From<PathError> for NtStatus {
-    fn from(error: PathError) -> Self {
-        match error {
-            PathError::LeadingSeparator => NtStatus::InvalidParameter,
-            PathError::EmptyComponent
-            | PathError::RelativeComponent
-            | PathError::ExcludedCharacter { .. } => NtStatus::ObjectNameInvalid,
-        }
-    }
-}
 
 /// A path relative to a share root: components separated by `\`, none of
 /// them empty, `.` or `..`, and no characters that NT file names exclude.
@@ -59,15 +20,19 @@ impl<'a> SharePath<'a> {
     /// Validate a path from a request.
     pub fn parse(path: Utf16Le<'a>) -> Result<Self, PathError> {
         let path = strip_default_stream(path);
+
         if path.is_empty() {
             return Ok(Self(path));
         }
+
         if path.unit(0) == Some(SEPARATOR) {
             return Err(PathError::LeadingSeparator);
         }
+
         for component in split(path) {
             validate_component(component)?;
         }
+
         Ok(Self(path))
     }
 
@@ -82,6 +47,7 @@ impl<'a> SharePath<'a> {
     pub fn components(self) -> impl DoubleEndedIterator<Item = Utf16Le<'a>> + Clone {
         let path = self.0;
         let empty = path.is_empty();
+
         split(path).filter(move |_| !empty)
     }
 
@@ -96,11 +62,14 @@ impl<'a> SharePath<'a> {
         if self.is_root() {
             return None;
         }
+
+        // A path with one component has the root as its parent.
         let end = self
             .0
             .units()
             .rposition(|unit| unit == SEPARATOR)
             .unwrap_or(0);
+
         Some(Self(self.0.slice(0, end)))
     }
 }
@@ -108,13 +77,6 @@ impl<'a> SharePath<'a> {
 impl core::fmt::Debug for SharePath<'_> {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(formatter, "SharePath({:?})", self.0)
-    }
-}
-
-/// Components of `path` split at separators.
-fn split(path: Utf16Le<'_>) -> Components<'_> {
-    Components {
-        rest: Some(path.as_bytes()),
     }
 }
 
@@ -128,6 +90,7 @@ impl<'a> Iterator for Components<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let rest = self.rest?;
+
         match find_separator(rest) {
             Some(index) => {
                 self.rest = Some(&rest[index + 2..]);
@@ -144,6 +107,7 @@ impl<'a> Iterator for Components<'a> {
 impl DoubleEndedIterator for Components<'_> {
     fn next_back(&mut self) -> Option<Self::Item> {
         let rest = self.rest?;
+
         match rfind_separator(rest) {
             Some(index) => {
                 self.rest = Some(&rest[..index]);
@@ -154,6 +118,13 @@ impl DoubleEndedIterator for Components<'_> {
                 Utf16Le::new(rest)
             }
         }
+    }
+}
+
+/// Components of `path` split at separators.
+fn split(path: Utf16Le<'_>) -> Components<'_> {
+    Components {
+        rest: Some(path.as_bytes()),
     }
 }
 
@@ -176,7 +147,12 @@ fn rfind_separator(bytes: &[u8]) -> Option<usize> {
 }
 
 fn strip_default_stream(path: Utf16Le<'_>) -> Utf16Le<'_> {
+    // Suffix naming the default data stream, which the server accepts and
+    // removes.
+    const DEFAULT_STREAM: &[u8] = b"::$DATA";
+
     let suffix = DEFAULT_STREAM.len();
+
     if path.len() >= suffix
         && path
             .slice(path.len() - suffix, path.len())
@@ -192,9 +168,11 @@ fn validate_component(component: Utf16Le<'_>) -> Result<(), PathError> {
     if component.is_empty() {
         return Err(PathError::EmptyComponent);
     }
+
     if component.eq_ignore_ascii_case(b".") || component.eq_ignore_ascii_case(b"..") {
         return Err(PathError::RelativeComponent);
     }
+
     match component.units().find(|&unit| is_excluded(unit)) {
         Some(unit) => Err(PathError::ExcludedCharacter { unit }),
         None => Ok(()),

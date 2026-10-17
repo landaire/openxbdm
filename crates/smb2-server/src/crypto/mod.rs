@@ -5,6 +5,7 @@ mod ccm;
 mod chain;
 mod cmac;
 mod engine;
+mod error;
 mod gcm;
 mod hmac;
 mod kdf;
@@ -18,6 +19,7 @@ pub use ccm::ccm_open;
 pub use ccm::ccm_seal;
 pub use cmac::AesCmac;
 pub use cmac::aes_cmac;
+pub use error::MessageTooLong;
 pub use gcm::gcm_open;
 pub use gcm::gcm_seal;
 pub use gcm::gmac;
@@ -36,16 +38,14 @@ pub use sha256::sha256;
 pub use sha512::Sha512;
 pub use sha512::sha512;
 
-/// The message exceeds the length the cipher mode can protect.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MessageTooLong;
-
 /// Whether `a` equals `b`, in time that depends only on the lengths.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
+
     let difference = a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y));
+
     core::hint::black_box(difference) == 0
 }
 
@@ -56,10 +56,12 @@ pub(crate) mod tests {
     /// Decode exactly `N` bytes of hexadecimal text.
     pub(crate) fn decode_hex<const N: usize>(text: &str) -> [u8; N] {
         assert_eq!(text.len(), N * 2, "hex length");
+
         let mut out = [0; N];
         for (byte, pair) in out.iter_mut().zip(text.as_bytes().as_chunks::<2>().0) {
             *byte = u8::from_str_radix(core::str::from_utf8(pair).unwrap(), 16).unwrap();
         }
+
         out
     }
 

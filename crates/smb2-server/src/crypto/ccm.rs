@@ -6,20 +6,24 @@ use super::aes::Aes128;
 use super::chain::Chain;
 use super::constant_time_eq;
 
-/// Flags byte of B0 without Adata: (M - 2) / 2 in bits 3-5, L - 1 in bits
-/// 0-2. The counter blocks carry L - 1 alone.
-const B0_FLAGS: u8 = (7 << 3) | 3;
-const COUNTER_FLAGS: u8 = 3;
-
 fn counter_prefix(nonce: &[u8; 11]) -> [u8; 12] {
+    /// The counter blocks carry L - 1 alone.
+    const COUNTER_FLAGS: u8 = 3;
+
     let mut prefix = [COUNTER_FLAGS; 12];
     prefix[1..].copy_from_slice(nonce);
+
     prefix
 }
 
 /// CBC-MAC over B0, the length-prefixed `aad`, and the plaintext `data`.
 fn cbc_mac(cipher: &Aes128, nonce: &[u8; 11], aad: &[u8], data: &[u8], length: u32) -> [u8; 16] {
+    /// Flags byte of B0 without Adata: (M - 2) / 2 in bits 3-5, L - 1 in
+    /// bits 0-2.
+    const B0_FLAGS: u8 = (7 << 3) | 3;
+
     let mut chain = Chain::new();
+
     let mut b0 = [B0_FLAGS; 16];
     if !aad.is_empty() {
         b0[0] |= 0x40;
@@ -27,6 +31,7 @@ fn cbc_mac(cipher: &Aes128, nonce: &[u8; 11], aad: &[u8], data: &[u8], length: u
     b0[1..12].copy_from_slice(nonce);
     b0[12..].copy_from_slice(&length.to_be_bytes());
     chain.update(&b0, cipher);
+
     if !aad.is_empty() {
         let aad_length = aad.len() as u64;
         let mut encoded = [0; 10];
@@ -46,8 +51,10 @@ fn cbc_mac(cipher: &Aes128, nonce: &[u8; 11], aad: &[u8], data: &[u8], length: u
         chain.update(aad, cipher);
         chain.pad(cipher);
     }
+
     chain.update(data, cipher);
     chain.pad(cipher);
+
     chain.state
 }
 
@@ -62,9 +69,11 @@ pub fn ccm_seal(
     let length = u32::try_from(data.len()).map_err(|_| MessageTooLong)?;
     let cipher = Aes128::new(key);
     let prefix = counter_prefix(nonce);
+
     let mut tag = cbc_mac(&cipher, nonce, aad, data, length);
     cipher.apply_counter_mode(&prefix, 0, &mut tag);
     cipher.apply_counter_mode(&prefix, 1, data);
+
     Ok(tag)
 }
 
@@ -80,11 +89,14 @@ pub fn ccm_open(
     let Ok(length) = u32::try_from(data.len()) else {
         return false;
     };
+
     let cipher = Aes128::new(key);
     let prefix = counter_prefix(nonce);
+
     cipher.apply_counter_mode(&prefix, 1, data);
     let mut expected = cbc_mac(&cipher, nonce, aad, data, length);
     cipher.apply_counter_mode(&prefix, 0, &mut expected);
+
     if constant_time_eq(&expected, tag) {
         true
     } else {

@@ -97,23 +97,6 @@ statuses! {
     NoPreauthIntegrityHashOverlap = 0xc05d_0000,
 }
 
-/// A status code that [`NtStatus`] has no variant for. Only
-/// [`NtStatus::from_raw`] makes one, so equal codes compare equal.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct OtherStatus(u32);
-
-impl OtherStatus {
-    pub const fn raw(self) -> u32 {
-        self.0
-    }
-}
-
-impl core::fmt::Debug for OtherStatus {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(formatter, "{:#010x}", self.0)
-    }
-}
-
 impl NtStatus {
     /// Severity is error (the two high bits are set).
     pub const fn is_error(self) -> bool {
@@ -144,6 +127,23 @@ impl core::fmt::Display for NtStatus {
     }
 }
 
+/// A status code that [`NtStatus`] has no variant for. Only
+/// [`NtStatus::from_raw`] makes one, so equal codes compare equal.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OtherStatus(u32);
+
+impl OtherStatus {
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+impl core::fmt::Debug for OtherStatus {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(formatter, "{:#010x}", self.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::NtStatus;
@@ -155,10 +155,12 @@ mod tests {
             NtStatus::ObjectNameNotFound
         );
         assert_eq!(NtStatus::ObjectNameNotFound.raw(), 0xc000_0034);
+
         let other = NtStatus::from_raw(0xc000_0185);
         assert!(matches!(other, NtStatus::Other(_)));
         assert_eq!(other, NtStatus::from_raw(0xc000_0185));
         assert_eq!(other.raw(), 0xc000_0185);
+
         assert!(other.is_error());
         assert!(NtStatus::BufferOverflow.is_warning());
         assert!(!NtStatus::NotifyEnumDir.is_error());

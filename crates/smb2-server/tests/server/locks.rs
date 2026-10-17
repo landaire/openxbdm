@@ -7,13 +7,27 @@ use smb2_server::status::NtStatus;
 use crate::backend::DATA;
 use crate::client::Client;
 use crate::client::LockElement;
+use crate::client::Message;
+use crate::client::Request;
 use crate::client::close_body;
 use crate::client::command;
 use crate::client::disposition;
+use crate::client::empty_body;
 use crate::client::flags;
 use crate::client::lock;
+use crate::client::lock_body;
 
 const FILE: &str = "locked.bin";
+
+/// A client and a peer on a second connection, each with an open of the
+/// same 100-byte file.
+struct TwoConnections {
+    client: Client,
+    file: FileId,
+
+    peer: Client,
+    peer_file: FileId,
+}
 
 fn element(offset: u64, length: u64, flags: u32) -> LockElement {
     LockElement {
@@ -35,20 +49,45 @@ fn unlock(offset: u64, length: u64) -> [LockElement; 1] {
     [element(offset, length, lock::UNLOCK)]
 }
 
-/// A client and a peer on a second connection, each with an open of the
-/// same 100-byte file.
-fn two_connections() -> (Client, FileId, Client, FileId) {
+fn two_connections() -> TwoConnections {
     let mut client = Client::connected("Data");
     client.backend.add_file(DATA, FILE, &[0x11; 100]);
     let file = client.open(FILE, disposition::OPEN);
+
     let mut peer = client.connected_peer("Data");
     let peer_file = client.with_peer(&mut peer, |peer| peer.open(FILE, disposition::OPEN));
-    (client, file, peer, peer_file)
+
+    TwoConnections {
+        client,
+        file,
+        peer,
+        peer_file,
+    }
+}
+
+/// Start a blocking exclusive lock of `0..10` on the peer; returns the
+/// interim reply.
+fn blocked_lock(client: &mut Client, peer: &mut Client, peer_file: FileId) -> Message {
+    client.with_peer(peer, |peer| {
+        let interim = peer.lock(peer_file, &[element(0, 10, lock::EXCLUSIVE)]);
+        interim.expect(NtStatus::Pending);
+        assert_ne!(interim.flags() & flags::ASYNC_COMMAND, 0);
+        assert!(!peer.wants_poll());
+        assert!(peer.poll().is_nothing());
+
+        interim
+    })
 }
 
 #[test]
 fn conflicting_locks_across_connections_fail_immediately() {
-    let (mut client, file, mut peer, peer_file) = two_connections();
+    let TwoConnections {
+        mut client,
+        file,
+        mut peer,
+        peer_file,
+    } = two_connections();
+
     client
         .lock(file, &exclusive_now(0, 10))
         .expect(NtStatus::Success);
@@ -67,6 +106,7 @@ fn conflicting_locks_across_connections_fail_immediately() {
         )
         .expect(NtStatus::Success);
     });
+
     // Shared locks coexist; an exclusive one does not join them.
     client
         .lock(
@@ -98,7 +138,13 @@ fn two_opens_on_one_connection_conflict() {
 
 #[test]
 fn failed_multi_element_lock_releases_its_earlier_elements() {
-    let (mut client, file, mut peer, peer_file) = two_connections();
+    let TwoConnections {
+        mut client,
+        file,
+        mut peer,
+        peer_file,
+    } = two_connections();
+
     client
         .lock(file, &exclusive_now(50, 10))
         .expect(NtStatus::Success);
@@ -112,6 +158,7 @@ fn failed_multi_element_lock_releases_its_earlier_elements() {
         )
         .expect(NtStatus::LockNotGranted);
     });
+
     client
         .lock(file, &exclusive_now(0, 10))
         .expect(NtStatus::Success);
@@ -119,7 +166,13 @@ fn failed_multi_element_lock_releases_its_earlier_elements() {
 
 #[test]
 fn read_and_write_over_another_opens_lock_conflict() {
-    let (mut client, file, mut peer, peer_file) = two_connections();
+    let TwoConnections {
+        mut client,
+        file,
+        mut peer,
+        peer_file,
+    } = two_connections();
+
     client
         .lock(file, &exclusive_now(0, 10))
         .expect(NtStatus::Success);
@@ -148,7 +201,13 @@ fn read_and_write_over_another_opens_lock_conflict() {
 
 #[test]
 fn unlock_needs_the_exact_range_of_the_same_open() {
-    let (mut client, file, mut peer, peer_file) = two_connections();
+    let TwoConnections {
+        mut client,
+        file,
+        mut peer,
+        peer_file,
+    } = two_connections();
+
     client
         .lock(file, &unlock(0, 10))
         .expect(NtStatus::RangeNotLocked);
@@ -162,6 +221,7 @@ fn unlock_needs_the_exact_range_of_the_same_open() {
         peer.lock(peer_file, &unlock(0, 10))
             .expect(NtStatus::RangeNotLocked);
     });
+
     client.lock(file, &unlock(0, 10)).expect(NtStatus::Success);
     client
         .lock(file, &unlock(0, 10))
@@ -174,7 +234,13 @@ fn unlock_needs_the_exact_range_of_the_same_open() {
 
 #[test]
 fn close_releases_the_opens_locks() {
-    let (mut client, file, mut peer, peer_file) = two_connections();
+    let TwoConnections {
+        mut client,
+        file,
+        mut peer,
+        peer_file,
+    } = two_connections();
+
     client
         .lock(file, &exclusive_now(0, 10))
         .expect(NtStatus::Success);
@@ -186,26 +252,15 @@ fn close_releases_the_opens_locks() {
     });
 }
 
-/// Start a blocking exclusive lock of `0..10` on the peer; returns the
-/// interim reply.
-fn blocked_lock(
-    client: &mut Client,
-    peer: &mut Client,
-    peer_file: FileId,
-) -> crate::client::Message {
-    client.with_peer(peer, |peer| {
-        let interim = peer.lock(peer_file, &[element(0, 10, lock::EXCLUSIVE)]);
-        interim.expect(NtStatus::Pending);
-        assert_ne!(interim.flags() & flags::ASYNC_COMMAND, 0);
-        assert!(!peer.wants_poll());
-        assert!(peer.poll().is_nothing());
-        interim
-    })
-}
-
 #[test]
 fn blocking_lock_is_granted_after_unlock() {
-    let (mut client, file, mut peer, peer_file) = two_connections();
+    let TwoConnections {
+        mut client,
+        file,
+        mut peer,
+        peer_file,
+    } = two_connections();
+
     client
         .lock(file, &exclusive_now(0, 10))
         .expect(NtStatus::Success);
@@ -226,6 +281,7 @@ fn blocking_lock_is_granted_after_unlock() {
         assert_eq!(granted.async_id(), interim.async_id());
         assert!(!peer.wants_poll());
     });
+
     client
         .lock(file, &exclusive_now(0, 10))
         .expect(NtStatus::LockNotGranted);
@@ -233,7 +289,13 @@ fn blocking_lock_is_granted_after_unlock() {
 
 #[test]
 fn blocking_lock_is_granted_when_the_holder_closes() {
-    let (mut client, file, mut peer, peer_file) = two_connections();
+    let TwoConnections {
+        mut client,
+        file,
+        mut peer,
+        peer_file,
+    } = two_connections();
+
     client
         .lock(file, &exclusive_now(0, 10))
         .expect(NtStatus::Success);
@@ -246,7 +308,13 @@ fn blocking_lock_is_granted_when_the_holder_closes() {
 
 #[test]
 fn cancel_ends_a_blocking_lock() {
-    let (mut client, file, mut peer, peer_file) = two_connections();
+    let TwoConnections {
+        mut client,
+        file,
+        mut peer,
+        peer_file,
+    } = two_connections();
+
     client
         .lock(file, &exclusive_now(0, 10))
         .expect(NtStatus::Success);
@@ -259,6 +327,7 @@ fn cancel_ends_a_blocking_lock() {
         assert_eq!(cancelled.command(), command::LOCK);
         assert_eq!(cancelled.async_id(), interim.async_id());
     });
+
     client.lock(file, &unlock(0, 10)).expect(NtStatus::Success);
     client.with_peer(&mut peer, |peer| assert!(peer.poll().is_nothing()));
     client
@@ -268,7 +337,13 @@ fn cancel_ends_a_blocking_lock() {
 
 #[test]
 fn closing_the_waiting_open_cancels_its_lock() {
-    let (mut client, file, mut peer, peer_file) = two_connections();
+    let TwoConnections {
+        mut client,
+        file,
+        mut peer,
+        peer_file,
+    } = two_connections();
+
     client
         .lock(file, &exclusive_now(0, 10))
         .expect(NtStatus::Success);
@@ -293,21 +368,27 @@ fn closing_the_waiting_open_cancels_its_lock() {
 
 #[test]
 fn lock_in_a_compound_chain_does_not_wait() {
-    let (mut client, file, mut peer, peer_file) = two_connections();
+    let TwoConnections {
+        mut client,
+        file,
+        mut peer,
+        peer_file,
+    } = two_connections();
+
     client
         .lock(file, &exclusive_now(0, 10))
         .expect(NtStatus::Success);
     client.with_peer(&mut peer, |peer| {
         let replies = peer
             .compound(&[
-                crate::client::Request {
+                Request {
                     command: command::LOCK,
-                    body: crate::client::lock_body(peer_file, &[element(0, 10, lock::EXCLUSIVE)]),
+                    body: lock_body(peer_file, &[element(0, 10, lock::EXCLUSIVE)]),
                     related: false,
                 },
-                crate::client::Request {
+                Request {
                     command: command::ECHO,
-                    body: crate::client::empty_body(),
+                    body: empty_body(),
                     related: false,
                 },
             ])
@@ -318,7 +399,13 @@ fn lock_in_a_compound_chain_does_not_wait() {
 
 #[test]
 fn failed_lock_keeps_an_earlier_lock_of_the_same_range() {
-    let (mut client, file, mut peer, peer_file) = two_connections();
+    let TwoConnections {
+        mut client,
+        file,
+        mut peer,
+        peer_file,
+    } = two_connections();
+
     client
         .lock(file, &exclusive_now(0, 10))
         .expect(NtStatus::Success);
@@ -326,6 +413,7 @@ fn failed_lock_keeps_an_earlier_lock_of_the_same_range() {
         peer.lock(peer_file, &exclusive_now(50, 1))
             .expect(NtStatus::Success);
     });
+
     // A shared lock over the open's own exclusive lock is granted, then the
     // second element conflicts and the request is undone.
     client
@@ -341,6 +429,7 @@ fn failed_lock_keeps_an_earlier_lock_of_the_same_range() {
         peer.read(peer_file, 0, 4)
             .expect(NtStatus::FileLockConflict);
     });
+
     client.lock(file, &unlock(0, 10)).expect(NtStatus::Success);
     client
         .lock(file, &unlock(0, 10))

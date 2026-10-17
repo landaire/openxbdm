@@ -28,27 +28,6 @@ pub enum PipeError {
     MalformedPdu(PduError),
 }
 
-/// What is wrong with a received PDU.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PduError {
-    /// The protocol version is not 5.0 or 5.1.
-    UnsupportedVersion { version: RpcVersion },
-    /// The first data representation byte is not little-endian integers
-    /// with ASCII characters (0x10).
-    UnsupportedDataRepresentation { format: DataFormat },
-    /// A packet type a client does not send.
-    UnexpectedType { packet_type: PacketType },
-    /// The fragment length is below the fixed part of its packet type.
-    FragmentTooShort {
-        packet_type: PacketType,
-        length: u32,
-        minimum: u32,
-    },
-    /// A request fragment without the first fragment flag that does not
-    /// continue the request being received.
-    UnexpectedContinuation { call_id: CallId },
-}
-
 impl From<PduError> for PipeError {
     fn from(error: PduError) -> Self {
         Self::MalformedPdu(error)
@@ -88,6 +67,27 @@ impl core::error::Error for PipeError {
             _ => None,
         }
     }
+}
+
+/// What is wrong with a received PDU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PduError {
+    /// The protocol version is not 5.0 or 5.1.
+    UnsupportedVersion { version: RpcVersion },
+    /// The first data representation byte is not little-endian integers
+    /// with ASCII characters (0x10).
+    UnsupportedDataRepresentation { format: DataFormat },
+    /// A packet type a client does not send.
+    UnexpectedType { packet_type: PacketType },
+    /// The fragment length is below the fixed part of its packet type.
+    FragmentTooShort {
+        packet_type: PacketType,
+        length: u32,
+        minimum: u32,
+    },
+    /// A request fragment without the first fragment flag that does not
+    /// continue the request being received.
+    UnexpectedContinuation { call_id: CallId },
 }
 
 impl core::fmt::Display for PduError {

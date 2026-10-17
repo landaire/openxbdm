@@ -41,79 +41,34 @@ pub const USER: &str = "alice";
 pub const PASSWORD: &str = "Secret1";
 pub const DATA: ShareId = ShareId(1);
 pub const PUBLIC: ShareId = ShareId(2);
-const SHARES: [(&str, ShareId, bool); 2] = [("Data", DATA, true), ("Public", PUBLIC, false)];
-const CLUSTER: u64 = 4096;
+const SHARES: [ShareDefinition; 2] = [
+    ShareDefinition {
+        name: "Data",
+        id: DATA,
+        writable: true,
+    },
+    ShareDefinition {
+        name: "Public",
+        id: PUBLIC,
+        writable: false,
+    },
+];
 /// Largest file the backend holds.
 const MAXIMUM_FILE: u64 = 1 << 24;
-/// What the backend returns for a handle the server never opened.
-const INVALID_HANDLE: FsError = FsError::from_status(NtStatus::InvalidHandle);
-
-pub fn utf16(text: &str) -> Vec<u8> {
-    text.encode_utf16().flat_map(u16::to_le_bytes).collect()
-}
-
-struct Node {
-    share: ShareId,
-    /// Components separated by `\`; empty for the share root.
-    path: String,
-    directory: bool,
-    data: Vec<u8>,
-    creation_time: FileTime,
-    last_access_time: FileTime,
-    last_write_time: FileTime,
-    change_time: FileTime,
-    attributes: FileAttributes,
-    index: u64,
-    delete_pending: bool,
-    opens: usize,
-}
-
-impl Node {
-    fn information(&self) -> FileInformation {
-        let end_of_file = self.data.len() as u64;
-        FileInformation {
-            creation_time: self.creation_time,
-            last_access_time: self.last_access_time,
-            last_write_time: self.last_write_time,
-            change_time: self.change_time,
-            allocation_size: end_of_file.div_ceil(CLUSTER) * CLUSTER,
-            end_of_file,
-            attributes: self.attributes,
-            index: Some(FileIndex(self.index)),
-        }
-    }
-
-    fn name(&self) -> &str {
-        self.path.rsplit('\\').next().unwrap_or("")
-    }
-}
-
-struct Handle {
-    node: usize,
-    delete_on_close: bool,
-    /// Names and nodes of a directory scan, taken at its start.
-    listing: Option<Vec<(String, usize)>>,
-    cursor: usize,
-}
 
 pub struct MemoryBackend {
     nodes: Vec<Option<Node>>,
     handles: Vec<Option<Handle>>,
+
     pub guest: bool,
     pub anonymous: bool,
+
     random: u8,
     /// What `system_time` returns.
     pub time: FileTime,
+
     /// Handles in the order the server closed them.
     pub closed: Vec<FileHandle>,
-}
-
-fn parent_of(path: &str) -> &str {
-    path.rsplit_once('\\').map_or("", |(parent, _)| parent)
-}
-
-fn path_string(path: SharePath<'_>) -> String {
-    String::from_utf16(&path.as_utf16().units().collect::<Vec<_>>()).unwrap()
 }
 
 impl MemoryBackend {
@@ -127,14 +82,22 @@ impl MemoryBackend {
             time: TIME,
             closed: Vec::new(),
         };
-        for (_, share, _) in SHARES {
-            backend.insert(share, "", true, Vec::new());
+
+        for share in SHARES {
+            backend.insert(share.id, "", true, Vec::new());
         }
+
         backend
     }
 
     fn insert(&mut self, share: ShareId, path: &str, directory: bool, data: Vec<u8>) -> usize {
         let index = self.nodes.len();
+        let attributes = if directory {
+            FileAttributes::DIRECTORY
+        } else {
+            FileAttributes::ARCHIVE
+        };
+
         self.nodes.push(Some(Node {
             share,
             path: path.to_owned(),
@@ -144,15 +107,12 @@ impl MemoryBackend {
             last_access_time: TIME,
             last_write_time: TIME,
             change_time: TIME,
-            attributes: if directory {
-                FileAttributes::DIRECTORY
-            } else {
-                FileAttributes::ARCHIVE
-            },
+            attributes,
             index: 0x100 + index as u64,
             delete_pending: false,
             opens: 0,
         }));
+
         index
     }
 
@@ -187,10 +147,12 @@ impl MemoryBackend {
     /// Move `source` and the entries below it to `target`.
     fn move_node(&mut self, share: ShareId, source: &str, target: &str) {
         let prefix = format!("{source}\\");
+
         for node in self.nodes.iter_mut().flatten() {
             if node.share != share {
                 continue;
             }
+
             if node.path.eq_ignore_ascii_case(source) {
                 node.path = target.to_owned();
             } else if node.path.len() > prefix.len()
@@ -214,6 +176,9 @@ impl MemoryBackend {
     }
 
     fn handle(&mut self, handle: FileHandle) -> Result<&mut Handle, FsError> {
+        /// What the backend returns for a handle the server never opened.
+        const INVALID_HANDLE: FsError = FsError::from_status(NtStatus::InvalidHandle);
+
         self.handles
             .get_mut(handle.0 as usize)
             .and_then(Option::as_mut)
@@ -230,6 +195,7 @@ impl MemoryBackend {
         if node.directory {
             return Err(FsError::IsADirectory);
         }
+
         Ok(node)
     }
 
@@ -248,6 +214,7 @@ impl MemoryBackend {
             .map(|(index, node)| (node.name().to_owned(), index))
             .collect();
         children.sort();
+
         children
     }
 }
@@ -266,6 +233,7 @@ impl Platform for MemoryBackend {
 
     fn computer_name(&mut self, output: &mut [u8; COMPUTER_NAME_CAPACITY]) -> usize {
         output[..COMPUTER_NAME.len()].copy_from_slice(COMPUTER_NAME);
+
         COMPUTER_NAME.len()
     }
 }
@@ -289,8 +257,11 @@ impl Shares for MemoryBackend {
     fn find_share(&mut self, name: Utf16Le<'_>, _kind: UserKind) -> Option<Share> {
         SHARES
             .iter()
-            .find(|(share, _, _)| name.eq_ignore_ascii_case(share.as_bytes()))
-            .map(|&(_, id, writable)| Share { id, writable })
+            .find(|share| name.eq_ignore_ascii_case(share.name.as_bytes()))
+            .map(|share| Share {
+                id: share.id,
+                writable: share.writable,
+            })
     }
 
     fn share_name(
@@ -299,12 +270,14 @@ impl Shares for MemoryBackend {
         _kind: UserKind,
         name: &mut [u16; SHARE_NAME_CAPACITY],
     ) -> Option<usize> {
-        let (share, _, _) = SHARES.get(index.0 as usize)?;
+        let share = SHARES.get(index.0 as usize)?;
+
         let mut length = 0;
-        for (unit, value) in name.iter_mut().zip(share.encode_utf16()) {
+        for (unit, value) in name.iter_mut().zip(share.name.encode_utf16()) {
             *unit = value;
             length += 1;
         }
+
         Some(length)
     }
 }
@@ -318,18 +291,22 @@ impl FileSystem for MemoryBackend {
     ) -> Result<Opened, FsError> {
         let path = path_string(path);
         let wants_directory = request.options.contains(CreateOptions::DIRECTORY_FILE);
+
         let (index, action) = match self.find(share, &path) {
             Some(index) => {
                 let node = self.node_mut(index);
                 if node.delete_pending {
                     return Err(FsError::DeletePending);
                 }
+
                 if wants_directory && !node.directory {
                     return Err(FsError::NotADirectory);
                 }
+
                 if request.options.contains(CreateOptions::NON_DIRECTORY_FILE) && node.directory {
                     return Err(FsError::IsADirectory);
                 }
+
                 let action = match request.disposition {
                     CreateDisposition::Create => return Err(FsError::NameCollision),
                     CreateDisposition::Open | CreateDisposition::OpenIf => CreateAction::Opened,
@@ -342,6 +319,7 @@ impl FileSystem for MemoryBackend {
                 if action != CreateAction::Opened {
                     node.data.clear();
                 }
+
                 (index, action)
             }
             None => {
@@ -351,19 +329,23 @@ impl FileSystem for MemoryBackend {
                 {
                     return Err(FsError::PathNotFound);
                 }
+
                 if matches!(
                     request.disposition,
                     CreateDisposition::Open | CreateDisposition::Overwrite
                 ) {
                     return Err(FsError::NotFound);
                 }
+
                 let index = self.insert(share, &path, wants_directory, Vec::new());
                 if request.attributes.0 != 0 && !wants_directory {
                     self.node_mut(index).attributes = request.attributes;
                 }
+
                 (index, CreateAction::Created)
             }
         };
+
         self.node_mut(index).opens += 1;
         let handle = Handle {
             node: index,
@@ -371,6 +353,7 @@ impl FileSystem for MemoryBackend {
             listing: None,
             cursor: 0,
         };
+
         let slot = match self.handles.iter().position(Option::is_none) {
             Some(slot) => {
                 self.handles[slot] = Some(handle);
@@ -381,6 +364,7 @@ impl FileSystem for MemoryBackend {
                 self.handles.len() - 1
             }
         };
+
         Ok(Opened {
             handle: FileHandle(slot as u32),
             action,
@@ -393,6 +377,7 @@ impl FileSystem for MemoryBackend {
             .take()
             .expect("server closes an open handle once");
         self.closed.push(handle);
+
         let node = self.node_mut(closed.node);
         node.opens -= 1;
         node.delete_pending |= closed.delete_on_close;
@@ -408,11 +393,14 @@ impl FileSystem for MemoryBackend {
         output: &mut [u8],
     ) -> Result<usize, FsError> {
         let data = &self.file_node(handle)?.data;
+
+        // An offset past the end, including one beyond `usize`, reads nothing.
         let start = usize::try_from(offset)
             .unwrap_or(usize::MAX)
             .min(data.len());
         let count = (data.len() - start).min(output.len());
         output[..count].copy_from_slice(&data[start..start + count]);
+
         Ok(count)
     }
 
@@ -423,10 +411,12 @@ impl FileSystem for MemoryBackend {
             .filter(|&end| end <= MAXIMUM_FILE)
             .ok_or(FsError::DiskFull)? as usize;
         let start = offset as usize;
+
         if node.data.len() < end {
             node.data.resize(end, 0);
         }
         node.data[start..end].copy_from_slice(data);
+
         Ok(())
     }
 
@@ -436,6 +426,7 @@ impl FileSystem for MemoryBackend {
 
     fn information(&mut self, handle: FileHandle) -> Result<FileInformation, FsError> {
         let index = self.handle_node(handle)?;
+
         Ok(self.node(index).information())
     }
 
@@ -446,6 +437,7 @@ impl FileSystem for MemoryBackend {
     ) -> Result<(), FsError> {
         let index = self.handle_node(handle)?;
         let node = self.node_mut(index);
+
         let times = [
             (&mut node.creation_time, information.creation_time),
             (&mut node.last_access_time, information.last_access_time),
@@ -453,13 +445,17 @@ impl FileSystem for MemoryBackend {
             (&mut node.change_time, information.change_time),
         ];
         for (time, value) in times {
-            if let Some(value) = value {
-                *time = value;
-            }
+            let Some(value) = value else {
+                continue;
+            };
+
+            *time = value;
         }
+
         if let Some(attributes) = information.attributes {
             node.attributes = attributes;
         }
+
         Ok(())
     }
 
@@ -467,7 +463,9 @@ impl FileSystem for MemoryBackend {
         if size > MAXIMUM_FILE {
             return Err(FsError::DiskFull);
         }
+
         self.file_node(handle)?.data.resize(size as usize, 0);
+
         Ok(())
     }
 
@@ -476,7 +474,9 @@ impl FileSystem for MemoryBackend {
         if delete && self.node(index).directory && !self.children(index).is_empty() {
             return Err(FsError::DirectoryNotEmpty);
         }
+
         self.node_mut(index).delete_pending = delete;
+
         Ok(())
     }
 
@@ -489,6 +489,7 @@ impl FileSystem for MemoryBackend {
         let index = self.handle_node(handle)?;
         let share = self.node(index).share;
         let target = path_string(target);
+
         if let Some(existing) = self
             .find(share, &target)
             .filter(|&existing| existing != index)
@@ -497,19 +498,24 @@ impl FileSystem for MemoryBackend {
             if !replace {
                 return Err(FsError::NameCollision);
             }
+
             if existing_node.directory || existing_node.opens != 0 {
                 return Err(FsError::AccessDenied);
             }
+
             self.nodes[existing] = None;
         }
+
         if !self
             .find(share, parent_of(&target))
             .is_some_and(|parent| self.node(parent).directory)
         {
             return Err(FsError::PathNotFound);
         }
+
         let source = self.node(index).path.clone();
         self.move_node(share, &source, &target);
+
         Ok(())
     }
 
@@ -523,23 +529,28 @@ impl FileSystem for MemoryBackend {
         if !self.node(index).directory {
             return Err(FsError::NotADirectory);
         }
+
         if restart || self.handle(handle)?.listing.is_none() {
             let listing = self.children(index);
             let open = self.handle(handle)?;
             open.listing = Some(listing);
             open.cursor = 0;
         }
+
         let open = self.handle(handle)?;
         let listing = open.listing.as_ref().expect("listing taken above");
         let Some((entry_name, entry)) = listing.get(open.cursor).cloned() else {
             return Ok(None);
         };
+
         open.cursor += 1;
+
         let mut length = 0;
         for (unit, value) in name.iter_mut().zip(entry_name.encode_utf16()) {
             *unit = value;
             length += 1;
         }
+
         Ok(Some(DirectoryEntry {
             information: self.node(entry).information(),
             name_length: length,
@@ -563,4 +574,72 @@ impl FileSystem for MemoryBackend {
                 .expect("NTFS is a valid file system name"),
         })
     }
+}
+
+struct Node {
+    share: ShareId,
+    /// Components separated by `\`; empty for the share root.
+    path: String,
+    directory: bool,
+    data: Vec<u8>,
+
+    creation_time: FileTime,
+    last_access_time: FileTime,
+    last_write_time: FileTime,
+    change_time: FileTime,
+    attributes: FileAttributes,
+    index: u64,
+
+    delete_pending: bool,
+    opens: usize,
+}
+
+impl Node {
+    fn information(&self) -> FileInformation {
+        const CLUSTER: u64 = 4096;
+
+        let end_of_file = self.data.len() as u64;
+
+        FileInformation {
+            creation_time: self.creation_time,
+            last_access_time: self.last_access_time,
+            last_write_time: self.last_write_time,
+            change_time: self.change_time,
+            allocation_size: end_of_file.div_ceil(CLUSTER) * CLUSTER,
+            end_of_file,
+            attributes: self.attributes,
+            index: Some(FileIndex(self.index)),
+        }
+    }
+
+    fn name(&self) -> &str {
+        self.path.rsplit('\\').next().unwrap_or("")
+    }
+}
+
+struct Handle {
+    node: usize,
+    delete_on_close: bool,
+
+    /// Names and nodes of a directory scan, taken at its start.
+    listing: Option<Vec<(String, usize)>>,
+    cursor: usize,
+}
+
+struct ShareDefinition {
+    name: &'static str,
+    id: ShareId,
+    writable: bool,
+}
+
+pub fn utf16(text: &str) -> Vec<u8> {
+    text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
+
+fn parent_of(path: &str) -> &str {
+    path.rsplit_once('\\').map_or("", |(parent, _)| parent)
+}
+
+fn path_string(path: SharePath<'_>) -> String {
+    String::from_utf16(&path.as_utf16().units().collect::<Vec<_>>()).unwrap()
 }

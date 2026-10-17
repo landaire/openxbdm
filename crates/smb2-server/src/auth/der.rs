@@ -45,6 +45,7 @@ impl<'a> Reader<'a> {
     pub(super) fn read(&mut self) -> Option<Element<'a>> {
         let (&tag, rest) = self.data.split_first()?;
         let tag = Tag(tag);
+
         let (&first, mut rest) = rest.split_first()?;
         let length = if first < 0x80 {
             usize::from(first)
@@ -53,16 +54,20 @@ impl<'a> Reader<'a> {
             if count == 0 || count > 4 {
                 return None;
             }
+
             let (bytes, after) = rest.split_at_checked(count)?;
             rest = after;
+
             bytes.iter().try_fold(0usize, |length, &byte| {
                 length.checked_mul(256)?.checked_add(usize::from(byte))
             })?
         };
+
         let content = rest.get(..length)?;
         let total = self.data.len() - rest.len() + length;
         let encoding = &self.data[..total];
         self.data = &self.data[total..];
+
         Some(Element {
             tag,
             content,
@@ -75,23 +80,6 @@ impl<'a> Reader<'a> {
         self.read()
             .filter(|element| element.tag == tag)
             .map(|element| element.content)
-    }
-}
-
-/// Bytes the encoding of an element with `content` bytes occupies.
-pub(super) const fn encoded_length(content: usize) -> usize {
-    1 + length_size(content) + content
-}
-
-const fn length_size(length: usize) -> usize {
-    if length < 0x80 {
-        1
-    } else if length <= 0xff {
-        2
-    } else if length <= 0xffff {
-        3
-    } else {
-        4
     }
 }
 
@@ -120,6 +108,7 @@ impl<'a> Writer<'a> {
             .get_mut(self.position..end)?
             .copy_from_slice(data);
         self.position = end;
+
         Some(())
     }
 
@@ -134,19 +123,39 @@ impl<'a> Writer<'a> {
     /// Tag and length of an element whose content follows.
     pub(super) fn header(&mut self, tag: Tag, length: usize) -> Option<()> {
         self.bytes(&[tag.0])?;
+
         let size = length_size(length);
         if size == 1 {
             return self.bytes(&[length as u8]);
         }
+
         self.bytes(&[0x80 | (size - 1) as u8])?;
-        let be = (length as u32).to_be_bytes();
-        self.bytes(&be[be.len() - (size - 1)..])
+        let encoded = (length as u32).to_be_bytes();
+        self.bytes(&encoded[encoded.len() - (size - 1)..])
     }
 
     /// A whole element.
     pub(super) fn element(&mut self, tag: Tag, content: &[u8]) -> Option<()> {
         self.header(tag, content.len())?;
+
         self.bytes(content)
+    }
+}
+
+/// Bytes the encoding of an element with `content` bytes occupies.
+pub(super) const fn encoded_length(content: usize) -> usize {
+    1 + length_size(content) + content
+}
+
+const fn length_size(length: usize) -> usize {
+    if length < 0x80 {
+        1
+    } else if length <= 0xff {
+        2
+    } else if length <= 0xffff {
+        3
+    } else {
+        4
     }
 }
 

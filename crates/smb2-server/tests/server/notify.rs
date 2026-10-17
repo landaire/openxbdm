@@ -11,6 +11,8 @@ use smb2_server::status::NtStatus;
 
 use crate::backend::DATA;
 use crate::backend::MemoryBackend;
+use crate::backend::PASSWORD;
+use crate::backend::USER;
 use crate::client::Client;
 use crate::client::Message;
 use crate::client::access;
@@ -47,12 +49,14 @@ const SCAN_INTERVAL: Duration = Duration::from_secs(5);
 fn watching(config: ServerConfig) -> (Client, FileId) {
     let mut client = Client::negotiated(MemoryBackend::new(), config);
     client
-        .logon(crate::backend::USER, crate::backend::PASSWORD, false)
+        .logon(USER, PASSWORD, false)
         .expect(NtStatus::Success);
     client.tree_connect("Data").expect(NtStatus::Success);
+
     client.backend.add_directory(DATA, "watch");
     client.backend.add_directory(DATA, "watch\\sub");
     let directory = client.open_directory("watch");
+
     (client, directory)
 }
 
@@ -62,6 +66,7 @@ fn wait_for_changes(client: &mut Client, directory: FileId, filter: u32, tree: b
     interim.expect(NtStatus::Pending);
     assert_eq!(interim.command(), command::CHANGE_NOTIFY);
     assert_ne!(interim.flags() & flags::ASYNC_COMMAND, 0);
+
     interim
 }
 
@@ -72,6 +77,7 @@ fn completion(client: &mut Client, interim: &Message) -> Message {
     assert_eq!(reply.command(), command::CHANGE_NOTIFY);
     assert_eq!(reply.message_id(), interim.message_id());
     assert_eq!(reply.async_id(), interim.async_id());
+
     reply
 }
 
@@ -142,6 +148,7 @@ fn writes_are_reported_to_a_size_filter() {
     let (mut client, directory) = watching(config(false));
     client.backend.add_file(DATA, "watch\\log.txt", b"");
     let mut peer = client.connected_peer("Data");
+
     let interim = wait_for_changes(&mut client, directory, SIZE | LAST_WRITE, false);
     client.with_peer(&mut peer, |peer| {
         let file = peer.open("watch\\log.txt", disposition::OPEN);
@@ -155,9 +162,11 @@ fn writes_are_reported_to_a_size_filter() {
 fn filter_selects_the_reported_changes() {
     let (mut client, directory) = watching(config(false));
     let mut peer = client.connected_peer("Data");
+
     let interim = wait_for_changes(&mut client, directory, DIR_NAME, false);
     client.with_peer(&mut peer, |peer| create_file(peer, "watch\\file.txt"));
     assert!(client.poll().is_nothing());
+
     client.with_peer(&mut peer, |peer| {
         peer.create(
             "watch\\folder",
@@ -176,6 +185,7 @@ fn only_a_tree_watch_reports_changes_below_the_directory() {
     let (mut client, directory) = watching(config(false));
     let tree_directory = client.open_directory("watch");
     let mut peer = client.connected_peer("Data");
+
     let flat = wait_for_changes(&mut client, directory, NAMES, false);
     let tree = wait_for_changes(&mut client, tree_directory, NAMES, true);
 
@@ -193,6 +203,7 @@ fn only_a_tree_watch_reports_changes_below_the_directory() {
 fn changes_while_no_notification_waits_report_enum_dir() {
     let (mut client, directory) = watching(config(false));
     let mut peer = client.connected_peer("Data");
+
     let interim = wait_for_changes(&mut client, directory, NAMES, false);
     client.with_peer(&mut peer, |peer| create_file(peer, "watch\\a.txt"));
     completion(&mut client, &interim);
@@ -211,6 +222,7 @@ fn changes_while_no_notification_waits_report_enum_dir() {
 #[test]
 fn own_change_completes_the_notification_in_the_same_reply() {
     let (mut client, directory) = watching(config(false));
+
     let interim = wait_for_changes(&mut client, directory, NAMES, false);
     let replies = client
         .call_all(
@@ -237,6 +249,7 @@ fn scans_find_changes_made_outside_the_server() {
         ..config(false)
     });
     let interim = wait_for_changes(&mut client, directory, NAMES, false);
+
     // A scan of an unchanged directory reports nothing.
     advance(&mut client, SCAN_INTERVAL);
     assert!(client.poll().is_nothing());
@@ -267,10 +280,12 @@ fn scans_of_a_tree_watch_look_below_the_directory() {
     let tree_directory = client.open_directory("watch");
     let flat = wait_for_changes(&mut client, directory, NAMES, false);
     let tree = wait_for_changes(&mut client, tree_directory, NAMES, true);
+
     client
         .backend
         .add_file(DATA, "watch\\sub\\outside.txt", b"");
     advance(&mut client, SCAN_INTERVAL);
+
     // Each poll scans one due watch; the entries of `watch` itself are
     // unchanged, so only the tree watch completes.
     let mut replies = client.poll().replies_or_none();
@@ -280,8 +295,10 @@ fn scans_of_a_tree_watch_look_below_the_directory() {
     };
     assert_eq!(reply.async_id(), tree.async_id());
     reply.expect(NtStatus::NotifyEnumDir);
+
     advance(&mut client, SCAN_INTERVAL);
     assert!(client.poll().is_nothing());
+
     let reply = client.cancel(flat.message_id(), flat.async_id()).single();
     reply.expect(NtStatus::Cancelled);
 }
@@ -290,6 +307,7 @@ fn scans_of_a_tree_watch_look_below_the_directory() {
 fn without_a_scan_interval_outside_changes_go_unreported() {
     let (mut client, directory) = watching(config(false));
     wait_for_changes(&mut client, directory, NAMES, false);
+
     client.backend.add_file(DATA, "watch\\outside.txt", b"");
     advance(&mut client, Duration::from_secs(3600));
     assert!(!client.wants_poll());
@@ -300,6 +318,7 @@ fn without_a_scan_interval_outside_changes_go_unreported() {
 fn closing_the_watched_open_ends_the_notification_with_cleanup() {
     let (mut client, directory) = watching(config(false));
     let interim = wait_for_changes(&mut client, directory, NAMES, false);
+
     let replies = client
         .call_all(command::CLOSE, &close_body(directory, 0))
         .replies();
@@ -314,18 +333,21 @@ fn closing_the_watched_open_ends_the_notification_with_cleanup() {
 fn cancel_ends_the_notification() {
     let (mut client, directory) = watching(config(false));
     let interim = wait_for_changes(&mut client, directory, NAMES, false);
+
     let reply = client
         .cancel(interim.message_id(), interim.async_id())
         .single();
     reply.expect(NtStatus::Cancelled);
     assert_eq!(reply.command(), command::CHANGE_NOTIFY);
     assert_eq!(reply.async_id(), interim.async_id());
+
     // A cancel of a request that already ended has no reply.
     assert!(
         client
             .cancel(interim.message_id(), interim.async_id())
             .is_nothing()
     );
+
     // The open accepts a new notification.
     wait_for_changes(&mut client, directory, NAMES, false);
 }
@@ -336,15 +358,18 @@ fn notifications_of_an_encrypted_session_are_encrypted() {
         encrypt_data: true,
         ..config(false)
     };
+
     let mut client = Client::smb3(config, dialect::SMB_3_1_1, &[context::AES_128_GCM], &[]);
     assert!(client.encrypt);
     client.tree_connect("Data").expect(NtStatus::Success);
+
     client.backend.add_directory(DATA, "watch");
     let directory = client.open_directory("watch");
     let mut peer = client.connected_peer("Data");
 
     let interim = wait_for_changes(&mut client, directory, NAMES, false);
     client.with_peer(&mut peer, |peer| create_file(peer, "watch\\new.txt"));
+
     let before = *client.reply_nonces.last().unwrap();
     let frames = client.poll().frames();
     assert_eq!(frames.len(), 1);
@@ -369,6 +394,7 @@ fn notifications_with_full_size_buffers_complete_together() {
     let (mut client, directory) = watching(config(false));
     let second = client.open_directory("watch");
     let mut peer = client.connected_peer("Data");
+
     let mut interims = Vec::new();
     for watched in [directory, second] {
         let interim = client
@@ -377,6 +403,7 @@ fn notifications_with_full_size_buffers_complete_together() {
         interim.expect(NtStatus::Pending);
         interims.push(interim);
     }
+
     client.with_peer(&mut peer, |peer| create_file(peer, "watch\\new.txt"));
     let replies = client.poll().replies();
     assert_eq!(replies.len(), 2);
@@ -384,6 +411,7 @@ fn notifications_with_full_size_buffers_complete_together() {
         assert_eq!(reply.async_id(), interim.async_id());
         assert_eq!(records(reply), [(ADDED, "new.txt".to_owned())]);
     }
+
     assert!(!client.wants_poll());
 }
 
@@ -395,15 +423,19 @@ fn one_poll_runs_one_due_scan_oldest_first() {
     });
     client.backend.add_directory(DATA, "other");
     let other = client.open_directory("other");
+
     let first = wait_for_changes(&mut client, directory, NAMES, false);
     advance(&mut client, Duration::from_secs(1));
     let second = wait_for_changes(&mut client, other, NAMES, false);
+
     client.backend.add_file(DATA, "watch\\outside.txt", b"");
     client.backend.add_file(DATA, "other\\outside.txt", b"");
     advance(&mut client, SCAN_INTERVAL);
+
     let reply = client.poll().single();
     assert_eq!(reply.async_id(), first.async_id());
     reply.expect(NtStatus::NotifyEnumDir);
+
     let reply = client.poll().single();
     assert_eq!(reply.async_id(), second.async_id());
     reply.expect(NtStatus::NotifyEnumDir);
@@ -420,10 +452,12 @@ fn change_between_notifications_is_found_by_the_next_scan() {
         .cancel(interim.message_id(), interim.async_id())
         .single()
         .expect(NtStatus::Cancelled);
+
     client.backend.add_file(DATA, "watch\\outside.txt", b"");
     // No notification waits, so nothing is scanned.
     advance(&mut client, SCAN_INTERVAL);
     assert!(client.poll().is_nothing());
+
     let interim = wait_for_changes(&mut client, directory, NAMES, false);
     let reply = client.poll().single();
     assert_eq!(reply.async_id(), interim.async_id());
@@ -437,6 +471,7 @@ fn undefined_filter_bits_are_ignored() {
         ..config(false)
     });
     let mut peer = client.connected_peer("Data");
+
     for filter in [0, 0x8000_1000] {
         // Nothing matches a filter without defined bits; the request waits
         // until it is cancelled.
@@ -454,6 +489,7 @@ fn undefined_filter_bits_are_ignored() {
             .single()
             .expect(NtStatus::Cancelled);
     }
+
     // Defined bits next to undefined ones are reported.
     let (mut client, directory) = watching(config(false));
     let mut peer = client.connected_peer("Data");

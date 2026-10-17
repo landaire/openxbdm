@@ -40,6 +40,7 @@ impl<'a> Utf16Le<'a> {
     pub fn unit(self, index: usize) -> Option<u16> {
         let start = index.checked_mul(2)?;
         let pair = self.0.get(start..start + 2)?;
+
         Some(u16::from_le_bytes([pair[0], pair[1]]))
     }
 
@@ -63,20 +64,24 @@ impl<'a> Utf16Le<'a> {
             && self
                 .units()
                 .zip(other.units())
-                .all(|(a, b)| fold_ascii(a) == fold_ascii(b))
+                .all(|(unit, other_unit)| fold_ascii(unit) == fold_ascii(other_unit))
     }
 }
 
 impl core::fmt::Debug for Utf16Le<'_> {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         use core::fmt::Write as _;
+
         formatter.write_char('"')?;
+
         for character in char::decode_utf16(self.units()) {
+            // Debug output shows unpaired surrogates as the replacement character.
             let character = character.unwrap_or(char::REPLACEMENT_CHARACTER);
             for escaped in character.escape_debug() {
                 formatter.write_char(escaped)?;
             }
         }
+
         formatter.write_char('"')
     }
 }
@@ -103,12 +108,14 @@ pub const fn upper_ascii(unit: u16) -> u16 {
 /// `None` when `output` is too small.
 pub fn encode_units(units: impl IntoIterator<Item = u16>, output: &mut [u8]) -> Option<usize> {
     let mut written = 0;
+
     for unit in units {
         output
             .get_mut(written..written + 2)?
             .copy_from_slice(&unit.to_le_bytes());
         written += 2;
     }
+
     Some(written)
 }
 

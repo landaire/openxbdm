@@ -19,17 +19,20 @@ impl GhashKey {
     fn new(cipher: &Aes128) -> Self {
         let mut block = [0; 16];
         cipher.encrypt_block(&mut block);
+
         Self(u128::from_be_bytes(block))
     }
 
     /// Absorb the AAD and data length block and return the GHASH value.
     fn finish(&self, mut chain: Chain, aad_length: u64, data_length: u64) -> [u8; 16] {
         chain.pad(self);
+
         let mut lengths = [0; 16];
         lengths[..8].copy_from_slice(&(aad_length * 8).to_be_bytes());
         lengths[8..].copy_from_slice(&(data_length * 8).to_be_bytes());
         chain.update(&lengths, self);
         chain.pad(self);
+
         chain.state
     }
 }
@@ -39,13 +42,15 @@ impl ChainStep for GhashKey {
     /// significant bit of its first byte.
     fn step(&self, state: &mut [u8; 16]) {
         const REDUCTION: u128 = 0xe1 << 120;
-        let x = u128::from_be_bytes(*state);
-        let mut v = self.0;
+
+        let operand = u128::from_be_bytes(*state);
+        let mut multiple = self.0;
         let mut product = 0;
         for bit in (0..128).rev() {
-            product ^= v & ((x >> bit) & 1).wrapping_neg();
-            v = (v >> 1) ^ (REDUCTION & (v & 1).wrapping_neg());
+            product ^= multiple & ((operand >> bit) & 1).wrapping_neg();
+            multiple = (multiple >> 1) ^ (REDUCTION & (multiple & 1).wrapping_neg());
         }
+
         *state = product.to_be_bytes();
     }
 }
@@ -56,6 +61,7 @@ fn ghash(key: &GhashKey, aad: &[u8], data: &[u8]) -> [u8; 16] {
     chain.update(aad, key);
     chain.pad(key);
     chain.update(data, key);
+
     key.finish(chain, aad.len() as u64, data.len() as u64)
 }
 
@@ -69,10 +75,12 @@ pub fn gcm_seal(
     if data.len() as u64 > MAX_DATA {
         return Err(MessageTooLong);
     }
+
     let cipher = Aes128::new(key);
     cipher.apply_counter_mode(nonce, 2, data);
     let mut tag = ghash(&GhashKey::new(&cipher), aad, data);
     cipher.apply_counter_mode(nonce, 1, &mut tag);
+
     Ok(tag)
 }
 
@@ -88,13 +96,17 @@ pub fn gcm_open(
     if data.len() as u64 > MAX_DATA {
         return false;
     }
+
     let cipher = Aes128::new(key);
     let mut expected = ghash(&GhashKey::new(&cipher), aad, data);
     cipher.apply_counter_mode(nonce, 1, &mut expected);
+
     if !constant_time_eq(&expected, tag) {
         return false;
     }
+
     cipher.apply_counter_mode(nonce, 2, data);
+
     true
 }
 
@@ -103,14 +115,17 @@ pub fn gcm_open(
 pub fn gmac(key: &[u8; 16], nonce: &[u8; 12], aad_parts: &[&[u8]]) -> [u8; 16] {
     let cipher = Aes128::new(key);
     let hash_key = GhashKey::new(&cipher);
+
     let mut chain = Chain::new();
     let mut aad_length = 0;
     for part in aad_parts {
         chain.update(part, &hash_key);
         aad_length += part.len() as u64;
     }
+
     let mut tag = hash_key.finish(chain, aad_length, 0);
     cipher.apply_counter_mode(nonce, 1, &mut tag);
+
     tag
 }
 

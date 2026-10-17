@@ -12,8 +12,10 @@ pub fn smb3_kdf(key: &[u8; 16], label: &[u8], context: &[u8]) -> [u8; 16] {
     mac.update(&[0]);
     mac.update(context);
     mac.update(&128u32.to_be_bytes());
+
     let mut derived = [0; 16];
     derived.copy_from_slice(&mac.finalize()[..16]);
+
     derived
 }
 

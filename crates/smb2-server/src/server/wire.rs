@@ -127,11 +127,11 @@ impl FileId {
     };
 
     /// The first identifier a connection assigns.
-    pub const FIRST: Self = Self::with_value(1);
+    pub const FIRST: Self = Self::from_value(1);
 
     /// Persistent and volatile parts are the same value; the server keeps
     /// no durable handles.
-    const fn with_value(value: u64) -> Self {
+    const fn from_value(value: u64) -> Self {
         Self {
             persistent: value,
             volatile: value,
@@ -143,7 +143,7 @@ impl FileId {
     pub const fn next(self) -> Self {
         match self.volatile.wrapping_add(1) {
             u64::MAX | 0 => Self::FIRST,
-            next => Self::with_value(next),
+            next => Self::from_value(next),
         }
     }
 
@@ -171,12 +171,14 @@ pub fn u16_at(bytes: &[u8], offset: usize) -> u16 {
 pub fn u32_at(bytes: &[u8], offset: usize) -> u32 {
     let mut value = [0; 4];
     value.copy_from_slice(&bytes[offset..offset + 4]);
+
     u32::from_le_bytes(value)
 }
 
 pub fn u64_at(bytes: &[u8], offset: usize) -> u64 {
     let mut value = [0; 8];
     value.copy_from_slice(&bytes[offset..offset + 8]);
+
     u64::from_le_bytes(value)
 }
 
@@ -206,6 +208,7 @@ pub fn buffer(message: &[u8], fixed: usize, offset: usize, length: usize) -> Opt
     if offset < HEADER_SIZE + fixed {
         return None;
     }
+
     message.get(offset..offset.checked_add(length)?)
 }
 

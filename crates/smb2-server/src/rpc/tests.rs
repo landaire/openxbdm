@@ -37,121 +37,9 @@ use crate::fs::VolumeInformation;
 use crate::path::SharePath;
 use crate::utf16::Utf16Le;
 
-/// Disk shares from a list, and the computer name XBOX360.
-struct TestBackend {
-    shares: &'static [&'static str],
-}
-
 const SHARES: TestBackend = TestBackend {
     shares: &["Devkit", "Hdd"],
 };
-
-impl Platform for TestBackend {
-    fn system_time(&mut self) -> FileTime {
-        FileTime(0)
-    }
-
-    fn random_bytes(&mut self, output: &mut [u8]) {
-        output.fill(0);
-    }
-
-    fn computer_name(&mut self, output: &mut [u8; COMPUTER_NAME_CAPACITY]) -> usize {
-        output[..7].copy_from_slice(b"XBOX360");
-        7
-    }
-}
-
-impl Accounts for TestBackend {
-    fn password(&mut self, _: Utf16Le<'_>, _: Utf16Le<'_>) -> Option<NtOwf> {
-        None
-    }
-
-    fn allow_guest(&mut self) -> bool {
-        true
-    }
-
-    fn allow_anonymous(&mut self) -> bool {
-        true
-    }
-}
-
-impl Shares for TestBackend {
-    fn find_share(&mut self, _: Utf16Le<'_>, _: UserKind) -> Option<Share> {
-        unreachable!()
-    }
-
-    fn share_name(
-        &mut self,
-        index: ShareIndex,
-        _: UserKind,
-        name: &mut [u16; SHARE_NAME_CAPACITY],
-    ) -> Option<usize> {
-        let share = self.shares.get(index.0 as usize)?;
-        for (unit, byte) in name.iter_mut().zip(share.bytes()) {
-            *unit = u16::from(byte);
-        }
-        Some(share.len())
-    }
-}
-
-impl FileSystem for TestBackend {
-    fn open(&mut self, _: ShareId, _: SharePath<'_>, _: &OpenRequest) -> Result<Opened, FsError> {
-        unreachable!()
-    }
-
-    fn close(&mut self, _: FileHandle) {
-        unreachable!()
-    }
-
-    fn read(&mut self, _: FileHandle, _: u64, _: &mut [u8]) -> Result<usize, FsError> {
-        unreachable!()
-    }
-
-    fn write(&mut self, _: FileHandle, _: u64, _: &[u8]) -> Result<(), FsError> {
-        unreachable!()
-    }
-
-    fn flush(&mut self, _: FileHandle) -> Result<(), FsError> {
-        unreachable!()
-    }
-
-    fn information(&mut self, _: FileHandle) -> Result<FileInformation, FsError> {
-        unreachable!()
-    }
-
-    fn set_basic_information(
-        &mut self,
-        _: FileHandle,
-        _: &BasicInformation,
-    ) -> Result<(), FsError> {
-        unreachable!()
-    }
-
-    fn set_end_of_file(&mut self, _: FileHandle, _: u64) -> Result<(), FsError> {
-        unreachable!()
-    }
-
-    fn set_delete_pending(&mut self, _: FileHandle, _: bool) -> Result<(), FsError> {
-        unreachable!()
-    }
-
-    fn rename(&mut self, _: FileHandle, _: SharePath<'_>, _: bool) -> Result<(), FsError> {
-        unreachable!()
-    }
-
-    fn read_directory(
-        &mut self,
-        _: FileHandle,
-        _: bool,
-        _: &mut [u16; NAME_CAPACITY],
-    ) -> Result<Option<DirectoryEntry>, FsError> {
-        unreachable!()
-    }
-
-    fn volume_information(&mut self, _: FileHandle) -> Result<VolumeInformation, FsError> {
-        unreachable!()
-    }
-}
 
 /// Bind as a Windows client sends it for srvsvc (C706 12.6.4.3, MS-RPCE
 /// 2.2.2.13 and 3.3.1.5.3): three presentation contexts for the srvsvc
@@ -281,6 +169,118 @@ const SERVER_GET_INFO_101: [u8; 60] = [
     // Level 101.
     0x65, 0x00, 0x00, 0x00,
 ];
+
+/// Disk shares from a list, and the computer name XBOX360.
+struct TestBackend {
+    shares: &'static [&'static str],
+}
+
+impl Platform for TestBackend {
+    fn system_time(&mut self) -> FileTime {
+        FileTime(0)
+    }
+
+    fn random_bytes(&mut self, output: &mut [u8]) {
+        output.fill(0);
+    }
+
+    fn computer_name(&mut self, output: &mut [u8; COMPUTER_NAME_CAPACITY]) -> usize {
+        output[..7].copy_from_slice(b"XBOX360");
+        7
+    }
+}
+
+impl Accounts for TestBackend {
+    fn password(&mut self, _: Utf16Le<'_>, _: Utf16Le<'_>) -> Option<NtOwf> {
+        None
+    }
+
+    fn allow_guest(&mut self) -> bool {
+        true
+    }
+
+    fn allow_anonymous(&mut self) -> bool {
+        true
+    }
+}
+
+impl Shares for TestBackend {
+    fn find_share(&mut self, _: Utf16Le<'_>, _: UserKind) -> Option<Share> {
+        unreachable!()
+    }
+
+    fn share_name(
+        &mut self,
+        index: ShareIndex,
+        _: UserKind,
+        name: &mut [u16; SHARE_NAME_CAPACITY],
+    ) -> Option<usize> {
+        let share = self.shares.get(index.0 as usize)?;
+        for (unit, byte) in name.iter_mut().zip(share.bytes()) {
+            *unit = u16::from(byte);
+        }
+        Some(share.len())
+    }
+}
+
+impl FileSystem for TestBackend {
+    fn open(&mut self, _: ShareId, _: SharePath<'_>, _: &OpenRequest) -> Result<Opened, FsError> {
+        unreachable!()
+    }
+
+    fn close(&mut self, _: FileHandle) {
+        unreachable!()
+    }
+
+    fn read(&mut self, _: FileHandle, _: u64, _: &mut [u8]) -> Result<usize, FsError> {
+        unreachable!()
+    }
+
+    fn write(&mut self, _: FileHandle, _: u64, _: &[u8]) -> Result<(), FsError> {
+        unreachable!()
+    }
+
+    fn flush(&mut self, _: FileHandle) -> Result<(), FsError> {
+        unreachable!()
+    }
+
+    fn information(&mut self, _: FileHandle) -> Result<FileInformation, FsError> {
+        unreachable!()
+    }
+
+    fn set_basic_information(
+        &mut self,
+        _: FileHandle,
+        _: &BasicInformation,
+    ) -> Result<(), FsError> {
+        unreachable!()
+    }
+
+    fn set_end_of_file(&mut self, _: FileHandle, _: u64) -> Result<(), FsError> {
+        unreachable!()
+    }
+
+    fn set_delete_pending(&mut self, _: FileHandle, _: bool) -> Result<(), FsError> {
+        unreachable!()
+    }
+
+    fn rename(&mut self, _: FileHandle, _: SharePath<'_>, _: bool) -> Result<(), FsError> {
+        unreachable!()
+    }
+
+    fn read_directory(
+        &mut self,
+        _: FileHandle,
+        _: bool,
+        _: &mut [u16; NAME_CAPACITY],
+    ) -> Result<Option<DirectoryEntry>, FsError> {
+        unreachable!()
+    }
+
+    fn volume_information(&mut self, _: FileHandle) -> Result<VolumeInformation, FsError> {
+        unreachable!()
+    }
+}
 
 fn hex(bytes: &[u8]) -> String {
     use core::fmt::Write as _;
@@ -454,18 +454,41 @@ fn share_list_change_breaks_reply() {
     };
     let mut small_frag_bind = BIND;
     small_frag_bind[18..20].copy_from_slice(&64u16.to_le_bytes());
-    // Bind, first read size and its result, backend for the second read.
+    /// Bind, first read size and its result, backend for the second read.
+    struct ChangeCase<'a> {
+        bind: &'a [u8],
+        first: usize,
+        first_result: PipeRead,
+        changed: TestBackend,
+    }
+
     let cases = [
-        (&BIND, 7, PipeRead::Partial { length: 7 }, ONE_SHARE),
-        (
-            &small_frag_bind,
-            1024,
-            PipeRead::Complete { length: 64 },
-            ONE_SHARE,
-        ),
-        (&BIND, 7, PipeRead::Partial { length: 7 }, RENAMED),
+        ChangeCase {
+            bind: &BIND,
+            first: 7,
+            first_result: PipeRead::Partial { length: 7 },
+            changed: ONE_SHARE,
+        },
+        ChangeCase {
+            bind: &small_frag_bind,
+            first: 1024,
+            first_result: PipeRead::Complete { length: 64 },
+            changed: ONE_SHARE,
+        },
+        ChangeCase {
+            bind: &BIND,
+            first: 7,
+            first_result: PipeRead::Partial { length: 7 },
+            changed: RENAMED,
+        },
     ];
-    for (bind, first, first_result, changed) in cases {
+    for case in cases {
+        let ChangeCase {
+            bind,
+            first,
+            first_result,
+            changed,
+        } = case;
         let mut pipe = Pipe::new();
         reply(&mut pipe, bind);
         pipe.write(&SHARE_ENUM).unwrap();
@@ -539,7 +562,25 @@ fn fragmented_request() {
     let stub = &SHARE_GET_INFO_1005[24..];
     let (head, tail) = stub.split_at(32);
     let mut stream = Vec::new();
-    for (part, flags, hint) in [(head, 0x01, stub.len()), (tail, 0x02, tail.len())] {
+    struct Fragment<'a> {
+        part: &'a [u8],
+        flags: u8,
+        hint: usize,
+    }
+
+    for fragment in [
+        Fragment {
+            part: head,
+            flags: 0x01,
+            hint: stub.len(),
+        },
+        Fragment {
+            part: tail,
+            flags: 0x02,
+            hint: tail.len(),
+        },
+    ] {
+        let Fragment { part, flags, hint } = fragment;
         let mut header = SHARE_GET_INFO_1005[..24].to_vec();
         header[3] = flags;
         header[8..10].copy_from_slice(&((24 + part.len()) as u16).to_le_bytes());

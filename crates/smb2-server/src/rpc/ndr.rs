@@ -2,7 +2,6 @@
 
 use crate::crypto::Sha256;
 
-const PADDING: [u8; 8] = [0; 8];
 /// Bytes of a rendering digest: SHA-256 truncated to 128 bits.
 pub(super) const DIGEST_LENGTH: usize = 16;
 
@@ -40,14 +39,17 @@ impl<'a> Writer<'a> {
         let digest = self.digest.finalize();
         let mut truncated = [0; DIGEST_LENGTH];
         truncated.copy_from_slice(&digest[..DIGEST_LENGTH]);
+
         truncated
     }
 
     pub fn bytes(&mut self, bytes: &[u8]) {
         self.digest.update(bytes);
+
         let begin = self.position;
         let end = begin + bytes.len();
         self.position = end;
+
         let window_end = self.start + self.output.len();
         let from = begin.max(self.start);
         let to = end.min(window_end);
@@ -59,6 +61,8 @@ impl<'a> Writer<'a> {
 
     /// Zero padding up to a multiple of `alignment` (at most 8).
     pub fn align(&mut self, alignment: usize) {
+        const PADDING: [u8; 8] = [0; 8];
+
         let padding = self.position.wrapping_neg() & (alignment - 1);
         self.bytes(&PADDING[..padding]);
     }
@@ -84,13 +88,16 @@ impl<'a> Writer<'a> {
             Text::Ascii(ascii) => ascii.len(),
         } as u32
             + 1;
+
         self.u32(count);
         self.u32(0);
         self.u32(count);
+
         match text {
             Text::Units(units) => units.iter().for_each(|&unit| self.u16(unit)),
             Text::Ascii(ascii) => ascii.iter().for_each(|&byte| self.u16(u16::from(byte))),
         }
+
         self.u16(0);
     }
 }
@@ -132,6 +139,7 @@ impl<'a> Reader<'a> {
         let start = self.position.next_multiple_of(4);
         let bytes = self.data.get(start..start + 4)?;
         self.position = start + 4;
+
         Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
@@ -144,14 +152,18 @@ impl<'a> Reader<'a> {
         if offset != 0 || actual == 0 || actual > maximum {
             return None;
         }
+
         let units = u16::try_from(actual - 1).ok()?;
         let start = self.position;
         let end = start.checked_add(2 * usize::from(units) + 2)?;
         let bytes = self.data.get(start..end)?;
+
         if bytes[bytes.len() - 2..] != [0, 0] {
             return None;
         }
+
         self.position = end;
+
         Some(StubString {
             start: u16::try_from(start).ok()?,
             units,
@@ -163,6 +175,7 @@ impl<'a> Reader<'a> {
         if self.u32()? != 0 {
             self.string()?;
         }
+
         Some(())
     }
 }

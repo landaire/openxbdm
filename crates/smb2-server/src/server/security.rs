@@ -1,12 +1,15 @@
 //! Message signing (MS-SMB2 3.1.4.1), key derivation (3.1.4.2), and
 //! encryption (3.1.4.3, 2.2.41).
 
+use core::fmt;
+
 use crate::auth::SessionKey;
 use crate::crypto::AesCmac;
 use crate::crypto::HmacSha256;
 use crate::crypto::Sha512;
 use crate::crypto::ccm_open;
 use crate::crypto::ccm_seal;
+use crate::crypto::constant_time_eq;
 use crate::crypto::gcm_open;
 use crate::crypto::gcm_seal;
 use crate::crypto::gmac;
@@ -89,8 +92,8 @@ pub(crate) struct SigningKey {
     pub algorithm: SigningAlgorithm,
 }
 
-impl core::fmt::Debug for SigningKey {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl fmt::Debug for SigningKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "SigningKey({:?}, ..)", self.algorithm)
     }
 }
@@ -105,8 +108,8 @@ pub(crate) struct EncryptionKeys {
     pub decryption: [u8; 16],
 }
 
-impl core::fmt::Debug for EncryptionKeys {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl fmt::Debug for EncryptionKeys {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "EncryptionKeys({:?}, ..)", self.cipher)
     }
 }
@@ -123,12 +126,13 @@ impl PreauthHash {
         let mut hash = Sha512::new();
         hash.update(&self.0);
         hash.update(message);
+
         Self(hash.finalize())
     }
 }
 
-impl core::fmt::Debug for PreauthHash {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl fmt::Debug for PreauthHash {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("PreauthHash(..)")
     }
 }
@@ -142,6 +146,7 @@ pub(super) fn derive_keys(
     cipher: Option<Cipher>,
 ) -> (SigningKey, Option<EncryptionKeys>) {
     let key = &session_key.0;
+
     match dialect {
         Dialect::SMB_3_1_1 => (
             SigningKey {
@@ -179,15 +184,18 @@ pub(super) fn derive_keys(
 pub(super) fn signature(message: &[u8], key: &SigningKey) -> [u8; 16] {
     let head = &message[..header::SIGNATURE];
     let tail = &message[header::SIGNATURE + 16..];
+
     match key.algorithm {
         SigningAlgorithm::HmacSha256 => {
             let mut mac = HmacSha256::new(&key.key);
             mac.update(head);
             mac.update(&[0; 16]);
             mac.update(tail);
+
             let digest = mac.finalize();
             let mut signature = [0; 16];
             signature.copy_from_slice(&digest[..16]);
+
             signature
         }
         SigningAlgorithm::AesCmac => {
@@ -221,7 +229,7 @@ pub(super) fn sign(message: &mut [u8], key: &SigningKey) {
 
 /// Whether a request carries the signature of `key`.
 pub(super) fn verify(message: &[u8], key: &SigningKey) -> bool {
-    crate::crypto::constant_time_eq(
+    constant_time_eq(
         &signature(message, key),
         &message[header::SIGNATURE..header::SIGNATURE + 16],
     )
@@ -240,14 +248,17 @@ pub(super) fn decrypt(message: &mut [u8], keys: &EncryptionKeys) -> Option<usize
     {
         return None;
     }
+
     let length = wire::u32_at(message, TRANSFORM_SIZE) as usize;
     if length != message.len() - TRANSFORM_HEADER {
         return None;
     }
+
     let (header, payload) = message.split_at_mut(TRANSFORM_HEADER);
     let mut tag = [0; 16];
     tag.copy_from_slice(&header[TRANSFORM_SIGNATURE..TRANSFORM_SIGNATURE + 16]);
     let aad = &header[TRANSFORM_NONCE..];
+
     let opened = match keys.cipher {
         Cipher::Aes128Ccm => {
             let mut nonce = [0; 11];
@@ -260,6 +271,7 @@ pub(super) fn decrypt(message: &mut [u8], keys: &EncryptionKeys) -> Option<usize
             gcm_open(&keys.decryption, &nonce, aad, payload, &tag)
         }
     };
+
     opened.then_some(length)
 }
 
@@ -279,6 +291,7 @@ pub(super) fn encrypt(
     wire::put_u32(header, TRANSFORM_SIZE, length as u32);
     wire::put_u16(header, TRANSFORM_FLAGS, TransformFlags::ENCRYPTED.0);
     wire::put_u64(header, TRANSFORM_SESSION, session.0);
+
     let (prefix, aad) = header.split_at_mut(TRANSFORM_NONCE);
     let tag = match keys.cipher {
         Cipher::Aes128Ccm => {
@@ -293,6 +306,7 @@ pub(super) fn encrypt(
         }
     };
     prefix[TRANSFORM_SIGNATURE..TRANSFORM_SIGNATURE + 16].copy_from_slice(&tag);
+
     Some(())
 }
 

@@ -15,6 +15,9 @@ mod srvsvc;
 #[cfg(test)]
 mod tests;
 
+use crate::backend::Backend;
+use crate::backend::UserKind;
+use crate::utf16::Utf16Le;
 use ndr::Writer;
 use pdu::BindRequest;
 use pdu::CALL_HEADER_LENGTH;
@@ -30,10 +33,6 @@ use pdu::RejectReason;
 use srvsvc::Call;
 use srvsvc::Opnum;
 
-use crate::backend::Backend;
-use crate::backend::UserKind;
-use crate::utf16::Utf16Le;
-
 pub use error::PduError;
 pub use error::PipeError;
 pub use pdu::CallId;
@@ -47,11 +46,6 @@ const DATA_CAPACITY: usize = 384;
 const BIND_CONTEXTS: usize = 8;
 /// Presentation contexts accepted on the association.
 const ACCEPTED_CONTEXTS: usize = 4;
-
-/// Pipe names the server opens on IPC$, compared without case.
-pub fn pipe_supported(name: Utf16Le<'_>) -> bool {
-    name.eq_ignore_ascii_case(b"srvsvc")
-}
 
 /// What a pipe read needs from the server.
 pub struct PipeContext<'a> {
@@ -95,6 +89,7 @@ impl Association {
         if self.accepts(context) {
             return true;
         }
+
         match self.contexts.iter_mut().find(|slot| slot.is_none()) {
             Some(slot) => {
                 *slot = Some(context);
@@ -175,8 +170,6 @@ pub struct Pipe {
     offset: u32,
 }
 
-const _: () = assert!(core::mem::size_of::<Pipe>() <= 512);
-
 impl Pipe {
     pub const fn new() -> Self {
         Self {
@@ -200,6 +193,7 @@ impl Pipe {
             self.received = 0;
             self.assembly = None;
         }
+
         result
     }
 
@@ -214,12 +208,14 @@ impl Pipe {
         if output.is_empty() {
             return Err(PipeError::OutputEmpty);
         }
+
         let progress = match reply.body {
             ReplyBody::Response(mut response) => {
                 let rendering = match response.rendering {
                     Some(rendering) => rendering,
                     None => self.measure(&response.call, context),
                 };
+
                 let Some(progress) =
                     self.read_response(reply.call_id, &response, rendering, output, context)
                 else {
@@ -227,21 +223,25 @@ impl Pipe {
                     self.offset = 0;
                     return Err(PipeError::ReplyChanged);
                 };
+
                 response.rendering = Some(rendering);
                 self.reply = Some(Reply {
                     call_id: reply.call_id,
                     body: ReplyBody::Response(response),
                 });
+
                 progress
             }
             _ => self.read_control(&reply, output),
         };
+
         if progress.reply_done {
             self.reply = None;
             self.offset = 0;
         } else {
             self.offset += progress.length as u32;
         }
+
         Ok(if progress.fragment_done {
             PipeRead::Complete {
                 length: progress.length,
@@ -263,6 +263,7 @@ impl Pipe {
             if self.reply.is_some() {
                 return Err(PipeError::Busy);
             }
+
             let received = usize::from(self.received);
             let head_length = if received < COMMON_HEADER_LENGTH {
                 COMMON_HEADER_LENGTH
@@ -279,21 +280,26 @@ impl Pipe {
                 self.store_body(&fragment, received, &data[..taken]);
                 taken
             };
+
             data = &data[taken..];
             let received = received + taken;
             self.received = received as u16;
+
             if received == COMMON_HEADER_LENGTH {
                 self.begin_fragment()?;
             }
+
             let fragment = self.fragment();
             if received == CALL_HEADER_LENGTH && fragment.packet_type == PacketType::REQUEST {
                 self.begin_request()?;
             }
+
             if received >= fragment.head_length() && received == fragment.length {
                 self.received = 0;
                 self.finish_fragment(&fragment);
             }
         }
+
         Ok(())
     }
 
@@ -301,6 +307,7 @@ impl Pipe {
     fn begin_fragment(&mut self) -> Result<(), PduError> {
         let fragment = self.fragment();
         fragment.validate(&self.head)?;
+
         if matches!(
             fragment.packet_type,
             PacketType::BIND | PacketType::ALTER_CONTEXT
@@ -309,6 +316,7 @@ impl Pipe {
             self.data_length = 0;
             self.data_overflow = false;
         }
+
         Ok(())
     }
 
@@ -316,6 +324,7 @@ impl Pipe {
     fn begin_request(&mut self) -> Result<(), PduError> {
         let fragment = self.fragment();
         let auth_fault = fragment.has_auth().then_some(FaultStatus::PROTOCOL_ERROR);
+
         if fragment.flags.contains(PduFlags::FIRST_FRAGMENT) {
             self.data_length = 0;
             self.data_overflow = false;
@@ -328,6 +337,7 @@ impl Pipe {
             });
             return Ok(());
         }
+
         match &mut self.assembly {
             Some(assembly) if assembly.call_id == fragment.call_id => {
                 assembly.fault = assembly.fault.or(auth_fault);
@@ -345,11 +355,13 @@ impl Pipe {
         let Some((body_start, body_end)) = fragment.body() else {
             return;
         };
+
         let from = received.max(body_start);
         let to = (received + bytes.len()).min(body_end);
         if from >= to {
             return;
         }
+
         let chunk = &bytes[from - received..to - received];
         let length = usize::from(self.data_length);
         match self.data.get_mut(length..length + chunk.len()) {
@@ -374,6 +386,7 @@ impl Pipe {
                 }
             }
             PacketType::ORPHANED => self.assembly = None,
+            // Other completed fragments need no action.
             _ => {}
         }
     }
@@ -393,19 +406,24 @@ impl Pipe {
                 ReplyBody::BindNak { reason }
             },
         };
+
         if fragment.has_auth() {
             return reject(RejectReason::AUTHENTICATION_TYPE_NOT_RECOGNIZED);
         }
+
         if self.data_overflow {
             return reject(RejectReason::LOCAL_LIMIT_EXCEEDED);
         }
+
         let body = &self.data[..usize::from(self.data_length)];
         let Some(request) = BindRequest::parse(body) else {
             return reject(RejectReason::NOT_SPECIFIED);
         };
+
         if request.context_count > BIND_CONTEXTS {
             return reject(RejectReason::LOCAL_LIMIT_EXCEEDED);
         }
+
         let mut association = if alter {
             match self.association {
                 Some(association) => association,
@@ -420,6 +438,7 @@ impl Pipe {
                 None => return reject(RejectReason::LOCAL_LIMIT_EXCEEDED),
             }
         };
+
         let mut results = [ContextResult::AbstractSyntaxNotSupported; BIND_CONTEXTS];
         let mut cursor = pdu::BIND_BODY_LENGTH;
         for result in &mut results[..request.context_count] {
@@ -431,7 +450,9 @@ impl Pipe {
                 *result = ContextResult::LocalLimitExceeded;
             }
         }
+
         self.association = Some(association);
+
         Reply {
             call_id,
             body: ReplyBody::BindAck {
@@ -451,18 +472,22 @@ impl Pipe {
                 status,
             },
         };
+
         if let Some(status) = assembly.fault {
             return fault(status);
         }
+
         let Some(association) = self
             .association
             .filter(|association| association.accepts(assembly.context))
         else {
             return fault(FaultStatus::UNKNOWN_INTERFACE);
         };
+
         if self.data_overflow {
             return fault(FaultStatus::REMOTE_NO_MEMORY);
         }
+
         match srvsvc::parse(assembly.opnum, &self.data[..usize::from(self.data_length)]) {
             Ok(call) => Reply {
                 call_id: assembly.call_id,
@@ -499,6 +524,7 @@ impl Pipe {
             ReplyBody::Fault { context, status } => {
                 pdu::put_fault(writer, fragment_length, reply.call_id, context, status)
             }
+            // Responses are rendered by `read_response`.
             ReplyBody::Response(_) => {}
         }
     }
@@ -507,6 +533,7 @@ impl Pipe {
         let mut counter = Writer::counter();
         Self::put_control(reply, 0, &mut counter);
         let total = counter.position();
+
         let offset = self.offset as usize;
         let length = total.saturating_sub(offset).min(output.len());
         Self::put_control(
@@ -514,6 +541,7 @@ impl Pipe {
             total,
             &mut Writer::window(&mut output[..length], offset),
         );
+
         let done = offset + length == total;
         Progress {
             length,
@@ -527,6 +555,7 @@ impl Pipe {
         let stub = &self.data[..usize::from(self.data_length)];
         let mut counter = Writer::counter();
         srvsvc::render(call, stub, context, &mut counter);
+
         Rendering::of(counter)
     }
 
@@ -563,6 +592,7 @@ impl Pipe {
         if last {
             flags = flags.union(PduFlags::LAST_FRAGMENT);
         }
+
         // The allocation hint is advisory; a stub beyond 4 GiB cannot occur.
         let allocation_hint = remaining as u32;
         pdu::put_response_header(
@@ -573,6 +603,7 @@ impl Pipe {
             allocation_hint,
             response.context,
         );
+
         // The whole stub is rendered even when the window holds none of it,
         // to check it against `rendering`.
         let header_part = CALL_HEADER_LENGTH.saturating_sub(within).min(length);
@@ -583,6 +614,7 @@ impl Pipe {
         if Rendering::of(writer) != rendering {
             return None;
         }
+
         let fragment_done = within + length == fragment_length;
         Some(Progress {
             length,
@@ -592,9 +624,16 @@ impl Pipe {
     }
 }
 
+const _: () = assert!(core::mem::size_of::<Pipe>() <= 512);
+
 /// Outcome of one read.
 struct Progress {
     length: usize,
     fragment_done: bool,
     reply_done: bool,
+}
+
+/// Pipe names the server opens on IPC$, compared without case.
+pub fn pipe_supported(name: Utf16Le<'_>) -> bool {
+    name.eq_ignore_ascii_case(b"srvsvc")
 }

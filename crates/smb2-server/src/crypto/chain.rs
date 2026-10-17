@@ -38,6 +38,7 @@ impl Chain {
                 self.fold();
                 step.step(&mut self.state);
             }
+
             let take = data.len().min(16 - self.used);
             let (head, rest) = data.split_at(take);
             self.pending[self.used..self.used + take].copy_from_slice(head);
@@ -58,10 +59,12 @@ impl Chain {
     /// there were.
     pub(super) fn fold(&mut self) -> usize {
         let used = self.used;
+
         for (byte, pending) in self.state.iter_mut().zip(&self.pending[..used]) {
             *byte ^= pending;
         }
         self.used = 0;
+
         used
     }
 }

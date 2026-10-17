@@ -27,12 +27,15 @@ fn share_types_and_maximal_access() {
     let ipc = client.tree_connect("IPC$");
     ipc.expect(NtStatus::Success);
     assert_eq!(ipc.body()[2], SHARE_TYPE_PIPE);
+
     let data = client.tree_connect("data");
     assert_eq!(data.body()[2], SHARE_TYPE_DISK);
     assert_eq!(u32_at(data.body(), 12), access::ALL);
+
     let public = client.tree_connect("PUBLIC");
     assert_eq!(public.body()[2], SHARE_TYPE_DISK);
     assert_eq!(u32_at(public.body(), 12), READ_ONLY_ACCESS);
+
     assert_ne!(ipc.tree_id(), data.tree_id());
     assert_ne!(data.tree_id(), public.tree_id());
 }
@@ -59,11 +62,13 @@ fn read_only_share_refuses_modification() {
             .create("readme.txt", rights, disposition::OPEN, 0)
             .expect(NtStatus::AccessDenied);
     }
+
     for disposition in [disposition::CREATE, disposition::OVERWRITE_IF] {
         client
             .create("new.txt", access::READ, disposition, 0)
             .expect(NtStatus::AccessDenied);
     }
+
     // OpenIf opens without creating.
     client
         .create("new.txt", access::READ, disposition::OPEN_IF, 0)
@@ -76,6 +81,7 @@ fn maximal_access_context_reports_share_rights() {
     let mut client = Client::logged_on();
     client.backend.add_file(PUBLIC, "readme.txt", b"");
     client.tree_connect("Public").expect(NtStatus::Success);
+
     let body = create_body(
         "readme.txt",
         access::READ,
@@ -83,10 +89,12 @@ fn maximal_access_context_reports_share_rights() {
         0,
         &create_context(b"MxAc"),
     );
+
     let reply = client.call(command::CREATE, &body);
     reply.expect(NtStatus::Success);
     let contexts = reply.0[u32_at(reply.body(), 80) as usize..].to_vec();
     assert_eq!(u32_at(reply.body(), 84), 32);
+
     assert_eq!(&contexts[16..20], b"MxAc");
     // QueryStatus, then MaximalAccess.
     assert_eq!(u32_at(&contexts, 24), 0);

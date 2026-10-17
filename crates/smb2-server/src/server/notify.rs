@@ -9,23 +9,22 @@
 
 use crate::backend::Backend;
 use crate::fs::AccessMask;
-use crate::server::Body;
-use crate::server::Completion;
+use crate::fs::FileTime;
 use crate::server::Connection;
-use crate::server::Exchange;
-use crate::server::Failure;
-use crate::server::Handled;
-use crate::server::RequestError;
 use crate::server::Server;
-use crate::server::pending::baseline;
+use crate::server::error::RequestError;
+use crate::server::request::Body;
+use crate::server::request::Completion;
+use crate::server::request::Exchange;
+use crate::server::request::Failure;
+use crate::server::request::Handled;
+use crate::server::scan::baseline;
 use crate::server::shared::ChangeFilter;
 use crate::server::tables::NotifyState;
 use crate::server::tables::OpenKind;
 use crate::server::tables::PendingKind;
 use crate::server::wire;
 use crate::server::wire::FileId;
-
-const REQUEST_FIXED: usize = 32;
 
 /// Flags of a CHANGE_NOTIFY request (MS-SMB2 2.2.35).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,9 +38,6 @@ impl NotifyFlags {
     }
 }
 
-/// Filter bits a client may set (MS-SMB2 2.2.35).
-const VALID_FILTER: ChangeFilter = ChangeFilter(0x0000_0fff);
-
 impl Connection {
     pub(super) fn change_notify(
         &mut self,
@@ -50,17 +46,25 @@ impl Connection {
         backend: &mut dyn Backend,
         output: &mut [u8],
     ) -> Handled {
+        const REQUEST_FIXED: usize = 32;
+        // Filter bits a client may set (MS-SMB2 2.2.35).
+        const VALID_FILTER: ChangeFilter = ChangeFilter(0x0000_0fff);
+
         let body = exchange.fixed_body(32, REQUEST_FIXED)?;
         let tree = NotifyFlags(wire::u16_at(body, 2)).contains(NotifyFlags::WATCH_TREE);
         let output_length = wire::u32_at(body, 4);
+
         // Undefined filter bits are ignored; a request with no defined
         // bits matches nothing and waits until it is cancelled or its open
         // closes.
         let filter = ChangeFilter(wire::u32_at(body, 24) & VALID_FILTER.0);
+
         let slot = self.find_open(exchange, FileId::read(body, 8))?;
+
         if output_length as usize > exchange.config.max_io() {
             return Err(Failure::Error(RequestError::InvalidRequest));
         }
+
         let open = *self.open(slot);
         let OpenKind::File(file) = open.kind else {
             return Err(Failure::Error(RequestError::InvalidRequest));
@@ -71,6 +75,7 @@ impl Connection {
         if !open.access.contains(AccessMask::READ_DATA) {
             return Err(Failure::Error(RequestError::AccessDenied));
         }
+
         let state = match file.notify {
             Some(state) => NotifyState {
                 filter,
@@ -90,8 +95,9 @@ impl Connection {
                         );
                         (Some(digest), scanned)
                     }
-                    None => (None, crate::fs::FileTime(0)),
+                    None => (None, FileTime(0)),
                 };
+
                 NotifyState {
                     filter,
                     tree,
@@ -101,6 +107,7 @@ impl Connection {
                 }
             }
         };
+
         let overflowed = state.overflowed;
         if let OpenKind::File(file) = &mut self.open_mut(slot).kind {
             file.notify = Some(NotifyState {
@@ -108,6 +115,7 @@ impl Connection {
                 ..state
             });
         }
+
         // Changes that were not kept, or a request that cannot wait in a
         // compound chain, tell the client to list the directory again.
         if overflowed || !exchange.last {
@@ -118,14 +126,16 @@ impl Connection {
                 length: 8,
             });
         }
+
+        // One notification waits per open at a time.
         if self.pending.iter().flatten().any(|pending| {
             pending.open == slot
                 && pending.ready.is_none()
                 && matches!(pending.kind, PendingKind::Notify { .. })
         }) {
-            // One notification waits per open at a time.
             return Err(Failure::Error(RequestError::InvalidRequest));
         }
+
         let session = exchange.session.ok_or(RequestError::SessionNotFound)?;
         let async_id = self.add_pending(
             &exchange.header,
@@ -134,6 +144,7 @@ impl Connection {
             slot,
             PendingKind::Notify { output_length },
         )?;
+
         Err(Failure::Pending { async_id })
     }
 }

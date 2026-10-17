@@ -3,28 +3,20 @@
 //! the scans that find changes made outside the server.
 
 use crate::backend::Backend;
-use crate::backend::OpenRequest;
 use crate::backend::ShareId;
-use crate::crypto::Sha256;
-use crate::fs::AccessMask;
-use crate::fs::CreateDisposition;
-use crate::fs::CreateOptions;
-use crate::fs::FileAttributes;
-use crate::fs::FileTime;
-use crate::fs::NAME_CAPACITY;
-use crate::fs::ShareAccess;
-use crate::path::SharePath;
 use crate::pattern::fold;
 use crate::server::Connection;
-use crate::server::ERROR_BODY;
-use crate::server::RequestError;
-use crate::server::RequestHeader;
 use crate::server::Server;
 use crate::server::ServerConfig;
+use crate::server::error::LockRefusal;
+use crate::server::error::RequestError;
+use crate::server::request::ERROR_BODY;
+use crate::server::request::RequestHeader;
+use crate::server::scan::scan;
 use crate::server::security;
 use crate::server::shared::Change;
-use crate::server::shared::LockRefusal;
-use crate::server::tables::ContentDigest;
+use crate::server::shared::ChangeSequence;
+use crate::server::shared::FileSlot;
 use crate::server::tables::NotifyState;
 use crate::server::tables::OpenKind;
 use crate::server::tables::OpenSlot;
@@ -40,35 +32,9 @@ use crate::server::wire::HeaderFlags;
 use crate::server::wire::header;
 use crate::status::NtStatus;
 use crate::transport;
-use crate::utf16::Utf16Le;
 
 /// Fixed part of a CHANGE_NOTIFY reply body.
 const NOTIFY_REPLY_FIXED: usize = 8;
-/// Fixed part of a FILE_NOTIFY_INFORMATION record.
-const RECORD_FIXED: usize = 12;
-/// Directory levels below a tree watch that a scan visits.
-const SCAN_DEPTH: usize = 4;
-/// Directory handles a scan holds at once.
-pub(super) const SCAN_HANDLES: usize = SCAN_DEPTH + 1;
-/// Directory entries a scan reads at most; a tree with more is digested
-/// up to this many entries in enumeration order.
-const SCAN_ENTRIES: u32 = 4096;
-/// Bytes of the path buffer a tree scan builds subdirectory paths in.
-const SCAN_PATH: usize = 2 * 512;
-/// Tag of a record a scan digests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DigestRecord {
-    Entry = 0,
-    Failure = 1,
-}
-
-impl DigestRecord {
-    const fn tag(self) -> [u8; 1] {
-        [self as u8]
-    }
-}
-
-const SEPARATOR: u16 = b'\\' as u16;
 
 impl Connection {
     /// End the request a CANCEL names with STATUS_CANCELLED (MS-SMB2
@@ -88,10 +54,11 @@ impl Connection {
         let Some(session) = self.sessions[usize::from(slot.0)] else {
             return;
         };
+
         let accepted = match encrypted {
             Some(decrypted) => decrypted == slot,
             None if session.encrypt_data => false,
-            None if request.signed() => session
+            None if request.is_signed() => session
                 .signing
                 .is_some_and(|key| security::verify(message, &key)),
             None => !session.signing_required,
@@ -99,11 +66,13 @@ impl Connection {
         if !accepted {
             return;
         }
+
         for pending in self.pending.iter_mut().flatten() {
             if pending.session != slot {
                 continue;
             }
-            let named = if request.asynchronous() {
+
+            let named = if request.is_async() {
                 pending.async_id == request.async_id
             } else {
                 pending.message_id == request.message_id
@@ -120,7 +89,7 @@ impl Connection {
         &mut self,
         request: &RequestHeader,
         encrypted: bool,
-        session: crate::server::tables::SessionSlot,
+        session: SessionSlot,
         open: OpenSlot,
         kind: PendingKind,
     ) -> Result<AsyncId, RequestError> {
@@ -129,6 +98,7 @@ impl Connection {
             .iter_mut()
             .find(|pending| pending.is_none())
             .ok_or(RequestError::TableFull)?;
+
         let async_id = self.next_async;
         self.next_async = async_id.next();
         *slot = Some(Pending {
@@ -136,12 +106,13 @@ impl Connection {
             async_id,
             session,
             open,
-            signed: request.signed(),
+            signed: request.is_signed(),
             encrypted,
             credit_charge: request.credit_charge,
             kind,
             ready: None,
         });
+
         Ok(async_id)
     }
 
@@ -152,6 +123,13 @@ impl Connection {
         config: &ServerConfig,
         backend: &mut dyn Backend,
     ) {
+        self.retry_locks(server);
+        self.scan_due(server, config, backend);
+    }
+
+    /// Retry blocked lock requests when a lock was released since their
+    /// last try.
+    fn retry_locks(&mut self, server: &mut Server) {
         let epoch = server.locks.epoch();
         for index in 0..self.pending.len() {
             let Some(pending) = self.pending[index] else {
@@ -168,12 +146,14 @@ impl Connection {
             if pending.ready.is_some() || tried == epoch {
                 continue;
             }
+
             let Some(open) = self.opens[usize::from(pending.open.0)] else {
                 continue;
             };
             let OpenKind::File(file) = open.kind else {
                 continue;
             };
+
             let owner = self.lock_owner(open.id);
             let entry = self.pending[index].as_mut().expect("pending entry exists");
             match server.locks.lock(file.file, owner, range, exclusive) {
@@ -190,11 +170,18 @@ impl Connection {
                 }
             }
         }
+    }
+
+    /// Scan the watched directory that is due, if any, for changes made
+    /// outside the server.
+    fn scan_due(&mut self, server: &mut Server, config: &ServerConfig, backend: &mut dyn Backend) {
         let Some(interval) = config.change_scan_interval else {
             return;
         };
+
         let interval = (interval.as_nanos() / 100) as u64;
         let now = backend.system_time();
+
         // One scan per call bounds the backend work of a poll; the watch
         // scanned longest ago goes first. A watch is scanned only while a
         // notification waits on it; its digest persists between
@@ -216,15 +203,18 @@ impl Connection {
         let Some((slot, file, notify)) = due else {
             return;
         };
+
         let share = server.files.share(file.file);
         let digest = scan(backend, share, server.files.path(file.file), notify.tree);
         let changed = notify.digest.is_some_and(|previous| previous != digest);
+
         if let Some(OpenKind::File(file)) = self.opens[slot].as_mut().map(|open| &mut open.kind)
             && let Some(state) = file.notify.as_mut()
         {
             state.digest = Some(digest);
             state.scanned = now;
         }
+
         if changed {
             self.report_overflow(OpenSlot(slot as u8));
         }
@@ -249,6 +239,7 @@ impl Connection {
         if watches_nothing {
             return;
         }
+
         if let Some(pending) = self.pending.iter_mut().flatten().find(|pending| {
             pending.open == slot
                 && pending.ready.is_none()
@@ -274,6 +265,7 @@ impl Connection {
         mut at: usize,
     ) -> usize {
         self.examine_changes(server, response, &mut at);
+
         for index in 0..self.pending.len() {
             let Some(pending) = self.pending[index] else {
                 continue;
@@ -281,6 +273,7 @@ impl Connection {
             let Some(outcome) = pending.ready else {
                 continue;
             };
+
             let granted = outcome == PendingOutcome::Completed;
             let body_length = match pending.kind {
                 PendingKind::Lock { .. } if granted => 4,
@@ -304,6 +297,7 @@ impl Connection {
             at = end;
             self.pending[index] = None;
         }
+
         at
     }
 
@@ -315,6 +309,7 @@ impl Connection {
         if self.change_cursor == next {
             return;
         }
+
         let lost = server.changes.oldest().0.wrapping_sub(self.change_cursor.0) as i32 > 0;
         for slot in 0..self.opens.len() {
             let Some(open) = self.opens[slot] else {
@@ -326,11 +321,13 @@ impl Connection {
             let Some(notify) = file.notify else {
                 continue;
             };
+
             let slot = OpenSlot(slot as u8);
             if lost {
                 self.report_overflow(slot);
                 continue;
             }
+
             let share = server.files.share(file.file);
             let watched = server.files.path(file.file);
             let mut matched = false;
@@ -342,11 +339,12 @@ impl Connection {
                     matched = true;
                     break;
                 }
-                sequence = crate::server::shared::ChangeSequence(sequence.0.wrapping_add(1));
+                sequence = ChangeSequence(sequence.0.wrapping_add(1));
             }
             if !matched {
                 continue;
             }
+
             let Some(index) = self.pending.iter().position(|pending| {
                 pending.is_some_and(|pending| {
                     pending.open == slot
@@ -361,6 +359,7 @@ impl Connection {
             let PendingKind::Notify { output_length } = pending.kind else {
                 continue;
             };
+
             let cursor = self.change_cursor;
             let written = self.write_final(
                 &pending,
@@ -388,6 +387,7 @@ impl Connection {
                     }
                 },
             );
+
             match written {
                 Some(end) => {
                     *at = end;
@@ -403,6 +403,7 @@ impl Connection {
                 }
             }
         }
+
         self.change_cursor = next;
     }
 
@@ -423,6 +424,7 @@ impl Connection {
         let Some(session) = self.sessions[usize::from(pending.session.0)].as_mut() else {
             return Some(at);
         };
+
         let encryption = session.encryption.filter(|_| pending.encrypted);
         let transform = if encryption.is_some() {
             security::TRANSFORM_HEADER
@@ -434,8 +436,10 @@ impl Connection {
         if end > response.len() {
             return None;
         }
+
         let message = &mut response[start..end];
         fill(&mut message[HEADER_SIZE..]);
+
         // A notification whose records did not fit reports
         // STATUS_NOTIFY_ENUM_DIR with an empty body.
         let notify = matches!(pending.kind, PendingKind::Notify { .. });
@@ -455,17 +459,20 @@ impl Connection {
         } else {
             (outcome, HEADER_SIZE + body_length)
         };
+
         let message = &mut response[start..start + length];
         message[..HEADER_SIZE].fill(0);
         message[..4].copy_from_slice(&wire::PROTOCOL_ID);
         wire::put_u16(message, header::STRUCTURE_SIZE, HEADER_SIZE as u16);
         wire::put_u16(message, header::CREDIT_CHARGE, pending.credit_charge.0);
         wire::put_u32(message, header::STATUS, NtStatus::from(outcome).raw());
+
         let command = match pending.kind {
             PendingKind::Notify { .. } => Command::CHANGE_NOTIFY,
             PendingKind::Lock { .. } => Command::LOCK,
         };
         wire::put_u16(message, header::COMMAND, command.0);
+
         let key = session
             .signing
             .filter(|_| encryption.is_none() && (session.signing_required || pending.signed));
@@ -480,6 +487,7 @@ impl Connection {
         if let Some(key) = key {
             security::sign(message, &key);
         }
+
         let frame = start + length - (at + transport::HEADER_LENGTH);
         if let Some(keys) = encryption {
             let nonce = session.next_nonce;
@@ -492,6 +500,7 @@ impl Connection {
             )?;
         }
         response[at..at + transport::HEADER_LENGTH].copy_from_slice(&transport::header(frame));
+
         Some(start + length)
     }
 }
@@ -501,17 +510,21 @@ impl Connection {
 /// length, or `None` when they do not fit in `output`.
 fn write_records(
     server: &Server,
-    from: crate::server::shared::ChangeSequence,
-    to: crate::server::shared::ChangeSequence,
+    from: ChangeSequence,
+    to: ChangeSequence,
     share: ShareId,
-    watched: crate::server::shared::FileSlot,
+    watched: FileSlot,
     notify: &NotifyState,
     output: &mut [u8],
 ) -> Option<usize> {
+    // Fixed part of a FILE_NOTIFY_INFORMATION record.
+    const RECORD_FIXED: usize = 12;
+
     let path = server.files.path(watched);
     let mut written = 0usize;
     let mut previous: Option<usize> = None;
     let mut sequence = from;
+
     while sequence != to {
         if let Some(change) = server.changes.get(sequence)
             && let Some(name) = relative_name(&change, share, path, notify)
@@ -521,6 +534,7 @@ fn write_records(
             if end > output.len() {
                 return None;
             }
+
             output[written..start].fill(0);
             if let Some(previous) = previous {
                 wire::put_u32(output, previous, (start - previous) as u32);
@@ -534,8 +548,9 @@ fn write_records(
             previous = Some(start);
             written = end;
         }
-        sequence = crate::server::shared::ChangeSequence(sequence.0.wrapping_add(1));
+        sequence = ChangeSequence(sequence.0.wrapping_add(1));
     }
+
     Some(written)
 }
 
@@ -547,9 +562,12 @@ fn relative_name<'a>(
     watched: &[u16],
     notify: &NotifyState,
 ) -> Option<&'a [u16]> {
+    const SEPARATOR: u16 = b'\\' as u16;
+
     if change.share != share || change.filter.0 & notify.filter.0 == 0 {
         return None;
     }
+
     let path = change.path;
     let rest = if watched.is_empty() {
         path
@@ -559,7 +577,7 @@ fn relative_name<'a>(
             || !path[..watched.len()]
                 .iter()
                 .zip(watched)
-                .all(|(&a, &b)| fold(a) == fold(b))
+                .all(|(&changed, &expected)| fold(changed) == fold(expected))
         {
             return None;
         }
@@ -568,135 +586,6 @@ fn relative_name<'a>(
     if rest.is_empty() || (!notify.tree && rest.contains(&SEPARATOR)) {
         return None;
     }
+
     Some(rest)
-}
-
-/// Digest of the contents of the directory `path` on `share`: names,
-/// attributes, sizes, and last write times of its entries, and of the
-/// directories below it up to [`SCAN_DEPTH`] levels for a tree watch. A
-/// failure to read is part of the digest, so it differs from any listing.
-#[inline(never)]
-fn scan(backend: &mut dyn Backend, share: ShareId, path: &[u16], tree: bool) -> ContentDigest {
-    let mut hash = Sha256::new();
-    let mut buffer = [0u8; SCAN_PATH];
-    let Some(mut length) = crate::utf16::encode_units(path.iter().copied(), &mut buffer) else {
-        hash.update(&DigestRecord::Failure.tag());
-        return finish(hash);
-    };
-    let mut handles = [None; SCAN_HANDLES];
-    let mut lengths = [0usize; SCAN_DEPTH + 1];
-    let mut depth = 0usize;
-    let mut budget = SCAN_ENTRIES;
-    let mut name = [0u16; NAME_CAPACITY];
-    handles[0] = open_directory(backend, share, &buffer[..length]);
-    if handles[0].is_none() {
-        hash.update(&DigestRecord::Failure.tag());
-    }
-    lengths[0] = length;
-    let mut restart = [true; SCAN_DEPTH + 1];
-    loop {
-        let Some(handle) = handles[depth] else {
-            if depth == 0 {
-                break;
-            }
-            depth -= 1;
-            length = lengths[depth];
-            continue;
-        };
-        let entry = if budget == 0 {
-            Ok(None)
-        } else {
-            backend.read_directory(handle, restart[depth], &mut name)
-        };
-        restart[depth] = false;
-        match entry {
-            Ok(Some(entry)) => {
-                budget -= 1;
-                let name = &name[..entry.name_length.min(NAME_CAPACITY)];
-                hash.update(&DigestRecord::Entry.tag());
-                hash.update(&(depth as u32).to_le_bytes());
-                hash.update(&(name.len() as u32).to_le_bytes());
-                for unit in name {
-                    hash.update(&unit.to_le_bytes());
-                }
-                let information = entry.information;
-                hash.update(&information.attributes.0.to_le_bytes());
-                hash.update(&information.end_of_file.to_le_bytes());
-                hash.update(&information.last_write_time.0.to_le_bytes());
-                let directory = information.attributes.contains(FileAttributes::DIRECTORY)
-                    && !matches!(name, [0x2e] | [0x2e, 0x2e]);
-                if tree && directory && depth < SCAN_DEPTH {
-                    let base = lengths[depth];
-                    let separator = usize::from(base > 0);
-                    let end = base + separator * 2 + name.len() * 2;
-                    if end <= buffer.len() {
-                        if separator == 1 {
-                            buffer[base..base + 2].copy_from_slice(&SEPARATOR.to_le_bytes());
-                        }
-                        let _ = crate::utf16::encode_units(
-                            name.iter().copied(),
-                            &mut buffer[base + separator * 2..end],
-                        );
-                        depth += 1;
-                        length = end;
-                        lengths[depth] = length;
-                        restart[depth] = true;
-                        handles[depth] = open_directory(backend, share, &buffer[..length]);
-                        if handles[depth].is_none() {
-                            hash.update(&DigestRecord::Failure.tag());
-                        }
-                    }
-                }
-            }
-            Ok(None) => {
-                backend.close(handle);
-                handles[depth] = None;
-            }
-            Err(_) => {
-                hash.update(&DigestRecord::Failure.tag());
-                backend.close(handle);
-                handles[depth] = None;
-            }
-        }
-    }
-    let _ = length;
-    finish(hash)
-}
-
-fn finish(hash: Sha256) -> ContentDigest {
-    let digest = hash.finalize();
-    let mut short = [0; 16];
-    short.copy_from_slice(&digest[..16]);
-    ContentDigest(short)
-}
-
-fn open_directory(
-    backend: &mut dyn Backend,
-    share: ShareId,
-    path: &[u8],
-) -> Option<crate::backend::FileHandle> {
-    let path = SharePath::parse(Utf16Le::new(path)?).ok()?;
-    let request = OpenRequest {
-        access: AccessMask::READ_DATA.union(AccessMask::SYNCHRONIZE),
-        share_access: ShareAccess::ALL,
-        disposition: CreateDisposition::Open,
-        options: CreateOptions::DIRECTORY_FILE,
-        attributes: FileAttributes::default(),
-        allocation_size: None,
-    };
-    backend
-        .open(share, path, &request)
-        .ok()
-        .map(|opened| opened.handle)
-}
-
-/// A digest and scan time for a newly watched directory.
-pub(super) fn baseline(
-    backend: &mut dyn Backend,
-    share: ShareId,
-    path: &[u16],
-    tree: bool,
-    now: FileTime,
-) -> (ContentDigest, FileTime) {
-    (scan(backend, share, path, tree), now)
 }

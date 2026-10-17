@@ -20,16 +20,19 @@ impl Hmac {
         } else {
             padded[..key.len()].copy_from_slice(key);
         }
+
         let mut inner = hash.clone();
         let mut outer = hash;
         for byte in &mut padded {
             *byte ^= 0x36;
         }
         inner.update(&padded);
+
         for byte in &mut padded {
             *byte ^= 0x36 ^ 0x5c;
         }
         outer.update(&padded);
+
         Self { inner, outer }
     }
 
@@ -59,15 +62,9 @@ impl HmacMd5 {
     pub fn finalize(mut self) -> [u8; 16] {
         let mut mac = [0; 16];
         self.0.finish(&mut mac);
+
         mac
     }
-}
-
-/// HMAC-MD5 of `data` under `key`.
-pub fn hmac_md5(key: &[u8], data: &[u8]) -> [u8; 16] {
-    let mut mac = HmacMd5::new(key);
-    mac.update(data);
-    mac.finalize()
 }
 
 /// Streaming HMAC-SHA256.
@@ -89,14 +86,24 @@ impl HmacSha256 {
     pub fn finalize(mut self) -> [u8; 32] {
         let mut mac = [0; 32];
         self.0.finish(&mut mac);
+
         mac
     }
+}
+
+/// HMAC-MD5 of `data` under `key`.
+pub fn hmac_md5(key: &[u8], data: &[u8]) -> [u8; 16] {
+    let mut mac = HmacMd5::new(key);
+    mac.update(data);
+
+    mac.finalize()
 }
 
 /// HMAC-SHA256 of `data` under `key`.
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut mac = HmacSha256::new(key);
     mac.update(data);
+
     mac.finalize()
 }
 

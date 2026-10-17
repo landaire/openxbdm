@@ -45,6 +45,7 @@
 - `xconfig` writes fail with `InvalidParameter` for values above 0xffff bytes, the largest size `ExSetXConfigSetting` takes.
 - Data breakpoints write DABR with a zero upper word.
 - Serve SMB on TCP port 445 from the server thread's select loop, with two connections of two 0x10400-byte pool buffers each; without the port the monitor runs without SMB.
+- Flash updates fail with `InvalidParameter` when the image header points outside the uploaded image, where stock reads past the buffer.
 
 ### Kernel debugger
 

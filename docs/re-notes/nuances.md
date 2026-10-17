@@ -99,6 +99,7 @@ lists.
 - `drivefreespace` keeps its 0x200-byte pool line buffer when the open fails (stock leak); an allocation failure replies `400- ` while `dirlist` replies `400- out of memory`.
 - Export 85 returns a counter (0x91f9feec) of file closes after delete, fileeof, mkdir, rename, setfileattributes, sendfile, writefile and sendvfile; it counts closes, not successful changes.
 - A dropped `sysfileupd` upload leaves the temporary file open and marked for deletion until reboot; a dropped `sendvfile` keeps its result block allocated.
+- The DMSATA hot-plug DPC (0x91f3f180) and StartReinitialize (0x91f3fcd0) address the SATA registers at the fixed CD-ROM channel address 0x7fea1200; stock reloads the address from word 0 of the channel extension each time. `find_channel` checked that the word holds that address before any hook was installed.
 
 ## Memory
 

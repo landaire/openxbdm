@@ -364,3 +364,10 @@ pub fn debug_print_bytes(text: &[u8]) {
     // SAFETY: `text` is valid for its length, which `%.*s` bounds.
     unsafe { DbgPrint(c"%.*s".as_ptr().cast(), text.len() as u32, text.as_ptr()) };
 }
+
+/// The address of `value`, as kernel calls and caller-visible words take
+/// it. The provenance is exposed so that [`object_at`] can return to it.
+#[inline(always)]
+pub fn address_of<T: ?Sized>(value: &T) -> u32 {
+    core::ptr::from_ref(value).cast::<u8>().expose_provenance() as u32
+}

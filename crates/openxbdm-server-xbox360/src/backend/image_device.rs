@@ -19,6 +19,7 @@ use xbox360_sys::xboxkrnl::AnsiString;
 use xbox360_sys::xboxkrnl::CreateOptions;
 use xbox360_sys::xboxkrnl::DeviceObject;
 use xbox360_sys::xboxkrnl::DeviceObjectFlags;
+use xbox360_sys::xboxkrnl::DiskGeometry;
 use xbox360_sys::xboxkrnl::DriverDispatch;
 use xbox360_sys::xboxkrnl::DriverObject;
 use xbox360_sys::xboxkrnl::DriverStartIo;
@@ -31,6 +32,8 @@ use xbox360_sys::xboxkrnl::IoDismountVolume;
 use xbox360_sys::xboxkrnl::IoInvalidDeviceRequest;
 use xbox360_sys::xboxkrnl::IoStackControl;
 use xbox360_sys::xboxkrnl::IoStackFlags;
+use xbox360_sys::xboxkrnl::IoStackLocation;
+use xbox360_sys::xboxkrnl::IoStackParameters;
 use xbox360_sys::xboxkrnl::IoStatusBlock;
 use xbox360_sys::xboxkrnl::Irp;
 use xbox360_sys::xboxkrnl::IrpMajorFunction;
@@ -38,6 +41,7 @@ use xbox360_sys::xboxkrnl::Irql;
 use xbox360_sys::xboxkrnl::KeSetPriorityThread;
 use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
 use xbox360_sys::xboxkrnl::ObjectAttributes;
+use xbox360_sys::xboxkrnl::PartitionInformation;
 use xbox360_sys::xboxkrnl::ProcessType;
 use xbox360_sys::xboxkrnl::ProcessorMode;
 use xbox360_sys::xboxkrnl::ShareAccess;
@@ -45,12 +49,16 @@ use xbox360_sys::xboxkrnl::ThreadCreationFlags;
 use xbox360_sys::xboxkrnl::WaitReason;
 
 /// `ExCreateThread` flags of the mount thread.
-const MOUNT_THREAD_FLAGS: ThreadCreationFlags = ThreadCreationFlags::from_bits_retain(0x22);
-/// `ExCreateThread` flags of the worker; 0x80 returns a referenced thread
-/// object instead of a handle.
-const WORKER_THREAD_FLAGS: u32 = 0x0400_00a8;
-/// Added to the worker flags when the creator runs in the system process.
-const THREAD_SYSTEM_PROCESS: u32 = 0x2;
+const MOUNT_THREAD_FLAGS: ThreadCreationFlags =
+    ThreadCreationFlags::SYSTEM_PROCESS.union(ThreadCreationFlags::PRIORITY_CLASS_13);
+/// `ExCreateThread` flags of the worker, plus
+/// `ThreadCreationFlags::SYSTEM_PROCESS` when the creator runs in the system
+/// process.
+const WORKER_THREAD_FLAGS: ThreadCreationFlags = ThreadCreationFlags::PROCESSOR2
+    .union(ThreadCreationFlags::RETURN_THREAD_OBJECT)
+    .union(ThreadCreationFlags::TLS_DATA)
+    .union(ThreadCreationFlags::PRIORITY_CLASS_13);
+const _: () = assert!(WORKER_THREAD_FLAGS.bits() == 0x0400_00a8);
 const WORKER_STACK_SIZE: u32 = 0x4000;
 const WORKER_PRIORITY: u32 = 0x1f;
 
@@ -61,19 +69,36 @@ const SECTOR_SIZE: u32 = 0x200;
 const SECTOR_SHIFT: u32 = 9;
 const SECTOR_MASK: u32 = SECTOR_SIZE - 1;
 
-/// Stack location parameter words as the worker reads them once a request
-/// is queued: transfer length, transfer address or user buffer, first
-/// sector, and the offset added to the buffer word.
-const LENGTH: usize = 0;
-const BUFFER: usize = 1;
-const SECTOR: usize = 2;
-const BUFFER_OFFSET: usize = 3;
-const NOTIFICATION: u8 = 0;
-const SYNCHRONIZATION: u8 = 1;
+/// The stack location parameters of a read or write once `read_write` has
+/// queued it for the worker.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct QueuedTransfer {
+    length: u32,
+    /// The transfer address, or the user buffer.
+    buffer: u32,
+    first_sector: u32,
+    /// Added to `buffer`: the caller's offset into the user buffer.
+    buffer_offset: u32,
+}
+
+const _: () = assert!(size_of::<QueuedTransfer>() == size_of::<IoStackParameters>());
+
+impl QueuedTransfer {
+    /// # Safety
+    ///
+    /// `location` must be the current stack location of a request this
+    /// driver owns.
+    unsafe fn of<'a>(location: *mut IoStackLocation) -> &'a mut Self {
+        // SAFETY: guaranteed by the caller; the parameters are four words.
+        unsafe { &mut *(&raw mut (*location).parameters).cast::<Self>() }
+    }
+}
 
 /// Kernel event object.
 #[repr(C)]
 struct EventObject {
+    /// The [`EventType`], which is the dispatcher object type of an event.
     kind: u8,
     _header: [u8; 3],
     signal_state: u32,
@@ -86,11 +111,11 @@ impl EventObject {
     ///
     /// # Safety
     /// `event` must be writable and unused by the kernel.
-    unsafe fn initialize(event: *mut Self, kind: u8) {
+    unsafe fn initialize(event: *mut Self, kind: EventType) {
         // SAFETY: guaranteed by the caller.
         unsafe {
             let list = (&raw mut (*event).wait_list).cast::<u32>();
-            (*event).kind = kind;
+            (*event).kind = kind.raw() as u8;
             (*event).signal_state = 0;
             (*event).wait_list = [list, list];
         }
@@ -104,10 +129,10 @@ struct GlobalEvent(UnsafeCell<EventObject>);
 unsafe impl Sync for GlobalEvent {}
 
 impl GlobalEvent {
-    const fn new(kind: u8, this: &'static Self) -> Self {
+    const fn new(kind: EventType, this: &'static Self) -> Self {
         let list = this.pointer().wrapping_add(2);
         Self(UnsafeCell::new(EventObject {
-            kind,
+            kind: kind.raw() as u8,
             _header: [0; 3],
             signal_state: 0,
             wait_list: [list, list],
@@ -121,9 +146,9 @@ impl GlobalEvent {
 
 /// Set at title termination; every mount thread waits on it, then deletes
 /// its device (stock 0x91f98e74).
-static DISMOUNT: GlobalEvent = GlobalEvent::new(NOTIFICATION, &DISMOUNT);
+static DISMOUNT: GlobalEvent = GlobalEvent::new(EventType::Notification, &DISMOUNT);
 /// Set by the last mount thread to finish (stock 0x91f98e84).
-static DISMOUNTED: GlobalEvent = GlobalEvent::new(SYNCHRONIZATION, &DISMOUNTED);
+static DISMOUNTED: GlobalEvent = GlobalEvent::new(EventType::Synchronization, &DISMOUNTED);
 /// Mount threads holding a device (stock 0x91fab7d0).
 static MOUNTED: AtomicU32 = AtomicU32::new(0);
 
@@ -156,7 +181,7 @@ struct MountRequest {
     name: *const AnsiString,
     length: u64,
     done: EventObject,
-    status: u32,
+    status: NtStatus,
 }
 
 const _: () = {
@@ -227,10 +252,6 @@ fn assertion_trap() {
     unsafe { core::arch::asm!("twi 31, 0, 0x19") };
 }
 
-fn succeeded(status: u32) -> bool {
-    NtStatus(status).is_success()
-}
-
 /// Export 130 entry: the console passes the 64-bit length in r5; `mount`
 /// takes it as two words.
 #[unsafe(naked)]
@@ -256,7 +277,7 @@ extern "C" fn mount(
     name: *const AnsiString,
     length_high: u32,
     length_low: u32,
-) -> u32 {
+) -> NtStatus {
     let mut storage = MaybeUninit::<MountRequest>::uninit();
     let request = storage.as_mut_ptr();
     // SAFETY: `request` is the local block; the fields are written in place
@@ -266,7 +287,7 @@ extern "C" fn mount(
         (*request).file = file;
         (*request).name = name;
         (*request).length = (u64::from(length_high) << 32) | u64::from(length_low);
-        EventObject::initialize(&raw mut (*request).done, SYNCHRONIZATION);
+        EventObject::initialize(&raw mut (*request).done, EventType::Synchronization);
         xboxkrnl::KeEnterCriticalRegion();
         let mut status = xboxkrnl::ExCreateThread(
             null_mut(),
@@ -276,9 +297,8 @@ extern "C" fn mount(
             mount_thread as *const () as usize as u32,
             request as usize as u32,
             MOUNT_THREAD_FLAGS,
-        )
-        .0;
-        if succeeded(status) {
+        );
+        if status.is_success() {
             xboxkrnl::KeWaitForSingleObject(
                 (&raw mut (*request).done).cast(),
                 WaitReason::UserRequest,
@@ -320,7 +340,7 @@ extern "C" fn mount_thread(request: *mut MountRequest) -> u32 {
             CreateOptions::empty(),
         )
     };
-    let status = if succeeded(opened.0) {
+    let status = if opened.is_success() {
         match create_device(file, name, length) {
             Ok(created) => {
                 device = Some(created);
@@ -329,17 +349,20 @@ extern "C" fn mount_thread(request: *mut MountRequest) -> u32 {
             }
             Err(error) => NtStatus::from(error),
         }
-        .0
     } else {
         file = 0;
-        opened.0
+        opened
     };
     // SAFETY: as above; `mount` may release the request once `done` is set.
     let mut result = unsafe {
         (*request).status = status;
-        xboxkrnl::KeSetEvent((&raw mut (*request).done).cast(), 1, false)
+        xboxkrnl::KeSetEvent(
+            (&raw mut (*request).done).cast(),
+            xboxkrnl::EVENT_INCREMENT,
+            false,
+        )
     };
-    let mounted = succeeded(status);
+    let mounted = status.is_success();
     if mounted {
         // SAFETY: `DISMOUNT` is a static event built by `GlobalEvent::new`.
         result = unsafe {
@@ -363,7 +386,9 @@ extern "C" fn mount_thread(request: *mut MountRequest) -> u32 {
     }
     if mounted && MOUNTED.fetch_sub(1, Ordering::Relaxed) == 1 {
         // SAFETY: `DISMOUNTED` is a static event built by `GlobalEvent::new`.
-        result = unsafe { xboxkrnl::KeSetEvent(DISMOUNTED.pointer().cast(), 1, false) };
+        result = unsafe {
+            xboxkrnl::KeSetEvent(DISMOUNTED.pointer().cast(), xboxkrnl::EVENT_INCREMENT, false)
+        };
     }
     result
 }
@@ -376,7 +401,7 @@ pub(crate) fn dismount_all() {
         // SAFETY: `DISMOUNT` and `DISMOUNTED` are static events built by
         // `GlobalEvent::new`.
         unsafe {
-            xboxkrnl::KeSetEvent(DISMOUNT.pointer().cast(), 1, false);
+            xboxkrnl::KeSetEvent(DISMOUNT.pointer().cast(), xboxkrnl::EVENT_INCREMENT, false);
             xboxkrnl::KeWaitForSingleObject(
                 DISMOUNTED.pointer().cast(),
                 WaitReason::UserRequest,
@@ -446,11 +471,11 @@ fn create_device(
         (*extension).irp = None;
         (*extension).start = 0;
         (*extension).length = length;
-        EventObject::initialize(&raw mut (*extension).work, SYNCHRONIZATION);
+        EventObject::initialize(&raw mut (*extension).work, EventType::Synchronization);
         let process_flags = if xboxkrnl::KeGetCurrentProcessType() == ProcessType::SYSTEM {
-            THREAD_SYSTEM_PROCESS
+            ThreadCreationFlags::SYSTEM_PROCESS
         } else {
-            0
+            ThreadCreationFlags::empty()
         };
         let status = xboxkrnl::ExCreateThread(
             (&raw mut (*extension).thread).cast(),
@@ -459,7 +484,7 @@ fn create_device(
             0,
             worker as *const () as usize as u32,
             device as usize as u32,
-            ThreadCreationFlags::from_bits_retain(WORKER_THREAD_FLAGS | process_flags),
+            WORKER_THREAD_FLAGS.union(process_flags),
         );
         if let Err(error) = status.result() {
             (*extension).thread = None;
@@ -496,7 +521,11 @@ unsafe fn delete_device(device: *mut DeviceObject) -> u32 {
             if !(*device).current_irp.is_null() {
                 assertion_trap();
             }
-            xboxkrnl::KeSetEvent((&raw mut (*extension).work).cast(), 1, false);
+            xboxkrnl::KeSetEvent(
+                (&raw mut (*extension).work).cast(),
+                xboxkrnl::EVENT_INCREMENT,
+                false,
+            );
             xboxkrnl::KeWaitForSingleObject(
                 thread.as_ptr().cast(),
                 WaitReason::UserRequest,
@@ -545,13 +574,12 @@ extern "C" fn worker(device: *mut DeviceObject) -> u32 {
                     Handle::from_raw((*extension).file),
                     &raw mut (*irp).io_status,
                 )
-                .0
             } else {
                 transfer(extension, irp)
             };
-            (*irp).io_status.status = NtStatus(status);
+            (*irp).io_status.status = status;
             xboxkrnl::KfRaiseIrql(Irql::DISPATCH);
-            xboxkrnl::IoCompleteRequest(irp, u32::from(succeeded(status)));
+            xboxkrnl::IoCompleteRequest(irp, u32::from(status.is_success()));
             xboxkrnl::IoStartNextPacket(device);
             xboxkrnl::KfLowerIrql(Irql::PASSIVE);
         }
@@ -563,16 +591,16 @@ extern "C" fn worker(device: *mut DeviceObject) -> u32 {
 /// # Safety
 /// `extension` and `irp` must be the worker's device extension and the
 /// request it took.
-unsafe fn transfer(extension: *mut Extension, irp: *mut Irp) -> u32 {
+unsafe fn transfer(extension: *mut Extension, irp: *mut Irp) -> NtStatus {
     // SAFETY: guaranteed by the caller; the transfer address was checked or
     // asserted when the request was queued.
     unsafe {
         let location = (*irp).current_stack_location;
-        let parameters = (*location).parameters.words;
-        let length = parameters[LENGTH];
+        let queued = *QueuedTransfer::of(location);
+        let length = queued.length;
         // Stock forms the byte offset in 32 bits.
-        let offset = u64::from(parameters[SECTOR] << SECTOR_SHIFT);
-        let buffer = parameters[BUFFER_OFFSET].wrapping_add(parameters[BUFFER]);
+        let offset = u64::from(queued.first_sector << SECTOR_SHIFT);
+        let buffer = queued.buffer_offset.wrapping_add(queued.buffer);
         let (file, event) = ((*extension).file, (*extension).io_event);
         let mut io_status = IoStatusBlock::default();
         let io_status = &raw mut io_status;
@@ -601,28 +629,28 @@ unsafe fn transfer(extension: *mut Extension, irp: *mut Irp) -> u32 {
             )
         };
         let mut status = if started == NtStatus::PENDING {
-            if !succeeded(
-                xboxkrnl::NtWaitForSingleObjectEx(
-                    Handle::from_raw(event),
-                    ProcessorMode::Kernel,
-                    false,
-                    null(),
-                )
-                .0,
-            ) {
+            let waited = xboxkrnl::NtWaitForSingleObjectEx(
+                Handle::from_raw(event),
+                ProcessorMode::Kernel,
+                false,
+                null(),
+            );
+            if !waited.is_success() {
                 assertion_trap();
             }
-            (&raw const (*io_status).status).read_volatile().0
+            // The kernel wrote the block through the pointer it was given
+            // before it signaled the event.
+            (*io_status).status
         } else {
-            started.0
+            started
         };
-        let information = (&raw const (*io_status).information).read_volatile();
+        let information = (*io_status).information;
         (*irp).io_status.information = information;
         if read {
-            if NtStatus(status) == KernelError::EndOfFile.status() {
+            if status == KernelError::EndOfFile.status() {
                 core::ptr::write_bytes(buffer as usize as *mut u8, 0, length as usize);
                 (*irp).io_status.information = length;
-                status = NtStatus::SUCCESS.0;
+                status = NtStatus::SUCCESS;
             } else if information < length {
                 core::ptr::write_bytes(
                     buffer.wrapping_add(information) as usize as *mut u8,
@@ -631,10 +659,10 @@ unsafe fn transfer(extension: *mut Extension, irp: *mut Irp) -> u32 {
                 );
                 (*irp).io_status.information = length;
             }
-        } else if succeeded(status) {
+        } else if status.is_success() {
             (*extension).writes = (*extension).writes.wrapping_add(1);
             if information < length {
-                status = KernelError::EndOfFile.status().0;
+                status = KernelError::EndOfFile.status();
             }
         }
         status
@@ -664,7 +692,11 @@ extern "C" fn start_io(device: *mut DeviceObject, irp: *mut Irp) -> u32 {
             assertion_trap();
         }
         (*extension).irp = NonNull::new(irp);
-        xboxkrnl::KeSetEvent((&raw mut (*extension).work).cast(), 1, false)
+        xboxkrnl::KeSetEvent(
+            (&raw mut (*extension).work).cast(),
+            xboxkrnl::EVENT_INCREMENT,
+            false,
+        )
     }
 }
 
@@ -708,13 +740,14 @@ extern "C" fn read_write(device: *mut DeviceObject, irp: *mut Irp) -> NtStatus {
             (*irp).io_status.information = 0;
             return complete(irp, NtStatus::SUCCESS);
         }
-        let words = &mut (*location).parameters.words;
-        words[SECTOR] = ((*extension).start.wrapping_add(offset) as i64 >> SECTOR_SHIFT) as u32;
+        let queued = QueuedTransfer::of(location);
+        queued.first_sector =
+            ((*extension).start.wrapping_add(offset) as i64 >> SECTOR_SHIFT) as u32;
         if address_given {
-            words[BUFFER_OFFSET] = 0;
+            queued.buffer_offset = 0;
         } else {
-            words[BUFFER_OFFSET] = parameters.buffer;
-            words[BUFFER] = user_buffer;
+            queued.buffer_offset = parameters.buffer;
+            queued.buffer = user_buffer;
         }
         (*irp).io_status.information = length;
         (*location).control |= IoStackControl::PENDING_RETURNED;
@@ -743,24 +776,30 @@ extern "C" fn device_control(device: *mut DeviceObject, irp: *mut Irp) -> NtStat
         let output_length = parameters.output_length;
         let output = (*irp).user_buffer;
         let status = match parameters.control_code {
-            IoControlCode::DISK_GET_DRIVE_GEOMETRY if output_length < 8 => {
+            IoControlCode::DISK_GET_DRIVE_GEOMETRY
+                if (output_length as usize) < size_of::<DiskGeometry>() =>
+            {
                 KernelError::BufferTooSmall.status()
             }
             IoControlCode::DISK_GET_DRIVE_GEOMETRY => {
-                let output = output.cast::<u32>();
-                output.add(1).write_unaligned(SECTOR_SIZE);
-                output.write_unaligned(((*extension).length as i64 >> SECTOR_SHIFT) as u32);
-                (*irp).io_status.information = 8;
+                // The user buffer need not be aligned.
+                let output = output.cast::<DiskGeometry>();
+                (&raw mut (*output).bytes_per_sector).write_unaligned(SECTOR_SIZE);
+                (&raw mut (*output).sectors)
+                    .write_unaligned(((*extension).length as i64 >> SECTOR_SHIFT) as u32);
+                (*irp).io_status.information = size_of::<DiskGeometry>() as u32;
                 NtStatus::SUCCESS
             }
-            IoControlCode::DISK_GET_PARTITION_INFO if output_length < 0x10 => {
+            IoControlCode::DISK_GET_PARTITION_INFO
+                if (output_length as usize) < size_of::<PartitionInformation>() =>
+            {
                 KernelError::BufferTooSmall.status()
             }
             IoControlCode::DISK_GET_PARTITION_INFO => {
-                let output = output.cast::<u64>();
-                output.write_unaligned((*extension).start);
-                output.add(1).write_unaligned((*extension).length);
-                (*irp).io_status.information = 0x10;
+                let output = output.cast::<PartitionInformation>();
+                (&raw mut (*output).starting_offset).write_unaligned((*extension).start);
+                (&raw mut (*output).partition_length).write_unaligned((*extension).length);
+                (*irp).io_status.information = size_of::<PartitionInformation>() as u32;
                 NtStatus::SUCCESS
             }
             _ => KernelError::InvalidDeviceRequest.status(),

@@ -909,11 +909,11 @@ impl memory::Backend for Console {
     }
 
     fn read_flash(&mut self, offset: u32, output: &mut [u8]) -> Result<(), KernelError> {
-        super::system::flash::device_read(offset, output.as_mut_ptr(), output.len() as u32)
+        super::system::flash::device_read(offset, output)
     }
 
     fn write_flash(&mut self, offset: u32, data: &[u8]) -> Result<(), KernelError> {
-        super::system::flash::device_write(offset, data.as_ptr(), data.len() as u32)
+        super::system::flash::device_write(offset, data)
     }
 
     fn trace_imports(&mut self, module: &[u8], enable: bool) -> bool {

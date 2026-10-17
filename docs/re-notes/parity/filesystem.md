@@ -64,6 +64,9 @@ thread already translate through `dispatcher::call_on_server`.
   unchanged or translates as an empty target (stock faults).
 - DMSATA prints (stock 0x91f3ebb0 into the `dbgprint` ring) are queued in
   `dvd_hotplug.rs` and reach the ring on the next server pass.
+- The DMSATA hot-plug DPC and StartReinitialize use the fixed CD-ROM SATA
+  register address; stock reloads it from the channel extension, whose
+  word `find_channel` validated.
 
 Transfer aborts follow stock (0x91f423f8/0x91f509f0): a failed 203 send
 calls the continuation once with `aborted` before closing; a 204 receive

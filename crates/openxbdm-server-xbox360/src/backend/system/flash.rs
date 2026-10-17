@@ -16,6 +16,7 @@ use xbox360_sys::xboxkrnl::AnsiString;
 use xbox360_sys::xboxkrnl::CreateOptions;
 use xbox360_sys::xboxkrnl::FileAttributes;
 use xbox360_sys::xboxkrnl::Handle;
+use xbox360_sys::xboxkrnl::HardwareFlags;
 use xbox360_sys::xboxkrnl::IoControlCode;
 use xbox360_sys::xboxkrnl::IoStatusBlock;
 use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
@@ -27,34 +28,132 @@ use super::POOL_TAG;
 use crate::kernel;
 
 const DEVICE_NAME: &[u8] = b"\\Device\\Flash\0";
+/// Bytes of the `IoControlCode::FLASH_GEOMETRY` output.
 const GEOMETRY_SIZE: u32 = 0x14;
 const PAGE_SIZE: u32 = 0x4000;
 /// `MmAllocatePhysicalMemory` protection of the boot loader buffer.
 const BOOT_LOADER_PROTECT: PageProtection =
     PageProtection::READWRITE.union(PageProtection::LARGE_PAGES);
-const ERROR_BAD_FORMAT: Win32Error = Win32Error::new(0xb).unwrap();
-const ERROR_REVISION_MISMATCH: Win32Error = Win32Error::new(0x51a).unwrap();
-const HEADER_WRITE_SIZE: u32 = 0x80;
+/// Bytes of the header that a reflash writes.
+const HEADER_WRITE_SIZE: usize = size_of::<ImageHeader>();
 const BODY_START: u32 = 0x100;
 /// Stock traps when the patch block ends past this offset but continues.
 const PATCH_LIMIT: u32 = 0x2_0000;
 
-/// Header word: image offset of the 16-bit hardware identifier.
-const HEADER_HARDWARE_ID_OFFSET: usize = 0x08;
-/// Header word: boot loader size passed to `XeKeysSaveBootLoader`.
-const HEADER_BOOT_LOADER_SIZE: usize = 0x0c;
-/// Header word: patch block size; 0 means `PAGE_SIZE`.
-const HEADER_PATCH_SIZE: usize = 0x60;
-/// Header word rounded up to the write unit and copied to
-/// `HEADER_BOOT_LOADER_SIZE`.
-const HEADER_LOADER_EXTENT: usize = 0x64;
-/// Header half-word that must match the flash copy to reuse its patch block.
-const HEADER_PATCH_VERSION: usize = 0x6a;
-/// Header word: flash offset of the patch block; 0 means none.
-const HEADER_PATCH_OFFSET: usize = 0x6c;
-/// Header word of unknown purpose: rounded up to the write unit, and when 0
-/// no header word is rounded.
-const HEADER_FIELD_70: usize = 0x70;
+/// A big-endian word of an image header.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct Be32([u8; 4]);
+
+impl Be32 {
+    fn get(self) -> u32 {
+        u32::from_be_bytes(self.0)
+    }
+
+    fn set(&mut self, value: u32) {
+        self.0 = value.to_be_bytes();
+    }
+}
+
+/// A big-endian halfword of an image header.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct Be16([u8; 2]);
+
+impl Be16 {
+    fn get(self) -> u16 {
+        u16::from_be_bytes(self.0)
+    }
+}
+
+/// The header of a kernel image, the part of flash a reflash writes first.
+/// Every field is bytes, so any bytes form a header.
+#[repr(C)]
+struct ImageHeader {
+    _reserved_00: [u8; 8],
+    /// Image offset of the 16-bit hardware identifier.
+    hardware_id_offset: Be32,
+    /// Boot loader size passed to `XeKeysSaveBootLoader`.
+    boot_loader_size: Be32,
+    _reserved_10: [u8; 0x50],
+    /// Patch block size; 0 means `PAGE_SIZE`.
+    patch_size: Be32,
+    /// Rounded up to the write unit and copied to `boot_loader_size`.
+    loader_extent: Be32,
+    _reserved_68: [u8; 2],
+    /// Must match the flash copy to reuse its patch block.
+    patch_version: Be16,
+    /// Flash offset of the patch block; 0 means none.
+    patch_offset: Be32,
+    /// Purpose unknown: rounded up to the write unit, and when 0 no header
+    /// word is rounded.
+    unknown_70: Be32,
+    _reserved_74: [u8; 0xc],
+}
+
+const _: () = {
+    use core::mem::offset_of;
+    assert!(offset_of!(ImageHeader, hardware_id_offset) == 0x08);
+    assert!(offset_of!(ImageHeader, boot_loader_size) == 0x0c);
+    assert!(offset_of!(ImageHeader, patch_size) == 0x60);
+    assert!(offset_of!(ImageHeader, loader_extent) == 0x64);
+    assert!(offset_of!(ImageHeader, patch_version) == 0x6a);
+    assert!(offset_of!(ImageHeader, patch_offset) == 0x6c);
+    assert!(offset_of!(ImageHeader, unknown_70) == 0x70);
+    assert!(size_of::<ImageHeader>() == 0x80);
+    assert!(align_of::<ImageHeader>() == 1);
+};
+
+impl ImageHeader {
+    const EMPTY: Self = Self {
+        _reserved_00: [0; 8],
+        hardware_id_offset: Be32([0; 4]),
+        boot_loader_size: Be32([0; 4]),
+        _reserved_10: [0; 0x50],
+        patch_size: Be32([0; 4]),
+        loader_extent: Be32([0; 4]),
+        _reserved_68: [0; 2],
+        patch_version: Be16([0; 2]),
+        patch_offset: Be32([0; 4]),
+        unknown_70: Be32([0; 4]),
+        _reserved_74: [0; 0xc],
+    };
+
+    fn patch_size(&self) -> u32 {
+        match self.patch_size.get() {
+            0 => PAGE_SIZE,
+            declared => declared,
+        }
+    }
+
+    fn as_bytes_mut(&mut self) -> &mut [u8; HEADER_WRITE_SIZE] {
+        // SAFETY: the header is `HEADER_WRITE_SIZE` bytes of alignment 1,
+        // and any bytes form a header.
+        unsafe { &mut *core::ptr::from_mut(self).cast() }
+    }
+}
+
+/// A kernel image of at least a header.
+struct Image<'a>(&'a mut [u8]);
+
+impl<'a> Image<'a> {
+    /// None for an image shorter than the header (a deviation: stock reads
+    /// the header past the buffer).
+    fn new(bytes: &'a mut [u8]) -> Option<Self> {
+        (bytes.len() >= HEADER_WRITE_SIZE).then_some(Self(bytes))
+    }
+
+    fn header(&self) -> &ImageHeader {
+        // SAFETY: the image holds a header (checked in `new`), which has
+        // alignment 1 and accepts any bytes.
+        unsafe { &*self.0.as_ptr().cast() }
+    }
+
+    fn header_mut(&mut self) -> &mut ImageHeader {
+        // SAFETY: as in `header`.
+        unsafe { &mut *self.0.as_mut_ptr().cast() }
+    }
+}
 
 /// Pool buffer holding a `flash` upload.
 pub struct FlashImage {
@@ -67,7 +166,7 @@ impl FlashImage {
     pub fn allocate(rounded_size: u32) -> Option<Self> {
         // SAFETY: the allocation takes only a size and tag.
         let address = unsafe { xboxkrnl::ExAllocatePoolWithTag(rounded_size, POOL_TAG) };
-        NonNull::new(address as usize as *mut u8).map(|base| Self {
+        NonNull::new(core::ptr::with_exposed_provenance_mut(address as usize)).map(|base| Self {
             base,
             size: rounded_size,
         })
@@ -84,13 +183,9 @@ impl FlashImage {
         ignore_version_checking: bool,
         stock_image: bool,
     ) -> Result<(), Win32Error> {
-        let image = Image {
-            base: self.base.as_ptr(),
-        };
         let mut buffers = Buffers::default();
         let result = flash_kernel_image(
-            image,
-            self.size,
+            self.bytes_mut(),
             ignore_version_checking,
             stock_image,
             &mut buffers,
@@ -98,7 +193,7 @@ impl FlashImage {
         buffers.release();
         match result {
             Ok(()) => Ok(()),
-            Err(Failure::Kernel(error)) => xboxkrnl::RtlNtStatusToDosError(error.status()).result(),
+            Err(Failure::Kernel(error)) => xbox360::status::dos_error(error).map_or(Ok(()), Err),
             Err(Failure::Win32(error)) => Err(error),
         }
     }
@@ -107,7 +202,7 @@ impl FlashImage {
 impl Drop for FlashImage {
     fn drop(&mut self) {
         // SAFETY: `base` is the pool block `allocate` returned and `self` owns it.
-        unsafe { xboxkrnl::ExFreePool(self.base.as_ptr() as usize as u32) };
+        unsafe { xboxkrnl::ExFreePool(self.base.as_ptr().expose_provenance() as u32) };
     }
 }
 
@@ -147,42 +242,6 @@ impl Buffers {
     }
 }
 
-/// Big-endian header access. Offsets come from the image itself and are not
-/// bounded by the buffer, as in stock.
-#[derive(Clone, Copy)]
-struct Image {
-    base: *mut u8,
-}
-
-impl Image {
-    fn word(self, offset: usize) -> u32 {
-        // SAFETY: stock reads the same address.
-        u32::from_be_bytes(unsafe { self.base.wrapping_add(offset).cast::<[u8; 4]>().read() })
-    }
-
-    fn half(self, offset: usize) -> u16 {
-        // SAFETY: stock reads the same address.
-        u16::from_be_bytes(unsafe { self.base.wrapping_add(offset).cast::<[u8; 2]>().read() })
-    }
-
-    fn set_word(self, offset: usize, value: u32) {
-        // SAFETY: stock writes the same address.
-        unsafe {
-            self.base
-                .wrapping_add(offset)
-                .cast::<[u8; 4]>()
-                .write(value.to_be_bytes())
-        };
-    }
-
-    fn patch_size(self) -> u32 {
-        match self.word(HEADER_PATCH_SIZE) {
-            0 => PAGE_SIZE,
-            declared => declared,
-        }
-    }
-}
-
 /// Location of the patch block kept from the current flash contents.
 #[derive(Clone, Copy)]
 enum PatchBlock {
@@ -204,22 +263,32 @@ fn trap_patch_layout() {
     unsafe { core::arch::asm!("twi 31, 0, 0x19") };
 }
 
+/// `bytes[start..end]`. Deviation: stock reads past the buffer when header
+/// offsets leave it; this fails instead.
+fn range(bytes: &[u8], start: u32, end: Option<u32>) -> Result<&[u8], KernelError> {
+    match end {
+        Some(end) => bytes.get(start as usize..end as usize),
+        None => bytes.get(start as usize..),
+    }
+    .ok_or(KernelError::InvalidParameter)
+}
+
 fn flash_kernel_image(
-    image: Image,
-    size: u32,
+    image: &mut [u8],
     ignore_version_checking: bool,
     stock_image: bool,
     buffers: &mut Buffers,
 ) -> Result<(), Failure> {
-    if size & (PAGE_SIZE - 1) != 0 {
+    if image.len() as u32 & (PAGE_SIZE - 1) != 0 {
         return Err(KernelError::InvalidParameter.into());
     }
-    if !ignore_version_checking && !hardware_matches(image) {
-        return Err(Failure::Win32(ERROR_REVISION_MISMATCH));
+    let mut image = Image::new(image).ok_or(KernelError::InvalidParameter)?;
+    if !ignore_version_checking && !hardware_matches(&image) {
+        return Err(Failure::Win32(Win32Error::REVISION_MISMATCH));
     }
-    align_to_write_unit(image)?;
+    align_to_write_unit(&mut image)?;
 
-    let mut patch_size = image.patch_size();
+    let mut patch_size = image.header().patch_size();
     let mut patch_base = 0;
     // SAFETY: `patch_base` and `patch_size` are live locals.
     let status = unsafe {
@@ -233,26 +302,35 @@ fn flash_kernel_image(
     };
     buffers.patch = NonZeroU32::new(patch_base);
     status.result()?;
+    // SAFETY: the kernel committed `patch_size` bytes at `patch_base`, which
+    // `buffers` releases only after the writer returns.
+    let patch_buffer = unsafe {
+        core::slice::from_raw_parts_mut(
+            core::ptr::with_exposed_provenance_mut::<u8>(patch_base as usize),
+            patch_size as usize,
+        )
+    };
 
-    let patch = match read_patch_block(image, patch_base as usize as *mut u8, patch_size) {
+    let patch = match read_patch_block(image.header(), patch_buffer) {
         Some(patch) => patch,
         // Stock continues with the cleared outputs, so no region is kept.
         None if ignore_version_checking => PatchBlock::Absent,
-        None => return Err(Failure::Win32(ERROR_BAD_FORMAT)),
+        None => return Err(Failure::Win32(Win32Error::BAD_FORMAT)),
     };
     if let PatchBlock::Present {
         offset,
         moved: true,
     } = patch
     {
-        device_write(offset.get(), patch_base as usize as *const u8, patch_size)?;
+        device_write(offset.get(), patch_buffer)?;
     }
-    write_ranges(image.base, size, patch.offset(), patch_size)?;
+    write_ranges(image.0, patch.offset(), patch_size)?;
     if stock_image {
         return Ok(());
     }
 
-    let mut loader_size = image.word(HEADER_BOOT_LOADER_SIZE);
+    let allocated = image.header().boot_loader_size.get();
+    let mut loader_size = allocated;
     let mut flags = 0;
     // SAFETY: the allocation takes only a size and protection.
     let loader = NonZeroU32::new(unsafe {
@@ -271,60 +349,77 @@ fn flash_kernel_image(
         );
         return Ok(());
     }
+    // SAFETY: the physical allocation holds `allocated` bytes, which
+    // `buffers` releases only after the writer returns.
+    let loader = unsafe {
+        core::slice::from_raw_parts(
+            core::ptr::with_exposed_provenance::<u8>(loader.get() as usize),
+            allocated as usize,
+        )
+    };
+    // Deviation: a size above the allocation fails instead of reading past it.
     write_ranges(
-        loader.get() as usize as *const u8,
-        loader_size,
+        range(loader, 0, Some(loader_size))?,
         patch.offset(),
         patch_size,
     )?;
     Ok(())
 }
 
-/// Stock 0x91f73260.
-fn hardware_matches(image: Image) -> bool {
-    let identifier = image.half(image.word(HEADER_HARDWARE_ID_OFFSET) as usize);
-    if hardware_flags().bits() & 3 == 3 {
-        identifier & 0xfff == 0x342
+/// Stock 0x91f73260. Deviation: an identifier offset outside the image does
+/// not match; stock reads past the image.
+fn hardware_matches(image: &Image<'_>) -> bool {
+    /// Hardware flag bits that select the identifier check; their kernel
+    /// meaning is unknown.
+    const IDENTIFIED_HARDWARE: HardwareFlags = HardwareFlags::from_bits_retain(0x3);
+    const IDENTIFIER_MASK: u16 = 0xfff;
+    const IDENTIFIER: u16 = 0x342;
+    let offset = image.header().hardware_id_offset.get() as usize;
+    let Some(&identifier) = image.0.get(offset..).and_then(<[u8]>::first_chunk::<2>) else {
+        return false;
+    };
+    let identifier = u16::from_be_bytes(identifier);
+    if hardware_flags().contains(IDENTIFIED_HARDWARE) {
+        identifier & IDENTIFIER_MASK == IDENTIFIER
     } else {
         identifier == 0
     }
 }
 
 /// Stock 0x91f732a8.
-fn align_to_write_unit(image: Image) -> Result<(), KernelError> {
+fn align_to_write_unit(image: &mut Image<'_>) -> Result<(), KernelError> {
     let mut device = Device::open_read()?;
     let unit = device.write_unit()?;
-    let field_70 = image.word(HEADER_FIELD_70);
+    let header = image.header_mut();
+    let field_70 = header.unknown_70.get();
     if unit > PAGE_SIZE && field_70 != 0 {
         let mask = !(unit - 1);
-        let extent = image.word(HEADER_LOADER_EXTENT).wrapping_add(unit - 1) & mask;
-        image.set_word(HEADER_LOADER_EXTENT, extent);
-        image.set_word(HEADER_FIELD_70, field_70.wrapping_add(unit - 1) & mask);
-        image.set_word(HEADER_BOOT_LOADER_SIZE, extent);
+        let extent = header.loader_extent.get().wrapping_add(unit - 1) & mask;
+        header.loader_extent.set(extent);
+        header
+            .unknown_70
+            .set(field_70.wrapping_add(unit - 1) & mask);
+        header.boot_loader_size.set(extent);
     }
     Ok(())
 }
 
 /// Stock 0x91f733b8: read the patch block of the current flash contents into
 /// `buffer`. None when the flash header does not describe a compatible one.
-fn read_patch_block(image: Image, buffer: *mut u8, size: u32) -> Option<PatchBlock> {
-    let Some(offset) = NonZeroU32::new(image.word(HEADER_PATCH_OFFSET)) else {
+fn read_patch_block(image: &ImageHeader, buffer: &mut [u8]) -> Option<PatchBlock> {
+    let Some(offset) = NonZeroU32::new(image.patch_offset.get()) else {
         return Some(PatchBlock::Absent);
     };
-    let mut header = [0u8; HEADER_WRITE_SIZE as usize];
-    device_read(0, header.as_mut_ptr(), HEADER_WRITE_SIZE).ok()?;
-    let current = Image {
-        base: header.as_mut_ptr(),
-    };
-    let current_offset = NonZeroU32::new(current.word(HEADER_PATCH_OFFSET))?;
-    if current.half(HEADER_PATCH_VERSION) != image.half(HEADER_PATCH_VERSION) {
+    let mut current = ImageHeader::EMPTY;
+    device_read(0, current.as_bytes_mut()).ok()?;
+    let current_offset = NonZeroU32::new(current.patch_offset.get())?;
+    if current.patch_version.get() != image.patch_version.get() {
         return None;
     }
-    let current_size = current.patch_size();
-    if current_size != size {
+    if current.patch_size() != buffer.len() as u32 {
         return None;
     }
-    device_read(current_offset.get(), buffer, size).ok()?;
+    device_read(current_offset.get(), buffer).ok()?;
     Some(PatchBlock::Present {
         offset,
         moved: current_offset != offset,
@@ -334,8 +429,7 @@ fn read_patch_block(image: Image, buffer: *mut u8, size: u32) -> Option<PatchBlo
 /// Stock 0x91f734a0 with no progress routine; the `flash` command passes
 /// none, which also makes the 0x20000-byte chunked path unreachable.
 fn write_ranges(
-    buffer: *const u8,
-    total: u32,
+    buffer: &[u8],
     patch: Option<NonZeroU32>,
     patch_size: u32,
 ) -> Result<(), KernelError> {
@@ -348,24 +442,15 @@ fn write_ranges(
     if patch_end > PATCH_LIMIT {
         trap_patch_layout();
     }
-    device_write(0, buffer, HEADER_WRITE_SIZE)?;
+    device_write(0, range(buffer, 0, Some(HEADER_WRITE_SIZE as u32))?)?;
     let resume = match patch {
         None => BODY_START,
         Some(offset) => {
-            device_write(
-                BODY_START,
-                buffer.wrapping_add(BODY_START as usize),
-                offset.get() - BODY_START,
-            )?;
+            device_write(BODY_START, range(buffer, BODY_START, Some(offset.get()))?)?;
             patch_end
         }
     };
-    // A total below `resume` wraps to a huge length, as in stock.
-    device_write(
-        resume,
-        buffer.wrapping_add(resume as usize),
-        total.wrapping_sub(resume),
-    )
+    device_write(resume, range(buffer, resume, None)?)
 }
 
 /// `\Device\Flash`, opened per operation as stock does.
@@ -440,6 +525,8 @@ impl Device {
         Ok(device)
     }
 
+    /// Bytes of the unit the device writes: the product of geometry words 0
+    /// and 2.
     fn write_unit(&mut self) -> Result<u32, KernelError> {
         let mut geometry = [0u32; GEOMETRY_SIZE as usize / 4];
         // SAFETY: the handle is open and `geometry` holds GEOMETRY_SIZE bytes.
@@ -461,9 +548,9 @@ impl Device {
         Ok(geometry[0].wrapping_mul(geometry[2]))
     }
 
-    fn read(&mut self, buffer: *mut u8, length: u32, offset: u64) -> Result<(), KernelError> {
-        // SAFETY: the handle is open; callers pass a buffer of `length`
-        // bytes; the device is synchronous.
+    fn read(&mut self, buffer: &mut [u8], offset: u64) -> Result<(), KernelError> {
+        // SAFETY: the handle is open; the device is synchronous, so the
+        // kernel writes `buffer` only during the call.
         unsafe {
             xboxkrnl::NtReadFile(
                 self.handle,
@@ -471,15 +558,15 @@ impl Device {
                 0,
                 0,
                 &mut self.io_status,
-                buffer,
-                length,
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
                 &offset,
             )
         }
         .result()
     }
 
-    fn write(&mut self, buffer: *const u8, length: u32, offset: u64) -> Result<(), KernelError> {
+    fn write(&mut self, data: &[u8], offset: u64) -> Result<(), KernelError> {
         // SAFETY: as in `read`.
         unsafe {
             xboxkrnl::NtWriteFile(
@@ -488,8 +575,8 @@ impl Device {
                 0,
                 0,
                 &mut self.io_status,
-                buffer,
-                length,
+                data.as_ptr(),
+                data.len() as u32,
                 &offset,
             )
         }
@@ -505,39 +592,47 @@ impl Drop for Device {
 }
 
 /// Stock 0x91f72bd0.
-pub(in crate::backend) fn device_read(
-    offset: u32,
-    buffer: *mut u8,
-    length: u32,
-) -> Result<(), KernelError> {
-    Device::open_read_write()?.read(buffer, length, u64::from(offset))
+pub(in crate::backend) fn device_read(offset: u32, buffer: &mut [u8]) -> Result<(), KernelError> {
+    Device::open_read_write()?.read(buffer, u64::from(offset))
 }
 
 /// Unit-sized bounce buffer for partial-unit writes, allocated on first use.
 struct Scratch {
     base: Option<NonZeroU32>,
+    /// The size to allocate, then the size the allocation reported.
     size: u32,
+    unit: u32,
 }
 
 impl Scratch {
-    fn page(&mut self) -> Result<*mut u8, KernelError> {
-        if let Some(base) = self.base {
-            return Ok(base.get() as usize as *mut u8);
-        }
-        let mut base = 0;
-        // SAFETY: `base` and `self.size` are live.
-        let status = unsafe {
-            xboxkrnl::NtAllocateVirtualMemory(
-                &mut base,
-                &mut self.size,
-                AllocationType::COMMIT | AllocationType::RESERVE,
-                PageProtection::READWRITE,
-                xboxkrnl::MemoryRegion::CurrentProcess,
-            )
+    fn page(&mut self) -> Result<&mut [u8], KernelError> {
+        let base = match self.base {
+            Some(base) => base.get(),
+            None => {
+                let mut base = 0;
+                // SAFETY: `base` and `self.size` are live.
+                let status = unsafe {
+                    xboxkrnl::NtAllocateVirtualMemory(
+                        &mut base,
+                        &mut self.size,
+                        AllocationType::COMMIT | AllocationType::RESERVE,
+                        PageProtection::READWRITE,
+                        xboxkrnl::MemoryRegion::CurrentProcess,
+                    )
+                };
+                self.base = NonZeroU32::new(base);
+                status.result()?;
+                base
+            }
         };
-        self.base = NonZeroU32::new(base);
-        status.result()?;
-        Ok(base as usize as *mut u8)
+        // SAFETY: the allocation holds at least the `unit` bytes requested,
+        // and `self` lends them for the borrow.
+        Ok(unsafe {
+            core::slice::from_raw_parts_mut(
+                core::ptr::with_exposed_provenance_mut(base as usize),
+                self.unit as usize,
+            )
+        })
     }
 
     /// Stock passes the size the allocation reported.
@@ -554,18 +649,15 @@ impl Scratch {
 
 /// Stock 0x91f72c78: whole units are written from `source`; partial units
 /// are read, merged, and written back.
-pub(in crate::backend) fn device_write(
-    offset: u32,
-    source: *const u8,
-    length: u32,
-) -> Result<(), KernelError> {
+pub(in crate::backend) fn device_write(offset: u32, source: &[u8]) -> Result<(), KernelError> {
     let mut device = Device::open_read_write()?;
     let unit = device.write_unit()?;
     let mut scratch = Scratch {
         base: None,
         size: unit,
+        unit,
     };
-    let result = write_units(&mut device, unit, &mut scratch, offset, source, length);
+    let result = write_units(&mut device, unit, &mut scratch, offset, source);
     scratch.release();
     result
 }
@@ -575,32 +667,26 @@ fn write_units(
     unit: u32,
     scratch: &mut Scratch,
     mut offset: u32,
-    mut source: *const u8,
-    mut length: u32,
+    mut source: &[u8],
 ) -> Result<(), KernelError> {
-    while length != 0 {
+    while !source.is_empty() {
+        let length = source.len() as u32;
         let misalignment = offset & unit.wrapping_sub(1);
-        let (data, position, chunk) = if misalignment == 0 && length >= unit {
-            (source, offset, unit)
+        let chunk = if misalignment == 0 && length >= unit {
+            device.write(&source[..unit as usize], u64::from(offset))?;
+            unit
         } else {
             let chunk = unit.wrapping_sub(misalignment).min(length);
             let page = scratch.page()?;
             let position = offset.wrapping_sub(misalignment);
-            device.read(page, unit, u64::from(position))?;
-            // SAFETY: stock copies the same range into its unit-sized buffer.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    source,
-                    page.wrapping_add(misalignment as usize),
-                    chunk as usize,
-                )
-            };
-            (page.cast_const(), position, chunk)
+            device.read(page, u64::from(position))?;
+            page[misalignment as usize..(misalignment + chunk) as usize]
+                .copy_from_slice(&source[..chunk as usize]);
+            device.write(page, u64::from(position))?;
+            chunk
         };
-        device.write(data, unit, u64::from(position))?;
-        length -= chunk;
         offset = offset.wrapping_add(chunk);
-        source = source.wrapping_add(chunk as usize);
+        source = &source[chunk as usize..];
     }
     Ok(())
 }

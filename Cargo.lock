@@ -2332,18 +2332,18 @@ dependencies = [
 
 [[package]]
 name = "xbox360"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c33dd22097eb0c02f644d5f2abe486c6b945a29fc8d26da59ec1cc93400d14f8"
+checksum = "82bda8e58e1697254fe048d361b82acdc24151bcc9b519ff95c718385c474a7a"
 dependencies = [
  "xbox360-sys",
 ]
 
 [[package]]
 name = "xbox360-sys"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eaa7fd5031b4062a96cf18a4d32f7dec542745b9ffce5ed20977e3ba291bf878"
+checksum = "01f1c536e005153e25b91c2fd21e05e388d335ebdd76d9e519e5a77d6baab7f6"
 
 [[package]]
 name = "xecrypt"

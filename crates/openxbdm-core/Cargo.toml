@@ -13,4 +13,4 @@ path = "src/lib.rs"
 doctest = false
 
 [dependencies]
-xbox360-sys = "0.1"
+xbox360-sys = "0.2"

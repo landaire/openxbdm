@@ -527,14 +527,19 @@ fn thread_names(file: super::super::files::CaptureFile) {
             return;
         }
     }
-    thread_name(file, crate::backend::debugger::server_thread());
+    thread_name(
+        file,
+        crate::backend::debugger::server_thread().map_or(0, core::num::NonZeroU32::get),
+    );
 }
 
 /// `{0x8000004a, dwords, thread id, name}` (stock 0x91f5d050); false when
 /// the write fails.
 fn thread_name(file: super::super::files::CaptureFile, thread: u32) -> bool {
     let Some(name) = (thread != 0)
-        .then(|| crate::backend::debugger::thread_name(thread))
+        // SAFETY: the thread object stays referenced while its name is read,
+        // as stock reads it.
+        .then(|| unsafe { crate::backend::debugger::thread_name(crate::kernel::thread_at(thread)) })
         .flatten()
     else {
         return true;

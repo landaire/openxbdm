@@ -574,7 +574,9 @@ mod xbox360 {
             xboxkrnl::KeBugCheckEx(BUG_CHECK_PANIC, 0, 0, 0, 0);
         }
         kernel::debug_print(c"openxbdm: panic\n");
-        if processor::current_thread() == crate::backend::debugger::server_thread() {
+        if crate::backend::debugger::server_thread()
+            .is_some_and(|server| server.get() == processor::current_thread())
+        {
             stop_server_services();
             // SAFETY: the server thread has released every waiter above.
             unsafe { xboxkrnl::ExTerminateThread(THREAD_EXIT_CODE) };

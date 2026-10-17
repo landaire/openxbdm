@@ -125,6 +125,9 @@ lists.
 - Exports 13/41 read and write gpr1 through record +0x14 when record flag 0x10000 is set; nothing in the image sets that flag, so openxbdm does not model it.
 - Export 8 sleeps 1 ms after releasing a thread whose record has flag 0x200; openxbdm does not model that flag and does not sleep.
 - `getcontext` copies the context once into a 0xa50-byte pool block (`400- out of memory` when the allocation fails); openxbdm frees the block of a connection closed mid-transfer at the next event pass.
+- Monitor records of other threads are read and changed without the process thread list lock where stock does so: naming a thread (thread-name exception, `setthreadname`-style requests, PIX), `continue` suspending a thread while execution is stopped, the PIX pause flag exchange, and PIX thread name records. A thread that ends meanwhile frees its record, and a rename frees the old name copy while `threadinfo`/export 89 may read it under the lock. openxbdm keeps these races, as stock has them. Records are freed only by the ending thread itself, so record reads of the calling thread, of a thread waiting at an event, and under the lock do not race.
+- Critical section wait tracing (control codes 0x81 and 0x82) reads the owner's thread id and processor through the owner word without a reference; an owner that releases the section and ends meanwhile is read after it is freed, as in stock.
+- Exports 13 and 41 reach the caller's CONTEXT through field pointers that need only 8-byte alignment; the 16-byte alignment of the vector registers is not assumed.
 
 ## Network
 

@@ -11,29 +11,29 @@ use core::sync::atomic::Ordering;
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::XbdmHresult;
+use openxbdm_server::commands::debugger::ExceptionNotificationFlags;
 use openxbdm_server::commands::memory::is_device_address;
 use openxbdm_server::commands::session::compare_names;
 use openxbdm_server::commands::session::notification_kind_length;
 use openxbdm_server::notify::DataAccess;
 use openxbdm_server::notify::Event;
 use openxbdm_server::notify::ExceptionDetail;
+use xbox360::thread::ThreadObject;
 use xbox360_sys::processor;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::Irql;
 use xbox360_sys::xboxkrnl::PoolTag;
+use xbox360_sys::xboxkrnl::ProcessType;
 
-use super::THREAD_ID;
-use super::TITLE_PROCESS;
-use super::c_string;
 use super::passive;
 use super::post_notification;
-use super::read_u32;
 use super::swap;
-use super::write_u32;
+use super::until_nul;
 use crate::backend::debugger::execution_code;
 use crate::backend::debugger::execution_state;
 use crate::exports::export;
 use crate::kernel;
+use crate::kernel::address_of;
 
 export!(6, close_notification_session);
 export!(24, register_notification_handler);
@@ -41,38 +41,194 @@ export!(25, open_notification_session);
 export!(32, register_notification_processor);
 export!(36, send_notification);
 
-/// Session block: +0x0 tag, +0x4 next session, +0x8 flags, +0xc handler
-/// lists (0x20 per kind, kinds 1..=0x16), +0xb08 + 4 * kind handler
-/// counts, +0xb64 processors.
+/// Tag word of a session block, 'xnot'.
 const SESSION_TAG: u32 = 0x786e_6f74;
 const SESSION_POOL_TAG: PoolTag = PoolTag::new(*b"snmd");
-const SESSION_SIZE: u32 = 0xba4;
-const SESSION_NEXT: u32 = 0x4;
-const SESSION_FLAGS: u32 = 0x8;
-const SESSION_HANDLERS: u32 = 0xc;
-const SESSION_COUNTS: u32 = 0xb08;
-const SESSION_PROCESSORS: u32 = 0xb64;
-const HANDLER_SLOTS: u32 = 0x20;
-const PROCESSOR_SLOTS: u32 = 0x10;
-const LAST_KIND: u32 = 0x16;
-/// Opened by a title process; unlinked when the title ends.
-const SESSION_TITLE: u32 = 0x1_0000;
-/// Processor block: a name of at most 0x3f characters, then the handler.
+/// Handler lists of a session, one per kind 1..=0x16.
+const LIST_COUNT: usize = 0x16;
+const HANDLER_SLOTS: usize = 0x20;
+const PROCESSOR_SLOTS: usize = 0x10;
 const PROCESSOR_POOL_TAG: PoolTag = PoolTag::new(*b"hcmd");
-const PROCESSOR_SIZE: u32 = 0x44;
 const PROCESSOR_NAME_LIMIT: usize = 0x3f;
-const PROCESSOR_HANDLER: u32 = 0x40;
-const KIND_MASK: u32 = 0xff_ffff;
-const KIND_EXECUTION: u32 = 3;
-/// Handlers of this kind get the notification data 4 bytes in.
-const KIND_MODULE_LOAD: u32 = 5;
-/// The kernel calls the routine stored through debug monitor data +0x10
-/// while kind 0xa has handlers [purpose of the kernel call unknown].
-const KIND_KERNEL_CALLBACK: u32 = 0xa;
-const KIND_THREAD_SWITCH: u32 = 0xf;
 const ASSERT_PASSIVE: &core::ffi::CStr = c"KeGetCurrentIrql() == PASSIVE_LEVEL";
 const ASSERT_FILE: &core::ffi::CStr =
     c"e:\\xenon\\xdksep13\\core\\private\\xdk\\tools\\debug\\xbdm\\core\\dmnotify.c";
+
+xbox360_sys::value_enum! {
+    /// Notification kinds of the stock event structures.
+    pub enum NotificationKind: u32 {
+        Break = 1,
+        DebugString = 2,
+        Execution = 3,
+        SingleStep = 4,
+        /// Handlers of this kind get the notification data 4 bytes in.
+        ModuleLoad = 5,
+        ModuleUnload = 6,
+        ThreadCreate = 7,
+        ThreadTerminate = 8,
+        Exception = 9,
+        /// The kernel calls the routine stored through debug monitor data
+        /// +0x10 while the kind has handlers [purpose of the kernel call
+        /// unknown].
+        KernelCallback = 0xa,
+        Assert = 0xc,
+        Data = 0xd,
+        Rip = 0xe,
+        ThreadSwitch = 0xf,
+        SectionLoad = 0x10,
+        SectionUnload = 0x11,
+        StackTrace = 0x13,
+        NtAssert = 0x15,
+        PogoModuleStartup = 0x16,
+    }
+}
+
+const _: () = assert!(NotificationKind::PogoModuleStartup.raw() as usize == LIST_COUNT);
+
+/// The kind word handlers get: the kind in the low 24 bits, and
+/// [`NotificationWord::STOPPED`] when the thread stops after the event.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct NotificationWord(u32);
+
+impl NotificationWord {
+    const KIND_MASK: u32 = 0xff_ffff;
+    const STOPPED: u32 = 0x8000_0000;
+
+    #[inline(always)]
+    const fn new(kind: NotificationKind, stopped: bool) -> Self {
+        Self(kind.raw() | (Self::STOPPED * stopped as u32))
+    }
+
+    #[inline(always)]
+    const fn list(self) -> HandlerList {
+        HandlerList(self.0 & Self::KIND_MASK)
+    }
+}
+
+/// Handler list of a session: a kind number in 1..=[`LIST_COUNT`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct HandlerList(u32);
+
+impl HandlerList {
+    #[inline(always)]
+    const fn of(kind: NotificationKind) -> Self {
+        Self(kind.raw())
+    }
+
+    /// `None` outside 1..=[`LIST_COUNT`].
+    #[inline(always)]
+    fn new(kind: u32) -> Option<Self> {
+        (kind != 0 && kind <= LIST_COUNT as u32).then_some(Self(kind))
+    }
+
+    fn all() -> impl Iterator<Item = Self> {
+        (1..=LIST_COUNT as u32).map(Self)
+    }
+
+    #[inline(always)]
+    const fn index(self) -> usize {
+        self.0 as usize - 1
+    }
+}
+
+xbox360_sys::flags! {
+    /// Flags word of a session; the opener's other bits are kept.
+    pub struct SessionFlags(u32) {
+        /// Opened by a title process; unlinked when the title ends.
+        TITLE = 0x1_0000,
+    }
+}
+
+/// Session block (pool tag `snmd`). The handle a session's opener gets is
+/// its address.
+#[repr(C)]
+struct NotificationSession {
+    tag: AtomicU32,
+    /// Next linked session, under the list lock.
+    next: AtomicU32,
+    flags: AtomicU32,
+    handlers: [[AtomicU32; HANDLER_SLOTS]; LIST_COUNT],
+    /// Handlers in use per list; at most HANDLER_SLOTS.
+    counts: [AtomicU32; LIST_COUNT],
+    /// Addresses of [`ProcessorBlock`]s, or 0.
+    processors: [AtomicU32; PROCESSOR_SLOTS],
+}
+
+const _: () = {
+    use core::mem::offset_of;
+    assert!(offset_of!(NotificationSession, next) == 0x4);
+    assert!(offset_of!(NotificationSession, flags) == 0x8);
+    assert!(offset_of!(NotificationSession, handlers) == 0xc);
+    // Stock addresses the count of kind k at +0xb08 + 4 * k.
+    assert!(offset_of!(NotificationSession, counts) == 0xb08 + 4);
+    assert!(offset_of!(NotificationSession, processors) == 0xb64);
+    assert!(core::mem::size_of::<NotificationSession>() == 0xba4);
+};
+
+impl NotificationSession {
+    /// The session at `address` when it carries the session tag.
+    ///
+    /// # Safety
+    ///
+    /// `address` must be 0 or readable for a session block for `'a`, as a
+    /// session handle from export 25 that is not closed is.
+    #[inline(always)]
+    unsafe fn from_handle<'a>(address: u32) -> Option<&'a Self> {
+        // SAFETY: the caller guarantees the block.
+        let session =
+            unsafe { core::ptr::with_exposed_provenance::<Self>(address as usize).as_ref() }?;
+        (session.tag.load(Ordering::Relaxed) == SESSION_TAG).then_some(session)
+    }
+
+    /// The linked session at `address`; `None` for 0.
+    ///
+    /// # Safety
+    ///
+    /// `address` must be 0 or a session linked in the list, and the list
+    /// lock must be held for `'a`; a session is freed only after it is
+    /// unlinked under the exclusive lock.
+    #[inline(always)]
+    unsafe fn linked<'a>(address: u32) -> Option<&'a Self> {
+        // SAFETY: the caller guarantees the block.
+        unsafe { core::ptr::with_exposed_provenance::<Self>(address as usize).as_ref() }
+    }
+
+    #[inline(always)]
+    fn count(&self, list: HandlerList) -> &AtomicU32 {
+        // SAFETY: a handler list number is in 1..=LIST_COUNT.
+        unsafe { self.counts.get_unchecked(list.index()) }
+    }
+
+    /// # Safety
+    ///
+    /// `index` must be below HANDLER_SLOTS.
+    #[inline(always)]
+    unsafe fn handler(&self, list: HandlerList, index: u32) -> &AtomicU32 {
+        // SAFETY: the list number is in range; the caller bounds `index`.
+        unsafe {
+            self.handlers
+                .get_unchecked(list.index())
+                .get_unchecked(index as usize)
+        }
+    }
+
+    fn address(&self) -> u32 {
+        core::ptr::from_ref(self).expose_provenance() as u32
+    }
+}
+
+/// Processor block (pool tag `hcmd`): a NUL-terminated name of at most
+/// [`PROCESSOR_NAME_LIMIT`] characters, then the handler.
+#[repr(C)]
+struct ProcessorBlock {
+    name: [u8; PROCESSOR_NAME_LIMIT + 1],
+    handler: u32,
+}
+
+const _: () = {
+    assert!(core::mem::offset_of!(ProcessorBlock, handler) == 0x40);
+    assert!(core::mem::size_of::<ProcessorBlock>() == 0x44);
+};
 
 /// Head of the session list.
 static SESSIONS: AtomicU32 = AtomicU32::new(0);
@@ -80,28 +236,37 @@ static LOCK: ListLock = ListLock(AtomicU32::new(0));
 /// The thread switch routine is in the swap chain.
 static THREAD_SWITCH_HOOKED: AtomicBool = AtomicBool::new(false);
 
+xbox360_sys::flags! {
+    /// Writer bits of the list lock word; the reader count is above them.
+    pub struct ListLockState(u32) {
+        /// A writer waits; new readers stay out.
+        WRITER_WAITING = 0x2,
+        WRITER = 0x4,
+    }
+}
+
 /// Reader-writer spin lock (stock words 0x91f23230 shared, 0x91f232bc
 /// exclusive, 0x91f23278/0x91f23304 release) taken at DISPATCH_LEVEL
 /// (stock 0x91f54e88, 0x91f54f10). A waiting writer keeps new readers out
 /// until a writer releases the lock.
 struct ListLock(AtomicU32);
 
-const WRITER_WAITING: u32 = 0x2;
-const WRITER: u32 = 0x4;
-const READER: u32 = 0x8;
-
 impl ListLock {
+    /// One reader in the count above the writer bits.
+    const READER: u32 = 0x8;
+
     fn shared(&self) -> ListGuard<'_> {
         // SAFETY: the guard lowers the IRQL back to `irql` on drop.
         let irql = unsafe { xboxkrnl::KfRaiseIrql(Irql::DISPATCH) };
         loop {
             let state = self.0.load(Ordering::Relaxed);
-            if state & (WRITER | WRITER_WAITING) == 0
+            if !ListLockState::from_bits_retain(state)
+                .intersects(ListLockState::WRITER | ListLockState::WRITER_WAITING)
                 && self
                     .0
                     .compare_exchange_weak(
                         state,
-                        state + READER,
+                        state + Self::READER,
                         Ordering::Acquire,
                         Ordering::Relaxed,
                     )
@@ -121,11 +286,16 @@ impl ListLock {
         // SAFETY: the guard lowers the IRQL back to `irql` on drop.
         let irql = unsafe { xboxkrnl::KfRaiseIrql(Irql::DISPATCH) };
         loop {
-            let state = self.0.load(Ordering::Relaxed);
-            if state & !WRITER_WAITING == 0 {
+            let state = ListLockState::from_bits_retain(self.0.load(Ordering::Relaxed));
+            if state.difference(ListLockState::WRITER_WAITING).is_empty() {
                 if self
                     .0
-                    .compare_exchange_weak(state, WRITER, Ordering::Acquire, Ordering::Relaxed)
+                    .compare_exchange_weak(
+                        state.bits(),
+                        ListLockState::WRITER.bits(),
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    )
                     .is_ok()
                 {
                     return ListGuard {
@@ -134,8 +304,9 @@ impl ListLock {
                         exclusive: true,
                     };
                 }
-            } else if state & WRITER_WAITING == 0 {
-                self.0.fetch_or(WRITER_WAITING, Ordering::Relaxed);
+            } else if !state.contains(ListLockState::WRITER_WAITING) {
+                self.0
+                    .fetch_or(ListLockState::WRITER_WAITING.bits(), Ordering::Relaxed);
             }
             core::hint::spin_loop();
         }
@@ -154,7 +325,7 @@ impl Drop for ListGuard<'_> {
             // Stock clears the whole word, including another writer's wait.
             self.lock.0.store(0, Ordering::Release);
         } else {
-            self.lock.0.fetch_sub(READER, Ordering::Release);
+            self.lock.0.fetch_sub(ListLock::READER, Ordering::Release);
         }
         // SAFETY: `irql` is the level the guard raised from.
         unsafe { xboxkrnl::KfLowerIrql(self.irql) };
@@ -176,101 +347,107 @@ fn assert_passive(line: u32) {
     }
 }
 
-fn is_session(session: u32) -> bool {
-    session != 0 && read_u32(session) == SESSION_TAG
-}
-
-fn sessions() -> impl Iterator<Item = u32> {
+/// The linked sessions, newest first, while `_guard` holds the lock.
+fn sessions<'g>(_guard: &'g ListGuard<'_>) -> impl Iterator<Item = &'g NotificationSession> {
     let mut next = SESSIONS.load(Ordering::Acquire);
     core::iter::from_fn(move || {
-        let session = next;
-        if session == 0 {
-            return None;
-        }
-        next = read_u32(session + SESSION_NEXT);
+        // SAFETY: the list links sessions, and the guard holds the lock.
+        let session = unsafe { NotificationSession::linked(next) }?;
+        next = session.next.load(Ordering::Relaxed);
         Some(session)
     })
 }
 
-fn count_address(session: u32, kind: u32) -> u32 {
-    session + SESSION_COUNTS + 4 * kind
-}
-
-fn handler_address(session: u32, kind: u32, index: u32) -> u32 {
-    session + SESSION_HANDLERS + (kind - 1) * HANDLER_SLOTS * 4 + index * 4
-}
-
-/// Unlink every session for which `remove` holds; returns them through
-/// `removed`. Called with the lock held exclusively.
-fn unlink_sessions(mut remove: impl FnMut(u32) -> bool, mut removed: impl FnMut(u32)) {
+/// Unlink every session for which `remove` holds; passes the address of
+/// each to `removed`. Called with the lock held exclusively.
+fn unlink_sessions(
+    _guard: &ListGuard<'_>,
+    mut remove: impl FnMut(&NotificationSession) -> bool,
+    mut removed: impl FnMut(u32),
+) {
     // The word that links the current session: the head, then a session's
     // next field.
     let mut link = &SESSIONS;
     loop {
         let current = link.load(Ordering::Relaxed);
-        if current == 0 {
+        // SAFETY: the list links sessions, and the guard holds the lock.
+        let Some(session) = (unsafe { NotificationSession::linked(current) }) else {
             return;
-        }
-        if remove(current) {
-            link.store(read_u32(current + SESSION_NEXT), Ordering::Release);
+        };
+        if remove(session) {
+            link.store(session.next.load(Ordering::Relaxed), Ordering::Release);
             removed(current);
         } else {
-            // SAFETY: an aligned word of a linked session block.
-            link = unsafe { AtomicU32::from_ptr((current + SESSION_NEXT) as usize as *mut u32) };
+            link = &session.next;
         }
     }
 }
 
 /// Export 25 (stock 0x91f3acc0): open a session with `flags`; sessions of
 /// title processes are marked to go with the title.
-extern "C" fn open_notification_session(flags: u32, session: *mut u32) -> u32 {
+extern "C" fn open_notification_session(flags: u32, session: *mut u32) -> Hresult {
     if session.is_null() {
-        return Hresult::INVALID_ARGUMENT.0;
+        return Hresult::INVALID_ARGUMENT;
     }
     assert_passive(0xbf9);
-    let flags = if xboxkrnl::KeGetCurrentProcessType().0 == TITLE_PROCESS {
-        flags | SESSION_TITLE
-    } else {
-        flags
-    };
+    let mut flags = SessionFlags::from_bits_retain(flags);
+    if xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE {
+        flags |= SessionFlags::TITLE;
+    }
     // SAFETY: the allocation takes only a size and tag.
-    let block = unsafe { xboxkrnl::ExAllocatePoolWithTag(SESSION_SIZE, SESSION_POOL_TAG) };
+    let block = unsafe {
+        xboxkrnl::ExAllocatePoolWithTag(
+            core::mem::size_of::<NotificationSession>() as u32,
+            SESSION_POOL_TAG,
+        )
+    };
     // SAFETY: the caller passes a writable handle location.
     unsafe { session.write_unaligned(block) };
     if block == 0 {
-        return Hresult::OUT_OF_MEMORY.0;
+        return Hresult::OUT_OF_MEMORY;
     }
     let _guard = LOCK.exclusive();
-    // SAFETY: the pool block is SESSION_SIZE bytes and not yet shared.
-    unsafe { core::ptr::write_bytes(block as usize as *mut u8, 0, SESSION_SIZE as usize) };
-    write_u32(block + SESSION_FLAGS, flags);
-    write_u32(block, SESSION_TAG);
-    write_u32(block + SESSION_NEXT, SESSIONS.load(Ordering::Relaxed));
+    // SAFETY: the pool block holds a session and is not yet shared.
+    let new = unsafe {
+        let pointer = core::ptr::with_exposed_provenance_mut::<NotificationSession>(block as usize);
+        pointer.write_bytes(0, 1);
+        &*pointer
+    };
+    new.flags.store(flags.bits(), Ordering::Relaxed);
+    new.tag.store(SESSION_TAG, Ordering::Relaxed);
+    new.next
+        .store(SESSIONS.load(Ordering::Relaxed), Ordering::Relaxed);
     SESSIONS.store(block, Ordering::Release);
-    Hresult::OK.0
+    Hresult::OK
 }
 
 /// Export 6 (stock 0x91f3adb8): unlink and free a session. A readable
 /// session block that is not linked is left alone. Kernel hooks keep their
 /// state until the next registration change.
-extern "C" fn close_notification_session(session: u32) -> u32 {
+extern "C" fn close_notification_session(session: u32) -> Hresult {
     let readable = session != 0 && {
         // SAFETY: the check only translates the address.
         let mapped = unsafe { xboxkrnl::MmDbgReadCheck(session) };
         mapped != 0 && !is_device_address(mapped)
     };
-    if !readable || read_u32(session) != SESSION_TAG {
-        return Hresult::INVALID_ARGUMENT.0;
+    // SAFETY: the debugger read check found the tag word readable.
+    if !readable
+        || unsafe { &*core::ptr::with_exposed_provenance::<AtomicU32>(session as usize) }
+            .load(Ordering::Relaxed)
+            != SESSION_TAG
+    {
+        return Hresult::INVALID_ARGUMENT;
     }
-    let _guard = LOCK.exclusive();
+    let guard = LOCK.exclusive();
     unlink_sessions(
-        |candidate| candidate == session,
+        &guard,
+        |candidate| candidate.address() == session,
         |removed| {
             // SAFETY: the unlinked session is a pool block of this module.
             unsafe { xboxkrnl::ExFreePool(removed) };
         },
     );
-    Hresult::OK.0
+    Hresult::OK
 }
 
 /// Export 24 (stock 0x91f3ca48): add `handler` for notification `kind`
@@ -281,53 +458,68 @@ extern "C" fn close_notification_session(session: u32) -> u32 {
 /// Kind 0 with a handler: stock removes it from the kind-1 list and then
 /// repeats the removal forever with the lock held. openxbdm removes it
 /// once and returns.
-extern "C" fn register_notification_handler(session: u32, kind: u32, handler: u32) -> u32 {
-    if !is_session(session) {
-        return Hresult::INVALID_ARGUMENT.0;
-    }
+extern "C" fn register_notification_handler(session: u32, kind: u32, handler: u32) -> Hresult {
+    // SAFETY: callers pass a session handle from export 25.
+    let Some(session) = (unsafe { NotificationSession::from_handle(session) }) else {
+        return Hresult::INVALID_ARGUMENT;
+    };
     assert_passive(0xc5c);
-    let kind = kind & KIND_MASK;
-    let _guard = LOCK.exclusive();
+    let kind = kind & NotificationWord::KIND_MASK;
+    let guard = LOCK.exclusive();
     if kind == 0 {
         if handler == 0 {
-            for kind in 1..LAST_KIND + 1 {
-                write_u32(count_address(session, kind), 0);
-                refresh_kernel_hooks(kind);
+            for list in HandlerList::all() {
+                session.count(list).store(0, Ordering::Relaxed);
+                refresh_kernel_hooks(&guard, list.0);
             }
         } else {
-            remove_handler(session, 1, handler);
-            refresh_kernel_hooks(1);
+            let list = HandlerList::of(NotificationKind::Break);
+            remove_handler(session, list, handler);
+            refresh_kernel_hooks(&guard, list.0);
         }
-        return Hresult::OK.0;
+        return Hresult::OK;
     }
-    if kind > LAST_KIND || handler == 0 {
-        return Hresult::INVALID_ARGUMENT.0;
+    let Some(list) = HandlerList::new(kind) else {
+        return Hresult::INVALID_ARGUMENT;
+    };
+    if handler == 0 {
+        return Hresult::INVALID_ARGUMENT;
     }
-    let count = read_u32(count_address(session, kind));
-    let present =
-        (0..count).any(|index| read_u32(handler_address(session, kind, index)) == handler);
-    if !present && count != HANDLER_SLOTS {
-        write_u32(handler_address(session, kind, count), handler);
-        write_u32(count_address(session, kind), count + 1);
-        refresh_kernel_hooks(kind);
-        if kind == KIND_EXECUTION {
-            call_handler(handler, KIND_EXECUTION, execution_code(execution_state()));
+    let count = session.count(list).load(Ordering::Relaxed);
+    // SAFETY (both): counts stay at most HANDLER_SLOTS; only this module
+    // writes them, under the exclusive lock.
+    let present = (0..count)
+        .any(|index| unsafe { session.handler(list, index) }.load(Ordering::Relaxed) == handler);
+    if !present && count != HANDLER_SLOTS as u32 {
+        // SAFETY: `count` is below HANDLER_SLOTS here.
+        unsafe { session.handler(list, count) }.store(handler, Ordering::Relaxed);
+        session.count(list).store(count + 1, Ordering::Relaxed);
+        refresh_kernel_hooks(&guard, list.0);
+        if list == HandlerList::of(NotificationKind::Execution) {
+            call_handler(
+                handler,
+                NotificationWord::new(NotificationKind::Execution, false),
+                execution_code(execution_state()),
+            );
         }
     }
-    Hresult::OK.0
+    Hresult::OK
 }
 
-/// Remove every copy of `handler` from the list of `kind`, moving the last
-/// entry into each freed place.
-fn remove_handler(session: u32, kind: u32, handler: u32) {
+/// Remove every copy of `handler` from `list`, moving the last entry into
+/// each freed place.
+fn remove_handler(session: &NotificationSession, list: HandlerList, handler: u32) {
+    let count = session.count(list);
     let mut index = 0;
-    while index < read_u32(count_address(session, kind)) {
-        if read_u32(handler_address(session, kind, index)) == handler {
-            let last = read_u32(count_address(session, kind)) - 1;
-            write_u32(count_address(session, kind), last);
-            write_u32(
-                handler_address(session, kind, index),
-                read_u32(handler_address(session, kind, last)),
+    while index < count.load(Ordering::Relaxed) {
+        // SAFETY (all): `index` and `last` are below the count, which stays
+        // at most HANDLER_SLOTS.
+        if unsafe { session.handler(list, index) }.load(Ordering::Relaxed) == handler {
+            let last = count.load(Ordering::Relaxed) - 1;
+            count.store(last, Ordering::Relaxed);
+            unsafe { session.handler(list, index) }.store(
+                unsafe { session.handler(list, last) }.load(Ordering::Relaxed),
+                Ordering::Relaxed,
             );
         } else {
             index += 1;
@@ -335,67 +527,74 @@ fn remove_handler(session: u32, kind: u32, handler: u32) {
     }
 }
 
-fn call_handler(handler: u32, kind: u32, data: u32) {
+fn call_handler(handler: u32, kind: NotificationWord, data: u32) {
     // SAFETY: registrants pass console `void (*)(DWORD kind, void *data)`
     // routines.
-    unsafe { kernel::call_export(handler, kind, data, 0, 0) };
+    unsafe { kernel::call_export(handler, kind.0, data, 0, 0) };
 }
 
-/// Install or remove the kernel hooks of `kind` by whether any session
-/// has handlers for it (stock 0x91f3c8c8). Called with the lock held.
-fn refresh_kernel_hooks(kind: u32) {
-    let wanted = || sessions().any(|session| read_u32(count_address(session, kind)) != 0);
-    match kind {
-        KIND_KERNEL_CALLBACK => {
-            let slot = kernel::debug_monitor_data()
-                .callback_routine
-                .load(Ordering::Relaxed);
-            if slot != 0 {
-                let routine = if wanted() {
-                    kernel_callback_entry as *const () as usize as u32
-                } else {
-                    0
-                };
-                write_u32(slot, routine);
-            }
+/// Install or remove the kernel hooks of list `kind` by whether any
+/// session has handlers in it (stock 0x91f3c8c8). Called with the lock
+/// held.
+fn refresh_kernel_hooks(guard: &ListGuard<'_>, kind: u32) {
+    let wanted = |kind: NotificationKind| {
+        let list = HandlerList::of(kind);
+        sessions(guard).any(|session| session.count(list).load(Ordering::Relaxed) != 0)
+    };
+    if kind == NotificationKind::KernelCallback.raw() {
+        if let Some(variable) = kernel::routine_variable(kernel::RoutineVariable::Callback) {
+            let routine = if wanted(NotificationKind::KernelCallback) {
+                kernel_callback_entry as *const () as usize as u32
+            } else {
+                0
+            };
+            // SAFETY: the routine is 0 or this module's bridged entry, which
+            // takes no arguments and stays loaded while installed.
+            unsafe { variable.store(routine, Ordering::Relaxed) };
         }
-        KIND_THREAD_SWITCH => {
-            let hooked = THREAD_SWITCH_HOOKED.load(Ordering::Relaxed);
-            if wanted() {
-                if !hooked {
-                    swap::register_swap_routine(thread_switched as *const () as usize as u32, 1);
-                    THREAD_SWITCH_HOOKED.store(true, Ordering::Relaxed);
-                }
-            } else if hooked {
-                swap::unregister_swap_routine(thread_switched as *const () as usize as u32);
-                THREAD_SWITCH_HOOKED.store(false, Ordering::Relaxed);
+    } else if kind == NotificationKind::ThreadSwitch.raw() {
+        let hooked = THREAD_SWITCH_HOOKED.load(Ordering::Relaxed);
+        if wanted(NotificationKind::ThreadSwitch) {
+            if !hooked {
+                swap::register_swap_routine(thread_switched, true);
+                THREAD_SWITCH_HOOKED.store(true, Ordering::Relaxed);
             }
+        } else if hooked {
+            swap::unregister_swap_routine(thread_switched);
+            THREAD_SWITCH_HOOKED.store(false, Ordering::Relaxed);
         }
-        _ => {}
     }
 }
 
 /// Kernel callback of kind 0xa (stock 0x91f3b1c0); like the delivery
 /// routine it tail-calls, it returns 0.
 extern "C" fn kernel_callback() -> u32 {
-    notify_sessions(KIND_KERNEL_CALLBACK, 0);
+    notify_sessions(
+        NotificationWord::new(NotificationKind::KernelCallback, false),
+        0,
+    );
     0
 }
 crate::exports::bridged!(kernel_callback_entry, kernel_callback);
 
 /// Swap routine of kind 0xf (stock 0x91f3b1d0): handlers get the thread
 /// identifiers of the outgoing and the incoming thread.
-extern "C" fn thread_switched(old: u32, _frame: u32, new: u32) -> u32 {
-    let threads = [read_u32(old + THREAD_ID), read_u32(new + THREAD_ID)];
-    notify_sessions(KIND_THREAD_SWITCH, threads.as_ptr() as usize as u32);
-    0
+extern "C" fn thread_switched(old: u32, _frame: u32, new: u32) {
+    // SAFETY: the kernel passes the thread objects of the switch, which
+    // stay allocated during it.
+    let (old, new) = unsafe { (ThreadObject::from_raw(old), ThreadObject::from_raw(new)) };
+    let threads = [old.id().raw(), new.id().raw()];
+    notify_sessions(
+        NotificationWord::new(NotificationKind::ThreadSwitch, false),
+        threads.as_ptr() as usize as u32,
+    );
 }
 
-/// Run every session handler of `kind & 0xffffff`, newest first, with
-/// `kind` and `data` (stock 0x91f395c0); module-load handlers get `data`
-/// 4 bytes in. Nothing runs above DISPATCH_LEVEL.
-fn notify_sessions(kind: u32, data: u32) {
-    let data = if kind == KIND_MODULE_LOAD {
+/// Run every session handler of the word's kind, newest first, with the
+/// word and `data` (stock 0x91f395c0); module-load handlers get `data` 4
+/// bytes in. Nothing runs above DISPATCH_LEVEL.
+fn notify_sessions(word: NotificationWord, data: u32) {
+    let data = if word == NotificationWord::new(NotificationKind::ModuleLoad, false) {
         data + 4
     } else {
         data
@@ -403,37 +602,29 @@ fn notify_sessions(kind: u32, data: u32) {
     if processor::current_irql() > Irql::DISPATCH {
         return;
     }
-    let list = kind & KIND_MASK;
-    let _guard = LOCK.shared();
-    for session in sessions() {
-        let mut index = read_u32(count_address(session, list));
+    let list = word.list();
+    let guard = LOCK.shared();
+    for session in sessions(&guard) {
+        let mut index = session.count(list).load(Ordering::Relaxed);
         while index != 0 {
             index -= 1;
-            call_handler(read_u32(handler_address(session, list, index)), kind, data);
+            // SAFETY: `index` is below the count, which stays at most
+            // HANDLER_SLOTS.
+            let handler = unsafe { session.handler(list, index) }.load(Ordering::Relaxed);
+            call_handler(handler, word, data);
         }
     }
 }
 
-/// Notification kinds of the stock event structures.
-const KIND_BREAK: u32 = 1;
-const KIND_DEBUG_STRING: u32 = 2;
-const KIND_SINGLE_STEP: u32 = 4;
-const KIND_MODULE_UNLOAD: u32 = 6;
-const KIND_THREAD_CREATE: u32 = 7;
-const KIND_THREAD_TERMINATE: u32 = 8;
-const KIND_EXCEPTION: u32 = 9;
-const KIND_ASSERT: u32 = 0xc;
-const KIND_DATA: u32 = 0xd;
-const KIND_RIP: u32 = 0xe;
-const KIND_SECTION_LOAD: u32 = 0x10;
-const KIND_SECTION_UNLOAD: u32 = 0x11;
-const KIND_STACK_TRACE: u32 = 0x13;
-const KIND_NT_ASSERT: u32 = 0x15;
-const KIND_POGO_MODULE_STARTUP: u32 = 0x16;
-/// Kind flag of an event after which the thread is stopped.
-const KIND_STOPPED: u32 = 0x8000_0000;
-const EXCEPTION_NONCONTINUABLE: u32 = 0x1;
-const EXCEPTION_FIRST_CHANCE: u32 = 0x2;
+/// Access word of the kind 0xd data breakpoint record.
+#[repr(u32)]
+#[derive(Clone, Copy)]
+enum DataAccessCode {
+    Write = 1,
+    Read = 2,
+    Execute = 3,
+}
+
 const NAME_CAPACITY: usize = 0x104;
 
 /// Module record of kinds 5 and 6 (stock 0x91f39fc0 fills them, formatter
@@ -496,24 +687,18 @@ fn name_field(name: &[u8]) -> NameField {
     field
 }
 
-fn kind_of(kind: u32, stopped: bool) -> u32 {
-    kind | (KIND_STOPPED * u32::from(stopped))
-}
-
-fn address_of<T>(value: &T) -> u32 {
-    value as *const T as usize as u32
-}
-
 /// Run the session handlers of `event` with the monitor's structure for
 /// its kind.
 pub(crate) fn notify_event(event: &Event<'_>) {
+    use NotificationKind as K;
+    use NotificationWord as W;
     match *event {
         Event::Break {
             address,
             thread,
             stopped,
         } => {
-            notify_sessions(kind_of(KIND_BREAK, stopped), address_of(&[address, thread]));
+            notify_sessions(W::new(K::Break, stopped), address_of(&[address, thread]));
         }
         Event::SingleStep {
             address,
@@ -521,7 +706,7 @@ pub(crate) fn notify_event(event: &Event<'_>) {
             stopped,
         } => {
             notify_sessions(
-                kind_of(KIND_SINGLE_STEP, stopped),
+                W::new(K::SingleStep, stopped),
                 address_of(&[address, thread]),
             );
         }
@@ -530,10 +715,7 @@ pub(crate) fn notify_event(event: &Event<'_>) {
             thread,
             stopped,
         } => {
-            notify_sessions(
-                kind_of(KIND_NT_ASSERT, stopped),
-                address_of(&[address, thread]),
-            );
+            notify_sessions(W::new(K::NtAssert, stopped), address_of(&[address, thread]));
         }
         Event::DebugString {
             thread,
@@ -541,11 +723,13 @@ pub(crate) fn notify_event(event: &Event<'_>) {
             stopped,
         } => {
             let record = [thread, text.len() as u32, text.as_ptr() as usize as u32];
-            notify_sessions(kind_of(KIND_DEBUG_STRING, stopped), address_of(&record));
+            notify_sessions(W::new(K::DebugString, stopped), address_of(&record));
         }
-        Event::Execution(state) => notify_sessions(KIND_EXECUTION, execution_code(state)),
+        Event::Execution(state) => {
+            notify_sessions(W::new(K::Execution, false), execution_code(state))
+        }
         Event::ExecutionStop(state) => {
-            notify_sessions(KIND_EXECUTION | KIND_STOPPED, execution_code(state))
+            notify_sessions(W::new(K::Execution, true), execution_code(state))
         }
         Event::ModuleLoad {
             module,
@@ -567,7 +751,7 @@ pub(crate) fn notify_event(event: &Event<'_>) {
                     image_size: module.image_size,
                 },
             };
-            notify_sessions(kind_of(KIND_MODULE_LOAD, stopped), address_of(&record));
+            notify_sessions(W::new(K::ModuleLoad, stopped), address_of(&record));
         }
         Event::ModuleUnload { name, base, size } => {
             let record = ModuleRecord {
@@ -576,7 +760,7 @@ pub(crate) fn notify_event(event: &Event<'_>) {
                 size,
                 ..ModuleRecord::default()
             };
-            notify_sessions(KIND_MODULE_UNLOAD, address_of(&record));
+            notify_sessions(W::new(K::ModuleUnload, false), address_of(&record));
         }
         Event::ThreadCreate {
             thread,
@@ -584,12 +768,12 @@ pub(crate) fn notify_event(event: &Event<'_>) {
             stopped,
         } => {
             notify_sessions(
-                kind_of(KIND_THREAD_CREATE, stopped),
+                W::new(K::ThreadCreate, stopped),
                 address_of(&[thread, start]),
             );
         }
         Event::ThreadTerminate { thread, stopped } => {
-            notify_sessions(kind_of(KIND_THREAD_TERMINATE, stopped), thread)
+            notify_sessions(W::new(K::ThreadTerminate, stopped), thread)
         }
         Event::Exception {
             code,
@@ -600,19 +784,19 @@ pub(crate) fn notify_event(event: &Event<'_>) {
             noncontinuable,
             stopped,
         } => {
-            let mut flags = 0;
+            let mut flags = ExceptionNotificationFlags::empty();
             if first_chance {
-                flags |= EXCEPTION_FIRST_CHANCE;
+                flags |= ExceptionNotificationFlags::FIRST_CHANCE;
             }
             if noncontinuable {
-                flags |= EXCEPTION_NONCONTINUABLE;
+                flags |= ExceptionNotificationFlags::NONCONTINUABLE;
             }
             let (first, second) = match detail {
                 ExceptionDetail::AccessViolation { write, address } => (u32::from(write), address),
                 ExceptionDetail::Parameters { count, address } => (count, address),
             };
-            let record = [thread, code, address, flags, first, second];
-            notify_sessions(kind_of(KIND_EXCEPTION, stopped), address_of(&record));
+            let record = [thread, code, address, flags.bits(), first, second];
+            notify_sessions(W::new(K::Exception, stopped), address_of(&record));
         }
         Event::Assert {
             thread,
@@ -621,7 +805,7 @@ pub(crate) fn notify_event(event: &Event<'_>) {
             stopped,
         } => {
             let record = [thread, string_length, string_address];
-            notify_sessions(kind_of(KIND_ASSERT, stopped), address_of(&record));
+            notify_sessions(W::new(K::Assert, stopped), address_of(&record));
         }
         Event::Data {
             access,
@@ -631,25 +815,25 @@ pub(crate) fn notify_event(event: &Event<'_>) {
             stopped,
         } => {
             let access = match access {
-                DataAccess::Write => 1,
-                DataAccess::Read => 2,
-                DataAccess::Execute => 3,
+                DataAccess::Write => DataAccessCode::Write,
+                DataAccess::Read => DataAccessCode::Read,
+                DataAccess::Execute => DataAccessCode::Execute,
             };
             notify_sessions(
-                kind_of(KIND_DATA, stopped),
-                address_of(&[address, thread, access, value]),
+                W::new(K::Data, stopped),
+                address_of(&[address, thread, access as u32, value]),
             );
         }
         Event::Rip {
             thread,
             text,
             stopped,
-        } => notify_text(kind_of(KIND_RIP, stopped), thread, text),
+        } => notify_text(W::new(K::Rip, stopped), thread, text),
         Event::StackTrace {
             thread,
             text,
             stopped,
-        } => notify_text(kind_of(KIND_STACK_TRACE, stopped), thread, text),
+        } => notify_text(W::new(K::StackTrace, stopped), thread, text),
         Event::SectionLoad {
             name,
             base,
@@ -672,11 +856,11 @@ pub(crate) fn notify_event(event: &Event<'_>) {
                 flags: flags as u16,
             };
             let kind = if matches!(event, Event::SectionLoad { .. }) {
-                KIND_SECTION_LOAD
+                K::SectionLoad
             } else {
-                KIND_SECTION_UNLOAD
+                K::SectionUnload
             };
-            notify_sessions(kind, address_of(&record));
+            notify_sessions(W::new(kind, false), address_of(&record));
         }
         Event::PogoModuleStartup {
             name,
@@ -686,10 +870,7 @@ pub(crate) fn notify_event(event: &Event<'_>) {
         } => {
             let name = name_field(name.as_bytes());
             let record = [name.0.as_ptr() as usize as u32, module, thread];
-            notify_sessions(
-                kind_of(KIND_POGO_MODULE_STARTUP, stopped),
-                address_of(&record),
-            );
+            notify_sessions(W::new(K::PogoModuleStartup, stopped), address_of(&record));
         }
         // No stock producer of assert prompt text runs the session path.
         Event::AssertString { .. } => {}
@@ -697,24 +878,28 @@ pub(crate) fn notify_event(event: &Event<'_>) {
 }
 
 /// Kinds 0xe and 0x13: `{thread, length, string}`, no string as 0.
-fn notify_text(kind: u32, thread: u32, text: Option<&str>) {
+fn notify_text(word: NotificationWord, thread: u32, text: Option<&str>) {
     let (length, string) = text.map_or((0, 0), |text| {
         (text.len() as u32, text.as_ptr() as usize as u32)
     });
-    notify_sessions(kind, address_of(&[thread, length, string]));
+    notify_sessions(word, address_of(&[thread, length, string]));
 }
 
 /// Title termination part of stock 0x91f3c9b0: sessions of the title are
 /// unlinked (not freed), then the kernel hooks of kinds 2..=0x17 are
 /// refreshed.
 pub(crate) fn unlink_title_notification_sessions() {
-    let _guard = LOCK.exclusive();
+    let guard = LOCK.exclusive();
     unlink_sessions(
-        |session| read_u32(session + SESSION_FLAGS) & SESSION_TITLE != 0,
+        &guard,
+        |session| {
+            SessionFlags::from_bits_retain(session.flags.load(Ordering::Relaxed))
+                .contains(SessionFlags::TITLE)
+        },
         |_| {},
     );
-    for kind in 2..LAST_KIND + 2 {
-        refresh_kernel_hooks(kind);
+    for kind in 2..LIST_COUNT as u32 + 2 {
+        refresh_kernel_hooks(&guard, kind);
     }
 }
 
@@ -722,74 +907,81 @@ pub(crate) fn unlink_title_notification_sessions() {
 /// `name` (at most 0x3f characters, 16 per session). Without one, remove
 /// the processors whose name equals `name` ignoring case, or all of them
 /// for no name.
-extern "C" fn register_notification_processor(session: u32, name: u32, handler: u32) -> u32 {
-    if !is_session(session) {
-        return Hresult::INVALID_ARGUMENT.0;
-    }
+extern "C" fn register_notification_processor(session: u32, name: u32, handler: u32) -> Hresult {
+    // SAFETY: callers pass a session handle from export 25.
+    let Some(session) = (unsafe { NotificationSession::from_handle(session) }) else {
+        return Hresult::INVALID_ARGUMENT;
+    };
     let mut block = None;
     if handler != 0 {
         if name == 0 {
-            return Hresult::INVALID_ARGUMENT.0;
+            return Hresult::INVALID_ARGUMENT;
         }
         // SAFETY: the allocation takes only a size and tag.
-        match unsafe { xboxkrnl::ExAllocatePoolWithTag(PROCESSOR_SIZE, PROCESSOR_POOL_TAG) } {
-            0 => return Hresult::OUT_OF_MEMORY.0,
+        match unsafe {
+            xboxkrnl::ExAllocatePoolWithTag(
+                core::mem::size_of::<ProcessorBlock>() as u32,
+                PROCESSOR_POOL_TAG,
+            )
+        } {
+            0 => return Hresult::OUT_OF_MEMORY,
             allocated => block = Some(allocated),
         }
     }
     assert_passive(0xce4);
     let guard = LOCK.exclusive();
-    let mut processors = (0..PROCESSOR_SLOTS).map(|slot| session + SESSION_PROCESSORS + 4 * slot);
+    let mut processors = session.processors.iter();
     let result: Result<(), AddProcessorError> = match block {
         None => {
-            let name = if name == 0 {
-                None
-            } else {
-                Some(c_string(name, usize::MAX))
-            };
+            // SAFETY: callers pass 0 or a NUL-terminated name.
+            let name = unsafe { kernel::c_string(name) };
             for slot in processors {
-                let processor = read_u32(slot);
-                if processor == 0 {
+                let address = slot.load(Ordering::Relaxed);
+                // SAFETY: a slot holds 0 or a processor block of this module,
+                // which is freed only here under the exclusive lock.
+                let Some(processor) = (unsafe {
+                    core::ptr::with_exposed_provenance::<ProcessorBlock>(address as usize).as_ref()
+                }) else {
                     continue;
-                }
+                };
                 let matches = match name {
                     None => true,
-                    Some(name) => {
-                        compare_names(
-                            c_string(processor, PROCESSOR_NAME_LIMIT + 1),
-                            name,
-                            name.len(),
-                        ) == 0
-                    }
+                    Some(name) => compare_names(until_nul(&processor.name), name, name.len()) == 0,
                 };
                 if matches {
-                    // SAFETY: a session slot holds a processor pool block; the
-                    // slot is cleared below with the lock held.
-                    unsafe { xboxkrnl::ExFreePool(processor) };
-                    write_u32(slot, 0);
+                    // SAFETY: the slot holds a processor pool block; the slot
+                    // is cleared below with the lock held.
+                    unsafe { xboxkrnl::ExFreePool(address) };
+                    slot.store(0, Ordering::Relaxed);
                 }
             }
             Ok(())
         }
-        Some(processor) => match processors.find(|&slot| read_u32(slot) == 0) {
+        Some(processor) => match processors.find(|slot| slot.load(Ordering::Relaxed) == 0) {
             None => Err(AddProcessorError::NoFreeSlot),
-            Some(slot) => {
-                let name = c_string(name, PROCESSOR_NAME_LIMIT + 1);
-                if name.len() > PROCESSOR_NAME_LIMIT {
-                    Err(AddProcessorError::NameTooLong)
-                } else {
-                    // SAFETY: the block holds PROCESSOR_SIZE bytes.
+            // SAFETY: a block exists only for a nonzero name (checked
+            // above), which callers pass NUL-terminated.
+            Some(slot) => match unsafe {
+                kernel::bounded_c_string(name, PROCESSOR_NAME_LIMIT + 1).unwrap_unchecked()
+            } {
+                name if name.len() > PROCESSOR_NAME_LIMIT => Err(AddProcessorError::NameTooLong),
+                name => {
+                    // SAFETY: the new block holds a processor block and is not
+                    // yet shared; the name fits its field with the NUL.
                     unsafe {
-                        let bytes = processor as usize as *mut u8;
+                        let pointer = core::ptr::with_exposed_provenance_mut::<ProcessorBlock>(
+                            processor as usize,
+                        );
+                        let bytes = (&raw mut (*pointer).name).cast::<u8>();
                         core::ptr::copy_nonoverlapping(name.as_ptr(), bytes, name.len());
                         bytes.add(name.len()).write(0);
+                        (&raw mut (*pointer).handler).write(handler);
                     }
-                    write_u32(processor + PROCESSOR_HANDLER, handler);
-                    write_u32(slot, processor);
+                    slot.store(processor, Ordering::Relaxed);
                     block = None;
                     Ok(())
                 }
-            }
+            },
         },
     };
     drop(guard);
@@ -797,7 +989,7 @@ extern "C" fn register_notification_processor(session: u32, name: u32, handler: 
         // SAFETY: the block was allocated above and never linked.
         unsafe { xboxkrnl::ExFreePool(unused) };
     }
-    crate::exports::export_result(result).0
+    crate::exports::export_result(result)
 }
 
 /// Why export 32 could not add a session processor.
@@ -806,6 +998,17 @@ enum AddProcessorError {
     NoFreeSlot,
     NameTooLong,
 }
+
+impl core::fmt::Display for AddProcessorError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::NoFreeSlot => "no free processor slot",
+            Self::NameTooLong => "processor name too long",
+        })
+    }
+}
+
+impl core::error::Error for AddProcessorError {}
 
 impl From<AddProcessorError> for Hresult {
     fn from(error: AddProcessorError) -> Self {
@@ -824,22 +1027,23 @@ impl From<AddProcessorError> for Hresult {
 /// Stock also offers the text to the session processors whose name
 /// matches the kind, but its compare (0x91f411f0) is called with the text
 /// first, which continues with the `!`, so no processor ever matches.
-pub(super) extern "C" fn send_notification(text: u32) -> u32 {
-    if text == 0 {
-        return Hresult::INVALID_ARGUMENT.0;
-    }
-    notification_result(send_notification_text(c_string(text, usize::MAX)))
+pub(super) extern "C" fn send_notification(text: u32) -> Hresult {
+    // SAFETY: callers pass 0 or a NUL-terminated text.
+    let Some(text) = (unsafe { kernel::c_string(text) }) else {
+        return Hresult::INVALID_ARGUMENT;
+    };
+    notification_result(send_notification_text(text))
 }
 
 /// A notification text that names no kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct MissingKind;
 
-/// The export result word of a notification send.
-pub(super) fn notification_result(result: Result<(), MissingKind>) -> u32 {
+/// The export result of a notification send.
+pub(super) fn notification_result(result: Result<(), MissingKind>) -> Hresult {
     match result {
-        Ok(()) => Hresult::OK.0,
-        Err(MissingKind) => Hresult::INVALID_ARGUMENT.0,
+        Ok(()) => Hresult::OK,
+        Err(MissingKind) => Hresult::INVALID_ARGUMENT,
     }
 }
 
@@ -863,9 +1067,9 @@ export!(371, exchange_value);
 export!(372, drain_named_calls);
 
 /// Export 76 (stock 0x91f3b4b8).
-extern "C" fn store_value(value: u32) -> u32 {
+extern "C" fn store_value(value: u32) -> Hresult {
     EXPORT_76_VALUE.store(value, Ordering::Relaxed);
-    Hresult::OK.0
+    Hresult::OK
 }
 
 /// Export 370 (stock 0x91f78c50).
@@ -881,5 +1085,7 @@ extern "C" fn exchange_value(value: u32) -> u32 {
 /// Export 372 (stock 0x91f3ea50): run the remote calls queued for the
 /// thread name `name`, newest first.
 extern "C" fn drain_named_calls(name: u32) -> u32 {
-    super::service_rpc_drain(name)
+    // SAFETY: the importer passes 0 or the NUL-terminated name of the
+    // calling thread.
+    unsafe { super::service_rpc_drain(name) }
 }

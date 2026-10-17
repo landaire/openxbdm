@@ -23,6 +23,7 @@ use xbox360_sys::xboxkrnl::PoolType;
 
 use super::status;
 use crate::backend::dispatcher;
+use crate::backend::dispatcher::ControlCode;
 
 /// Ring size and pool tag `PIXs`.
 const RING_BYTES: u32 = 0x1_0000;
@@ -44,8 +45,9 @@ const KIND_CAPTURE_START: u32 = 0x16;
 const CAPTURED_DWORDS: usize = 8;
 /// Stream consumers (stock 0x91fa2b20).
 const CONSUMERS: usize = 5;
-/// Context swap routine flag when `pixcmd b` registers the ring's routine.
-const SWAP_ROUTINE_FLAG: u32 = 1;
+/// `pixcmd b` registers the ring's context swap routine to stay
+/// registered.
+const SWAP_ROUTINE_PERSISTENT: bool = true;
 /// `CxSw` record tag.
 const CONTEXT_SWITCH_TAG: u32 = 0x4378_5377;
 
@@ -623,10 +625,18 @@ fn send_tagged_record(record: &mut TaggedRecord, tag: u32, length: u32) -> bool 
     record[2] = length;
     let address = record.as_ptr() as usize as u32;
     let list = [address, 3, address + 12, dwords, 0];
-    match dispatcher::dispatch(0x5e, list.as_ptr() as usize as u32) as i32 {
+    // SAFETY: the list and the block are live locals that describe the
+    // record, as the codes take them.
+    match unsafe { dispatcher::dispatch(ControlCode::PIX_WRITE_BLOCK_LIST, list.as_ptr() as usize as u32) }
+        as i32
+    {
         0 => {
             let block = [address, dwords + 3];
-            dispatcher::dispatch(0x43, block.as_ptr() as usize as u32) != 0
+            // SAFETY: as above.
+            let written = unsafe {
+                dispatcher::dispatch(ControlCode::PIX_WRITE_BLOCK, block.as_ptr() as usize as u32)
+            };
+            written != 0
         }
         result => result > 0,
     }
@@ -662,10 +672,7 @@ pub(super) fn start() {
         ring.captured_index = None;
         ring.flush_capture = false;
         if fresh {
-            crate::backend::session::register_swap_routine(
-                context_switch as *const () as usize as u32,
-                SWAP_ROUTINE_FLAG,
-            );
+            crate::backend::session::register_swap_routine(context_switch, SWAP_ROUTINE_PERSISTENT);
         }
     }
     release();
@@ -683,9 +690,7 @@ pub(super) fn stop() {
     ring.write = 0;
     ring.committed = 0;
     if block.is_some() {
-        crate::backend::session::unregister_swap_routine(
-            context_switch as *const () as usize as u32,
-        );
+        crate::backend::session::unregister_swap_routine(context_switch);
     }
     release();
     if let Some(block) = block {

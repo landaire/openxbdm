@@ -19,7 +19,11 @@ use xbox360::module::ExportAddress;
 use xbox360::module::Ordinal;
 use xbox360::module::SystemModule;
 use xbox360::module::resolve_export;
+use xbox360::status::last_error;
 use xbox360::status::set_last_error;
+use xbox360_sys::xam;
+use xbox360_sys::xam::MediaVerificationFailedBlocks;
+use xbox360_sys::xam::UserIndex;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::FirmwareRequest;
 use xbox360_sys::xboxkrnl::ThreadCreationFlags;
@@ -27,26 +31,9 @@ use xbox360_sys::xboxkrnl::ThreadCreationFlags;
 use super::Console;
 use crate::kernel;
 
-const XAM_CREATE_PROCESS: Ordinal = Ordinal::new(0x9bb).unwrap();
-const XAM_CLOSE_PROCESS: Ordinal = Ordinal::new(0x9bc).unwrap();
-const XAM_VERIFY: Ordinal = Ordinal::new(0x9bd).unwrap();
-const XAM_FAILED_BLOCKS: Ordinal = Ordinal::new(0x9be).unwrap();
-const XAM_INJECT: Ordinal = Ordinal::new(0x9bf).unwrap();
-const XAM_FAILURE: Ordinal = Ordinal::new(0x9c0).unwrap();
-
-/// Argument the failure thread passes to XAM 0x9c0.
-const FAILURE_CODE: u32 = 0xff;
-/// `ExCreateThread` creation flags of the failure thread.
-const FAILURE_THREAD_FLAGS: ThreadCreationFlags = ThreadCreationFlags::from_bits_retain(0x20);
-/// Size of the XAM 0x9be record, stored in its first dword.
-const FAILED_BLOCKS_RECORD_SIZE: u32 = 0x18;
-
-/// The calling thread's last-error value.
-fn last_error() -> LastError {
-    LastError::from_win32(xbox360::status::last_error())
-}
-
-/// Why a XAM export could not be called.
+/// Why a XAM export could not be called. The failure is stored as the
+/// calling thread's last error, as stock stores it.
+#[derive(Debug)]
 enum Unresolved {
     /// xam.xex is not loaded.
     Module,
@@ -54,16 +41,32 @@ enum Unresolved {
     Export,
 }
 
+impl core::fmt::Display for Unresolved {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Unresolved::Module => "xam.xex is not loaded",
+            Unresolved::Export => "the XAM export is absent",
+        })
+    }
+}
+
+impl core::error::Error for Unresolved {}
+
+/// The calling thread's last error.
+fn stored_last_error() -> LastError {
+    LastError::from_win32(last_error())
+}
+
 /// Resolve a XAM export; failures set the last error.
 fn xam_export(ordinal: Ordinal) -> Result<u32, Unresolved> {
-    let module = SystemModule::Xam.handle().map_err(|status| {
-        set_last_error(status);
+    let module = SystemModule::Xam.handle().map_err(|error| {
+        set_last_error(error);
         Unresolved::Module
     })?;
     resolve_export(module, ordinal)
         .map(ExportAddress::raw)
-        .map_err(|status| {
-            set_last_error(status);
+        .map_err(|error| {
+            set_last_error(error);
             Unresolved::Export
         })
 }
@@ -76,18 +79,20 @@ fn call_reporting(ordinal: Ordinal, a0: u32, a1: u32, a2: u32) -> CivResult {
         Ok(function) => CivResult::Returned(Hresult(unsafe {
             kernel::call_export(function, a0, a1, a2, 0)
         })),
-        Err(Unresolved::Module) => CivResult::NoModule(last_error()),
-        Err(Unresolved::Export) => CivResult::NoExport(last_error()),
+        Err(Unresolved::Module) => CivResult::NoModule(stored_last_error()),
+        Err(Unresolved::Export) => CivResult::NoExport(stored_last_error()),
     }
 }
 
 /// Start routine of the `civfail` thread; `context` is nonzero to reboot.
 extern "C" fn failure_thread(context: u32) -> u32 {
-    match xam_export(XAM_FAILURE) {
+    match xam_export(xam::ordinal::SHOW_BAD_DISC_ERROR_UI) {
         Err(Unresolved::Module) => return 0,
+        // The meaning of the argument is unknown; stock passes the
+        // any-user index, as to `XamShowDirtyDiscErrorUI`.
         // SAFETY: the export takes one dword argument.
         Ok(function) => unsafe {
-            kernel::call_export(function, FAILURE_CODE, 0, 0, 0);
+            kernel::call_export(function, UserIndex::Any.raw(), 0, 0, 0);
         },
         Err(Unresolved::Export) => {}
     }
@@ -125,6 +130,8 @@ fn detection_exports() -> Result<([u32; 4], NtStatus), DetectionRoutineMissing> 
 
 impl commands::services::Backend for Console {
     fn start_civ_failure_thread(&mut self, reboot: bool) -> Result<ThreadHandle, LastError> {
+        /// Stock's creation flags of the thread.
+        const FLAGS: ThreadCreationFlags = ThreadCreationFlags::PRIORITY_CLASS_13;
         let mut handle = 0u32;
         let mut thread_id = 0u32;
         // SAFETY: `handle` and `thread_id` are live locals; `failure_thread`
@@ -137,20 +144,20 @@ impl commands::services::Backend for Console {
                 0,
                 failure_thread as *const () as usize as u32,
                 u32::from(reboot),
-                FAILURE_THREAD_FLAGS,
+                FLAGS,
             )
         };
         // Thread creation does not set the last error; stock reports
         // whatever the thread held before.
         if !status.is_success() || handle == 0 {
-            Err(last_error())
+            Err(stored_last_error())
         } else {
             Ok(ThreadHandle(handle))
         }
     }
 
     fn inject_civ_errors(&mut self, hash_errors: u32, read_errors: u32) {
-        if let Ok(function) = xam_export(XAM_INJECT) {
+        if let Ok(function) = xam_export(xam::ordinal::MEDIA_VERIFICATION_INJECT) {
             // SAFETY: the export takes two dword arguments.
             unsafe { kernel::call_export(function, hash_errors, read_errors, 0, 0) };
         }
@@ -179,47 +186,45 @@ impl commands::services::Backend for Console {
     }
 
     fn create_civ_process(&mut self, thread_id: u32) -> CivResult {
-        call_reporting(XAM_CREATE_PROCESS, thread_id, 0, 0)
+        call_reporting(xam::ordinal::MEDIA_VERIFICATION_CREATE, thread_id, 0, 0)
     }
 
     fn close_civ_process(&mut self) {
-        if let Ok(function) = xam_export(XAM_CLOSE_PROCESS) {
+        if let Ok(function) = xam_export(xam::ordinal::MEDIA_VERIFICATION_CLOSE) {
             // SAFETY: the export takes no arguments.
             unsafe { kernel::call_export(function, 0, 0, 0, 0) };
         }
     }
 
     fn verify_civ(&mut self, milliseconds: u32) -> CivResult {
-        call_reporting(XAM_VERIFY, milliseconds, 0, 0)
+        call_reporting(xam::ordinal::MEDIA_VERIFICATION_VERIFY, milliseconds, 0, 0)
     }
 
     fn civ_progress(&mut self) -> Result<CivProgress, CivResult> {
-        let mut record = [0u32; FAILED_BLOCKS_RECORD_SIZE as usize / 4];
-        record[0] = FAILED_BLOCKS_RECORD_SIZE;
-        match xam_export(XAM_FAILED_BLOCKS) {
+        let mut record = MediaVerificationFailedBlocks::new();
+        match xam_export(xam::ordinal::MEDIA_VERIFICATION_FAILED_BLOCKS) {
             Ok(function) => {
-                // SAFETY: the export fills the 0x18-byte record it is given.
-                let result = unsafe {
-                    kernel::call_export(function, record.as_mut_ptr() as usize as u32, 0, 0, 0)
-                };
+                let address = core::ptr::from_mut(&mut record).expose_provenance() as u32;
+                // SAFETY: the export fills the record it is given, which is a
+                // live local of the size its first word states.
+                let result = unsafe { kernel::call_export(function, address, 0, 0, 0) };
                 if result != 0 {
                     return Err(CivResult::Returned(Hresult(result)));
                 }
             }
-            Err(Unresolved::Module) => return Err(CivResult::NoModule(last_error())),
-            Err(Unresolved::Export) => match last_error() {
-                LastError::ProcNotFound => {
-                    record = [0, 0, 0, 0, 0, 1];
-                }
+            Err(Unresolved::Module) => return Err(CivResult::NoModule(stored_last_error())),
+            Err(Unresolved::Export) => match stored_last_error() {
+                // Without the export the verification counts as complete.
+                LastError::ProcNotFound => record.completed = 1,
                 error => return Err(CivResult::NoExport(error)),
             },
         }
         Ok(CivProgress {
-            failed_reads: record[1],
-            failed_hashes: record[2],
-            blocks_checked: record[3],
-            total_blocks: record[4],
-            completed: record[5] != 0,
+            failed_reads: record.failed_reads,
+            failed_hashes: record.failed_hashes,
+            blocks_checked: record.blocks_checked,
+            total_blocks: record.total_blocks,
+            completed: record.completed != 0,
         })
     }
 }

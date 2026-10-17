@@ -8,102 +8,133 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
 use xbox360::sync::SpinLock;
+use xbox360_sys::xboxkrnl::KernelU32;
 
-use super::read_u32;
-use super::write_u32;
 use crate::kernel;
 
 const SWAP_SLOTS: usize = 8;
 
-/// Read by the dispatcher without the lock, as stock does.
+/// A routine run on every thread switch with the outgoing thread object,
+/// the dispatcher's frame, and the incoming thread object.
+pub(crate) type SwapRoutine = extern "C" fn(old: u32, frame: u32, new: u32);
+
+/// Routine addresses, 0 for a free slot. Read by the dispatcher without
+/// the lock, as stock does.
 static ROUTINES: [AtomicU32; SWAP_SLOTS] = [const { AtomicU32::new(0) }; SWAP_SLOTS];
 static CHAIN: SpinLock<Chain> = SpinLock::new(Chain {
-    flags: [0; SWAP_SLOTS],
+    persistent: [false; SWAP_SLOTS],
     installed: false,
     replaced: 0,
 });
 
 struct Chain {
-    /// Nonzero: the routine stays registered when the title ends.
-    flags: [u32; SWAP_SLOTS],
+    /// The routine stays registered when the title ends.
+    persistent: [bool; SWAP_SLOTS],
     installed: bool,
     /// Kernel swap routine replaced by the dispatcher.
     replaced: u32,
 }
 
+/// `KiContextSwapNotification`, the routine variable the kernel calls on
+/// each thread switch.
+///
+/// # Safety
+///
+/// The query service must have published the address of the variable,
+/// which it does at registration. Stock uses the word without a check.
+unsafe fn kernel_swap_routine() -> &'static KernelU32 {
+    // SAFETY: the caller's contract.
+    unsafe { kernel::routine_variable(kernel::RoutineVariable::ContextSwap).unwrap_unchecked() }
+}
+
+fn routine_address(routine: SwapRoutine) -> u32 {
+    routine as usize as u32
+}
+
 impl Chain {
-    fn install(&mut self) {
-        let kernel_slot = kernel::debug_monitor_data()
-            .context_swap_notification
-            .load(Ordering::Relaxed);
-        self.replaced = read_u32(kernel_slot);
-        write_u32(kernel_slot, dispatch_entry as *const () as usize as u32);
+    /// # Safety
+    ///
+    /// As for [`kernel_swap_routine`].
+    unsafe fn install(&mut self) {
+        // SAFETY: the caller's contract.
+        let kernel_slot = unsafe { kernel_swap_routine() };
+        self.replaced = kernel_slot.load(Ordering::Relaxed);
+        // SAFETY: the dispatcher entry takes the kernel's swap routine
+        // arguments and stays loaded while installed.
+        unsafe {
+            kernel_slot.store(
+                dispatch_entry as *const () as usize as u32,
+                Ordering::Relaxed,
+            )
+        };
         self.installed = true;
     }
 }
 
-/// Add `routine(old_thread, frame, new_thread)` in the first free slot
-/// (nothing when all are taken) and install the dispatcher.
-pub(crate) fn register_swap_routine(routine: u32, flag: u32) {
+/// Add `routine` in the first free slot (nothing when all are taken) and
+/// install the dispatcher. A `persistent` routine stays registered when
+/// the title ends.
+pub(crate) fn register_swap_routine(routine: SwapRoutine, persistent: bool) {
     let mut chain = CHAIN.lock();
     if let Some(slot) = ROUTINES
         .iter()
         .position(|slot| slot.load(Ordering::Relaxed) == 0)
     {
-        ROUTINES[slot].store(routine, Ordering::Release);
-        chain.flags[slot] = flag;
+        ROUTINES[slot].store(routine_address(routine), Ordering::Release);
+        chain.persistent[slot] = persistent;
     }
     if !chain.installed {
-        chain.install();
+        // SAFETY: the monitor registered with the kernel before any routine
+        // registers, so the variable is published, as stock assumes.
+        unsafe { chain.install() };
     }
 }
 
 /// Remove every slot holding `routine`; with no routine left the kernel's
 /// own swap routine is restored.
-pub(crate) fn unregister_swap_routine(routine: u32) {
+pub(crate) fn unregister_swap_routine(routine: SwapRoutine) {
+    let routine = routine_address(routine);
     let mut chain = CHAIN.lock();
     let mut remaining = 0;
-    for (slot, flag) in ROUTINES.iter().zip(&mut chain.flags) {
+    for (slot, persistent) in ROUTINES.iter().zip(&mut chain.persistent) {
         match slot.load(Ordering::Relaxed) {
             0 => {}
             current if current == routine => {
                 slot.store(0, Ordering::Release);
-                *flag = 0;
+                *persistent = false;
             }
             _ => remaining += 1,
         }
     }
     if remaining == 0 && chain.installed {
-        write_u32(
-            kernel::debug_monitor_data()
-                .context_swap_notification
-                .load(Ordering::Relaxed),
-            chain.replaced,
-        );
+        // SAFETY: `install` found the variable; the routine the dispatcher
+        // replaced is the kernel's own.
+        unsafe { kernel_swap_routine().store(chain.replaced, Ordering::Relaxed) };
         chain.installed = false;
     }
 }
 
 /// Title termination part (stock 0x91f64128, from 0x91f566f0): remove the
-/// routines registered with a zero flag. With routines left the
+/// routines registered as not persistent. With routines left the
 /// dispatcher is installed again, replacing whatever the kernel slot holds
 /// then (possibly the dispatcher itself); with none left it stays in the
 /// kernel slot with an empty chain.
 pub(crate) fn remove_unflagged_swap_routines() {
     let mut chain = CHAIN.lock();
     let mut remaining = 0;
-    for (slot, flag) in ROUTINES.iter().zip(&mut chain.flags) {
+    for (slot, persistent) in ROUTINES.iter().zip(&mut chain.persistent) {
         if slot.load(Ordering::Relaxed) == 0 {
             continue;
         }
-        if *flag != 0 {
+        if *persistent {
             remaining += 1;
         } else {
             slot.store(0, Ordering::Release);
         }
     }
     if remaining > 0 {
-        chain.install();
+        // SAFETY: as in `register_swap_routine`.
+        unsafe { chain.install() };
     } else {
         chain.installed = false;
     }
@@ -137,10 +168,9 @@ extern "C" fn dispatch(old: u32, new: u32, frame: u32) {
     for slot in &ROUTINES {
         let routine = slot.load(Ordering::Acquire);
         if routine != 0 {
-            // SAFETY: registrants pass `(old, frame, new)` routines of this
-            // module.
-            let routine: extern "C" fn(u32, u32, u32) -> u32 =
-                unsafe { core::mem::transmute(routine as usize) };
+            // SAFETY: nonzero slots hold only `SwapRoutine` addresses stored
+            // by `register_swap_routine`.
+            let routine: SwapRoutine = unsafe { core::mem::transmute(routine as usize) };
             routine(old, frame, new);
         }
     }

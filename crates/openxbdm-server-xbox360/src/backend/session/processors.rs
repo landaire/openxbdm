@@ -20,6 +20,7 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::ConnectionIndex;
 use openxbdm_server::Server;
@@ -40,9 +41,12 @@ use openxbdm_server::server::MAX_CONNECTIONS;
 use openxbdm_server::server::Owner;
 use openxbdm_server::text::ResponseText;
 use openxbdm_server::text::Text;
+use xbox360::thread::current_object;
 use xbox360::time::TickCount;
+use xbox360::time::relative_interval;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::KeResumeThread;
+use xbox360_sys::xboxkrnl::ProcessType;
 use xbox360_sys::xboxkrnl::ProcessorMode;
 use xbox360_sys::xboxkrnl::ThreadCreationFlags;
 use xbox360_sys::xboxkrnl::WaitReason;
@@ -50,11 +54,7 @@ use xbox360_sys::xboxkrnl::WaitType;
 
 use super::super::Console;
 use super::CriticalSection;
-use super::THREAD_SYSTEM_PROCESS;
-use super::TITLE_PROCESS;
-use super::c_string;
-use super::current_thread;
-use super::read_u32;
+use super::until_nul;
 use crate::exports::export;
 use crate::kernel;
 use crate::kernel::KernelEvent;
@@ -68,28 +68,29 @@ const CONTINUATION_BUFFER_SIZE: u32 = 0x100;
 const LINE_SIZE: usize = 0x200;
 /// Scratch area a context points at (stock connection +0x240).
 const SCRATCH_SIZE: usize = 0x58;
-/// Context `count`: the data buffer holds one NUL-terminated line.
-const TEXT_LINE: u32 = u32::MAX;
-/// Context `remaining` outside a 204 upload.
-const NOT_RECEIVING: u32 = u32::MAX;
 
 /// `ExCreateThread` flags of the title command thread and of dedicated
-/// threads (stock 0x91f50500, 0x91f51730): suspended, thread object; a
-/// thread of the system process adds `THREAD_SYSTEM_PROCESS`.
-const THREAD_FLAGS: u32 = 0x0400_02a5;
+/// threads (stock 0x91f50500, 0x91f51730); a thread of the system process
+/// adds [`ThreadCreationFlags::SYSTEM_PROCESS`]. Bit 0x4 has no name: no
+/// kernel code tests it, and it passes on as stock sets it.
+const THREAD_FLAGS: ThreadCreationFlags = ThreadCreationFlags::SUSPENDED
+    .union(ThreadCreationFlags::RETURN_THREAD_OBJECT)
+    .union(ThreadCreationFlags::EXEMPT_FROM_STOPS)
+    .union(ThreadCreationFlags::PROCESSOR2)
+    .union(ThreadCreationFlags::PRIORITY_CLASS_13)
+    .union(ThreadCreationFlags::from_bits_retain(0x4));
+const _: () = assert!(THREAD_FLAGS.bits() == 0x0400_02a5);
 const THREAD_STACK_SIZE: u32 = 0x8000;
 /// Executor context of the title command thread; dedicated threads get
 /// their connection index.
-const TITLE_EXECUTOR: u32 = MAX_CONNECTIONS as u32;
+const TITLE_EXECUTOR: u8 = MAX_CONNECTIONS as u8;
 /// The title command thread ends after this long without a title-owned
 /// connection (stock 0x91f42b98 waits 30 s).
 const TITLE_IDLE_MILLISECONDS: u32 = 30_000;
 /// How long the server thread waits for a call before it continues with
 /// other work; one pass of its loop.
-const FAST_WAIT: i64 = -20 * 10_000;
+const FAST_WAIT: i64 = relative_interval(core::time::Duration::from_millis(20));
 const NO_WAIT: i64 = 0;
-const STATUS_WAIT_0: u32 = 0;
-const STATUS_TIMEOUT: u32 = 0x102;
 
 /// Registry entries (stock 0x91f9ff98, 16 pool records of 0x48 bytes).
 struct Registry {
@@ -131,7 +132,7 @@ export!(30, register_processor);
 export!(72, register_processor_ex);
 
 /// Export 30 (stock 0x91f51438): export 72 without a dedicated thread.
-extern "C" fn register_processor(name: u32, handler: u32) -> u32 {
+extern "C" fn register_processor(name: u32, handler: u32) -> Hresult {
     register_processor_ex(name, handler, 0)
 }
 
@@ -139,14 +140,15 @@ extern "C" fn register_processor(name: u32, handler: u32) -> u32 {
 /// unregister every processor named `name` when `handler` is null. A
 /// nonzero `dedicated` runs connections dedicated to the processor on
 /// their own thread.
-extern "C" fn register_processor_ex(name: u32, handler: u32, dedicated: u32) -> u32 {
-    if name == 0 {
-        return Hresult::INVALID_ARGUMENT.0;
-    }
+extern "C" fn register_processor_ex(name: u32, handler: u32, dedicated: u32) -> Hresult {
     // One byte past the longest stored name tells an overlong name apart.
-    let name = c_string(name, PROCESSOR_NAME_CAPACITY + 1);
+    // SAFETY: callers pass 0 or a NUL-terminated name.
+    let Some(name) = (unsafe { kernel::bounded_c_string(name, PROCESSOR_NAME_CAPACITY + 1) })
+    else {
+        return Hresult::INVALID_ARGUMENT;
+    };
     let mut flags = ProcessorFlags::empty();
-    if xboxkrnl::KeGetCurrentProcessType().0 == TITLE_PROCESS {
+    if xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE {
         flags = flags.union(ProcessorFlags::TITLE);
     }
     if dedicated != 0 {
@@ -156,19 +158,32 @@ extern "C" fn register_processor_ex(name: u32, handler: u32, dedicated: u32) -> 
     crate::exports::export_result(
         REGISTRY.with(|processors| processors.register(name, handler, flags)),
     )
-    .0
 }
 
 /// Monitor control code 0x1c (stock 0x91f3b6c0): register the `PIX`
 /// processor through export 30.
 pub(crate) fn service_register_pix_processor(handler: u32) -> u32 {
-    register_processor(c"PIX".as_ptr() as usize as u32, handler)
+    register_processor(c"PIX".as_ptr() as usize as u32, handler).0
 }
 
-/// Monitor control code 0x32 (stock 0x91f3b8a4): export 30 with
-/// `{+0 name, +4 handler}`.
-pub(crate) fn service_register_processor(argument: u32) -> u32 {
-    register_processor(read_u32(argument), read_u32(argument + 4))
+/// Record of monitor control code 0x32.
+#[repr(C)]
+struct ProcessorRegistration {
+    name: u32,
+    handler: u32,
+}
+
+/// Monitor control code 0x32 (stock 0x91f3b8a4): export 30 with a
+/// [`ProcessorRegistration`].
+///
+/// # Safety
+///
+/// `argument` must be the address of a [`ProcessorRegistration`] whose
+/// name is 0 or a NUL-terminated string, unchanged for the call.
+pub(crate) unsafe fn service_register_processor(argument: u32) -> u32 {
+    // SAFETY: the caller's contract.
+    let registration = unsafe { kernel::object_at::<ProcessorRegistration>(argument) };
+    register_processor(registration.name, registration.handler).0
 }
 
 /// Context of a handler call (stock connection +0x228, handler argument 4).
@@ -176,14 +191,39 @@ pub(crate) fn service_register_processor(argument: u32) -> u32 {
 struct Context {
     /// Continuation routine; 0 when none.
     continuation: u32,
-    /// Bytes in `buffer`, or `TEXT_LINE`.
+    /// Bytes in `buffer`, or [`Context::TEXT_LINE`].
     count: u32,
     /// Data buffer; 0 makes the transfer pump supply one.
     buffer: u32,
     size: u32,
     scratch: u32,
-    /// Bytes still expected in a 204 upload, or `NOT_RECEIVING`.
+    /// Bytes still expected in a 204 upload, or [`Context::NOT_RECEIVING`].
     remaining: u32,
+}
+
+/// What a continuation left in its data buffer.
+#[derive(Clone, Copy)]
+enum ContinuationData {
+    /// One NUL-terminated line.
+    Line,
+    Bytes(u32),
+    Nothing,
+}
+
+impl Context {
+    /// `count`: the data buffer holds one NUL-terminated line.
+    const TEXT_LINE: u32 = u32::MAX;
+    /// `remaining` outside a 204 upload.
+    const NOT_RECEIVING: u32 = u32::MAX;
+
+    #[inline(always)]
+    fn data(&self) -> ContinuationData {
+        match self.count {
+            Self::TEXT_LINE => ContinuationData::Line,
+            0 => ContinuationData::Nothing,
+            count => ContinuationData::Bytes(count),
+        }
+    }
 }
 
 /// Memory a call reads and writes; handlers and continuations get
@@ -199,18 +239,54 @@ struct CallBlock {
     response: [u8; HANDLER_RESPONSE_SIZE as usize],
 }
 
-const SLOT_IDLE: u32 = 0;
-const SLOT_POSTED: u32 = 1;
-const SLOT_RUNNING: u32 = 2;
-const SLOT_FINISHED: u32 = 3;
-/// The thread of a posted or running call ended without finishing it.
-const SLOT_LOST: u32 = 4;
+/// Call state of a connection slot.
+#[repr(u32)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallSlotState {
+    Idle = 0,
+    Posted = 1,
+    Running = 2,
+    Finished = 3,
+    /// The thread of a posted or running call ended without finishing it.
+    Lost = 4,
+}
+
+/// Word of a [`CallSlotState`]; only these methods store it.
+#[repr(transparent)]
+struct SlotState(AtomicU32);
+
+impl SlotState {
+    const fn new() -> Self {
+        Self(AtomicU32::new(CallSlotState::Idle as u32))
+    }
+
+    #[inline(always)]
+    fn load(&self, order: Ordering) -> CallSlotState {
+        let raw = self.0.load(order);
+        // SAFETY: the word only ever holds a `CallSlotState` value.
+        unsafe { core::mem::transmute::<u32, CallSlotState>(raw) }
+    }
+
+    #[inline(always)]
+    fn store(&self, state: CallSlotState, order: Ordering) {
+        self.0.store(state as u32, order);
+    }
+
+    /// Compare-exchange from `from` to `to`; the failure ordering is
+    /// relaxed.
+    #[inline(always)]
+    fn transition(&self, from: CallSlotState, to: CallSlotState, success: Ordering) -> bool {
+        self.0
+            .compare_exchange(from as u32, to as u32, success, Ordering::Relaxed)
+            .is_ok()
+    }
+}
 
 /// Call state of one connection slot.
 struct Slot {
     block: UnsafeCell<CallBlock>,
-    state: AtomicU32,
-    /// Executor context the call is posted to.
+    state: SlotState,
+    /// Tag of the executor thread the call is posted to.
     executor: AtomicU32,
     routine: AtomicU32,
     arguments: [AtomicU32; 4],
@@ -250,7 +326,7 @@ impl Slot {
     fn busy(&self) -> bool {
         matches!(
             self.state.load(Ordering::Acquire),
-            SLOT_POSTED | SLOT_RUNNING
+            CallSlotState::Posted | CallSlotState::Running
         )
     }
 }
@@ -264,13 +340,13 @@ static SLOTS: [Slot; MAX_CONNECTIONS] = [const {
                 buffer: 0,
                 size: 0,
                 scratch: 0,
-                remaining: NOT_RECEIVING,
+                remaining: Context::NOT_RECEIVING,
             },
             scratch: [0; SCRATCH_SIZE],
             line: [0; LINE_SIZE],
             response: [0; HANDLER_RESPONSE_SIZE as usize],
         }),
-        state: AtomicU32::new(SLOT_IDLE),
+        state: SlotState::new(),
         executor: AtomicU32::new(0),
         routine: AtomicU32::new(0),
         arguments: [const { AtomicU32::new(0) }; 4],
@@ -293,12 +369,29 @@ static EXECUTORS: [Executor; MAX_CONNECTIONS + 1] = [const {
     }
 }; MAX_CONNECTIONS + 1];
 
-/// Executor context in the low byte of a thread's tag, generation above.
-const GENERATION_SHIFT: u32 = 8;
-const GENERATION_MASK: u32 = u32::MAX >> GENERATION_SHIFT;
+/// Context of an executor thread: the executor index in the low byte and
+/// the generation of the thread above it, modulo 2^24.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ThreadTag(u32);
 
-fn tag_context(tag: u32) -> u32 {
-    tag & ((1 << GENERATION_SHIFT) - 1)
+impl ThreadTag {
+    const GENERATION_SHIFT: u32 = 8;
+
+    #[inline(always)]
+    const fn new(context: u8, generation: u32) -> Self {
+        Self(context as u32 | generation << Self::GENERATION_SHIFT)
+    }
+
+    #[inline(always)]
+    const fn context(self) -> usize {
+        (self.0 & ((1 << Self::GENERATION_SHIFT) - 1)) as usize
+    }
+
+    /// Whether an executor's generation counter names this tag's thread.
+    #[inline(always)]
+    const fn is_generation(self, generation: u32) -> bool {
+        generation & (u32::MAX >> Self::GENERATION_SHIFT) == self.0 >> Self::GENERATION_SHIFT
+    }
 }
 
 /// Trace text of the title command thread, under trace mask bit 0x1 (stock
@@ -317,30 +410,27 @@ fn trace_title_thread(text: &str, thread: Option<u32>) {
 
 /// Executor thread: run the calls posted to it, in connection order.
 extern "C" fn executor_thread(tag: u32) -> u32 {
-    let title = tag_context(tag) == TITLE_EXECUTOR;
+    // `ExecutorThread::start` passes the thread's tag as its context.
+    let tag = ThreadTag(tag);
+    let title = tag.context() == usize::from(TITLE_EXECUTOR);
     if title {
         trace_title_thread(
             "XBDM: New title command processor thread = ",
-            Some(current_thread()),
+            Some(current_object().raw()),
         );
     }
-    let executor = &EXECUTORS[tag_context(tag) as usize];
-    let current =
-        || executor.generation.load(Ordering::Acquire) & GENERATION_MASK == tag >> GENERATION_SHIFT;
+    let executor = &EXECUTORS[tag.context()];
+    let current = || tag.is_generation(executor.generation.load(Ordering::Acquire));
     loop {
         executor.work.wait();
         while current()
             && let Some(slot) = SLOTS.iter().find(|slot| {
-                slot.executor.load(Ordering::Acquire) == tag
-                    && slot
-                        .state
-                        .compare_exchange(
-                            SLOT_POSTED,
-                            SLOT_RUNNING,
-                            Ordering::AcqRel,
-                            Ordering::Relaxed,
-                        )
-                        .is_ok()
+                slot.executor.load(Ordering::Acquire) == tag.0
+                    && slot.state.transition(
+                        CallSlotState::Posted,
+                        CallSlotState::Running,
+                        Ordering::AcqRel,
+                    )
             })
         {
             let argument = |index: usize| slot.arguments[index].load(Ordering::Relaxed);
@@ -356,7 +446,7 @@ extern "C" fn executor_thread(tag: u32) -> u32 {
                 )
             };
             slot.result.store(result, Ordering::Relaxed);
-            slot.state.store(SLOT_FINISHED, Ordering::Release);
+            slot.state.store(CallSlotState::Finished, Ordering::Release);
             slot.done.set();
         }
         if !current() {
@@ -365,7 +455,7 @@ extern "C" fn executor_thread(tag: u32) -> u32 {
             if title {
                 trace_title_thread(
                     "XBDM: Terminating title command processor thread=",
-                    Some(current_thread()),
+                    Some(current_object().raw()),
                 );
             }
             return 0;
@@ -377,19 +467,19 @@ extern "C" fn executor_thread(tag: u32) -> u32 {
 #[derive(Debug, PartialEq, Eq)]
 struct ExecutorThread {
     object: NonZeroU32,
-    tag: u32,
+    tag: ThreadTag,
 }
 
 impl ExecutorThread {
-    fn start(context: u32, title: bool) -> Option<Self> {
-        let executor = &EXECUTORS[context as usize];
+    fn start(context: u8, title: bool) -> Option<Self> {
+        let executor = &EXECUTORS[usize::from(context)];
         let generation = executor.generation.load(Ordering::Acquire).wrapping_add(1);
         executor.generation.store(generation, Ordering::Release);
-        let tag = context | generation << GENERATION_SHIFT;
+        let tag = ThreadTag::new(context, generation);
         let flags = if title {
             THREAD_FLAGS
         } else {
-            THREAD_FLAGS | THREAD_SYSTEM_PROCESS
+            THREAD_FLAGS | ThreadCreationFlags::SYSTEM_PROCESS
         };
         let mut object = 0u32;
         // SAFETY: `object` is a local word; `executor_thread` takes the tag
@@ -401,11 +491,11 @@ impl ExecutorThread {
                 core::ptr::null_mut(),
                 0,
                 executor_thread as *const () as usize as u32,
-                tag,
-                ThreadCreationFlags::from_bits_retain(flags),
+                tag.0,
+                flags,
             )
         };
-        if (status.0 as i32) < 0 {
+        if !status.is_success() {
             return None;
         }
         let object = NonZeroU32::new(object)?;
@@ -416,7 +506,7 @@ impl ExecutorThread {
 
     fn ended(&self) -> bool {
         // SAFETY: `object` is the referenced thread object `self` owns.
-        unsafe {
+        let status = unsafe {
             xboxkrnl::KeWaitForSingleObject(
                 self.object.get() as usize as *mut xboxkrnl::DispatcherObject,
                 WaitReason::Executive,
@@ -424,20 +514,20 @@ impl ExecutorThread {
                 false,
                 &NO_WAIT,
             )
-        }
-        .0 == STATUS_WAIT_0
+        };
+        status == NtStatus::WAIT_0
     }
 
     /// Whether a call posted to this thread is waiting or running.
     fn busy(&self) -> bool {
         SLOTS
             .iter()
-            .any(|slot| slot.executor.load(Ordering::Acquire) == self.tag && slot.busy())
+            .any(|slot| slot.executor.load(Ordering::Acquire) == self.tag.0 && slot.busy())
     }
 
     /// Ask the thread to exit after its current call.
     fn retire(&self) {
-        let executor = &EXECUTORS[tag_context(self.tag) as usize];
+        let executor = &EXECUTORS[self.tag.context()];
         executor.generation.fetch_add(1, Ordering::AcqRel);
         executor.work.set();
     }
@@ -470,7 +560,7 @@ impl ExecutorThread {
     fn release(self, retired: &mut [Option<ExecutorThread>; MAX_CONNECTIONS + 1]) {
         if self.busy() {
             self.retire();
-            let slot = &mut retired[tag_context(self.tag) as usize];
+            let slot = &mut retired[self.tag.context()];
             if let Some(older) = slot.replace(self) {
                 older.join();
             }
@@ -482,8 +572,8 @@ impl ExecutorThread {
     /// Release a thread that ended; its posted and running calls are lost.
     fn release_ended(self) {
         for slot in &SLOTS {
-            if slot.executor.load(Ordering::Acquire) == self.tag && slot.busy() {
-                slot.state.store(SLOT_LOST, Ordering::Release);
+            if slot.executor.load(Ordering::Acquire) == self.tag.0 && slot.busy() {
+                slot.state.store(CallSlotState::Lost, Ordering::Release);
             }
         }
         // SAFETY: `self` owns the reference and is consumed here.
@@ -578,7 +668,8 @@ pub struct Data {
 
 /// How a call started.
 enum Started {
-    Finished(u32),
+    /// The routine's result.
+    Finished(Hresult),
     Running,
     /// No thread could run the call.
     Unavailable,
@@ -592,22 +683,17 @@ enum Taken {
 
 fn take_result(slot: &Slot) -> Option<Taken> {
     match slot.state.load(Ordering::Acquire) {
-        SLOT_FINISHED => {
+        CallSlotState::Finished => {
             let result = Hresult(slot.result.load(Ordering::Relaxed));
-            slot.state.store(SLOT_IDLE, Ordering::Release);
+            slot.state.store(CallSlotState::Idle, Ordering::Release);
             Some(Taken::Returned(result))
         }
-        SLOT_LOST => {
-            slot.state.store(SLOT_IDLE, Ordering::Release);
+        CallSlotState::Lost => {
+            slot.state.store(CallSlotState::Idle, Ordering::Release);
             Some(Taken::Lost)
         }
         _ => None,
     }
-}
-
-/// Length of the NUL-terminated text at `address`, at most `limit`.
-fn text_length(address: u32, limit: usize) -> usize {
-    c_string(address, limit).len()
 }
 
 impl Data {
@@ -649,7 +735,7 @@ impl Data {
                     other.thread.stop();
                 }
                 if dedicated.is_none() {
-                    let thread = ExecutorThread::start(slot as u32, title)?;
+                    let thread = ExecutorThread::start(slot as u8, title)?;
                     *dedicated = Some(DedicatedThread {
                         thread,
                         title,
@@ -676,20 +762,20 @@ impl Data {
             let [first, second, third, fourth] = arguments;
             // SAFETY: the routine is a handler or continuation of a
             // registered processor, called with the monitor's arguments.
-            return Started::Finished(unsafe {
+            return Started::Finished(Hresult(unsafe {
                 kernel::call_export(routine, first, second, third, fourth)
-            });
+            }));
         };
         let (tag, object) = (executor.tag, executor.object.get());
         let call = &SLOTS[slot];
-        call.executor.store(tag, Ordering::Relaxed);
+        call.executor.store(tag.0, Ordering::Relaxed);
         call.routine.store(routine, Ordering::Relaxed);
         for (stored, &argument) in call.arguments.iter().zip(&arguments) {
             stored.store(argument, Ordering::Relaxed);
         }
         call.done.reset();
-        call.state.store(SLOT_POSTED, Ordering::Release);
-        EXECUTORS[tag_context(tag) as usize].work.set();
+        call.state.store(CallSlotState::Posted, Ordering::Release);
+        EXECUTORS[tag.context()].work.set();
         let objects = [call.done.pointer() as usize as u32, object];
         let mut wait_blocks = [0u32; 0x10];
         loop {
@@ -708,11 +794,11 @@ impl Data {
                 )
             };
             return match take_result(call) {
-                Some(Taken::Returned(result)) => Started::Finished(result.0),
+                Some(Taken::Returned(result)) => Started::Finished(result),
                 Some(Taken::Lost) => Started::Unavailable,
-                None if status.0 == STATUS_TIMEOUT => Started::Running,
+                None if status == NtStatus::TIMEOUT => Started::Running,
                 // A late signal of the slot's previous call.
-                None if status.0 == STATUS_WAIT_0 => continue,
+                None if status == NtStatus::WAIT_0 => continue,
                 // The thread ended (the title process went away) before the
                 // call finished.
                 None => {
@@ -822,7 +908,7 @@ fn reset_context(slot: &Slot) {
     // SAFETY: the slot is idle; only the server thread uses it.
     unsafe {
         (*context).buffer = 0;
-        (*context).remaining = NOT_RECEIVING;
+        (*context).remaining = Context::NOT_RECEIVING;
         (*context).continuation = 0;
         (*context).scratch = slot.scratch_address();
     }
@@ -865,12 +951,13 @@ impl Console {
     ) -> Hresult {
         let index = call.connection.0 as usize;
         let slot = &SLOTS[index];
-        let response = slot.response_address();
-        text.set_bytes(c_string(response, HANDLER_RESPONSE_SIZE as usize));
+        // SAFETY: the slot is idle; only the server thread uses it.
+        let block = unsafe { &*slot.block() };
+        text.set_bytes(until_nul(&block.response));
         let context = slot.context();
         let mode = if result == Hresult::MULTILINE {
             // SAFETY: the slot is idle; only the server thread uses it.
-            unsafe { (*context).count = TEXT_LINE };
+            unsafe { (*context).count = Context::TEXT_LINE };
             Mode::Lines
         } else if result == Hresult::BINARY {
             Mode::Binary
@@ -928,10 +1015,10 @@ impl Console {
             }
             let mut result = result;
             // SAFETY: the slot is idle; only the server thread uses it.
-            unsafe { (*context).remaining = NOT_RECEIVING };
+            unsafe { (*context).remaining = Context::NOT_RECEIVING };
             calls.mode = if result == Hresult::MULTILINE {
                 // SAFETY: as above.
-                unsafe { (*context).count = TEXT_LINE };
+                unsafe { (*context).count = Context::TEXT_LINE };
                 Mode::Lines
             } else if result == Hresult::BINARY {
                 Mode::Binary
@@ -946,9 +1033,10 @@ impl Console {
                 calls.mode = Mode::Idle;
                 result = Hresult::UNEXPECTED;
             } else {
-                transfer.line.set_bytes(c_string(
-                    slot.response_address(),
-                    CONTINUATION_BUFFER_SIZE as usize,
+                // SAFETY: as above.
+                let block = unsafe { &*slot.block() };
+                transfer.line.set_bytes(until_nul(
+                    &block.response[..CONTINUATION_BUFFER_SIZE as usize],
                 ));
             }
             *transfer.receive_remaining = Some(0);
@@ -963,31 +1051,35 @@ impl Console {
             return result;
         }
         // SAFETY: the slot is idle; only the server thread uses it.
-        let (count, buffer) = unsafe { ((*context).count, (*context).buffer) };
-        let output = if count == TEXT_LINE {
-            // The supplied buffer bounds the line; a processor's own buffer
-            // is read to its NUL, as stock does.
-            let limit = if buffer == slot.line_address() {
-                CONTINUATION_BUFFER_SIZE as usize
-            } else {
-                usize::MAX
-            };
-            let length = text_length(buffer, limit) as u32;
-            Some(Output {
-                address: buffer,
-                length,
-                total: length + 2,
-                passed: 0,
-            })
-        } else if count != 0 {
-            Some(Output {
+        let (data, buffer) = unsafe { ((*context).data(), (*context).buffer) };
+        let output = match data {
+            ContinuationData::Line => {
+                // The supplied buffer bounds the line; a processor's own
+                // buffer is read to its NUL, as stock does.
+                let length = if buffer == slot.line_address() {
+                    // SAFETY: as above.
+                    let block = unsafe { &*slot.block() };
+                    until_nul(&block.line[..CONTINUATION_BUFFER_SIZE as usize]).len()
+                } else {
+                    // SAFETY: a continuation that reports a line leaves it
+                    // NUL-terminated in its buffer, which is not 0; stock
+                    // reads it without a check.
+                    unsafe { kernel::c_string(buffer).unwrap_unchecked() }.len()
+                } as u32;
+                Some(Output {
+                    address: buffer,
+                    length,
+                    total: length + 2,
+                    passed: 0,
+                })
+            }
+            ContinuationData::Bytes(count) => Some(Output {
                 address: buffer,
                 length: count,
                 total: count,
                 passed: 0,
-            })
-        } else {
-            None
+            }),
+            ContinuationData::Nothing => None,
         };
         match output {
             Some(output) => {
@@ -1073,7 +1165,7 @@ impl ProcessorBackend for Console {
         {
             Started::Finished(result) => ProcessorProgress::Complete(self.finish_handler(
                 call,
-                Hresult(result),
+                result,
                 text,
                 continuation,
                 receive_remaining,
@@ -1146,7 +1238,7 @@ impl ProcessorBackend for Console {
             Started::Finished(result) => ProcessorProgress::Complete(self.finish_continuation(
                 index,
                 aborted,
-                Taken::Returned(Hresult(result)),
+                Taken::Returned(result),
                 transfer,
             )),
             Started::Running => {
@@ -1190,7 +1282,7 @@ pub(crate) fn poll_processor_calls(
     for (index, slot) in SLOTS.iter().enumerate() {
         if !matches!(
             slot.state.load(Ordering::Acquire),
-            SLOT_FINISHED | SLOT_LOST
+            CallSlotState::Finished | CallSlotState::Lost
         ) {
             continue;
         }

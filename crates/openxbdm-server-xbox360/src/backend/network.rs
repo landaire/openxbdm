@@ -48,6 +48,7 @@ use xbox360_sys::xboxkrnl::NicStatistics;
 
 use super::Console;
 use super::dispatcher;
+use super::dispatcher::ControlCode;
 use crate::kernel;
 use crate::kernel::pool_tag;
 
@@ -71,17 +72,6 @@ static CONFIG_STATUS: [AtomicU32; CONFIG_STATUS_WORDS] =
 /// `XnpConfig` flags of a static address, subnet, and gateway; stock sets
 /// both bits together.
 const STATIC_ADDRESS: XnetConfigFlags = XnetConfigFlags::from_bits_retain(0xc);
-
-/// Control codes that read the static address configuration. Code 0x0b
-/// reads them through the dispatcher, so extensions see them.
-#[derive(Clone, Copy)]
-#[repr(u32)]
-enum AddressQuery {
-    UseStatic = 0x0d,
-    Address = 0x0f,
-    Subnet = 0x11,
-    Gateway = 0x13,
-}
 
 fn address(value: u32) -> Ipv4Address {
     Ipv4Address(value.to_be_bytes())
@@ -109,16 +99,17 @@ fn set_and_save(target: &AtomicU32, value: u32) -> u32 {
 /// address configuration is read through the dispatcher, so extensions see
 /// the queries.
 pub(crate) fn service_apply_xnet_config(_argument: u32) -> u32 {
-    let query = |code: AddressQuery| dispatcher::dispatch(code as u32, 0);
+    // SAFETY: the address queries take no argument.
+    let query = |code: ControlCode| unsafe { dispatcher::dispatch(code, 0) };
     for word in &CONFIG_STATUS {
         word.store(0, Ordering::Relaxed);
     }
     let mut config = XnetConfigParams::new();
-    if query(AddressQuery::UseStatic) != 0 {
+    if query(ControlCode::GET_STATIC_IP_ENABLE) != 0 {
         config.flags = STATIC_ADDRESS;
-        config.address = query(AddressQuery::Address);
-        config.subnet = query(AddressQuery::Subnet);
-        config.gateway = query(AddressQuery::Gateway);
+        config.address = query(ControlCode::GET_STATIC_IP_ADDRESS);
+        config.subnet = query(ControlCode::GET_SUBNET);
+        config.gateway = query(ControlCode::GET_GATEWAY);
     }
     let name = crate::backend::console::debug_name();
     let name = name.as_bytes();

@@ -251,7 +251,10 @@ pub(crate) fn initialize() {
     let audio = unsafe { xboxkrnl::XAudioGetRenderDriverThread() } as usize as u32;
     if audio != 0 {
         let id = openxbdm_server::commands::debugger::ThreadId(read_u32(audio + 0x14c));
-        crate::backend::debugger::name_thread(Some(id), c"Audio Driver".as_ptr() as usize as u32);
+        // SAFETY: the name is a static NUL-terminated string.
+        unsafe {
+            crate::backend::debugger::name_thread(Some(id), c"Audio Driver".as_ptr() as usize as u32)
+        };
     }
     plugin::initialize();
     frame::reset_frame_count();

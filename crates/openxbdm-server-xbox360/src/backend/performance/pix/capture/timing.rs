@@ -95,7 +95,8 @@ fn write(kind: u32, id: u32, data: &[u32], extra: u32, request: [u32; 5]) {
 /// Code 0x8d (stock 0x91f56628): name the calling thread `NuiCam Driver`
 /// and begin a timing event named `name`.
 pub(crate) fn service_nuicam_begin(name: u32) -> u32 {
-    crate::backend::debugger::name_thread(None, c"NuiCam Driver".as_ptr() as usize as u32);
+    // SAFETY: the name is a static NUL-terminated string.
+    unsafe { crate::backend::debugger::name_thread(None, c"NuiCam Driver".as_ptr() as usize as u32) };
     begin_named(0, name);
     0
 }

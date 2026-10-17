@@ -119,10 +119,10 @@ pub(super) fn update_swap_routine(s: S) {
         flags & super::RUNNING != 0 && flags & super::PAUSED == 0 && s.word(0) != super::OFF;
     let registered = s.word(0x87d4) != 0;
     if wanted && !registered {
-        crate::backend::session::register_swap_routine(swap_record as *const () as usize as u32, 0);
+        crate::backend::session::register_swap_routine(swap_record, false);
         s.set_word(0x87d4, 1);
     } else if !wanted && registered {
-        crate::backend::session::unregister_swap_routine(swap_record as *const () as usize as u32);
+        crate::backend::session::unregister_swap_routine(swap_record);
         s.set_word(0x87d4, 0);
     }
 }
@@ -235,9 +235,9 @@ extern "C" fn marker_ipi(_context: u32) -> u32 {
 
 /// Context swap routine (stock 0x91f5f948): a record with both threads'
 /// call stacks and identifiers in the outgoing processor's buffer.
-extern "C" fn swap_record(old: u32, frame: u32, new: u32) -> u32 {
+extern "C" fn swap_record(old: u32, frame: u32, new: u32) {
     let Some(s) = super::super::session::session() else {
-        return 0;
+        return;
     };
     let processor = super::processor();
     let pcr = Kpcr::current();
@@ -257,7 +257,7 @@ extern "C" fn swap_record(old: u32, frame: u32, new: u32) -> u32 {
         if cursor >= buffer.limit.load(Ordering::Relaxed) {
             s.set_word(0x1_2298 + processor * 4, 1);
             super::interrupts_on();
-            return 0;
+            return;
         }
     }
     wr(cursor, super::timebase_low() << 7 | 1);
@@ -270,7 +270,6 @@ extern "C" fn swap_record(old: u32, frame: u32, new: u32) -> u32 {
     // SAFETY: the new cursor ends the record written inside the buffer.
     unsafe { buffer.cursor.store(cursor + total * 4, Ordering::Relaxed) };
     super::interrupts_on();
-    0
 }
 
 /// Whether `address` is inside `thread`'s stack (stock 0x91f5cd08; the

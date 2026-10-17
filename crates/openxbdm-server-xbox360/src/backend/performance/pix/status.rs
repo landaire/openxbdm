@@ -124,12 +124,14 @@ fn send(status: Status, argument: u32) {
                 length += 1;
                 address += 1;
             }
-            session::service_send_notification(text.as_ptr() as usize as u32);
+            // SAFETY: the text is a NUL-terminated local.
+            unsafe { session::service_send_notification(text.as_ptr() as usize as u32) };
             return;
         }
         _ => fixed.as_ptr() as usize as u32,
     };
-    session::service_send_notification(text);
+    // SAFETY: the text is a NUL-terminated local or static string.
+    unsafe { session::service_send_notification(text) };
 }
 
 /// Monitor control code 0x1b (stock 0x91f3b6b0): post status 9 with the

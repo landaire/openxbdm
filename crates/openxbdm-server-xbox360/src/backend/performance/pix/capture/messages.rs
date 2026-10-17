@@ -30,6 +30,7 @@ use super::buffers;
 use super::engine;
 use super::rd;
 use super::wr;
+use crate::backend::debugger::MonitorRecordFlags;
 use crate::kernel;
 
 const MESSAGE: u32 = super::CURRENT_MESSAGE;
@@ -46,7 +47,9 @@ const AUDIO_THREAD_FLAGS: u32 = 0x1_228c;
 const CALLER_FLAGS: u32 = 0x1_2288;
 /// Monitor record flags exchanged while paused: exempt from stops, not
 /// debuggable, and 0x1000.
-const RECORD_PAUSE_MASK: u32 = 0x0200_3000;
+const RECORD_PAUSE_MASK: MonitorRecordFlags = MonitorRecordFlags::from_bits_retain(0x0200_3000);
+/// The record flags of a paused thread within [`RECORD_PAUSE_MASK`].
+const RECORD_PAUSED: MonitorRecordFlags = MonitorRecordFlags::from_bits_retain(0x0200_1000);
 const UNNAMED: &core::ffi::CStr = c"unnamed.pix2";
 
 fn payload(s: S) -> u32 {
@@ -519,7 +522,10 @@ fn resource_state(payload: u32, out: &mut u32) -> bool {
                 kernel::call_export(procedure, payload, out as *mut u32 as usize as u32, 0, 0)
             };
         } else {
-            crate::backend::session::service_send_notification(refusal.as_ptr() as usize as u32);
+            // SAFETY: the refusal text is a static NUL-terminated string.
+            unsafe {
+                crate::backend::session::service_send_notification(refusal.as_ptr() as usize as u32)
+            };
         }
     }
     super::super::set_resource_information(payload + 0xc);
@@ -628,17 +634,28 @@ fn pause_engine(s: S) {
         call_kernel_routine(routine, s.word(AUDIO_CLIENT), 1);
         // SAFETY: takes no arguments; returns the thread object address.
         let thread = unsafe { xboxkrnl::XAudioGetRenderDriverThread() } as usize as u32;
-        if let Some(previous) =
-            crate::backend::debugger::exchange_record_flags(thread, RECORD_PAUSE_MASK, 0x0200_1000)
-        {
-            s.set_word(AUDIO_THREAD_FLAGS, previous);
+        // SAFETY: the render driver thread runs while XAudio keeps it, which
+        // the pause relies on, as stock does.
+        if let Some(previous) = unsafe {
+            crate::backend::debugger::exchange_record_flags(
+                kernel::thread_at(thread),
+                RECORD_PAUSE_MASK,
+                RECORD_PAUSED,
+            )
+        } {
+            s.set_word(AUDIO_THREAD_FLAGS, previous.bits());
         }
     }
     let thread = processor::current_thread();
-    if let Some(previous) =
-        crate::backend::debugger::exchange_record_flags(thread, RECORD_PAUSE_MASK, 0x0200_1000)
-    {
-        s.set_word(CALLER_FLAGS, previous);
+    // SAFETY: the calling thread does not end during the call.
+    if let Some(previous) = unsafe {
+        crate::backend::debugger::exchange_record_flags(
+            kernel::thread_at(thread),
+            RECORD_PAUSE_MASK,
+            RECORD_PAUSED,
+        )
+    } {
+        s.set_word(CALLER_FLAGS, previous.bits());
     }
     engine::stop(s, s.0 + FRAME_RECORD, false, true);
     for port in 0..4 {
@@ -660,20 +677,26 @@ fn resume_engine(s: S) {
     };
     crate::backend::debugger::request_execution(target, true);
     let thread = processor::current_thread();
-    crate::backend::debugger::exchange_record_flags(
-        thread,
-        RECORD_PAUSE_MASK,
-        s.word(CALLER_FLAGS),
-    );
+    // SAFETY: as in `pause_engine`.
+    unsafe {
+        crate::backend::debugger::exchange_record_flags(
+            kernel::thread_at(thread),
+            RECORD_PAUSE_MASK,
+            MonitorRecordFlags::from_bits_retain(s.word(CALLER_FLAGS)),
+        )
+    };
     let routine = s.word(super::super::session::KERNEL_ROUTINE);
     if routine != 0 {
         // SAFETY: takes no arguments; returns the thread object address.
         let audio = unsafe { xboxkrnl::XAudioGetRenderDriverThread() } as usize as u32;
-        crate::backend::debugger::exchange_record_flags(
-            audio,
-            RECORD_PAUSE_MASK,
-            s.word(AUDIO_THREAD_FLAGS),
-        );
+        // SAFETY: as in `pause_engine`.
+        unsafe {
+            crate::backend::debugger::exchange_record_flags(
+                kernel::thread_at(audio),
+                RECORD_PAUSE_MASK,
+                MonitorRecordFlags::from_bits_retain(s.word(AUDIO_THREAD_FLAGS)),
+            )
+        };
         call_kernel_routine(routine, s.word(AUDIO_CLIENT), 0);
         // SAFETY: the client `pause_engine` registered.
         unsafe { XAudioUnregisterRenderDriverClient(s.word(AUDIO_CLIENT)) };

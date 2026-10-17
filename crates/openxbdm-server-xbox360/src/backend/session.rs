@@ -6,12 +6,16 @@
 //! the state they share with the commands is static and lock-protected.
 
 use core::cell::UnsafeCell;
+use core::num::NonZeroU32;
+use core::ptr::NonNull;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
+use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::Win32Error;
 use openxbdm_server::Server;
 use openxbdm_server::commands;
 use openxbdm_server::commands::filesystem::FileHandle;
@@ -36,11 +40,18 @@ use openxbdm_server::commands::session::WaitTraceLine;
 use openxbdm_server::commands::session::format_wait_trace;
 use openxbdm_server::notify::POSTED_TEXT_CAPACITY;
 use openxbdm_server::notify::PostedTexts;
+use xbox360::status::Win32ErrorCode;
 use xbox360::sync::SpinLock;
+use xbox360::thread::ThreadObject;
+use xbox360::thread::current_object;
+use xbox360::time::relative_interval;
+use xbox360_sys::image::XexExecutionInfo;
 use xbox360_sys::image::XexHeaderKey;
 use xbox360_sys::processor;
 use xbox360_sys::processor::Kpcr;
-use xbox360_sys::processor::current_thread;
+use xbox360_sys::processor::WaitCounts;
+use xbox360_sys::processor::WaitStatistics;
+use xbox360_sys::processor::WaitStatisticsFlags;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::ExRegisterTitleTerminateNotification;
 use xbox360_sys::xboxkrnl::FscGetCacheElementCount;
@@ -50,9 +61,13 @@ use xbox360_sys::xboxkrnl::IoStatusBlock;
 use xbox360_sys::xboxkrnl::Irql;
 use xbox360_sys::xboxkrnl::KeResumeThread;
 use xbox360_sys::xboxkrnl::LdrDataTableEntry;
+use xbox360_sys::xboxkrnl::NotificationRegistration;
 use xbox360_sys::xboxkrnl::PoolTag;
 use xbox360_sys::xboxkrnl::PoolType;
+use xbox360_sys::xboxkrnl::ProcessType;
 use xbox360_sys::xboxkrnl::ProcessorMode;
+use xbox360_sys::xboxkrnl::RtlCriticalSection;
+use xbox360_sys::xboxkrnl::RtlCriticalSectionFields;
 use xbox360_sys::xboxkrnl::RtlImageXexHeaderField;
 use xbox360_sys::xboxkrnl::ThreadCreationFlags;
 use xbox360_sys::xboxkrnl::WaitReason;
@@ -60,6 +75,7 @@ use xbox360_sys::xboxkrnl::XexExecutableModuleHandle;
 
 use super::Console;
 use super::dispatcher;
+use super::dispatcher::ControlCode;
 use crate::net::XamNetwork;
 
 mod file_events;
@@ -88,30 +104,13 @@ use xbox360::time::TickCount;
 use xbox360::time::Timebase;
 use xbox360::time::sleep;
 
+use crate::kernel;
 use crate::kernel::CriticalSection;
 
-/// Pool tag of the debug capture ring.
-const DEBUG_CAPTURE_TAG: PoolTag = PoolTag::new(*b"mdbX");
 /// Pool type the monitor allocates the ring from.
 const DEBUG_CAPTURE_POOL: PoolType = PoolType::System;
-/// Pseudo handle of the calling thread.
-const CURRENT_THREAD: u32 = 0xffff_fffe;
 /// File system cache the pipe engine resizes.
 const PIPE_CACHE: u32 = 2;
-/// `ExCreateThread` flags: create suspended, return the thread object.
-const THREAD_SUSPENDED: u32 = 0x1;
-const THREAD_OBJECT: u32 = 0x80;
-/// Create the thread in the system process [INFERENCE: stock sets it for
-/// `rpc system` and for a log started outside the title process].
-const THREAD_SYSTEM_PROCESS: u32 = 0x2;
-const STATUS_SUCCESS: u32 = 0;
-/// `KeGetCurrentProcessType` of the title process.
-const TITLE_PROCESS: u32 = 1;
-
-/// Thread fields.
-const THREAD_ID: u32 = 0x14c;
-const THREAD_PROCESSOR: u32 = 0xbf;
-const THREAD_LAST_ERROR: u32 = 0x160;
 
 /// Platform state of this domain owned by the server thread.
 pub struct Data {
@@ -133,74 +132,44 @@ fn passive() -> bool {
     processor::current_irql() == Irql::PASSIVE
 }
 
-fn read_u32(address: u32) -> u32 {
-    // SAFETY: callers pass addresses of kernel or caller structures.
-    unsafe { core::ptr::read_volatile(address as usize as *const u32) }
+/// `bytes` up to their first NUL.
+fn until_nul(bytes: &[u8]) -> &[u8] {
+    let length = bytes
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(bytes.len());
+    &bytes[..length]
 }
 
-fn read_u8(address: u32) -> u8 {
-    // SAFETY: callers pass addresses of kernel or caller structures.
-    unsafe { core::ptr::read_volatile(address as usize as *const u8) }
-}
+/// Priority 0x78 in the high byte, as stock's registration (0x91f97434).
+const TITLE_TERMINATE_PRIORITY: u32 = 0x7800_0000;
 
-fn read_u64(address: u32) -> u64 {
-    // SAFETY: callers pass addresses of kernel or caller structures.
-    unsafe { core::ptr::read_unaligned(address as usize as *const u64) }
-}
-
-fn write_u32(address: u32, value: u32) {
-    // SAFETY: callers pass addresses of structures they own.
-    unsafe { core::ptr::write_volatile(address as usize as *mut u32, value) }
-}
-
-fn write_u64(address: u32, value: u64) {
-    // SAFETY: callers pass addresses of structures they own.
-    unsafe { core::ptr::write_unaligned(address as usize as *mut u64, value) }
-}
-
-/// Bytes of a NUL-terminated string, read for at most `limit` bytes.
-fn c_string<'a>(address: u32, limit: usize) -> &'a [u8] {
-    let mut length = 0;
-    while length < limit && read_u8(address + length as u32) != 0 {
-        length += 1;
-    }
-    // SAFETY: the bytes were just read.
-    unsafe { core::slice::from_raw_parts(address as usize as *const u8, length) }
-}
-
-/// Title-terminate notification registration: routine, priority, links.
-struct Registration(UnsafeCell<[u32; 4]>);
-
-// SAFETY: written once by `initialize` before the kernel reads it.
-unsafe impl Sync for Registration {}
-
-static TITLE_TERMINATE: Registration = Registration(UnsafeCell::new([0; 4]));
+static TITLE_TERMINATE: NotificationRegistration = NotificationRegistration::new();
 
 /// Prepare the shared state; called once at module start, before the
 /// control dispatcher is published.
 pub(crate) fn initialize() {
     RPC_QUEUE_LOCK.initialize();
     processors::initialize();
-    // Priority byte 0x78 as stock's registration (0x91f97434).
-    // SAFETY: the registration is written once, before the kernel uses it.
+    // SAFETY: the record is not registered yet. The routine stays loaded
+    // until `uninstall` removes the record.
     unsafe {
-        *TITLE_TERMINATE.0.get() = [
+        TITLE_TERMINATE.routine.store(
             title_terminated_entry as *const () as usize as u32,
-            0x7800_0000,
-            0,
-            0,
-        ]
-    };
-    // SAFETY: TITLE_TERMINATE is static and holds the registration record.
-    unsafe { ExRegisterTitleTerminateNotification(TITLE_TERMINATE.0.get().cast(), true) };
+            Ordering::Relaxed,
+        );
+        TITLE_TERMINATE
+            .priority
+            .store(TITLE_TERMINATE_PRIORITY, Ordering::Relaxed);
+        ExRegisterTitleTerminateNotification(TITLE_TERMINATE.as_ptr(), true);
+    }
 }
 
 /// Undo the registration of [`initialize`] before the image unloads.
 pub(crate) fn uninstall() {
-    // SAFETY: written once by `initialize`; nonzero once registered.
-    if unsafe { (*TITLE_TERMINATE.0.get())[0] } != 0 {
+    if TITLE_TERMINATE.routine.load(Ordering::Relaxed) != 0 {
         // SAFETY: the static record registered by `initialize`.
-        unsafe { ExRegisterTitleTerminateNotification(TITLE_TERMINATE.0.get().cast(), false) };
+        unsafe { ExRegisterTitleTerminateNotification(TITLE_TERMINATE.as_ptr(), false) };
     }
 }
 
@@ -240,7 +209,8 @@ pub(crate) fn take_title_terminated() -> bool {
     TITLE_TERMINATED.swap(false, Ordering::AcqRel)
 }
 
-/// Title identifier of the running executable (stock 0x91f335c0).
+/// Title identifier of the running executable (stock 0x91f335c0); 0 when
+/// none runs or its header has no execution information.
 fn current_title_id() -> u32 {
     // SAFETY: `data_imports_resolved` held at module load.
     let module = unsafe { XexExecutableModuleHandle.get_unchecked() }.load(Ordering::Relaxed);
@@ -252,9 +222,14 @@ fn current_title_id() -> u32 {
     let entry =
         unsafe { &*core::ptr::with_exposed_provenance::<LdrDataTableEntry>(module as usize) };
     // SAFETY: the loader entry holds the address of its XEX header.
-    match unsafe { RtlImageXexHeaderField(entry.xex_header_base, XexHeaderKey::EXECUTION_INFO) } {
-        0 => 0,
-        field => read_u32(field + 0xc),
+    let field =
+        unsafe { RtlImageXexHeaderField(entry.xex_header_base, XexHeaderKey::EXECUTION_INFO) };
+    // SAFETY: the field is 0 or the address of the execution information in
+    // the loaded header, which stays mapped while the title runs.
+    match unsafe { core::ptr::with_exposed_provenance::<XexExecutionInfo>(field as usize).as_ref() }
+    {
+        None => 0,
+        Some(info) => info.title_id,
     }
 }
 
@@ -264,7 +239,7 @@ impl commands::session::Backend for Console {
         match unsafe {
             xboxkrnl::ExAllocatePoolTypeWithTag(
                 DEBUG_CAPTURE_SIZE as u32,
-                DEBUG_CAPTURE_TAG,
+                crate::kernel::pool_tag::BUFFER,
                 DEBUG_CAPTURE_POOL,
             )
         } {
@@ -302,15 +277,10 @@ impl commands::session::Backend for Console {
                 as u32;
         // SAFETY: `thread` is a local word; the pseudo handle names the
         // calling thread.
-        if (unsafe {
-            xboxkrnl::ObReferenceObjectByHandle(
-                Handle::from_raw(CURRENT_THREAD),
-                object_type,
-                &mut thread,
-            )
+        if unsafe {
+            xboxkrnl::ObReferenceObjectByHandle(Handle::CURRENT_THREAD, object_type, &mut thread)
         }
-        .0 as i32)
-            >= 0
+        .is_success()
         {
             let mut previous = 0u32;
             // SAFETY: `thread` is the referenced object of the calling
@@ -371,7 +341,7 @@ pub(crate) fn post_notification(text: &[u8]) -> bool {
         return true;
     }
     let worker = TELL_LOG.worker.load(Ordering::Acquire);
-    if worker != 0 && worker == read_u32(current_thread() + THREAD_ID) {
+    if worker != 0 && worker == current_object().id().raw() {
         return false;
     }
     let mut request = WaitingText {
@@ -409,83 +379,284 @@ fn send_waiting_text(
 
 /// Monitor control code 0xa9 (stock case 0x91f3bb08): export 36 with the
 /// caller's text; the result is dropped.
-pub(crate) fn service_send_notification(text: u32) -> u32 {
+///
+/// # Safety
+///
+/// `text` must be 0 or a NUL-terminated string the caller keeps unchanged
+/// for the call.
+pub(crate) unsafe fn service_send_notification(text: u32) -> u32 {
     send_notification(text);
     0
 }
 
-/// Call block (stock 0x91f3e7c8, pool tag `drpc`): +0x00 queue link,
-/// +0x04 abort flag, +0x08 system flag, +0x0c thread object, +0x10 buffer
-/// size, +0x18 marker quadword, +0x20 thread name, +0x60 done flag, +0x64
-/// release state, +0x68 the call buffer.
+/// Pool tag of call blocks.
 const CALL_TAG: PoolTag = PoolTag::new(*b"drpc");
-const CALL_LINK: u32 = 0x00;
-const CALL_ABORT: u32 = 0x04;
-const CALL_SYSTEM: u32 = 0x08;
-const CALL_THREAD: u32 = 0x0c;
-const CALL_SIZE: u32 = 0x10;
-const CALL_MARKER: u32 = 0x18;
-const CALL_NAME: u32 = 0x20;
 const CALL_NAME_CAPACITY: usize = 0x40;
-const CALL_DONE: u32 = 0x60;
-const CALL_RELEASE: u32 = 0x64;
-const CALL_BUFFER: u32 = 0x68;
-/// Release states: the runner finished, or the stream released the block.
-const RUNNER_FINISHED: u32 = 1;
-const STREAM_RELEASED: u32 = 2;
-/// Call buffer fields.
-const BUFFER_RESULT: u32 = 0x00;
-const BUFFER_RETURN: u32 = 0x08;
-const BUFFER_LAST_ERROR: u32 = 0x10;
-const BUFFER_FLAGS: u32 = 0x18;
-const BUFFER_INTEGERS: u32 = 0x20;
-const BUFFER_DOUBLES: u32 = 0x28;
-const BUFFER_MODULE: u32 = 0x30;
-const BUFFER_TARGET: u32 = 0x38;
-const BUFFER_ARGUMENTS: u32 = 0x40;
-const MODULE_NOT_FOUND: u64 = 0xffff_ffff_8007_007e;
-const PROCEDURE_NOT_FOUND: u64 = 0xffff_ffff_8007_007f;
 /// Register slots: eight integers, then eight doubles.
 const ARGUMENT_SLOTS: usize = 16;
-/// Relative wait of the stream for an own-thread call: 100 ms.
-const CALL_WAIT: i64 = -1_000_000;
+/// How long the stream waits for a call: 100 ms.
 const CALL_WAIT_MS: u32 = 100;
+const CALL_WAIT: i64 = relative_interval(Duration::from_millis(CALL_WAIT_MS as u64));
 const CALL_POLL_MS: u32 = 10;
+
+/// A quadword the stream and the runner share, accessed as two words, as
+/// the monitor's 32-bit code does.
+#[repr(C)]
+struct Quad([AtomicU32; 2]);
+
+impl Quad {
+    #[inline(always)]
+    fn get(&self) -> u64 {
+        (u64::from(self.0[0].load(Ordering::Relaxed)) << 32)
+            | u64::from(self.0[1].load(Ordering::Relaxed))
+    }
+
+    /// The low word alone, with one load.
+    #[inline(always)]
+    fn low(&self) -> u32 {
+        self.0[1].load(Ordering::Relaxed)
+    }
+
+    #[inline(always)]
+    fn set(&self, value: u64) {
+        self.0[0].store((value >> 32) as u32, Ordering::Relaxed);
+        self.0[1].store(value as u32, Ordering::Relaxed);
+    }
+}
+
+/// Owner of a call block that released it last: the stream that created
+/// it or the runner that makes the call.
+#[repr(u32)]
+#[derive(Clone, Copy)]
+enum ReleaseState {
+    Held = 0,
+    RunnerFinished = 1,
+    StreamReleased = 2,
+}
+
+/// Word of a [`ReleaseState`].
+#[repr(transparent)]
+struct ReleaseWord(AtomicU32);
+
+impl ReleaseWord {
+    /// Store `state`; whether the word held `previous` before.
+    #[inline(always)]
+    fn swap_from(&self, state: ReleaseState, previous: ReleaseState) -> bool {
+        self.0.swap(state as u32, Ordering::AcqRel) == previous as u32
+    }
+}
+
+/// Call block (stock 0x91f3e7c8), followed by the call buffer of the size
+/// the client gives.
+#[repr(C)]
+struct CallBlock {
+    /// Next queued call, under [`RPC_QUEUE_LOCK`]; 0 ends the queue.
+    link: AtomicU32,
+    /// Nonzero once the stream abandoned an own-thread call before it ran.
+    abort: AtomicU32,
+    /// Nonzero for a call in the system process.
+    system: AtomicU32,
+    /// Referenced, suspended thread object of an own-thread call; 0 for a
+    /// call queued for a named thread.
+    thread: AtomicU32,
+    /// Size of the call buffer.
+    size: AtomicU32,
+    _reserved_14: AtomicU32,
+    /// `ERROR_IO_PENDING` from the creation on; nothing reads it.
+    marker: Quad,
+    /// Name of the thread that runs a queued call, NUL-terminated.
+    name: [u8; CALL_NAME_CAPACITY],
+    /// Nonzero once the call finished.
+    done: AtomicU32,
+    release: ReleaseWord,
+}
+
+const _: () = {
+    use core::mem::offset_of;
+    assert!(offset_of!(CallBlock, abort) == 0x4);
+    assert!(offset_of!(CallBlock, system) == 0x8);
+    assert!(offset_of!(CallBlock, thread) == 0xc);
+    assert!(offset_of!(CallBlock, size) == 0x10);
+    assert!(offset_of!(CallBlock, marker) == 0x18);
+    assert!(offset_of!(CallBlock, name) == 0x20);
+    assert!(offset_of!(CallBlock, done) == 0x60);
+    assert!(offset_of!(CallBlock, release) == 0x64);
+    assert!(core::mem::size_of::<CallBlock>() == 0x68);
+};
+
+impl CallBlock {
+    #[inline(always)]
+    fn thread_object(&self) -> Option<NonZeroU32> {
+        NonZeroU32::new(self.thread.load(Ordering::Relaxed))
+    }
+}
+
+xbox360_sys::flags! {
+    /// Flags quadword of a call buffer.
+    pub struct CallFlags(u64) {
+        /// The return value is the double in f1.
+        DOUBLE_RESULT = 0x1,
+    }
+}
+
+/// Header of a call buffer, followed by the integer arguments, then the
+/// doubles. The client fills it before the call; the runner stores the
+/// results.
+#[repr(C)]
+struct CallBuffer {
+    /// HRESULT, sign-extended.
+    result: Quad,
+    value: Quad,
+    /// [`CallBuffer::LAST_ERROR_REQUESTED`] asks for the last error.
+    last_error: Quad,
+    flags: Quad,
+    integer_count: Quad,
+    double_count: Quad,
+    /// Address of the module name, or 0 for a target address.
+    module: Quad,
+    /// Function address, or the export ordinal or name address in `module`.
+    target: Quad,
+}
+
+const _: () = {
+    use core::mem::offset_of;
+    assert!(offset_of!(CallBuffer, value) == 0x8);
+    assert!(offset_of!(CallBuffer, last_error) == 0x10);
+    assert!(offset_of!(CallBuffer, flags) == 0x18);
+    assert!(offset_of!(CallBuffer, integer_count) == 0x20);
+    assert!(offset_of!(CallBuffer, double_count) == 0x28);
+    assert!(offset_of!(CallBuffer, module) == 0x30);
+    assert!(offset_of!(CallBuffer, target) == 0x38);
+    assert!(core::mem::size_of::<CallBuffer>() == 0x40);
+};
+
+impl CallBuffer {
+    const LAST_ERROR_REQUESTED: u64 = 1;
+}
+
+/// Why a call did not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallError {
+    ModuleNotFound,
+    ProcedureNotFound,
+}
+
+impl From<CallError> for Hresult {
+    fn from(error: CallError) -> Self {
+        Hresult::from_win32(match error {
+            CallError::ModuleNotFound => Win32Error::MOD_NOT_FOUND,
+            CallError::ProcedureNotFound => Win32Error::PROC_NOT_FOUND,
+        })
+    }
+}
+
+impl core::fmt::Display for CallError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::ModuleNotFound => "module not found",
+            Self::ProcedureNotFound => "procedure not found",
+        })
+    }
+}
+
+impl core::error::Error for CallError {}
+
+/// The result quadword of a call buffer: the HRESULT sign-extended.
+const fn result_quad(result: Hresult) -> u64 {
+    result.0 as i32 as i64 as u64
+}
+
+/// A call block allocated by [`RpcBackend::rpc_create`], possibly freed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CallPointer(NonNull<CallBlock>);
+
+impl CallPointer {
+    /// `None` for 0.
+    ///
+    /// # Safety
+    ///
+    /// `address` must be 0 or the address of a call block.
+    #[inline(always)]
+    unsafe fn new(address: u32) -> Option<Self> {
+        NonNull::new(core::ptr::with_exposed_provenance_mut(address as usize)).map(Self)
+    }
+
+    /// # Safety
+    ///
+    /// `address` must be the address of a call block.
+    #[inline(always)]
+    unsafe fn from_address(address: u32) -> Self {
+        // SAFETY: the address of a call block is not 0.
+        Self(unsafe {
+            NonNull::new_unchecked(core::ptr::with_exposed_provenance_mut(address as usize))
+        })
+    }
+
+    #[inline(always)]
+    fn address(self) -> u32 {
+        self.0.as_ptr().expose_provenance() as u32
+    }
+
+    /// # Safety
+    ///
+    /// The block must stay allocated while the reference is used: the
+    /// caller is the stream before `rpc_release`, the runner before
+    /// [`release_runner`], or holds [`RPC_QUEUE_LOCK`] while the block is
+    /// queued.
+    #[inline(always)]
+    unsafe fn block<'a>(self) -> &'a CallBlock {
+        // SAFETY: the caller guarantees the block for `'a`.
+        unsafe { self.0.as_ref() }
+    }
+
+    /// The call buffer after the block.
+    #[inline(always)]
+    fn buffer(self) -> *mut CallBuffer {
+        self.0.as_ptr().wrapping_add(1).cast()
+    }
+
+    /// # Safety
+    ///
+    /// The caller is the last owner of the block and does not use it after.
+    #[inline(always)]
+    unsafe fn free(self) {
+        // SAFETY: the caller releases the last use of the pool block.
+        unsafe { xboxkrnl::ExFreePool(self.address()) };
+    }
+}
 
 /// Head of the named-call queue (stock 0x91f9fda8), newest first.
 static RPC_QUEUE: AtomicU32 = AtomicU32::new(0);
 /// Lock of the named-call queue (stock 0x91f9766c).
 static RPC_QUEUE_LOCK: CriticalSection = CriticalSection::new();
 
-fn call_atomic(block: u32, offset: u32) -> &'static AtomicU32 {
-    // SAFETY: the field is an aligned word of a live call block.
-    unsafe { &*((block + offset) as usize as *const AtomicU32) }
-}
-
-fn push_call(block: u32) {
+fn push_call(call: CallPointer) {
     RPC_QUEUE_LOCK.enter();
-    write_u32(block + CALL_LINK, RPC_QUEUE.load(Ordering::Relaxed));
-    RPC_QUEUE.store(block, Ordering::Relaxed);
+    // SAFETY: the stream owns the block until it releases it.
+    unsafe { call.block() }
+        .link
+        .store(RPC_QUEUE.load(Ordering::Relaxed), Ordering::Relaxed);
+    RPC_QUEUE.store(call.address(), Ordering::Relaxed);
     RPC_QUEUE_LOCK.leave();
 }
 
-/// Remove `block` from the queue; returns whether it was queued.
-fn unlink_call(block: u32) -> bool {
+/// Remove `call` from the queue; returns whether it was queued.
+fn unlink_call(call: CallPointer) -> bool {
     RPC_QUEUE_LOCK.enter();
     // The word that links the current call: the head, then a call's link.
     let mut link = &RPC_QUEUE;
     let mut found = false;
-    loop {
-        let current = link.load(Ordering::Relaxed);
-        if current == 0 {
-            break;
-        }
-        if current == block {
-            link.store(read_u32(current + CALL_LINK), Ordering::Relaxed);
+    // SAFETY: the queue links call blocks, which stay allocated while they
+    // are queued and the lock is held.
+    while let Some(current) = unsafe { CallPointer::new(link.load(Ordering::Relaxed)) } {
+        // SAFETY: as above.
+        let block = unsafe { current.block() };
+        if current == call {
+            link.store(block.link.load(Ordering::Relaxed), Ordering::Relaxed);
             found = true;
             break;
         }
-        link = call_atomic(current, CALL_LINK);
+        link = &block.link;
     }
     RPC_QUEUE_LOCK.leave();
     found
@@ -493,24 +664,24 @@ fn unlink_call(block: u32) -> bool {
 
 /// Take the newest call queued for `name` (stock 0x91f3e208). A busy lock
 /// reads as an empty queue.
-fn take_call(name: &[u8]) -> Option<u32> {
+fn take_call(name: &[u8]) -> Option<CallPointer> {
     if !RPC_QUEUE_LOCK.try_enter() {
         return None;
     }
     let mut link = &RPC_QUEUE;
     let mut taken = None;
-    loop {
-        let current = link.load(Ordering::Relaxed);
-        if current == 0 {
-            break;
-        }
-        if c_string(current + CALL_NAME, CALL_NAME_CAPACITY) == name {
-            link.store(read_u32(current + CALL_LINK), Ordering::Relaxed);
-            write_u32(current + CALL_LINK, 0);
+    // SAFETY: the queue links call blocks, which stay allocated while they
+    // are queued and the lock is held.
+    while let Some(current) = unsafe { CallPointer::new(link.load(Ordering::Relaxed)) } {
+        // SAFETY: as above.
+        let block = unsafe { current.block() };
+        if until_nul(&block.name) == name {
+            link.store(block.link.load(Ordering::Relaxed), Ordering::Relaxed);
+            block.link.store(0, Ordering::Relaxed);
             taken = Some(current);
             break;
         }
-        link = call_atomic(current, CALL_LINK);
+        link = &block.link;
     }
     RPC_QUEUE_LOCK.leave();
     taken
@@ -518,46 +689,65 @@ fn take_call(name: &[u8]) -> Option<u32> {
 
 /// Monitor control code 0xa8 (export 372, stock 0x91f3ea50): run every
 /// call queued for the calling thread's name, newest first.
-pub(crate) fn service_rpc_drain(name: u32) -> u32 {
-    if name == 0 {
+///
+/// # Safety
+///
+/// `name` must be 0 or the NUL-terminated name of the calling thread,
+/// unchanged for the call.
+pub(crate) unsafe fn service_rpc_drain(name: u32) -> u32 {
+    // SAFETY: the caller's contract.
+    let Some(name) = (unsafe { kernel::c_string(name) }) else {
         return 0;
-    }
-    let name = c_string(name, usize::MAX);
-    while let Some(block) = take_call(name) {
-        run_call(block);
+    };
+    while let Some(call) = take_call(name) {
+        // SAFETY: the taken call is unlinked, so this thread is its runner.
+        unsafe { run_call(call) };
     }
     0
 }
 
 /// Own-thread call start routine.
-extern "C" fn call_thread(block: u32) -> u32 {
-    if call_atomic(block, CALL_ABORT).load(Ordering::Acquire) != 0 {
+extern "C" fn call_thread(context: u32) -> u32 {
+    // SAFETY: `rpc_create` starts the thread with its call block as the
+    // context; the thread is the block's runner.
+    let call = unsafe { CallPointer::from_address(context) };
+    // SAFETY: the runner's block stays allocated until it releases it.
+    if unsafe { call.block() }.abort.load(Ordering::Acquire) != 0 {
         // SAFETY: an aborted block is owned by this thread and freed once.
-        unsafe { xboxkrnl::ExFreePool(block) };
+        unsafe { call.free() };
     } else {
-        run_call(block);
+        // SAFETY: this thread is the runner of the block.
+        unsafe { run_call(call) };
     }
     // SAFETY: this thread was created for the call and holds no resources.
     unsafe { xboxkrnl::ExTerminateThread(0) }
 }
 
 /// Make the call described by the block's buffer (stock 0x91f3e630).
-fn run_call(block: u32) {
-    let buffer = block + CALL_BUFFER;
-    let mut target = read_u64(buffer + BUFFER_TARGET) as u32;
-    let module = read_u64(buffer + BUFFER_MODULE);
+///
+/// # Safety
+///
+/// The caller must be the runner of `call`, which owns the block until
+/// [`release_runner`].
+unsafe fn run_call(call: CallPointer) {
+    // SAFETY: the runner's block stays allocated until it releases it.
+    let block = unsafe { call.block() };
+    // SAFETY: the client sizes the buffer for the header and the arguments
+    // it gives; as in stock, nothing checks the size.
+    let buffer = unsafe { &*call.buffer() };
+    let mut target = buffer.target.low();
+    let module = buffer.module.get();
     let failure = if module != 0 {
         let mut handle = 0u32;
         // SAFETY: the client supplied the module name address; `handle` and
         // `target` are live locals.
         unsafe {
-            if (xboxkrnl::XexGetModuleHandle(module as u32 as usize as *const u8, &mut handle).0
-                as i32)
-                < 0
+            if !xboxkrnl::XexGetModuleHandle(module as u32 as usize as *const u8, &mut handle)
+                .is_success()
             {
-                Some(MODULE_NOT_FOUND)
-            } else if (xboxkrnl::XexGetProcedureAddress(handle, target, &mut target).0 as i32) < 0 {
-                Some(PROCEDURE_NOT_FOUND)
+                Some(CallError::ModuleNotFound)
+            } else if !xboxkrnl::XexGetProcedureAddress(handle, target, &mut target).is_success() {
+                Some(CallError::ProcedureNotFound)
             } else {
                 None
             }
@@ -567,58 +757,70 @@ fn run_call(block: u32) {
     };
     if let Some(failure) = failure {
         // Failures store the result before the done flag.
-        write_u64(buffer + BUFFER_RESULT, failure);
-        call_atomic(block, CALL_DONE).store(1, Ordering::Release);
-        release_runner(block);
+        buffer.result.set(result_quad(Hresult::from(failure)));
+        block.done.store(1, Ordering::Release);
+        // SAFETY: this thread is the runner and does not use the block after.
+        unsafe { release_runner(call) };
         return;
     }
     // The monitor copies the integers to slot 0 and the doubles to slot 8
     // of two adjacent eight-slot arrays without bounds; the copies are
     // limited to the arrays here.
     let mut slots = [0u64; ARGUMENT_SLOTS];
-    let integers = (read_u64(buffer + BUFFER_INTEGERS) as u32 as usize).min(ARGUMENT_SLOTS);
-    let doubles = (read_u64(buffer + BUFFER_DOUBLES) as u32 as usize).min(ARGUMENT_SLOTS / 2);
-    for (index, slot) in slots.iter_mut().take(integers).enumerate() {
-        *slot = read_u64(buffer + BUFFER_ARGUMENTS + 8 * index as u32);
+    let integers = (buffer.integer_count.low() as usize).min(ARGUMENT_SLOTS);
+    let doubles = (buffer.double_count.low() as usize).min(ARGUMENT_SLOTS / 2);
+    let first = call.buffer().wrapping_add(1).cast::<Quad>();
+    // SAFETY: the arguments follow the header, integers first; the client
+    // sizes the buffer for them as for the header.
+    let (integer_arguments, double_arguments) = unsafe {
+        (
+            core::slice::from_raw_parts(first, integers),
+            core::slice::from_raw_parts(first.add(integers), doubles),
+        )
+    };
+    for (slot, argument) in slots.iter_mut().zip(integer_arguments) {
+        *slot = argument.get();
     }
-    let double_base = buffer + BUFFER_ARGUMENTS + 8 * integers as u32;
-    for index in 0..doubles {
-        slots[ARGUMENT_SLOTS / 2 + index] = read_u64(double_base + 8 * index as u32);
+    for (slot, argument) in slots[ARGUMENT_SLOTS / 2..].iter_mut().zip(double_arguments) {
+        *slot = argument.get();
     }
     let mut registers = [0u64; 2];
     // SAFETY: the client supplied the target and its arguments; the call is
     // the purpose of the command.
     unsafe { invoke(target, slots.as_ptr(), registers.as_mut_ptr()) };
-    let value = if read_u64(buffer + BUFFER_FLAGS) & 1 != 0 {
+    // The defined flag lies in the low word.
+    let flags = CallFlags::from_bits_retain(u64::from(buffer.flags.low()));
+    let value = if flags.contains(CallFlags::DOUBLE_RESULT) {
         registers[1]
     } else {
         registers[0]
     };
-    write_u64(buffer + BUFFER_RETURN, value);
-    if read_u64(buffer + BUFFER_LAST_ERROR) == 1 {
-        write_u64(buffer + BUFFER_LAST_ERROR, u64::from(last_error()));
+    buffer.value.set(value);
+    if buffer.last_error.get() == CallBuffer::LAST_ERROR_REQUESTED {
+        let code = Win32ErrorCode::from(xbox360::status::last_error());
+        buffer.last_error.set(u64::from(code.0));
     }
     // The done flag is set before the success result is stored.
-    call_atomic(block, CALL_DONE).store(1, Ordering::Release);
-    write_u64(buffer + BUFFER_RESULT, 0);
-    release_runner(block);
+    block.done.store(1, Ordering::Release);
+    buffer.result.set(result_quad(Hresult::SUCCESS));
+    // SAFETY: this thread is the runner and does not use the block after.
+    unsafe { release_runner(call) };
 }
 
 /// The runner is done with the block; free it when the stream already
 /// released it.
-fn release_runner(block: u32) {
-    if call_atomic(block, CALL_RELEASE).swap(RUNNER_FINISHED, Ordering::AcqRel) == STREAM_RELEASED {
+///
+/// # Safety
+///
+/// The caller must be the runner of `call` and must not use it after.
+unsafe fn release_runner(call: CallPointer) {
+    // SAFETY: the runner's block stays allocated until this release.
+    if unsafe { call.block() }
+        .release
+        .swap_from(ReleaseState::RunnerFinished, ReleaseState::StreamReleased)
+    {
         // SAFETY: both owners released the block; this is the last use.
-        unsafe { xboxkrnl::ExFreePool(block) };
-    }
-}
-
-/// `GetLastError` of the calling thread (stock 0x91f72ba0).
-fn last_error() -> u32 {
-    if Kpcr::current().prcb.dpc_active.load(Ordering::Relaxed) != 0 {
-        0
-    } else {
-        read_u32(current_thread() + THREAD_LAST_ERROR)
+        unsafe { call.free() };
     }
 }
 
@@ -665,6 +867,17 @@ unsafe extern "C" fn invoke(target: u32, slots: *const u64, registers: *mut u64)
     )
 }
 
+/// The call block of `call`.
+///
+/// # Safety
+///
+/// `call` must come from `rpc_create`.
+#[inline(always)]
+unsafe fn call_pointer(call: RpcCall) -> CallPointer {
+    // SAFETY: `rpc_create` returns the address of the call block.
+    unsafe { CallPointer::from_address(call.0) }
+}
+
 impl RpcBackend for Console {
     fn rpc_create(
         &mut self,
@@ -673,43 +886,58 @@ impl RpcBackend for Console {
         thread: RpcThread<'_>,
     ) -> Result<RpcCall, RpcCreateError> {
         // SAFETY: the allocation takes only a size and tag.
-        let block =
-            unsafe { xboxkrnl::ExAllocatePoolWithTag(size.wrapping_add(CALL_BUFFER), CALL_TAG) };
-        if block == 0 {
+        let address = unsafe {
+            xboxkrnl::ExAllocatePoolWithTag(
+                size.wrapping_add(core::mem::size_of::<CallBlock>() as u32),
+                CALL_TAG,
+            )
+        };
+        // SAFETY: the allocation is 0 or a new block sized for a call block
+        // and its buffer.
+        let Some(call) = (unsafe { CallPointer::new(address) }) else {
             return Err(RpcCreateError::OutOfMemory);
-        }
-        let system = context == RpcContext::System;
-        write_u32(block + CALL_LINK, 0);
-        write_u32(block + CALL_ABORT, 0);
-        write_u32(block + CALL_THREAD, 0);
-        write_u32(block + CALL_DONE, 0);
-        write_u32(block + CALL_RELEASE, 0);
-        write_u32(block + CALL_SYSTEM, u32::from(system));
-        write_u32(block + CALL_SIZE, size);
-        write_u64(block + CALL_MARKER, 0x3e5);
+        };
         let name = match thread {
             RpcThread::Named(name) => &name[..name.len().min(CALL_NAME_CAPACITY - 1)],
             RpcThread::Own { .. } => &[],
         };
-        // SAFETY: the name field holds CALL_NAME_CAPACITY bytes.
+        // SAFETY: the new block is not shared; its name field holds
+        // CALL_NAME_CAPACITY bytes.
         unsafe {
-            let field = (block + CALL_NAME) as usize as *mut u8;
+            let field = (&raw mut (*call.0.as_ptr()).name).cast::<u8>();
             core::ptr::copy_nonoverlapping(name.as_ptr(), field, name.len());
             field.add(name.len()).write(0);
         }
+        // SAFETY: the stream owns the new block.
+        let block = unsafe { call.block() };
+        let system = context == RpcContext::System;
+        block.link.store(0, Ordering::Relaxed);
+        block.abort.store(0, Ordering::Relaxed);
+        block.thread.store(0, Ordering::Relaxed);
+        block.done.store(0, Ordering::Relaxed);
+        block
+            .release
+            .0
+            .store(ReleaseState::Held as u32, Ordering::Relaxed);
+        block.system.store(u32::from(system), Ordering::Relaxed);
+        block.size.store(size, Ordering::Relaxed);
+        block.marker.set(u64::from(Win32Error::IO_PENDING.code()));
         if let RpcThread::Own { processor } = thread {
             // Only the low six bits of the processor reach the shift.
+            // Numbers 6 and 7 set bits above PROCESSOR5, which pass on
+            // unchanged as stock passes them.
             let processor = processor & 0x3f;
-            let affinity = if processor < 32 {
+            let affinity = ThreadCreationFlags::from_bits_retain(if processor < 32 {
                 (1u32 << processor) << 24
             } else {
                 0
-            };
-            let flags = if system { THREAD_SYSTEM_PROCESS } else { 0 }
-                | affinity
-                | THREAD_OBJECT
-                | THREAD_SUSPENDED;
-            let flags = ThreadCreationFlags::from_bits_retain(flags);
+            });
+            let mut flags = affinity
+                | ThreadCreationFlags::RETURN_THREAD_OBJECT
+                | ThreadCreationFlags::SUSPENDED;
+            if system {
+                flags |= ThreadCreationFlags::SYSTEM_PROCESS;
+            }
             let mut object = 0u32;
             // SAFETY: `object` is a local word; `call_thread` takes the block
             // as its context.
@@ -720,66 +948,79 @@ impl RpcBackend for Console {
                     core::ptr::null_mut(),
                     0,
                     call_thread as *const () as usize as u32,
-                    block,
+                    call.address(),
                     flags,
                 )
             };
             if let Err(error) = status.result() {
                 // SAFETY: the block was allocated above and no thread owns it.
-                unsafe { xboxkrnl::ExFreePool(block) };
+                unsafe { call.free() };
                 return Err(RpcCreateError::Thread(error));
             }
-            write_u32(block + CALL_THREAD, object);
+            block.thread.store(object, Ordering::Relaxed);
         }
-        Ok(RpcCall(block))
+        Ok(RpcCall(call.address()))
     }
 
     fn rpc_buffer_address(&mut self, call: RpcCall) -> u32 {
-        call.0 + CALL_BUFFER
+        call.0 + core::mem::size_of::<CallBlock>() as u32
     }
 
     fn rpc_write(&mut self, call: RpcCall, offset: u32, data: &[u8]) {
-        let destination = (call.0 + CALL_BUFFER + offset) as usize as *mut u8;
+        // SAFETY: `call` comes from `rpc_create`.
+        let call = unsafe { call_pointer(call) };
+        let destination = call.buffer().cast::<u8>().wrapping_add(offset as usize);
         // SAFETY: the upload never exceeds the buffer size it was sized for.
         unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), destination, data.len()) };
     }
 
     fn rpc_start(&mut self, call: RpcCall) {
-        match read_u32(call.0 + CALL_THREAD) {
-            0 => push_call(call.0),
-            thread => {
-                // SAFETY: CALL_THREAD holds the referenced, suspended thread object.
-                unsafe { KeResumeThread(thread as usize as *mut xboxkrnl::Kthread) };
+        // SAFETY: `call` comes from `rpc_create`.
+        let call = unsafe { call_pointer(call) };
+        // SAFETY: the stream owns the block until it releases it.
+        match unsafe { call.block() }.thread_object() {
+            None => push_call(call),
+            Some(thread) => {
+                // SAFETY: the block holds the referenced, suspended thread object.
+                unsafe { KeResumeThread(thread.get() as usize as *mut xboxkrnl::Kthread) };
             }
         }
     }
 
     fn rpc_abort(&mut self, call: RpcCall) {
-        match read_u32(call.0 + CALL_THREAD) {
-            0 => {
-                unlink_call(call.0);
+        // SAFETY: `call` comes from `rpc_create`.
+        let call = unsafe { call_pointer(call) };
+        // SAFETY: the stream owns the block until it releases it.
+        let block = unsafe { call.block() };
+        match block.thread_object() {
+            None => {
+                unlink_call(call);
                 // SAFETY: the unlinked block has no runner.
-                unsafe { xboxkrnl::ExFreePool(call.0) };
+                unsafe { call.free() };
             }
-            thread => {
+            Some(thread) => {
                 // The thread sees the abort flag and frees the block.
-                call_atomic(call.0, CALL_ABORT).store(1, Ordering::Release);
-                // SAFETY: CALL_THREAD holds the referenced thread object;
-                // the reference is dropped once here.
+                block.abort.store(1, Ordering::Release);
+                // SAFETY: the block holds the referenced thread object; the
+                // reference is dropped once here.
                 unsafe {
-                    KeResumeThread(thread as usize as *mut xboxkrnl::Kthread);
-                    xboxkrnl::ObDereferenceObject(thread);
+                    KeResumeThread(thread.get() as usize as *mut xboxkrnl::Kthread);
+                    xboxkrnl::ObDereferenceObject(thread.get());
                 }
             }
         }
     }
 
     fn rpc_wait(&mut self, call: RpcCall) -> bool {
-        match read_u32(call.0 + CALL_THREAD) {
-            0 => {
+        // SAFETY: `call` comes from `rpc_create`.
+        let call = unsafe { call_pointer(call) };
+        // SAFETY: the stream owns the block until it releases it.
+        let block = unsafe { call.block() };
+        match block.thread_object() {
+            None => {
                 let start = TickCount::now().milliseconds();
                 loop {
-                    if call_atomic(call.0, CALL_DONE).load(Ordering::Acquire) != 0 {
+                    if block.done.load(Ordering::Acquire) != 0 {
                         return true;
                     }
                     if TickCount::now().milliseconds().wrapping_sub(start) >= CALL_WAIT_MS {
@@ -788,48 +1029,59 @@ impl RpcBackend for Console {
                     sleep(Duration::from_millis(u64::from(CALL_POLL_MS)));
                 }
             }
-            thread => {
+            Some(thread) => {
                 let timeout = CALL_WAIT;
-                // SAFETY: CALL_THREAD holds the referenced thread object;
+                // SAFETY: the block holds the referenced thread object;
                 // `timeout` is a live local.
-                unsafe {
+                let status = unsafe {
                     xboxkrnl::KeWaitForSingleObject(
-                        thread as usize as *mut xboxkrnl::DispatcherObject,
+                        thread.get() as usize as *mut xboxkrnl::DispatcherObject,
                         WaitReason::UserRequest,
                         ProcessorMode::Kernel,
                         false,
                         &timeout,
                     )
-                }
-                .0 == STATUS_SUCCESS
+                };
+                status == NtStatus::WAIT_0
             }
         }
     }
 
     fn rpc_read(&mut self, call: RpcCall, offset: u32, output: &mut [u8]) {
-        let source = (call.0 + CALL_BUFFER + offset) as usize as *const u8;
+        // SAFETY: `call` comes from `rpc_create`.
+        let call = unsafe { call_pointer(call) };
+        let source = call.buffer().cast::<u8>().wrapping_add(offset as usize);
         // SAFETY: reads stay within the buffer size.
         unsafe { core::ptr::copy_nonoverlapping(source, output.as_mut_ptr(), output.len()) };
     }
 
     fn rpc_release(&mut self, call: RpcCall) {
-        let thread = read_u32(call.0 + CALL_THREAD);
-        if thread != 0 {
-            // SAFETY: CALL_THREAD holds the reference ExCreateThread returned.
-            unsafe { xboxkrnl::ObDereferenceObject(thread) };
-        } else if unlink_call(call.0) {
-            // Still queued: no runner exists.
-            // SAFETY: the unlinked block has no runner.
-            unsafe { xboxkrnl::ExFreePool(call.0) };
-            return;
+        // SAFETY: `call` comes from `rpc_create`.
+        let call = unsafe { call_pointer(call) };
+        // SAFETY: the stream owns the block until it releases it here.
+        let block = unsafe { call.block() };
+        match block.thread_object() {
+            Some(thread) => {
+                // SAFETY: the block holds the reference ExCreateThread returned.
+                unsafe { xboxkrnl::ObDereferenceObject(thread.get()) };
+            }
+            None => {
+                if unlink_call(call) {
+                    // Still queued: no runner exists.
+                    // SAFETY: the unlinked block has no runner.
+                    unsafe { call.free() };
+                    return;
+                }
+            }
         }
         // The monitor frees the block at once; a runner still in the call
         // frees it when it finishes instead.
-        if call_atomic(call.0, CALL_RELEASE).swap(STREAM_RELEASED, Ordering::AcqRel)
-            == RUNNER_FINISHED
+        if block
+            .release
+            .swap_from(ReleaseState::StreamReleased, ReleaseState::RunnerFinished)
         {
             // SAFETY: the runner finished, so this is the last use.
-            unsafe { xboxkrnl::ExFreePool(call.0) };
+            unsafe { call.free() };
         }
     }
 }
@@ -862,9 +1114,6 @@ static TELL_LOG: TellLog = TellLog {
     producers: AtomicU32::new(0),
 };
 
-/// Writer results carry this bit on top of the write status.
-const TELL_LOG_STATUS_FLAG: u32 = 0x1000_0000;
-
 /// The writer's collection buffer; it outlives a log, as stock's static
 /// buffer does.
 struct WriterCell(UnsafeCell<TellLogWriter>);
@@ -875,14 +1124,19 @@ unsafe impl Sync for WriterCell {}
 static TELL_LOG_WRITER: WriterCell = WriterCell(UnsafeCell::new(TellLogWriter::new()));
 
 fn tell_log_engine() -> Option<Engine> {
-    // SAFETY: the cell holds 0 or the engine tell_log_start created;
-    // tell_log_stop clears it before any other use of a closed engine.
+    // SAFETY: the word holds 0 or the engine of the open log. Only
+    // `tell_log_stop` on the server thread destroys the engine, after
+    // `tell_log_close` set the closing flag: it waits until no producer is
+    // inside `service_tell_log_record`, closes the engine, and then clears
+    // the word. Producers test the flag before they load the word, so none
+    // uses the engine from that wait on; the other callers run on the
+    // server thread or only test whether a log is open.
     unsafe { Engine::new(TELL_LOG.engine.load(Ordering::SeqCst)) }
 }
 
 /// Engine callback of the log (stock 0x91f51938): collect the entry text
 /// and write the collection to the log file. The state is static, so the
-/// context is not read.
+/// context is not read. A success carries the NT status form.
 extern "C" fn tell_log_write(_context: u32, entry: u32, length: u32) -> Hresult {
     // SAFETY: only the worker of the open log calls the writer.
     let writer = unsafe { &mut *TELL_LOG_WRITER.0.get() };
@@ -893,7 +1147,7 @@ extern "C" fn tell_log_write(_context: u32, entry: u32, length: u32) -> Hresult 
     let closing = TELL_LOG.closing.load(Ordering::Acquire);
     let mut write = |bytes: &[u8]| write_log(file, bytes);
     match writer.process(entry, closing, &mut write) {
-        Ok(()) => Hresult(TELL_LOG_STATUS_FLAG),
+        Ok(()) => Hresult::from_nt(NtStatus::SUCCESS),
         Err(error) => Hresult::from(error),
     }
 }
@@ -935,11 +1189,7 @@ impl TellLogBackend for Console {
     ) -> Result<(), LogEngineError> {
         TELL_LOG.file.store(file.0, Ordering::Release);
         let context = &TELL_LOG as *const TellLog as usize as u32;
-        match log_engine::create_for_callback(
-            context,
-            tell_log_write,
-            config,
-        ) {
+        match log_engine::create_for_callback(context, tell_log_write, config) {
             Ok(engine) => {
                 TELL_LOG
                     .entry_size
@@ -973,7 +1223,8 @@ impl TellLogBackend for Console {
             sleep(Duration::from_millis(1));
         }
         // SAFETY: producers have left and the closing flag keeps new ones
-        // out; the engine cell is cleared next.
+        // away from the engine word until it is cleared below, after the
+        // close; nothing else uses the engine off the server thread.
         unsafe { log_engine::close_after_worker(engine) };
         TELL_LOG.engine.store(0, Ordering::SeqCst);
         TELL_LOG.worker.store(0, Ordering::Release);
@@ -983,24 +1234,58 @@ impl TellLogBackend for Console {
     }
 }
 
-/// Monitor control code 0x88 (stock 0x91f51d58): write a record `{u16
-/// length, u16, u32 text}` to the open log through export 363.
-pub(crate) fn service_tell_log_record(argument: u32) -> u32 {
+/// Producer record of monitor control code 0x88. The length is the high
+/// half of the first word, read with one word load as stock reads it; the
+/// load is atomic so that it is not narrowed to a halfword load.
+#[repr(C)]
+struct TellLogRecord {
+    /// Text length in bits 16 to 31; bits 0 to 15 are unused.
+    length_word: AtomicU32,
+    /// Address of the text.
+    text: u32,
+}
+
+impl TellLogRecord {
+    const LENGTH_SHIFT: u32 = 16;
+
+    #[inline(always)]
+    fn new(length: u16, text: u32) -> Self {
+        Self {
+            length_word: AtomicU32::new(u32::from(length) << Self::LENGTH_SHIFT),
+            text,
+        }
+    }
+
+    #[inline(always)]
+    fn length(&self) -> u32 {
+        self.length_word.load(Ordering::Relaxed) >> Self::LENGTH_SHIFT
+    }
+}
+
+/// Monitor control code 0x88 (stock 0x91f51d58): write a record to the
+/// open log through export 363.
+///
+/// # Safety
+///
+/// `argument` must be 0 or the address of a [`TellLogRecord`] whose text
+/// holds its length in readable bytes, both unchanged for the call.
+pub(crate) unsafe fn service_tell_log_record(argument: u32) -> u32 {
     TELL_LOG.producers.fetch_add(1, Ordering::SeqCst);
     // The closing flag is read first: a stop clears the engine before the
     // flag.
     if !TELL_LOG.closing.load(Ordering::SeqCst)
         && let Some(engine) = tell_log_engine()
-        && argument != 0
+        // SAFETY: the caller's contract.
+        && let Some(record) =
+            unsafe { core::ptr::with_exposed_provenance::<TellLogRecord>(argument as usize).as_ref() }
     {
-        let length = read_u32(argument) >> 16;
-        let text = read_u32(argument + 4);
+        let length = record.length();
+        let text = record.text;
         if length != 0 && text != 0 {
-            // SAFETY: control code 0x88 contract: the record's text holds
-            // `length` bytes.
-            let record =
+            // SAFETY: the record's text holds `length` bytes.
+            let text =
                 unsafe { core::slice::from_raw_parts(text as usize as *const u8, length as usize) };
-            log_engine::write(engine, record);
+            log_engine::write(engine, text);
         }
     }
     TELL_LOG.producers.fetch_sub(1, Ordering::SeqCst);
@@ -1017,39 +1302,98 @@ pub(crate) fn service_tell_log_area(_argument: u32) -> u32 {
     tell_log_engine().map_or(0, |_| TELL_LOG.area.load(Ordering::Acquire))
 }
 
+/// The section of control codes 0x81 and 0x82.
+///
+/// # Safety
+///
+/// `section` must be 0 or the address of an initialized critical section
+/// that stays initialized while the calling thread waits for it.
+#[inline(always)]
+unsafe fn waited_section<'a>(section: u32) -> Option<&'a RtlCriticalSectionFields> {
+    // SAFETY: the caller guarantees the section.
+    unsafe { core::ptr::with_exposed_provenance::<RtlCriticalSection>(section as usize).as_ref() }
+        .map(RtlCriticalSection::fields)
+}
+
 /// Monitor control code 0x81 (stock 0x91f2b798): a thread starts waiting
 /// for critical section `section`. `entry_stack` is the caller's stack
 /// pointer at the dispatcher.
-pub(crate) fn service_cs_trace_wait_begin(section: u32, entry_stack: u32) -> u32 {
-    count_wait(0x18, 0x20);
-    trace_wait(WaitTrace::Enter, section, entry_stack);
+///
+/// # Safety
+///
+/// `section` must be 0 or the address of an initialized critical section
+/// the calling thread waits for, whose owner stays allocated for the call
+/// (see [`trace_wait`]). `entry_stack` must be the stack pointer of the
+/// dispatcher's caller, with a valid back chain.
+pub(crate) unsafe fn service_cs_trace_wait_begin(section: u32, entry_stack: u32) -> u32 {
+    count_wait(WaitEdge::Begin);
+    // SAFETY: the caller's contract.
+    unsafe { trace_wait(WaitTrace::Enter, waited_section(section), entry_stack) };
     0
 }
 
 /// Monitor control code 0x82 (stock 0x91f2b828): the thread acquired the
 /// section after waiting.
-pub(crate) fn service_cs_trace_wait_end(section: u32, entry_stack: u32) -> u32 {
-    count_wait(0x1c, 0x24);
-    trace_wait(WaitTrace::Leave, section, entry_stack);
+///
+/// # Safety
+///
+/// As [`service_cs_trace_wait_begin`], for the section the calling thread
+/// acquired.
+pub(crate) unsafe fn service_cs_trace_wait_end(section: u32, entry_stack: u32) -> u32 {
+    count_wait(WaitEdge::End);
+    // SAFETY: the caller's contract.
+    unsafe { trace_wait(WaitTrace::Leave, waited_section(section), entry_stack) };
     0
 }
 
-/// Count the wait in the processor's wait statistics when they are
-/// enabled: `title` for title threads, `system` otherwise.
-fn count_wait(title: u32, system: u32) {
-    let statistics = Kpcr::current().wait_statistics.load(Ordering::Relaxed);
-    if statistics == 0 || read_u32(statistics + 4) & 1 == 0 {
-        return;
+/// Which end of a critical section wait a count records.
+#[derive(Clone, Copy)]
+enum WaitEdge {
+    Begin,
+    End,
+}
+
+impl WaitEdge {
+    #[inline(always)]
+    fn counter(self, counts: &WaitCounts) -> &AtomicU32 {
+        match self {
+            WaitEdge::Begin => &counts.begins,
+            WaitEdge::End => &counts.ends,
+        }
     }
+}
+
+/// The wait statistics of the current processor while they are enabled.
+#[inline(always)]
+fn current_wait_statistics() -> Option<&'static WaitStatistics> {
+    let address = Kpcr::current().wait_statistics.load(Ordering::Relaxed);
+    // SAFETY: the kernel keeps 0 or the address of the processor's
+    // statistics block, which stays mapped, in the PCR.
+    let statistics =
+        unsafe { core::ptr::with_exposed_provenance::<WaitStatistics>(address as usize).as_ref() }?;
+    WaitStatisticsFlags::from_bits_retain(statistics.flags.load(Ordering::Relaxed))
+        .contains(WaitStatisticsFlags::ENABLED)
+        .then_some(statistics)
+}
+
+/// Count the wait in the processor's wait statistics when they are
+/// enabled, under the counts of title or system threads.
+fn count_wait(edge: WaitEdge) {
+    let Some(statistics) = current_wait_statistics() else {
+        return;
+    };
     // SAFETY: re-enabled below; nothing in between waits or faults.
     unsafe { processor::disable_interrupts() };
-    let counter = statistics
-        + if xboxkrnl::KeGetCurrentProcessType().0 == TITLE_PROCESS {
-            title
-        } else {
-            system
-        };
-    write_u32(counter, read_u32(counter).wrapping_add(1));
+    let counts = if xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE {
+        &statistics.title
+    } else {
+        &statistics.system
+    };
+    let counter = edge.counter(counts);
+    counter.store(
+        counter.load(Ordering::Relaxed).wrapping_add(1),
+        Ordering::Relaxed,
+    );
     // SAFETY: interrupts were disabled above.
     unsafe { processor::enable_interrupts() };
 }
@@ -1074,9 +1418,11 @@ crate::exports::bridged!(reset_title_wait_counts_entry, reset_title_wait_counts)
 extern "C" fn reset_title_wait_counts(_context: u32) -> u32 {
     // SAFETY: re-enabled below; nothing in between waits or faults.
     unsafe { processor::disable_interrupts() };
-    let statistics = Kpcr::current().wait_statistics.load(Ordering::Relaxed);
-    if statistics != 0 && read_u32(statistics + 4) & 1 != 0 {
-        write_u32(statistics + 0x1c, read_u32(statistics + 0x18));
+    if let Some(statistics) = current_wait_statistics() {
+        let title = &statistics.title;
+        title
+            .ends
+            .store(title.begins.load(Ordering::Relaxed), Ordering::Relaxed);
     }
     // SAFETY: interrupts were disabled above.
     unsafe { processor::enable_interrupts() };
@@ -1085,38 +1431,54 @@ extern "C" fn reset_title_wait_counts(_context: u32) -> u32 {
 
 /// Write an `E:` or `L:` line into the log when area bit 2 is set (stock
 /// 0x91f2b680 and line writer 0x91f2b530).
-fn trace_wait(trace: WaitTrace, section: u32, entry_stack: u32) {
-    let open = TellLogAreas::from_bits_retain(dispatcher::dispatch(0x8a, 0));
+///
+/// # Safety
+///
+/// The thread object `section` names as its owner, if any, must stay
+/// allocated for the call. Stock reads the owner's id and processor
+/// without a reference, so an owner that releases the section and ends
+/// after the owner word is read races with those reads; the trace keeps
+/// that race.
+unsafe fn trace_wait(
+    trace: WaitTrace,
+    section: Option<&RtlCriticalSectionFields>,
+    entry_stack: u32,
+) {
+    // SAFETY: the code takes no argument.
+    let open = TellLogAreas::from_bits_retain(unsafe {
+        dispatcher::dispatch(ControlCode::TELL_LOG_AREAS, 0)
+    });
     if !open.intersects(TellLogAreas::CRITICAL_SECTIONS) {
         return;
     }
-    let thread = current_thread();
+    let thread = current_object();
     let time_base = Timebase::now().ticks();
     let processor = Kpcr::current().processor_number().get();
-    let title = xboxkrnl::KeGetCurrentProcessType().0 == TITLE_PROCESS;
-    let (lock_count, recursion_count, owner) = if section == 0 {
-        (0, 0, 0)
-    } else {
-        (
-            read_u32(section + 0x10) as u16,
-            read_u32(section + 0x14) as u16,
-            read_u32(section + 0x18),
-        )
+    let title = xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE;
+    let (lock_count, recursion_count, owner) = match section {
+        None => (0, 0, 0),
+        Some(section) => (
+            section.lock_count.load(Ordering::Relaxed) as u16,
+            section.recursion_count.load(Ordering::Relaxed) as u16,
+            section.owning_thread.load(Ordering::Relaxed),
+        ),
     };
-    let (owner_id, owner_processor) = if owner == 0 {
-        (0, -1)
-    } else {
-        (
-            read_u32(owner + THREAD_ID),
-            i32::from(read_u8(owner + THREAD_PROCESSOR)),
-        )
+    let (owner_id, owner_processor) = match owner {
+        0 => (0, -1),
+        owner => {
+            // SAFETY: the caller's contract.
+            let owner = unsafe { ThreadObject::from_raw(owner) };
+            (owner.id().raw(), i32::from(owner.hardware_thread().get()))
+        }
     };
     let line = WaitTraceLine {
         trace,
         title,
         time_base,
-        section,
-        thread_id: read_u32(thread + THREAD_ID),
+        section: section.map_or(0, |section| {
+            core::ptr::from_ref(section).expose_provenance() as u32
+        }),
+        thread_id: thread.id().raw(),
         lock_count,
         recursion_count,
         processor,
@@ -1125,15 +1487,22 @@ fn trace_wait(trace: WaitTrace, section: u32, entry_stack: u32) {
         owner_processor,
         callers: callers(entry_stack),
     };
-    let size = dispatcher::dispatch(0x89, 0);
-    if size == 0 || dispatcher::dispatch(0x8a, 0) == 0 {
+    // SAFETY: the codes take no argument.
+    let size = unsafe { dispatcher::dispatch(ControlCode::TELL_LOG_ENTRY_SIZE, 0) };
+    if size == 0 || unsafe { dispatcher::dispatch(ControlCode::TELL_LOG_AREAS, 0) } == 0 {
         return;
     }
     let mut text = [0u8; TELL_LOG_LINE_LIMIT as usize];
     let length = format_wait_trace(&line, size, &mut text);
-    // Producer record: u16 length, u16 unused, u32 text.
-    let record = [(length as u32) << 16, text.as_ptr() as usize as u32];
-    dispatcher::dispatch(0x88, record.as_ptr() as usize as u32);
+    let record = TellLogRecord::new(length as u16, text.as_ptr() as usize as u32);
+    // SAFETY: `record` and its text are live locals; the length is the
+    // formatted length within `text`.
+    unsafe {
+        dispatcher::dispatch(
+            ControlCode::TELL_LOG_RECORD,
+            &record as *const TellLogRecord as usize as u32,
+        )
+    };
 }
 
 /// Return addresses three frames up from the dispatcher's caller (stock
@@ -1149,13 +1518,19 @@ fn callers(entry_stack: u32) -> [u32; 3] {
     let mut found = 0;
     let mut frame = entry_stack;
     while frame != 0 && frame >= limit && frame < base && found < callers.len() {
+        let word = |address: u32| {
+            // SAFETY: `frame` lies in the calling thread's stack between its
+            // limit and base, which stays mapped; the save word 8 bytes
+            // below a frame lies in the stack as well.
+            unsafe { core::ptr::with_exposed_provenance::<u32>(address as usize).read() }
+        };
         if skip != 0 {
             skip -= 1;
         } else {
-            callers[found] = read_u32(frame - 8);
+            callers[found] = word(frame - 8);
             found += 1;
         }
-        frame = read_u32(frame);
+        frame = word(frame);
     }
     callers
 }

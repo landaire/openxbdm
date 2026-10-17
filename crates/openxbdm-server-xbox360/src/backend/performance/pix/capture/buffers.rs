@@ -476,26 +476,26 @@ pub(super) fn delay() {
     unsafe { xboxkrnl::KeDelayExecutionThread(ProcessorMode::Kernel, false, &interval) };
 }
 
-/// Handle of stream `base` for the calling process (stock 0x91f5cb08):
-/// titles open their own handle to the partition once.
-fn handle(s: S, base: u32) -> u32 {
-    if xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE && s.word(base + 4) == 0 {
+/// Handle of the stream block at address `base` for the calling process
+/// (stock 0x91f5cb08): titles open their own handle to the partition once.
+fn handle(base: u32) -> u32 {
+    if xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE && rd(base + 4) == 0 {
         let mut handle = 0u32;
         if !super::super::session::open_partition(&mut handle) {
             return 0;
         }
-        s.set_word(base + 4, handle);
+        wr(base + 4, handle);
     }
     if xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE {
-        s.word(base + 4)
+        rd(base + 4)
     } else {
-        s.word(base)
+        rd(base)
     }
 }
 
 /// Partition handle of stream `k` for the calling process.
 pub(super) fn stream_handle(s: S, k: u32) -> u32 {
-    handle(s, s.0 + stream(k))
+    handle(s.0 + stream(k))
 }
 
 /// Take the next buffer of a completed request (stock 0x91f5de90). With
@@ -604,7 +604,7 @@ pub(super) fn submit(s: S, entry: u32, frame: u32) {
             // the call.
             unsafe {
                 NtWriteFileGather(
-                    Handle::from_raw(handle(s, base)),
+                    Handle::from_raw(handle(base)),
                     Handle::from_raw(event),
                     0,
                     0,
@@ -768,7 +768,7 @@ pub(super) fn read_unit(s: S, unit: u32, position: u32) -> u32 {
     // below completes the read.
     unsafe {
         xboxkrnl::NtReadFile(
-            Handle::from_raw(handle(s, s.0 + stream(0))),
+            Handle::from_raw(handle(s.0 + stream(0))),
             Handle::from_raw(rd(request + 8)),
             0,
             0,

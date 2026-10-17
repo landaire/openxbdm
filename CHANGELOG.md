@@ -47,6 +47,7 @@
 - Serve SMB on TCP port 445 from the server thread's select loop, with two connections of two 0x10400-byte pool buffers each; without the port the monitor runs without SMB.
 - Flash updates fail with `InvalidParameter` when the image header points outside the uploaded image, where stock reads past the buffer.
 - The module does not load when the loader leaves a kernel data import unresolved (as Xenia does for some), so later reads need no check.
+- PIX stream writes and reads use the stream's file handle; the handle address added the session address twice.
 
 ### Kernel debugger
 

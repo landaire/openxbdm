@@ -95,6 +95,7 @@ use xbox360_sys::xboxkrnl::KspinLock;
 use xbox360_sys::xboxkrnl::KswitchFrame;
 use xbox360_sys::xboxkrnl::Kthread;
 use xbox360_sys::xboxkrnl::KtrapFrame;
+use xbox360_sys::xboxkrnl::NotificationRegistration;
 use xbox360_sys::xboxkrnl::ObLookupAnyThreadByThreadId;
 use xbox360_sys::xboxkrnl::PoolTag;
 use xbox360_sys::xboxkrnl::PoolType;
@@ -619,8 +620,9 @@ static SLOTS: [Slot; SLOT_COUNT] = [const { Slot::new() }; SLOT_COUNT];
 static PREVIOUS_DEBUG_ROUTINE: AtomicU32 = AtomicU32::new(0);
 /// Thread object of the server thread, which must never wait in a slot.
 static SERVER_THREAD: AtomicU32 = AtomicU32::new(0);
-/// Thread notification registration: routine, then the kernel's links.
-static THREAD_NOTIFICATION: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
+/// Thread notification registration, priority 0. The kernel uses all 0x10
+/// bytes of the record.
+static THREAD_NOTIFICATION: NotificationRegistration = NotificationRegistration::new();
 /// Loaded extension exports read off the server thread.
 static EXTENSION_TELL_DEBUGGER: AtomicU32 = AtomicU32::new(0);
 static EXTENSION_PREPARE_TO_UNLOAD: AtomicU32 = AtomicU32::new(0);
@@ -1277,21 +1279,27 @@ pub(crate) fn install() {
             );
         }
     }
-    THREAD_NOTIFICATION[0].store(
-        thread_notification_entry as *const () as usize as u32,
-        Ordering::Relaxed,
-    );
+    // SAFETY: the record is not registered yet; the routine is the bridged
+    // entry of `thread_notification`, which takes the arguments of a thread
+    // notification routine.
+    unsafe {
+        THREAD_NOTIFICATION.routine.store(
+            thread_notification_entry as *const () as usize as u32,
+            Ordering::Relaxed,
+        )
+    };
     // SAFETY: the registration block is static and stays registered until
     // `uninstall`.
-    unsafe { ExRegisterThreadNotification(THREAD_NOTIFICATION.as_ptr().cast_mut().cast(), true) };
+    unsafe { ExRegisterThreadNotification(THREAD_NOTIFICATION.as_ptr(), true) };
 }
 
 /// Undo [`install`] before the image unloads.
 pub(crate) fn uninstall() {
-    if THREAD_NOTIFICATION[0].load(Ordering::Relaxed) != 0 {
+    if THREAD_NOTIFICATION.routine.load(Ordering::Relaxed) != 0 {
         // SAFETY: `install` registered this static block.
-        unsafe { ExRegisterThreadNotification(THREAD_NOTIFICATION.as_ptr().cast_mut().cast(), false) };
-        THREAD_NOTIFICATION[0].store(0, Ordering::Relaxed);
+        unsafe { ExRegisterThreadNotification(THREAD_NOTIFICATION.as_ptr(), false) };
+        // SAFETY: the record is no longer registered.
+        unsafe { THREAD_NOTIFICATION.routine.store(0, Ordering::Relaxed) };
     }
     if let Some(variable) = kernel::routine_variable(RoutineVariable::StackOverflow) {
         // SAFETY: `KernelU32` is a transparent `AtomicU32`; the exchange

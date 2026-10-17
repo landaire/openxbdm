@@ -48,6 +48,7 @@
 - Flash updates fail with `InvalidParameter` when the image header points outside the uploaded image, where stock reads past the buffer.
 - The module does not load when the loader leaves a kernel data import unresolved (as Xenia does for some), so later reads need no check.
 - PIX stream writes and reads use the stream's file handle; the handle address added the session address twice.
+- Register the thread notification with a 16-byte record; the kernel writes its list link at +0xC, past the 12 bytes registered before.
 
 ### Kernel debugger
 

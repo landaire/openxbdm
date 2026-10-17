@@ -138,13 +138,13 @@ extern "C" fn get_thread_context(thread: u32, context: u32) -> u32 {
     if context == 0 {
         return Hresult::INVALID_ARGUMENT.0;
     }
-    let flags = ContextFlags(read_u32(context));
+    let flags = ContextFlags::from_bits_retain(read_u32(context));
     let mut read = debugger::Context {
         flags,
         ..debugger::Context::default()
     };
     let result = super::read_thread_context(ThreadId(thread), &mut read).map(|()| {
-        write_u32(context, read.flags.0);
+        write_u32(context, read.flags.bits());
         super::context_to_memory(context, &read);
     });
     result_word(result)
@@ -299,7 +299,7 @@ extern "C" fn set_thread_context(thread: u32, context: u32) -> u32 {
     if context == 0 {
         return Hresult::INVALID_ARGUMENT.0;
     }
-    let flags = ContextFlags(read_u32(context)).intersection(ContextFlags::FULL);
+    let flags = ContextFlags::from_bits_retain(read_u32(context)) & ContextFlags::FULL;
     let source = super::context_from_memory(context, flags);
     result_word(super::write_thread_context(ThreadId(thread), &source))
 }
@@ -331,8 +331,8 @@ static PENDING_STOP_ON_CLEAR: AtomicU32 = AtomicU32::new(0);
 pub(crate) fn apply_pending_stop_on(state: &mut ServerState) {
     let clear = PENDING_STOP_ON_CLEAR.swap(0, Ordering::AcqRel);
     let set = PENDING_STOP_ON_SET.swap(0, Ordering::AcqRel);
-    debugger::change_stop_on(state, StopOn(clear), false);
-    debugger::change_stop_on(state, StopOn(set), true);
+    debugger::change_stop_on(state, StopOn::from_bits_retain(clear), false);
+    debugger::change_stop_on(state, StopOn::from_bits_retain(set), true);
 }
 
 /// Stock export 46 (0x91f26790): `(flags, set) -> HRESULT`; stock changes
@@ -344,7 +344,7 @@ extern "C" fn stop_on(flags: u32, set: u32) -> u32 {
         |server, _, _, request| {
             debugger::change_stop_on(
                 &mut server.state,
-                StopOn(request.first),
+                StopOn::from_bits_retain(request.first),
                 request.second != 0,
             );
             0

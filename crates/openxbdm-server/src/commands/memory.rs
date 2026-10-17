@@ -11,9 +11,12 @@ use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::Win32Error;
 use openxbdm_core::status::XbdmHresult;
+use xbox360_sys::image::XexHeaderKey;
+use xbox360_sys::status::Facility;
 
 use crate::access::Access;
 use crate::commands::console;
+use crate::commands::console::c_string;
 use crate::commands::debugger;
 use crate::commands::filesystem;
 use crate::commands::system::SettingsFile;
@@ -32,7 +35,8 @@ use crate::state::ServerState;
 use crate::text::Text;
 use crate::transfer_blocks::TransferBlock;
 
-const PAGE_SIZE: u32 = 0x1000;
+/// Size of a small page in bytes.
+pub const PAGE_SIZE: u32 = 0x1000;
 const LARGE_PAGE_SIZE: u32 = 0x1_0000;
 const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
 /// `getmem` emits at most this many lines per continuation call.
@@ -49,10 +53,6 @@ const WALK_LIMIT: u32 = 0xa000_0000;
 const WALK_LINE_LENGTH: usize = 52;
 /// Bytes per `xexfield` data line.
 const XEX_FIELD_BYTES_PER_LINE: u32 = 32;
-/// Optional header 0x10100 is reported with its inline value as data.
-const XEX_FIELD_INLINE_REPORTED: u32 = 0x10100;
-/// Optional header holding the additional title memory.
-const XEX_FIELD_ADDITIONAL_TITLE_MEMORY: u32 = 0x40801;
 
 /// Bytes of a module base name buffer, including the terminator.
 pub const MODULE_NAME_CAPACITY: usize = 0x104;
@@ -98,20 +98,24 @@ pub fn is_device_address(address: u32) -> bool {
 }
 
 pub(crate) const COMMANDS: &[CommandEntry] = &[
-    entry("addtitlemem", DispatchFlags::NONE, additional_title_memory),
-    entry("advmem", DispatchFlags::NONE, advanced_memory),
+    entry(
+        "addtitlemem",
+        DispatchFlags::empty(),
+        additional_title_memory,
+    ),
+    entry("advmem", DispatchFlags::empty(), advanced_memory),
     entry("detour", DispatchFlags::DEVKIT_ONLY, detour_command),
-    entry("getmem", DispatchFlags::NONE, get_memory),
-    entry("getmemex", DispatchFlags::NONE, get_memory_binary),
-    entry("memtrack", DispatchFlags::NONE, memory_tracking),
-    entry("modsections", DispatchFlags::NONE, module_sections),
-    entry("modules", DispatchFlags::NONE, modules),
-    entry("pdbinfo", DispatchFlags::NONE, pdb_info),
+    entry("getmem", DispatchFlags::empty(), get_memory),
+    entry("getmemex", DispatchFlags::empty(), get_memory_binary),
+    entry("memtrack", DispatchFlags::empty(), memory_tracking),
+    entry("modsections", DispatchFlags::empty(), module_sections),
+    entry("modules", DispatchFlags::empty(), modules),
+    entry("pdbinfo", DispatchFlags::empty(), pdb_info),
     entry("setmem", DispatchFlags::DEVKIT_ONLY, set_memory),
-    entry("traceimports", DispatchFlags::NONE, trace_imports),
-    entry("walkmem", DispatchFlags::NONE, walk_memory),
-    entry("xbeinfo", DispatchFlags::NONE, executable_info),
-    entry("xexfield", DispatchFlags::NONE, xex_field),
+    entry("traceimports", DispatchFlags::empty(), trace_imports),
+    entry("walkmem", DispatchFlags::empty(), walk_memory),
+    entry("xbeinfo", DispatchFlags::empty(), executable_info),
+    entry("xexfield", DispatchFlags::empty(), xex_field),
 ];
 
 const fn entry(
@@ -119,27 +123,32 @@ const fn entry(
     flags: DispatchFlags,
     handler: crate::registry::Handler,
 ) -> CommandEntry {
-    CommandEntry::new(name, Access::CONTROL, Access::NONE, flags, handler)
+    CommandEntry::new(name, Access::CONTROL, Access::empty(), flags, handler)
 }
 
-/// Allocation tracking type flags. The low eight bits select allocation
-/// types, bit 8 turns tracking diagnostics into assertions, and bit 31 of
-/// the saved value marks a pending `enableonce`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct TrackingFlags(pub u32);
+xbox360_sys::flags! {
+    /// Allocation tracking type flags. The low eight bits select allocation
+    /// types, bit 8 turns tracking diagnostics into assertions, and bit 31 of
+    /// the saved value marks a pending `enableonce`.
+    pub struct TrackingFlags(u32) {
+        /// Allocation type selection; `enable` needs at least one.
+        TYPES = 0xff,
+        ASSERT = 0x100,
+        /// Set in the saved flags by `enableonce`; cleared when the settings
+        /// file is loaded.
+        ONCE = 0x8000_0000,
+    }
+}
 
 impl TrackingFlags {
     /// Bits `enable` replaces and `disable` clears.
-    pub const TYPE_MASK: u32 = 0x1ff;
+    pub const TYPE_MASK: Self = Self::TYPES.union(Self::ASSERT);
     /// Default `flags` value of `enable` and `enableonce`.
-    pub const DEFAULT: Self = Self(0x1ff);
-    /// Set in the saved flags by `enableonce`; cleared when the settings
-    /// file is loaded.
-    pub const ONCE: u32 = 0x8000_0000;
+    pub const DEFAULT: Self = Self::TYPE_MASK;
 
     /// Whether any tracking type is selected.
     pub fn is_active(self) -> bool {
-        self.0 & Self::TYPE_MASK != 0
+        self.intersects(Self::TYPE_MASK)
     }
 }
 
@@ -190,7 +199,7 @@ impl State {
     pub const fn new() -> Self {
         Self {
             tracking: TrackingSettings {
-                flags: TrackingFlags(0),
+                flags: TrackingFlags::empty(),
                 stack_depth: StackDepth(0),
             },
             detour_log: DetourLogName::EMPTY,
@@ -420,7 +429,9 @@ impl From<MemoryError> for Hresult {
             MemoryError::DetourNotRunning => Hresult::INVALID_STATE,
             // Stock moves the code to the Win32 facility without the sign
             // test of HRESULT_FROM_WIN32.
-            MemoryError::TrackingSave(error) => Hresult(0x8007_0000 | (error.code() & 0xffff)),
+            MemoryError::TrackingSave(error) => {
+                Hresult::failure(Facility::WIN32, error.code() as u16)
+            }
         }
     }
 }
@@ -435,11 +446,6 @@ impl From<detour::DetourError> for CommandError {
     }
 }
 
-/// `ERROR_NOT_FOUND`: the module has no CodeView record.
-const NOT_FOUND: Win32Error = Win32Error::new(0x490).unwrap();
-/// `ERROR_SERVICE_NOT_ACTIVE`: no allocation type is tracked.
-const SERVICE_NOT_ACTIVE: Win32Error = Win32Error::new(0x426).unwrap();
-
 /// XEX optional header field key: the high bits identify the field and the
 /// low byte encodes its size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -453,7 +459,8 @@ impl XexFieldKey {
         data_length: impl FnOnce() -> Result<u32, XexFieldError>,
     ) -> Result<u32, XexFieldError> {
         match self.0 & 0xff {
-            0 if self.0 == XEX_FIELD_INLINE_REPORTED => Ok(4),
+            // The entry point is reported with its inline value as data.
+            0 if self.0 == XexHeaderKey::ENTRY_POINT.0 => Ok(4),
             0 => Ok(0),
             1 => Ok(4),
             0xff => data_length(),
@@ -647,11 +654,6 @@ impl RawWriter<'_> {
         self.buffer[self.len..end].copy_from_slice(&bytes[..count]);
         self.len = end;
     }
-}
-
-/// Bytes before the first NUL.
-fn c_string(buffer: &[u8]) -> &[u8] {
-    buffer.split(|&byte| byte == 0).next().unwrap_or_default()
 }
 
 /// Copy a string parameter the way the monitor does; `None` when absent.
@@ -1092,7 +1094,8 @@ fn pdb_info(invocation: &mut Invocation<'_>) -> CommandResult {
         Some(base) => invocation
             .backend
             .code_view(base)
-            .ok_or(CommandError::Win32(NOT_FOUND)),
+            // The module has no CodeView record.
+            .ok_or(CommandError::Win32(Win32Error::NOT_FOUND)),
         None => Err(CommandError::InvalidArgument),
     };
     let code_view = match code_view {
@@ -1229,12 +1232,12 @@ fn executable_info(invocation: &mut Invocation<'_>) -> CommandResult {
         // Stock leaves the handle open and reports the file missing
         // whatever the open returned.
         let request = filesystem::CreateRequest {
-            access: filesystem::FileAccess(0x8010_0000),
+            access: filesystem::FileAccess::GENERIC_READ.union(filesystem::FileAccess::SYNCHRONIZE),
             allocation_size: None,
-            attributes: filesystem::FileAttributes(0),
-            share: filesystem::ShareAccess(0),
+            attributes: filesystem::FileAttributes::NONE,
+            share: filesystem::ShareAccess::NONE,
             disposition: filesystem::CreateDisposition::Open,
-            options: filesystem::CreateOptions(0x20),
+            options: filesystem::CreateOptions::SYNCHRONOUS_IO_NONALERT,
         };
         let _ = filesystem::open_translated(
             invocation.state,
@@ -1310,7 +1313,7 @@ fn additional_title_memory(invocation: &mut Invocation<'_>) -> CommandResult {
     if console::console_memory(invocation.backend).value() & 0x2 != 0 {
         match invocation
             .backend
-            .title_xex_dword(XexFieldKey(XEX_FIELD_ADDITIONAL_TITLE_MEMORY))
+            .title_xex_dword(XexFieldKey(XexHeaderKey::ADDITIONAL_TITLE_MEMORY.0))
         {
             Ok(field) => value = field.unwrap_or(0),
             Err(NoSuchModule) => return Err(ErrorCode::NoSuchModule.into()),
@@ -1643,7 +1646,7 @@ fn detour_entry(invocation: &mut Invocation<'_>) -> CommandResult {
                 detour::HookSettings {
                     address: required("addr")?,
                     param_size: required("paramsize")?,
-                    flags: detour::HookFlags(required("flags")?),
+                    flags: detour::HookFlags::from_bits_retain(required("flags")?),
                     return_value: detour::ReturnValue(required("return")?),
                     sleep_milliseconds: optional("sleep"),
                     discard_frequency: optional("disccallfreq"),
@@ -1756,7 +1759,12 @@ fn memory_tracking(invocation: &mut Invocation<'_>) -> CommandResult {
             tracking_enable(invocation, command == TrackingCommand::EnableOnce)
         }
         Some(TrackingCommand::Disable) => {
-            invocation.state.memory.tracking.flags.0 &= !TrackingFlags::TYPE_MASK;
+            invocation
+                .state
+                .memory
+                .tracking
+                .flags
+                .remove(TrackingFlags::TYPE_MASK);
             invocation.state.settings_dirty = true;
             Ok(Reply::Ok)
         }
@@ -1769,7 +1777,7 @@ fn memory_tracking(invocation: &mut Invocation<'_>) -> CommandResult {
         }
         Some(command @ (TrackingCommand::QueryStackDepth | TrackingCommand::QueryFlags)) => {
             let value = if command == TrackingCommand::QueryFlags {
-                invocation.backend.tracking_flags().0
+                invocation.backend.tracking_flags().bits()
             } else {
                 ACTIVE_STACK_DEPTH.0
             };
@@ -1811,17 +1819,20 @@ fn tracking_enable(invocation: &mut Invocation<'_>, once: bool) -> CommandResult
         missing = Some("flags");
     }
     let depth = StackDepth(depth.unwrap_or(0));
-    let flags = TrackingFlags(flags.unwrap_or(TrackingFlags::DEFAULT.0));
-    if depth.0 > MEMTRACK_MAX_STACK_DEPTH || flags.0 & 0xff == 0 {
+    let flags = TrackingFlags::from_bits_retain(flags.unwrap_or(TrackingFlags::DEFAULT.bits()));
+    if depth.0 > MEMTRACK_MAX_STACK_DEPTH || !flags.intersects(TrackingFlags::TYPES) {
         return Err(CommandError::InvalidArgument);
     }
     let saved = &mut invocation.state.memory.tracking;
     if once {
         invocation.backend.set_tracking_flags(flags);
-        saved.flags.0 |= TrackingFlags::ONCE;
+        saved.flags.insert(TrackingFlags::ONCE);
     } else {
         saved.stack_depth = depth;
-        saved.flags.0 = (saved.flags.0 & !TrackingFlags::TYPE_MASK) | flags.0;
+        saved.flags = saved
+            .flags
+            .difference(TrackingFlags::TYPE_MASK)
+            .union(flags);
         invocation.state.settings_dirty = true;
     }
     match missing {
@@ -1835,15 +1846,18 @@ fn tracking_enable(invocation: &mut Invocation<'_>, once: bool) -> CommandResult
 /// failed write deletes the file.
 fn save_tracking_records(invocation: &mut Invocation<'_>, filename: &[u8]) -> CommandResult {
     if !invocation.backend.tracking_flags().is_active() {
-        return Err(CommandError::Win32(SERVICE_NOT_ACTIVE));
+        // No allocation type is tracked.
+        return Err(CommandError::Win32(Win32Error::SERVICE_NOT_ACTIVE));
     }
     let request = filesystem::CreateRequest {
-        access: filesystem::FileAccess(0x4011_0000),
+        access: filesystem::FileAccess::GENERIC_WRITE
+            .union(filesystem::FileAccess::DELETE)
+            .union(filesystem::FileAccess::SYNCHRONIZE),
         allocation_size: None,
-        attributes: filesystem::FileAttributes(0x80),
-        share: filesystem::ShareAccess(1),
+        attributes: filesystem::FileAttributes::NORMAL,
+        share: filesystem::ShareAccess::READ,
         disposition: filesystem::CreateDisposition::OverwriteIf,
-        options: filesystem::CreateOptions(0x20),
+        options: filesystem::CreateOptions::SYNCHRONOUS_IO_NONALERT,
     };
     let written =
         filesystem::open_translated(invocation.state, invocation.backend, filename, &request)
@@ -1888,7 +1902,8 @@ pub(crate) fn memtrack_settings_lines(
         file,
         format_args!(
             "memtrack flags=0x{:x} stackdepth=0x{:x}",
-            tracking.flags.0, tracking.stack_depth.0
+            tracking.flags.bits(),
+            tracking.stack_depth.0
         ),
     );
 }
@@ -1898,12 +1913,12 @@ pub(crate) fn memtrack_settings_lines(
 pub(crate) fn ini_memtrack(invocation: &mut Invocation<'_>) {
     let tracking = &mut invocation.state.memory.tracking;
     if let Some(value) = invocation.line.param("flags") {
-        tracking.flags = TrackingFlags(value.dword_prefix());
+        tracking.flags = TrackingFlags::from_bits_retain(value.dword_prefix());
     }
     if let Some(value) = invocation.line.param("stackdepth") {
         tracking.stack_depth = StackDepth(value.dword_prefix());
     }
-    tracking.flags.0 &= !TrackingFlags::ONCE;
+    tracking.flags.remove(TrackingFlags::ONCE);
 }
 
 #[cfg(test)]

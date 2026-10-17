@@ -114,7 +114,7 @@ impl Invocation<'_> {
     pub fn access(&self) -> Access {
         self.session
             .as_ref()
-            .map_or(Access::ALL, |session| session.access)
+            .map_or(Access::UNRESTRICTED, |session| session.access)
     }
 
     /// Write a line directly to the connection socket.

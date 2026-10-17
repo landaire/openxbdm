@@ -11,6 +11,8 @@ pub struct Ipv4Address(pub [u8; 4]);
 
 impl Ipv4Address {
     pub const UNSPECIFIED: Self = Self([0; 4]);
+    pub const BROADCAST: Self = Self([0xff; 4]);
+    pub const LOOPBACK: Self = Self([127, 0, 0, 1]);
 
     pub const fn octets(self) -> [u8; 4] {
         self.0

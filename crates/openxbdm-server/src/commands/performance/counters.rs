@@ -39,14 +39,46 @@ const RATES_OFFSET: i32 = 0x68;
 const FRAMES_OFFSET: i32 = 0x94;
 const INDEX_OFFSET: i32 = 0xc0;
 
-/// Registration flag: the source holds a complete sample that is copied.
-const COPIES_SAMPLE: u32 = 0x8_0000;
-/// Registration flag: the source is a query routine.
-const HAS_HANDLER: u32 = 0x10_0000;
-/// Counter class bits of the type.
-const CLASS_MASK: u32 = 0x30;
-const CLASS_RATE: u32 = 0x10;
-const CLASS_RATIO: u32 = 0x20;
+xbox360_sys::flags! {
+    /// Source bits of a [`CounterRegistration`] word.
+    pub struct RegistrationFlags(u32) {
+        /// The source holds a complete sample that is copied.
+        COPIES_SAMPLE = 0x8_0000,
+        /// The source is a query routine.
+        HAS_HANDLER = 0x10_0000,
+    }
+}
+
+/// Counter class: bits 4 and 5 of a counter type or query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CounterClass(u32);
+
+impl CounterClass {
+    const VALUE: Self = Self(0);
+    const RATE: Self = Self(0x10);
+    const RATIO: Self = Self(0x20);
+    const MASK: u32 = 0x30;
+
+    const fn of(word: u32) -> Self {
+        Self(word & Self::MASK)
+    }
+}
+
+xbox360_sys::flags! {
+    /// Rate units of a history query and of a rate sample type, as the
+    /// xbdm.h `DMCOUNT_PER*` bits.
+    pub struct RateUnit(u32) {
+        PER_SECOND = 0x40,
+        PER_MILLISECOND = 0x80,
+        PER_FRAME = 0x100,
+        PER_TICK = 0x200,
+    }
+}
+
+/// Sample type word of a history evaluation: `class` with `unit`.
+const fn sample_type(class: CounterClass, unit: RateUnit) -> u32 {
+    class.0 | unit.bits()
+}
 
 /// The `querypc type=` word: counter class bits, history selectors, and a
 /// sample count in the low nibble.
@@ -57,8 +89,8 @@ impl CounterQuery {
     /// Selector bits that request history evaluation.
     const HISTORY: u32 = 0xfc0;
 
-    const fn class(self) -> u32 {
-        self.0 & CLASS_MASK
+    const fn class(self) -> CounterClass {
+        CounterClass::of(self.0)
     }
 
     /// Samples to evaluate; 0 selects the default.
@@ -70,8 +102,8 @@ impl CounterQuery {
         self.0 & Self::HISTORY != 0
     }
 
-    const fn contains(self, bits: u32) -> bool {
-        self.0 & bits != 0
+    const fn unit(self) -> RateUnit {
+        RateUnit::from_bits_retain(self.0)
     }
 }
 
@@ -167,6 +199,14 @@ impl CounterRegistration {
     /// Counter type reported by `pclist`.
     pub const fn counter_type(self) -> u16 {
         self.0 as u16
+    }
+
+    pub const fn flags(self) -> RegistrationFlags {
+        RegistrationFlags::from_bits_retain(self.0)
+    }
+
+    const fn class(self) -> CounterClass {
+        CounterClass::of(self.0)
     }
 
     /// Sampling period in sampler ticks; zero means never sampled.
@@ -271,7 +311,7 @@ fn read_source(object: &mut impl CounterObject, value: &mut u64, rate: Option<&m
 pub fn sample(object: &mut impl CounterObject, tick_count: u32, frame_number: u32) {
     let word = registration(object);
     let mut value = 0u64;
-    let (valid, rate) = if word.0 & CLASS_MASK != CLASS_RATIO {
+    let (valid, rate) = if word.class() != CounterClass::RATIO {
         (read_source(object, &mut value, None), tick_count)
     } else {
         let mut rate = 0u64;
@@ -306,9 +346,9 @@ pub fn query(
     query: CounterQuery,
     out: &mut CounterSample,
 ) -> Result<Evaluation, CounterError> {
-    let word = registration(object).0;
-    let class = word & CLASS_MASK;
-    if word & COPIES_SAMPLE != 0 {
+    let word = registration(object);
+    let class = word.class();
+    if word.flags().contains(RegistrationFlags::COPIES_SAMPLE) {
         object.exclude_sampler();
         out.value = object.source_u64(0);
         out.rate = object.source_u64(8);
@@ -316,21 +356,21 @@ pub fn query(
         object.allow_sampler();
         return Ok(Evaluation::Sampled);
     }
-    if word & HAS_HANDLER != 0 {
+    if word.flags().contains(RegistrationFlags::HAS_HANDLER) {
         return object.call_handler(query, out);
     }
-    if word & CLASS_MASK != query.class() {
+    if class != query.class() {
         return Err(CounterError::TypeInvalid);
     }
     let mut count = query.count();
-    if !query.history() && class != CLASS_RATIO {
+    if !query.history() && class != CounterClass::RATIO {
         if !read_source(object, &mut out.value, None) {
             return Err(CounterError::DataNotAvailable);
         }
-        out.sample_type = class;
+        out.sample_type = class.0;
         return Ok(Evaluation::Sampled);
     }
-    if class == 0 {
+    if class == CounterClass::VALUE {
         if count == 0 {
             count = 1;
         }
@@ -379,7 +419,7 @@ fn history_difference(
     count: i32,
     out: &mut CounterSample,
 ) -> Result<Evaluation, CounterError> {
-    let class = registration(object).0 & CLASS_MASK;
+    let class = registration(object).class();
     let index = history_index(object);
     if index < 0 {
         return Err(CounterError::DataNotAvailable);
@@ -389,24 +429,27 @@ fn history_difference(
         back += HISTORY_LENGTH;
     }
     out.value = value_at(object, index).wrapping_sub(value_at(object, back));
-    if query.0 & 0x130 == 0x110 {
-        out.sample_type = 0x110;
+    // A rate class per-frame query, tested with one mask as stock does.
+    const PER_FRAME_RATE: u32 = sample_type(CounterClass::RATE, RateUnit::PER_FRAME);
+    if query.0 & (CounterClass::MASK | RateUnit::PER_FRAME.bits()) == PER_FRAME_RATE {
+        out.sample_type = PER_FRAME_RATE;
         out.rate = u64::from(frame_at(object, index).wrapping_sub(frame_at(object, back)));
     } else {
         out.rate = u64::from(rate_at(object, index).wrapping_sub(rate_at(object, back)));
-        out.sample_type = if class == CLASS_RATE {
-            if query.contains(0x200) {
-                0x210
-            } else if query.contains(0x40) {
+        out.sample_type = if class == CounterClass::RATE {
+            if query.unit().contains(RateUnit::PER_TICK) {
+                sample_type(CounterClass::RATE, RateUnit::PER_TICK)
+            } else if query.unit().contains(RateUnit::PER_SECOND) {
                 out.value = out.value.wrapping_mul(1000);
-                0x50
+                sample_type(CounterClass::RATE, RateUnit::PER_SECOND)
             } else {
-                0x90
+                sample_type(CounterClass::RATE, RateUnit::PER_MILLISECOND)
             }
-        } else if class == CLASS_RATIO {
-            0x20
+        } else if class == CounterClass::RATIO {
+            sample_type(CounterClass::RATIO, RateUnit::empty())
         } else {
-            0x210
+            // Stock reports a rate-per-tick type for any other class.
+            sample_type(CounterClass::RATE, RateUnit::PER_TICK)
         };
     }
     out.sample_type |= count as u32;

@@ -311,7 +311,10 @@ fn modifyq_merges_settings() {
     assert_eq!(
         config,
         QueueConfig {
-            mask: ConfigMask(0x0f),
+            mask: ConfigMask::LIMITS
+                | ConfigMask::RATE
+                | ConfigMask::TOKEN_RATE
+                | ConfigMask::BUCKET,
             packet_limit: 5,
             byte_limit: 0x1000,
             rate: 10_000_000,

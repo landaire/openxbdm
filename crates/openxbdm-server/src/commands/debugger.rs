@@ -7,6 +7,7 @@ mod direct;
 mod events;
 mod kd;
 
+use crate::commands::system::hardware_flags;
 use core::fmt::Write as _;
 
 use openxbdm_core::status::ErrorCode;
@@ -25,8 +26,8 @@ pub use self::breakpoints::TRAP_INSTRUCTION;
 use self::context::CONTEXT_SIZE;
 pub use self::context::Context;
 pub use self::context::ContextFlags;
+// Field types of `Context` and `DirectException`.
 use self::context::ContextLine;
-pub use self::context::MSR_SINGLE_STEP;
 pub use self::direct::Delivery;
 pub use self::direct::DirectException;
 pub use self::direct::DirectNotice;
@@ -45,6 +46,8 @@ pub use self::kd::load_extension;
 pub use self::kd::release_extension;
 use crate::access::Access;
 use crate::backend::Backend as AnyBackend;
+use crate::commands::console::ConfigSetting;
+use crate::commands::console::ConsoleConfigFlags;
 use crate::commands::services::ThreadHandle;
 use crate::commands::system::SettingsFile;
 use crate::commands::system::end_line;
@@ -67,44 +70,46 @@ use crate::text::LineText;
 use crate::text::Text;
 use crate::transfer_blocks::TransferBlock;
 use crate::transfer_blocks::TransferBlocks;
+pub use xbox360_sys::processor::Msr;
+pub use xbox360_sys::xboxkrnl::HardwareFlags;
 
 const fn entry(
     name: &'static str,
     flags: DispatchFlags,
     handler: fn(&mut Invocation<'_>) -> CommandResult,
 ) -> CommandEntry {
-    CommandEntry::new(name, Access::CONTROL, Access::NONE, flags, handler)
+    CommandEntry::new(name, Access::CONTROL, Access::empty(), flags, handler)
 }
 
 pub(crate) const COMMANDS: &[CommandEntry] = &[
     entry("break", DispatchFlags::DEVKIT_ONLY, set_breakpoint),
-    entry("continue", DispatchFlags::NONE, continue_thread),
-    entry("crashdump", DispatchFlags::NONE, crash_dump),
-    entry("dbgextld", DispatchFlags::NONE, kd::debugger_extension),
-    entry("debugger", DispatchFlags::NONE, debugger_identity),
-    entry("getcontext", DispatchFlags::NONE, get_context),
-    entry("getpid", DispatchFlags::NONE, get_process_id),
-    entry("go", DispatchFlags::NONE, go),
+    entry("continue", DispatchFlags::empty(), continue_thread),
+    entry("crashdump", DispatchFlags::empty(), crash_dump),
+    entry("dbgextld", DispatchFlags::empty(), kd::debugger_extension),
+    entry("debugger", DispatchFlags::empty(), debugger_identity),
+    entry("getcontext", DispatchFlags::empty(), get_context),
+    entry("getpid", DispatchFlags::empty(), get_process_id),
+    entry("go", DispatchFlags::empty(), go),
     entry("halt", DispatchFlags::DEVKIT_ONLY, halt),
     entry("isbreak", DispatchFlags::DEVKIT_ONLY, is_breakpoint),
-    entry("isdebugger", DispatchFlags::NONE, is_debugger),
-    entry("isstopped", DispatchFlags::NONE, is_stopped),
+    entry("isdebugger", DispatchFlags::empty(), is_debugger),
+    entry("isstopped", DispatchFlags::empty(), is_stopped),
     entry("kd", DispatchFlags::DEVKIT_ONLY, kd::kernel_debugger),
-    entry("kdlite", DispatchFlags::NONE, kd::kernel_debugger_lite),
+    entry("kdlite", DispatchFlags::empty(), kd::kernel_debugger_lite),
     entry(
         "kdnet",
         DispatchFlags::DEVKIT_ONLY,
         kd::kernel_debugger_network,
     ),
-    entry("nostopon", DispatchFlags::NONE, no_stop_on),
+    entry("nostopon", DispatchFlags::empty(), no_stop_on),
     entry("resume", DispatchFlags::DEVKIT_ONLY, resume_thread),
     entry("setcontext", DispatchFlags::DEVKIT_ONLY, set_context),
     entry("stop", DispatchFlags::DEVKIT_ONLY, stop),
-    entry("stopon", DispatchFlags::NONE, stop_on),
+    entry("stopon", DispatchFlags::empty(), stop_on),
     entry("suspend", DispatchFlags::DEVKIT_ONLY, suspend_thread),
-    entry("threadinfo", DispatchFlags::NONE, thread_info),
-    entry("threads", DispatchFlags::NONE, threads),
-    entry("threadstat", DispatchFlags::NONE, thread_status),
+    entry("threadinfo", DispatchFlags::empty(), thread_info),
+    entry("threads", DispatchFlags::empty(), threads),
+    entry("threadstat", DispatchFlags::empty(), thread_status),
 ];
 
 /// Kernel thread identifier.
@@ -121,30 +126,21 @@ pub enum ProcessKind {
 /// The order the monitor visits the processes in.
 static PROCESS_ORDER: [ProcessKind; 2] = [ProcessKind::Title, ProcessKind::System];
 
-/// Events that stop the reporting thread when they occur.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct StopOn(pub u32);
-
-impl StopOn {
-    pub const CREATE_THREAD: Self = Self(0x1);
-    /// First-chance exceptions.
-    pub const FIRST_CHANCE_EXCEPTION: Self = Self(0x2);
-    pub const DEBUG_STRING: Self = Self(0x4);
-    pub const STACK_TRACE: Self = Self(0x8);
-    pub const MODULE_LOAD: Self = Self(0x10);
-    pub const POGO_MODULE_START: Self = Self(0x40);
-
-    pub const fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
+xbox360_sys::flags! {
+    /// Events that stop the reporting thread when they occur.
+    pub struct StopOn(u32) {
+        CREATE_THREAD = 0x1,
+        /// First-chance exceptions.
+        FIRST_CHANCE_EXCEPTION = 0x2,
+        DEBUG_STRING = 0x4,
+        STACK_TRACE = 0x8,
+        MODULE_LOAD = 0x10,
+        /// Set only by `stopon all`: title reboots of reasons other than 0
+        /// and 4.
+        TITLE_REBOOT = 0x20,
+        POGO_MODULE_START = 0x40,
     }
 }
-
-/// Hardware information flag: a kernel debugger is attached.
-pub const HARDWARE_KERNEL_DEBUGGER: u32 = 0x100;
-/// Hardware information flag: the kernel debugger is enabled at boot.
-pub const HARDWARE_KD_ENABLED: u32 = 0x80;
-/// Hardware information flag: the console supports kd lite.
-pub const HARDWARE_KD_LITE: u32 = 0x0200_0000;
 
 /// Scheduler and stack information of a thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -172,17 +168,21 @@ pub struct ThreadName {
     pub length: u32,
 }
 
-/// Flags of an exception record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ExceptionFlags(pub u32);
+xbox360_sys::flags! {
+    /// Flags of an exception record.
+    pub struct ExceptionFlags(u32) {
+        /// The exception cannot be continued.
+        NONCONTINUABLE = 0x1,
+    }
+}
 
-impl ExceptionFlags {
-    pub const NONE: Self = Self(0);
-    /// The exception cannot be continued.
-    pub const NONCONTINUABLE: Self = Self(0x1);
-
-    pub const fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
+xbox360_sys::flags! {
+    /// Flags word of an exception notification.
+    pub struct ExceptionNotificationFlags(u32) {
+        /// The exception cannot be continued.
+        NONCONTINUABLE = 0x1,
+        /// The debugger sees the exception before the handlers do.
+        FIRST_CHANCE = 0x2,
     }
 }
 
@@ -204,7 +204,7 @@ impl Default for ExceptionRecord {
     fn default() -> Self {
         Self {
             code: NtStatus::SUCCESS,
-            flags: ExceptionFlags::NONE,
+            flags: ExceptionFlags::empty(),
             address: 0,
             parameter_count: 0,
             parameters: [0; 4],
@@ -214,13 +214,6 @@ impl Default for ExceptionRecord {
 }
 
 impl ExceptionRecord {
-    pub const BREAKPOINT: NtStatus = NtStatus(0x8000_0003);
-    pub const SINGLE_STEP: NtStatus = NtStatus(0x8000_0004);
-    pub const ACCESS_VIOLATION: NtStatus = NtStatus(0xc000_0005);
-    pub const STACK_OVERFLOW: NtStatus = NtStatus(0xc000_00fd);
-    pub const NT_ASSERT: NtStatus = NtStatus(0xc000_0420);
-    pub const THREAD_NAME: NtStatus = NtStatus(0x406d_1388);
-
     /// Trap code of a breakpoint exception (low half of the first
     /// parameter).
     pub const fn trap_code(&self) -> u16 {
@@ -257,8 +250,7 @@ pub struct ModuleEvent {
     pub timestamp: u32,
     pub pdata: u32,
     pub pdata_size: u32,
-    /// `ModuleFlags` bits.
-    pub flags: u32,
+    pub flags: ModuleFlags,
     pub image_size: u32,
     /// The image header was found.
     pub has_header: bool,
@@ -275,7 +267,7 @@ impl Default for ModuleEvent {
             timestamp: 0,
             pdata: 0,
             pdata_size: 0,
-            flags: 0,
+            flags: ModuleFlags::empty(),
             image_size: 0,
             has_header: false,
         }
@@ -287,11 +279,13 @@ pub const MODULE_NAME_CAPACITY: usize = 0x100;
 /// Bytes of a debug string or rip message a notification carries.
 pub const NOTICE_TEXT_CAPACITY: usize = 0x800;
 
-/// Module description flags.
-pub mod module_flags {
-    pub const TLS: u32 = 0x1;
-    pub const XBE: u32 = 0x2;
-    pub const DLL: u32 = 0x4;
+xbox360_sys::flags! {
+    /// Module description flags.
+    pub struct ModuleFlags(u32) {
+        TLS = 0x1,
+        XBE = 0x2,
+        DLL = 0x4,
+    }
 }
 
 /// What the platform reports to the monitor. The reporting thread waits
@@ -629,7 +623,7 @@ impl State {
             process_id: None,
             breakpoints: Breakpoints::new(),
             data_breakpoint: None,
-            stop_on: StopOn(0),
+            stop_on: StopOn::empty(),
             break_at_title_entry: false,
             saved_execution: ExecutionState::Stopped,
             kernel_debugger: None,
@@ -667,10 +661,9 @@ pub(crate) fn kernel_debugger_enabled(
     state: &mut ServerState,
     backend: &mut dyn AnyBackend,
 ) -> bool {
-    *state
-        .debugger
-        .kernel_debugger
-        .get_or_insert_with(|| backend.hardware_flags() & HARDWARE_KD_ENABLED != 0)
+    *state.debugger.kernel_debugger.get_or_insert_with(|| {
+        hardware_flags(backend).contains(HardwareFlags::KERNEL_DEBUGGER_ENABLED)
+    })
 }
 
 /// Apply the persisted kd lite flag (control code 0x63): console
@@ -678,12 +671,10 @@ pub(crate) fn kernel_debugger_enabled(
 pub fn refresh_kd_lite(state: &mut ServerState, backend: &mut dyn AnyBackend) {
     let mut value = [0u8; 4];
     let persisted = backend
-        .xconfig_get(
-            crate::commands::console::ConfigSetting::new(2, 6),
-            &mut value,
-        )
+        .xconfig_get(ConfigSetting::CONSOLE_FLAGS, &mut value)
         .is_ok()
-        && u32::from_be_bytes(value) & 0x2 != 0;
+        && ConsoleConfigFlags::from_bits_retain(u32::from_be_bytes(value))
+            .contains(ConsoleConfigFlags::KD_LITE);
     state.debugger.kd_lite = persisted;
 }
 
@@ -1492,7 +1483,7 @@ fn get_context(invocation: &mut Invocation<'_>) -> CommandResult {
         return Err(util::MISSING);
     };
     let line = invocation.line;
-    let mut flags = ContextFlags::NONE;
+    let mut flags = ContextFlags::empty();
     for (name, group) in [
         ("control", ContextFlags::CONTROL),
         ("int", ContextFlags::INTEGER),
@@ -1607,38 +1598,38 @@ const STOP_ON_FLAGS: [(&str, StopOn); 6] = [
     ("pogomodstart", StopOn::POGO_MODULE_START),
 ];
 
-fn stop_on_mask(invocation: &mut Invocation<'_>, all_text: &str) -> u32 {
+fn stop_on_mask(invocation: &mut Invocation<'_>, all_text: &str) -> StopOn {
     if invocation.line.has("all") {
         invocation.set_text(format_args!("{all_text}"));
-        return u32::MAX;
+        return StopOn::from_bits_retain(u32::MAX);
     }
     STOP_ON_FLAGS
         .iter()
         .filter(|(name, _)| invocation.line.has(name))
-        .fold(0, |mask, (_, flag)| mask | flag.0)
+        .fold(StopOn::empty(), |mask, &(_, flag)| mask | flag)
 }
 
 /// Set or clear stop-on flags (stock export 46, 0x91f26790).
 pub fn change_stop_on(state: &mut ServerState, mask: StopOn, enable: bool) {
-    let stop_on = &mut state.debugger.stop_on.0;
+    let stop_on = &mut state.debugger.stop_on;
     if enable {
-        *stop_on |= mask.0;
+        stop_on.insert(mask);
     } else {
-        *stop_on &= !mask.0;
+        stop_on.remove(mask);
     }
 }
 
 /// `stopon`.
 fn stop_on(invocation: &mut Invocation<'_>) -> CommandResult {
     let mask = stop_on_mask(invocation, "stop on all");
-    change_stop_on(invocation.state, StopOn(mask), true);
+    change_stop_on(invocation.state, mask, true);
     Ok(Reply::Ok)
 }
 
 /// `nostopon`.
 fn no_stop_on(invocation: &mut Invocation<'_>) -> CommandResult {
     let mask = stop_on_mask(invocation, "stop on none");
-    change_stop_on(invocation.state, StopOn(mask), false);
+    change_stop_on(invocation.state, mask, false);
     Ok(Reply::Ok)
 }
 

@@ -5,7 +5,7 @@
 //! outward by the console or attached by a `notify reconnectport=` peer.
 
 use crate::commands::debugger::ModuleEvent;
-use crate::commands::debugger::module_flags;
+use crate::commands::debugger::ModuleFlags;
 use crate::network::Endpoint;
 use crate::network::NetError;
 use crate::network::Network;
@@ -23,27 +23,13 @@ const SEND_TIMEOUT_MS: u32 = 60_000;
 /// Capacity of a formatted notification line.
 const EVENT_LINE_CAPACITY: usize = 0x230;
 
-/// Target flags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct TargetFlags(u32);
-
-impl TargetFlags {
-    pub const NONE: Self = Self(0);
-    /// Debugger notifications (`debug`).
-    pub const DEBUG: Self = Self(0x2);
-    /// The peer connects to the console (`reverse`).
-    pub const REVERSE: Self = Self(0x40000);
-
-    pub const fn bits(self) -> u32 {
-        self.0
-    }
-
-    pub const fn union(self, other: Self) -> Self {
-        Self(self.0 | other.0)
-    }
-
-    pub const fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
+xbox360_sys::flags! {
+    /// Target flags.
+    pub struct TargetFlags(u32) {
+        /// Debugger notifications (`debug`).
+        DEBUG = 0x2,
+        /// The peer connects to the console (`reverse`).
+        REVERSE = 0x40000,
     }
 }
 
@@ -319,8 +305,12 @@ impl Event<'_> {
                 thread,
                 stopped,
             } => {
-                let flag = |bit: u32, text: &'static [u8]| {
-                    if module.flags & bit != 0 { text } else { b"" }
+                let flag = |bit: ModuleFlags, text: &'static [u8]| {
+                    if module.flags.intersects(bit) {
+                        text
+                    } else {
+                        b""
+                    }
                 };
                 put(out, b"modload name=\"");
                 put(out, &module.name[..module.name_length]);
@@ -330,9 +320,9 @@ impl Event<'_> {
                 hex(out, b" timestamp=0x", module.timestamp);
                 hex(out, b" pdata=0x", module.pdata);
                 hex(out, b" psize=0x", module.pdata_size);
-                put(out, flag(module_flags::XBE, b" xbe"));
-                put(out, flag(module_flags::TLS, b" tls"));
-                put(out, flag(module_flags::DLL, b" dll"));
+                put(out, flag(ModuleFlags::XBE, b" xbe"));
+                put(out, flag(ModuleFlags::TLS, b" tls"));
+                put(out, flag(ModuleFlags::DLL, b" dll"));
                 hex(out, b" thread=0x", thread);
                 hex(out, b" osize=0x", module.image_size);
                 put(out, stop(stopped))
@@ -909,7 +899,7 @@ mod tests {
             timestamp: 0,
             pdata: 0,
             pdata_size: 0,
-            flags: module_flags::DLL,
+            flags: ModuleFlags::DLL,
             image_size: 0x1000,
             has_header: false,
         };
@@ -931,7 +921,7 @@ mod tests {
             timestamp: 7,
             pdata: 0x10,
             pdata_size: 0x20,
-            flags: module_flags::XBE | module_flags::TLS | module_flags::DLL,
+            flags: ModuleFlags::XBE | ModuleFlags::TLS | ModuleFlags::DLL,
             image_size: 0x30,
             has_header: true,
         };

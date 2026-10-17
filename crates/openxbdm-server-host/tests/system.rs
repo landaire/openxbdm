@@ -643,7 +643,7 @@ fn title_reboot_stops_by_reason_and_flags() {
         ..
     } = &mut *host;
     let state = &mut core.state;
-    state.system.boot_flags = BootFlags(BootFlags::WAIT.0 | BootFlags::STOP.0);
+    state.system.boot_flags = BootFlags::WAIT | BootFlags::STOP;
     assert_eq!(
         title_reboot_stop(state, backend, LaunchReason(0)),
         TitleRebootStop::Run
@@ -882,7 +882,7 @@ fn launch_export_translates_relaunches_or_reboots() {
 
     backend.system.relaunch_routine = false;
     // Execution is at reboot_title now, so only a cold launch restarts.
-    let cold_wait = BootFlags(BootFlags::WAIT.0 | BootFlags::COLD.0);
+    let cold_wait = BootFlags::WAIT | BootFlags::COLD;
     assert_eq!(
         launch_without_connection(core, backend, network, cold_wait, None),
         Ok(Reply::Sent)
@@ -905,7 +905,7 @@ fn settings_load_and_write_traces() {
     host.backend.system.recint = Some(b"wait\r\n".to_vec());
     // The mask is set before the saved settings run.
     host.server.state.console.trace_mask = TraceMask::SETTINGS;
-    host.backend.console.published.trace_mask = TraceMask::SETTINGS.0;
+    host.backend.console.published.trace_mask = TraceMask::SETTINGS.bits();
     let server = TestServer::with_host(host);
     let lines = settings_traced(&server.host.lock());
     let head = [
@@ -1169,7 +1169,7 @@ fn title_reboot_traces() {
         ..
     } = &mut *host;
     let state = &mut core.state;
-    state.system.boot_flags = BootFlags(BootFlags::WAIT.0 | BootFlags::STOP.0);
+    state.system.boot_flags = BootFlags::WAIT | BootFlags::STOP;
     trace_title_reboot(state, backend, LaunchReason(4));
     assert_eq!(
         title_reboot_stop(state, backend, LaunchReason(4)),

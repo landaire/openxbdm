@@ -16,6 +16,7 @@ use crate::access::Access;
 use crate::commands::console;
 use crate::commands::console::ConfigFlags;
 use crate::commands::console::ConfigSetting;
+use crate::commands::console::ConsoleConfigFlags;
 use crate::commands::console::RetailFlags;
 use crate::commands::console::UserFlags;
 use crate::commands::util;
@@ -40,26 +41,26 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
     entry(
         "autoinput",
         Access::CONTROL,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         auto_input,
     ),
-    entry("avatar", Access::CONTROL, DispatchFlags::NONE, avatar),
+    entry("avatar", Access::CONTROL, DispatchFlags::empty(), avatar),
     entry(
         "bkgdmodetest",
         Access::CONTROL,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         background_mode_test,
     ),
     entry(
         "bootanim",
         Access::CONTROL,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         boot_animation,
     ),
     entry(
         "builtinmu",
         Access::CONTROL,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         built_in_memory_unit,
     ),
     entry(
@@ -68,20 +69,25 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         DispatchFlags::DEVKIT_ONLY,
         enable_wireless_controllers,
     ),
-    entry("irtsweep", Access::CONTROL, DispatchFlags::NONE, irt_sweep),
+    entry(
+        "irtsweep",
+        Access::CONTROL,
+        DispatchFlags::empty(),
+        irt_sweep,
+    ),
     entry(
         "kinecthsmsg",
         Access::CONTROL,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         kinect_health_message,
     ),
     entry(
         "mdetect",
         Access::CONTROL,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         motion_detection,
     ),
-    entry("mixcmd", Access::READ, DispatchFlags::NONE, mix_command),
+    entry("mixcmd", Access::READ, DispatchFlags::empty(), mix_command),
     entry(
         "mockcurrencyvalue",
         Access::CONTROL,
@@ -91,39 +97,44 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
     entry(
         "oddlog",
         Access::CONTROL,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         optical_disc_log,
     ),
-    entry("playto", Access::NONE, DispatchFlags::DEVKIT_ONLY, play_to),
+    entry(
+        "playto",
+        Access::empty(),
+        DispatchFlags::DEVKIT_ONLY,
+        play_to,
+    ),
     entry(
         "pogoctrl",
         Access::CONTROL,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         pgo_control,
     ),
     entry(
         "runnuioobe",
         Access::CONTROL,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         run_nui_oobe,
     ),
-    entry("runoobe", Access::CONTROL, DispatchFlags::NONE, run_oobe),
+    entry("runoobe", Access::CONTROL, DispatchFlags::empty(), run_oobe),
     entry(
         "runoobecheckpoint",
         Access::CONTROL,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         run_oobe_checkpoint,
     ),
     entry(
         "tdecomp",
-        Access::NONE,
-        DispatchFlags::NONE,
+        Access::empty(),
+        DispatchFlags::empty(),
         title_decompression,
     ),
     entry(
         "usbportctrl",
         Access::CONFIG,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         usb_port_control,
     ),
 ];
@@ -134,7 +145,7 @@ const fn entry(
     flags: DispatchFlags,
     handler: fn(&mut Invocation<'_>) -> CommandResult,
 ) -> CommandEntry {
-    CommandEntry::new(name, any_of, Access::NONE, flags, handler)
+    CommandEntry::new(name, any_of, Access::empty(), flags, handler)
 }
 
 const BAD_PARAMETER: CommandError = CommandError::Status(ErrorCode::BadParameter);
@@ -145,8 +156,6 @@ const MISSING_PARAMETER: CommandError = CommandError::Hardware(HardwareError::Mi
 const SERVICE_FAILED: CommandError = CommandError::Hardware(HardwareError::ServiceFailed);
 /// `400-` with no text.
 const FAILED: CommandError = CommandError::Status(ErrorCode::Undefined);
-
-const BUILT_IN_MEMORY_UNIT_DISABLED: u32 = 0x4;
 
 /// Global state of this domain.
 #[derive(Debug)]
@@ -801,17 +810,9 @@ fn built_in_memory_unit(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(enable) = enable_flag(invocation) else {
         return Err(CommandError::Fail);
     };
-    let bits = if enable {
-        0
-    } else {
-        BUILT_IN_MEMORY_UNIT_DISABLED
-    };
-    update_setting(
-        invocation,
-        ConfigSetting::new(2, 6),
-        BUILT_IN_MEMORY_UNIT_DISABLED,
-        bits,
-    )
+    let disabled = ConsoleConfigFlags::BUILT_IN_MEMORY_UNIT_DISABLED.bits();
+    let bits = if enable { 0 } else { disabled };
+    update_setting(invocation, ConfigSetting::CONSOLE_FLAGS, disabled, bits)
 }
 
 /// Whether `enabled=` is `off` or `false`, compared over the first

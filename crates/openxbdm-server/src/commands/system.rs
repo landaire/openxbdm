@@ -19,6 +19,7 @@ use crate::commands::console::RetailFlags;
 use crate::commands::console::TraceMask;
 use crate::commands::console::trace;
 use crate::commands::console::trace_text;
+use crate::commands::debugger::StopOn;
 use crate::commands::filesystem::BasicInformation;
 use crate::commands::filesystem::CreateDisposition;
 use crate::commands::filesystem::CreateOptions;
@@ -41,6 +42,8 @@ use crate::reply::CommandResult;
 use crate::reply::Reply;
 use crate::server::Server;
 use crate::state::ServerState;
+use xbox360_sys::status::Facility;
+use xbox360_sys::xboxkrnl::HardwareFlags;
 
 /// Delay between the `200- OK` of a reboot and the reboot.
 const REBOOT_REPLY_DELAY_MS: u32 = 200;
@@ -55,40 +58,50 @@ const fn entry(
     flags: DispatchFlags,
     handler: fn(&mut Invocation<'_>) -> CommandResult,
 ) -> CommandEntry {
-    CommandEntry::new(name, any_of, Access::NONE, flags, handler)
+    CommandEntry::new(name, any_of, Access::empty(), flags, handler)
 }
 
 pub(crate) const COMMANDS: &[CommandEntry] = &[
     entry(
         "deftitle",
         Access::CONTROL,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         default_title,
     ),
-    entry("flash", Access::CONFIG, DispatchFlags::NONE, flash),
+    entry("flash", Access::CONFIG, DispatchFlags::empty(), flash),
     entry(
         "magicboot",
         Access::CONTROL,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         magic_boot,
     ),
-    entry("reboot", Access::CONTROL, DispatchFlags::NONE, reboot),
-    entry("recovery", Access::CONFIG, DispatchFlags::NONE, recovery),
+    entry("reboot", Access::CONTROL, DispatchFlags::empty(), reboot),
+    entry("recovery", Access::CONFIG, DispatchFlags::empty(), recovery),
     entry(
         "setdiscboot",
         Access::CONTROL,
         DispatchFlags::DEVKIT_ONLY,
         set_disc_boot,
     ),
-    entry("setreset", Access::NONE, DispatchFlags::NONE, set_reset),
+    entry(
+        "setreset",
+        Access::empty(),
+        DispatchFlags::empty(),
+        set_reset,
+    ),
     entry(
         "setsystime",
         Access::CONFIG,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         set_system_time,
     ),
-    entry("systime", Access::NONE, DispatchFlags::NONE, system_time),
-    entry("title", Access::CONTROL, DispatchFlags::NONE, title),
+    entry(
+        "systime",
+        Access::empty(),
+        DispatchFlags::empty(),
+        system_time,
+    ),
+    entry("title", Access::CONTROL, DispatchFlags::empty(), title),
 ];
 
 /// What the console does at the next boot before the title runs.
@@ -225,7 +238,7 @@ impl State {
             recovery_boot: false,
             title: LaunchTitle::EMPTY,
             persistent_title: LaunchTitle::EMPTY,
-            boot_flags: BootFlags(0),
+            boot_flags: BootFlags::empty(),
             internal_drive_map: false,
             hard_reboot_pending: false,
         }
@@ -263,7 +276,7 @@ pub struct FlashFailed(pub Win32Error);
 /// code, as the reply text prints it.
 impl From<FlashFailed> for Hresult {
     fn from(FlashFailed(error): FlashFailed) -> Self {
-        Hresult(0x8007_0000 | (error.code() & 0xffff))
+        Hresult::failure(Facility::WIN32, error.code() as u16)
     }
 }
 
@@ -333,7 +346,8 @@ pub trait Backend {
     /// Set the system clock (FILETIME) and tell the network stack the
     /// clock changed.
     fn set_system_time(&mut self, file_time: u64);
-    /// The first dword of the kernel hardware information.
+    /// The first dword of the kernel hardware information. Callers use
+    /// [`hardware_flags`].
     fn hardware_flags(&mut self) -> u32;
     /// The system registered a title launch routine that supports a
     /// relaunch (stock 0x91fa200c nonzero).
@@ -358,6 +372,11 @@ pub(crate) fn resume(
     match continuation {
         Continuation::Flash(upload) => resume_flash(upload, cx),
     }
+}
+
+/// The kernel hardware flags.
+pub(crate) fn hardware_flags(backend: &mut dyn AnyBackend) -> HardwareFlags {
+    HardwareFlags::from_bits_retain(backend.hardware_flags())
 }
 
 /// Append formatted text and the line terminator to a settings file
@@ -630,16 +649,13 @@ pub enum TitleRebootStop {
     Stop { forever: bool },
 }
 
-/// Stop-on bit set only by `stopon all`; it stops title reboots of
-/// reasons other than 0 and 4.
-const STOP_ON_TITLE_REBOOT: u32 = 0x20;
-
 /// Control code 0x21 (stock DmpTitleReboot 0x91f523a0) on entry with
 /// launch information: the reason and the launch flags.
 pub fn trace_title_reboot(state: &ServerState, backend: &mut dyn AnyBackend, reason: LaunchReason) {
     let text = format_args!(
         "[xbdm] DmpTitleReboot: Reason={}, g_XamGlobals.Flags=0x{:08x}\n",
-        reason.0 as i32, state.system.boot_flags.0
+        reason.0 as i32,
+        state.system.boot_flags.bits()
     );
     trace(state, backend, TraceMask::TITLE_LAUNCH, text);
 }
@@ -665,11 +681,11 @@ pub fn title_reboot_stop(
         }
         4 => {
             let flags = &mut state.system.boot_flags;
-            let stop = flags.0 & (BootFlags::WAIT.0 | BootFlags::STOP.0) != 0;
-            flags.0 &= !BootFlags::STOP.0;
+            let stop = flags.intersects(BootFlags::WAIT | BootFlags::STOP);
+            flags.remove(BootFlags::STOP);
             stop
         }
-        _ => state.debugger.stop_on.0 & STOP_ON_TITLE_REBOOT != 0,
+        _ => state.debugger.stop_on.contains(StopOn::TITLE_REBOOT),
     };
     if !stop {
         return TitleRebootStop::Run;
@@ -796,11 +812,11 @@ fn title_settings_lines(state: &ServerState, backend: &mut dyn AnyBackend, file:
     let current = &state.system.title;
     if !current.image.is_empty() {
         write_bytes(backend, file, b"title");
-        if state.system.boot_flags.0 != 0 {
+        if !state.system.boot_flags.is_empty() {
             write_text(
                 backend,
                 file,
-                format_args!(" flags=0x{:08x}", state.system.boot_flags.0),
+                format_args!(" flags=0x{:08x}", state.system.boot_flags.bits()),
             );
         }
         write_bytes(backend, file, b" name=\"");
@@ -1034,19 +1050,14 @@ fn recovery(invocation: &mut Invocation<'_>) -> CommandResult {
     launch(invocation, BootFlags::COLD, None)
 }
 
-/// Flags of a title launch (stock 0x91fa2324).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct BootFlags(pub u32);
-
-impl BootFlags {
-    pub const WAIT: Self = Self(0x1);
-    pub const COLD: Self = Self(0x4);
-    pub const STOP: Self = Self(0x8);
-    /// Export 125: the paths are object paths and are not translated.
-    pub const OBJECT_PATHS: Self = Self(0x10);
-
-    pub const fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
+xbox360_sys::flags! {
+    /// Flags of a title launch (stock 0x91fa2324).
+    pub struct BootFlags(u32) {
+        WAIT = 0x1,
+        COLD = 0x4,
+        STOP = 0x8,
+        /// Export 125: the paths are object paths and are not translated.
+        OBJECT_PATHS = 0x10,
     }
 }
 
@@ -1178,7 +1189,7 @@ const RESET_CHORD_SIZE: usize = 5;
 /// `setreset [chord=<string>]`: store the reset button chord (up to four
 /// characters), or report the stored one.
 fn set_reset(invocation: &mut Invocation<'_>) -> CommandResult {
-    let setting = ConfigSetting::new(2, 5);
+    let setting = ConfigSetting::RESET_CHORD;
     let mut chord = [0u8; RESET_CHORD_SIZE];
     let result = match invocation.line.param("chord") {
         Some(value) => {
@@ -1217,8 +1228,9 @@ fn set_reset(invocation: &mut Invocation<'_>) -> CommandResult {
 const TITLE_PATH_CAPACITY: usize = 0x100;
 /// Buffer of a string parameter of the title commands.
 const TITLE_PARAMETER_BUFFER: usize = 0x100;
-/// Launch flags that rule out a relaunch without a hardware reboot.
-const HARD_REBOOT_FLAGS: u32 = 0x6;
+/// Launch flags that rule out a relaunch without a hardware reboot. The
+/// meaning of bit 1 is not known.
+const HARD_REBOOT_FLAGS: BootFlags = BootFlags::COLD.union(BootFlags::from_bits_retain(0x2));
 /// Images under this prefix are launched without an existence check.
 const DISC_IMAGE_PREFIX: &[u8] = b"\\device\\cdrom0";
 const DEFAULT_TITLE_PATH: &[u8] = b"\\SystemRoot\\dashboard.xbx";
@@ -1463,18 +1475,13 @@ fn set_title(
     Ok(Reply::Ok)
 }
 
-/// Flags of export 81.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct TitleFlags(pub u32);
-
-impl TitleFlags {
-    /// The title also becomes the persistent title.
-    pub const PERSIST: Self = Self(0x1);
-    /// Clear the persistent title first.
-    pub const CLEAR_PERSISTENT: Self = Self(0x2);
-
-    pub const fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
+xbox360_sys::flags! {
+    /// Flags of export 81.
+    pub struct TitleFlags(u32) {
+        /// The title also becomes the persistent title.
+        PERSIST = 0x1,
+        /// Clear the persistent title first.
+        CLEAR_PERSISTENT = 0x2,
     }
 }
 
@@ -1523,7 +1530,7 @@ fn title(invocation: &mut Invocation<'_>) -> CommandResult {
     let line = invocation.line;
     let loading = invocation.session.is_none();
     if loading && let Some(flags) = line.dword("flags") {
-        invocation.state.system.boot_flags = BootFlags(flags);
+        invocation.state.system.boot_flags = BootFlags::from_bits_retain(flags);
     }
     if line.has("nopersist") {
         invocation.state.system.persistent_title = LaunchTitle::default();
@@ -1608,13 +1615,13 @@ fn begin_launch(
     }
     let mut effective = flags;
     if !state.system.internal_drive_map
-        && commands::console::trinity_or_later(backend.hardware_flags())
+        && commands::console::trinity_or_later(hardware_flags(backend))
         && !backend.is_test_kit()
         && !commands::console::settings_block_readable(backend)
     {
-        effective = BootFlags(effective.0 | BootFlags::COLD.0);
+        effective.insert(BootFlags::COLD);
     }
-    if effective.0 & HARD_REBOOT_FLAGS == 0 {
+    if !effective.intersects(HARD_REBOOT_FLAGS) {
         if execution == ExecutionState::RebootTitle {
             return LaunchOutcome::Done(Ok(Reply::Ok));
         }
@@ -1746,7 +1753,7 @@ fn translate_optional_path<'p>(
 /// [cmdline=<s>]`: launch a title, relaunching in place when possible.
 fn magic_boot(invocation: &mut Invocation<'_>) -> CommandResult {
     let line = invocation.line;
-    let mut flags = 0;
+    let mut flags = BootFlags::empty();
     for (name, bit) in [
         ("warm", BootFlags::COLD),
         ("cold", BootFlags::COLD),
@@ -1754,7 +1761,7 @@ fn magic_boot(invocation: &mut Invocation<'_>) -> CommandResult {
         ("stop", BootFlags::STOP),
     ] {
         if line.has(name) {
-            flags |= bit.0;
+            flags.insert(bit);
         }
     }
     let mut paths = TitlePaths::EMPTY;
@@ -1780,7 +1787,7 @@ fn magic_boot(invocation: &mut Invocation<'_>) -> CommandResult {
         drive,
         command_line,
     });
-    launch(invocation, BootFlags(flags), request)
+    launch(invocation, flags, request)
 }
 
 /// `deftitle none` | `deftitle launcher` | `deftitle dir=<s> name=<s>`:

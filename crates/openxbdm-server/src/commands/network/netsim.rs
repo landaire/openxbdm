@@ -107,7 +107,8 @@ impl From<NetsimError> for Hresult {
             NetsimError::InstanceChanged => Hresult::ALREADY_STOPPED,
             NetsimError::OutOfMemory => ErrorCode::OutOfMemory.hresult(),
             NetsimError::ShortBuffer => Hresult::BUFFER_FULL,
-            NetsimError::Unencodable => Hresult(0x8007_0545),
+            // The library reports an unencodable item with its syntax error result.
+            NetsimError::Unencodable => classifier::compile_result::SYNTAX,
             NetsimError::Compile(error) => error.into(),
             NetsimError::Busy => Hresult::IN_PROGRESS,
         }
@@ -240,39 +241,38 @@ impl QueueKind {
     }
 }
 
-/// Field mask of a queue blob.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
-pub struct ConfigMask(pub u32);
+xbox360_sys::flags! {
+    /// Field mask of a queue blob.
+    pub struct ConfigMask(u32) {
+        /// Packet and byte limits.
+        LIMITS = 0x1,
+        /// Transmission rate in bits per second.
+        RATE = 0x2,
+        /// Token rate in bits per second.
+        TOKEN_RATE = 0x4,
+        /// Bucket depth in bytes.
+        BUCKET = 0x8,
+        /// Loss per [`LOSS_SCALE`] frames.
+        LOSS = 0x10,
+        /// Latency range in milliseconds.
+        LATENCY = 0x20,
+        /// Latency may reorder frames.
+        REORDER = 0x40,
+        /// Fill the bucket when the depth is set.
+        START_FULL = 0x80,
+        /// Empty the bucket when the depth is set.
+        START_EMPTY = 0x100,
+    }
+}
 
 impl ConfigMask {
-    /// Packet and byte limits.
-    pub const LIMITS: Self = Self(0x1);
-    /// Transmission rate in bits per second.
-    pub const RATE: Self = Self(0x2);
-    /// Token rate in bits per second.
-    pub const TOKEN_RATE: Self = Self(0x4);
-    /// Bucket depth in bytes.
-    pub const BUCKET: Self = Self(0x8);
-    /// Loss per [`LOSS_SCALE`] frames.
-    pub const LOSS: Self = Self(0x10);
-    /// Latency range in milliseconds.
-    pub const LATENCY: Self = Self(0x20);
-    /// Latency may reorder frames.
-    pub const REORDER: Self = Self(0x40);
-    /// Fill the bucket when the depth is set.
-    pub const START_FULL: Self = Self(0x80);
-    /// Empty the bucket when the depth is set.
-    pub const START_EMPTY: Self = Self(0x100);
     /// Fields of the settings struct.
-    const FIELDS: Self = Self(0x3f);
-
-    pub const fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
-    }
-
-    pub const fn intersects(self, other: Self) -> bool {
-        self.0 & other.0 != 0
-    }
+    const FIELDS: Self = Self::LIMITS
+        .union(Self::RATE)
+        .union(Self::TOKEN_RATE)
+        .union(Self::BUCKET)
+        .union(Self::LOSS)
+        .union(Self::LATENCY);
 }
 
 /// Queue settings as the blob and the library hold them (0x24-byte
@@ -340,7 +340,7 @@ pub fn parse_queue_blob(
         None
     };
     let mut config = QueueConfig {
-        mask: ConfigMask(reader.dword()?),
+        mask: ConfigMask::from_bits_retain(reader.dword()?),
         ..QueueConfig::default()
     };
     let mask = config.mask;
@@ -437,7 +437,7 @@ impl QueueConfig {
         let mask = self.mask;
         let mut out = QueueConfig::default();
         if mask.contains(ConfigMask::LIMITS) {
-            out.mask.0 |= ConfigMask::LIMITS.0;
+            out.mask.insert(ConfigMask::LIMITS);
             out.packet_limit = self.packet_limit;
             out.byte_limit = self.byte_limit;
         }
@@ -445,39 +445,41 @@ impl QueueConfig {
             if self.rate == 0 {
                 return Err(InvalidConfig);
             }
-            out.mask.0 |= ConfigMask::RATE.0;
+            out.mask.insert(ConfigMask::RATE);
             out.rate = self.rate;
         }
         if mask.contains(ConfigMask::TOKEN_RATE) {
             if self.token_rate == 0 {
                 return Err(InvalidConfig);
             }
-            out.mask.0 |= ConfigMask::TOKEN_RATE.0;
+            out.mask.insert(ConfigMask::TOKEN_RATE);
             out.token_rate = self.token_rate;
         }
-        let start = mask.0 & (ConfigMask::START_FULL.0 | ConfigMask::START_EMPTY.0);
+        let both = ConfigMask::START_FULL.union(ConfigMask::START_EMPTY);
+        let start = mask & both;
         if mask.contains(ConfigMask::BUCKET) {
-            out.mask.0 |= ConfigMask::BUCKET.0;
+            out.mask.insert(ConfigMask::BUCKET);
             out.bucket_depth = self.bucket_depth;
-            if start == ConfigMask::START_FULL.0 | ConfigMask::START_EMPTY.0 {
+            if start == both {
                 return Err(InvalidConfig);
             }
-            out.mask.0 |= start;
-        } else if start != 0 {
+            out.mask.insert(start);
+        } else if !start.is_empty() {
             return Err(InvalidConfig);
         }
         if mask.contains(ConfigMask::LOSS) {
             if self.loss > LOSS_SCALE {
                 return Err(InvalidConfig);
             }
-            out.mask.0 |= ConfigMask::LOSS.0;
+            out.mask.insert(ConfigMask::LOSS);
             out.loss = self.loss;
         }
         if mask.contains(ConfigMask::LATENCY) {
             if self.latency_min > self.latency_max {
                 return Err(InvalidConfig);
             }
-            out.mask.0 |= ConfigMask::LATENCY.0 | (mask.0 & ConfigMask::REORDER.0);
+            out.mask
+                .insert(ConfigMask::LATENCY | (mask & ConfigMask::REORDER));
             out.latency_min = self.latency_min;
             out.latency_max = self.latency_max;
         }
@@ -491,8 +493,8 @@ impl QueueConfig {
         let mask = update.mask;
         let rejected = match kind {
             QueueKind::Unshaped => ConfigMask::FIELDS,
-            QueueKind::Link => ConfigMask(ConfigMask::TOKEN_RATE.0 | ConfigMask::BUCKET.0),
-            QueueKind::TokenBucket => ConfigMask(ConfigMask::LOSS.0 | ConfigMask::LATENCY.0),
+            QueueKind::Link => ConfigMask::TOKEN_RATE.union(ConfigMask::BUCKET),
+            QueueKind::TokenBucket => ConfigMask::LOSS.union(ConfigMask::LATENCY),
         };
         if mask.intersects(rejected) {
             return Err(InvalidConfig);
@@ -511,10 +513,9 @@ impl QueueConfig {
             self.token_rate = update.token_rate;
         }
         if mask.contains(ConfigMask::BUCKET) {
-            if !mask.intersects(ConfigMask(
-                ConfigMask::START_FULL.0 | ConfigMask::START_EMPTY.0,
-            )) {
-                self.mask.0 &= !(ConfigMask::START_FULL.0 | ConfigMask::START_EMPTY.0);
+            let start = ConfigMask::START_FULL.union(ConfigMask::START_EMPTY);
+            if !mask.intersects(start) {
+                self.mask.remove(start);
             }
             self.bucket_depth = update.bucket_depth;
         }
@@ -525,7 +526,7 @@ impl QueueConfig {
             self.latency_min = update.latency_min;
             self.latency_max = update.latency_max;
         }
-        self.mask.0 |= mask.0;
+        self.mask.insert(mask);
         Ok(())
     }
 }
@@ -611,14 +612,13 @@ pub struct RedirectSnapshot {
     pub program: Option<Program>,
 }
 
-/// `XeKeysGetStatus` result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KeyStatus(pub u32);
-
-impl KeyStatus {
-    /// Settings-file `netsim reload` lines are skipped while this status
-    /// bit is set (DoIniLine 0x91f311b8); its meaning is not identified.
-    pub const SKIP_SETTINGS_RELOAD: u32 = 0x8;
+xbox360_sys::flags! {
+    /// `XeKeysGetStatus` result.
+    pub struct KeyStatus(u32) {
+        /// Settings-file `netsim reload` lines are skipped while this status
+        /// bit is set (DoIniLine 0x91f311b8); its meaning is not identified.
+        SKIP_SETTINGS_RELOAD = 0x8,
+    }
 }
 
 /// Platform services `netsim` needs: the simulator library. Every queue and
@@ -893,8 +893,8 @@ fn execute(
 
 /// Settings-file `netsim` line (DoIniLine 0x91f311b8).
 pub(crate) fn ini_netsim(invocation: &mut Invocation<'_>) {
-    let KeyStatus(key_status) = invocation.backend.key_status();
-    if key_status & KeyStatus::SKIP_SETTINGS_RELOAD != 0 && invocation.line.has("reload") {
+    let key_status = invocation.backend.key_status();
+    if key_status.intersects(KeyStatus::SKIP_SETTINGS_RELOAD) && invocation.line.has("reload") {
         return;
     }
     let _ = netsim(invocation);

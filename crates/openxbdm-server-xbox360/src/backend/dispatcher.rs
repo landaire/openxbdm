@@ -483,7 +483,7 @@ extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: u32) ->
         0xa8 => session::service_rpc_drain(argument),
         0xa9 => session::service_send_notification(argument),
         0x63 => {
-            if hardware_flags().bits() & debugger::HARDWARE_KD_LITE != 0 {
+            if hardware_flags().contains(xboxkrnl::HardwareFlags::TEST_KIT) {
                 KD_LITE_REFRESH.store(true, Ordering::Release);
             }
             0
@@ -554,7 +554,7 @@ pub(crate) fn drain(server: &mut Server, console: &mut Console, network: &mut Xa
     let state = &server.state.debugger;
     let kd = state
         .kernel_debugger
-        .unwrap_or(hardware_flags().bits() & debugger::HARDWARE_KD_ENABLED != 0);
+        .unwrap_or(hardware_flags().contains(xboxkrnl::HardwareFlags::KERNEL_DEBUGGER_ENABLED));
     KERNEL_DEBUGGER.store(kd, Ordering::Relaxed);
     DEBUGGER_ADDRESS.store(state.debugger.address, Ordering::Relaxed);
     DEBUGGER_PORT.store(state.debugger.port, Ordering::Relaxed);

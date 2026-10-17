@@ -21,6 +21,7 @@ use super::pmc::Setup;
 use crate::backend::Backend;
 use crate::commands::filesystem::DriveTable;
 use crate::commands::filesystem::ObjectPath;
+use crate::commands::memory::PAGE_SIZE;
 use crate::reply;
 use crate::reply::CommandError;
 use crate::reply::Reply;
@@ -113,7 +114,7 @@ impl From<CaptureError> for Hresult {
             CaptureError::TooLong => Hresult::DURATION_EXCEEDED,
             CaptureError::CountersUnavailable => Hresult::NOT_ACQUIRED,
             CaptureError::CountersLost => Hresult::NOT_OWNER,
-            CaptureError::Busy => Hresult(0x8007_00aa),
+            CaptureError::Busy => Win32Error::BUSY.into(),
             CaptureError::Kernel(error) => error.into(),
             CaptureError::Write(error) => error.into(),
             CaptureError::Title(result) => result,
@@ -159,7 +160,6 @@ pub const fn call_cap_state(present: bool) -> Result<CaptureReply, CaptureError>
 
 /// Ceiling of a requested buffer size.
 const BUFFER_SIZE_LIMIT: u32 = 0x1000_0000;
-const PAGE_SIZE: u32 = 0x1000;
 /// Probe range of the default buffer size, in MiB.
 const PROBE_MEGABYTES: u32 = 0x100;
 /// Ceiling of the chunk size when several processors record.

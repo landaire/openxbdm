@@ -302,13 +302,13 @@ fn nicstats_prints_counters() {
 /// The observable fields of a proxy entry.
 #[derive(Debug, PartialEq, Eq)]
 struct Proxy {
-    flags: u32,
+    flags: ProxyFlags,
     name: Option<Vec<u8>>,
     port: u32,
     certificate: Vec<u8>,
 }
 
-fn proxy(flags: u32, name: Option<&[u8]>, port: u32, certificate: &[u8]) -> Proxy {
+fn proxy(flags: ProxyFlags, name: Option<&[u8]>, port: u32, certificate: &[u8]) -> Proxy {
     Proxy {
         flags,
         name: name.map(<[u8]>::to_vec),
@@ -325,7 +325,7 @@ fn proxies(server: &TestServer) -> Vec<Proxy> {
         .entries
         .iter()
         .map(|entry| Proxy {
-            flags: entry.flags.0,
+            flags: entry.flags,
             name: entry.name.clone(),
             port: entry.port,
             certificate: entry.certificate.clone(),

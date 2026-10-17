@@ -39,15 +39,21 @@ const fn entry(
     any_of: Access,
     handler: crate::registry::Handler,
 ) -> CommandEntry {
-    CommandEntry::new(name, any_of, Access::NONE, DispatchFlags::NONE, handler)
+    CommandEntry::new(
+        name,
+        any_of,
+        Access::empty(),
+        DispatchFlags::empty(),
+        handler,
+    )
 }
 
 pub(crate) const COMMANDS: &[CommandEntry] = &[
     entry("adminpw", Access::MANAGE, admin_password),
-    entry("authuser", Access::NONE, authenticate_user),
-    entry("boxid", Access::NONE, box_id),
-    entry("getuserpriv", Access::NONE, get_user_privileges),
-    entry("keyxchg", Access::NONE, key_exchange),
+    entry("authuser", Access::empty(), authenticate_user),
+    entry("boxid", Access::empty(), box_id),
+    entry("getuserpriv", Access::empty(), get_user_privileges),
+    entry("keyxchg", Access::empty(), key_exchange),
     entry("lockmode", Access::MANAGE, lock_mode),
     entry("setuserpriv", Access::MANAGE, set_user_privileges),
     entry("user", Access::MANAGE, user),
@@ -241,7 +247,9 @@ fn parse_privileges(line: &CommandLine<'_>) -> Access {
     PRIVILEGE_WORDS
         .iter()
         .filter(|(_, word)| line.has(word))
-        .fold(Access::NONE, |privileges, &(bit, _)| privileges.union(bit))
+        .fold(Access::empty(), |privileges, &(bit, _)| {
+            privileges.union(bit)
+        })
 }
 
 /// ` read`, ` write`, ... for each privilege held.
@@ -380,9 +388,9 @@ fn authenticate_user(invocation: &mut Invocation<'_>) -> CommandResult {
             Some(Password(secret))
                 if auth::response(auth::Password(secret), challenge).0 == value =>
             {
-                Access::ALL
+                Access::UNRESTRICTED
             }
-            _ => Access::NONE,
+            _ => Access::empty(),
         }
     } else {
         let Some(name) = line.param("name") else {
@@ -392,18 +400,18 @@ fn authenticate_user(invocation: &mut Invocation<'_>) -> CommandResult {
         let mut buffer = [0u8; AUTH_NAME_CAPACITY];
         let name = name.copy_into(&mut buffer);
         match invocation.backend.find_user(name) {
-            None => Access::NONE,
+            None => Access::empty(),
             Some(user) => match (user.password, mode) {
                 (Some(Password(secret)), AuthMode::Response) => {
                     if auth::response(auth::Password(secret), challenge).0 == value {
                         user.privileges
                     } else {
-                        Access::NONE
+                        Access::empty()
                     }
                 }
                 (Some(_), AuthMode::SetPassword) => {
                     mode = AuthMode::Response;
-                    Access::NONE
+                    Access::empty()
                 }
                 (None, AuthMode::SetPassword) => {
                     let updated = User {
@@ -417,13 +425,13 @@ fn authenticate_user(invocation: &mut Invocation<'_>) -> CommandResult {
                 }
                 (None, AuthMode::Response) => {
                     mode = AuthMode::SetPassword;
-                    Access::NONE
+                    Access::empty()
                 }
             },
         }
     };
     session.access = privileges;
-    if privileges != Access::NONE {
+    if privileges != Access::empty() {
         Ok(Reply::Ok)
     } else if mode == AuthMode::SetPassword {
         Err(ErrorCode::KeyExchangeRequired.into())
@@ -456,7 +464,7 @@ fn get_user_privileges(invocation: &mut Invocation<'_>) -> CommandResult {
         }
     };
     invocation.text.clear();
-    if privileges == Access::NONE {
+    if privileges == Access::empty() {
         invocation.text.set_bytes(b"none");
     } else {
         // The monitor writes each word with a leading space one byte before

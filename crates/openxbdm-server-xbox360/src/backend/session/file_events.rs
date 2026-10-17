@@ -12,14 +12,13 @@ use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::commands::session::EventPath;
 use openxbdm_server::commands::session::FILE_EVENT_TEXT_LIMIT;
-use openxbdm_server::commands::session::FLAG_BUFFERED;
-use openxbdm_server::commands::session::FLAG_SCATTER_GATHER;
-use openxbdm_server::commands::session::FLAG_SYNCHRONOUS;
 use openxbdm_server::commands::session::FileEventBegin;
+use openxbdm_server::commands::session::FileEventFlags;
 use openxbdm_server::commands::session::FileEventId;
 use openxbdm_server::commands::session::FileEventText;
 use openxbdm_server::commands::session::PseudoBegin;
 use openxbdm_server::commands::session::PseudoBeginIo;
+use openxbdm_server::commands::session::PseudoOptions;
 use openxbdm_server::commands::session::file_event_kind;
 use openxbdm_server::commands::session::format_file_event_begin;
 use openxbdm_server::commands::session::format_file_event_end;
@@ -202,7 +201,7 @@ extern "C" fn pseudo_begin(library: u32, path: u32, options: u32, id: u32) -> u3
         library: string(library),
         time_base: event_time(),
         thread_id,
-        options,
+        options: PseudoOptions::from_bits_retain(options),
         path: ansi_path(path),
     };
     send(&format_pseudo_begin(&event))
@@ -254,7 +253,7 @@ extern "C" fn pseudo_begin_io(
         handle,
         offset,
         bytes,
-        options,
+        options: PseudoOptions::from_bits_retain(options),
     };
     send(&format_pseudo_begin_io(&event))
 }
@@ -325,7 +324,7 @@ pub(crate) fn service_file_event_begin(record: u32) -> u32 {
     let operation = read_u32(record + EVENT_OPERATION);
     let handle = read_u32(record + EVENT_HANDLE);
     let mut offset = 0u64;
-    let mut flags = 0u32;
+    let mut flags = FileEventFlags::empty();
     match operation {
         3..=6 => {
             let pointer = read_u32(record + EVENT_OFFSET);
@@ -366,7 +365,7 @@ pub(crate) fn service_file_event_begin(record: u32) -> u32 {
                 flags = mode_flags(mode);
             }
             if matches!(operation, 5 | 6) {
-                flags |= FLAG_SCATTER_GATHER;
+                flags |= FileEventFlags::SCATTER_GATHER;
             }
         }
         0 | 1 => flags = mode_flags(read_u32(record + EVENT_OPTIONS)),
@@ -398,13 +397,13 @@ pub(crate) fn service_file_event_begin(record: u32) -> u32 {
 }
 
 /// Begin flags from file mode or create option bits.
-fn mode_flags(mode: u32) -> u32 {
-    let mut flags = 0;
+fn mode_flags(mode: u32) -> FileEventFlags {
+    let mut flags = FileEventFlags::empty();
     if mode & FILE_SYNCHRONOUS_IO_NONALERT != 0 {
-        flags |= FLAG_SYNCHRONOUS;
+        flags |= FileEventFlags::SYNCHRONOUS;
     }
     if mode & FILE_NO_INTERMEDIATE_BUFFERING == 0 {
-        flags |= FLAG_BUFFERED;
+        flags |= FileEventFlags::BUFFERED;
     }
     flags
 }

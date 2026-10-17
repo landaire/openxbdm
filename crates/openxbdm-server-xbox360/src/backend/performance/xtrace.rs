@@ -567,10 +567,10 @@ impl Thread for TrapFrame {
     }
 }
 
-fn cache() -> &'static mut [u32; xtrace::CACHE_WORDS] {
-    // SAFETY: the session allocation holds the cache at `CACHE`; only the
-    // traced thread's handler uses it.
-    unsafe { &mut *(CACHE.load(Ordering::Relaxed) as usize as *mut [u32; xtrace::CACHE_WORDS]) }
+fn cache() -> &'static [AtomicU32; xtrace::CACHE_WORDS] {
+    // SAFETY: the session allocation holds the cache at `CACHE`, whose words
+    // are only accessed atomically.
+    unsafe { &*(CACHE.load(Ordering::Relaxed) as usize as *const [AtomicU32; xtrace::CACHE_WORDS]) }
 }
 
 /// Record the instruction at `iar` (stock 0x91f66288); false when no
@@ -1272,7 +1272,7 @@ extern "C" fn start_recording_at(name: u32, start: u32, record_nested: u32) -> u
     }
     session()
         .encoder
-        .set_start((start != 0).then_some(start), record_nested != 0);
+        .set_start(core::num::NonZeroU32::new(start), record_nested != 0);
     start_body(name)
 }
 export!(134, start_recording_at);

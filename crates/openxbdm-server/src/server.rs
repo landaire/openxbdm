@@ -227,10 +227,10 @@ impl Server {
             let _ = banner.push_bytes(b" nonce=0q");
             let _ = banner.push_hex32(nonce[0]);
             let _ = banner.push_hex32(nonce[1]);
-            (Access::NONE, nonce)
+            (Access::empty(), nonce)
         } else {
             let _ = banner.push_bytes(b"201- connected");
-            (Access::ALL, self.nonces[slot])
+            (Access::UNRESTRICTED, self.nonces[slot])
         };
         if send_line(network, socket, banner.as_bytes()).is_err() {
             network.close(socket);
@@ -1032,10 +1032,10 @@ impl Server {
             }
             Some(SessionRequest::Dedicate(target)) => {
                 let flags = match target {
-                    DedicateTarget::Main => ProcessorFlags::NONE,
+                    DedicateTarget::Main => ProcessorFlags::empty(),
                     DedicateTarget::Processor(processor_index) => backend
                         .processor(processor_index)
-                        .map_or(ProcessorFlags::NONE, |p| p.flags),
+                        .map_or(ProcessorFlags::empty(), |p| p.flags),
                 };
                 let Some(connection) = self.connections[slot].as_mut() else {
                     return Outcome::Released;

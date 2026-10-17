@@ -275,6 +275,6 @@ impl netsim::Backend for MockBackend {
     }
 
     fn key_status(&mut self) -> KeyStatus {
-        KeyStatus(self.network.netsim.key_status)
+        KeyStatus::from_bits_retain(self.network.netsim.key_status)
     }
 }

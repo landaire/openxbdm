@@ -31,7 +31,7 @@ use openxbdm_server::commands::hardware::pgo::Fatal;
 use openxbdm_server::commands::hardware::pgo::IniDirective;
 use openxbdm_server::commands::hardware::pgo::ListHead;
 use openxbdm_server::commands::hardware::pgo::ModuleShape;
-use openxbdm_server::commands::hardware::pgo::PAGE_SIZE;
+use openxbdm_server::commands::memory::PAGE_SIZE;
 use openxbdm_server::commands::hardware::pgo::PATH_UNITS;
 use openxbdm_server::commands::hardware::pgo::PgoOption;
 use openxbdm_server::commands::hardware::pgo::ProfileName;

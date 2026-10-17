@@ -22,34 +22,28 @@ const FILE_PARAMETER_SIZE: usize = 0x104;
 /// bytes.
 const OBJECT_PATH_SIZE: usize = 0x104;
 
-/// `start` flags (0x91f9f694).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct CaptureFlags(pub u32);
+xbox360_sys::flags! {
+    /// `start` flags (0x91f9f694).
+    pub struct CaptureFlags(u32) {
+        /// Put the adapter in promiscuous mode for the capture.
+        PROMISCUOUS = 0x1,
+        /// Skip received frames sent to the broadcast address.
+        SKIP_BROADCAST = 0x2,
+        /// Skip received frames sent to other group addresses.
+        SKIP_MULTICAST = 0x4,
+        /// Keep capturing when the title exits; also selects the smaller
+        /// buffer defaults and the allocation pool that survives title
+        /// termination.
+        PERSISTENT = 0x8,
+    }
+}
 
 impl CaptureFlags {
-    /// Put the adapter in promiscuous mode for the capture.
-    pub const PROMISCUOUS: Self = Self(0x1);
-    /// Skip received frames sent to the broadcast address.
-    pub const SKIP_BROADCAST: Self = Self(0x2);
-    /// Skip received frames sent to other group addresses.
-    pub const SKIP_MULTICAST: Self = Self(0x4);
-    /// Keep capturing when the title exits; also selects the smaller buffer
-    /// defaults and the allocation pool that survives title termination.
-    pub const PERSISTENT: Self = Self(0x8);
-
-    pub const fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
-    }
-
-    const fn without(self, other: Self) -> Self {
-        Self(self.0 & !other.0)
-    }
-
     /// Whether the receive callback leaves `frame` out of the capture
     /// (0x91f34e78). Received frames only; transmitted frames are always
     /// recorded.
     pub fn skips_received(self, frame: &[u8]) -> bool {
-        if self.0 & (Self::SKIP_BROADCAST.0 | Self::SKIP_MULTICAST.0) == 0 || frame.len() <= 6 {
+        if !self.intersects(Self::SKIP_BROADCAST.union(Self::SKIP_MULTICAST)) || frame.len() <= 6 {
             return false;
         }
         if frame[..6] == [0xff; 6] {
@@ -182,7 +176,7 @@ fn start(invocation: &mut Invocation<'_>) -> CommandResult {
     let dword = |name| line.dword(name).unwrap_or(0);
     let data_limit = dword("maxframedata");
     let buffer = dword("buffersize");
-    let flags = CaptureFlags(dword("flags"));
+    let flags = CaptureFlags::from_bits_retain(dword("flags"));
     let Some(file) = line.param("file") else {
         return Err(ErrorCode::FilenameInvalid.into());
     };
@@ -263,7 +257,7 @@ pub fn start_capture(
     };
     backend.open_capture(&request).map_err(StartError::Open)?;
     if flags.contains(CaptureFlags::PROMISCUOUS) && !backend.set_promiscuous(true) {
-        flags = flags.without(CaptureFlags::PROMISCUOUS);
+        flags.remove(CaptureFlags::PROMISCUOUS);
     }
     if let Err(error) = backend.attach_capture(flags) {
         // Stock leaves promiscuous mode on here.
@@ -377,7 +371,7 @@ mod tests {
     #[test]
     fn buffer_sizes_follow_the_flags() {
         assert_eq!(
-            BufferSizes::new(None, CaptureFlags(0)),
+            BufferSizes::new(None, CaptureFlags::empty()),
             BufferSizes {
                 buffer: 0x20000,
                 chunk: 0x4000
@@ -398,14 +392,14 @@ mod tests {
             }
         );
         assert_eq!(
-            BufferSizes::new(Some(0x10_0000), CaptureFlags(0)),
+            BufferSizes::new(Some(0x10_0000), CaptureFlags::empty()),
             BufferSizes {
                 buffer: 0x10_0000,
                 chunk: 0x4000
             }
         );
         assert_eq!(
-            BufferSizes::new(Some(1), CaptureFlags(0)),
+            BufferSizes::new(Some(1), CaptureFlags::empty()),
             BufferSizes {
                 buffer: 1,
                 chunk: 0
@@ -418,7 +412,7 @@ mod tests {
         let broadcast = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0];
         let multicast = [0x01, 0x00, 0x5e, 0, 0, 1, 0];
         let unicast = [0x00, 0x0d, 0x3a, 0, 0, 1, 0];
-        let both = CaptureFlags(CaptureFlags::SKIP_BROADCAST.0 | CaptureFlags::SKIP_MULTICAST.0);
+        let both = CaptureFlags::SKIP_BROADCAST | CaptureFlags::SKIP_MULTICAST;
         assert!(both.skips_received(&broadcast));
         assert!(both.skips_received(&multicast));
         assert!(!both.skips_received(&unicast));

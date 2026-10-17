@@ -11,6 +11,7 @@ use core::fmt::Write as _;
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
+use openxbdm_core::status::NtStatus;
 
 use crate::backend::Backend as AnyBackend;
 use crate::commands::filesystem::CreateDisposition;
@@ -30,30 +31,11 @@ use crate::text::Text;
 /// Bytes the writer collects before writing to the file.
 pub const TELL_LOG_BUFFER_SIZE: usize = 0x2000;
 
-/// Area bits of the open log; each producer component owns bits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TellLogAreas(pub u32);
-
-impl TellLogAreas {
-    pub const NONE: Self = Self(0);
-    /// Enables the critical section wait trace lines.
-    pub const CRITICAL_SECTIONS: Self = Self(2);
-
-    pub const fn union(self, other: Self) -> Self {
-        Self(self.0 | other.0)
-    }
-
-    /// The bits of `self` not in `other`.
-    pub const fn difference(self, other: Self) -> Self {
-        Self(self.0 & !other.0)
-    }
-
-    pub const fn intersects(self, other: Self) -> bool {
-        self.0 & other.0 != 0
-    }
-
-    pub const fn is_empty(self) -> bool {
-        self.0 == 0
+xbox360_sys::flags! {
+    /// Area bits of the open log; each producer component owns bits.
+    pub struct TellLogAreas(u32) {
+        /// Enables the critical section wait trace lines.
+        CRITICAL_SECTIONS = 2,
     }
 }
 
@@ -64,8 +46,6 @@ const PATH_PREFIX: &[u8] = br"\Device\Harddisk0\Partition1\DEVKIT\";
 const FILE_NAME_CAPACITY: usize = 0x104;
 const DEFAULT_ENTRY_SIZE: u32 = 0x80;
 const DEFAULT_ENTRIES: u32 = 0x200;
-/// Results carry this bit on top of a kernel or engine status.
-const STATUS_FLAG: u32 = 0x1000_0000;
 
 /// Record engine parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,12 +99,19 @@ pub enum TellLogReply {
     Stopped,
 }
 
+impl TellLogReply {
+    /// Stock returns the bare Win32 codes 1056 and 1172 for these replies,
+    /// not HRESULTs built from them.
+    const ALREADY_OPEN: Hresult = Hresult(0x420);
+    const NOT_OPEN: Hresult = Hresult(0x494);
+}
+
 impl From<TellLogReply> for Hresult {
     fn from(reply: TellLogReply) -> Self {
         match reply {
-            TellLogReply::AlreadyOpen => Hresult(0x420),
-            TellLogReply::NotOpen => Hresult(0x494),
-            TellLogReply::Started | TellLogReply::Stopped => Hresult(STATUS_FLAG),
+            TellLogReply::AlreadyOpen => TellLogReply::ALREADY_OPEN,
+            TellLogReply::NotOpen => TellLogReply::NOT_OPEN,
+            TellLogReply::Started | TellLogReply::Stopped => Hresult::from_nt(NtStatus::SUCCESS),
         }
     }
 }
@@ -135,7 +122,8 @@ pub struct TellLogFailed(pub LogEngineError);
 
 impl From<TellLogFailed> for Hresult {
     fn from(TellLogFailed(error): TellLogFailed) -> Self {
-        Hresult(Hresult::from(error).0 | STATUS_FLAG)
+        // The engine result carries the NT bit as a kernel status would.
+        Hresult::from_nt(NtStatus(Hresult::from(error).0))
     }
 }
 
@@ -312,7 +300,11 @@ pub(super) fn tell_log(invocation: &mut Invocation<'_>) -> CommandResult {
         else {
             return Err(ErrorCode::BadParameter.into());
         };
-        let Some(area) = invocation.line.dword("area").map(TellLogAreas) else {
+        let Some(area) = invocation
+            .line
+            .dword("area")
+            .map(TellLogAreas::from_bits_retain)
+        else {
             return Err(ErrorCode::BadParameter.into());
         };
         // Absent values select blocking off and the engine defaults.
@@ -328,7 +320,7 @@ pub(super) fn tell_log(invocation: &mut Invocation<'_>) -> CommandResult {
         let area = invocation
             .line
             .dword("area")
-            .map_or(TellLogAreas::NONE, TellLogAreas);
+            .map_or(TellLogAreas::empty(), TellLogAreas::from_bits_retain);
         stop(invocation.backend, area)
     } else {
         return Err(ErrorCode::UnknownCommand.into());

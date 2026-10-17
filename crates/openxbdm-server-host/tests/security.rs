@@ -31,7 +31,6 @@ use openxbdm_client::commands::UserEntry;
 use openxbdm_client::commands::UserList;
 use openxbdm_client::commands::security::DhValue;
 use openxbdm_core::status::Hresult;
-use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::Access;
 use openxbdm_server::commands::security;
 use openxbdm_server::commands::security::User;
@@ -736,13 +735,13 @@ fn exports_share_lock_state_and_users_with_commands() {
         )
         .map_err(Hresult::from)
     });
-    assert_eq!(unlocked, Err(ErrorCode::BoxNotLocked.hresult()));
+    assert_eq!(unlocked, Err(Hresult(0x82da_0014)));
     assert_eq!(
         export(&server, |state, backend| security::walk_users(
             state, backend, &mut 0
         )
         .map_err(Hresult::from)),
-        Err(Hresult::END_OF_DATA)
+        Err(Hresult(0x82da_0104))
     );
 
     assert_eq!(
@@ -794,10 +793,10 @@ fn exports_share_lock_state_and_users_with_commands() {
         )
         .map_err(Hresult::from)
     });
-    assert_eq!(again, Err(ErrorCode::FileAlreadyExists.hresult()));
+    assert_eq!(again, Err(Hresult(0x82da_000a)));
 
     // The access word is stored as given, including bits no command names.
-    let raw = Access::from_bits(0x8000_0001);
+    let raw = Access::from_bits_retain(0x8000_0001);
     assert_eq!(
         export(&server, |_, backend| security::set_user_access(
             backend, b"eve", raw
@@ -814,14 +813,14 @@ fn exports_share_lock_state_and_users_with_commands() {
             backend, b"nobody", raw
         )
         .map_err(Hresult::from)),
-        Err(ErrorCode::FileNotFound.hresult())
+        Err(Hresult(0x82da_0002))
     );
     assert_eq!(
         export(&server, |_, backend| security::user_access(
             backend, b"nobody"
         )
         .map_err(Hresult::from)),
-        Err(ErrorCode::FileNotFound.hresult())
+        Err(Hresult(0x82da_0002))
     );
 
     assert_eq!(admin.command("user name=bob write"), "200- OK");
@@ -838,7 +837,7 @@ fn exports_share_lock_state_and_users_with_commands() {
             Err(end) => break end,
         }
     };
-    assert_eq!(end, Hresult::END_OF_DATA);
+    assert_eq!(end, Hresult(0x82da_0104));
     assert_eq!(
         walked,
         [("eve".to_owned(), 0x8000_0001), ("bob".to_owned(), 0x2)]
@@ -849,7 +848,7 @@ fn exports_share_lock_state_and_users_with_commands() {
             state, backend, b"nobody"
         )
         .map_err(Hresult::from)),
-        Err(ErrorCode::FileNotFound.hresult())
+        Err(Hresult(0x82da_0002))
     );
     assert_eq!(
         export(&server, |state, backend| security::remove_user(

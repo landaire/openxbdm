@@ -19,6 +19,7 @@ use core::time::Duration;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
 use openxbdm_server::commands::console::DumpMode;
+use openxbdm_server::commands::console::EventDeferMask;
 use openxbdm_server::commands::debugger;
 use openxbdm_server::commands::debugger::Context;
 use openxbdm_server::commands::debugger::ContextFlags;
@@ -37,7 +38,6 @@ use openxbdm_server::commands::debugger::ExceptionFlags;
 use openxbdm_server::commands::debugger::ExceptionRecord;
 use openxbdm_server::commands::debugger::ExitStatus;
 use openxbdm_server::commands::debugger::ExtensionHandle;
-use openxbdm_server::commands::debugger::HARDWARE_KERNEL_DEBUGGER;
 use openxbdm_server::commands::debugger::MODULE_NAME_CAPACITY;
 use openxbdm_server::commands::debugger::ModuleEvent;
 use openxbdm_server::commands::debugger::NOTICE_TEXT_CAPACITY;
@@ -49,7 +49,7 @@ use openxbdm_server::commands::debugger::ThreadId;
 use openxbdm_server::commands::debugger::ThreadInfo;
 use openxbdm_server::commands::debugger::ThreadName;
 use openxbdm_server::commands::debugger::dispatch_direct;
-use openxbdm_server::commands::debugger::module_flags;
+use openxbdm_server::commands::debugger::ModuleFlags;
 use openxbdm_server::commands::services::ThreadHandle;
 use openxbdm_server::notify::ExecutionState;
 use xbox360::console::hardware_flags;
@@ -58,6 +58,7 @@ use xbox360::time::sleep;
 use xbox360_sys::image::ImageCharacteristics;
 use xbox360_sys::image::ImageDirectory;
 use xbox360_sys::processor;
+use xbox360_sys::processor::Msr;
 use xbox360_sys::processor::current_irql;
 use xbox360_sys::processor::current_thread;
 use xbox360_sys::xboxkrnl;
@@ -638,7 +639,7 @@ extern "C" fn debug_routine(trap_frame: u32, record: u32, context: u32, second_c
     let server = thread_object == SERVER_THREAD.load(Ordering::Relaxed);
     if server
         && irql == Irql::PASSIVE
-        && NtStatus(read_u32(record)) == ExceptionRecord::BREAKPOINT
+        && NtStatus(read_u32(record)) == NtStatus::BREAKPOINT
         && BREAK_NOW_ARMED.swap(false, Ordering::AcqRel)
     {
         capture_break_now(record, context);
@@ -738,7 +739,8 @@ extern "C" fn stack_overflow(frame: u32) -> u32 {
         unsafe { AtomicU32::from_ptr(variable as usize as *mut u32) }.swap(0, Ordering::AcqRel);
     let policy = load_policy();
     if hooked == 0
-        || (policy.kernel_debugger && hardware_flags().bits() & HARDWARE_KERNEL_DEBUGGER != 0)
+        || (policy.kernel_debugger
+            && hardware_flags().contains(xboxkrnl::HardwareFlags::KERNEL_DEBUGGER))
     {
         return address;
     }
@@ -752,13 +754,13 @@ extern "C" fn stack_overflow(frame: u32) -> u32 {
         return address;
     }
     let mut context = KernelContext([0; context::SIZE]);
-    context.0[..4].copy_from_slice(&ContextFlags::FULL.0.to_be_bytes());
+    context.0[..4].copy_from_slice(&ContextFlags::FULL.bits().to_be_bytes());
     // SAFETY: `frame` is the trap frame the kernel passed; `context` is a
     // live local of the full context size.
     unsafe { KeContextFromKframes(frame, context.0.as_mut_ptr()) };
     let mut record = [0u32; 0x14];
-    record[0] = ExceptionRecord::STACK_OVERFLOW.0;
-    record[1] = ExceptionFlags::NONCONTINUABLE.0;
+    record[0] = NtStatus::STACK_OVERFLOW.0;
+    record[1] = ExceptionFlags::NONCONTINUABLE.bits();
     record[3] = address;
     let record_address = record.as_mut_ptr() as usize as u32;
     let context_address = context.0.as_mut_ptr() as usize as u32;
@@ -796,7 +798,7 @@ extern "C" fn stack_overflow(frame: u32) -> u32 {
 fn read_exception_record(raw: u32) -> ExceptionRecord {
     ExceptionRecord {
         code: NtStatus(read_u32(raw)),
-        flags: ExceptionFlags(read_u32(raw + 4)),
+        flags: ExceptionFlags::from_bits_retain(read_u32(raw + 4)),
         address: read_u32(raw + 0xc),
         parameter_count: read_u32(raw + 0x10),
         parameters: core::array::from_fn(|n| read_u32(raw + 0x14 + 4 * n as u32)),
@@ -816,7 +818,7 @@ fn dispatch_in_place(
     let policy = load_policy();
     let gpr = |n: u32| context + context::GPR + 8 * n;
     let mut registers = DirectRegisters {
-        msr: read_u32(context + context::MSR),
+        msr: Msr::from_bits_retain(read_u32(context + context::MSR)),
         iar: read_u32(context + context::IAR),
         gpr3: read_u64(gpr(3)),
         gpr4: read_u64(gpr(4)),
@@ -828,7 +830,7 @@ fn dispatch_in_place(
         record: read_exception_record(record),
         second_chance,
         has_record: record_of(thread_object).is_some(),
-        hardware_flags: hardware_flags().bits(),
+        hardware_flags: hardware_flags(),
         delivery,
     };
     let instruction = readable(iar).then(|| read_u32(iar));
@@ -843,7 +845,7 @@ fn dispatch_in_place(
         step.map_or(0, |step| 1 + u32::from(step.saved_trace)),
         Ordering::Release,
     );
-    write_u32(context + context::MSR, registers.msr);
+    write_u32(context + context::MSR, registers.msr.bits());
     write_u32(context + context::IAR, registers.iar);
     write_u64(gpr(3), registers.gpr3);
     write_u64(gpr(4), registers.gpr4);
@@ -1046,8 +1048,8 @@ fn encode_policy(policy: &DirectPolicy) -> [u32; POLICY_WORDS] {
     [
         flags,
         dump_mode,
-        policy.defer_mask,
-        policy.stop_on.0,
+        policy.defer_mask.bits(),
+        policy.stop_on.bits(),
         data.map_or(0, |data| data.address),
         data.map_or(0, |data| data.size),
         data.map_or(0, |data| data.kind as u32),
@@ -1062,14 +1064,14 @@ fn decode_policy(words: [u32; POLICY_WORDS]) -> DirectPolicy {
         _ => DataKind::Read,
     };
     DirectPolicy {
-        stop_on: StopOn(words[3]),
+        stop_on: StopOn::from_bits_retain(words[3]),
         kd_lite: flag(POLICY_KD_LITE),
         kernel_debugger: flag(POLICY_KERNEL_DEBUGGER),
         trap_passthrough: flag(POLICY_TRAP_PASSTHROUGH),
         dump_mode: DumpMode::from_raw(words[1]),
         dump_in_progress: flag(POLICY_DUMP_IN_PROGRESS),
         attached: flag(POLICY_ATTACHED),
-        defer_mask: words[2],
+        defer_mask: EventDeferMask::from_bits_retain(words[2]),
         data_breakpoint: flag(POLICY_DATA_BREAKPOINT).then_some(DataBreakpoint {
             address: words[4],
             size: words[5],
@@ -1451,7 +1453,7 @@ fn readable(address: u32) -> bool {
 /// Copy the groups in `flags` between a kernel context and a [`Context`].
 fn read_context(address: u32, flags: ContextFlags, out: &mut Context) {
     if flags.contains(ContextFlags::CONTROL) {
-        out.msr = read_u32(address + context::MSR);
+        out.msr = Msr::from_bits_retain(read_u32(address + context::MSR));
         out.iar = read_u32(address + context::IAR);
         out.lr = read_u32(address + context::LR);
         out.ctr = read_u64(address + context::CTR);
@@ -1484,7 +1486,7 @@ fn read_context(address: u32, flags: ContextFlags, out: &mut Context) {
 fn write_context(address: u32, source: &Context) {
     let flags = source.flags;
     if flags.contains(ContextFlags::CONTROL) {
-        write_u32(address + context::MSR, source.msr);
+        write_u32(address + context::MSR, source.msr.bits());
         write_u32(address + context::IAR, source.iar);
         write_u32(address + context::LR, source.lr);
         write_u64(address + context::CTR, source.ctr);
@@ -1567,7 +1569,7 @@ fn describe_module(name_string: u32, entry: u32) -> Option<ModuleEvent> {
             .characteristics()
             .contains(ImageCharacteristics::DLL)
         {
-            module.flags |= module_flags::DLL;
+            module.flags |= ModuleFlags::DLL;
         }
         let mut size = 0u32;
         // SAFETY: the image has the NT header found above; `size` is a live local.
@@ -1647,7 +1649,7 @@ pub(crate) fn read_thread_context(thread: ThreadId, out: &mut Context) -> Result
     // SAFETY: the referenced thread's process object starts with its thread
     // list spin lock.
     let irql = unsafe { xboxkrnl::KfAcquireSpinLock(process as usize as *mut KspinLock) };
-    let requested = out.flags.intersection(ContextFlags::FULL);
+    let requested = out.flags & ContextFlags::FULL;
     let result = if record_of(object).is_none() {
         Err(NoSuchThread)
     } else if let Some(address) = slot_context(object) {
@@ -1657,7 +1659,7 @@ pub(crate) fn read_thread_context(thread: ThreadId, out: &mut Context) -> Result
     } else {
         // Switch frame: only the nonvolatile state is meaningful.
         let frame = read_u32(object + thread::SWITCH_FRAME);
-        let mut flags = ContextFlags::NONE;
+        let mut flags = ContextFlags::empty();
         if requested.contains(ContextFlags::INTEGER) {
             flags = flags.union(ContextFlags::INTEGER);
             out.gpr = [u64::MAX; 32];
@@ -1670,7 +1672,7 @@ pub(crate) fn read_thread_context(thread: ThreadId, out: &mut Context) -> Result
         }
         if requested.contains(ContextFlags::CONTROL) {
             flags = flags.union(ContextFlags::CONTROL);
-            out.msr = u32::MAX;
+            out.msr = Msr::from_bits_retain(u32::MAX);
             out.iar = read_u32(frame + 0xe4);
             out.lr = read_u32(frame + 0xe8);
             out.ctr = u64::MAX;

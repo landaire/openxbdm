@@ -1,6 +1,8 @@
 //! Console identity and configuration commands.
 
 use core::fmt::Write as _;
+use xbox360_sys::xboxkrnl::HardwareFlags;
+use xbox360_sys::xboxkrnl::HardwareGeneration;
 
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
@@ -60,12 +62,6 @@ impl From<ConsoleError> for CommandError {
     }
 }
 
-/// Configuration settings written by this domain.
-const SETTING_AUTO_SHUTOFF: ConfigSetting = ConfigSetting::new(7, 2);
-const SETTING_DISCOVERABLE: ConfigSetting = ConfigSetting::new(7, 0xf);
-const SETTING_KIOSK_ID: ConfigSetting = ConfigSetting::new(0xb, 3);
-const SETTING_NETWORK_SHARE: ConfigSetting = ConfigSetting::new(3, 0x10);
-
 /// Value buffer of the on/off string parameters.
 const SWITCH_BUFFER: usize = 10;
 /// Value buffer of the `kiosk enabled=` parameter.
@@ -109,14 +105,14 @@ const fn entry(
     flags: DispatchFlags,
     handler: fn(&mut Invocation<'_>) -> CommandResult,
 ) -> CommandEntry {
-    CommandEntry::new(name, any_of, Access::NONE, flags, handler)
+    CommandEntry::new(name, any_of, Access::empty(), flags, handler)
 }
 
 pub(crate) const COMMANDS: &[CommandEntry] = &[
     entry(
         "altaddr",
         Access::CONTROL,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         alternate_address,
     ),
     entry(
@@ -134,84 +130,99 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
     entry(
         "consolefeatures",
         Access::CONTROL,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         console_features,
     ),
     entry(
         "consolemem",
         Access::CONTROL,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         console_memory_command,
     ),
     entry(
         "consoletype",
         Access::CONTROL,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         console_type,
     ),
     entry(
         "datacentermode",
         Access::CONTROL,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         data_center_mode,
     ),
-    entry("dbgname", Access::NONE, DispatchFlags::NONE, debug_name),
+    entry(
+        "dbgname",
+        Access::empty(),
+        DispatchFlags::empty(),
+        debug_name,
+    ),
     entry(
         "debugmemsize",
         Access::CONTROL,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         debug_memory_size,
     ),
-    entry("debugmode", Access::NONE, DispatchFlags::NONE, debug_mode),
+    entry(
+        "debugmode",
+        Access::empty(),
+        DispatchFlags::empty(),
+        debug_mode,
+    ),
     entry(
         "discoverable",
         Access::CONTROL,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         discoverable,
     ),
     entry(
         "dmversion",
         Access::CONTROL,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         monitor_version,
     ),
-    entry("dumpmode", Access::CONFIG, DispatchFlags::NONE, dump_mode),
+    entry(
+        "dumpmode",
+        Access::CONFIG,
+        DispatchFlags::empty(),
+        dump_mode,
+    ),
     entry(
         "dumpsettings",
         Access::CONFIG,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         dump_settings,
     ),
     entry(
         "eventdefer",
         Access::CONFIG,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         event_defer,
     ),
-    entry("feature", Access::CONTROL, DispatchFlags::NONE, feature),
+    entry("feature", Access::CONTROL, DispatchFlags::empty(), feature),
     entry(
         "getconsoleid",
         Access::CONTROL,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         console_id,
     ),
     entry(
         "getnetaddrs",
         Access::READ,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         network_addresses,
     ),
     entry(
         "httpreg",
         Access::MANAGE,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         http_registration,
     ),
     entry("kiosk", Access::CONTROL, DispatchFlags::DEVKIT_ONLY, kiosk),
     entry(
         "livesigninrequired",
         Access::CONTROL,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         live_signin_required,
     ),
     entry(
@@ -220,26 +231,41 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         DispatchFlags::DEVKIT_ONLY,
         reset_network_ra,
     ),
-    entry("setconfig", Access::CONFIG, DispatchFlags::NONE, set_config),
+    entry(
+        "setconfig",
+        Access::CONFIG,
+        DispatchFlags::empty(),
+        set_config,
+    ),
     entry(
         "setretail",
         Access::WRITE,
         DispatchFlags::DEVKIT_ONLY,
         set_retail,
     ),
-    entry("setserver", Access::MANAGE, DispatchFlags::NONE, set_server),
-    entry("systeminfo", Access::READ, DispatchFlags::NONE, system_info),
-    entry("verbose", Access::CONFIG, DispatchFlags::NONE, verbose),
+    entry(
+        "setserver",
+        Access::MANAGE,
+        DispatchFlags::empty(),
+        set_server,
+    ),
+    entry(
+        "systeminfo",
+        Access::READ,
+        DispatchFlags::empty(),
+        system_info,
+    ),
+    entry("verbose", Access::CONFIG, DispatchFlags::empty(), verbose),
     entry(
         "welcomedefault",
         Access::CONTROL,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         welcome_default,
     ),
     entry(
         "welcomehide",
         Access::CONTROL,
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         welcome_hide,
     ),
 ];
@@ -304,27 +330,22 @@ pub fn copy_debug_name(name: &DebugName, output: &mut [u8]) -> Result<(), Buffer
     }
 }
 
-/// Diagnostic trace mask set by `verbose` (stock 0x91f9fef4); each bit
-/// enables the monitor's DbgPrint texts of one area.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct TraceMask(pub u32);
-
-impl TraceMask {
-    /// Command lines, status lines, title command processor thread.
-    pub const REPLIES: Self = Self(0x1);
-    /// 204 binary receive.
-    pub const BINARY_RECEIVE: Self = Self(0x2);
-    /// Settings file reads and writes.
-    pub const SETTINGS: Self = Self(0x4);
-    /// Drive path and title image resolution.
-    pub const PATHS: Self = Self(0x8);
-    /// Title launch control codes.
-    pub const TITLE_LAUNCH: Self = Self(0x10);
-    /// CD-ROM driver setup at startup.
-    pub const CDROM: Self = Self(0x20);
-
-    pub fn contains(self, bits: Self) -> bool {
-        self.0 & bits.0 != 0
+xbox360_sys::flags! {
+    /// Diagnostic trace mask set by `verbose` (stock 0x91f9fef4); each bit
+    /// enables the monitor's DbgPrint texts of one area.
+    pub struct TraceMask(u32) {
+        /// Command lines, status lines, title command processor thread.
+        REPLIES = 0x1,
+        /// 204 binary receive.
+        BINARY_RECEIVE = 0x2,
+        /// Settings file reads and writes.
+        SETTINGS = 0x4,
+        /// Drive path and title image resolution.
+        PATHS = 0x8,
+        /// Title launch control codes.
+        TITLE_LAUNCH = 0x10,
+        /// CD-ROM driver setup at startup.
+        CDROM = 0x20,
     }
 }
 
@@ -335,7 +356,7 @@ pub(crate) fn trace(
     bits: TraceMask,
     arguments: core::fmt::Arguments<'_>,
 ) {
-    if state.console.trace_mask.contains(bits) {
+    if state.console.trace_mask.intersects(bits) {
         print(backend, arguments);
     }
 }
@@ -349,7 +370,7 @@ pub(crate) fn trace_text(
     bits: TraceMask,
     build: impl FnOnce(&mut MessageText),
 ) {
-    if mask.contains(bits) {
+    if mask.intersects(bits) {
         let mut message = MessageText::new();
         build(&mut message);
         backend.debug_print(message.as_bytes());
@@ -526,11 +547,22 @@ impl DumpSettings {
     }
 }
 
-/// Notifications queued to the server thread rather than delivered inline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EventDeferMask(pub u32);
+xbox360_sys::flags! {
+    /// Notifications queued to the server thread rather than delivered
+    /// inline.
+    pub struct EventDeferMask(u32) {
+        BREAK = 0x1,
+        DEBUG_STRING = 0x2,
+        SINGLE_STEP = 0x4,
+        ASSERT = 0x8,
+        NT_ASSERT = 0x10,
+        DATA_BREAK = 0x20,
+        RIP = 0x40,
+    }
+}
 
 impl EventDeferMask {
+    /// Reply and parameter names, indexed by bit number.
     const NAMES: [&'static str; 7] = [
         "break",
         "debugstring",
@@ -541,6 +573,11 @@ impl EventDeferMask {
         "rip",
     ];
 
+    pub const DEFAULT: Self = Self::BREAK
+        .union(Self::DEBUG_STRING)
+        .union(Self::SINGLE_STEP)
+        .union(Self::DATA_BREAK);
+
     fn names(self) -> impl Iterator<Item = &'static str> {
         Self::NAMES
             .iter()
@@ -548,9 +585,6 @@ impl EventDeferMask {
             .filter(move |(bit, _)| self.0 & (1 << bit) != 0)
             .map(|(_, name)| *name)
     }
-
-    /// break, debugstring, singlestep, databreak.
-    pub const DEFAULT: Self = Self(0x27);
 }
 
 /// State of the HTTP registration with a lab server (stock 0x91f9f638).
@@ -744,7 +778,7 @@ impl State {
     pub const fn new() -> Self {
         Self {
             debug_name: DebugName::EMPTY,
-            trace_mask: TraceMask(0),
+            trace_mask: TraceMask::empty(),
             dump_mode: DumpMode::Smart,
             dump_settings: DumpSettings::new(),
             event_defer: EventDeferMask::DEFAULT,
@@ -799,8 +833,32 @@ pub struct ConfigSetting {
 }
 
 impl ConfigSetting {
+    /// The console MAC address.
+    pub const MAC_ADDRESS: Self = Self::new(2, 1);
+    /// The reset button chord.
+    pub const RESET_CHORD: Self = Self::new(2, 5);
+    /// [`ConsoleConfigFlags`].
+    pub const CONSOLE_FLAGS: Self = Self::new(2, 6);
+    /// The automatic sign-in profile XUID.
+    pub const AUTO_PROFILE_XUID: Self = Self::new(3, 8);
+    pub const NETWORK_SHARE: Self = Self::new(3, 0x10);
+    pub const AUTO_SHUTOFF: Self = Self::new(7, 2);
+    pub const DISCOVERABLE: Self = Self::new(7, 0xf);
+    /// The previous flash version.
+    pub const PREVIOUS_FLASH_VERSION: Self = Self::new(0xa, 2);
+    pub const KIOSK_ID: Self = Self::new(0xb, 3);
+
     pub const fn new(category: u16, index: u16) -> Self {
         Self { category, index }
+    }
+}
+
+xbox360_sys::flags! {
+    /// Bits of the console flags dword, setting (2, 6).
+    pub struct ConsoleConfigFlags(u32) {
+        HARD_DISK_DISABLED = 0x1,
+        KD_LITE = 0x2,
+        BUILT_IN_MEMORY_UNIT_DISABLED = 0x4,
     }
 }
 
@@ -811,30 +869,17 @@ pub trait ConfigFlags: Copy {
     fn bits(self) -> u32;
 }
 
-/// Bits of the user flags dword, setting (3, 0xd).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct UserFlags(u32);
-
-impl UserFlags {
-    pub const MOTION_DETECTION_DISABLED: Self = Self(0x01);
-    pub const BACKGROUND_MODE_TEST: Self = Self(0x02);
-    pub const BOOT_ANIMATION_DISABLED: Self = Self(0x04);
-    pub const LIVE_SIGNIN_REQUIRED: Self = Self(0x08);
-    pub const KINECT_HEALTH_MESSAGE_DISABLED: Self = Self(0x20);
-    pub const KIOSK: Self = Self(0x40);
-    pub const DATA_CENTER: Self = Self(0x400);
-    pub const WIRELESS_CONTROLLERS_DISABLED: Self = Self(0x800);
-
-    pub const fn from_bits(bits: u32) -> Self {
-        Self(bits)
-    }
-
-    pub const fn union(self, other: Self) -> Self {
-        Self(self.0 | other.0)
-    }
-
-    pub const fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
+xbox360_sys::flags! {
+    /// Bits of the user flags dword, setting (3, 0xd).
+    pub struct UserFlags(u32) {
+        MOTION_DETECTION_DISABLED = 0x01,
+        BACKGROUND_MODE_TEST = 0x02,
+        BOOT_ANIMATION_DISABLED = 0x04,
+        LIVE_SIGNIN_REQUIRED = 0x08,
+        KINECT_HEALTH_MESSAGE_DISABLED = 0x20,
+        KIOSK = 0x40,
+        DATA_CENTER = 0x400,
+        WIRELESS_CONTROLLERS_DISABLED = 0x800,
     }
 }
 
@@ -846,39 +891,26 @@ impl ConfigFlags for UserFlags {
     }
 }
 
-/// Bits of the retail flags dword, setting (3, 0xc).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct RetailFlags(u32);
-
-impl RetailFlags {
-    pub const OOBE_DISABLED: Self = Self(0x40);
-    /// Boot device selection of `setdiscboot enable=0`; the meaning of the
-    /// single bit is not known.
-    pub const DISC_BOOT_DISABLED: Self = Self(0x80);
-    /// Boot device selection of `setdiscboot enable=1`; the meaning of the
-    /// single bit is not known.
-    pub const DISC_BOOT_ENABLED: Self = Self(0x2000);
-    /// Every bit `setdiscboot` clears before setting its selection.
-    pub const BOOT_DEVICE: Self = Self(0x0002_2880);
-    pub const IPTV_ENABLED: Self = Self(0x1000);
-    pub const OOBE_CHECKPOINT_DISABLED: Self = Self(0x8000);
-    pub const IPTV_DVR: Self = Self(0x0008_0000);
-    /// Set when uninstalling IPTV is not allowed.
-    pub const IPTV_UNINSTALL_BLOCKED: Self = Self(0x0200_0000);
-    pub const WELCOME_HIDE: Self = Self(0x0400_0000);
-    pub const WELCOME_DEFAULT: Self = Self(0x0800_0000);
-    pub const NUI_OOBE_DISABLED: Self = Self(0x2000_0000);
-
-    pub const fn from_bits(bits: u32) -> Self {
-        Self(bits)
-    }
-
-    pub const fn union(self, other: Self) -> Self {
-        Self(self.0 | other.0)
-    }
-
-    pub const fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
+xbox360_sys::flags! {
+    /// Bits of the retail flags dword, setting (3, 0xc).
+    pub struct RetailFlags(u32) {
+        OOBE_DISABLED = 0x40,
+        /// Boot device selection of `setdiscboot enable=0`; the meaning of
+        /// the single bit is not known.
+        DISC_BOOT_DISABLED = 0x80,
+        /// Boot device selection of `setdiscboot enable=1`; the meaning of
+        /// the single bit is not known.
+        DISC_BOOT_ENABLED = 0x2000,
+        /// Every bit `setdiscboot` clears before setting its selection.
+        BOOT_DEVICE = 0x0002_2880,
+        IPTV_ENABLED = 0x1000,
+        OOBE_CHECKPOINT_DISABLED = 0x8000,
+        IPTV_DVR = 0x0008_0000,
+        /// Set when uninstalling IPTV is not allowed.
+        IPTV_UNINSTALL_BLOCKED = 0x0200_0000,
+        WELCOME_HIDE = 0x0400_0000,
+        WELCOME_DEFAULT = 0x0800_0000,
+        NUI_OOBE_DISABLED = 0x2000_0000,
     }
 }
 
@@ -934,13 +966,16 @@ pub struct NetworkRaError(pub Hresult);
 /// network service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct NetworkRaRecord {
-    pub flags: u32,
+    pub flags: NetworkRaFlags,
     pub custom_boot_address: u32,
 }
 
-impl NetworkRaRecord {
-    pub const RELAX_HEARTBEAT: u32 = 0x8000_0000;
-    pub const CUSTOM_BOOT_ADDRESS: u32 = 0x4000_0000;
+xbox360_sys::flags! {
+    /// Flags of a [`NetworkRaRecord`].
+    pub struct NetworkRaFlags(u32) {
+        CUSTOM_BOOT_ADDRESS = 0x4000_0000,
+        RELAX_HEARTBEAT = 0x8000_0000,
+    }
 }
 
 /// A request to the system network service (message 0x00a00004).
@@ -1230,9 +1265,6 @@ pub(crate) fn initialize(state: &mut ServerState, backend: &mut dyn AnyBackend) 
     refresh_network_share(state, backend);
 }
 
-/// Hardware flags field of the console generation; Trinity is 4.
-const HARDWARE_GENERATION_MASK: u32 = 0xf000_0000;
-const HARDWARE_GENERATION_TRINITY: u32 = 0x4000_0000;
 /// Reads of the settings block before it counts as unreadable.
 const SETTINGS_BLOCK_READS: usize = 3;
 /// Flash block startup inspects, and the dword in it that it clears.
@@ -1246,8 +1278,8 @@ pub(crate) fn settings_block_readable(backend: &mut dyn AnyBackend) -> bool {
 }
 
 /// Whether hardware `flags` describe a console from Trinity on.
-pub(crate) fn trinity_or_later(flags: u32) -> bool {
-    flags & HARDWARE_GENERATION_MASK >= HARDWARE_GENERATION_TRINITY
+pub(crate) fn trinity_or_later(flags: HardwareFlags) -> bool {
+    flags.generation() >= HardwareGeneration::TRINITY
 }
 
 /// Stock 0x91f329f0, after the settings files when `drivemap internal` is
@@ -1255,7 +1287,9 @@ pub(crate) fn trinity_or_later(flags: u32) -> bool {
 /// is a test kit. When the dword at +0x10 of the flash block at 0x80 is
 /// nonzero, it is cleared and the console restarts.
 pub(crate) fn check_settings_block(state: &mut ServerState, backend: &mut dyn AnyBackend) {
-    if settings_block_readable(backend) || !trinity_or_later(backend.hardware_flags()) {
+    if settings_block_readable(backend)
+        || !trinity_or_later(crate::commands::system::hardware_flags(backend))
+    {
         return;
     }
     backend.mark_test_kit();
@@ -1318,7 +1352,7 @@ pub(crate) fn sysset_settings_lines(
 pub(crate) fn refresh_network_share(state: &mut ServerState, backend: &mut dyn AnyBackend) {
     let mut setting = [0u8; NETWORK_SHARE_SIZE];
     if backend
-        .xconfig_get(SETTING_NETWORK_SHARE, &mut setting)
+        .xconfig_get(ConfigSetting::NETWORK_SHARE, &mut setting)
         .is_err()
     {
         return;
@@ -1403,7 +1437,7 @@ fn auto_shutoff(invocation: &mut Invocation<'_>) -> CommandResult {
             let minutes = ((hours * 60) as u16) | 0x8000;
             if invocation
                 .backend
-                .xconfig_set(SETTING_AUTO_SHUTOFF, &minutes.to_be_bytes())
+                .xconfig_set(ConfigSetting::AUTO_SHUTOFF, &minutes.to_be_bytes())
                 .is_ok()
             {
                 invocation.backend.apply_inactivity_time();
@@ -1435,14 +1469,14 @@ fn network_ra_failure(invocation: &mut Invocation<'_>, error: NetworkRaError) ->
 
 /// Stock 0x91f46560: query and print the configuration.
 fn show_network_ra(invocation: &mut Invocation<'_>, record: &mut NetworkRaRecord) -> CommandResult {
-    record.flags = 0;
+    record.flags = NetworkRaFlags::empty();
     if let Err(error) = invocation
         .backend
         .network_ra_request(NetworkRaRequest::Get(record))
     {
         return network_ra_failure(invocation, error);
     }
-    let relax = if record.flags & NetworkRaRecord::RELAX_HEARTBEAT != 0 {
+    let relax = if record.flags.contains(NetworkRaFlags::RELAX_HEARTBEAT) {
         "on"
     } else {
         "off"
@@ -1470,9 +1504,9 @@ fn configure_network_ra(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.line.has("relaxheartbeat") {
         let mut buffer = [0u8; SWITCH_BUFFER];
         if let Some(value) = string_param(invocation, "relaxheartbeat", &mut buffer) {
-            record.flags &= !NetworkRaRecord::RELAX_HEARTBEAT;
+            record.flags.remove(NetworkRaFlags::RELAX_HEARTBEAT);
             if value.eq_ignore_ascii_case(b"on") {
-                record.flags |= NetworkRaRecord::RELAX_HEARTBEAT;
+                record.flags.insert(NetworkRaFlags::RELAX_HEARTBEAT);
             }
             changes += 1;
         }
@@ -1481,9 +1515,9 @@ fn configure_network_ra(invocation: &mut Invocation<'_>) -> CommandResult {
         && let Some(address) = invocation.line.dword("customubootaddr")
     {
         record.custom_boot_address = address;
-        record.flags &= !NetworkRaRecord::CUSTOM_BOOT_ADDRESS;
+        record.flags.remove(NetworkRaFlags::CUSTOM_BOOT_ADDRESS);
         if address != 0 {
-            record.flags |= NetworkRaRecord::CUSTOM_BOOT_ADDRESS;
+            record.flags.insert(NetworkRaFlags::CUSTOM_BOOT_ADDRESS);
         }
         changes += 1;
     }
@@ -1617,7 +1651,7 @@ fn discoverable(invocation: &mut Invocation<'_>) -> CommandResult {
     };
     let _ = invocation
         .backend
-        .xconfig_set(SETTING_DISCOVERABLE, &[value]);
+        .xconfig_set(ConfigSetting::DISCOVERABLE, &[value]);
     Ok(Reply::Ok)
 }
 
@@ -1700,16 +1734,14 @@ fn dump_settings(invocation: &mut Invocation<'_>) -> CommandResult {
 /// with the named events. Replies with a leading space before each name.
 fn event_defer(invocation: &mut Invocation<'_>) -> CommandResult {
     if invocation.line.has("set") {
-        let mut mask = 0;
+        let mut mask = EventDeferMask::empty();
         for (bit, name) in EventDeferMask::NAMES.iter().enumerate() {
             if invocation.line.has(name) {
-                mask |= 1 << bit;
+                mask.insert(EventDeferMask::from_bits_retain(1 << bit));
             }
         }
-        invocation.state.console.event_defer = EventDeferMask(mask);
-        invocation
-            .backend
-            .publish(Published::EventDefer(EventDeferMask(mask)));
+        invocation.state.console.event_defer = mask;
+        invocation.backend.publish(Published::EventDefer(mask));
         crate::commands::system::save_settings(invocation.state, invocation.backend);
     }
     invocation.text.clear();
@@ -1769,8 +1801,9 @@ pub fn apply_exported_setting(
             backend.publish(Published::DumpSettings(&settings));
         }
         ExportedSetting::EventDefer(mask) => {
-            state.console.event_defer = EventDeferMask(mask);
-            backend.publish(Published::EventDefer(EventDeferMask(mask)));
+            let mask = EventDeferMask::from_bits_retain(mask);
+            state.console.event_defer = mask;
+            backend.publish(Published::EventDefer(mask));
         }
     }
     crate::commands::system::save_settings(state, backend);
@@ -2195,7 +2228,7 @@ fn kiosk(invocation: &mut Invocation<'_>) -> CommandResult {
     if modify_config_flag(invocation.backend, UserFlags::KIOSK, enable).is_err()
         || invocation
             .backend
-            .xconfig_set(SETTING_KIOSK_ID, &id.to_be_bytes())
+            .xconfig_set(ConfigSetting::KIOSK_ID, &id.to_be_bytes())
             .is_err()
     {
         return Err(ErrorCode::AccessDenied.into());
@@ -2272,7 +2305,7 @@ fn set_server(invocation: &mut Invocation<'_>) -> CommandResult {
     }
     if invocation
         .backend
-        .xconfig_set(SETTING_NETWORK_SHARE, &setting)
+        .xconfig_set(ConfigSetting::NETWORK_SHARE, &setting)
         .is_err()
     {
         invocation.text.set_bytes(b"save setting failed");
@@ -2300,8 +2333,8 @@ fn system_info(invocation: &mut Invocation<'_>) -> CommandResult {
     Ok(Reply::Multiline)
 }
 
-fn platform_name(flags: u32) -> &'static str {
-    match flags & 3 {
+fn platform_name(flags: HardwareFlags) -> &'static str {
+    match flags.bits() & 3 {
         0 => "Alpha",
         1 => "Mongrel",
         2 => "Shiva",
@@ -2309,8 +2342,8 @@ fn platform_name(flags: u32) -> &'static str {
     }
 }
 
-fn system_name(flags: u32) -> &'static str {
-    match flags >> 28 {
+fn system_name(flags: HardwareFlags) -> &'static str {
+    match flags.generation().get() {
         0 => "Xenon",
         1 => "Zephyr",
         2 => "Falcon",
@@ -2323,9 +2356,6 @@ fn system_name(flags: u32) -> &'static str {
     }
 }
 
-/// Hardware flag: a hard disk is attached.
-const HARDWARE_HDD: u32 = 0x20;
-
 fn system_info_line(
     next: &mut SystemInfoLine,
     info: &SystemInformation,
@@ -2333,11 +2363,11 @@ fn system_info_line(
     line: &mut LineText,
 ) -> CommandResult {
     line.clear();
-    let flags = info.hardware_flags;
+    let flags = HardwareFlags::from_bits_retain(info.hardware_flags);
     let _ = match *next {
         SystemInfoLine::Disk => {
             *next = SystemInfoLine::KitType;
-            line.write_str(if flags & HARDWARE_HDD != 0 {
+            line.write_str(if flags.contains(HardwareFlags::HARD_DISK) {
                 "HDD=Enabled"
             } else {
                 "HDD=Disabled"
@@ -2390,7 +2420,7 @@ fn system_info_line(
 /// is rejected.
 fn verbose(invocation: &mut Invocation<'_>) -> CommandResult {
     if let Some(value) = invocation.line.param("level") {
-        invocation.state.console.trace_mask = TraceMask(value.dword_prefix());
+        invocation.state.console.trace_mask = TraceMask::from_bits_retain(value.dword_prefix());
         invocation
             .backend
             .publish(Published::TraceMask(invocation.state.console.trace_mask));
@@ -2431,7 +2461,7 @@ pub(crate) fn verbose_settings_lines(
     backend: &mut dyn AnyBackend,
     file: SettingsFile,
 ) {
-    let TraceMask(mask) = state.console.trace_mask;
+    let mask = state.console.trace_mask.bits();
     if mask != 0 {
         write_line(backend, file, format_args!("verbose level={}", mask as i32));
     }
@@ -2559,32 +2589,32 @@ mod tests {
             (
                 RegistrationState::Pending,
                 RegistrationError::NotRegistered,
-                Hresult::IN_PROGRESS,
+                0x82da_0150,
             ),
             (
                 RegistrationState::InProgress,
                 RegistrationError::NotRegistered,
-                Hresult::IN_PROGRESS,
+                0x82da_0150,
             ),
             (
                 RegistrationState::Cleared,
                 RegistrationError::Cleared,
-                ErrorCode::FileNotFound.hresult(),
+                0x82da_0002,
             ),
             (
                 RegistrationState::Failed,
                 RegistrationError::Failed,
-                Hresult::REQUEST_FAILED,
+                0x82da_0100,
             ),
             (
                 RegistrationState::Rejected,
                 RegistrationError::Rejected,
-                Hresult::SERVICE_FAILED,
+                0x82da_010a,
             ),
             (
                 RegistrationState::ResponseTooLarge,
                 RegistrationError::ResponseTooLarge,
-                ErrorCode::NoRoomOnDevice.hresult(),
+                0x82da_000f,
             ),
         ] {
             registration.state = state;
@@ -2592,7 +2622,7 @@ mod tests {
                 registration.export_response(Some(&mut [0; 8])),
                 failed(error)
             );
-            assert_eq!(Hresult::from(error), result);
+            assert_eq!(Hresult::from(error), Hresult(result));
         }
         registration.state = RegistrationState::Registered;
         registration.transaction = 0x0123_4567_89ab_cdef;
@@ -2615,7 +2645,7 @@ mod tests {
         );
         assert_eq!(
             Hresult::from(RegistrationError::BufferTooSmall),
-            Hresult::BUFFER_TOO_SMALL
+            Hresult(0x82da_0105)
         );
         assert_eq!(registration.export_response(None), registered(Ok(())));
     }

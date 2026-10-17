@@ -28,24 +28,19 @@ pub const NAME_CAPACITY: usize = 0x100;
 /// Certificate bytes per hex chunk of a settings line.
 const SETTINGS_CHUNK: u32 = 0x1ff;
 
-/// Flag bits of a proxy entry, as stored by the monitor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProxyFlags(pub u32);
-
-impl ProxyFlags {
-    /// Entry of the system scope.
-    pub const SYS: u32 = 0x8000_0000;
-    /// System entry hidden from title queries.
-    pub const SYS_ONLY: u32 = 0x4000_0000;
-    pub const ACTIVE: u32 = 0x2000_0000;
-    /// Not written to the settings file.
-    pub const TEMP: u32 = 0x1000_0000;
-    pub const FORCE: u32 = 0x0800_0000;
-    /// The certificate upload has not finished.
-    pub const CERTIFICATE_PENDING: u32 = 0x0400_0000;
-
-    pub const fn contains(self, bits: u32) -> bool {
-        self.0 & bits == bits
+xbox360_sys::flags! {
+    /// Flag bits of a proxy entry, as stored by the monitor.
+    pub struct ProxyFlags(u32) {
+        /// The certificate upload has not finished.
+        CERTIFICATE_PENDING = 0x0400_0000,
+        FORCE = 0x0800_0000,
+        /// Not written to the settings file.
+        TEMP = 0x1000_0000,
+        ACTIVE = 0x2000_0000,
+        /// System entry hidden from title queries.
+        SYS_ONLY = 0x4000_0000,
+        /// Entry of the system scope.
+        SYS = 0x8000_0000,
     }
 }
 
@@ -193,7 +188,7 @@ pub(super) fn xhttpproxy(invocation: &mut Invocation<'_>) -> CommandResult {
         (force, ProxyFlags::FORCE),
     ] {
         if set {
-            flags |= bit;
+            flags.insert(bit);
         }
     }
     let new = (name.is_some() || force).then(|| {
@@ -215,7 +210,7 @@ pub(super) fn xhttpproxy(invocation: &mut Invocation<'_>) -> CommandResult {
             }
         };
         NewProxy {
-            flags: ProxyFlags(flags),
+            flags,
             name: name.map(|(name, _)| name),
             port: name.map_or(0, |(_, port)| port),
             certificate,

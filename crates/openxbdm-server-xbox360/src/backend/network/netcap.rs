@@ -177,7 +177,8 @@ extern "C" fn receive(context: usize, frame: *mut u8, length: u32) -> u32 {
     // SAFETY: as for `transmit`.
     let (context, frame) = unsafe { frame_parts(context, frame, length) };
     if !context.error.is_set()
-        && !CaptureFlags(context.flags.load(Ordering::Acquire)).skips_received(frame)
+        && !CaptureFlags::from_bits_retain(context.flags.load(Ordering::Acquire))
+            .skips_received(frame)
     {
         context.record(frame);
     }
@@ -315,7 +316,7 @@ impl netcap::Backend for Console {
         // SAFETY: the context stays allocated until `close_capture` takes it.
         let context = unsafe { pointer.as_ref() };
         context.error.clear();
-        context.flags.store(flags.0, Ordering::Release);
+        context.flags.store(flags.bits(), Ordering::Release);
         let hook = FrameHook {
             transmit,
             receive,

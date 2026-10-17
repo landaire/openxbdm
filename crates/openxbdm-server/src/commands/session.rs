@@ -15,14 +15,13 @@ pub use fastpipe::PipeGroup;
 pub use fastpipe::on_readable as on_fast_pipe_readable;
 pub use fileevent::EventPath;
 pub use fileevent::FILE_EVENT_TEXT_LIMIT;
-pub use fileevent::FLAG_BUFFERED;
-pub use fileevent::FLAG_SCATTER_GATHER;
-pub use fileevent::FLAG_SYNCHRONOUS;
 pub use fileevent::FileEventBegin;
+pub use fileevent::FileEventFlags;
 pub use fileevent::FileEventId;
 pub use fileevent::FileEventText;
 pub use fileevent::PseudoBegin;
 pub use fileevent::PseudoBeginIo;
+pub use fileevent::PseudoOptions;
 pub use fileevent::file_event_kind;
 pub use fileevent::format_file_event_begin;
 pub use fileevent::format_file_event_end;
@@ -56,6 +55,7 @@ pub use telllog::WaitTraceLine;
 pub use telllog::format_wait_trace;
 
 use core::fmt::Write as _;
+use xbox360_sys::processor::HARDWARE_THREAD_COUNT;
 
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::KernelError;
@@ -102,107 +102,105 @@ const DEBUG_CAPTURE_RECORD: usize = 0x100;
 const ADDRESS_TEXT_CAPACITY: usize = 0x14;
 /// Buffer the monitor copies `handler=` into.
 const HANDLER_NAME_CAPACITY: usize = 0x100;
-/// Processors the server thread can be bound to.
-const PROCESSOR_COUNT: u32 = 6;
 /// `srvproc` binds to this processor when `num` is absent.
 const DEFAULT_SERVER_PROCESSOR: u32 = 2;
 /// Time persistent targets are given to connect, in FILETIME units.
 const PERSISTENT_CONNECT_WINDOW: u64 = 30_000 * FILETIME_PER_MILLISECOND;
 const FILETIME_PER_MILLISECOND: u64 = 10_000;
 
-/// UDP port of the name discovery responder.
-pub const DISCOVERY_PORT: u16 = 730;
 /// Receive buffer of a discovery request and size of the reply buffer.
 pub const DISCOVERY_PACKET_CAPACITY: usize = 0x102;
-const DISCOVERY_LOOKUP: u8 = 1;
-const DISCOVERY_REPLY: u8 = 2;
-const DISCOVERY_IDENTIFY: u8 = 3;
-/// Request flag: send the reply to the broadcast address.
-const DISCOVERY_BROADCAST: u8 = 0x80;
+xbox360_sys::flags! {
+    /// Flag bits of a discovery request's kind byte.
+    pub struct DiscoveryFlags(u8) {
+        /// Send the reply to the broadcast address.
+        BROADCAST = 0x80,
+    }
+}
 
 pub(crate) const COMMANDS: &[CommandEntry] = &[
     CommandEntry::new(
         "bye",
-        Access::NONE,
-        Access::NONE,
+        Access::empty(),
+        Access::empty(),
         DispatchFlags::ANY_CONTEXT,
         bye,
     ),
     CommandEntry::new(
         "dbgprint",
         Access::READ,
-        Access::NONE,
+        Access::empty(),
         DispatchFlags::DEVKIT_ONLY,
         debug_print,
     ),
     CommandEntry::new(
         "dedicate",
-        Access::NONE,
-        Access::NONE,
+        Access::empty(),
+        Access::empty(),
         DispatchFlags::ANY_CONTEXT,
         dedicate,
     ),
     CommandEntry::new(
         "dmtelllog",
         Access::CONTROL,
-        Access::NONE,
-        DispatchFlags::NONE,
+        Access::empty(),
+        DispatchFlags::empty(),
         telllog::tell_log,
     ),
     CommandEntry::new(
         "fastpipe",
-        Access::NONE,
-        Access::NONE,
-        DispatchFlags::NONE,
+        Access::empty(),
+        Access::empty(),
+        DispatchFlags::empty(),
         fastpipe::fast_pipe,
     ),
     CommandEntry::new(
         "fileevent",
         Access::CONTROL,
-        Access::NONE,
-        DispatchFlags::NONE,
+        Access::empty(),
+        DispatchFlags::empty(),
         file_event,
     ),
     CommandEntry::new(
         "notify",
         Access::CONTROL,
-        Access::NONE,
-        DispatchFlags::NONE,
+        Access::empty(),
+        DispatchFlags::empty(),
         notify,
     ),
     CommandEntry::new(
         "notifyat",
         Access::CONTROL,
-        Access::NONE,
-        DispatchFlags::NONE,
+        Access::empty(),
+        DispatchFlags::empty(),
         notify_at,
     ),
     CommandEntry::new(
         "notifyport",
         Access::CONTROL,
-        Access::NONE,
-        DispatchFlags::NONE,
+        Access::empty(),
+        DispatchFlags::empty(),
         notify,
     ),
     CommandEntry::new(
         "spew",
         Access::READ,
-        Access::NONE,
+        Access::empty(),
         DispatchFlags::DEVKIT_ONLY,
         spew,
     ),
     CommandEntry::new(
         "srvproc",
         Access::CONTROL,
-        Access::NONE,
-        DispatchFlags::NONE,
+        Access::empty(),
+        DispatchFlags::empty(),
         server_processor,
     ),
     CommandEntry::new(
         "rpc",
         Access::CONTROL,
-        Access::NONE,
-        DispatchFlags::NONE,
+        Access::empty(),
+        DispatchFlags::empty(),
         rpc::rpc,
     ),
 ];
@@ -389,7 +387,7 @@ fn send_execution_line(
 }
 
 fn target_flags(invocation: &Invocation<'_>) -> TargetFlags {
-    let mut flags = TargetFlags::NONE;
+    let mut flags = TargetFlags::empty();
     if invocation.line.has("debug") {
         flags = flags.union(TargetFlags::DEBUG);
     }
@@ -804,7 +802,7 @@ fn server_processor(invocation: &mut Invocation<'_>) -> CommandResult {
         .line
         .dword("num")
         .unwrap_or(DEFAULT_SERVER_PROCESSOR);
-    if number >= PROCESSOR_COUNT {
+    if number >= HARDWARE_THREAD_COUNT as u32 {
         return Err(ErrorCode::UnknownCommand.into());
     }
     let previous = invocation.backend.current_processor();
@@ -840,6 +838,17 @@ pub fn answer_discovery(
     discovery_reply(state.console.debug_name.as_bytes(), request, reply)
 }
 
+xbox360_sys::value_enum! {
+    /// Type of a name discovery datagram, without [`DISCOVERY_BROADCAST`].
+    pub enum DiscoveryOpcode: u8 {
+        /// Ask the console with the given debug name.
+        Lookup = 1,
+        Reply = 2,
+        /// Ask every console for its name.
+        Identify = 3,
+    }
+}
+
 /// Answer a name discovery datagram. Type 3 asks every console for its
 /// name; type 1 asks the console whose debug name equals the given name,
 /// ignoring ASCII case. The reply is type 2, a length byte, and the name.
@@ -851,22 +860,23 @@ pub fn discovery_reply(
     reply: &mut [u8; DISCOVERY_PACKET_CAPACITY],
 ) -> Option<DiscoveryReply> {
     let (&kind, body) = request.split_first()?;
-    match kind & !DISCOVERY_BROADCAST {
-        DISCOVERY_IDENTIFY => {}
-        DISCOVERY_LOOKUP => {
+    let kind = DiscoveryFlags::from_bits_retain(kind);
+    match DiscoveryOpcode::from_raw(kind.difference(DiscoveryFlags::BROADCAST).bits())? {
+        DiscoveryOpcode::Identify => {}
+        DiscoveryOpcode::Lookup => {
             let (&length, requested) = body.split_first()?;
             let length = usize::from(length);
             if length == 0 || requested.len() != length || !requested.eq_ignore_ascii_case(name) {
                 return None;
             }
         }
-        _ => return None,
+        DiscoveryOpcode::Reply => return None,
     }
     let length = name.len().min(usize::from(u8::MAX));
-    reply[0] = DISCOVERY_REPLY;
+    reply[0] = DiscoveryOpcode::Reply.raw();
     reply[1] = length as u8;
     reply[2..2 + length].copy_from_slice(&name[..length]);
-    let destination = if kind & DISCOVERY_BROADCAST != 0 {
+    let destination = if kind.intersects(DiscoveryFlags::BROADCAST) {
         DiscoveryDestination::Broadcast
     } else {
         DiscoveryDestination::Sender

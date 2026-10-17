@@ -560,7 +560,7 @@ pub(crate) fn notify_event(event: &Event<'_>) {
                     size: module.size,
                     timestamp: module.timestamp,
                     checksum: module.checksum,
-                    flags: module.flags,
+                    flags: module.flags.bits(),
                     pdata: module.pdata,
                     pdata_size: module.pdata_size,
                     thread,

@@ -12,6 +12,7 @@ use core::fmt::Write as _;
 
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::KernelError;
+use openxbdm_core::status::Win32Error;
 
 use crate::continuation::Continuation as AnyContinuation;
 use crate::continuation::ContinuationContext;
@@ -28,8 +29,8 @@ const RPC_VERSION: u32 = 4;
 const DEFAULT_PROCESSOR: u32 = 5;
 /// Buffer the monitor copies `thread=` into.
 const THREAD_NAME_CAPACITY: usize = 0x40;
-/// Sent while the call has not finished: the quadword 0x3e5.
-const PENDING_MARKER: [u8; 8] = [0, 0, 0, 0, 0, 0, 0x03, 0xe5];
+/// Sent while the call has not finished.
+const PENDING_MARKER: [u8; 8] = (Win32Error::IO_PENDING.code() as u64).to_be_bytes();
 /// Sent once when the call has finished, before the buffer.
 const DONE_MARKER: [u8; 8] = [0; 8];
 

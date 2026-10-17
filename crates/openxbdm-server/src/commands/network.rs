@@ -47,7 +47,13 @@ const fn entry(
     any_of: Access,
     handler: crate::registry::Handler,
 ) -> CommandEntry {
-    CommandEntry::new(name, any_of, Access::NONE, DispatchFlags::NONE, handler)
+    CommandEntry::new(
+        name,
+        any_of,
+        Access::empty(),
+        DispatchFlags::empty(),
+        handler,
+    )
 }
 
 pub(crate) const COMMANDS: &[CommandEntry] = &[
@@ -138,11 +144,11 @@ pub struct WsaError(NonZeroI32);
 
 impl WsaError {
     /// `WSAEINVAL`.
-    pub const INVALID_ARGUMENT: Self = Self::known(10022);
+    pub const INVALID_ARGUMENT: Self = Self::known(Win32Error::INVALID_SOCKET_ARGUMENT);
     /// `WSAEALREADY`.
-    pub const ALREADY: Self = Self::known(10037);
+    pub const ALREADY: Self = Self::known(Win32Error::ALREADY_IN_PROGRESS);
     /// `WSAENOBUFS`.
-    pub const NO_BUFFERS: Self = Self::known(10055);
+    pub const NO_BUFFERS: Self = Self::known(Win32Error::NO_BUFFER_SPACE);
 
     /// `None` for no error.
     pub const fn new(code: i32) -> Option<Self> {
@@ -152,8 +158,8 @@ impl WsaError {
         }
     }
 
-    const fn known(code: i32) -> Self {
-        match Self::new(code) {
+    const fn known(error: Win32Error) -> Self {
+        match Self::new(error.code() as i32) {
             Some(error) => error,
             None => panic!("zero is not an error"),
         }
@@ -212,7 +218,7 @@ impl From<NetworkError> for Hresult {
             NetworkError::FramesLost => Hresult::BUFFER_FULL,
             NetworkError::UploadAborted => Hresult::CONNECTION_LOST,
         };
-        if result.0 & 0x1fff_0000 == Hresult::OK.0 & 0x1fff_0000 {
+        if result.facility() == Hresult::OK.facility() {
             result
         } else {
             ErrorCode::Undefined.hresult()
@@ -238,6 +244,9 @@ pub struct LinkFlags {
 }
 
 impl LinkFlags {
+    /// The link state bit `linkstate disconnect` sets.
+    const DISCONNECTED: u32 = 0x0001_0000;
+
     /// `linkstate restore`.
     pub const RESTORE: Self = Self {
         and: u32::MAX,
@@ -246,7 +255,7 @@ impl LinkFlags {
     /// `linkstate disconnect`.
     pub const DISCONNECT: Self = Self {
         and: 0,
-        or: 0x0001_0000,
+        or: Self::DISCONNECTED,
     };
 }
 

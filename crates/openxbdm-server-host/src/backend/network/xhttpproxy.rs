@@ -64,7 +64,7 @@ impl xhttpproxy::Backend for MockBackend {
         let cleared = mock.active(sys).map(|position| {
             let entry = &mut mock.entries[position];
             let flags = entry.flags;
-            entry.flags.0 &= !ProxyFlags::ACTIVE;
+            entry.flags.remove(ProxyFlags::ACTIVE);
             entry.references -= 1;
             mock.release_if_unused(position);
             flags
@@ -109,7 +109,7 @@ impl xhttpproxy::Backend for MockBackend {
             }
             Certificate::Upload { size } => {
                 entry.certificate = vec![0u8; size as usize];
-                entry.flags.0 |= ProxyFlags::CERTIFICATE_PENDING;
+                entry.flags.insert(ProxyFlags::CERTIFICATE_PENDING);
                 entry.references += 1;
                 Ok(Inserted::Pending(id))
             }
@@ -135,7 +135,7 @@ impl xhttpproxy::Backend for MockBackend {
         let mock = &mut self.network.xhttpproxy;
         let position = mock.position(id)?;
         let entry = &mut mock.entries[position];
-        entry.flags.0 &= !ProxyFlags::CERTIFICATE_PENDING;
+        entry.flags.remove(ProxyFlags::CERTIFICATE_PENDING);
         entry.references -= 1;
         let flags = entry.flags;
         mock.release_if_unused(position);
@@ -155,7 +155,7 @@ impl xhttpproxy::Backend for MockBackend {
         let entry = &mut mock.entries[position];
         entry.references -= 1;
         if entry.flags.contains(ProxyFlags::ACTIVE) {
-            entry.flags.0 &= !ProxyFlags::ACTIVE;
+            entry.flags.remove(ProxyFlags::ACTIVE);
             entry.references -= 1;
         }
         mock.release_if_unused(position);
@@ -196,7 +196,7 @@ impl xhttpproxy::Backend for MockBackend {
                 && flags.contains(ProxyFlags::ACTIVE)
                 && flags.contains(ProxyFlags::TEMP)
             {
-                entry.flags.0 &= !ProxyFlags::ACTIVE;
+                entry.flags.remove(ProxyFlags::ACTIVE);
                 entry.references -= 1;
             }
         }

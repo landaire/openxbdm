@@ -8,6 +8,13 @@
 //! storage accesses. Branches and traps are deferred until the next traced
 //! address, which is written after the branch word.
 
+use core::num::NonZeroU32;
+use core::sync::atomic::AtomicBool;
+use core::sync::atomic::AtomicU32;
+use core::sync::atomic::Ordering::Relaxed;
+
+use xbox360_sys::xboxkrnl::AllocationType;
+
 /// First word of a trace file.
 pub const TRACE_MAGIC: u32 = u32::from_be_bytes(*b"TRAC");
 /// Second word of a trace file.
@@ -31,8 +38,6 @@ pub const BLR: u32 = 0x4e80_0020;
 /// function, and the branch word deferred with it.
 const LEFT_RECORDED_FUNCTION: u32 = 0xffff_fffc;
 const LEFT_RECORDED_BRANCH: u32 = 0x4800_0001;
-/// `VirtualQuery` state of committed pages.
-const MEM_COMMIT: u32 = 0x1000;
 
 /// The traced thread at a trace exception.
 pub trait Thread {
@@ -57,24 +62,109 @@ pub struct Mismatch {
     pub found: u32,
 }
 
-/// Encoder state (stock 0x91fa2e78-0x91fa30a0).
-#[derive(Debug, Clone)]
+/// A 64-bit count as two words, high word first.
+struct Count {
+    high: AtomicU32,
+    low: AtomicU32,
+}
+
+impl Count {
+    const fn new() -> Self {
+        Self {
+            high: AtomicU32::new(0),
+            low: AtomicU32::new(0),
+        }
+    }
+
+    fn load(&self) -> u64 {
+        u64::from(self.high.load(Relaxed)) << 32 | u64::from(self.low.load(Relaxed))
+    }
+
+    fn store(&self, value: u64) {
+        self.high.store((value >> 32) as u32, Relaxed);
+        self.low.store(value as u32, Relaxed);
+    }
+}
+
+/// An address word and whether it is present.
+struct OptionalAddress {
+    address: AtomicU32,
+    present: AtomicBool,
+}
+
+impl OptionalAddress {
+    const fn new() -> Self {
+        Self {
+            address: AtomicU32::new(0),
+            present: AtomicBool::new(false),
+        }
+    }
+
+    fn load(&self) -> Option<u32> {
+        self.present
+            .load(Relaxed)
+            .then(|| self.address.load(Relaxed))
+    }
+
+    fn store(&self, address: Option<u32>) {
+        if let Some(address) = address {
+            self.address.store(address, Relaxed);
+        }
+        self.present.store(address.is_some(), Relaxed);
+    }
+}
+
+struct MismatchSlot {
+    instruction: Count,
+    expected: AtomicU32,
+    found: AtomicU32,
+}
+
+impl MismatchSlot {
+    const fn new() -> Self {
+        Self {
+            instruction: Count::new(),
+            expected: AtomicU32::new(0),
+            found: AtomicU32::new(0),
+        }
+    }
+
+    fn load(&self) -> Mismatch {
+        Mismatch {
+            instruction: self.instruction.load(),
+            expected: self.expected.load(Relaxed),
+            found: self.found.load(Relaxed),
+        }
+    }
+
+    fn store(&self, mismatch: Mismatch) {
+        self.instruction.store(mismatch.instruction);
+        self.expected.store(mismatch.expected, Relaxed);
+        self.found.store(mismatch.found, Relaxed);
+    }
+}
+
+/// Encoder state (stock 0x91fa2e78-0x91fa30a0). The trace handler of each
+/// single-stepped thread updates it, and the threads that start, stop, and
+/// save a session read and reset it, without synchronization as in stock,
+/// so every field is an atomic accessed with relaxed loads and stores.
 pub struct Encoder {
-    total: u64,
-    recorded: u64,
-    depth: u32,
-    start: Option<u32>,
-    record_nested: bool,
-    expected: Option<u32>,
-    return_pending: bool,
-    call_pending: bool,
-    after_trap: Option<u32>,
-    first_written: bool,
-    deferred: bool,
-    deferred_word: u32,
-    deferred_address: u32,
-    mismatch_count: u32,
-    mismatches: [Mismatch; MISMATCH_CAPACITY],
+    total: Count,
+    recorded: Count,
+    depth: AtomicU32,
+    /// First recorded address; 0 records from the first traced address.
+    start: AtomicU32,
+    record_nested: AtomicBool,
+    expected: OptionalAddress,
+    return_pending: AtomicBool,
+    call_pending: AtomicBool,
+    after_trap: OptionalAddress,
+    first_written: AtomicBool,
+    deferred: AtomicBool,
+    deferred_word: AtomicU32,
+    deferred_address: AtomicU32,
+    mismatch_count: AtomicU32,
+    mismatches: [MismatchSlot; MISMATCH_CAPACITY],
 }
 
 impl Default for Encoder {
@@ -85,9 +175,9 @@ impl Default for Encoder {
 
 /// Mark `address` most recently used in its set; true when it was absent
 /// (stock 0x91f67510).
-fn cache_miss(cache: &mut [u32; CACHE_WORDS], address: u32) -> bool {
+fn cache_miss(cache: &[AtomicU32; CACHE_WORDS], address: u32) -> bool {
     let index = ((address & 0x7ffc) >> 1) as usize;
-    let (first, second) = (cache[index], cache[index + 1]);
+    let (first, second) = (cache[index].load(Relaxed), cache[index + 1].load(Relaxed));
     let (first_address, second_address) = (first & !1, second & !1);
     let (first, second, miss) = if first_address == address {
         (first | 1, second_address, false)
@@ -98,8 +188,8 @@ fn cache_miss(cache: &mut [u32; CACHE_WORDS], address: u32) -> bool {
     } else {
         (first_address, address | 1, true)
     };
-    cache[index] = first;
-    cache[index + 1] = second;
+    cache[index].store(first, Relaxed);
+    cache[index + 1].store(second, Relaxed);
     miss
 }
 
@@ -189,88 +279,93 @@ fn classify(word: u32, thread: &impl Thread) -> Class {
 impl Encoder {
     pub const fn new() -> Self {
         Self {
-            total: 0,
-            recorded: 0,
-            depth: 0,
-            start: None,
-            record_nested: false,
-            expected: None,
-            return_pending: false,
-            call_pending: false,
-            after_trap: None,
-            first_written: false,
-            deferred: false,
-            deferred_word: 0,
-            deferred_address: 0,
-            mismatch_count: 0,
-            mismatches: [Mismatch {
-                instruction: 0,
-                expected: 0,
-                found: 0,
-            }; MISMATCH_CAPACITY],
+            total: Count::new(),
+            recorded: Count::new(),
+            depth: AtomicU32::new(0),
+            start: AtomicU32::new(0),
+            record_nested: AtomicBool::new(false),
+            expected: OptionalAddress::new(),
+            return_pending: AtomicBool::new(false),
+            call_pending: AtomicBool::new(false),
+            after_trap: OptionalAddress::new(),
+            first_written: AtomicBool::new(false),
+            deferred: AtomicBool::new(false),
+            deferred_word: AtomicU32::new(0),
+            deferred_address: AtomicU32::new(0),
+            mismatch_count: AtomicU32::new(0),
+            mismatches: [const { MismatchSlot::new() }; MISMATCH_CAPACITY],
         }
     }
 
     /// Instructions the handler saw since [`Encoder::arm`].
     pub fn total(&self) -> u64 {
-        self.total
+        self.total.load()
+    }
+
+    /// Low word of [`Encoder::total`].
+    pub fn total_low(&self) -> u32 {
+        self.total.low.load(Relaxed)
     }
 
     /// Instructions written to the stream.
     pub fn recorded(&self) -> u64 {
-        self.recorded
+        self.recorded.load()
     }
 
     /// Whether a branch waits for its target (stock 0x91f67120).
     pub fn deferred(&self) -> bool {
-        self.deferred
+        self.deferred.load(Relaxed)
     }
 
     /// Mismatches seen and the kept ones (stock 0x91f67138 reads them).
-    pub fn mismatches(&self) -> (u32, &[Mismatch]) {
-        let kept = (self.mismatch_count as usize).min(MISMATCH_CAPACITY);
-        (self.mismatch_count, &self.mismatches[..kept])
+    pub fn mismatches(&self) -> (u32, impl Iterator<Item = Mismatch> + '_) {
+        let count = self.mismatch_count.load(Relaxed);
+        let kept = (count as usize).min(MISMATCH_CAPACITY);
+        (
+            count,
+            self.mismatches[..kept].iter().map(MismatchSlot::load),
+        )
     }
 
-    pub fn clear_mismatches(&mut self) {
-        self.mismatch_count = 0;
+    pub fn clear_mismatches(&self) {
+        self.mismatch_count.store(0, Relaxed);
     }
 
     /// Reset the call depth (session start, stock 0x91f665e0).
-    pub fn reset_depth(&mut self) {
-        self.depth = 0;
+    pub fn reset_depth(&self) {
+        self.depth.store(0, Relaxed);
     }
 
     /// Record only from `start` onward, and calls below it only with
     /// `record_nested` (export 134).
-    pub fn set_start(&mut self, start: Option<u32>, record_nested: bool) {
-        self.start = start;
-        self.record_nested = record_nested;
+    pub fn set_start(&self, start: Option<NonZeroU32>, record_nested: bool) {
+        self.start.store(start.map_or(0, NonZeroU32::get), Relaxed);
+        self.record_nested.store(record_nested, Relaxed);
     }
 
     /// Record from the first traced instruction again; the nested flag
     /// stays.
-    pub fn clear_start(&mut self) {
-        self.start = None;
+    pub fn clear_start(&self) {
+        self.start.store(0, Relaxed);
     }
 
     /// Reset the stream state when the header is written (stock
     /// 0x91f673e8).
-    pub fn begin(&mut self) {
-        self.recorded = 0;
-        self.after_trap = None;
-        self.expected = None;
-        self.mismatch_count = 0;
-        self.call_pending = false;
-        self.deferred = false;
-        self.first_written = false;
-        self.return_pending = false;
+    pub fn begin(&self) {
+        self.recorded.store(0);
+        self.after_trap.store(None);
+        self.expected.store(None);
+        self.mismatch_count.store(0, Relaxed);
+        self.call_pending.store(false, Relaxed);
+        self.deferred.store(false, Relaxed);
+        self.first_written.store(false, Relaxed);
+        self.return_pending.store(false, Relaxed);
     }
 
     /// Reset the counters when single-stepping starts (stock 0x91f66138).
-    pub fn arm(&mut self) {
-        self.total = 0;
-        self.recorded = 0;
+    pub fn arm(&self) {
+        self.total.store(0);
+        self.recorded.store(0);
     }
 
     /// Record the instruction at `iar`, about to execute (stock
@@ -278,114 +373,128 @@ impl Encoder {
     /// without a trace exception of its own; it is recorded before the
     /// next traced address unless execution continues there.
     pub fn record(
-        &mut self,
+        &self,
         iar: u32,
         thread: &impl Thread,
-        cache: &mut [u32; CACHE_WORDS],
+        cache: &[AtomicU32; CACHE_WORDS],
         sink: &mut impl Sink,
     ) {
-        if let Some(skipped) = self.after_trap
+        if let Some(skipped) = self.after_trap.load()
             && skipped != iar
         {
             self.encode(skipped, thread.instruction(skipped), thread, cache, sink);
         }
         let word = thread.instruction(iar);
-        self.after_trap = None;
+        self.after_trap.store(None);
         self.encode(iar, word, thread, cache, sink);
         if matches!(word >> 26, 0x11 | 3) {
-            self.after_trap = Some(iar.wrapping_add(4));
+            self.after_trap.store(Some(iar.wrapping_add(4)));
         }
     }
 
     /// Stock 0x91f67578.
     fn encode(
-        &mut self,
+        &self,
         iar: u32,
         word: u32,
         thread: &impl Thread,
-        cache: &mut [u32; CACHE_WORDS],
+        cache: &[AtomicU32; CACHE_WORDS],
         sink: &mut impl Sink,
     ) {
-        self.total = self.total.wrapping_add(1);
+        self.total.store(self.total.load().wrapping_add(1));
         let opcode = word >> 26;
         let extended = (word >> 1) & 0x3ff;
-        let mut expected = self.expected;
-        if self.call_pending || self.return_pending {
+        let mut expected = self.expected.load();
+        let call_pending = self.call_pending.load(Relaxed);
+        let return_pending = self.return_pending.load(Relaxed);
+        if call_pending || return_pending {
             if expected == Some(iar) {
                 // The call or return was not taken.
-                if self.call_pending {
-                    self.depth = self.depth.wrapping_sub(1);
-                } else {
-                    self.depth = self.depth.wrapping_add(1);
-                }
-            } else if self.return_pending && self.depth == 0 {
-                if self.deferred && cache_miss(cache, self.deferred_address) {
-                    sink.push(self.deferred_word);
+                let depth = self.depth.load(Relaxed);
+                self.depth.store(
+                    if call_pending {
+                        depth.wrapping_sub(1)
+                    } else {
+                        depth.wrapping_add(1)
+                    },
+                    Relaxed,
+                );
+            } else if return_pending && self.depth.load(Relaxed) == 0 {
+                if self.deferred.load(Relaxed)
+                    && cache_miss(cache, self.deferred_address.load(Relaxed))
+                {
+                    sink.push(self.deferred_word.load(Relaxed));
                 }
                 sink.push(LEFT_RECORDED_FUNCTION);
-                self.deferred_address = LEFT_RECORDED_FUNCTION;
-                self.deferred_word = LEFT_RECORDED_BRANCH;
+                self.deferred_address.store(LEFT_RECORDED_FUNCTION, Relaxed);
+                self.deferred_word.store(LEFT_RECORDED_BRANCH, Relaxed);
             }
-            self.call_pending = false;
-            self.return_pending = false;
+            self.call_pending.store(false, Relaxed);
+            self.return_pending.store(false, Relaxed);
         }
 
         let mut record = true;
-        if let Some(start) = self.start {
-            if iar == start && self.depth == 0 {
-                self.depth = 1;
+        if let Some(start) = NonZeroU32::new(self.start.load(Relaxed)) {
+            let start = start.get();
+            let mut depth = self.depth.load(Relaxed);
+            if iar == start && depth == 0 {
+                depth = 1;
                 expected = Some(start);
             }
-            if self.depth == 0 || (self.depth != 1 && !self.record_nested) {
+            if depth == 0 || (depth != 1 && !self.record_nested.load(Relaxed)) {
                 record = false;
             }
-            if self.depth != 0 {
+            if depth != 0 {
                 if opcode == 0x13 && extended == 0x10 {
-                    self.return_pending = true;
-                    self.depth = self.depth.wrapping_sub(1);
+                    self.return_pending.store(true, Relaxed);
+                    depth = depth.wrapping_sub(1);
                 }
                 let branch = matches!(opcode, 0x10 | 0x12)
                     || (opcode == 0x13 && matches!(extended, 0x10 | 0x210));
                 if branch && word & 1 != 0 {
-                    self.call_pending = true;
-                    self.depth = self.depth.wrapping_add(1);
+                    self.call_pending.store(true, Relaxed);
+                    depth = depth.wrapping_add(1);
                 }
             }
+            self.depth.store(depth, Relaxed);
         }
         let expected = expected.unwrap_or(iar);
-        self.expected = Some(iar.wrapping_add(4));
+        self.expected.store(Some(iar.wrapping_add(4)));
         if !record {
             return;
         }
 
-        self.recorded = self.recorded.wrapping_add(1);
-        if !self.deferred && expected != iar {
-            if let Some(slot) = self.mismatches.get_mut(self.mismatch_count as usize) {
-                *slot = Mismatch {
-                    instruction: self.recorded,
+        let recorded = self.recorded.load().wrapping_add(1);
+        self.recorded.store(recorded);
+        let deferred = self.deferred.load(Relaxed);
+        if !deferred && expected != iar {
+            let count = self.mismatch_count.load(Relaxed);
+            if let Some(slot) = self.mismatches.get(count as usize) {
+                slot.store(Mismatch {
+                    instruction: recorded,
                     expected,
                     found: iar,
-                };
+                });
             }
-            self.mismatch_count = self.mismatch_count.wrapping_add(1);
+            self.mismatch_count.store(count.wrapping_add(1), Relaxed);
         }
-        if !self.first_written {
+        if !self.first_written.load(Relaxed) {
             sink.push(iar);
-            self.first_written = true;
+            self.first_written.store(true, Relaxed);
         }
-        if self.deferred {
-            if cache_miss(cache, self.deferred_address) {
-                sink.push(self.deferred_word);
+        if deferred {
+            if cache_miss(cache, self.deferred_address.load(Relaxed)) {
+                sink.push(self.deferred_word.load(Relaxed));
             }
             sink.push(iar);
-            self.deferred = false;
+            self.deferred.store(false, Relaxed);
         }
 
         match classify(word, thread) {
             Class::Deferred => {
-                self.deferred = true;
-                self.deferred_word = word;
-                self.deferred_address = iar;
+                self.deferred.store(true, Relaxed);
+                self.deferred_word.store(word, Relaxed);
+                self.deferred_address.store(iar, Relaxed);
             }
             Class::Plain(operands) => {
                 let words = if cache_miss(cache, iar) {
@@ -437,7 +546,7 @@ pub fn write_memory_map(space: &mut impl AddressSpace, sink: &mut impl Sink) {
             && region.size != 0
         {
             step = region.size >> 12;
-            if region.state == MEM_COMMIT {
+            if region.state == AllocationType::COMMIT.bits() {
                 emit(page, step, region.protect);
             }
         }
@@ -540,9 +649,9 @@ mod tests {
     }
 
     fn run(
-        encoder: &mut Encoder,
+        encoder: &Encoder,
         program: &Program,
-        cache: &mut [u32; CACHE_WORDS],
+        cache: &[AtomicU32; CACHE_WORDS],
         trace: &[u32],
     ) -> Words {
         let mut words = Words::new();
@@ -550,6 +659,10 @@ mod tests {
             encoder.record(iar, program, cache, &mut words);
         }
         words
+    }
+
+    fn new_cache() -> [AtomicU32; CACHE_WORDS] {
+        [const { AtomicU32::new(0) }; CACHE_WORDS]
     }
 
     const ADDI: u32 = 0x3860_0001; // li r3, 1
@@ -565,12 +678,12 @@ mod tests {
             gpr,
             xer: 0,
         };
-        let mut cache = [0; CACHE_WORDS];
-        let mut encoder = Encoder::new();
+        let cache = new_cache();
+        let encoder = Encoder::new();
         let words = run(
-            &mut encoder,
+            &encoder,
             &program,
-            &mut cache,
+            &cache,
             &[0x1000, 0x1004, 0x1008, 0x1000, 0x1004, 0x1008, 0x1000],
         );
         assert_eq!(
@@ -604,8 +717,8 @@ mod tests {
             gpr,
             xer: 0x2000_0085,
         };
-        let mut cache = [0; CACHE_WORDS];
-        let words = run(&mut Encoder::new(), &program, &mut cache, &[0x1000]);
+        let cache = new_cache();
+        let words = run(&Encoder::new(), &program, &cache, &[0x1000]);
         assert_eq!(words.as_slice(), &[0x1000, LSWX, 0x120, 0x05]);
     }
 
@@ -616,20 +729,20 @@ mod tests {
             gpr: [0; 32],
             xer: 0,
         };
-        let mut cache = [0; CACHE_WORDS];
-        let mut encoder = Encoder::new();
-        run(&mut encoder, &program, &mut cache, &[0x1000, 0x100c]);
+        let cache = new_cache();
+        let encoder = Encoder::new();
+        run(&encoder, &program, &cache, &[0x1000, 0x100c]);
+        let (count, mut kept) = encoder.mismatches();
+        assert_eq!(count, 1);
         assert_eq!(
-            encoder.mismatches(),
-            (
-                1,
-                &[Mismatch {
-                    instruction: 2,
-                    expected: 0x1004,
-                    found: 0x100c
-                }][..]
-            )
+            kept.next(),
+            Some(Mismatch {
+                instruction: 2,
+                expected: 0x1004,
+                found: 0x100c
+            })
         );
+        assert_eq!(kept.next(), None);
     }
 
     #[test]
@@ -640,9 +753,9 @@ mod tests {
             gpr: [0; 32],
             xer: 0,
         };
-        let mut cache = [0; CACHE_WORDS];
-        let mut encoder = Encoder::new();
-        let words = run(&mut encoder, &program, &mut cache, &[0x1000, 0x1008]);
+        let cache = new_cache();
+        let encoder = Encoder::new();
+        let words = run(&encoder, &program, &cache, &[0x1000, 0x1008]);
         // The system call is deferred to its continuation, which executed
         // without a trace exception of its own.
         assert_eq!(words.as_slice(), &[0x1000, 0x4400_0002, 0x1004, ADDI, ADDI]);
@@ -657,13 +770,13 @@ mod tests {
             gpr: [0; 32],
             xer: 0,
         };
-        let mut cache = [0; CACHE_WORDS];
-        let mut encoder = Encoder::new();
-        encoder.set_start(Some(0x1000), false);
+        let cache = new_cache();
+        let encoder = Encoder::new();
+        encoder.set_start(NonZeroU32::new(0x1000), false);
         let words = run(
-            &mut encoder,
+            &encoder,
             &program,
-            &mut cache,
+            &cache,
             &[0x1000, 0x1008, 0x100c, 0x1004, 0x2000],
         );
         // The callee is skipped; the return out of the start function
@@ -677,13 +790,13 @@ mod tests {
 
     #[test]
     fn cache_replaces_the_least_recent_way() {
-        let mut cache = [0; CACHE_WORDS];
-        assert!(cache_miss(&mut cache, 0x1000));
-        assert!(cache_miss(&mut cache, 0x9000));
-        assert!(!cache_miss(&mut cache, 0x1000));
-        assert!(cache_miss(&mut cache, 0x11000));
-        assert!(!cache_miss(&mut cache, 0x1000));
-        assert!(cache_miss(&mut cache, 0x9000));
+        let cache = new_cache();
+        assert!(cache_miss(&cache, 0x1000));
+        assert!(cache_miss(&cache, 0x9000));
+        assert!(!cache_miss(&cache, 0x1000));
+        assert!(cache_miss(&cache, 0x11000));
+        assert!(!cache_miss(&cache, 0x1000));
+        assert!(cache_miss(&cache, 0x9000));
     }
 
     struct Space;
@@ -698,7 +811,7 @@ mod tests {
                 }),
                 0x0008_0000 => Some(Region {
                     size: 0x2000,
-                    state: MEM_COMMIT,
+                    state: AllocationType::COMMIT.bits(),
                     protect: 4,
                 }),
                 _ => None,

@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 
 use openxbdm_core::status::KernelError;
+use openxbdm_core::status::NtStatus;
 use openxbdm_server::commands::debugger;
 use openxbdm_server::commands::debugger::Context;
 use openxbdm_server::commands::debugger::ContextFlags;
@@ -24,7 +25,9 @@ use openxbdm_server::commands::debugger::Disposition;
 use openxbdm_server::commands::debugger::ExceptionRecord;
 use openxbdm_server::commands::debugger::ExitStatus;
 use openxbdm_server::commands::debugger::ExtensionHandle;
+use openxbdm_server::commands::debugger::HardwareFlags;
 use openxbdm_server::commands::debugger::ModuleEvent;
+use openxbdm_server::commands::debugger::Msr;
 use openxbdm_server::commands::debugger::NOTICE_TEXT_CAPACITY;
 use openxbdm_server::commands::debugger::NoSuchThread;
 use openxbdm_server::commands::debugger::ProcessKind;
@@ -198,7 +201,7 @@ impl Mock {
     pub fn raise_breakpoint(&mut self, thread: u32, address: u32) {
         let context = self.exception_context(thread, address);
         let record = ExceptionRecord {
-            code: ExceptionRecord::BREAKPOINT,
+            code: NtStatus::BREAKPOINT,
             address,
             parameter_count: 1,
             parameters: [u32::from(debugger::trap::BREAKPOINT), 0, 0, 0],
@@ -215,7 +218,7 @@ impl Mock {
             context.msr = previous.msr;
         }
         let record = ExceptionRecord {
-            code: ExceptionRecord::SINGLE_STEP,
+            code: NtStatus::SINGLE_STEP,
             address,
             parameter_count: 1,
             parameters: [1, 0, 0, 0],
@@ -232,7 +235,7 @@ impl Mock {
             .map(|found| found.frame.clone())
             .unwrap_or_default();
         context.flags = ContextFlags::FULL;
-        context.msr = 0x0000_9032;
+        context.msr = Msr::from_bits_retain(0x0000_9032);
         context.iar = address;
         context.ctr = 0x10;
         context.xer = 0x2000_0000;
@@ -326,7 +329,7 @@ impl MockBackend {
             record,
             second_chance: false,
             has_record,
-            hardware_flags: self.hardware_flags(),
+            hardware_flags: HardwareFlags::from_bits_retain(self.hardware_flags()),
             delivery,
         };
         let iar = context.iar;
@@ -502,7 +505,7 @@ impl debugger::Backend for MockBackend {
             return Ok(());
         }
         let frame = &found.frame;
-        let mut flags = ContextFlags::NONE;
+        let mut flags = ContextFlags::empty();
         if requested.contains(ContextFlags::INTEGER) {
             flags = flags.union(ContextFlags::INTEGER);
             context.gpr = [u64::MAX; 32];
@@ -513,7 +516,7 @@ impl debugger::Backend for MockBackend {
         }
         if requested.contains(ContextFlags::CONTROL) {
             flags = flags.union(ContextFlags::CONTROL);
-            context.msr = u32::MAX;
+            context.msr = Msr::from_bits_retain(u32::MAX);
             context.iar = frame.iar;
             context.lr = frame.lr;
             context.ctr = u64::MAX;
@@ -636,7 +639,7 @@ impl debugger::Backend for MockBackend {
             .exception_context(COMMAND_THREAD, BREAK_NOW_TRAP);
         self.debugger.in_monitor.insert(COMMAND_THREAD, context);
         let record = ExceptionRecord {
-            code: ExceptionRecord::BREAKPOINT,
+            code: NtStatus::BREAKPOINT,
             address: BREAK_NOW_TRAP,
             parameter_count: 1,
             parameters: [u32::from(debugger::trap::BREAKPOINT), 0, 0, 0],

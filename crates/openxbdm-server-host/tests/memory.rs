@@ -552,9 +552,12 @@ fn memtrack_settings_and_queries() {
         let tracking = host.server.state.memory.tracking;
         assert_eq!(
             (tracking.flags, tracking.stack_depth.0),
-            (TrackingFlags(0x1ff), 8)
+            (TrackingFlags::from_bits_retain(0x1ff), 8)
         );
-        assert_eq!(host.backend.memory.tracking_flags, TrackingFlags(0));
+        assert_eq!(
+            host.backend.memory.tracking_flags,
+            TrackingFlags::from_bits_retain(0)
+        );
     }
     assert_eq!(session.command("memtrack cmd=queryflags"), "200- 0x0");
 
@@ -565,13 +568,13 @@ fn memtrack_settings_and_queries() {
     assert_eq!(session.command("memtrack cmd=queryflags"), "200- 0x3");
     assert_eq!(
         server.host.lock().server.state.memory.tracking.flags,
-        TrackingFlags(0x8000_01ff)
+        TrackingFlags::from_bits_retain(0x8000_01ff)
     );
 
     assert_eq!(session.command("memtrack cmd=disable"), "200- OK");
     assert_eq!(
         server.host.lock().server.state.memory.tracking.flags,
-        TrackingFlags(0x8000_0000)
+        TrackingFlags::from_bits_retain(0x8000_0000)
     );
     assert_eq!(session.command("memtrack cmd=queryflags"), "200- 0x3");
 }

@@ -10,6 +10,7 @@ use core::num::NonZeroU32;
 
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
+use openxbdm_core::status::Win32Error;
 
 /// Bytes before the first record: the 0x80-byte file header and the
 /// 0x74-byte media block.
@@ -50,10 +51,10 @@ pub enum CaptureFileError {
 impl From<CaptureFileError> for Hresult {
     fn from(error: CaptureFileError) -> Self {
         match error {
-            CaptureFileError::BadLength => Hresult(0x8007_0018),
-            CaptureFileError::DataLimitReached => Hresult(0x8007_006f),
-            CaptureFileError::WriteFault => Hresult(0x8007_001d),
-            CaptureFileError::InvalidData => Hresult(0x8007_000d),
+            CaptureFileError::BadLength => Win32Error::BAD_LENGTH.into(),
+            CaptureFileError::DataLimitReached => Win32Error::BUFFER_OVERFLOW.into(),
+            CaptureFileError::WriteFault => Win32Error::WRITE_FAULT.into(),
+            CaptureFileError::InvalidData => Win32Error::INVALID_DATA.into(),
             CaptureFileError::OutOfMemory => Hresult::OUT_OF_MEMORY,
             CaptureFileError::Kernel(error) => error.into(),
         }

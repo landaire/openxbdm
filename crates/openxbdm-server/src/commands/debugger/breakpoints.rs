@@ -17,9 +17,14 @@ const SAVED: usize = ADDRESSES + 4 * BLOCK_ENTRIES;
 const FLAGS: usize = SAVED + 4 * BLOCK_ENTRIES;
 const NEXT: usize = FLAGS + BLOCK_ENTRIES;
 const _: () = assert!(NEXT + 4 == BLOCK_SIZE);
-/// Flag bit 0: the trap is in memory. Stock also refuses to arm on bit 1,
-/// which has no writer.
-const ARMED: u8 = 1;
+xbox360_sys::flags! {
+    /// Flags byte of a breakpoint slot. Stock also refuses to arm on bit 1,
+    /// which has no writer.
+    pub struct BreakpointFlags(u8) {
+        /// The trap is in memory.
+        ARMED = 1,
+    }
+}
 
 type Block = [u8; BLOCK_SIZE];
 
@@ -63,7 +68,7 @@ impl BlockFields for Block {
     }
 
     fn armed(&self, index: usize) -> bool {
-        self[FLAGS + index] & ARMED != 0
+        BreakpointFlags::from_bits_retain(self[FLAGS + index]).intersects(BreakpointFlags::ARMED)
     }
 
     fn next(&self) -> Option<BlockId> {
@@ -465,7 +470,7 @@ impl Breakpoints {
         if let Some(original) = code.replace_code_word(block.address(slot.index), TRAP_INSTRUCTION)
         {
             block.set_word(SAVED + 4 * slot.index, original);
-            block[FLAGS + slot.index] = ARMED;
+            block[FLAGS + slot.index] = BreakpointFlags::ARMED.bits();
         }
     }
 

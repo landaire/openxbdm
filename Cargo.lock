@@ -1137,6 +1137,7 @@ dependencies = [
  "insta",
  "openxbdm-core",
  "smb2-server",
+ "xbox360-sys",
 ]
 
 [[package]]

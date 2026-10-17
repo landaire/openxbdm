@@ -153,8 +153,8 @@ impl Default for PublishedState {
             name: Vec::new(),
             dump_mode: state.dump_mode.raw(),
             dump_settings: state.dump_settings.to_block().to_vec(),
-            event_defer: state.event_defer.0,
-            trace_mask: state.trace_mask.0,
+            event_defer: state.event_defer.bits(),
+            trace_mask: state.trace_mask.bits(),
             registration: state.http_registration.result(),
         }
     }
@@ -495,8 +495,8 @@ impl console::Backend for MockBackend {
             Published::DumpSettings(settings) => {
                 published.dump_settings = settings.to_block().to_vec()
             }
-            Published::EventDefer(mask) => published.event_defer = mask.0,
-            Published::TraceMask(mask) => published.trace_mask = mask.0,
+            Published::EventDefer(mask) => published.event_defer = mask.bits(),
+            Published::TraceMask(mask) => published.trace_mask = mask.bits(),
             Published::Registration(registration) => published.registration = registration.result(),
         }
     }
@@ -518,6 +518,6 @@ impl console::Backend for MockBackend {
     }
 
     fn trace_mask(&mut self) -> console::TraceMask {
-        console::TraceMask(self.console.published.trace_mask)
+        console::TraceMask::from_bits_retain(self.console.published.trace_mask)
     }
 }

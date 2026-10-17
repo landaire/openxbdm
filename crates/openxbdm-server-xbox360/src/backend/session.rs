@@ -916,11 +916,12 @@ fn write_log(file: u32, bytes: &[u8]) -> Result<(), KernelError> {
 
 impl TellLogBackend for Console {
     fn tell_log_area(&mut self) -> Option<TellLogAreas> {
-        tell_log_engine().map(|_| TellLogAreas(TELL_LOG.area.load(Ordering::Acquire)))
+        tell_log_engine()
+            .map(|_| TellLogAreas::from_bits_retain(TELL_LOG.area.load(Ordering::Acquire)))
     }
 
     fn set_tell_log_area(&mut self, area: TellLogAreas) {
-        TELL_LOG.area.store(area.0, Ordering::Release);
+        TELL_LOG.area.store(area.bits(), Ordering::Release);
     }
 
     fn tell_log_start(
@@ -940,7 +941,7 @@ impl TellLogBackend for Console {
                 TELL_LOG
                     .entry_size
                     .store(config.entry_size, Ordering::Release);
-                TELL_LOG.area.store(area.0, Ordering::Release);
+                TELL_LOG.area.store(area.bits(), Ordering::Release);
                 TELL_LOG
                     .worker
                     .store(log_engine::worker_id(engine), Ordering::Release);
@@ -1077,7 +1078,7 @@ extern "C" fn reset_title_wait_counts(_context: u32) -> u32 {
 /// Write an `E:` or `L:` line into the log when area bit 2 is set (stock
 /// 0x91f2b680 and line writer 0x91f2b530).
 fn trace_wait(trace: WaitTrace, section: u32, entry_stack: u32) {
-    let open = TellLogAreas(dispatcher::dispatch(0x8a, 0));
+    let open = TellLogAreas::from_bits_retain(dispatcher::dispatch(0x8a, 0));
     if !open.intersects(TellLogAreas::CRITICAL_SECTIONS) {
         return;
     }

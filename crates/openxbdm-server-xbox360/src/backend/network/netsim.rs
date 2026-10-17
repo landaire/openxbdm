@@ -272,6 +272,6 @@ impl netsim::Backend for Console {
         let mut value = 0u32;
         // SAFETY: `value` is a live u32.
         unsafe { XeKeysGetStatus(&mut value) };
-        KeyStatus(value)
+        KeyStatus::from_bits_retain(value)
     }
 }

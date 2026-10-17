@@ -22,12 +22,24 @@ const PATH_PREFIX: &[u8] = b" \"Path=";
 pub type FileEventText = Text<FILE_EVENT_TEXT_LIMIT>;
 pub type FileEventSwitchText = Text<SWITCH_TEXT_LIMIT>;
 
-/// `Flags=` bits.
-pub const FLAG_SYNCHRONOUS: u32 = 0x8000_0000;
-pub const FLAG_SCATTER_GATHER: u32 = 0x4000_0000;
-pub const FLAG_BUFFERED: u32 = 0x2000_0000;
-/// The event was reported by a title (exports 155 and 157).
-pub const FLAG_REPORTED: u32 = 0x1000_0000;
+xbox360_sys::flags! {
+    /// `Flags=` bits.
+    pub struct FileEventFlags(u32) {
+        /// The event was reported by a title (exports 155 and 157).
+        REPORTED = 0x1000_0000,
+        BUFFERED = 0x2000_0000,
+        SCATTER_GATHER = 0x4000_0000,
+        SYNCHRONOUS = 0x8000_0000,
+    }
+}
+
+xbox360_sys::flags! {
+    /// Caller option bits of exports 155 and 157.
+    pub struct PseudoOptions(u32) {
+        SYNCHRONOUS = 0x1,
+        BUFFERED = 0x2,
+    }
+}
 
 /// Sequence number of the switch announcements and the events, one counter
 /// for both (stock 0x91f9735c). The counter starts at 0, as stock's.
@@ -62,7 +74,7 @@ pub struct FileEventBegin<'a> {
     pub handle: u32,
     pub offset: u64,
     pub bytes: u32,
-    pub flags: u32,
+    pub flags: FileEventFlags,
     pub path: Option<EventPath<'a>>,
 }
 
@@ -74,7 +86,7 @@ pub struct PseudoBegin<'a> {
     pub time_base: u64,
     pub thread_id: u32,
     /// Caller option bits, see [`pseudo_flags`].
-    pub options: u32,
+    pub options: PseudoOptions,
     pub path: Option<EventPath<'a>>,
 }
 
@@ -92,7 +104,7 @@ pub struct PseudoBeginIo<'a> {
     pub offset: u64,
     pub bytes: u32,
     /// Caller option bits, see [`pseudo_flags`].
-    pub options: u32,
+    pub options: PseudoOptions,
 }
 
 /// `Type=` of operation `operation` of the event record.
@@ -111,13 +123,13 @@ pub const fn file_event_kind(operation: u32) -> u32 {
 
 /// `Flags=` of a title-reported begin: option bit 0 synchronous, bit 1
 /// buffered.
-pub const fn pseudo_flags(options: u32) -> u32 {
-    let mut flags = FLAG_REPORTED;
-    if options & 1 != 0 {
-        flags |= FLAG_SYNCHRONOUS;
+pub const fn pseudo_flags(options: PseudoOptions) -> FileEventFlags {
+    let mut flags = FileEventFlags::REPORTED;
+    if options.intersects(PseudoOptions::SYNCHRONOUS) {
+        flags.insert(FileEventFlags::SYNCHRONOUS);
     }
-    if options & 2 != 0 {
-        flags |= FLAG_BUFFERED;
+    if options.intersects(PseudoOptions::BUFFERED) {
+        flags.insert(FileEventFlags::BUFFERED);
     }
     flags
 }
@@ -128,10 +140,10 @@ pub const fn pseudo_io_type(operation: u32) -> u32 {
     if operation < 7 { operation + 1 } else { 8 }
 }
 
-const fn pseudo_io_flags(operation: u32, options: u32) -> u32 {
+const fn pseudo_io_flags(operation: u32, options: PseudoOptions) -> FileEventFlags {
     let flags = pseudo_flags(options);
     if matches!(operation, 2 | 3) {
-        flags | FLAG_SCATTER_GATHER
+        flags.union(FileEventFlags::SCATTER_GATHER)
     } else {
         flags
     }
@@ -187,7 +199,7 @@ pub fn format_file_event_begin(event: &FileEventBegin<'_>) -> FileEventText {
         high(event.offset),
         event.offset as u32,
         event.bytes,
-        event.flags,
+        event.flags.bits(),
     );
     if let Some(path) = event.path {
         append_path(&mut text, path);
@@ -237,7 +249,7 @@ pub fn format_pseudo_begin(event: &PseudoBegin<'_>) -> FileEventText {
                 high(event.time_base),
                 event.time_base as u32,
                 event.thread_id,
-                pseudo_flags(event.options),
+                pseudo_flags(event.options).bits(),
             )
         });
     if let Some(path) = event.path {
@@ -270,7 +282,7 @@ pub fn format_pseudo_begin_io(event: &PseudoBeginIo<'_>) -> FileEventText {
                 high(event.offset),
                 event.offset as u32,
                 event.bytes,
-                pseudo_io_flags(event.operation, event.options),
+                pseudo_io_flags(event.operation, event.options).bits(),
             )
         });
     text
@@ -331,7 +343,7 @@ mod tests {
             handle: 0,
             offset: 0,
             bytes: 0,
-            flags: 0xa000_0000,
+            flags: FileEventFlags::SYNCHRONOUS | FileEventFlags::BUFFERED,
             path,
         }
     }
@@ -347,7 +359,7 @@ mod tests {
             library: b"",
             time_base: 0,
             thread_id: 0,
-            options: 0,
+            options: PseudoOptions::empty(),
             path: None,
         });
         let event = PseudoBegin {
@@ -355,7 +367,7 @@ mod tests {
             library: &library[..fixed - bare.as_bytes().len()],
             time_base: 0,
             thread_id: 0,
-            options: 0,
+            options: PseudoOptions::empty(),
             path: Some(path),
         };
         format_pseudo_begin(&event)
@@ -445,7 +457,7 @@ mod tests {
             library: b"xmedia",
             time_base: 0x0000_0012_3456_789a,
             thread_id: 0xf900_0020,
-            options: 3,
+            options: PseudoOptions::SYNCHRONOUS.union(PseudoOptions::BUFFERED),
             path: Some(EventPath {
                 length: 8,
                 text: b"game:\\a\\b",
@@ -462,7 +474,7 @@ mod tests {
             library: b"lib",
             time_base: 1,
             thread_id: 5,
-            options: 2,
+            options: PseudoOptions::BUFFERED,
             path: None,
         });
         let expected: &[u8] = b"XBDMFE!PseudoBegin 0x00000004 \"Library=lib\" \"Perf=0x0000000000000001\" \"Type=0x00000000\" \"ThreadId=0x00000005\" \"Flags=0x30000000\"";
@@ -525,7 +537,7 @@ mod tests {
             handle: 0x80,
             offset: 0x1_0000_0200,
             bytes: 0x800,
-            options: 1,
+            options: PseudoOptions::SYNCHRONOUS,
         });
         let expected: &[u8] = b"XBDMFE!PseudoBegin 0x00000009 \"Library=xmedia\" \"Perf=0x0000000100000000\" \"Type=0x00000003\" \"Event=stream\" \"ThreadId=0xf9000020\" \"Handle=0x00000080\" \"Offset=0x0000000100000200\" \"Bytes=0x00000800\" \"Flags=0xd0000000\"";
         assert_eq!(text.as_bytes(), expected);
@@ -536,8 +548,9 @@ mod tests {
         let types: [u32; 9] = core::array::from_fn(|operation| pseudo_io_type(operation as u32));
         assert_eq!(types, [1, 2, 3, 4, 5, 6, 7, 8, 8]);
         assert_eq!(pseudo_io_type(u32::MAX), 8);
-        let flags: [u32; 5] =
-            core::array::from_fn(|operation| pseudo_io_flags(operation as u32, 0));
+        let flags: [u32; 5] = core::array::from_fn(|operation| {
+            pseudo_io_flags(operation as u32, PseudoOptions::empty()).bits()
+        });
         assert_eq!(
             flags,
             [

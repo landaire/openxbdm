@@ -19,6 +19,7 @@ use openxbdm_core::status::KernelError;
 use openxbdm_server::commands::console::ConfigSetting;
 use openxbdm_server::commands::console::DumpMode;
 use openxbdm_server::commands::console::NetworkRaError;
+use openxbdm_server::commands::console::NetworkRaFlags;
 use openxbdm_server::commands::console::NetworkRaRecord;
 use openxbdm_server::commands::console::RegistrationState;
 use openxbdm_server::commands::filesystem::DriveTarget;
@@ -385,7 +386,7 @@ fn data_center_network_configuration() {
     assert_eq!(
         server.host.lock().backend.console.network_ra.record,
         NetworkRaRecord {
-            flags: 0xc000_0000,
+            flags: NetworkRaFlags::RELAX_HEARTBEAT | NetworkRaFlags::CUSTOM_BOOT_ADDRESS,
             custom_boot_address: 0xabc
         }
     );
@@ -395,7 +396,7 @@ fn data_center_network_configuration() {
     );
     assert_eq!(
         server.host.lock().backend.console.network_ra.record.flags,
-        0x8000_0000
+        NetworkRaFlags::RELAX_HEARTBEAT
     );
 
     assert_eq!(session.command("resetnetra"), "200- OK");
@@ -478,9 +479,12 @@ fn verbose() {
     let mut session = session(&server);
     assert_eq!(session.command("verbose"), "400- missing level");
     assert_eq!(session.command("verbose level=5x"), "400- missing level");
-    assert_eq!(server.host.lock().server.state.console.trace_mask.0, 5);
+    assert_eq!(server.host.lock().server.state.console.trace_mask.bits(), 5);
     assert_eq!(session.command("verbose level=0x24"), "200- OK");
-    assert_eq!(server.host.lock().server.state.console.trace_mask.0, 0x24);
+    assert_eq!(
+        server.host.lock().server.state.console.trace_mask.bits(),
+        0x24
+    );
 }
 
 #[test]

@@ -5,7 +5,10 @@
 use core::ops::Range;
 use core::time::Duration;
 
+use xbox360_sys::xam::Protocol;
+
 use crate::network::Endpoint;
+use crate::network::Ipv4Address;
 
 /// Largest tunnel message, and the receive buffer size.
 pub const MESSAGE_LIMIT: usize = 0x5c0;
@@ -14,12 +17,19 @@ pub const RECEIVE_TIMEOUT: Duration = Duration::from_millis(5000);
 /// Time without an outbound message after which a keepalive is sent.
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(20_000);
 /// The keepalive message.
-pub const KEEPALIVE: [u8; 1] = [MESSAGE_KEEPALIVE];
+pub const KEEPALIVE: [u8; 1] = [TunnelMessage::Keepalive.raw()];
 
-const MESSAGE_KEEPALIVE: u8 = 0x01;
-const MESSAGE_TCP: u8 = 0x02;
-const MESSAGE_UDP: u8 = 0x03;
-const MESSAGE_BROADCAST: u8 = 0x04;
+xbox360_sys::value_enum! {
+    /// Type byte of a tunnel message.
+    pub enum TunnelMessage: u8 {
+        Keepalive = 0x01,
+        Tcp = 0x02,
+        Udp = 0x03,
+        /// UDP to the broadcast address.
+        Broadcast = 0x04,
+    }
+}
+
 const TCP_HEADER_LENGTH: usize = 5;
 const UDP_HEADER_LENGTH: usize = 9;
 
@@ -27,12 +37,12 @@ const UDP_HEADER_LENGTH: usize = 9;
 pub const IPV4_HEADER_LENGTH: usize = 20;
 /// Bytes of a UDP header.
 pub const UDP_DATAGRAM_HEADER_LENGTH: usize = 8;
-const PROTOCOL_TCP: u8 = 6;
-const PROTOCOL_UDP: u8 = 17;
+const PROTOCOL_TCP: u8 = Protocol::Tcp.raw() as u8;
+const PROTOCOL_UDP: u8 = Protocol::Udp.raw() as u8;
 /// Fragment offset and more-fragments bits of the IPv4 flags word.
 const FRAGMENT_MASK: u16 = 0x3fff;
-const BROADCAST: [u8; 4] = [0xff; 4];
-const LOOPBACK: [u8; 4] = [127, 0, 0, 1];
+const BROADCAST: [u8; 4] = Ipv4Address::BROADCAST.octets();
+const LOOPBACK: [u8; 4] = Ipv4Address::LOOPBACK.octets();
 /// Time to live of injected packets.
 const INJECTED_TTL: u8 = 1;
 
@@ -86,7 +96,7 @@ pub fn encapsulate(packet: &mut [u8], tunnel: &Tunnel) -> Option<Outbound> {
         PROTOCOL_TCP => {
             packet.get_mut(header_length..)?.get_mut(16..20)?.fill(0);
             (
-                [MESSAGE_TCP, d0, d1, d2, d3, 0, 0, 0, 0],
+                [TunnelMessage::Tcp.raw(), d0, d1, d2, d3, 0, 0, 0, 0],
                 TCP_HEADER_LENGTH,
                 header_length..packet.len(),
             )
@@ -94,12 +104,22 @@ pub fn encapsulate(packet: &mut [u8], tunnel: &Tunnel) -> Option<Outbound> {
         PROTOCOL_UDP => {
             let ports = packet.get(header_length..header_length + UDP_DATAGRAM_HEADER_LENGTH)?;
             let kind = if [d0, d1, d2, d3] == BROADCAST {
-                MESSAGE_BROADCAST
+                TunnelMessage::Broadcast
             } else {
-                MESSAGE_UDP
+                TunnelMessage::Udp
             };
             (
-                [kind, d0, d1, d2, d3, ports[2], ports[3], ports[0], ports[1]],
+                [
+                    kind.raw(),
+                    d0,
+                    d1,
+                    d2,
+                    d3,
+                    ports[2],
+                    ports[3],
+                    ports[0],
+                    ports[1],
+                ],
                 UDP_HEADER_LENGTH,
                 header_length + UDP_DATAGRAM_HEADER_LENGTH..packet.len(),
             )
@@ -148,16 +168,18 @@ pub struct Injected<'a> {
 /// 255.255.255.255 for 0x04; the UDP header has checksum 0. `None`: the
 /// message is ignored (unknown type or truncated).
 pub fn decapsulate(message: &[u8]) -> Option<Inbound<'_>> {
-    let (protocol, udp, payload, destination) = match *message.first()? {
-        MESSAGE_KEEPALIVE => return Some(Inbound::Keepalive),
-        MESSAGE_TCP if message.len() >= TCP_HEADER_LENGTH => {
+    let (protocol, udp, payload, destination) = match TunnelMessage::from_raw(*message.first()?)? {
+        TunnelMessage::Keepalive => return Some(Inbound::Keepalive),
+        TunnelMessage::Tcp if message.len() >= TCP_HEADER_LENGTH => {
             (PROTOCOL_TCP, None, &message[TCP_HEADER_LENGTH..], LOOPBACK)
         }
-        kind @ (MESSAGE_UDP | MESSAGE_BROADCAST) if message.len() >= UDP_HEADER_LENGTH => {
+        kind @ (TunnelMessage::Udp | TunnelMessage::Broadcast)
+            if message.len() >= UDP_HEADER_LENGTH =>
+        {
             let payload = &message[UDP_HEADER_LENGTH..];
             let [l0, l1] = ((payload.len() + UDP_DATAGRAM_HEADER_LENGTH) as u16).to_be_bytes();
             let udp = [message[5], message[6], message[7], message[8], l0, l1, 0, 0];
-            let destination = if kind == MESSAGE_BROADCAST {
+            let destination = if kind == TunnelMessage::Broadcast {
                 BROADCAST
             } else {
                 LOOPBACK

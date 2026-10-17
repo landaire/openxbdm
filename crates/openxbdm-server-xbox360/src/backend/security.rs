@@ -155,7 +155,7 @@ fn read_user(object: u32) -> User {
         (password_set != 0).then_some(Password((u64::from(high) << 32) | u64::from(low)));
     User {
         password,
-        privileges: Access::from_bits(privileges),
+        privileges: Access::from_bits_retain(privileges),
     }
 }
 
@@ -341,7 +341,7 @@ extern "C" fn set_user_access(user: u32, access: u32) -> u32 {
             let result = security::set_user_access(
                 console,
                 name(request.first),
-                Access::from_bits(request.second),
+                Access::from_bits_retain(request.second),
             );
             crate::exports::export_result(result).0
         },
@@ -404,7 +404,7 @@ extern "C" fn add_user(user: u32, access: u32) -> u32 {
         |server, console, _, request| {
             let user = User {
                 password: None,
-                privileges: Access::from_bits(request.second),
+                privileges: Access::from_bits_retain(request.second),
             };
             let result = security::add_user(&mut server.state, console, name(request.first), user);
             save_settings(server, console);

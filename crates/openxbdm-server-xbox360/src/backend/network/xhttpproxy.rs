@@ -107,7 +107,7 @@ impl Guard {
     fn active(&self, sys: bool) -> Option<*mut Entry> {
         // SAFETY: entries are valid while the lock is held.
         self.iter().find(|&entry| unsafe {
-            let flags = ProxyFlags((*entry).flags);
+            let flags = ProxyFlags::from_bits_retain((*entry).flags);
             flags.contains(ProxyFlags::ACTIVE) && flags.contains(ProxyFlags::SYS) == sys
         })
     }
@@ -147,8 +147,8 @@ impl xhttpproxy::Backend for Console {
         let cleared = guard.active(sys).map(|entry| {
             // SAFETY: the entry is linked and the lock is held.
             unsafe {
-                let flags = ProxyFlags((*entry).flags);
-                (*entry).flags &= !ProxyFlags::ACTIVE;
+                let flags = ProxyFlags::from_bits_retain((*entry).flags);
+                (*entry).flags &= !ProxyFlags::ACTIVE.bits();
                 (*entry).references -= 1;
                 guard.release_if_unused(entry);
                 flags
@@ -198,7 +198,7 @@ impl xhttpproxy::Backend for Console {
             entry.write(Entry {
                 flink: (*guard.head()).flink,
                 blink: guard.head(),
-                flags: new.flags.0,
+                flags: new.flags.bits(),
                 references: 1,
                 consumers: 0,
                 name,
@@ -222,7 +222,7 @@ impl xhttpproxy::Backend for Console {
                     }
                 }
                 Certificate::Upload { .. } => {
-                    (*entry).flags |= ProxyFlags::CERTIFICATE_PENDING;
+                    (*entry).flags |= ProxyFlags::CERTIFICATE_PENDING.bits();
                     (*entry).references += 1;
                     Ok(Inserted::Pending(ProxyId(entry as usize as u32)))
                 }
@@ -253,9 +253,9 @@ impl xhttpproxy::Backend for Console {
         let entry = guard.find(id)?;
         // SAFETY: the entry is linked and the lock is held.
         unsafe {
-            (*entry).flags &= !ProxyFlags::CERTIFICATE_PENDING;
+            (*entry).flags &= !ProxyFlags::CERTIFICATE_PENDING.bits();
             (*entry).references -= 1;
-            let flags = ProxyFlags((*entry).flags);
+            let flags = ProxyFlags::from_bits_retain((*entry).flags);
             guard.release_if_unused(entry);
             Some(flags)
         }
@@ -277,8 +277,8 @@ impl xhttpproxy::Backend for Console {
         // SAFETY: the entry is linked and the lock is held.
         unsafe {
             (*entry).references -= 1;
-            if ProxyFlags((*entry).flags).contains(ProxyFlags::ACTIVE) {
-                (*entry).flags &= !ProxyFlags::ACTIVE;
+            if ProxyFlags::from_bits_retain((*entry).flags).contains(ProxyFlags::ACTIVE) {
+                (*entry).flags &= !ProxyFlags::ACTIVE.bits();
                 (*entry).references -= 1;
             }
             guard.release_if_unused(entry);
@@ -310,7 +310,7 @@ impl xhttpproxy::Backend for Console {
             });
             Some(ProxyEntry {
                 id: ProxyId(entry as usize as u32),
-                flags: ProxyFlags((*entry).flags),
+                flags: ProxyFlags::from_bits_retain((*entry).flags),
                 name_len,
                 name,
                 port: (*entry).port,
@@ -340,12 +340,12 @@ impl xhttpproxy::Backend for Console {
             // may be freed.
             unsafe {
                 (*entry).consumers = 0;
-                let flags = ProxyFlags((*entry).flags);
+                let flags = ProxyFlags::from_bits_retain((*entry).flags);
                 if !flags.contains(ProxyFlags::SYS)
                     && flags.contains(ProxyFlags::ACTIVE)
                     && flags.contains(ProxyFlags::TEMP)
                 {
-                    (*entry).flags &= !ProxyFlags::ACTIVE;
+                    (*entry).flags &= !ProxyFlags::ACTIVE.bits();
                     (*entry).references -= 1;
                 }
                 if (*entry).references == 0 {
@@ -386,7 +386,7 @@ pub(crate) fn service_http_proxy_acquire(argument: u32) -> u32 {
     // a system entry that is not system-only.
     let found = guard.iter().find(|&entry| {
         // SAFETY: entries are valid while the lock is held.
-        let flags = ProxyFlags(unsafe { (*entry).flags });
+        let flags = ProxyFlags::from_bits_retain(unsafe { (*entry).flags });
         let scope = if flags.contains(ProxyFlags::SYS) {
             sys || !flags.contains(ProxyFlags::SYS_ONLY)
         } else {
@@ -399,7 +399,7 @@ pub(crate) fn service_http_proxy_acquire(argument: u32) -> u32 {
     // has the fields of this code.
     unsafe {
         let force_only = request.cast::<u8>().add(0x10);
-        let forced = ProxyFlags((*entry).flags).contains(ProxyFlags::FORCE);
+        let forced = ProxyFlags::from_bits_retain((*entry).flags).contains(ProxyFlags::FORCE);
         if force_only.read() != 0 && !forced {
             return NOT_FORCED;
         }
@@ -475,7 +475,7 @@ pub(crate) fn service_http_proxy_certificate(argument: u32) -> u32 {
     if size == 0 {
         return NOT_FOUND;
     }
-    if ProxyFlags(flags).contains(ProxyFlags::CERTIFICATE_PENDING) {
+    if ProxyFlags::from_bits_retain(flags).contains(ProxyFlags::CERTIFICATE_PENDING) {
         return Hresult::IN_PROGRESS.0;
     }
     // SAFETY: the callback is the caller's; it takes (context, value 5,

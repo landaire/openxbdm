@@ -5,26 +5,16 @@ use crate::reply::CommandResult;
 use crate::access::Access;
 use crate::invocation::Invocation;
 
-/// Dispatch flags carried by a command table entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DispatchFlags(u32);
-
-impl DispatchFlags {
-    pub const NONE: Self = Self(0);
-    /// The command may run on a connection serviced outside the main
-    /// server context (dedicated or title connections).
-    pub const ANY_CONTEXT: Self = Self(0x1);
-    /// The command exists only on development kits; test kits reply 407.
-    pub const DEVKIT_ONLY: Self = Self(0x2);
-    /// The monitor runs the handler on a separate thread and waits for it.
-    pub const OWN_THREAD: Self = Self(0x4);
-
-    pub const fn bits(self) -> u32 {
-        self.0
-    }
-
-    pub const fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
+xbox360_sys::flags! {
+    /// Dispatch flags carried by a command table entry.
+    pub struct DispatchFlags(u8) {
+        /// The command may run on a connection serviced outside the main
+        /// server context (dedicated or title connections).
+        ANY_CONTEXT = 0x1,
+        /// The command exists only on development kits; test kits reply 407.
+        DEVKIT_ONLY = 0x2,
+        /// The monitor runs the handler on a separate thread and waits for it.
+        OWN_THREAD = 0x4,
     }
 }
 
@@ -44,7 +34,7 @@ pub struct CommandEntry {
     /// When nonzero, the connection must hold all of these bits and
     /// `any_of` is not consulted.
     all_of: u8,
-    flags: u8,
+    flags: DispatchFlags,
 }
 
 impl CommandEntry {
@@ -55,29 +45,29 @@ impl CommandEntry {
         flags: DispatchFlags,
         handler: Handler,
     ) -> Self {
-        assert!(any_of.bits() <= 0xff && all_of.bits() <= 0xff && flags.0 <= 0xff);
+        assert!(any_of.bits() <= 0xff && all_of.bits() <= 0xff);
         Self {
             name,
             handler,
             any_of: any_of.bits() as u8,
             all_of: all_of.bits() as u8,
-            flags: flags.0 as u8,
+            flags,
         }
     }
 
     pub const fn flags(&self) -> DispatchFlags {
-        DispatchFlags(self.flags as u32)
+        self.flags
     }
 
     /// The access rule of the monitor's table lookup.
     pub fn permits(&self, access: Access) -> bool {
-        let all_of = Access::from_bits(u32::from(self.all_of));
+        let all_of = Access::from_bits_retain(u32::from(self.all_of));
         if self.all_of != 0 {
             access.contains(all_of)
         } else if self.any_of == 0 {
             true
         } else {
-            access.intersects(Access::from_bits(u32::from(self.any_of)))
+            access.intersects(Access::from_bits_retain(u32::from(self.any_of)))
         }
     }
 }

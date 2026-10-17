@@ -20,28 +20,36 @@ use crate::reply::CommandResult;
 use crate::reply::Reply;
 
 pub(crate) const COMMANDS: &[CommandEntry] = &[
-    entry("civfail", DispatchFlags::NONE, civ_fail),
+    entry("civfail", DispatchFlags::empty(), civ_fail),
     entry("civinject", DispatchFlags::OWN_THREAD, civ_inject),
     entry("civsetbits", DispatchFlags::DEVKIT_ONLY, civ_set_bits),
     entry("civstart", DispatchFlags::OWN_THREAD, civ_start),
-    entry("civstatus", DispatchFlags::NONE, civ_status),
+    entry("civstatus", DispatchFlags::empty(), civ_status),
     entry("civstop", DispatchFlags::OWN_THREAD, civ_stop),
     entry("civverify", DispatchFlags::OWN_THREAD, civ_verify),
-    entry("iptv", DispatchFlags::NONE, iptv),
+    entry("iptv", DispatchFlags::empty(), iptv),
     entry(
         "iptvallowuninstall",
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         iptv_allow_uninstall,
     ),
-    entry("iptvbootstrapurl", DispatchFlags::NONE, iptv_bootstrap_url),
-    entry("iptvdvr", DispatchFlags::NONE, iptv_dvr),
-    entry("iptvprovidername", DispatchFlags::NONE, iptv_provider_name),
+    entry(
+        "iptvbootstrapurl",
+        DispatchFlags::empty(),
+        iptv_bootstrap_url,
+    ),
+    entry("iptvdvr", DispatchFlags::empty(), iptv_dvr),
+    entry(
+        "iptvprovidername",
+        DispatchFlags::empty(),
+        iptv_provider_name,
+    ),
     entry(
         "iptvprovisioningurl",
-        DispatchFlags::NONE,
+        DispatchFlags::empty(),
         iptv_provisioning_url,
     ),
-    entry("iptvsupportinfo", DispatchFlags::NONE, iptv_support_info),
+    entry("iptvsupportinfo", DispatchFlags::empty(), iptv_support_info),
 ];
 
 const fn entry(
@@ -49,7 +57,7 @@ const fn entry(
     flags: DispatchFlags,
     handler: crate::registry::Handler,
 ) -> CommandEntry {
-    CommandEntry::new(name, Access::CONTROL, Access::NONE, flags, handler)
+    CommandEntry::new(name, Access::CONTROL, Access::empty(), flags, handler)
 }
 
 /// Global state of this domain.
@@ -81,12 +89,10 @@ pub enum LastError {
 }
 
 impl LastError {
-    const PROC_NOT_FOUND: Win32Error = Win32Error::new(0x7f).unwrap();
-
     pub fn from_win32(error: Option<Win32Error>) -> Self {
         match error {
             None => Self::Success,
-            Some(error) if error == Self::PROC_NOT_FOUND => Self::ProcNotFound,
+            Some(Win32Error::PROC_NOT_FOUND) => Self::ProcNotFound,
             Some(error) => Self::Other(error),
         }
     }
@@ -95,7 +101,7 @@ impl LastError {
     pub fn code(self) -> u32 {
         match self {
             Self::Success => 0,
-            Self::ProcNotFound => Self::PROC_NOT_FOUND.code(),
+            Self::ProcNotFound => Win32Error::PROC_NOT_FOUND.code(),
             Self::Other(error) => error.code(),
         }
     }

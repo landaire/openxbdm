@@ -45,7 +45,7 @@ pub struct ReturnValue(pub u32);
 impl ReturnValue {
     /// `ERROR_IO_PENDING`: the result of a discarded call that completes
     /// its overlapped request later.
-    pub const IO_PENDING: Self = Self(0x3e5);
+    pub const IO_PENDING: Self = Self(Win32Error::IO_PENDING.code());
 }
 
 /// Why an engine request failed.
@@ -98,46 +98,33 @@ impl EngineState {
     }
 }
 
-/// Hook flags: set per entry by `setinfo`; the logger derives the flags of
-/// one call from them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct HookFlags(pub u32);
-
-impl HookFlags {
-    pub const NONE: Self = Self(0);
-    /// Log register, stack, floating-point, and vector parameter records.
-    pub const LOG_PARAMETERS: Self = Self(0x1);
-    /// Log a return record.
-    pub const LOG_RETURN: Self = Self(0x2);
-    /// Entry: never discard a call. Call: the original function runs.
-    pub const CALL_ORIGINAL: Self = Self(0x4);
-    /// Call: the original function is skipped and the configured return
-    /// value is returned.
-    pub const DISCARDED: Self = Self(0x8);
-    pub const REGISTERS: Self = Self(0x10);
-    pub const FLOATING_POINT: Self = Self(0x20);
-    pub const VECTOR: Self = Self(0x40);
-    pub const STACK: Self = Self(0x80);
-    pub const SLEEP_BEFORE: Self = Self(0x100);
-    pub const SLEEP_AFTER: Self = Self(0x200);
-    /// A discarded call completes an overlapped request.
-    pub const OVERLAPPED: Self = Self(0x400);
-    /// The overlapped offset is an argument register index rather than a
-    /// stack offset.
-    pub const OVERLAPPED_IN_REGISTER: Self = Self(0x800);
-    /// Call: the call record was logged.
-    pub const LOGGED: Self = Self(0x1000);
-
-    pub const fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
-    }
-
-    pub const fn union(self, other: Self) -> Self {
-        Self(self.0 | other.0)
-    }
-
-    pub const fn without(self, other: Self) -> Self {
-        Self(self.0 & !other.0)
+xbox360_sys::flags! {
+    /// Hook flags: set per entry by `setinfo`; the logger derives the flags
+    /// of one call from them.
+    pub struct HookFlags(u32) {
+        /// Log register, stack, floating-point, and vector parameter
+        /// records.
+        LOG_PARAMETERS = 0x1,
+        /// Log a return record.
+        LOG_RETURN = 0x2,
+        /// Entry: never discard a call. Call: the original function runs.
+        CALL_ORIGINAL = 0x4,
+        /// Call: the original function is skipped and the configured return
+        /// value is returned.
+        DISCARDED = 0x8,
+        REGISTERS = 0x10,
+        FLOATING_POINT = 0x20,
+        VECTOR = 0x40,
+        STACK = 0x80,
+        SLEEP_BEFORE = 0x100,
+        SLEEP_AFTER = 0x200,
+        /// A discarded call completes an overlapped request.
+        OVERLAPPED = 0x400,
+        /// The overlapped offset is an argument register index rather than
+        /// a stack offset.
+        OVERLAPPED_IN_REGISTER = 0x800,
+        /// Call: the call record was logged.
+        LOGGED = 0x1000,
     }
 }
 
@@ -208,7 +195,7 @@ impl Entry {
     }
 
     fn flags(&self) -> HookFlags {
-        HookFlags(self.flags.load(Ordering::Relaxed))
+        HookFlags::from_bits_retain(self.flags.load(Ordering::Relaxed))
     }
 
     fn get(field: &AtomicU32) -> u32 {
@@ -779,7 +766,7 @@ impl Engine {
     ) -> Result<(), DetourError> {
         let index = self.checked_entry(id)?;
         if let Some(record) = self.allocate(platform) {
-            self.log.set_u32(record, 0x1c, settings.flags.0);
+            self.log.set_u32(record, 0x1c, settings.flags.bits());
             self.log.set_u32(record, 0x18, id.0);
             self.log.set_u32(record, 0, RecordType::SetInfo as u32);
             self.log.set_u32(record, 4, 0);
@@ -798,7 +785,7 @@ impl Engine {
         entry
             .return_value
             .store(settings.return_value.0, Ordering::Relaxed);
-        entry.flags.store(settings.flags.0, Ordering::Relaxed);
+        entry.flags.store(settings.flags.bits(), Ordering::Relaxed);
         entry
             .sleep_milliseconds
             .store(settings.sleep_milliseconds, Ordering::Relaxed);
@@ -1070,7 +1057,7 @@ impl Engine {
         };
         call.overlapped = (overlapped != 0).then_some(overlapped);
         if call.overlapped.is_none() {
-            call.flags = call.flags.without(HookFlags::OVERLAPPED);
+            call.flags = call.flags.difference(HookFlags::OVERLAPPED);
         }
         if discard {
             call.function = None;
@@ -1078,7 +1065,7 @@ impl Engine {
         } else {
             call.flags = call
                 .flags
-                .without(HookFlags::DISCARDED)
+                .difference(HookFlags::DISCARDED)
                 .union(HookFlags::CALL_ORIGINAL);
         }
 
@@ -1086,7 +1073,7 @@ impl Engine {
             Some(record) => {
                 self.log.set_u32(record, 0, RecordType::Call as u32);
                 self.log.set_u32(record, 4, call.sequence);
-                self.log.set_u32(record, 0x1c, call.flags.0);
+                self.log.set_u32(record, 0x1c, call.flags.bits());
                 self.log.set_u32(record, 0x18, call.hook);
                 self.log.set_u64(record, 8, timestamp(platform));
                 self.log.set_u64(record, 0x10, platform.system_time());
@@ -1120,7 +1107,7 @@ impl Engine {
                 }
                 call.flags = call.flags.union(HookFlags::LOGGED);
             }
-            None => call.flags = call.flags.without(HookFlags::LOGGED),
+            None => call.flags = call.flags.difference(HookFlags::LOGGED),
         }
         if entry.flags().contains(HookFlags::SLEEP_BEFORE) {
             platform.sleep(Entry::get(&entry.sleep_milliseconds));
@@ -1207,7 +1194,7 @@ impl Engine {
         };
         self.log.set_u32(record, 0, RecordType::Return as u32);
         self.log.set_u32(record, 4, call.sequence);
-        self.log.set_u32(record, 0x14, call.flags.0);
+        self.log.set_u32(record, 0x14, call.flags.bits());
         self.log.set_u32(record, 0x10, call.hook);
         self.log.set_u32(record, 0x18, call.return_value.0);
         self.log.set_u64(record, 8, timestamp(platform));
@@ -1241,7 +1228,7 @@ impl Engine {
                 .store(pending.event.unwrap_or(0), Ordering::Relaxed);
             slot.sequence.store(pending.sequence, Ordering::Relaxed);
             slot.hook.store(pending.hook, Ordering::Relaxed);
-            slot.flags.store(pending.flags.0, Ordering::Relaxed);
+            slot.flags.store(pending.flags.bits(), Ordering::Relaxed);
             platform.completion_queued();
         }
         platform.unlock_completions();
@@ -1278,7 +1265,8 @@ impl Engine {
             }
             // Stock reuses the previous record of this pass for an unlogged
             // call and queues it a second time; no record is written here.
-            if HookFlags(slot.flags.load(Ordering::Relaxed)).contains(HookFlags::LOGGED)
+            if HookFlags::from_bits_retain(slot.flags.load(Ordering::Relaxed))
+                .contains(HookFlags::LOGGED)
                 && let Some(record) = self.allocate(platform)
             {
                 self.log.set_u32(record, 0, RecordType::Completion as u32);

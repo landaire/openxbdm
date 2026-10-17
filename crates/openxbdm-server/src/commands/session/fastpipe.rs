@@ -38,6 +38,18 @@ use crate::reply::Reply;
 use crate::state::ServerState;
 use crate::text::Text;
 
+xbox360_sys::value_enum! {
+    /// First word of a pipe packet.
+    pub enum PacketMagic: u16 {
+        /// `AA`: file data.
+        Data = 0x4141,
+        /// `BB`: the result of a file.
+        Reply = 0x4242,
+        /// `CC`: create a file.
+        Create = 0x4343,
+    }
+}
+
 /// Pipes open at one time, all of one group.
 pub const PIPE_SLOTS: usize = 6;
 /// Largest packet.
@@ -45,9 +57,6 @@ const PACKET_CAPACITY: u32 = 0x1000c;
 /// Every packet is read with a first receive of this many bytes; a shorter
 /// packet is followed by padding up to it.
 const FIRST_READ: u32 = 0x5b4;
-const MAGIC_CREATE: u16 = 0x4343;
-const MAGIC_DATA: u16 = 0x4141;
-const MAGIC_REPLY: u16 = 0x4242;
 /// Data bytes of one `AA` packet.
 const BLOCK_SIZE: u32 = 0x10000;
 /// File cache elements while a group is open.
@@ -60,8 +69,10 @@ const PATH_OFFSET: usize = 0x2c;
 const CREATE_FALLBACK: CommandError = CommandError::Status(ErrorCode::FileCannotBeCreated);
 /// `BB` result word of a complete file.
 const PIPE_SUCCESS: u32 = 0;
-/// Access the monitor opens files with: GENERIC_WRITE | DELETE | SYNCHRONIZE.
-const PIPE_FILE_ACCESS: FileAccess = FileAccess(0x4011_0000);
+/// Access the monitor opens files with.
+const PIPE_FILE_ACCESS: FileAccess = FileAccess::GENERIC_WRITE
+    .union(FileAccess::DELETE)
+    .union(FileAccess::SYNCHRONIZE);
 
 /// Platform services of `fastpipe`.
 pub trait FastPipeBackend {
@@ -259,9 +270,11 @@ pub fn on_readable(
     pipe.received += received;
     if pipe.received == FIRST_READ && pipe.expected == FIRST_READ {
         let header = &backend.pool(block)[..8];
-        let magic = u16::from_be_bytes([header[0], header[1]]);
+        let magic = PacketMagic::from_raw(u16::from_be_bytes([header[0], header[1]]));
         let length = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
-        if (magic != MAGIC_CREATE && magic != MAGIC_DATA) || length > PACKET_CAPACITY {
+        if !matches!(magic, Some(PacketMagic::Create | PacketMagic::Data))
+            || length > PACKET_CAPACITY
+        {
             return close_pipe(state, backend, network, slot);
         }
         pipe.expected = length;
@@ -278,7 +291,7 @@ pub fn on_readable(
         let header = backend.pool(block);
         u16::from_be_bytes([header[0], header[1]])
     };
-    if magic == MAGIC_CREATE {
+    if magic == PacketMagic::Create.raw() {
         create(state, backend, network, slot as u8, block);
     } else if keeps_block(state, backend, network, block) {
         // The packet waits for its file; the pipe needs a new block.
@@ -554,7 +567,7 @@ fn send_reply(
         return;
     };
     let mut reply = [0u8; 12];
-    reply[..2].copy_from_slice(&MAGIC_REPLY.to_be_bytes());
+    reply[..2].copy_from_slice(&PacketMagic::Reply.raw().to_be_bytes());
     reply[2..4].copy_from_slice(&id.to_be_bytes());
     reply[4..8].copy_from_slice(&create_length.to_be_bytes());
     let word = result.map_or_else(|error| Hresult::from(error).0, |()| PIPE_SUCCESS);

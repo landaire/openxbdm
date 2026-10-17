@@ -8,6 +8,7 @@
 //! re-serializes it in canonical form for `getq` and the settings file.
 
 mod compile;
+pub(super) use self::compile::result as compile_result;
 mod grammar;
 pub mod variant;
 

@@ -186,7 +186,7 @@ fn processor_answering_205_takes_the_connection() {
             .register_processor(
                 b"sys",
                 Some(Box::new(|_, _| Hresult::OK)),
-                ProcessorFlags::NONE,
+                ProcessorFlags::empty(),
             )
             .unwrap();
     }
@@ -209,28 +209,28 @@ fn status_lines_follow_the_line_builder() {
             .register_processor(
                 b"low",
                 Some(Box::new(|_, _| xbdm_success(0x64))),
-                ProcessorFlags::NONE,
+                ProcessorFlags::empty(),
             )
             .unwrap();
         host.backend
             .register_processor(
                 b"mid",
                 Some(Box::new(|_, _| xbdm_success(0xc8))),
-                ProcessorFlags::NONE,
+                ProcessorFlags::empty(),
             )
             .unwrap();
         host.backend
             .register_processor(
                 b"bad",
                 Some(Box::new(|_, _| xbdm_error(0x96))),
-                ProcessorFlags::NONE,
+                ProcessorFlags::empty(),
             )
             .unwrap();
         host.backend
             .register_processor(
                 b"big",
                 Some(Box::new(|_, _| xbdm_success(0x100))),
-                ProcessorFlags::NONE,
+                ProcessorFlags::empty(),
             )
             .unwrap();
     }
@@ -250,14 +250,14 @@ fn transfer_without_continuation_keeps_the_original_text() {
             .register_processor(
                 b"multi",
                 Some(Box::new(|_, _| Hresult::MULTILINE)),
-                ProcessorFlags::NONE,
+                ProcessorFlags::empty(),
             )
             .unwrap();
         host.backend
             .register_processor(
                 b"send",
                 Some(Box::new(|_, _| Hresult::SEND_BINARY)),
-                ProcessorFlags::NONE,
+                ProcessorFlags::empty(),
             )
             .unwrap();
     }
@@ -702,9 +702,9 @@ fn dmtelllog_result_codes() {
         }
     };
     session.send("dmtelllog start file=other.log area=2");
-    server.wait_until(area(TellLogAreas(3)));
+    server.wait_until(area(TellLogAreas::from_bits_retain(3)));
     session.send("dmtelllog stop area=1");
-    server.wait_until(area(TellLogAreas(2)));
+    server.wait_until(area(TellLogAreas::CRITICAL_SECTIONS));
     assert_eq!(session.command("dmtelllog stop"), "200- hresult=0x10000000");
     assert_eq!(
         session.command("dmtelllog start file=tell.log area=1 size=0x10000 entries=0x1000"),

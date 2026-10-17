@@ -16,27 +16,13 @@ pub const PROCESSOR_NAME_CAPACITY: usize = 63;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProcessorHandle(pub u32);
 
-/// Registration flags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ProcessorFlags(u32);
-
-impl ProcessorFlags {
-    pub const NONE: Self = Self(0);
-    /// Registered from the title process.
-    pub const TITLE: Self = Self(0x1);
-    /// Commands run on a connection dedicated to this processor.
-    pub const DEDICATED_THREAD: Self = Self(0x2);
-
-    pub const fn bits(self) -> u32 {
-        self.0
-    }
-
-    pub const fn union(self, other: Self) -> Self {
-        Self(self.0 | other.0)
-    }
-
-    pub const fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
+xbox360_sys::flags! {
+    /// Registration flags.
+    pub struct ProcessorFlags(u32) {
+        /// Registered from the title process.
+        TITLE = 0x1,
+        /// Commands run on a connection dedicated to this processor.
+        DEDICATED_THREAD = 0x2,
     }
 }
 

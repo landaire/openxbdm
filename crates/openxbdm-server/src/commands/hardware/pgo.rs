@@ -16,10 +16,9 @@ use crate::commands::filesystem::FileAccess;
 use crate::commands::filesystem::FileAttributes;
 use crate::commands::filesystem::PoolRange;
 use crate::commands::filesystem::ShareAccess;
+use crate::commands::memory::PAGE_SIZE;
 use crate::state::ServerState;
 
-/// Allocation granularity of count blocks (0x91fa36a4).
-pub const PAGE_SIZE: u32 = 0x1000;
 /// Capacity in UTF-16 units of every path and phase buffer.
 pub const PATH_UNITS: usize = 0x104;
 /// Capacity in bytes of a profile file name.

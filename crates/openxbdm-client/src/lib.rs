@@ -35,4 +35,4 @@ pub use protocol::StatusCode;
 pub use protocol::SuccessCode;
 pub use time::FileTime;
 
-pub const XBDM_PORT: u16 = 730;
+pub use openxbdm_core::XBDM_PORT;

@@ -8,7 +8,9 @@ pub mod profiler;
 pub mod studio;
 pub mod xtrace;
 
+use crate::commands::system::hardware_flags;
 use core::fmt::Write as _;
+use xbox360_sys::xboxkrnl::HardwareFlags;
 
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
@@ -44,7 +46,13 @@ const fn command(
     any_of: Access,
     handler: crate::registry::Handler,
 ) -> CommandEntry {
-    CommandEntry::new(name, any_of, Access::NONE, DispatchFlags::NONE, handler)
+    CommandEntry::new(
+        name,
+        any_of,
+        Access::empty(),
+        DispatchFlags::empty(),
+        handler,
+    )
 }
 
 pub(crate) const COMMANDS: &[CommandEntry] = &[
@@ -62,10 +70,6 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
     command("xstudio", Access::CONTROL, studio),
 ];
 
-/// Hardware flag that enables the automatic sign-in profile settings.
-const HARDWARE_AUTO_PROFILE: u32 = 0x10;
-/// Console setting holding the automatic sign-in profile XUID.
-const AUTO_PROFILE_SETTING: ConfigSetting = ConfigSetting::new(3, 8);
 /// Bytes of a counter name the enumeration copies.
 pub const COUNTER_NAME_CAPACITY: usize = 0x100;
 /// Path buffers of `capctrl` and `lopctrl`.
@@ -427,20 +431,20 @@ fn auto_profile(invocation: &mut Invocation<'_>) -> CommandResult {
         .line
         .param("xuid")
         .and_then(|value| value.qword());
-    if invocation.backend.hardware_flags() & HARDWARE_AUTO_PROFILE == 0 {
+    if !hardware_flags(invocation.backend).contains(HardwareFlags::AUTO_PROFILE) {
         return Err(ErrorCode::UnknownCommand.into());
     }
     match xuid {
         Some(xuid) => invocation
             .backend
-            .xconfig_set(AUTO_PROFILE_SETTING, &xuid.to_be_bytes())
+            .xconfig_set(ConfigSetting::AUTO_PROFILE_XUID, &xuid.to_be_bytes())
             .map(|()| Reply::Ok)
             .map_err(CommandError::Kernel),
         None => {
             let mut value = [0u8; 8];
             invocation
                 .backend
-                .xconfig_get(AUTO_PROFILE_SETTING, &mut value)
+                .xconfig_get(ConfigSetting::AUTO_PROFILE_XUID, &mut value)
                 .map_err(CommandError::Kernel)?;
             invocation.set_text(format_args!("xuid==0q{:016x}", u64::from_be_bytes(value)));
             Ok(Reply::Ok)
@@ -527,7 +531,7 @@ fn start_capture(
     buffer: capture::BufferRequest,
 ) -> Result<capture::Started, capture::CaptureError> {
     let request = CreateRequest {
-        access: FileAccess(FileAccess::GENERIC_WRITE.0 | FileAccess::SYNCHRONIZE.0),
+        access: FileAccess::GENERIC_WRITE.union(FileAccess::SYNCHRONIZE),
         allocation_size: None,
         attributes: FileAttributes::NORMAL,
         share: ShareAccess::READ,

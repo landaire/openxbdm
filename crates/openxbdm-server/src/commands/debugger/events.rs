@@ -6,7 +6,9 @@
 //! `continue` (or a state change that releases stopped threads) supplies
 //! what the monitor's exception path does after its wait returns.
 
+use crate::commands::system::hardware_flags;
 use core::fmt::Write as _;
+use xbox360_sys::xboxkrnl::HardwareFlags;
 
 use openxbdm_core::status::NtStatus;
 
@@ -18,10 +20,9 @@ use super::DirectNotification;
 use super::DirectPolicy;
 use super::Disposition;
 use super::ExceptionFlags;
+use super::ExceptionNotificationFlags;
 use super::ExceptionRecord;
-use super::HARDWARE_KERNEL_DEBUGGER;
 use super::MODULE_NAME_CAPACITY;
-use super::MSR_SINGLE_STEP;
 use super::ModuleEvent;
 use super::NOTICE_TEXT_CAPACITY;
 use super::ProcessKind;
@@ -31,7 +32,6 @@ use super::TRAP_INSTRUCTION;
 use super::ThreadId;
 use super::breakpoints::Slot;
 use super::change_execution;
-use super::context::MSR_EXTERNAL_INTERRUPTS;
 use super::kernel_debugger_enabled;
 use super::transition;
 use super::trap;
@@ -45,6 +45,7 @@ use crate::notify::ExecutionState;
 use crate::state::ServerState;
 use crate::text::ResponseText;
 use crate::text::Text;
+use xbox360_sys::processor::Msr;
 
 /// Threads that can be stopped at once.
 const MAX_PENDING: usize = 16;
@@ -211,7 +212,7 @@ fn direct_policy(state: &mut ServerState, backend: &mut dyn AnyBackend) -> Direc
         dump_mode: state.console.dump_mode,
         dump_in_progress: state.debugger.events.dump_in_progress,
         attached: state.debugger.debugger.attached,
-        defer_mask: state.console.event_defer.0,
+        defer_mask: state.console.event_defer,
         data_breakpoint: state.debugger.data_breakpoint,
     }
 }
@@ -509,7 +510,7 @@ fn stack_overflow(
     record_address: u32,
     can_stop: bool,
 ) {
-    let hardware_kd = backend.hardware_flags() & HARDWARE_KERNEL_DEBUGGER != 0;
+    let hardware_kd = hardware_flags(backend).contains(HardwareFlags::KERNEL_DEBUGGER);
     if kernel_debugger_enabled(state, backend) && hardware_kd {
         backend.complete_event(thread, Disposition::default());
         return;
@@ -532,7 +533,7 @@ fn stack_overflow(
         return;
     }
     let record = ExceptionRecord {
-        code: ExceptionRecord::STACK_OVERFLOW,
+        code: NtStatus::STACK_OVERFLOW,
         flags: ExceptionFlags::NONCONTINUABLE,
         address,
         record_address,
@@ -546,7 +547,7 @@ fn stack_overflow(
     begin_stop(state, backend, network, entry);
     // The notification arguments carry no parameter array.
     let line = Event::Exception {
-        code: ExceptionRecord::STACK_OVERFLOW.0,
+        code: NtStatus::STACK_OVERFLOW.0,
         thread: thread.0,
         address,
         detail: ExceptionDetail::Parameters {
@@ -575,7 +576,7 @@ fn stack_overflow(
 /// Registers of a thread in the monitor that the dispatch reads.
 #[derive(Clone, Copy)]
 struct Registers {
-    msr: u32,
+    msr: Msr,
     iar: u32,
     gpr3: u64,
     gpr4: u64,
@@ -614,7 +615,7 @@ fn edit_registers(
 
 fn clear_single_step(backend: &mut dyn AnyBackend, thread: ThreadId) {
     edit_registers(backend, thread, &mut |_, context| {
-        context.msr &= !MSR_SINGLE_STEP;
+        context.msr.remove(Msr::SINGLE_STEP);
         true
     });
 }
@@ -623,12 +624,11 @@ fn clear_single_step(backend: &mut dyn AnyBackend, thread: ThreadId) {
 /// instructions into breakpoints, or into divide errors for the compiler's
 /// overflow and divide-by-zero checks.
 pub(super) fn rewrite_trap(record: &mut ExceptionRecord) {
-    const INTEGER_DIVIDE_BY_ZERO: NtStatus = NtStatus(0xc000_0094);
-    const INTEGER_OVERFLOW: NtStatus = NtStatus(0xc000_0095);
-    const ILLEGAL_INSTRUCTION: NtStatus = NtStatus(0xc000_008c);
     if !matches!(
         record.code,
-        INTEGER_DIVIDE_BY_ZERO | INTEGER_OVERFLOW | ILLEGAL_INSTRUCTION
+        NtStatus::INTEGER_DIVIDE_BY_ZERO
+            | NtStatus::INTEGER_OVERFLOW
+            | NtStatus::ARRAY_BOUNDS_EXCEEDED
     ) {
         return;
     }
@@ -638,16 +638,16 @@ pub(super) fn rewrite_trap(record: &mut ExceptionRecord) {
         31 if matches!((instruction & 0x7fe) >> 1, 4 | 0x44) => false,
         _ => return,
     };
-    record.code = ExceptionRecord::BREAKPOINT;
+    record.code = NtStatus::BREAKPOINT;
     if !immediate {
         return;
     }
     let condition = (instruction & 0x03e0_0000) >> 21;
     let value = instruction as u16 as i16;
     if condition == 5 && value == -1 {
-        record.code = INTEGER_OVERFLOW;
+        record.code = NtStatus::INTEGER_OVERFLOW;
     } else if (condition == 6 || condition == 7) && value == 0 {
-        record.code = INTEGER_DIVIDE_BY_ZERO;
+        record.code = NtStatus::INTEGER_DIVIDE_BY_ZERO;
     }
 }
 
@@ -671,11 +671,11 @@ fn exception(
     if !second_chance {
         rewrite_trap(&mut record);
     }
-    let hardware_kd = backend.hardware_flags() & HARDWARE_KERNEL_DEBUGGER != 0;
+    let hardware_kd = hardware_flags(backend).contains(HardwareFlags::KERNEL_DEBUGGER);
     if !second_chance && state.debugger.trap_passthrough && !hardware_kd {
         let passes = match record.code {
-            ExceptionRecord::BREAKPOINT => record.trap_code() == trap::BREAKPOINT,
-            ExceptionRecord::SINGLE_STEP => true,
+            NtStatus::BREAKPOINT => record.trap_code() == trap::BREAKPOINT,
+            NtStatus::SINGLE_STEP => true,
             _ => false,
         };
         if passes {
@@ -703,7 +703,7 @@ fn exception(
     let dump_mode = state.console.dump_mode;
     let mut dump = !hardware_kd && dump_mode != DumpMode::Disabled;
     let context = registers(backend, thread);
-    let mut can_stop = debuggable && context.msr & MSR_EXTERNAL_INTERRUPTS != 0;
+    let mut can_stop = debuggable && context.msr.contains(Msr::EXTERNAL_INTERRUPT);
     if dump_mode == DumpMode::Enabled {
         can_stop &= state.debugger.debugger.attached;
     }
@@ -716,7 +716,7 @@ fn exception(
     // Each arm yields the notification (if any), whether it stops, and the
     // resolution applied when the event ends.
     let plan: Plan = match record.code {
-        ExceptionRecord::BREAKPOINT => match record.trap_code() {
+        NtStatus::BREAKPOINT => match record.trap_code() {
             trap::DEBUG_STRING => {
                 dump = false;
                 let stop = stop_on.contains(StopOn::DEBUG_STRING) && can_stop;
@@ -793,14 +793,14 @@ fn exception(
                 Plan::notify(Notice::Break, true, Resolution::Break { table })
             }
         },
-        ExceptionRecord::NT_ASSERT => {
+        NtStatus::ASSERTION_FAILURE => {
             if !kd && can_stop {
                 Plan::notify(Notice::NtAssert, true, Resolution::Advance { iar })
             } else {
                 Plan::silent(Resolution::Final)
             }
         }
-        ExceptionRecord::SINGLE_STEP if record.parameters[0] == 0 => {
+        NtStatus::SINGLE_STEP if record.parameters[0] == 0 => {
             match state.debugger.data_breakpoint {
                 Some(data) if data.overlaps(record.parameters[1], access_length(backend, iar)) => {
                     Plan::notify(
@@ -813,7 +813,7 @@ fn exception(
                 None => Plan::silent(Resolution::Final),
             }
         }
-        ExceptionRecord::SINGLE_STEP => {
+        NtStatus::SINGLE_STEP => {
             if let Some(step) = state.debugger.events.steps[process_index(process)].take() {
                 match step.target {
                     StepTarget::Breakpoint(slot) => state.debugger.breakpoints.rearm(slot, backend),
@@ -836,7 +836,7 @@ fn exception(
             Plan::notify(Notice::SingleStep, !kd && can_stop, Resolution::SingleStep)
         }
         _ => {
-            if record.code == ExceptionRecord::THREAD_NAME && record.parameters[0] == 0x1000 {
+            if record.code == NtStatus::THREAD_NAME && record.parameters[0] == 0x1000 {
                 let target = match record.parameters[2] {
                     u32::MAX => thread,
                     other => ThreadId(other),
@@ -1133,7 +1133,7 @@ fn deliver_notice(
             code: record.code.0,
             thread: id,
             address: record.address,
-            detail: if record.code == ExceptionRecord::ACCESS_VIOLATION {
+            detail: if record.code == NtStatus::ACCESS_VIOLATION {
                 ExceptionDetail::AccessViolation {
                     write: record.parameters[0] != 0,
                     address: record.parameters[1],
@@ -1194,9 +1194,9 @@ fn step_over(
         if let Some(slot) = state.debugger.breakpoints.lift(context.iar, backend) {
             state.debugger.events.steps[process_index(process)] = Some(Step {
                 target: StepTarget::Breakpoint(slot),
-                saved_trace: context.msr & MSR_SINGLE_STEP != 0,
+                saved_trace: context.msr.contains(Msr::SINGLE_STEP),
             });
-            context.msr |= MSR_SINGLE_STEP;
+            context.msr.insert(Msr::SINGLE_STEP);
             lifted = true;
             return true;
         }
@@ -1276,7 +1276,7 @@ fn finish(
                 }
             } else {
                 edit_registers(backend, thread, &mut |_, context| {
-                    context.msr |= MSR_SINGLE_STEP;
+                    context.msr.insert(Msr::SINGLE_STEP);
                     true
                 });
             }
@@ -1287,9 +1287,9 @@ fn finish(
                 edit_registers(backend, thread, &mut |_, context| {
                     state.debugger.events.steps[process_index(process)] = Some(Step {
                         target: StepTarget::DataBreakpoint,
-                        saved_trace: context.msr & MSR_SINGLE_STEP != 0,
+                        saved_trace: context.msr.contains(Msr::SINGLE_STEP),
                     });
-                    context.msr |= MSR_SINGLE_STEP;
+                    context.msr.insert(Msr::SINGLE_STEP);
                     true
                 });
             }
@@ -1321,7 +1321,7 @@ fn finish(
             // goes on to the crash dump unless the kernel debugger has it.
             let again = continued && !entry.released;
             let kd = kernel_debugger_enabled(state, backend)
-                && backend.hardware_flags() & HARDWARE_KERNEL_DEBUGGER != 0;
+                && hardware_flags(backend).contains(HardwareFlags::KERNEL_DEBUGGER);
             let write_dump = !again && entry.dump && !kd;
             state.debugger.events.dump_in_progress |= write_dump;
             backend.complete_event(
@@ -1486,8 +1486,8 @@ fn blocks_relaunch(
         || !((0x8200_0000..=0x8bfe_ffff).contains(&iar)
             || (0x9200_0000..=0x9ffe_ffff).contains(&iar));
     match record.code {
-        ExceptionRecord::SINGLE_STEP => false,
-        ExceptionRecord::BREAKPOINT => match record.trap_code() {
+        NtStatus::SINGLE_STEP => false,
+        NtStatus::BREAKPOINT => match record.trap_code() {
             trap::DEBUG_STRING | trap::MODULE_LOAD => false,
             trap::BREAKPOINT => {
                 if state.debugger.breakpoints.contains(iar) {
@@ -1568,11 +1568,14 @@ impl StopReason {
                 record,
                 first_chance,
             } => {
-                let mut flags = u32::from(record.flags.contains(ExceptionFlags::NONCONTINUABLE));
+                // Bit 0x1 has the same meaning in both words.
+                let mut flags = ExceptionNotificationFlags::from_bits_retain(
+                    (record.flags & ExceptionFlags::NONCONTINUABLE).bits(),
+                );
                 if first_chance {
-                    flags |= 2;
+                    flags.insert(ExceptionNotificationFlags::FIRST_CHANCE);
                 }
-                let (first, second) = if record.code == ExceptionRecord::ACCESS_VIOLATION {
+                let (first, second) = if record.code == NtStatus::ACCESS_VIOLATION {
                     (record.parameters[0], record.parameters[1])
                 } else {
                     (record.parameter_count, record.parameters_address())
@@ -1582,7 +1585,7 @@ impl StopReason {
                     thread.0,
                     record.code.0,
                     record.address,
-                    flags,
+                    flags.bits(),
                     first,
                     second,
                 ];
@@ -1616,7 +1619,7 @@ pub(super) fn stop_reason(
     let address = context.gpr3 as u32;
     let length = context.gpr4 as u16;
     Ok(match record.code {
-        ExceptionRecord::BREAKPOINT => match record.trap_code() {
+        NtStatus::BREAKPOINT => match record.trap_code() {
             trap::DEBUG_STRING => StopReason::DebugString { thread },
             trap::BREAKPOINT => StopReason::Breakpoint {
                 address: iar,
@@ -1634,11 +1637,11 @@ pub(super) fn stop_reason(
             },
             _ => StopReason::Unknown,
         },
-        ExceptionRecord::SINGLE_STEP if record.parameters[0] == 0 => StopReason::DataBreakpoint {
+        NtStatus::SINGLE_STEP if record.parameters[0] == 0 => StopReason::DataBreakpoint {
             address: iar,
             thread,
         },
-        ExceptionRecord::SINGLE_STEP => StopReason::SingleStep {
+        NtStatus::SINGLE_STEP => StopReason::SingleStep {
             address: iar,
             thread,
         },
@@ -1721,7 +1724,7 @@ pub(super) fn stop_description(
                 "exception code=0x{code:08x} thread=0x{:08x} address=0x{:08x}",
                 thread.0, record.address
             );
-            if record.code == ExceptionRecord::ACCESS_VIOLATION {
+            if record.code == NtStatus::ACCESS_VIOLATION {
                 let kind = if record.parameters[0] == 0 {
                     "read"
                 } else {
@@ -1754,33 +1757,33 @@ mod tests {
     #[test]
     fn trap_rewrite_follows_instruction_form() {
         let mut record = ExceptionRecord {
-            code: NtStatus(0xc000_008c),
+            code: NtStatus::ARRAY_BOUNDS_EXCEEDED,
             parameters: [0x0ca0_ffff, 0, 0, 0],
             ..Default::default()
         };
         rewrite_trap(&mut record);
-        assert_eq!(record.code, NtStatus(0xc000_0095));
+        assert_eq!(record.code, NtStatus::INTEGER_OVERFLOW);
         let mut record = ExceptionRecord {
-            code: NtStatus(0xc000_0094),
+            code: NtStatus::INTEGER_DIVIDE_BY_ZERO,
             parameters: [0x0cc0_0000, 0, 0, 0],
             ..Default::default()
         };
         rewrite_trap(&mut record);
-        assert_eq!(record.code, NtStatus(0xc000_0094));
+        assert_eq!(record.code, NtStatus::INTEGER_DIVIDE_BY_ZERO);
         let mut record = ExceptionRecord {
-            code: NtStatus(0xc000_0094),
+            code: NtStatus::INTEGER_DIVIDE_BY_ZERO,
             parameters: [0x0fe0_0016, 0, 0, 0],
             ..Default::default()
         };
         rewrite_trap(&mut record);
-        assert_eq!(record.code, ExceptionRecord::BREAKPOINT);
+        assert_eq!(record.code, NtStatus::BREAKPOINT);
         let mut record = ExceptionRecord {
-            code: NtStatus(0xc000_0094),
+            code: NtStatus::INTEGER_DIVIDE_BY_ZERO,
             parameters: [0x7c00_0008, 0, 0, 0],
             ..Default::default()
         };
         rewrite_trap(&mut record);
-        assert_eq!(record.code, ExceptionRecord::BREAKPOINT);
+        assert_eq!(record.code, NtStatus::BREAKPOINT);
     }
 
     #[test]

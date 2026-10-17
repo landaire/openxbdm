@@ -10,7 +10,9 @@ use openxbdm_core::status::Win32Error;
 use crate::access::Access;
 use crate::commands::console;
 use crate::commands::console::ConfigSetting;
+use crate::commands::console::ConsoleConfigFlags;
 use crate::commands::console::TraceMask;
+use crate::commands::memory::PAGE_SIZE;
 use crate::commands::util;
 use crate::continuation::Continuation as AnyContinuation;
 use crate::continuation::ContinuationContext;
@@ -66,17 +68,11 @@ const FORMAT_CLUSTER_SIZE: u32 = 0x4000;
 /// `getsum` blocks emitted per continuation call fill at most this many
 /// bytes.
 const GETSUM_CHUNK: u32 = 0x1000;
-const PAGE_SIZE: u32 = 0x1000;
 /// Bytes per `dvdperf` trace record.
 const DVD_TRACE_RECORD: u32 = 16;
 
 const DEVICE_PREFIX: &[u8] = b"\\Device\\";
 const DOS_DEVICES: &[u8] = b"\\??";
-
-/// Configuration setting holding the hard disk disable flag.
-const HDD_SETTING: ConfigSetting = ConfigSetting::new(2, 6);
-/// Configuration setting holding the previous flash version.
-const PREVIOUS_FLASH_SETTING: ConfigSetting = ConfigSetting::new(0xa, 2);
 
 /// Opened file or directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,6 +185,7 @@ pub struct CreateOptions(pub u32);
 impl CreateOptions {
     pub const NONE: Self = Self(0);
     pub const DIRECTORY_FILE: Self = Self(0x1);
+    pub const SEQUENTIAL_ONLY: Self = Self(0x4);
     pub const NO_INTERMEDIATE_BUFFERING: Self = Self(0x8);
     pub const SYNCHRONOUS_IO_ALERT: Self = Self(0x10);
     pub const SYNCHRONOUS_IO_NONALERT: Self = Self(0x20);
@@ -1202,68 +1199,73 @@ fn write_attributes(output: &mut SliceWriter<'_>, information: &FileInformation)
 pub(crate) const COMMANDS: &[CommandEntry] = &[
     entry(
         "delete",
-        Access::NONE,
+        Access::empty(),
         Access::READ.union(Access::WRITE),
         delete,
     ),
-    entry("dirlist", Access::READ, Access::NONE, dirlist),
+    entry("dirlist", Access::READ, Access::empty(), dirlist),
     entry(
         "drivefreespace",
         Access::READ,
-        Access::NONE,
+        Access::empty(),
         drive_free_space,
     ),
-    entry("drivelist", Access::READ, Access::NONE, drive_list),
-    entry("dvdblk", Access::READ, Access::NONE, dvd_block),
-    entry("dvdeject", Access::READ, Access::NONE, dvd_eject),
-    entry("dvdperf", Access::CONTROL, Access::NONE, dvd_performance),
+    entry("drivelist", Access::READ, Access::empty(), drive_list),
+    entry("dvdblk", Access::READ, Access::empty(), dvd_block),
+    entry("dvdeject", Access::READ, Access::empty(), dvd_eject),
+    entry("dvdperf", Access::CONTROL, Access::empty(), dvd_performance),
     entry(
         "fileeof",
-        Access::NONE,
+        Access::empty(),
         Access::READ.union(Access::WRITE),
         file_eof,
     ),
-    entry("fmtfat", Access::CONFIG, Access::NONE, format_fat),
-    entry("getfile", Access::READ, Access::NONE, get_file),
+    entry("fmtfat", Access::CONFIG, Access::empty(), format_fat),
+    entry("getfile", Access::READ, Access::empty(), get_file),
     entry(
         "getfileattributes",
         Access::READ.union(Access::WRITE),
-        Access::NONE,
+        Access::empty(),
         get_file_attributes,
     ),
-    entry("gethddblk", Access::READ, Access::NONE, get_hdd_block),
-    entry("getsum", Access::CONTROL, Access::NONE, get_sum),
+    entry("gethddblk", Access::READ, Access::empty(), get_hdd_block),
+    entry("getsum", Access::CONTROL, Access::empty(), get_sum),
     entry(
         "getvfattr",
         Access::READ.union(Access::WRITE),
-        Access::NONE,
+        Access::empty(),
         get_vfattr,
     ),
-    entry("hdd", Access::CONTROL, Access::NONE, hdd),
-    entry("mkdir", Access::WRITE, Access::NONE, make_directory),
-    entry("prevflash", Access::CONTROL, Access::NONE, previous_flash),
+    entry("hdd", Access::CONTROL, Access::empty(), hdd),
+    entry("mkdir", Access::WRITE, Access::empty(), make_directory),
+    entry(
+        "prevflash",
+        Access::CONTROL,
+        Access::empty(),
+        previous_flash,
+    ),
     entry(
         "rename",
-        Access::NONE,
+        Access::empty(),
         Access::READ.union(Access::WRITE),
         rename,
     ),
-    entry("sendfile", Access::WRITE, Access::NONE, send_file),
-    entry("sendvfile", Access::WRITE, Access::NONE, send_vfile),
+    entry("sendfile", Access::WRITE, Access::empty(), send_file),
+    entry("sendvfile", Access::WRITE, Access::empty(), send_vfile),
     entry(
         "setfileattributes",
         Access::WRITE,
-        Access::NONE,
+        Access::empty(),
         set_file_attributes,
     ),
-    entry("sethddblk", Access::WRITE, Access::NONE, set_hdd_block),
+    entry("sethddblk", Access::WRITE, Access::empty(), set_hdd_block),
     entry(
         "sysfileupd",
         Access::CONFIG,
-        Access::NONE,
+        Access::empty(),
         system_file_update,
     ),
-    entry("writefile", Access::WRITE, Access::NONE, write_file),
+    entry("writefile", Access::WRITE, Access::empty(), write_file),
 ];
 
 const fn entry(
@@ -1272,7 +1274,7 @@ const fn entry(
     all_of: Access,
     handler: crate::registry::Handler,
 ) -> CommandEntry {
-    CommandEntry::new(name, any_of, all_of, DispatchFlags::NONE, handler)
+    CommandEntry::new(name, any_of, all_of, DispatchFlags::empty(), handler)
 }
 
 /// Transfers started by this domain.
@@ -2085,21 +2087,26 @@ impl VirtualAttributes {
 /// (2, 6).
 fn hdd(invocation: &mut Invocation<'_>) -> CommandResult {
     let value = if invocation.line.has("enable") {
-        0
+        ConsoleConfigFlags::empty()
     } else if invocation.line.has("disable") {
-        1
+        ConsoleConfigFlags::HARD_DISK_DISABLED
     } else {
         invocation.set_text(format_args!("missing arguments"));
         return Err(CommandError::Fail);
     };
     let mut bytes = [0u8; 4];
-    if let Err(error) = invocation.backend.xconfig_get(HDD_SETTING, &mut bytes) {
+    if let Err(error) = invocation
+        .backend
+        .xconfig_get(ConfigSetting::CONSOLE_FLAGS, &mut bytes)
+    {
         return Err(CommandError::from_kernel(error, CommandError::Unexpected));
     }
-    let flags = u32::from_be_bytes(bytes) & !1 | value;
+    let flags = ConsoleConfigFlags::from_bits_retain(u32::from_be_bytes(bytes))
+        .difference(ConsoleConfigFlags::HARD_DISK_DISABLED)
+        .union(value);
     match invocation
         .backend
-        .xconfig_set(HDD_SETTING, &flags.to_be_bytes())
+        .xconfig_set(ConfigSetting::CONSOLE_FLAGS, &flags.bits().to_be_bytes())
     {
         Ok(()) => Ok(Reply::Ok),
         Err(error) => Err(CommandError::from_kernel(error, CommandError::Unexpected)),
@@ -2132,10 +2139,10 @@ fn make_directory(invocation: &mut Invocation<'_>) -> CommandResult {
 /// `prevflash [prevflashver=<dword>]`.
 fn previous_flash(invocation: &mut Invocation<'_>) -> CommandResult {
     let version = optional_dword(invocation, "PREVFLASHVER", 0);
-    match invocation
-        .backend
-        .xconfig_set(PREVIOUS_FLASH_SETTING, &version.to_be_bytes())
-    {
+    match invocation.backend.xconfig_set(
+        ConfigSetting::PREVIOUS_FLASH_VERSION,
+        &version.to_be_bytes(),
+    ) {
         Ok(()) => Ok(Reply::Ok),
         Err(error) => Err(CommandError::from_kernel(error, CommandError::Unexpected)),
     }
@@ -3207,7 +3214,7 @@ fn dos_result(backend: &mut dyn crate::backend::Backend, error: KernelError) -> 
 
 /// `ERROR_INVALID_NAME`: the target path has no room for the temporary
 /// file name.
-const INVALID_NAME: CommandError = CommandError::Win32(Win32Error::new(0x7b).unwrap());
+const INVALID_NAME: CommandError = CommandError::Win32(Win32Error::INVALID_NAME);
 
 /// Why `sysfileupd` failed before its upload started.
 enum UpdateError {
@@ -3421,7 +3428,7 @@ fn copy_local_file(
             disposition: CreateDisposition::OverwriteIf,
             options: CreateOptions::NON_DIRECTORY_FILE
                 .union(SYNCHRONOUS)
-                .union(CreateOptions(0x4)),
+                .union(CreateOptions::SEQUENTIAL_ONLY),
         };
         let output = *target_handle.insert(backend.create_file(target, &write)?);
         backend.set_end_of_file(output, information.end_of_file)?;

@@ -33,6 +33,7 @@ use openxbdm_server::commands::console::MemoryStatistics;
 use openxbdm_server::commands::console::NETWORK_ADDRESS_SIZE;
 use openxbdm_server::commands::console::NetworkAddress;
 use openxbdm_server::commands::console::NetworkRaError;
+use openxbdm_server::commands::console::NetworkRaFlags;
 use openxbdm_server::commands::console::NetworkRaRecord;
 use openxbdm_server::commands::console::NetworkRaRequest;
 use openxbdm_server::commands::console::Published;
@@ -424,7 +425,7 @@ impl commands::console::Backend for Console {
         };
         let mut message = NetworkRaMessage {
             operation,
-            flags: record.flags,
+            flags: record.flags.bits(),
             custom_boot_address: record.custom_boot_address,
         };
         let mut descriptor = NetworkRaDescriptor {
@@ -434,7 +435,7 @@ impl commands::console::Backend for Console {
         };
         let result = send_network_ra(&mut descriptor);
         *record = NetworkRaRecord {
-            flags: message.flags,
+            flags: NetworkRaFlags::from_bits_retain(message.flags),
             custom_boot_address: message.custom_boot_address,
         };
         result
@@ -699,8 +700,8 @@ impl commands::console::Backend for Console {
             Published::DebugName(name) => *DEBUG_NAME.lock() = *name,
             Published::DumpMode(mode) => DUMP_MODE.store(mode.raw(), Ordering::Release),
             Published::DumpSettings(settings) => *DUMP_SETTINGS.lock() = settings.to_block(),
-            Published::EventDefer(mask) => EVENT_DEFER.store(mask.0, Ordering::Release),
-            Published::TraceMask(mask) => TRACE_MASK.store(mask.0, Ordering::Release),
+            Published::EventDefer(mask) => EVENT_DEFER.store(mask.bits(), Ordering::Release),
+            Published::TraceMask(mask) => TRACE_MASK.store(mask.bits(), Ordering::Release),
             Published::Registration(registration) => *REGISTRATION.lock() = registration.result(),
         }
     }
@@ -728,7 +729,7 @@ impl commands::console::Backend for Console {
 
 /// The server's trace mask, for code that runs on other threads.
 pub(crate) fn trace_mask() -> TraceMask {
-    TraceMask(TRACE_MASK.load(Ordering::Acquire))
+    TraceMask::from_bits_retain(TRACE_MASK.load(Ordering::Acquire))
 }
 
 /// The server's debug name, for other threads (stock 0x91fab9c0).

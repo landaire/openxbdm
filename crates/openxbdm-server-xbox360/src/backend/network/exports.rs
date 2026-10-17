@@ -106,7 +106,7 @@ struct CaptureStart<'a> {
 
 /// Start a capture (0x91f384d0 calling 0x91f34f80 without reply text).
 extern "C" fn capture_start(name: u32, data_limit: u32, buffer: u32, flags: u32) -> u32 {
-    let flags = CaptureFlags(flags);
+    let flags = CaptureFlags::from_bits_retain(flags);
     if flags.contains(CaptureFlags::PERSISTENT)
         && xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE
     {

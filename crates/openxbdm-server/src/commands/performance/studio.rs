@@ -33,12 +33,12 @@ pub enum StudioError {
 impl From<StudioError> for Hresult {
     fn from(error: StudioError) -> Self {
         match error {
-            StudioError::Pending => Hresult(0x8000_000a),
-            StudioError::NotConnected => Hresult(0x8000_4002),
-            StudioError::Aborted => Hresult(0x8000_4004),
+            StudioError::Pending => Hresult::PENDING,
+            StudioError::NotConnected => Hresult::NO_INTERFACE,
+            StudioError::Aborted => Hresult::ABORT,
             StudioError::OutOfMemory => Hresult::OUT_OF_MEMORY,
             StudioError::InvalidArgument => Hresult::INVALID_ARGUMENT,
-            StudioError::NotImplemented => Hresult(0x8000_4001),
+            StudioError::NotImplemented => Hresult::NOT_IMPLEMENTED,
             StudioError::Fail => Hresult::FAIL,
         }
     }
@@ -47,7 +47,7 @@ impl From<StudioError> for Hresult {
 /// The result word of a transport routine; success is 0.
 pub fn routine_result(result: Result<(), StudioError>) -> Hresult {
     match result {
-        Ok(()) => Hresult(0),
+        Ok(()) => Hresult::SUCCESS,
         Err(error) => error.into(),
     }
 }

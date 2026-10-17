@@ -32,6 +32,7 @@ rust_library(
     deps = [
         "//crates/openxbdm-core:openxbdm_core",
         "//crates/smb2-server:smb2_server",
+        "//third-party/rust:xbox360-sys",
     ],
     doctests = False,
     visibility = [
@@ -57,5 +58,6 @@ rust_test(
         "//crates/openxbdm-core:openxbdm_core",
         "//crates/smb2-server:smb2_server",
         "//third-party/rust:insta",
+        "//third-party/rust:xbox360-sys",
     ],
 )

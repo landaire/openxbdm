@@ -632,7 +632,9 @@ export!(77, get_tracking_type_name);
 /// Stock export 78 (0x91f23a30): `(name, type) -> HRESULT`; register an
 /// allocation type name and store its index through `type` (u16).
 extern "C" fn register_tracking_type(name: u32, kind: u32) -> u32 {
-    if TRACKING.flags.load(Ordering::Relaxed) & memory::TrackingFlags::TYPE_MASK == 0 {
+    if !memory::TrackingFlags::from_bits_retain(TRACKING.flags.load(Ordering::Relaxed))
+        .intersects(memory::TrackingFlags::TYPE_MASK)
+    {
         return tracking_hresult(Err(TrackingError::Off)).0;
     }
     if TRACKING_TYPE_COUNT.load(Ordering::Acquire) > 0xffff {

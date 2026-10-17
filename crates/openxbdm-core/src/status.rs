@@ -409,6 +409,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn monitor_results_have_wire_values() {
+        for (result, raw) in [
+            (Hresult::CAPTURE_CONTINUED, 0x02da_0006),
+            (Hresult::FAST_CAP_ENABLED, 0x02da_0007),
+            (Hresult::CALL_CAP_ENABLED, 0x02da_0008),
+            (Hresult::NOT_STARTED, 0x82da_0018),
+            (Hresult::ALREADY_STARTED, 0x82da_0019),
+            (Hresult::ALREADY_STOPPED, 0x82da_001a),
+            (Hresult::FAST_CAP_DISABLED, 0x82da_001b),
+            (Hresult::NO_RESPONSE, 0x82da_001d),
+            (Hresult::CALL_CAP_DISABLED, 0x82da_0021),
+            (Hresult::PERSISTENT_FROM_TITLE, 0x82da_0022),
+            (Hresult::CAPTURE_NOT_ENABLED, 0x82da_0023),
+            (Hresult::CALL_CAP_UNAVAILABLE, 0x82da_0024),
+            (Hresult::NO_SUCH_FIELD, 0x82da_0025),
+            (Hresult::BUFFER_FULL, 0x82da_0026),
+            (Hresult::TITLE_TERMINATED, 0x82da_0027),
+            (Hresult::DURATION_EXCEEDED, 0x82da_0029),
+            (Hresult::INVALID_STATE, 0x82da_002a),
+            (Hresult::EXTENSION_LOADED, 0x82da_002b),
+            (Hresult::NOT_ACQUIRED, 0x82da_002c),
+            (Hresult::NOT_OWNER, 0x82da_002d),
+            (Hresult::REQUEST_FAILED, 0x82da_0100),
+            (Hresult::CONNECTION_LOST, 0x82da_0101),
+            (Hresult::BUFFER_TOO_SMALL, 0x82da_0105),
+            (Hresult::SERVICE_FAILED, 0x82da_010a),
+            (Hresult::IN_PROGRESS, 0x82da_0150),
+        ] {
+            assert_eq!(result, Hresult(raw));
+        }
+    }
+
+    #[test]
     fn status_follows_the_line_builder() {
         assert_eq!(&Hresult::OK.status_digits(), b"200");
         assert_eq!(&Hresult::MULTILINE.status_digits(), b"202");
@@ -416,7 +449,7 @@ mod tests {
         assert_eq!(&Hresult::END_OF_DATA.status_digits(), b"400");
         assert_eq!(&Hresult::FAIL.status_digits(), b"400");
         assert_eq!(&Hresult(0x0000_0001).status_digits(), b"200");
-        assert_eq!(&xbdm_success(0x100).status_digits(), b"400");
+        assert_eq!(&Hresult(0x02da_0100).status_digits(), b"400");
         assert_eq!(&xbdm_success(0x64).status_digits(), b"2:0");
         assert_eq!(&xbdm_success(0xc8).status_digits(), b"2D0");
         assert_eq!(&xbdm_error(0x96).status_digits(), b"4?0");

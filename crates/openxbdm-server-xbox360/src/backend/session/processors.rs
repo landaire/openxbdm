@@ -145,7 +145,7 @@ extern "C" fn register_processor_ex(name: u32, handler: u32, dedicated: u32) -> 
     }
     // One byte past the longest stored name tells an overlong name apart.
     let name = c_string(name, PROCESSOR_NAME_CAPACITY + 1);
-    let mut flags = ProcessorFlags::NONE;
+    let mut flags = ProcessorFlags::empty();
     if xboxkrnl::KeGetCurrentProcessType().0 == TITLE_PROCESS {
         flags = flags.union(ProcessorFlags::TITLE);
     }

@@ -986,7 +986,7 @@ extern "C" fn reboot_export(flags: u32) -> u32 {
     launch_export(
         |server, console, network, arguments| {
             console.system.relaunched = false;
-            let flags = BootFlags(arguments.flags);
+            let flags = BootFlags::from_bits_retain(arguments.flags);
             let result =
                 commands::system::launch_without_connection(server, console, network, flags, None);
             note_relaunch(console, arguments);
@@ -1009,7 +1009,7 @@ extern "C" fn launch_title_export(flags: u32, image: u32, drive: u32, command_li
                 server,
                 console,
                 network,
-                BootFlags(arguments.flags),
+                BootFlags::from_bits_retain(arguments.flags),
                 caller_string(arguments.image),
                 caller_string(arguments.drive),
                 caller_string(arguments.command_line),
@@ -1034,7 +1034,7 @@ extern "C" fn set_title_export(dir: u32, name: u32, command_line: u32, flags: u3
                 caller_string(arguments.drive),
                 caller_string(arguments.image),
                 caller_string(arguments.command_line),
-                TitleFlags(arguments.flags),
+                TitleFlags::from_bits_retain(arguments.flags),
             );
             reply::hresult(result).0
         },

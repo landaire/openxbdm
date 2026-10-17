@@ -446,7 +446,7 @@ fn track_allocation(address: u32, size: u32, kind: u16) -> TrackingResult {
         assert_allocation_pointer(TRACK_ASSERT_LINE);
     }
     let flags = TRACKING.flags.load(Ordering::Relaxed);
-    if flags & TrackingFlags::TYPE_MASK == 0 {
+    if !TrackingFlags::from_bits_retain(flags).intersects(TrackingFlags::TYPE_MASK) {
         return Err(TrackingError::Off);
     }
     if u32::from(kind) >= tracking_type_count() {
@@ -518,7 +518,7 @@ fn untrack_allocation(address: u32, size: u32, kind: u16) -> Untracked {
         assert_allocation_pointer(UNTRACK_ASSERT_LINE);
     }
     let flags = TRACKING.flags.load(Ordering::Relaxed);
-    if flags & TrackingFlags::TYPE_MASK == 0 {
+    if !TrackingFlags::from_bits_retain(flags).intersects(TrackingFlags::TYPE_MASK) {
         return Untracked::Skipped(Err(TrackingError::Off));
     }
     if u32::from(kind) >= tracking_type_count() {
@@ -939,11 +939,11 @@ impl memory::Backend for Console {
     }
 
     fn tracking_flags(&mut self) -> TrackingFlags {
-        TrackingFlags(TRACKING.flags.load(Ordering::Relaxed))
+        TrackingFlags::from_bits_retain(TRACKING.flags.load(Ordering::Relaxed))
     }
 
     fn set_tracking_flags(&mut self, flags: TrackingFlags) {
-        TRACKING.flags.store(flags.0, Ordering::Relaxed);
+        TRACKING.flags.store(flags.bits(), Ordering::Relaxed);
     }
 
     fn write_tracking_records(&mut self, file: filesystem::FileHandle) -> Result<(), KernelError> {

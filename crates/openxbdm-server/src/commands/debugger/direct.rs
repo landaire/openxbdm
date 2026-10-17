@@ -12,8 +12,6 @@
 use super::DataBreakpoint;
 use super::Disposition;
 use super::ExceptionRecord;
-use super::HARDWARE_KERNEL_DEBUGGER;
-use super::MSR_SINGLE_STEP;
 use super::StopOn;
 use super::ThreadId;
 use super::breakpoints::access_length;
@@ -21,6 +19,10 @@ use super::events::ASSERT_IGNORE;
 use super::events::rewrite_trap;
 use super::trap;
 use crate::commands::console::DumpMode;
+use crate::commands::console::EventDeferMask;
+use openxbdm_core::status::NtStatus;
+use xbox360_sys::processor::Msr;
+use xbox360_sys::xboxkrnl::HardwareFlags;
 
 /// Monitor state the dispatch and the platform's event services read,
 /// copied by the server for use on any thread.
@@ -40,16 +42,8 @@ pub struct DirectPolicy {
     /// A debugger is attached (`debugger connect` or a debug target).
     pub attached: bool,
     /// `eventdefer` mask: notifications queued above passive level.
-    pub defer_mask: u32,
+    pub defer_mask: EventDeferMask,
     pub data_breakpoint: Option<DataBreakpoint>,
-}
-
-impl DirectPolicy {
-    const DEFER_DEBUG_STRING: u32 = 0x2;
-    const DEFER_SINGLE_STEP: u32 = 0x4;
-    const DEFER_ASSERT: u32 = 0x8;
-    const DEFER_DATA_BREAK: u32 = 0x20;
-    const DEFER_RIP: u32 = 0x40;
 }
 
 /// How notifications leave the raising thread.
@@ -71,7 +65,7 @@ pub struct DirectException {
     pub second_chance: bool,
     /// The thread has a monitor record.
     pub has_record: bool,
-    pub hardware_flags: u32,
+    pub hardware_flags: HardwareFlags,
     pub delivery: Delivery,
 }
 
@@ -145,7 +139,7 @@ pub struct ThreadNameRequest {
 /// The registers [`dispatch_direct`] reads and changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DirectRegisters {
-    pub msr: u32,
+    pub msr: Msr,
     pub iar: u32,
     pub gpr3: u64,
     pub gpr4: u64,
@@ -167,12 +161,14 @@ pub fn dispatch_direct(
         rewrite_trap(&mut record);
     }
     outcome.record = record;
-    let hardware_kd = event.hardware_flags & HARDWARE_KERNEL_DEBUGGER != 0;
+    let hardware_kd = event
+        .hardware_flags
+        .contains(HardwareFlags::KERNEL_DEBUGGER);
     let reprogram = policy.data_breakpoint.map(DataBreakpoint::register);
     if !event.second_chance && policy.trap_passthrough && !hardware_kd {
         let passes = match record.code {
-            ExceptionRecord::BREAKPOINT => record.trap_code() == trap::BREAKPOINT,
-            ExceptionRecord::SINGLE_STEP => true,
+            NtStatus::BREAKPOINT => record.trap_code() == trap::BREAKPOINT,
+            NtStatus::SINGLE_STEP => true,
             _ => false,
         };
         if passes {
@@ -188,21 +184,23 @@ pub fn dispatch_direct(
     } else {
         // Whether the notification goes out, and whether the deferred
         // queue took it (which resolves the event as a continue would).
-        let sent = |defer_bit: Option<u32>| match event.delivery {
+        let sent = |defer_bit: Option<EventDeferMask>| match event.delivery {
             Delivery::Inline => true,
             Delivery::Deferred => {
-                defer_bit.is_some_and(|bit| policy.attached && policy.defer_mask & bit != 0)
+                defer_bit.is_some_and(|bit| policy.attached && policy.defer_mask.intersects(bit))
             }
             Delivery::Discarded => false,
         };
-        let queued = |defer_bit: u32| event.delivery == Delivery::Deferred && sent(Some(defer_bit));
+        let queued = |defer_bit: EventDeferMask| {
+            event.delivery == Delivery::Deferred && sent(Some(defer_bit))
+        };
         let gpr3 = context.gpr3;
         let gpr4 = context.gpr4;
         match record.code {
-            ExceptionRecord::BREAKPOINT => match record.trap_code() {
+            NtStatus::BREAKPOINT => match record.trap_code() {
                 trap::DEBUG_STRING => {
                     dump = false;
-                    if event.has_record && sent(Some(DirectPolicy::DEFER_DEBUG_STRING)) {
+                    if event.has_record && sent(Some(EventDeferMask::DEBUG_STRING)) {
                         outcome.notice = Some(DirectNotice::DebugString {
                             address: gpr3 as u32,
                             length: gpr4 as u16,
@@ -231,7 +229,7 @@ pub fn dispatch_direct(
                 code @ (trap::ASSERT_PROMPT | trap::RIP) => {
                     let (bit, notice) = if code == trap::ASSERT_PROMPT {
                         (
-                            DirectPolicy::DEFER_ASSERT,
+                            EventDeferMask::ASSERT,
                             DirectNotice::Assert {
                                 address: gpr3 as u32,
                                 length: gpr4 as u16,
@@ -239,7 +237,7 @@ pub fn dispatch_direct(
                         )
                     } else {
                         (
-                            DirectPolicy::DEFER_RIP,
+                            EventDeferMask::RIP,
                             DirectNotice::Rip {
                                 address: gpr3 as u32,
                                 length: gpr4 as u16,
@@ -267,50 +265,50 @@ pub fn dispatch_direct(
                     return outcome;
                 }
             },
-            ExceptionRecord::NT_ASSERT => {}
-            ExceptionRecord::SINGLE_STEP if record.parameters[0] == 0 => {
+            NtStatus::ASSERTION_FAILURE => {}
+            NtStatus::SINGLE_STEP if record.parameters[0] == 0 => {
                 if let Some(data) = policy.data_breakpoint {
                     let length = instruction.map_or(8, access_length);
                     let overlap = data.overlaps(record.parameters[1], length);
-                    if overlap && sent(Some(DirectPolicy::DEFER_DATA_BREAK)) {
+                    if overlap && sent(Some(EventDeferMask::DATA_BREAK)) {
                         outcome.notice = Some(DirectNotice::Data {
                             kind: data.kind as u32,
                             address: data.address,
                         });
                     }
-                    if !overlap || queued(DirectPolicy::DEFER_DATA_BREAK) {
+                    if !overlap || queued(EventDeferMask::DATA_BREAK) {
                         *step = Some(DirectStep {
-                            saved_trace: context.msr & MSR_SINGLE_STEP != 0,
+                            saved_trace: context.msr.contains(Msr::SINGLE_STEP),
                         });
-                        context.msr |= MSR_SINGLE_STEP;
+                        context.msr.insert(Msr::SINGLE_STEP);
                         outcome.data_breakpoint_register = Some(0);
                         outcome.disposition.handled = true;
                         return outcome;
                     }
                 }
             }
-            ExceptionRecord::SINGLE_STEP => {
+            NtStatus::SINGLE_STEP => {
                 if let Some(finished) = step.take() {
                     outcome.data_breakpoint_register = reprogram;
                     if !finished.saved_trace {
-                        context.msr &= !MSR_SINGLE_STEP;
+                        context.msr.remove(Msr::SINGLE_STEP);
                         outcome.disposition.handled = true;
                         return outcome;
                     }
                 }
-                context.msr &= !MSR_SINGLE_STEP;
-                if sent(Some(DirectPolicy::DEFER_SINGLE_STEP)) {
+                context.msr.remove(Msr::SINGLE_STEP);
+                if sent(Some(EventDeferMask::SINGLE_STEP)) {
                     outcome.notice = Some(DirectNotice::SingleStep);
                 }
-                if queued(DirectPolicy::DEFER_SINGLE_STEP) {
+                if queued(EventDeferMask::SINGLE_STEP) {
                     outcome.disposition.handled = true;
                     return outcome;
                 }
-                context.msr |= MSR_SINGLE_STEP;
+                context.msr.insert(Msr::SINGLE_STEP);
             }
             _ => {
                 advance = false;
-                if record.code == ExceptionRecord::THREAD_NAME && record.parameters[0] == 0x1000 {
+                if record.code == NtStatus::THREAD_NAME && record.parameters[0] == 0x1000 {
                     let thread = match record.parameters[2] {
                         u32::MAX => event.thread,
                         other => ThreadId(other),

@@ -34,18 +34,22 @@ const PROFILE_VERSION: u32 = 0x17e5;
 /// Runtime version `u` requires for GPU captures.
 const GPU_CAPTURE_VERSION: u32 = 0x209e;
 
-/// Engine message codes.
-const MESSAGE_CAPTURE_FRAMES: u32 = 1;
-const MESSAGE_STOP: u32 = 3;
-const MESSAGE_SET_CAPTURE: u32 = 4;
-const MESSAGE_START: u32 = 5;
-const MESSAGE_RECORD: u32 = 6;
-const MESSAGE_FRAMES: u32 = 7;
-const MESSAGE_PROFILE: u32 = 0xa;
-const MESSAGE_RESUME: u32 = 0xb;
-const MESSAGE_FRAME_RANGE: u32 = 0xc;
-const MESSAGE_FRAME_DETAIL: u32 = 0xe;
-const MESSAGE_GPU_CAPTURE: u32 = 0xf;
+xbox360_sys::value_enum! {
+    /// Engine message codes.
+    pub enum PixMessage: u32 {
+        CaptureFrames = 1,
+        Stop = 3,
+        SetCapture = 4,
+        Start = 5,
+        Record = 6,
+        Frames = 7,
+        Profile = 0xa,
+        Resume = 0xb,
+        FrameRange = 0xc,
+        FrameDetail = 0xe,
+        GpuCapture = 0xf,
+    }
+}
 
 /// Counter group of the enable bitmap; groups 2 to 6 have callbacks.
 const BITMAP_GROUP: u32 = 1;
@@ -188,7 +192,7 @@ pub(super) fn pix_command(invocation: &mut Invocation<'_>) -> CommandResult {
         b'a' => Reply::posted(
             invocation
                 .backend
-                .pix_post(MESSAGE_START, &[1, 0, 0, 0, 0, 0, 0]),
+                .pix_post(PixMessage::Start.raw(), &[1, 0, 0, 0, 0, 0, 0]),
         ),
         b'b' => {
             invocation.backend.pix_set_trace(true);
@@ -202,7 +206,7 @@ pub(super) fn pix_command(invocation: &mut Invocation<'_>) -> CommandResult {
             Reply::posted(
                 invocation
                     .backend
-                    .pix_post(MESSAGE_CAPTURE_FRAMES, &[count, 1, 0]),
+                    .pix_post(PixMessage::CaptureFrames.raw(), &[count, 1, 0]),
             )
         }
         b'd' => frames(invocation, &mut arguments),
@@ -210,10 +214,10 @@ pub(super) fn pix_command(invocation: &mut Invocation<'_>) -> CommandResult {
             invocation.backend.pix_set_trace(false);
             Reply::Ok
         }
-        b'g' => Reply::posted(invocation.backend.pix_post(MESSAGE_RESUME, &[])),
+        b'g' => Reply::posted(invocation.backend.pix_post(PixMessage::Resume.raw(), &[])),
         b'h' => match invocation.backend.pix_dogma() {
             Some(image) => Reply::posted(invocation.backend.pix_post(
-                MESSAGE_START,
+                PixMessage::Start.raw(),
                 &[
                     1,
                     0,
@@ -253,12 +257,12 @@ pub(super) fn pix_command(invocation: &mut Invocation<'_>) -> CommandResult {
                 Some(status) if pix.version >= PROFILE_VERSION && status[2] < PROFILE_VERSION => {
                     Reply::OldD3d
                 }
-                _ => Reply::posted(invocation.backend.pix_post(MESSAGE_PROFILE, &[])),
+                _ => Reply::posted(invocation.backend.pix_post(PixMessage::Profile.raw(), &[])),
             }
         }
         b'q' => status(invocation, &mut arguments),
         b'r' => return trace(invocation),
-        b't' => Reply::posted(invocation.backend.pix_post(MESSAGE_STOP, &[0])),
+        b't' => Reply::posted(invocation.backend.pix_post(PixMessage::Stop.raw(), &[0])),
         b'u' => gpu_capture(invocation, &arguments),
         b'v' => frame_range(invocation, &mut arguments),
         b'w' => frame_detail(invocation, &mut arguments),
@@ -305,7 +309,11 @@ fn frames(invocation: &mut Invocation<'_>, arguments: &mut Arguments<'_>) -> Rep
         .wrapping_add(1)
         .min(MAX_FRAME_COUNT);
     let payload = [frame.wrapping_sub(first) as u32, count, 1];
-    Reply::posted_or_busy(invocation.backend.pix_post(MESSAGE_FRAMES, &payload))
+    Reply::posted_or_busy(
+        invocation
+            .backend
+            .pix_post(PixMessage::Frames.raw(), &payload),
+    )
 }
 
 fn frame_detail(invocation: &mut Invocation<'_>, arguments: &mut Arguments<'_>) -> Reply {
@@ -325,7 +333,11 @@ fn frame_detail(invocation: &mut Invocation<'_>, arguments: &mut Arguments<'_>) 
         (last.wrapping_sub(first) as u32).wrapping_add(1),
         detail,
     ];
-    Reply::posted(invocation.backend.pix_post(MESSAGE_FRAME_DETAIL, &payload))
+    Reply::posted(
+        invocation
+            .backend
+            .pix_post(PixMessage::FrameDetail.raw(), &payload),
+    )
 }
 
 /// `v [a b c d]`: all four values or none.
@@ -351,7 +363,11 @@ fn frame_range(invocation: &mut Invocation<'_>, arguments: &mut Arguments<'_>) -
             end,
         ]
     };
-    Reply::posted_or_busy(invocation.backend.pix_post(MESSAGE_FRAME_RANGE, &payload))
+    Reply::posted_or_busy(
+        invocation
+            .backend
+            .pix_post(PixMessage::FrameRange.raw(), &payload),
+    )
 }
 
 /// `k a b text`.
@@ -377,7 +393,11 @@ fn set_capture(invocation: &mut Invocation<'_>, arguments: &mut Arguments<'_>) -
         return Reply::No;
     };
     invocation.backend.pix_set_capture_text(text);
-    Reply::posted(invocation.backend.pix_post(MESSAGE_SET_CAPTURE, &[0]))
+    Reply::posted(
+        invocation
+            .backend
+            .pix_post(PixMessage::SetCapture.raw(), &[0]),
+    )
 }
 
 /// `o a f s [t u]`.
@@ -429,7 +449,11 @@ fn record(invocation: &mut Invocation<'_>, arguments: &mut Arguments<'_>) -> Rep
     if invocation.backend.pix_boot_animation_loaded() {
         return Reply::Busy;
     }
-    Reply::posted_or_busy(invocation.backend.pix_post(MESSAGE_RECORD, &payload))
+    Reply::posted_or_busy(
+        invocation
+            .backend
+            .pix_post(PixMessage::Record.raw(), &payload),
+    )
 }
 
 /// `q version flags`: store the title's D3D version and flags, then report
@@ -503,7 +527,11 @@ fn gpu_capture(invocation: &mut Invocation<'_>, arguments: &Arguments<'_>) -> Re
             return Reply::OldD3d;
         }
     }
-    Reply::posted(invocation.backend.pix_post(MESSAGE_GPU_CAPTURE, &payload))
+    Reply::posted(
+        invocation
+            .backend
+            .pix_post(PixMessage::GpuCapture.raw(), &payload),
+    )
 }
 
 /// `r`: sample the counters into the trace ring and send the queued

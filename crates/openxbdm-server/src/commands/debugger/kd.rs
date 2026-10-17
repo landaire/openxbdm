@@ -5,21 +5,23 @@ use openxbdm_core::line::CommandLine;
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
+use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::XbdmHresult;
 
 use super::ExtensionHandle;
-use super::HARDWARE_KD_ENABLED;
-use super::HARDWARE_KD_LITE;
 use super::context::strtoul;
 use super::events;
 use crate::backend::Backend as AnyBackend;
 use crate::commands::console::ConfigSetting;
+use crate::commands::console::ConsoleConfigFlags;
+use crate::commands::system::hardware_flags;
 use crate::invocation::Invocation;
 use crate::reply::CommandError;
 use crate::reply::CommandResult;
 use crate::reply::Reply;
 use crate::state::ServerState;
 use crate::text::Text;
+use xbox360_sys::xboxkrnl::HardwareFlags;
 
 /// Offset of the kdnet settings record in the raw flash device.
 pub const KDNET_RECORD_OFFSET: u32 = 0x80;
@@ -27,12 +29,7 @@ pub const KDNET_RECORD_SIZE: usize = 0x80;
 const KDNET_SIGNATURE: u16 = 0xca4a;
 /// Value of a successful flash access in the `kdnet` texts; a failure
 /// prints its status as an NT-facility result.
-const FLASH_SUCCESS: Hresult = Hresult(0x1000_0000);
-/// Console configuration value of the kd lite flag.
-const KD_LITE_SETTING: ConfigSetting = ConfigSetting::new(2, 6);
-const KD_LITE_BIT: u32 = 0x2;
-/// Console configuration value of the console MAC address.
-const MAC_SETTING: ConfigSetting = ConfigSetting::new(2, 1);
+const FLASH_SUCCESS: Hresult = Hresult::from_nt(NtStatus::SUCCESS);
 const EXTENSION_DIRECTORY: &[u8] = b"\\Device\\Harddisk0\\Partition1\\DEVKIT\\DMEXT\\";
 /// Characters kept of an extension path.
 const EXTENSION_PATH_LIMIT: usize = 0x6b;
@@ -67,7 +64,7 @@ pub(super) fn kernel_debugger(invocation: &mut Invocation<'_>) -> CommandResult 
     let except = if line.has("except") {
         true
     } else if line.has("exceptif") {
-        invocation.backend.hardware_flags() & HARDWARE_KD_ENABLED != 0
+        hardware_flags(invocation.backend).contains(HardwareFlags::KERNEL_DEBUGGER_ENABLED)
     } else {
         return improper(invocation);
     };
@@ -80,7 +77,8 @@ pub(super) fn kernel_debugger(invocation: &mut Invocation<'_>) -> CommandResult 
 
 /// `kdlite enable|disable`.
 pub(super) fn kernel_debugger_lite(invocation: &mut Invocation<'_>) -> CommandResult {
-    if invocation.backend.hardware_flags() & HARDWARE_KD_LITE == 0 {
+    // Kd lite exists only on test kits.
+    if !hardware_flags(invocation.backend).contains(HardwareFlags::TEST_KIT) {
         return improper(invocation);
     }
     let enable = if invocation.line.has("enable") {
@@ -93,20 +91,20 @@ pub(super) fn kernel_debugger_lite(invocation: &mut Invocation<'_>) -> CommandRe
     let mut value = [0u8; 4];
     if invocation
         .backend
-        .xconfig_get(KD_LITE_SETTING, &mut value)
+        .xconfig_get(ConfigSetting::CONSOLE_FLAGS, &mut value)
         .is_err()
     {
         return improper(invocation);
     }
-    let mut flags = u32::from_be_bytes(value);
+    let mut flags = ConsoleConfigFlags::from_bits_retain(u32::from_be_bytes(value));
     if enable {
-        flags |= KD_LITE_BIT;
+        flags.insert(ConsoleConfigFlags::KD_LITE);
     } else {
-        flags &= !KD_LITE_BIT;
+        flags.remove(ConsoleConfigFlags::KD_LITE);
     }
     if invocation
         .backend
-        .xconfig_set(KD_LITE_SETTING, &flags.to_be_bytes())
+        .xconfig_set(ConfigSetting::CONSOLE_FLAGS, &flags.bits().to_be_bytes())
         .is_err()
     {
         return improper(invocation);
@@ -339,7 +337,7 @@ fn kdnet_set(
         let mut console_mac = [0u8; 6];
         match invocation
             .backend
-            .xconfig_get(MAC_SETTING, &mut console_mac)
+            .xconfig_get(ConfigSetting::MAC_ADDRESS, &mut console_mac)
         {
             Ok(_) => {
                 console_mac[5] = console_mac[5].wrapping_sub(1);

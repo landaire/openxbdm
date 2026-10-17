@@ -16,7 +16,7 @@ use openxbdm_server::commands::debugger::BREAKPOINT_BLOCKS;
 use openxbdm_server::commands::debugger::ContextFlags;
 use openxbdm_server::commands::debugger::ExceptionRecord;
 use openxbdm_server::commands::debugger::ExitStatus;
-use openxbdm_server::commands::debugger::MSR_SINGLE_STEP;
+use openxbdm_server::commands::debugger::Msr;
 use openxbdm_server::commands::debugger::TRAP_INSTRUCTION;
 use openxbdm_server::commands::debugger::trap;
 use openxbdm_server::commands::services::ThreadHandle;
@@ -398,7 +398,7 @@ fn breakpoint_hit_stops_and_continue_steps_over_it() {
         .backend
         .debugger
         .exception_context(TITLE_THREAD, CODE);
-    context.msr |= MSR_SINGLE_STEP;
+    context.msr |= Msr::SINGLE_STEP;
     server
         .host
         .lock()
@@ -435,7 +435,7 @@ fn first_chance_exception_is_reported_without_stopping() {
     let server = TestServer::start();
     let mut channel = Channel::attach(&server);
     let record = ExceptionRecord {
-        code: ExceptionRecord::ACCESS_VIOLATION,
+        code: NtStatus::ACCESS_VIOLATION,
         address: CODE,
         parameter_count: 2,
         parameters: [1, 0x1234_5678, 0, 0],
@@ -535,7 +535,7 @@ fn debug_strings_are_split_into_lines() {
         context.gpr[3] = u64::from(text_address);
         context.gpr[4] = 10;
         let record = ExceptionRecord {
-            code: ExceptionRecord::BREAKPOINT,
+            code: NtStatus::BREAKPOINT,
             address: CODE,
             parameter_count: 1,
             parameters: [u32::from(trap::DEBUG_STRING), 0, 0, 0],
@@ -773,13 +773,25 @@ fn stop_on_flags_and_replies() {
         session.command("stopon modload pogomodstart titleinit"),
         "200- OK"
     );
-    assert_eq!(server.host.lock().server.state.debugger.stop_on.0, 0x50);
+    assert_eq!(
+        server.host.lock().server.state.debugger.stop_on.bits(),
+        0x50
+    );
     assert_eq!(session.command("nostopon"), "200- OK");
-    assert_eq!(server.host.lock().server.state.debugger.stop_on.0, 0x50);
+    assert_eq!(
+        server.host.lock().server.state.debugger.stop_on.bits(),
+        0x50
+    );
     assert_eq!(session.command("stopon all"), "200- stop on all");
-    assert_eq!(server.host.lock().server.state.debugger.stop_on.0, u32::MAX);
+    assert_eq!(
+        server.host.lock().server.state.debugger.stop_on.bits(),
+        u32::MAX
+    );
     assert_eq!(session.command("nostopon debugstr"), "200- OK");
-    assert_eq!(server.host.lock().server.state.debugger.stop_on.0, !0x4);
+    assert_eq!(
+        server.host.lock().server.state.debugger.stop_on.bits(),
+        !0x4
+    );
 }
 
 #[test]
@@ -1083,7 +1095,7 @@ fn debug_string_above_passive_level_is_deferred_only_when_selected() {
     session.line();
     write_memory(&server, MEMORY_BASE + 0x2000, b"hi\n");
     let record = ExceptionRecord {
-        code: ExceptionRecord::BREAKPOINT,
+        code: NtStatus::BREAKPOINT,
         parameter_count: 1,
         parameters: [u32::from(trap::DEBUG_STRING), 0, 0, 0],
         ..ExceptionRecord::default()
@@ -1135,7 +1147,7 @@ fn data_breakpoint_overlap_uses_the_instruction_access_length() {
     let raise = |server: &TestServer, instruction: u32, access: u32| {
         write_memory(server, CODE, &instruction.to_be_bytes());
         let record = ExceptionRecord {
-            code: ExceptionRecord::SINGLE_STEP,
+            code: NtStatus::SINGLE_STEP,
             parameter_count: 2,
             parameters: [0, access, 0, 0],
             ..ExceptionRecord::default()

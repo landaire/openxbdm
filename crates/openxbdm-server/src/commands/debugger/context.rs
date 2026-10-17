@@ -6,38 +6,18 @@ use core::fmt::Write as _;
 use openxbdm_core::line::CommandLine;
 
 use crate::text::Text;
+use core::mem::offset_of;
+use xbox360_sys::processor::Msr;
+use xbox360_sys::xboxkrnl::Context as KernelContext;
 
-/// Register groups of a context.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ContextFlags(pub u32);
-
-impl ContextFlags {
-    pub const NONE: Self = Self(0);
-    pub const CONTROL: Self = Self(0x1);
-    pub const FLOATING_POINT: Self = Self(0x2);
-    pub const INTEGER: Self = Self(0x4);
-    pub const VECTOR: Self = Self(0x10);
-    pub const FULL: Self = Self(0x17);
-
-    pub const fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
-    }
-
-    pub const fn union(self, other: Self) -> Self {
-        Self(self.0 | other.0)
-    }
-
-    pub const fn intersection(self, other: Self) -> Self {
-        Self(self.0 & other.0)
-    }
-}
+pub use xbox360_sys::xboxkrnl::ContextFlags;
 
 /// Register state of a thread, in the layout groups of the kernel context.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Context {
     /// Groups that hold valid values.
     pub flags: ContextFlags,
-    pub msr: u32,
+    pub msr: Msr,
     pub iar: u32,
     pub lr: u32,
     pub ctr: u64,
@@ -59,8 +39,8 @@ impl Default for Context {
 
 impl Context {
     pub const EMPTY: Self = Self {
-        flags: ContextFlags::NONE,
-        msr: 0,
+        flags: ContextFlags::empty(),
+        msr: Msr::empty(),
         iar: 0,
         lr: 0,
         ctr: 0,
@@ -75,28 +55,32 @@ impl Context {
 }
 
 /// Bytes of the kernel context layout (`ContextFlags` word first).
-pub const CONTEXT_SIZE: usize = 0xa40;
+pub const CONTEXT_SIZE: usize = size_of::<KernelContext>();
 
 mod offset {
-    pub const MSR: usize = 0x4;
-    pub const IAR: usize = 0x8;
-    pub const LR: usize = 0xc;
-    pub const CTR: usize = 0x10;
-    pub const GPR: usize = 0x18;
-    pub const CR: usize = 0x118;
-    pub const XER: usize = 0x11c;
-    pub const FPSCR: usize = 0x120;
-    pub const FPR: usize = 0x128;
-    pub const VSCR: usize = 0x230;
-    pub const VR: usize = 0x240;
+    use super::KernelContext;
+    use super::offset_of;
+
+    pub const FLAGS: usize = offset_of!(KernelContext, context_flags);
+    pub const MSR: usize = offset_of!(KernelContext, msr);
+    pub const IAR: usize = offset_of!(KernelContext, iar);
+    pub const LR: usize = offset_of!(KernelContext, lr);
+    pub const CTR: usize = offset_of!(KernelContext, ctr);
+    pub const GPR: usize = offset_of!(KernelContext, gpr);
+    pub const CR: usize = offset_of!(KernelContext, cr);
+    pub const XER: usize = offset_of!(KernelContext, xer);
+    pub const FPSCR: usize = offset_of!(KernelContext, fpscr);
+    pub const FPR: usize = offset_of!(KernelContext, fpr);
+    pub const VSCR: usize = offset_of!(KernelContext, vscr);
+    pub const VR: usize = offset_of!(KernelContext, vr);
 }
 
 impl Context {
     /// Store every register in the big-endian kernel layout.
     pub fn encode(&self, out: &mut [u8; CONTEXT_SIZE]) {
         let mut put = |at: usize, bytes: &[u8]| out[at..at + bytes.len()].copy_from_slice(bytes);
-        put(0, &self.flags.0.to_be_bytes());
-        put(offset::MSR, &self.msr.to_be_bytes());
+        put(offset::FLAGS, &self.flags.bits().to_be_bytes());
+        put(offset::MSR, &self.msr.bits().to_be_bytes());
         put(offset::IAR, &self.iar.to_be_bytes());
         put(offset::LR, &self.lr.to_be_bytes());
         put(offset::CTR, &self.ctr.to_be_bytes());
@@ -126,8 +110,8 @@ impl Context {
         };
         let dword = |at: usize| (u64::from(word(at)) << 32) | u64::from(word(at + 4));
         Self {
-            flags: ContextFlags(word(0)),
-            msr: word(offset::MSR),
+            flags: ContextFlags::from_bits_retain(word(offset::FLAGS)),
+            msr: Msr::from_bits_retain(word(offset::MSR)),
             iar: word(offset::IAR),
             lr: word(offset::LR),
             ctr: dword(offset::CTR),
@@ -143,11 +127,6 @@ impl Context {
         }
     }
 }
-
-/// MSR single-step trace enable.
-pub const MSR_SINGLE_STEP: u32 = 0x400;
-/// MSR external interrupt enable.
-pub const MSR_EXTERNAL_INTERRUPTS: u32 = 0x8000;
 
 /// One `getcontext` line, in output order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,7 +181,7 @@ impl ContextLine {
     /// Write the line without its line end.
     pub fn write<const N: usize>(self, context: &Context, out: &mut Text<N>) {
         let _ = match self {
-            Self::Msr => write!(out, "Msr=0x{:08x}", context.msr),
+            Self::Msr => write!(out, "Msr=0x{:08x}", context.msr.bits()),
             Self::Iar => write!(out, "Iar=0x{:08x}", context.iar),
             Self::Lr => write!(out, "Lr=0x{:08x}", context.lr),
             Self::Ctr => write!(out, "Ctr=0q{:016x}", context.ctr),
@@ -240,7 +219,7 @@ fn write_vector<const N: usize>(
 /// and values that do not parse are ignored.
 pub fn apply_parameters(line: &CommandLine<'_>, context: &mut Context) {
     if let Some(value) = line.dword("Msr") {
-        context.msr = value;
+        context.msr = Msr::from_bits_retain(value);
     }
     if let Some(value) = line.dword("Iar") {
         context.iar = value;

@@ -485,7 +485,7 @@ fn load_context(address: u32) -> CallContext {
         address,
         hook: field(CallContext::HOOK),
         sequence: field(CallContext::SEQUENCE),
-        flags: detour::HookFlags(field(CallContext::FLAGS)),
+        flags: detour::HookFlags::from_bits_retain(field(CallContext::FLAGS)),
         param_size: field(CallContext::PARAM_SIZE),
         function: optional(field(CallContext::FUNCTION)),
         return_value: detour::ReturnValue(field(CallContext::RETURN_VALUE)),
@@ -505,7 +505,7 @@ fn store_context(call: &CallContext) {
         detour::Platform::write_u32(&platform, call.address + offset, value)
     };
     store(CallContext::SEQUENCE, call.sequence);
-    store(CallContext::FLAGS, call.flags.0);
+    store(CallContext::FLAGS, call.flags.bits());
     store(CallContext::PARAM_SIZE, call.param_size);
     store(CallContext::FUNCTION, call.function.unwrap_or(0));
     store(CallContext::RETURN_VALUE, call.return_value.0);

@@ -34,6 +34,11 @@ use super::FrameHook;
 use super::SIMULATOR_INTERCEPT;
 use crate::backend::Console;
 
+/// The instance (0x91f9fc84). Only `destroy_simulator`, on the server
+/// thread, unpublishes and frees it. The query exports read it on caller
+/// threads, unsynchronized with that, as stock does (see [`instance`]).
+static INSTANCE: AtomicPtr<Instance> = AtomicPtr::new(null_mut());
+
 /// Pool blocks of the library (stock allocator 0x91f36460: tag `DMNS`,
 /// pool type 2).
 mod memory {
@@ -61,119 +66,6 @@ mod memory {
     }
 }
 
-/// An intercept registration failure. Only the simulator's own
-/// registration turns `WSAEALREADY` into its busy error.
-fn registration_error(error: WsaError, own_registration: bool) -> NetsimError {
-    if own_registration && error == WsaError::ALREADY {
-        NetsimError::InterceptBusy
-    } else {
-        NetsimError::Intercept(error)
-    }
-}
-
-/// The instance (0x91f9fc84). Only `destroy_simulator`, on the server
-/// thread, unpublishes and frees it. The query exports read it on caller
-/// threads, unsynchronized with that, as stock does (see [`instance`]).
-static INSTANCE: AtomicPtr<Instance> = AtomicPtr::new(null_mut());
-
-/// The published instance, without access to it.
-fn published() -> Option<NonNull<Instance>> {
-    NonNull::new(INSTANCE.load(Ordering::Acquire))
-}
-
-/// The published instance.
-///
-/// # Safety
-/// `destroy_simulator` does not run while the reference lives. Code that
-/// holds the console uses [`held_instance`] instead. The query exports
-/// (221, 222, 223, 226) call this on caller threads, where stock does not
-/// exclude a destruction during the query; there the stock race remains.
-unsafe fn instance<'a>() -> Result<&'a Instance, NetsimError> {
-    // SAFETY: a published instance stays allocated until `destroy_simulator`,
-    // which the contract excludes.
-    published()
-        .map(|instance| unsafe { &*instance.as_ptr() })
-        .ok_or(NetsimError::NoInstance)
-}
-
-/// The published instance, for the holder of the console.
-#[inline(always)]
-fn held_instance(_console: &mut Console) -> Result<&Instance, NetsimError> {
-    // SAFETY: `destroy_simulator` needs the console mutably, so the borrow
-    // excludes it while the reference lives.
-    unsafe { instance() }
-}
-
-/// Whether the instance exists.
-pub(crate) fn simulator_exists() -> bool {
-    published().is_some()
-}
-
-/// Forward frames to a capture's callbacks, or stop forwarding; `false`
-/// when there is no instance to chain into (0x91f8d428).
-pub(crate) fn chain_capture(console: &mut Console, hook: Option<FrameHook>) -> bool {
-    let Ok(instance) = held_instance(console) else {
-        return false;
-    };
-    instance.chain(hook, false);
-    true
-}
-
-/// Let frames bypass the simulation while the IP proxy runs (0x91f8d3d8).
-pub(crate) fn set_proxy_bypass(console: &mut Console, active: bool) {
-    if let Ok(instance) = held_instance(console) {
-        instance.set_bypass(active);
-    }
-}
-
-/// Queue counts of the instance, zero without one (0x91f37028 through
-/// 0x91f8d4f8).
-///
-/// # Safety
-/// As for [`instance`].
-pub(crate) unsafe fn queue_counts() -> (u32, u32) {
-    // SAFETY: guaranteed by the caller.
-    unsafe { instance() }.map_or((0, 0), |instance| {
-        (
-            instance.queue_count(Direction::Inbound),
-            instance.queue_count(Direction::Outbound),
-        )
-    })
-}
-
-/// Redirect count of the instance, zero without one (0x91f8da78).
-///
-/// # Safety
-/// As for [`instance`].
-pub(crate) unsafe fn redirect_count() -> u32 {
-    // SAFETY: guaranteed by the caller.
-    unsafe { instance() }.map_or(0, Instance::redirect_count)
-}
-
-/// Counters of a queue (0x91f8d558).
-///
-/// # Safety
-/// As for [`instance`].
-pub(crate) unsafe fn queue_stats(
-    direction: Direction,
-    index: QueueIndex,
-) -> Result<QueueStats, NetsimError> {
-    // SAFETY: guaranteed by the caller.
-    unsafe { instance() }?.queue_stats(direction, index)
-}
-
-/// Type and stored settings of a queue (0x91f8d620).
-///
-/// # Safety
-/// As for [`instance`].
-pub(crate) unsafe fn queue(
-    direction: Direction,
-    index: QueueIndex,
-) -> Result<QueueSnapshot, NetsimError> {
-    // SAFETY: guaranteed by the caller.
-    unsafe { instance() }?.queue(direction, index)
-}
-
 impl netsim::Backend for Console {
     fn simulator_exists(&mut self) -> bool {
         simulator_exists()
@@ -185,14 +77,19 @@ impl netsim::Backend for Console {
         if simulator_exists() {
             return Err(NetsimError::InstanceExists);
         }
+
         let pointer = Instance::create()?;
+
         // SAFETY: just created and owned here.
         let instance = unsafe { pointer.as_ref() };
+
         if self.network.ipproxy.is_started() {
             instance.set_bypass(true);
         }
+
         if let Some(hook) = self.network.netcap.hook() {
             instance.chain(Some(hook), false);
+
             // SAFETY: clearing the callbacks passes no pointers.
             let error = unsafe {
                 NetDll_XnpEthernetInterceptSetCallbacks(
@@ -203,12 +100,14 @@ impl netsim::Backend for Console {
                     EthernetInterceptFlags::empty().bits(),
                 )
             };
+
             if let Some(error) = WsaError::new(error) {
                 // SAFETY: created here and never published.
                 unsafe { Instance::destroy(pointer) };
                 return Err(registration_error(error, false));
             }
         }
+
         // SAFETY: the entries take the instance context, which stays allocated
         // until `destroy_simulator` removes the callbacks.
         let error = unsafe {
@@ -220,13 +119,16 @@ impl netsim::Backend for Console {
                 SIMULATOR_INTERCEPT.bits(),
             )
         };
+
         if let Some(error) = WsaError::new(error) {
             // SAFETY: the failed registration installed no callbacks; the
             // instance was never published.
             unsafe { Instance::destroy(pointer) };
             return Err(registration_error(error, true));
         }
+
         INSTANCE.store(pointer.as_ptr(), Ordering::Release);
+
         Ok(())
     }
 
@@ -234,6 +136,7 @@ impl netsim::Backend for Console {
     fn destroy_simulator(&mut self) -> Result<(), NetsimError> {
         let pointer = NonNull::new(INSTANCE.swap(null_mut(), Ordering::AcqRel))
             .ok_or(NetsimError::InstanceChanged)?;
+
         // SAFETY: removing the simulator callbacks passes no pointers. The
         // capture entries take its context, which stays allocated until
         // `close_capture`, after `detach_capture` removes the hook.
@@ -245,6 +148,7 @@ impl netsim::Backend for Console {
                 0,
                 SIMULATOR_INTERCEPT.bits(),
             );
+
             if let Some(hook) = self.network.netcap.hook() {
                 NetDll_XnpEthernetInterceptSetCallbacks(
                     XnCaller::SystemApp,
@@ -255,6 +159,7 @@ impl netsim::Backend for Console {
                 );
             }
         }
+
         // SAFETY: the instance came from `Instance::create`, left `INSTANCE`
         // above, and no intercept callback is installed for it. The console
         // borrow excludes every `held_instance` reference. Stock does not
@@ -262,6 +167,7 @@ impl netsim::Backend for Console {
         // release DPC or intercept callback already running on another
         // processor; those races remain (see `Instance::destroy`).
         unsafe { Instance::destroy(pointer) };
+
         Ok(())
     }
 
@@ -344,6 +250,117 @@ impl netsim::Backend for Console {
         let mut value = 0u32;
         // SAFETY: `value` is a live u32.
         unsafe { XeKeysGetStatus(&mut value) };
+
         KeyStatus::from_bits_retain(value)
     }
+}
+
+/// An intercept registration failure. Only the simulator's own
+/// registration turns `WSAEALREADY` into its busy error.
+fn registration_error(error: WsaError, own_registration: bool) -> NetsimError {
+    if own_registration && error == WsaError::ALREADY {
+        NetsimError::InterceptBusy
+    } else {
+        NetsimError::Intercept(error)
+    }
+}
+
+/// The published instance, without access to it.
+fn published() -> Option<NonNull<Instance>> {
+    NonNull::new(INSTANCE.load(Ordering::Acquire))
+}
+
+/// The published instance.
+///
+/// # Safety
+/// `destroy_simulator` does not run while the reference lives. Code that
+/// holds the console uses [`held_instance`] instead. The query exports
+/// (221, 222, 223, 226) call this on caller threads, where stock does not
+/// exclude a destruction during the query; there the stock race remains.
+unsafe fn instance<'a>() -> Result<&'a Instance, NetsimError> {
+    // SAFETY: a published instance stays allocated until `destroy_simulator`,
+    // which the contract excludes.
+    published()
+        .map(|instance| unsafe { &*instance.as_ptr() })
+        .ok_or(NetsimError::NoInstance)
+}
+
+/// The published instance, for the holder of the console.
+#[inline(always)]
+fn held_instance(_console: &mut Console) -> Result<&Instance, NetsimError> {
+    // SAFETY: `destroy_simulator` needs the console mutably, so the borrow
+    // excludes it while the reference lives.
+    unsafe { instance() }
+}
+
+/// Whether the instance exists.
+pub(crate) fn simulator_exists() -> bool {
+    published().is_some()
+}
+
+/// Forward frames to a capture's callbacks, or stop forwarding; `false`
+/// when there is no instance to chain into (0x91f8d428).
+pub(crate) fn chain_capture(console: &mut Console, hook: Option<FrameHook>) -> bool {
+    let Ok(instance) = held_instance(console) else {
+        return false;
+    };
+
+    instance.chain(hook, false);
+
+    true
+}
+
+/// Let frames bypass the simulation while the IP proxy runs (0x91f8d3d8).
+pub(crate) fn set_proxy_bypass(console: &mut Console, active: bool) {
+    if let Ok(instance) = held_instance(console) {
+        instance.set_bypass(active);
+    }
+}
+
+/// Queue counts of the instance, zero without one (0x91f37028 through
+/// 0x91f8d4f8).
+///
+/// # Safety
+/// As for [`instance`].
+pub(crate) unsafe fn queue_counts() -> (u32, u32) {
+    // SAFETY: guaranteed by the caller.
+    unsafe { instance() }.map_or((0, 0), |instance| {
+        (
+            instance.queue_count(Direction::Inbound),
+            instance.queue_count(Direction::Outbound),
+        )
+    })
+}
+
+/// Redirect count of the instance, zero without one (0x91f8da78).
+///
+/// # Safety
+/// As for [`instance`].
+pub(crate) unsafe fn redirect_count() -> u32 {
+    // SAFETY: guaranteed by the caller.
+    unsafe { instance() }.map_or(0, Instance::redirect_count)
+}
+
+/// Counters of a queue (0x91f8d558).
+///
+/// # Safety
+/// As for [`instance`].
+pub(crate) unsafe fn queue_stats(
+    direction: Direction,
+    index: QueueIndex,
+) -> Result<QueueStats, NetsimError> {
+    // SAFETY: guaranteed by the caller.
+    unsafe { instance() }?.queue_stats(direction, index)
+}
+
+/// Type and stored settings of a queue (0x91f8d620).
+///
+/// # Safety
+/// As for [`instance`].
+pub(crate) unsafe fn queue(
+    direction: Direction,
+    index: QueueIndex,
+) -> Result<QueueSnapshot, NetsimError> {
+    // SAFETY: guaranteed by the caller.
+    unsafe { instance() }?.queue(direction, index)
 }

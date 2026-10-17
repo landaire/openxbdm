@@ -72,6 +72,112 @@ impl Position {
     }
 }
 
+struct CaptureStart<'a> {
+    name: &'a [u8],
+    data_limit: u32,
+    buffer: u32,
+    flags: CaptureFlags,
+}
+
+/// A settings blob the server thread applies to a queue.
+struct QueueRequest {
+    direction: Direction,
+    index: QueueIndex,
+    blob: [u8; CONFIG_CAPACITY],
+    length: usize,
+}
+
+/// Queues of the selected directions to remove, and the count removed.
+struct RemoveQueues {
+    inbound: bool,
+    outbound: bool,
+    position: Position,
+    /// Count the helper reports, 0 after a failure; `None` when it did not
+    /// run.
+    removed: Option<u32>,
+}
+
+/// An insert blob the server thread applies to `target` (a queue
+/// direction, or nothing for a redirect), and the index it reports.
+struct InsertRequest<T> {
+    target: T,
+    position: Position,
+    blob: [u8; CONFIG_CAPACITY],
+    length: usize,
+    /// What the helper stored; `None` when it did not run.
+    inserted: Option<InsertOutcome>,
+}
+
+impl<T> InsertRequest<T> {
+    fn new(target: T, index: u32) -> Self {
+        Self {
+            target,
+            position: Position::from_raw(index),
+            blob: [0; CONFIG_CAPACITY],
+            length: 0,
+            inserted: None,
+        }
+    }
+
+    /// Build the blob around the program compiled from `text` (0x91f8bdd0);
+    /// a null text or a constant true program adds none.
+    ///
+    /// # Safety
+    ///
+    /// `text` is null or a NUL-terminated string.
+    unsafe fn build(
+        &mut self,
+        text: *const c_char,
+        build: impl FnOnce(Option<Source<'_>>, &mut [u8; CONFIG_CAPACITY]) -> Result<usize, NetsimError>,
+    ) -> Result<(), NetsimError> {
+        // SAFETY: guaranteed by the caller.
+        let compiled = match unsafe { kernel::c_string(text.expose_provenance() as u32) } {
+            Some(text) => classifier::compile_text(text)?,
+            None => None,
+        };
+
+        self.length = build(compiled.as_ref().map(Source::Compiled), &mut self.blob)?;
+
+        Ok(())
+    }
+
+    /// Record the helper's outcome and return the mapped result word.
+    fn record(&mut self, result: Result<u32, NetsimError>) -> u32 {
+        self.inserted = Some(match result {
+            Ok(index) => InsertOutcome::Inserted(index),
+            Err(_) => InsertOutcome::Failed,
+        });
+
+        result.map_or_else(|error| reported(error).0, |_| Hresult::OK.0)
+    }
+
+    /// Store the outcome for the caller.
+    fn finish(self, result: Hresult, output: Option<&mut DwordOut>) -> Hresult {
+        if let Some(outcome) = self.inserted {
+            let index = match outcome {
+                InsertOutcome::Inserted(index) => index,
+                InsertOutcome::Failed => u32::MAX,
+            };
+            store(output, index);
+        }
+
+        result
+    }
+}
+
+/// Result of an insert helper, for the caller's index output.
+#[derive(Clone, Copy)]
+enum InsertOutcome {
+    Inserted(u32),
+    /// Stored as -1.
+    Failed,
+}
+
+struct RemoveRedirects {
+    position: Position,
+    removed: Option<u32>,
+}
+
 /// Run `service` on the server thread with `request`. The server thread
 /// cannot serve a call made on itself or above passive level; those
 /// report a generic failure.
@@ -114,15 +220,39 @@ unsafe fn read_settings(settings: *const Settings) -> Result<netsim::QueueConfig
     {
         return Err(NetsimError::Invalid);
     }
+
     // SAFETY: the structure declares its full size, so it is readable.
     api::decode_settings(unsafe { settings.as_ref() }).map_err(NetsimError::from)
 }
 
-struct CaptureStart<'a> {
-    name: &'a [u8],
-    data_limit: u32,
-    buffer: u32,
-    flags: CaptureFlags,
+fn remove_queues(request: &mut RemoveQueues) -> Hresult {
+    on_server(
+        request,
+        |server: &mut Server,
+         console: &mut Console,
+         _: &mut XamNetwork,
+         request: &mut RemoveQueues| {
+            let state = &server.state.network.netsim;
+            let position = request.position.index().map(QueueIndex);
+            match netsim::remove_queues(
+                state,
+                console,
+                request.inbound,
+                request.outbound,
+                position,
+                true,
+            ) {
+                Ok(removal) => {
+                    request.removed = Some(removal.removed);
+                    Hresult::OK.0
+                }
+                Err(error) => {
+                    request.removed = Some(0);
+                    reported(error).0
+                }
+            }
+        },
+    )
 }
 
 /// Start a capture (0x91f384d0 calling 0x91f34f80 without reply text).
@@ -133,11 +263,13 @@ extern "C" fn capture_start(
     flags: u32,
 ) -> Hresult {
     let flags = CaptureFlags::from_bits_retain(flags);
+
     if flags.contains(CaptureFlags::PERSISTENT)
         && xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE
     {
         return Hresult::PERSISTENT_FROM_TITLE;
     }
+
     let mut start = CaptureStart {
         // SAFETY: the caller passes a capture file name or null.
         name: unsafe { kernel::c_string(name.expose_provenance() as u32) }.unwrap_or_default(),
@@ -145,6 +277,7 @@ extern "C" fn capture_start(
         buffer,
         flags,
     };
+
     on_server(
         &mut start,
         |server: &mut Server,
@@ -188,62 +321,16 @@ extern "C" fn set_link_disconnected(disconnect: u32) -> Hresult {
     } else {
         LinkFlags::RESTORE
     };
+
     // The helper reads the state for its reply before changing it.
     let _ = super::link_status();
+
     match super::set_link_flags(flags) {
         Ok(()) => Hresult::OK,
         Err(error) => Hresult::from(link_error(error)),
     }
 }
 export!(215, set_link_disconnected);
-
-/// A settings blob the server thread applies to a queue.
-struct QueueRequest {
-    direction: Direction,
-    index: QueueIndex,
-    blob: [u8; CONFIG_CAPACITY],
-    length: usize,
-}
-
-/// Queues of the selected directions to remove, and the count removed.
-struct RemoveQueues {
-    inbound: bool,
-    outbound: bool,
-    position: Position,
-    /// Count the helper reports, 0 after a failure; `None` when it did not
-    /// run.
-    removed: Option<u32>,
-}
-
-fn remove_queues(request: &mut RemoveQueues) -> Hresult {
-    on_server(
-        request,
-        |server: &mut Server,
-         console: &mut Console,
-         _: &mut XamNetwork,
-         request: &mut RemoveQueues| {
-            let state = &server.state.network.netsim;
-            let position = request.position.index().map(QueueIndex);
-            match netsim::remove_queues(
-                state,
-                console,
-                request.inbound,
-                request.outbound,
-                position,
-                true,
-            ) {
-                Ok(removal) => {
-                    request.removed = Some(removal.removed);
-                    Hresult::OK.0
-                }
-                Err(error) => {
-                    request.removed = Some(0);
-                    reported(error).0
-                }
-            }
-        },
-    )
-}
 
 /// Remove one queue of a direction (0x91f38650).
 extern "C" fn remove_queue(inbound: u32, index: u32) -> Hresult {
@@ -253,6 +340,7 @@ extern "C" fn remove_queue(inbound: u32, index: u32) -> Hresult {
         position: Position::from_raw(index),
         removed: None,
     };
+
     remove_queues(&mut request)
 }
 export!(217, remove_queue);
@@ -266,11 +354,14 @@ extern "C" fn remove_all_queues(inbound: u32, outbound: u32, removed: *mut Dword
         position: Position::All,
         removed: None,
     };
+
     let result = remove_queues(&mut request);
+
     if let Some(count) = request.removed {
         // SAFETY: the caller passes a writable dword or null.
         store(unsafe { removed.as_mut() }, count);
     }
+
     result
 }
 export!(218, remove_all_queues);
@@ -284,16 +375,19 @@ extern "C" fn modify_queue(inbound: u32, index: u32, settings: *const Settings) 
         Ok(config) => config,
         Err(error) => return Hresult::from(error),
     };
+
     let mut request = QueueRequest {
         direction: direction(inbound),
         index: QueueIndex(index),
         blob: [0; CONFIG_CAPACITY],
         length: 0,
     };
+
     request.length = match api::queue_blob(0, &config, None, &mut request.blob) {
         Ok(length) => length,
         Err(error) => return Hresult::from(error),
     };
+
     on_server(
         &mut request,
         |server: &mut Server,
@@ -317,78 +411,6 @@ extern "C" fn modify_queue(inbound: u32, index: u32, settings: *const Settings) 
 }
 export!(219, modify_queue);
 
-/// An insert blob the server thread applies to `target` (a queue
-/// direction, or nothing for a redirect), and the index it reports.
-struct InsertRequest<T> {
-    target: T,
-    position: Position,
-    blob: [u8; CONFIG_CAPACITY],
-    length: usize,
-    /// What the helper stored; `None` when it did not run.
-    inserted: Option<InsertOutcome>,
-}
-
-/// Result of an insert helper, for the caller's index output.
-#[derive(Clone, Copy)]
-enum InsertOutcome {
-    Inserted(u32),
-    /// Stored as -1.
-    Failed,
-}
-
-impl<T> InsertRequest<T> {
-    fn new(target: T, index: u32) -> Self {
-        Self {
-            target,
-            position: Position::from_raw(index),
-            blob: [0; CONFIG_CAPACITY],
-            length: 0,
-            inserted: None,
-        }
-    }
-
-    /// Build the blob around the program compiled from `text` (0x91f8bdd0);
-    /// a null text or a constant true program adds none.
-    ///
-    /// # Safety
-    ///
-    /// `text` is null or a NUL-terminated string.
-    unsafe fn build(
-        &mut self,
-        text: *const c_char,
-        build: impl FnOnce(Option<Source<'_>>, &mut [u8; CONFIG_CAPACITY]) -> Result<usize, NetsimError>,
-    ) -> Result<(), NetsimError> {
-        // SAFETY: guaranteed by the caller.
-        let compiled = match unsafe { kernel::c_string(text.expose_provenance() as u32) } {
-            Some(text) => classifier::compile_text(text)?,
-            None => None,
-        };
-        self.length = build(compiled.as_ref().map(Source::Compiled), &mut self.blob)?;
-        Ok(())
-    }
-
-    /// Record the helper's outcome and return the mapped result word.
-    fn record(&mut self, result: Result<u32, NetsimError>) -> u32 {
-        self.inserted = Some(match result {
-            Ok(index) => InsertOutcome::Inserted(index),
-            Err(_) => InsertOutcome::Failed,
-        });
-        result.map_or_else(|error| reported(error).0, |_| Hresult::OK.0)
-    }
-
-    /// Store the outcome for the caller.
-    fn finish(self, result: Hresult, output: Option<&mut DwordOut>) -> Hresult {
-        if let Some(outcome) = self.inserted {
-            let index = match outcome {
-                InsertOutcome::Inserted(index) => index,
-                InsertOutcome::Failed => u32::MAX,
-            };
-            store(output, index);
-        }
-        result
-    }
-}
-
 /// Insert a queue from caller settings and classifier text (0x91f38570):
 /// validate, compile, build a blob with the type byte when `kind` is
 /// nonzero, then the `insertq` helper.
@@ -406,7 +428,9 @@ extern "C" fn insert_queue(
         Ok(config) => config,
         Err(error) => return Hresult::from(error),
     };
+
     let mut request = InsertRequest::new(direction(inbound), index);
+
     // SAFETY: the caller passes classifier text or null.
     if let Err(error) = unsafe {
         request.build(text, |program, blob| {
@@ -415,6 +439,7 @@ extern "C" fn insert_queue(
     } {
         return Hresult::from(error);
     }
+
     let result = on_server(
         &mut request,
         |server: &mut Server,
@@ -434,6 +459,7 @@ extern "C" fn insert_queue(
             request.record(result.map(|QueueIndex(index)| index))
         },
     );
+
     // SAFETY: the caller passes a writable dword or null.
     request.finish(result, unsafe { inserted_index.as_mut() })
 }
@@ -456,10 +482,12 @@ extern "C" fn insert_redirect(
     // Stock reads a null address as 0.0.0.0.
     // SAFETY: the caller passes readable addresses or null.
     let address = |pointer: *const Dword| unsafe { pointer.as_ref() }.copied().unwrap_or([0; 4]);
+
     // The session count is checked before it is narrowed to 16 bits.
     let Ok(sessions) = u16::try_from(sessions) else {
         return Hresult::from(NetsimError::Invalid);
     };
+
     let config = RedirectConfig {
         match_address: address(match_address),
         match_port: match_port as u16,
@@ -467,10 +495,13 @@ extern "C" fn insert_redirect(
         target_port: target_port as u16,
         sessions,
     };
+
     if let Err(error) = config.validate() {
         return Hresult::from(NetsimError::from(error));
     }
+
     let mut request = InsertRequest::new((), index);
+
     // SAFETY: the caller passes classifier text or null.
     if let Err(error) = unsafe {
         request.build(text, |program, blob| {
@@ -479,6 +510,7 @@ extern "C" fn insert_redirect(
     } {
         return Hresult::from(error);
     }
+
     let result = on_server(
         &mut request,
         |server: &mut Server,
@@ -497,6 +529,7 @@ extern "C" fn insert_redirect(
             request.record(result.map(|RedirectIndex(index)| index))
         },
     );
+
     // SAFETY: the caller passes a writable dword or null.
     request.finish(result, unsafe { inserted_index.as_mut() })
 }
@@ -518,6 +551,7 @@ extern "C" fn queue_stats(inbound: u32, index: u32, stats: *mut MaybeUninit<Stat
     } else {
         Err(NetsimError::NoInstance)
     };
+
     match result {
         Ok(counters) => {
             // SAFETY: the structure declares its full size, so it is
@@ -542,6 +576,7 @@ extern "C" fn queue_settings(
     if !super::netsim::simulator_exists() {
         return Hresult::from(NetsimError::NoInstance);
     }
+
     // SAFETY: the caller passes a settings structure, whose size dword is
     // readable, or null.
     if let Some(size) = unsafe { settings.cast::<Dword>().as_ref() }
@@ -549,6 +584,7 @@ extern "C" fn queue_settings(
     {
         return Hresult::from(NetsimError::Invalid);
     }
+
     // SAFETY: as in `queue_stats`.
     match unsafe { super::netsim::queue(direction(inbound), QueueIndex(index)) } {
         Ok(snapshot) => {
@@ -570,19 +606,16 @@ export!(222, queue_settings);
 extern "C" fn queue_counts(inbound: *mut DwordOut, outbound: *mut DwordOut) -> Hresult {
     // SAFETY: as in `queue_stats`.
     let (inbound_count, outbound_count) = unsafe { super::netsim::queue_counts() };
+
     // SAFETY: the caller passes writable dwords or null.
     unsafe {
         store(inbound.as_mut(), inbound_count);
         store(outbound.as_mut(), outbound_count);
     }
+
     Hresult::OK
 }
 export!(223, queue_counts);
-
-struct RemoveRedirects {
-    position: Position,
-    removed: Option<u32>,
-}
 
 /// Remove one or every redirect (0x91f38838 calling 0x91f37220);
 /// `removed` receives the count, 0 after a failure.
@@ -591,6 +624,7 @@ extern "C" fn remove_redirects(index: u32, removed: *mut DwordOut) -> Hresult {
         position: Position::from_raw(index),
         removed: None,
     };
+
     let result = on_server(
         &mut request,
         |server: &mut Server,
@@ -610,10 +644,12 @@ extern "C" fn remove_redirects(index: u32, removed: *mut DwordOut) -> Hresult {
             }
         },
     );
+
     if let Some(count) = request.removed {
         // SAFETY: the caller passes a writable dword or null.
         store(unsafe { removed.as_mut() }, count);
     }
+
     result
 }
 export!(225, remove_redirects);
@@ -625,6 +661,7 @@ extern "C" fn redirect_count(count: *mut DwordOut) -> Hresult {
     store(unsafe { count.as_mut() }, unsafe {
         super::netsim::redirect_count()
     });
+
     Hresult::OK
 }
 export!(226, redirect_count);

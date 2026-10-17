@@ -38,6 +38,8 @@ use super::system;
 use crate::kernel;
 use crate::net::XamNetwork;
 
+const REQUEST_SLOTS: usize = 4;
+
 /// Settings must be written (stock signals the server thread to run
 /// WriteIniFile).
 static SETTINGS_WRITE: AtomicBool = AtomicBool::new(false);
@@ -48,6 +50,7 @@ static KD_LITE_REFRESH: AtomicBool = AtomicBool::new(false);
 /// Code 0xa4 value: first-chance breakpoint and trace exceptions pass
 /// through without the debugger.
 static TRAP_PASSTHROUGH: AtomicU32 = AtomicU32::new(0);
+
 /// Mirrors of server state read by handlers. Each word stands alone, as
 /// stock's plain globals, so the accesses need no ordering.
 static KERNEL_DEBUGGER: AtomicBool = AtomicBool::new(true);
@@ -56,10 +59,31 @@ static DEBUGGER_ADDRESS: AtomicU32 = AtomicU32::new(0);
 static DEBUGGER_PORT: AtomicU32 = AtomicU32::new(0);
 static THREADS_STOPPED: AtomicBool = AtomicBool::new(false);
 
-/// Ask the server thread to write the settings file.
-pub(crate) fn request_settings_write() {
-    SETTINGS_WRITE.store(true, Ordering::Release);
-}
+static REQUESTS: [Request; REQUEST_SLOTS] = [const {
+    Request {
+        state: Handoff::new(),
+        service: AtomicPtr::new(core::ptr::null_mut()),
+        argument: AtomicPtr::new(core::ptr::null_mut()),
+        result: AtomicU32::new(0),
+        done: kernel::KernelEvent::new(),
+    }
+}; REQUEST_SLOTS];
+
+/// Thread object of the server thread, recorded at its first pass.
+static SERVER_THREAD: AtomicU32 = AtomicU32::new(0);
+/// The server stopped serving requests (control code 0x02 or unload).
+static STOPPED: AtomicBool = AtomicBool::new(false);
+/// Threads inside `call_on_server`; unload waits for them to leave.
+static CALLERS: AtomicU32 = AtomicU32::new(0);
+
+static STARTUP_HOST: StartupHost = StartupHost {
+    created: UnsafeCell::new(false),
+    server: UnsafeCell::new(Server::new()),
+    console: UnsafeCell::new(Console::new()),
+};
+static STARTUP_LOCK: kernel::CriticalSection = kernel::CriticalSection::new();
+/// The command loop owns the server state; requests are queued to it.
+static SERVING: AtomicBool = AtomicBool::new(false);
 
 /// The attached debugger as `debugger` recorded it (stock 0x91f9fef8: flag,
 /// address word, port).
@@ -67,18 +91,6 @@ pub(crate) struct PublishedDebugger {
     pub(crate) attached: u32,
     pub(crate) address: u32,
     pub(crate) port: u32,
-}
-
-pub(crate) fn published_debugger() -> PublishedDebugger {
-    PublishedDebugger {
-        attached: DEBUGGER_ATTACHED.load(Ordering::Relaxed),
-        address: DEBUGGER_ADDRESS.load(Ordering::Relaxed),
-        port: DEBUGGER_PORT.load(Ordering::Relaxed),
-    }
-}
-
-fn passive() -> bool {
-    processor::current_irql() == Irql::PASSIVE
 }
 
 /// A service run on the server thread with the server's state and the
@@ -89,12 +101,6 @@ pub(crate) type ServerService<T> = fn(&mut Server, &mut Console, &mut XamNetwork
 /// A [`ServerService`] whose return word is an HRESULT.
 pub(crate) type HresultService<T> =
     fn(&mut Server, &mut Console, &mut XamNetwork, &mut T) -> Hresult;
-
-/// [`ServerService`] with the request type erased, as the request slots
-/// carry it. `&mut T` and `NonNull<()>` are ABI-compatible arguments for a
-/// sized `T`, so a `ServerService<T>` may be called through this type with
-/// a pointer to a live `T`.
-type ErasedService = fn(&mut Server, &mut Console, &mut XamNetwork, NonNull<()>) -> u32;
 
 /// Where a request that a thread hands to the server thread stands. The
 /// poster claims a free request, fills it and posts it; the server takes
@@ -142,299 +148,6 @@ impl Handoff {
         self.0
             .compare_exchange(from as u32, to as u32, success, Ordering::Relaxed)
             .is_ok()
-    }
-}
-
-const REQUEST_SLOTS: usize = 4;
-
-/// Argument of control code 0x35: the thread to name and the address of
-/// the name.
-#[repr(C)]
-struct NameThreadRequest {
-    thread: u32,
-    name: u32,
-}
-
-/// A dispatcher request waiting for the server thread.
-struct Request {
-    state: Handoff,
-    /// An [`ErasedService`].
-    service: AtomicPtr<()>,
-    argument: AtomicPtr<()>,
-    result: AtomicU32,
-    done: kernel::KernelEvent,
-}
-
-static REQUESTS: [Request; REQUEST_SLOTS] = [const {
-    Request {
-        state: Handoff::new(),
-        service: AtomicPtr::new(core::ptr::null_mut()),
-        argument: AtomicPtr::new(core::ptr::null_mut()),
-        result: AtomicU32::new(0),
-        done: kernel::KernelEvent::new(),
-    }
-}; REQUEST_SLOTS];
-/// Thread object of the server thread, recorded at its first pass.
-static SERVER_THREAD: AtomicU32 = AtomicU32::new(0);
-/// The server stopped serving requests (control code 0x02 or unload).
-static STOPPED: AtomicBool = AtomicBool::new(false);
-/// Threads inside `call_on_server`; unload waits for them to leave.
-static CALLERS: AtomicU32 = AtomicU32::new(0);
-/// Interval at which a waiting caller checks whether the server stopped.
-const STOP_CHECK_INTERVAL: i64 = relative_interval(Duration::from_millis(100));
-
-/// Server state before the command loop owns it. Stock runs export and
-/// control-code work inline on the calling thread; until the loop starts,
-/// openxbdm does the same under `STARTUP_LOCK`, so callers that load during
-/// boot (system software that imports this module) never wait for a thread
-/// that is still starting the network. The state is a static built at
-/// compile time; the server thread's stack could not hold it.
-struct StartupHost {
-    /// Set by the server thread; callers before it see no state.
-    created: UnsafeCell<bool>,
-    server: UnsafeCell<Server>,
-    console: UnsafeCell<Console>,
-}
-
-// SAFETY: accessed only with `STARTUP_LOCK` held, or by the server thread
-// alone once `SERVING` is set.
-unsafe impl Sync for StartupHost {}
-
-static STARTUP_HOST: StartupHost = StartupHost {
-    created: UnsafeCell::new(false),
-    server: UnsafeCell::new(Server::new()),
-    console: UnsafeCell::new(Console::new()),
-};
-static STARTUP_LOCK: kernel::CriticalSection = kernel::CriticalSection::new();
-/// The command loop owns the server state; requests are queued to it.
-static SERVING: AtomicBool = AtomicBool::new(false);
-/// Longest wait of a caller for the startup lock, and its poll interval.
-const STARTUP_WAIT_MS: u32 = 5000;
-const STARTUP_POLL_MS: u32 = 10;
-
-/// Called once at module start, before any thread can call in.
-pub(crate) fn initialize_host() {
-    STARTUP_LOCK.initialize();
-}
-
-/// Make the server state available to callers.
-pub(crate) fn create_host() {
-    STARTUP_LOCK.enter();
-    // SAFETY: the lock is held.
-    unsafe { *STARTUP_HOST.created.get() = true };
-    STARTUP_LOCK.leave();
-}
-
-/// The server state once created.
-///
-/// # Safety
-///
-/// `STARTUP_LOCK` is held, or the caller is the server thread after it set
-/// `SERVING`; the references must not outlive that exclusivity.
-unsafe fn host() -> Option<(&'static mut Server, &'static mut Console)> {
-    // SAFETY: exclusivity per the contract.
-    unsafe {
-        (*STARTUP_HOST.created.get()).then(|| {
-            (
-                &mut *STARTUP_HOST.server.get(),
-                &mut *STARTUP_HOST.console.get(),
-            )
-        })
-    }
-}
-
-/// Run `operation` on the server state during startup.
-pub(crate) fn with_startup_host<R>(
-    operation: impl FnOnce(&mut Server, &mut Console) -> R,
-) -> Option<R> {
-    STARTUP_LOCK.enter();
-    // SAFETY: the lock is held and the loop does not own the state yet.
-    let result = match unsafe { host() } {
-        Some((server, console)) if !SERVING.load(Ordering::Acquire) => {
-            Some(operation(server, console))
-        }
-        _ => None,
-    };
-    STARTUP_LOCK.leave();
-    result
-}
-
-/// Hand the server state to the command loop.
-pub(crate) fn begin_serving() -> Option<(&'static mut Server, &'static mut Console)> {
-    STARTUP_LOCK.enter();
-    // SAFETY: the lock is held; after `SERVING` is set only the server
-    // thread touches the state, which lives as long as the module.
-    let result = unsafe { host() };
-    if result.is_some() {
-        SERVING.store(true, Ordering::Release);
-    }
-    STARTUP_LOCK.leave();
-    result
-}
-
-/// Run `service` with the server's state and `request` and return its
-/// result: inline while the command loop has not started, otherwise on the
-/// server thread. `None` on the server thread, above passive level, before
-/// the state exists, when the startup lock stays busy, or once the server
-/// stopped.
-///
-/// `T` is not bound by `Send`: requests carry raw addresses of caller
-/// records (`*mut` and `NonNull` fields) that the service dereferences
-/// under the poster's own contract. The poster waits in this call until
-/// the service returned, so one thread at a time uses the request, and the
-/// service is a plain `fn` that keeps nothing of it after the call. A
-/// request type must not depend on the thread that uses it (no
-/// thread-affine guards, no `Rc`).
-#[inline(always)]
-pub(crate) fn call_on_server_with<T>(request: &mut T, service: ServerService<T>) -> Option<u32> {
-    // SAFETY: `ServerService<T>` and `ErasedService` differ only in the
-    // request argument, which is ABI-compatible; the service is called with
-    // the address of `request`, which outlives the call.
-    let service = unsafe { core::mem::transmute::<ServerService<T>, ErasedService>(service) };
-    call_on_server(service, NonNull::from(request).cast())
-}
-
-/// [`call_on_server_with`] for a service that returns an HRESULT; the
-/// result word converts back to it here.
-#[inline(always)]
-pub(crate) fn call_hresult_service<T>(
-    request: &mut T,
-    service: HresultService<T>,
-) -> Option<Hresult> {
-    // SAFETY: `Hresult` is `#[repr(transparent)]` over `u32`, so the two
-    // function types differ only in an ABI-compatible return type.
-    let service = unsafe { core::mem::transmute::<HresultService<T>, ServerService<T>>(service) };
-    call_on_server_with(request, service).map(Hresult)
-}
-
-fn call_on_server(service: ErasedService, argument: NonNull<()>) -> Option<u32> {
-    CALLERS.fetch_add(1, Ordering::AcqRel);
-    let result = call_on_server_counted(service, argument);
-    CALLERS.fetch_sub(1, Ordering::AcqRel);
-    result
-}
-
-fn call_on_server_counted(service: ErasedService, argument: NonNull<()>) -> Option<u32> {
-    // The debugger backend records the server thread before startup work
-    // (settings, extension loads) that may call in; this module's copy is
-    // set only at the first pass.
-    let thread = current_thread();
-    let server = thread == SERVER_THREAD.load(Ordering::Acquire)
-        || monitor::server_thread().is_some_and(|server| server.get() == thread);
-    if !passive() || server || STOPPED.load(Ordering::Acquire) {
-        return None;
-    }
-    if !SERVING.load(Ordering::Acquire) {
-        let mut network = XamNetwork;
-        let mut waited_ms = 0;
-        // The server thread holds the lock while it loads the settings,
-        // which can load images; a caller inside the loader would then
-        // wait on the server while the server waits on the loader, so the
-        // wait is bounded.
-        loop {
-            if STARTUP_LOCK.try_enter() {
-                let serving = SERVING.load(Ordering::Acquire);
-                // SAFETY: the lock is held; the loop owns the state only
-                // once `SERVING` is set, which takes the lock.
-                let result = match unsafe { host() } {
-                    Some((server, console)) if !serving => {
-                        Some(service(server, console, &mut network, argument))
-                    }
-                    _ => None,
-                };
-                STARTUP_LOCK.leave();
-                if !serving {
-                    return result;
-                }
-                break;
-            }
-            if SERVING.load(Ordering::Acquire) {
-                break;
-            }
-            if waited_ms >= STARTUP_WAIT_MS {
-                return None;
-            }
-            sleep(Duration::from_millis(u64::from(STARTUP_POLL_MS)));
-            waited_ms += STARTUP_POLL_MS;
-        }
-    }
-    let request = loop {
-        if STOPPED.load(Ordering::Acquire) {
-            return None;
-        }
-        if let Some(request) = REQUESTS.iter().find(|request| {
-            request
-                .state
-                .transition(HandoffState::Free, HandoffState::Filling, Ordering::Acquire)
-        }) {
-            break request;
-        }
-        sleep(Duration::from_millis(1));
-    };
-    request.done.initialize();
-    request.service.store(service as *mut (), Ordering::Relaxed);
-    request.argument.store(argument.as_ptr(), Ordering::Relaxed);
-    request.state.store(HandoffState::Posted, Ordering::Release);
-    while !request.state.is(HandoffState::Completed, Ordering::Acquire) {
-        // SAFETY: `done` was initialized above and lives in a static slot.
-        unsafe {
-            xboxkrnl::KeWaitForSingleObject(
-                request.done.pointer().cast(),
-                WaitReason::Executive,
-                ProcessorMode::Kernel,
-                false,
-                &STOP_CHECK_INTERVAL,
-            )
-        };
-        let released = STOPPED.load(Ordering::Acquire);
-        if released
-            && request
-                .state
-                .transition(HandoffState::Posted, HandoffState::Free, Ordering::AcqRel)
-        {
-            return None;
-        }
-    }
-    let result = request.result.load(Ordering::Relaxed);
-    request.state.store(HandoffState::Free, Ordering::Release);
-    Some(result)
-}
-
-/// The server thread is about to exit; later requests fail.
-pub(crate) fn stop_serving() {
-    STOPPED.store(true, Ordering::Release);
-}
-
-/// Wait until no thread runs in `call_on_server`; call after
-/// [`stop_serving`] before the image unloads.
-pub(crate) fn wait_for_callers() {
-    while CALLERS.load(Ordering::Acquire) != 0 {
-        sleep(Duration::from_millis(10));
-    }
-}
-
-fn serve_requests(server: &mut Server, console: &mut Console, network: &mut XamNetwork) {
-    SERVER_THREAD.store(current_thread(), Ordering::Release);
-    for request in &REQUESTS {
-        if !request
-            .state
-            .transition(HandoffState::Posted, HandoffState::Taken, Ordering::AcqRel)
-        {
-            continue;
-        }
-        // SAFETY: the poster stored an `ErasedService` function pointer.
-        let service = unsafe {
-            core::mem::transmute::<*mut (), ErasedService>(request.service.load(Ordering::Relaxed))
-        };
-        // SAFETY: the poster stored a pointer to its request, which it keeps
-        // alive and untouched until the state reads completed.
-        let argument = unsafe { NonNull::new_unchecked(request.argument.load(Ordering::Relaxed)) };
-        let result = service(server, console, network, argument);
-        request.result.store(result, Ordering::Relaxed);
-        request
-            .state
-            .store(HandoffState::Completed, Ordering::Release);
-        request.done.set();
     }
 }
 
@@ -557,6 +270,324 @@ impl ControlCode {
     }
 }
 
+/// [`ServerService`] with the request type erased, as the request slots
+/// carry it. `&mut T` and `NonNull<()>` are ABI-compatible arguments for a
+/// sized `T`, so a `ServerService<T>` may be called through this type with
+/// a pointer to a live `T`.
+type ErasedService = fn(&mut Server, &mut Console, &mut XamNetwork, NonNull<()>) -> u32;
+
+/// Argument of control code 0x35: the thread to name and the address of
+/// the name.
+#[repr(C)]
+struct NameThreadRequest {
+    thread: u32,
+    name: u32,
+}
+
+/// A dispatcher request waiting for the server thread.
+struct Request {
+    state: Handoff,
+    /// An [`ErasedService`].
+    service: AtomicPtr<()>,
+    argument: AtomicPtr<()>,
+    result: AtomicU32,
+    done: kernel::KernelEvent,
+}
+
+/// Server state before the command loop owns it. Stock runs export and
+/// control-code work inline on the calling thread; until the loop starts,
+/// openxbdm does the same under `STARTUP_LOCK`, so callers that load during
+/// boot (system software that imports this module) never wait for a thread
+/// that is still starting the network. The state is a static built at
+/// compile time; the server thread's stack could not hold it.
+struct StartupHost {
+    /// Set by the server thread; callers before it see no state.
+    created: UnsafeCell<bool>,
+    server: UnsafeCell<Server>,
+    console: UnsafeCell<Console>,
+}
+
+// SAFETY: accessed only with `STARTUP_LOCK` held, or by the server thread
+// alone once `SERVING` is set.
+unsafe impl Sync for StartupHost {}
+
+/// Ask the server thread to write the settings file.
+pub(crate) fn request_settings_write() {
+    SETTINGS_WRITE.store(true, Ordering::Release);
+}
+
+pub(crate) fn published_debugger() -> PublishedDebugger {
+    PublishedDebugger {
+        attached: DEBUGGER_ATTACHED.load(Ordering::Relaxed),
+        address: DEBUGGER_ADDRESS.load(Ordering::Relaxed),
+        port: DEBUGGER_PORT.load(Ordering::Relaxed),
+    }
+}
+
+fn passive() -> bool {
+    processor::current_irql() == Irql::PASSIVE
+}
+
+/// Called once at module start, before any thread can call in.
+pub(crate) fn initialize_host() {
+    STARTUP_LOCK.initialize();
+}
+
+/// Make the server state available to callers.
+pub(crate) fn create_host() {
+    STARTUP_LOCK.enter();
+
+    // SAFETY: the lock is held.
+    unsafe { *STARTUP_HOST.created.get() = true };
+
+    STARTUP_LOCK.leave();
+}
+
+/// The server state once created.
+///
+/// # Safety
+///
+/// `STARTUP_LOCK` is held, or the caller is the server thread after it set
+/// `SERVING`; the references must not outlive that exclusivity.
+unsafe fn host() -> Option<(&'static mut Server, &'static mut Console)> {
+    // SAFETY: exclusivity per the contract.
+    unsafe {
+        (*STARTUP_HOST.created.get()).then(|| {
+            (
+                &mut *STARTUP_HOST.server.get(),
+                &mut *STARTUP_HOST.console.get(),
+            )
+        })
+    }
+}
+
+/// Run `operation` on the server state during startup.
+pub(crate) fn with_startup_host<R>(
+    operation: impl FnOnce(&mut Server, &mut Console) -> R,
+) -> Option<R> {
+    STARTUP_LOCK.enter();
+
+    // SAFETY: the lock is held and the loop does not own the state yet.
+    let result = match unsafe { host() } {
+        Some((server, console)) if !SERVING.load(Ordering::Acquire) => {
+            Some(operation(server, console))
+        }
+        _ => None,
+    };
+
+    STARTUP_LOCK.leave();
+
+    result
+}
+
+/// Hand the server state to the command loop.
+pub(crate) fn begin_serving() -> Option<(&'static mut Server, &'static mut Console)> {
+    STARTUP_LOCK.enter();
+
+    // SAFETY: the lock is held; after `SERVING` is set only the server
+    // thread touches the state, which lives as long as the module.
+    let result = unsafe { host() };
+    if result.is_some() {
+        SERVING.store(true, Ordering::Release);
+    }
+
+    STARTUP_LOCK.leave();
+
+    result
+}
+
+/// Run `service` with the server's state and `request` and return its
+/// result: inline while the command loop has not started, otherwise on the
+/// server thread. `None` on the server thread, above passive level, before
+/// the state exists, when the startup lock stays busy, or once the server
+/// stopped.
+///
+/// `T` is not bound by `Send`: requests carry raw addresses of caller
+/// records (`*mut` and `NonNull` fields) that the service dereferences
+/// under the poster's own contract. The poster waits in this call until
+/// the service returned, so one thread at a time uses the request, and the
+/// service is a plain `fn` that keeps nothing of it after the call. A
+/// request type must not depend on the thread that uses it (no
+/// thread-affine guards, no `Rc`).
+#[inline(always)]
+pub(crate) fn call_on_server_with<T>(request: &mut T, service: ServerService<T>) -> Option<u32> {
+    // SAFETY: `ServerService<T>` and `ErasedService` differ only in the
+    // request argument, which is ABI-compatible; the service is called with
+    // the address of `request`, which outlives the call.
+    let service = unsafe { core::mem::transmute::<ServerService<T>, ErasedService>(service) };
+
+    call_on_server(service, NonNull::from(request).cast())
+}
+
+/// [`call_on_server_with`] for a service that returns an HRESULT; the
+/// result word converts back to it here.
+#[inline(always)]
+pub(crate) fn call_hresult_service<T>(
+    request: &mut T,
+    service: HresultService<T>,
+) -> Option<Hresult> {
+    // SAFETY: `Hresult` is `#[repr(transparent)]` over `u32`, so the two
+    // function types differ only in an ABI-compatible return type.
+    let service = unsafe { core::mem::transmute::<HresultService<T>, ServerService<T>>(service) };
+
+    call_on_server_with(request, service).map(Hresult)
+}
+
+fn call_on_server(service: ErasedService, argument: NonNull<()>) -> Option<u32> {
+    CALLERS.fetch_add(1, Ordering::AcqRel);
+    let result = call_on_server_counted(service, argument);
+    CALLERS.fetch_sub(1, Ordering::AcqRel);
+
+    result
+}
+
+fn call_on_server_counted(service: ErasedService, argument: NonNull<()>) -> Option<u32> {
+    /// Longest wait of a caller for the startup lock, and its poll interval.
+    const STARTUP_WAIT_MS: u32 = 5000;
+    const STARTUP_POLL_MS: u32 = 10;
+    /// Interval at which a waiting caller checks whether the server stopped.
+    const STOP_CHECK_INTERVAL: i64 = relative_interval(Duration::from_millis(100));
+
+    // The debugger backend records the server thread before startup work
+    // (settings, extension loads) that may call in; this module's copy is
+    // set only at the first pass.
+    let thread = current_thread();
+    let on_server_thread = thread == SERVER_THREAD.load(Ordering::Acquire)
+        || monitor::server_thread().is_some_and(|recorded| recorded.get() == thread);
+    if !passive() || on_server_thread || STOPPED.load(Ordering::Acquire) {
+        return None;
+    }
+
+    if !SERVING.load(Ordering::Acquire) {
+        let mut network = XamNetwork;
+        let mut waited_ms = 0;
+
+        // The server thread holds the lock while it loads the settings,
+        // which can load images; a caller inside the loader would then
+        // wait on the server while the server waits on the loader, so the
+        // wait is bounded.
+        loop {
+            if !STARTUP_LOCK.try_enter() {
+                if SERVING.load(Ordering::Acquire) {
+                    break;
+                }
+                if waited_ms >= STARTUP_WAIT_MS {
+                    return None;
+                }
+
+                sleep(Duration::from_millis(u64::from(STARTUP_POLL_MS)));
+                waited_ms += STARTUP_POLL_MS;
+                continue;
+            }
+
+            let serving = SERVING.load(Ordering::Acquire);
+            // SAFETY: the lock is held; the loop owns the state only once
+            // `SERVING` is set, which takes the lock.
+            let result = match unsafe { host() } {
+                Some((server, console)) if !serving => {
+                    Some(service(server, console, &mut network, argument))
+                }
+                _ => None,
+            };
+            STARTUP_LOCK.leave();
+            if serving {
+                break;
+            }
+
+            return result;
+        }
+    }
+
+    let request = loop {
+        if STOPPED.load(Ordering::Acquire) {
+            return None;
+        }
+
+        if let Some(request) = REQUESTS.iter().find(|request| {
+            request
+                .state
+                .transition(HandoffState::Free, HandoffState::Filling, Ordering::Acquire)
+        }) {
+            break request;
+        }
+
+        sleep(Duration::from_millis(1));
+    };
+
+    request.done.initialize();
+    request.service.store(service as *mut (), Ordering::Relaxed);
+    request.argument.store(argument.as_ptr(), Ordering::Relaxed);
+    request.state.store(HandoffState::Posted, Ordering::Release);
+
+    while !request.state.is(HandoffState::Completed, Ordering::Acquire) {
+        // SAFETY: `done` was initialized above and lives in a static slot.
+        unsafe {
+            xboxkrnl::KeWaitForSingleObject(
+                request.done.pointer().cast(),
+                WaitReason::Executive,
+                ProcessorMode::Kernel,
+                false,
+                &STOP_CHECK_INTERVAL,
+            )
+        };
+
+        let stopped = STOPPED.load(Ordering::Acquire);
+        if stopped
+            && request
+                .state
+                .transition(HandoffState::Posted, HandoffState::Free, Ordering::AcqRel)
+        {
+            return None;
+        }
+    }
+
+    let result = request.result.load(Ordering::Relaxed);
+    request.state.store(HandoffState::Free, Ordering::Release);
+
+    Some(result)
+}
+
+/// The server thread is about to exit; later requests fail.
+pub(crate) fn stop_serving() {
+    STOPPED.store(true, Ordering::Release);
+}
+
+/// Wait until no thread runs in `call_on_server`; call after
+/// [`stop_serving`] before the image unloads.
+pub(crate) fn wait_for_callers() {
+    while CALLERS.load(Ordering::Acquire) != 0 {
+        sleep(Duration::from_millis(10));
+    }
+}
+
+fn serve_requests(server: &mut Server, console: &mut Console, network: &mut XamNetwork) {
+    SERVER_THREAD.store(current_thread(), Ordering::Release);
+
+    for request in &REQUESTS {
+        if !request
+            .state
+            .transition(HandoffState::Posted, HandoffState::Taken, Ordering::AcqRel)
+        {
+            continue;
+        }
+
+        // SAFETY: the poster stored an `ErasedService` function pointer.
+        let service = unsafe {
+            core::mem::transmute::<*mut (), ErasedService>(request.service.load(Ordering::Relaxed))
+        };
+        // SAFETY: the poster stored a pointer to its request, which it keeps
+        // alive and untouched until the state reads completed.
+        let argument = unsafe { NonNull::new_unchecked(request.argument.load(Ordering::Relaxed)) };
+        let result = service(server, console, network, argument);
+
+        request.result.store(result, Ordering::Relaxed);
+        request
+            .state
+            .store(HandoffState::Completed, Ordering::Release);
+        request.done.set();
+    }
+}
+
 /// Run one control code from this module and pass the result through the
 /// extension hook, as stock's calls through the data block do.
 ///
@@ -568,6 +599,7 @@ pub(crate) unsafe fn dispatch(code: ControlCode, argument: u32) -> u32 {
     let stack: u32;
     // SAFETY: reads r1.
     unsafe { core::arch::asm!("mr {0}, 1", out(reg) stack) };
+
     // SAFETY: the caller's contract.
     unsafe { dispatch_with_stack(code.raw(), argument, stack) }
 }
@@ -588,6 +620,7 @@ unsafe extern "C" fn dispatch_entry() {
 /// under the same contract.
 unsafe extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: u32) -> u32 {
     use ControlCode as C;
+
     let code = ControlCode(code);
     let result = match code {
         C::BREAK_IN_POLL => {
@@ -596,6 +629,7 @@ unsafe extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: 
             if THREADS_STOPPED.load(Ordering::Relaxed) {
                 BREAK_IN.store(true, Ordering::Release);
             }
+
             0
         }
         C::PREPARE_REBOOT => {
@@ -628,9 +662,9 @@ unsafe extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: 
         C::WIPE_SETTINGS => system::service_wipe_settings(argument),
         C::GET_MODULE_PROC_ADDRESS => unsafe { memory::service_get_module_proc_address(argument) },
         C::BREAK_ALLOWED => {
-            let kd = KERNEL_DEBUGGER.load(Ordering::Relaxed)
+            let kernel_debugger = KERNEL_DEBUGGER.load(Ordering::Relaxed)
                 && hardware_flags().contains(HardwareFlags::KERNEL_DEBUGGER);
-            u32::from(passive() || kd)
+            u32::from(passive() || kernel_debugger)
         }
         C::REGISTER_PIX_PROCESSOR => unsafe { session::service_register_pix_processor(argument) },
         C::WRITE_SETTINGS_COPY => unsafe { system::service_write_settings_copy(argument) },
@@ -646,6 +680,7 @@ unsafe extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: 
         C::GET_DEBUG_NAME => unsafe { console::service_get_debug_name(argument) },
         C::NAME_CURRENT_THREAD => {
             unsafe { monitor::name_thread(None, argument) };
+
             0
         }
         C::NAME_THREAD => {
@@ -656,6 +691,7 @@ unsafe extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: 
                 let request = kernel::object_at::<NameThreadRequest>(argument);
                 monitor::name_thread(Some(debugger::ThreadId(request.thread)), request.name);
             }
+
             0
         }
         C::ODD_READ_START => unsafe { hardware::service_odd_read_start(argument) },
@@ -677,9 +713,10 @@ unsafe extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: 
         C::RPC_DRAIN => unsafe { session::service_rpc_drain(argument) },
         C::SEND_NOTIFICATION => unsafe { session::service_send_notification(argument) },
         C::REFRESH_KD_LITE => {
-            if hardware_flags().contains(xboxkrnl::HardwareFlags::TEST_KIT) {
+            if hardware_flags().contains(HardwareFlags::TEST_KIT) {
                 KD_LITE_REFRESH.store(true, Ordering::Release);
             }
+
             0
         }
         C::LAUNCH_OVERRIDE => unsafe { system::service_launch_override(argument) },
@@ -707,6 +744,7 @@ unsafe extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: 
         },
         C::SET_TRAP_PASSTHROUGH => {
             TRAP_PASSTHROUGH.store(u32::from(argument != 0), Ordering::Relaxed);
+
             0
         }
         C::HTTP_PROXY_ACQUIRE => unsafe {
@@ -722,6 +760,7 @@ unsafe extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: 
         // monitor's default exit unless they are performance or PIX codes.
         _ => unsafe { super::performance::service(code, argument) }.unwrap_or(0),
     };
+
     monitor::tell_extension(code, argument, result)
 }
 
@@ -739,9 +778,11 @@ pub(crate) fn install() {
 /// handlers read.
 pub(crate) fn drain(server: &mut Server, console: &mut Console, network: &mut XamNetwork) {
     server.state.debugger.trap_passthrough = TRAP_PASSTHROUGH.load(Ordering::Relaxed) != 0;
+
     if KD_LITE_REFRESH.swap(false, Ordering::AcqRel) {
         debugger::refresh_kd_lite(&mut server.state, console);
     }
+
     if BREAK_IN.swap(false, Ordering::AcqRel) {
         let flags = &kernel::hardware_info().flags;
         // SAFETY: the monitor sets the kernel debugger bit on a break-in, as
@@ -754,25 +795,29 @@ pub(crate) fn drain(server: &mut Server, console: &mut Console, network: &mut Xa
         };
         debugger::break_in(&mut server.state, console, network);
     }
+
     // The server's timer pass writes dirty settings.
     if SETTINGS_WRITE.swap(false, Ordering::AcqRel) {
         server.state.settings_dirty = true;
     }
+
     if session::take_title_terminated() {
         server.title_terminated(console, network);
     }
+
     // Texts a requester posted before its request go out first.
     server.drain_posted_notifications(console, network);
     monitor::apply_pending_stop_on(&mut server.state);
     serve_requests(server, console, network);
     super::dvd_hotplug::drain(server, console);
+
     let state = &server.state.debugger;
     // Without a persisted setting the boot-time kernel debugger flag
     // applies, as the server's own default.
-    let kd = state
+    let kernel_debugger = state
         .kernel_debugger
         .unwrap_or(hardware_flags().contains(HardwareFlags::KERNEL_DEBUGGER_ENABLED));
-    KERNEL_DEBUGGER.store(kd, Ordering::Relaxed);
+    KERNEL_DEBUGGER.store(kernel_debugger, Ordering::Relaxed);
     DEBUGGER_ADDRESS.store(state.debugger.address, Ordering::Relaxed);
     DEBUGGER_PORT.store(state.debugger.port, Ordering::Relaxed);
     DEBUGGER_ATTACHED.store(u32::from(state.debugger.attached), Ordering::Relaxed);

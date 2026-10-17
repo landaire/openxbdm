@@ -222,17 +222,16 @@ unsafe extern "C" {
     static openxbdm_detour_trampolines: u32;
 }
 
-fn trampolines() -> u32 {
-    &raw const openxbdm_detour_trampolines as usize as u32
-}
-
-fn entry_stub() -> u32 {
-    &raw const openxbdm_detour_entry as usize as u32
-}
+/// Stock passes a positive (absolute, already past) timeout, so these
+/// waits return at once.
+const ELAPSED_TIMEOUT: i64 = 1_000_000;
+/// Bytes of an object path the log name translates to.
+const LOG_PATH_CAPACITY: usize = 0x141;
 
 const _: () = assert!(detour::ENTRY_COUNT * detour::TRAMPOLINE_SIZE == 0x3ff0 * 4);
 
 static ENGINE: Engine = Engine::new();
+
 /// A record returned to the pool (0x91f9f4c8).
 static RECORD_FREED: KernelEvent = KernelEvent::new();
 /// A record queued for the writer (0x91f9f4d8).
@@ -244,25 +243,15 @@ static COMPLETION_WORK: KernelEvent = KernelEvent::new();
 /// The completion worker must exit (0x91f9f318).
 static COMPLETION_STOP: KernelEvent = KernelEvent::new();
 static COMPLETION_LOCK: CriticalSection = CriticalSection::new();
+
 /// Thread object of the completion worker (0x91f9e4c8).
 static COMPLETION_THREAD: HandleSlot = HandleSlot::new();
 static WRITE_HANDLE: HandleSlot = HandleSlot::new();
 static READ_HANDLE: HandleSlot = HandleSlot::new();
 static LOG_PATH: LogPath = LogPath(UnsafeCell::new(None));
+
 /// Record pool storage, obtained at the first start and kept; 0 before.
 static RECORDS: AtomicU32 = AtomicU32::new(0);
-
-/// Stock passes a positive (absolute, already past) timeout, so these
-/// waits return at once.
-const ELAPSED_TIMEOUT: i64 = 1_000_000;
-const COMPLETION_POLL: i64 = relative_interval(Duration::from_millis(
-    detour::COMPLETION_POLL_MILLISECONDS as u64,
-));
-const WORKER_STACK_SIZE: u32 = 0x8000;
-const WORKER_FLAGS: ThreadCreationFlags =
-    kernel::SYSTEM_THREAD_FLAGS.union(ThreadCreationFlags::EXEMPT_FROM_STOPS);
-/// Bytes of an object path the log name translates to.
-const LOG_PATH_CAPACITY: usize = 0x141;
 
 /// A kernel handle or object pointer that may be absent.
 struct HandleSlot {
@@ -292,6 +281,7 @@ impl HandleSlot {
     fn take(&self) -> Option<u32> {
         let handle = self.get();
         self.open.store(false, Ordering::Release);
+
         handle
     }
 }
@@ -330,6 +320,7 @@ impl detour::Platform for ConsolePlatform {
         } else {
             relative_interval(Duration::from_millis(milliseconds as u64))
         };
+
         // SAFETY: `interval` is a live local.
         unsafe { xboxkrnl::KeDelayExecutionThread(ProcessorMode::User, false, &interval) };
     }
@@ -352,6 +343,7 @@ impl detour::Platform for ConsolePlatform {
         if base == 0 {
             return None;
         }
+
         // SAFETY: the pool block holds the storage, is aligned for words,
         // and is never freed.
         Some(unsafe {
@@ -367,6 +359,7 @@ impl detour::Platform for ConsolePlatform {
         if RECORDS.load(Ordering::Acquire) != 0 {
             return true;
         }
+
         // SAFETY: pool allocation has no pointer arguments.
         let base = unsafe {
             xboxkrnl::ExAllocatePoolTypeWithTag(
@@ -376,6 +369,7 @@ impl detour::Platform for ConsolePlatform {
             )
         };
         RECORDS.store(base, Ordering::Release);
+
         base != 0
     }
 
@@ -423,6 +417,7 @@ impl detour::Platform for ConsolePlatform {
         let mut object = 0u32;
         // SAFETY: `object` is a live local; the kernel validates the handle.
         unsafe { xboxkrnl::ObReferenceObjectByHandle(Handle::from_raw(handle), 0, &mut object) };
+
         (object != 0).then_some(object)
     }
 
@@ -448,53 +443,6 @@ impl detour::Platform for ConsolePlatform {
     }
 }
 
-/// Module init (0x91f2c458): link the entry table and write `li r12, id`
-/// and a branch to the entry stub at the start of every trampoline.
-pub(crate) fn initialize() {
-    /// `li r12, 0`; the entry id goes in the low half.
-    const LOAD_ENTRY_ID: u32 = 0x3980_0000;
-    /// `b 0`; the word offset goes in the masked bits.
-    const BRANCH: u32 = 0x4800_0000;
-    const BRANCH_OFFSET_MASK: u32 = 0x03ff_fffc;
-    ENGINE.initialize();
-    RECORD_FREED.initialize();
-    RECORD_QUEUED.initialize();
-    WRITER_DONE.initialize();
-    WRITER_DONE.set();
-    COMPLETION_WORK.initialize();
-    COMPLETION_STOP.initialize();
-    COMPLETION_LOCK.initialize();
-    let entry = entry_stub();
-    for id in 0..detour::ENTRY_COUNT {
-        let trampoline = trampolines() + id * detour::TRAMPOLINE_SIZE;
-        write_code_word(trampoline, LOAD_ENTRY_ID | id);
-        write_code_word(
-            trampoline + 4,
-            BRANCH | (entry.wrapping_sub(trampoline + 4) & BRANCH_OFFSET_MASK),
-        );
-    }
-}
-
-/// Write an instruction word of this module's code section through a
-/// writable debugger mapping.
-fn write_code_word(address: u32, value: u32) {
-    let mut context = [0u32; super::WRITE_CONTEXT_WORDS];
-    // SAFETY: `context` is a live local of the size the kernel fills.
-    let mapped = unsafe { xboxkrnl::MmDbgWriteCheck(address, context.as_mut_ptr()) };
-    if mapped == 0 {
-        return;
-    }
-    let pointer = mapped as usize as *mut u32;
-    // SAFETY: the kernel mapped the aligned code word writable for the
-    // debugger; `mapped` and `context` come from `MmDbgWriteCheck` above.
-    // The sweep takes the pointer, so the store is kept before it.
-    unsafe {
-        pointer.write(value);
-        xboxkrnl::KeSweepIcacheRange(pointer.cast(), 4);
-        xboxkrnl::MmDbgReleaseAddress(mapped, context.as_mut_ptr());
-    }
-}
-
 /// The entry stub's locals (stub frame + 0x50) in the title's stack, up to
 /// the last field the logger uses. Stock accesses them without assuming
 /// alignment.
@@ -510,22 +458,11 @@ struct StubLocals {
     overlapped: u32,
 }
 
-const _: () = {
-    use core::mem::offset_of;
-    assert!(offset_of!(StubLocals, hook) == CallContext::HOOK as usize);
-    assert!(offset_of!(StubLocals, sequence) == CallContext::SEQUENCE as usize);
-    assert!(offset_of!(StubLocals, flags) == CallContext::FLAGS as usize);
-    assert!(offset_of!(StubLocals, param_size) == CallContext::PARAM_SIZE as usize);
-    assert!(offset_of!(StubLocals, function) == CallContext::FUNCTION as usize);
-    assert!(offset_of!(StubLocals, return_value) == CallContext::RETURN_VALUE as usize);
-    assert!(offset_of!(StubLocals, registers) == CallContext::REGISTERS as usize);
-    assert!(offset_of!(StubLocals, overlapped) == CallContext::OVERLAPPED as usize);
-};
-
 impl StubLocals {
     /// The engine's view of the locals at `address`.
     fn context(&self, address: u32) -> CallContext {
         let optional = |value: u32| (value != 0).then_some(value);
+
         CallContext {
             address,
             hook: self.hook,
@@ -551,6 +488,19 @@ impl StubLocals {
     }
 }
 
+const _: () = {
+    use core::mem::offset_of;
+
+    assert!(offset_of!(StubLocals, hook) == CallContext::HOOK as usize);
+    assert!(offset_of!(StubLocals, sequence) == CallContext::SEQUENCE as usize);
+    assert!(offset_of!(StubLocals, flags) == CallContext::FLAGS as usize);
+    assert!(offset_of!(StubLocals, param_size) == CallContext::PARAM_SIZE as usize);
+    assert!(offset_of!(StubLocals, function) == CallContext::FUNCTION as usize);
+    assert!(offset_of!(StubLocals, return_value) == CallContext::RETURN_VALUE as usize);
+    assert!(offset_of!(StubLocals, registers) == CallContext::REGISTERS as usize);
+    assert!(offset_of!(StubLocals, overlapped) == CallContext::OVERLAPPED as usize);
+};
+
 /// Notification codes the stubs pass to the logger.
 mod notification {
     /// Entry, with the stack parameters.
@@ -563,6 +513,65 @@ mod notification {
     pub(super) const EXIT: u32 = 3;
 }
 
+fn trampolines() -> u32 {
+    &raw const openxbdm_detour_trampolines as usize as u32
+}
+
+fn entry_stub() -> u32 {
+    &raw const openxbdm_detour_entry as usize as u32
+}
+
+/// Module init (0x91f2c458): link the entry table and write `li r12, id`
+/// and a branch to the entry stub at the start of every trampoline.
+pub(crate) fn initialize() {
+    /// `li r12, 0`; the entry id goes in the low half.
+    const LOAD_ENTRY_ID: u32 = 0x3980_0000;
+    /// `b 0`; the word offset goes in the masked bits.
+    const BRANCH: u32 = 0x4800_0000;
+    const BRANCH_OFFSET_MASK: u32 = 0x03ff_fffc;
+
+    ENGINE.initialize();
+    RECORD_FREED.initialize();
+    RECORD_QUEUED.initialize();
+    WRITER_DONE.initialize();
+    WRITER_DONE.set();
+    COMPLETION_WORK.initialize();
+    COMPLETION_STOP.initialize();
+    COMPLETION_LOCK.initialize();
+
+    let entry = entry_stub();
+
+    for id in 0..detour::ENTRY_COUNT {
+        let trampoline = trampolines() + id * detour::TRAMPOLINE_SIZE;
+        write_code_word(trampoline, LOAD_ENTRY_ID | id);
+        write_code_word(
+            trampoline + 4,
+            BRANCH | (entry.wrapping_sub(trampoline + 4) & BRANCH_OFFSET_MASK),
+        );
+    }
+}
+
+/// Write an instruction word of this module's code section through a
+/// writable debugger mapping.
+fn write_code_word(address: u32, value: u32) {
+    let mut context = [0u32; super::WRITE_CONTEXT_WORDS];
+    // SAFETY: `context` is a live local of the size the kernel fills.
+    let mapped = unsafe { xboxkrnl::MmDbgWriteCheck(address, context.as_mut_ptr()) };
+    if mapped == 0 {
+        return;
+    }
+
+    let pointer = mapped as usize as *mut u32;
+    // SAFETY: the kernel mapped the aligned code word writable for the
+    // debugger; `mapped` and `context` come from `MmDbgWriteCheck` above.
+    // The sweep takes the pointer, so the store is kept before it.
+    unsafe {
+        pointer.write(value);
+        xboxkrnl::KeSweepIcacheRange(pointer.cast(), 4);
+        xboxkrnl::MmDbgReleaseAddress(mapped, context.as_mut_ptr());
+    }
+}
+
 /// Logger entry from the stubs (0x91f2c6d0): `context` is the stub
 /// locals, `area` the stack parameters (notification 0) or a register save
 /// area (1, 2).
@@ -572,6 +581,7 @@ extern "C" fn openxbdm_detour_notify_rust(context: u32, area: u32, notify: u32) 
     // SAFETY: the stubs pass the address of their locals, which stay live
     // on the calling thread's stack for this call.
     let mut call = unsafe { &*locals }.context(context);
+
     // SAFETY: the stubs pass their locals and, per notification, the hooked
     // call's stack parameters or the save area they filled, all live on
     // the calling thread's stack during this call. What the entry's
@@ -588,6 +598,7 @@ extern "C" fn openxbdm_detour_notify_rust(context: u32, area: u32, notify: u32) 
             _ => return,
         }
     }
+
     // SAFETY: as above; the engine's accesses to the locals have ended.
     unsafe { &mut *locals }.store(&call);
 }
@@ -599,6 +610,10 @@ pub(super) fn with_engine(operation: &mut dyn FnMut(&Engine, &dyn detour::Platfo
 
 /// Create the writer and completion workers (0x91f2d378).
 pub(super) fn start(log: Option<&[u8]>) -> Result<(), KernelError> {
+    const WORKER_STACK_SIZE: u32 = 0x8000;
+    const WORKER_FLAGS: ThreadCreationFlags =
+        kernel::SYSTEM_THREAD_FLAGS.union(ThreadCreationFlags::EXEMPT_FROM_STOPS);
+
     // SAFETY: no writer runs while the engine is starting.
     let stored = unsafe { &mut *LOG_PATH.0.get() };
     *stored = None;
@@ -607,12 +622,14 @@ pub(super) fn start(log: Option<&[u8]>) -> Result<(), KernelError> {
         let (bytes, _) = stored.insert(([0; LOG_PATH_CAPACITY], length));
         bytes[..length].copy_from_slice(&log[..length]);
     }
+
     let mut writer = 0u32;
     let mut completion = 0u32;
     // SAFETY: the thread entries are functions of this module and the
     // handle outputs are live locals.
     unsafe {
         WRITER_DONE.reset();
+
         let created = xboxkrnl::ExCreateThread(
             &mut writer,
             WORKER_STACK_SIZE,
@@ -623,6 +640,7 @@ pub(super) fn start(log: Option<&[u8]>) -> Result<(), KernelError> {
             WORKER_FLAGS,
         );
         created.result()?;
+
         let created = xboxkrnl::ExCreateThread(
             &mut completion,
             WORKER_STACK_SIZE,
@@ -635,6 +653,7 @@ pub(super) fn start(log: Option<&[u8]>) -> Result<(), KernelError> {
         created.result()?;
     }
     COMPLETION_THREAD.set(completion);
+
     Ok(())
 }
 
@@ -643,6 +662,7 @@ pub(super) fn stop(log: Option<&[u8]>) {
     // SAFETY: `RECORD_QUEUED` is a static event initialized by `initialize`.
     unsafe { xboxkrnl::KeSetEvent(RECORD_QUEUED.pointer(), EVENT_INCREMENT, true) };
     WRITER_DONE.wait();
+
     if let Some(log) = log {
         let name = kernel::ansi_string(log);
         let attributes = ObjectAttributes {
@@ -653,6 +673,7 @@ pub(super) fn stop(log: Option<&[u8]>) {
         // SAFETY: `attributes` refers to `name`, which refers to `log`.
         unsafe { xboxkrnl::NtDeleteFile(&attributes) };
     }
+
     // SAFETY: `COMPLETION_STOP` is a static event initialized by
     // `initialize`; `thread` is the referenced completion worker thread
     // object.
@@ -669,6 +690,7 @@ pub(super) fn stop(log: Option<&[u8]>) {
             xboxkrnl::ObDereferenceObject(thread);
         }
     }
+
     COMPLETION_STOP.reset();
     COMPLETION_WORK.reset();
     ENGINE.finish_stop(&ConsolePlatform);
@@ -679,9 +701,11 @@ pub(super) fn read_record(output: &mut [u8; RECORD_SIZE]) -> bool {
     if !ENGINE.has_unread() {
         return false;
     }
+
     let Some(handle) = READ_HANDLE.get() else {
         return false;
     };
+
     let mut io = IoStatusBlock::default();
     // SAFETY: `output` holds RECORD_SIZE bytes and `io` is a live local.
     let status = unsafe {
@@ -699,7 +723,9 @@ pub(super) fn read_record(output: &mut [u8; RECORD_SIZE]) -> bool {
     if status.severity() == Severity::Error {
         return false;
     }
+
     ENGINE.note_read();
+
     true
 }
 
@@ -724,13 +750,16 @@ fn open_log() -> Result<(), KernelError> {
         AccessMask::GENERIC_READ.union(AccessMask::SYNCHRONIZE),
         CreateDisposition::Open,
     );
+
     // SAFETY: the server thread wrote the path before creating this thread.
     let Some((bytes, length)) = (unsafe { &*LOG_PATH.0.get() }) else {
         return Err(KernelError::NoSuchFile);
     };
+
     let path = &bytes[..*length];
     WRITE_HANDLE.set(create_file(path, &WRITE)?.0);
     READ_HANDLE.set(create_file(path, &READ)?.0);
+
     Ok(())
 }
 
@@ -748,6 +777,7 @@ fn write_record(record: &[u8; RECORD_SIZE]) -> bool {
     let Some(handle) = WRITE_HANDLE.get() else {
         return false;
     };
+
     let mut io = IoStatusBlock::default();
     // SAFETY: `record` holds RECORD_SIZE bytes and `io` is a live local.
     let status = unsafe {
@@ -762,6 +792,7 @@ fn write_record(record: &[u8; RECORD_SIZE]) -> bool {
             core::ptr::null(),
         )
     };
+
     status.is_success()
 }
 
@@ -769,11 +800,13 @@ fn write_record(record: &[u8; RECORD_SIZE]) -> bool {
 extern "C" fn writer_thread(_context: u32) -> u32 {
     const EXIT_SUCCESS: u32 = 0;
     const EXIT_FAILURE: u32 = 1;
+
     if !ENGINE.prepare_log(&ConsolePlatform) {
         ENGINE.abort_start();
         WRITER_DONE.set();
         return EXIT_FAILURE;
     }
+
     let opened = open_log();
     ENGINE.set_log_result(opened);
     if opened.is_err() {
@@ -782,11 +815,14 @@ extern "C" fn writer_thread(_context: u32) -> u32 {
         WRITER_DONE.set();
         return EXIT_FAILURE;
     }
+
     ENGINE.mark_running();
+
     while ENGINE.writing() {
         RECORD_QUEUED.wait();
         ENGINE.write_queued(&ConsolePlatform, &mut write_record);
     }
+
     while ENGINE.discard_queued(&ConsolePlatform) {
         // SAFETY: `RECORD_QUEUED` is a static event initialized by `initialize`.
         unsafe {
@@ -799,8 +835,10 @@ extern "C" fn writer_thread(_context: u32) -> u32 {
             )
         };
     }
+
     close_log();
     WRITER_DONE.set();
+
     EXIT_SUCCESS
 }
 
@@ -811,26 +849,35 @@ extern "C" fn writer_thread(_context: u32) -> u32 {
 extern "C" fn completion_thread(_context: u32) -> u32 {
     /// Wait block storage stock passes for the two objects.
     const WAIT_BLOCK_WORDS: usize = 0x10;
+    const COMPLETION_POLL: i64 = relative_interval(Duration::from_millis(
+        detour::COMPLETION_POLL_MILLISECONDS as u64,
+    ));
+
     let objects: [*mut DispatcherObject; 2] = [
         COMPLETION_WORK.pointer().cast(),
         COMPLETION_STOP.pointer().cast(),
     ];
     let mut wait_blocks = [0u32; WAIT_BLOCK_WORDS];
-    // SAFETY: `objects` holds two static events initialized by
-    // `initialize`; `wait_blocks` is a live local.
-    while unsafe {
-        xboxkrnl::KeWaitForMultipleObjects(
-            objects.len() as u32,
-            objects.as_ptr(),
-            WaitType::Any,
-            WaitReason::Executive,
-            ProcessorMode::Kernel,
-            false,
-            core::ptr::null(),
-            wait_blocks.as_mut_ptr(),
-        )
-    } == NtStatus::WAIT_0
-    {
+
+    loop {
+        // SAFETY: `objects` holds two static events initialized by
+        // `initialize`; `wait_blocks` is a live local.
+        let signaled = unsafe {
+            xboxkrnl::KeWaitForMultipleObjects(
+                objects.len() as u32,
+                objects.as_ptr(),
+                WaitType::Any,
+                WaitReason::Executive,
+                ProcessorMode::Kernel,
+                false,
+                core::ptr::null(),
+                wait_blocks.as_mut_ptr(),
+            )
+        };
+        if signaled != NtStatus::WAIT_0 {
+            return 0;
+        }
+
         while ENGINE.service_completions(&ConsolePlatform) {
             // SAFETY: `COMPLETION_STOP` is a static event initialized by `initialize`.
             let waited = unsafe {
@@ -847,5 +894,4 @@ extern "C" fn completion_thread(_context: u32) -> u32 {
             }
         }
     }
-    0
 }

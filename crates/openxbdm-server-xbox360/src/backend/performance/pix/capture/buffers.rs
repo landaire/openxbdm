@@ -43,6 +43,18 @@ use super::cached;
 use super::gpu::StreamRecordKind;
 use super::wrap;
 
+pub(super) const BUFFER_BYTES: u32 = 0x4000;
+/// Header word at the start of a buffer's data, `type | dwords << 8` with
+/// the data dwords after it; records follow it.
+pub(super) const HEADER_BYTES: u32 = 4;
+pub(super) const HEADER_DWORDS_SHIFT: u32 = 8;
+/// Partition offsets and command data sizes are in units of one buffer.
+pub(super) const UNIT_SHIFT: u32 = BUFFER_BYTES.trailing_zeros();
+const REQUEST_SIZE: u32 = size_of::<WriteRequest>() as u32;
+const REQUEST_BUFFERS: u32 = 8;
+/// Large page size; physical blocks start on a large page.
+const LARGE_PAGE: u32 = 0x1_0000;
+
 /// Type of a capture buffer, in its header and its entry's info word.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct BufferType(pub(super) u32);
@@ -60,9 +72,9 @@ impl BufferType {
     /// before `audio::ready_buffer` types them.
     pub(super) const FILLER: Self = Self(0x11);
 
-    /// Record buffer type of stream `k`.
-    pub(super) const fn records(k: StreamId) -> Self {
-        Self(Self::RECORDS.0 + k.raw())
+    /// Record buffer type of stream `stream`.
+    pub(super) const fn records(stream: StreamId) -> Self {
+        Self(Self::RECORDS.0 + stream.raw())
     }
 }
 
@@ -72,10 +84,17 @@ impl BufferType {
 pub(super) struct BufferInfo(pub(super) u32);
 
 impl BufferInfo {
-    /// Info of a buffer of `kind` on stream `k` taken at the frame of
-    /// `flags`, keeping bit 0 of `previous`.
-    pub(super) const fn new(k: u32, kind: BufferType, flags: EngineFlags, previous: Self) -> Self {
-        Self((k << 5 | kind.0) << 25 | (flags.bits() >> 4 & 0x01ff_fffe) | (previous.0 & 1))
+    /// Info of a buffer of `kind` on stream `raw_stream` taken at the frame
+    /// of `flags`, keeping bit 0 of `previous`.
+    pub(super) const fn new(
+        raw_stream: u32,
+        kind: BufferType,
+        flags: EngineFlags,
+        previous: Self,
+    ) -> Self {
+        Self(
+            (raw_stream << 5 | kind.0) << 25 | (flags.bits() >> 4 & 0x01ff_fffe) | (previous.0 & 1),
+        )
     }
 
     /// Stream (arithmetic shift, as stock).
@@ -141,9 +160,6 @@ pub(super) struct WriteRequest {
     pub(super) buffers: [AtomicU32; REQUEST_BUFFERS as usize],
 }
 
-const _: () = assert!(size_of::<BufferEntry>() == 8);
-const _: () = assert!(size_of::<WriteRequest>() == 0x34);
-
 impl WriteRequest {
     /// The request at `address`.
     ///
@@ -174,17 +190,8 @@ impl WriteRequest {
     }
 }
 
-pub(super) const BUFFER_BYTES: u32 = 0x4000;
-/// Header word at the start of a buffer's data, `type | dwords << 8` with
-/// the data dwords after it; records follow it.
-pub(super) const HEADER_BYTES: u32 = 4;
-pub(super) const HEADER_DWORDS_SHIFT: u32 = 8;
-/// Partition offsets and command data sizes are in units of one buffer.
-pub(super) const UNIT_SHIFT: u32 = BUFFER_BYTES.trailing_zeros();
-const REQUEST_SIZE: u32 = size_of::<WriteRequest>() as u32;
-const REQUEST_BUFFERS: u32 = 8;
-/// Large page size; physical blocks start on a large page.
-const LARGE_PAGE: u32 = 0x1_0000;
+const _: () = assert!(size_of::<BufferEntry>() == 8);
+const _: () = assert!(size_of::<WriteRequest>() == 0x34);
 
 /// `bytes` rounded up to a large page.
 const fn round_up(bytes: u32) -> u32 {
@@ -197,28 +204,29 @@ const fn requests_for(buffers: u32) -> u32 {
 }
 
 /// The request table.
-fn request_table(s: &PixSession) -> &[WriteRequest] {
-    let table = s.requests.load(Relaxed);
+fn request_table(session: &PixSession) -> &[WriteRequest] {
+    let table = session.requests.load(Relaxed);
     if table == 0 {
         return &[];
     }
+
     // SAFETY: the nonzero `requests` word.
-    unsafe { requests_at(s, table) }
+    unsafe { requests_at(session, table) }
 }
 
 /// The request table at `table`.
 ///
 /// # Safety
 ///
-/// `table` must be the nonzero `requests` word of `s`.
-unsafe fn requests_at(s: &PixSession, table: u32) -> &[WriteRequest] {
+/// `table` must be the nonzero `requests` word of `session`.
+unsafe fn requests_at(session: &PixSession, table: u32) -> &[WriteRequest] {
     // SAFETY: a nonzero `requests` is the table `try_allocate` allocated
     // for `request_count` requests; `free` releases it only after the
     // engine stopped using it.
     unsafe {
         core::slice::from_raw_parts(
             core::ptr::with_exposed_provenance::<WriteRequest>(table as usize),
-            s.request_count.load(Relaxed) as usize,
+            session.request_count.load(Relaxed) as usize,
         )
     }
 }
@@ -228,11 +236,12 @@ unsafe fn requests_at(s: &PixSession, table: u32) -> &[WriteRequest] {
 /// # Safety
 ///
 /// `index` must be below `buffer_count`.
-unsafe fn entry_at(s: &PixSession, index: u32) -> &BufferEntry {
-    let address = s
+unsafe fn entry_at(session: &PixSession, index: u32) -> &BufferEntry {
+    let address = session
         .buffer_table
         .load(Relaxed)
         .wrapping_add(index * size_of::<BufferEntry>() as u32);
+
     // SAFETY: entries below a nonzero `buffer_count` lie in the table
     // `try_allocate` allocated; `free` releases it after the engine
     // stopped using its entries.
@@ -263,60 +272,70 @@ pub(super) fn close(entry: &BufferEntry, kind: BufferType, cursor: u32) {
     // SAFETY: the data of a buffer table entry is a 16 KiB block the engine
     // owns while the entry is out of the queues.
     let header = unsafe { super::super::words_at(data, 1) };
+
     let dwords = (cursor.wrapping_sub(data).wrapping_sub(HEADER_BYTES) as i32) >> 2;
     header[0].store(kind.0 | (dwords as u32) << HEADER_DWORDS_SHIFT, Relaxed);
 }
 
 /// Allocate `size` zeroed bytes against the system budget, else the title
 /// budget (stock 0x91f5c418).
-pub(super) fn allocate(s: &PixSession, size: u32) -> u32 {
+pub(super) fn allocate(session: &PixSession, size: u32) -> u32 {
     for &(kind, pool_type) in &[
         (MemoryKind::System, PoolType::System),
         (MemoryKind::Title, PoolType::Title),
     ] {
-        let used = &s.used[kind.index()];
-        if used.load(Relaxed).wrapping_add(size) <= s.budgets[kind.index()].load(Relaxed) {
-            // SAFETY: allocates from the pool; no pointer arguments.
-            let block = unsafe { xboxkrnl::ExAllocatePoolTypeWithTag(size, POOL_TAG, pool_type) };
-            if block != 0 {
-                // SAFETY: a fresh pool block of `size` bytes, not yet shared.
-                unsafe {
-                    core::ptr::write_bytes(
-                        core::ptr::with_exposed_provenance_mut::<u8>(block as usize),
-                        0,
-                        size as usize,
-                    )
-                };
-                used.store(used.load(Relaxed).wrapping_add(size), Relaxed);
-                return block;
-            }
+        let used = &session.used[kind.index()];
+        if used.load(Relaxed).wrapping_add(size) > session.budgets[kind.index()].load(Relaxed) {
+            continue;
         }
+
+        // SAFETY: allocates from the pool; no pointer arguments.
+        let block = unsafe { xboxkrnl::ExAllocatePoolTypeWithTag(size, POOL_TAG, pool_type) };
+        if block == 0 {
+            continue;
+        }
+
+        // SAFETY: a fresh pool block of `size` bytes, not yet shared.
+        unsafe {
+            core::ptr::write_bytes(
+                core::ptr::with_exposed_provenance_mut::<u8>(block as usize),
+                0,
+                size as usize,
+            )
+        };
+        used.store(used.load(Relaxed).wrapping_add(size), Relaxed);
+        return block;
     }
+
     0
 }
 
 /// [`allocate`] into `slot`; `None` when it failed.
-fn allocate_into(s: &PixSession, slot: &AtomicU32, size: u32) -> Option<NonZeroU32> {
-    let block = allocate(s, size);
+fn allocate_into(session: &PixSession, slot: &AtomicU32, size: u32) -> Option<NonZeroU32> {
+    let block = allocate(session, size);
     slot.store(block, Relaxed);
+
     NonZeroU32::new(block)
 }
 
 /// Buffers the configuration needs (stock 0x91f5c820).
-fn needed(s: &PixSession) -> u32 {
+fn needed(session: &PixSession) -> u32 {
     /// Buffers each part needs, in [`Part`] order.
     const PART_BUFFERS: [u32; 4] = [7, 6, 0x11, 3];
     /// Bits of the two streams in a stream mask.
     const STREAMS: u32 = 0b11;
+
     let mut count = 0;
     let mut streams = 0u32;
-    for (part, &extra) in s.configuration.parts.iter().zip(&PART_BUFFERS) {
-        let k = PartStream(part.load(Relaxed));
-        if !k.is_off() {
+
+    for (part, &extra) in session.configuration.parts.iter().zip(&PART_BUFFERS) {
+        let part_stream = PartStream(part.load(Relaxed));
+        if !part_stream.is_off() {
             count += extra;
-            streams |= k.bit();
+            streams |= part_stream.bit();
         }
     }
+
     // Each stream may hold the eight buffers of its next gather write.
     count + REQUEST_BUFFERS * (streams & STREAMS).count_ones()
 }
@@ -324,67 +343,76 @@ fn needed(s: &PixSession) -> u32 {
 /// Write back the data cache lines of `[start, end)` (stock 0x91f5d778).
 pub(super) fn flush(start: u32, end: u32) {
     const LINE: u32 = 0x80;
+
     let mut line = start & !(LINE - 1);
     while line < (end.wrapping_add(LINE - 1) & !(LINE - 1)) {
         // SAFETY: flushes one cache line of memory the engine owns.
         unsafe { core::arch::asm!("dcbf 0, {0}", in(reg) line, options(nostack)) };
         line += LINE;
     }
+
     super::sync();
 }
 
 /// Release every capture allocation (stock 0x91f5d828).
-pub(super) fn free(s: &PixSession) {
+pub(super) fn free(session: &PixSession) {
     for &kind in &[MemoryKind::System, MemoryKind::Title] {
         let index = kind.index();
-        let address = s.physical_blocks[index].load(Relaxed);
+        let address = session.physical_blocks[index].load(Relaxed);
         if address != 0 {
             let start = cached(address);
             flush(
                 start,
-                start.wrapping_add(s.physical_sizes[index].load(Relaxed)),
+                start.wrapping_add(session.physical_sizes[index].load(Relaxed)),
             );
             // SAFETY: the physical block of this kind that `try_allocate`
             // allocated; its slot is cleared below.
             unsafe { xboxkrnl::MmFreePhysicalMemory(kind.region(), address) };
-            s.physical_blocks[index].store(0, Relaxed);
-            s.physical_sizes[index].store(0, Relaxed);
+            session.physical_blocks[index].store(0, Relaxed);
+            session.physical_sizes[index].store(0, Relaxed);
         }
-        s.budgets[index].store(0, Relaxed);
-        s.used[index].store(0, Relaxed);
+        session.budgets[index].store(0, Relaxed);
+        session.used[index].store(0, Relaxed);
     }
+
     let release = |slot: &AtomicU32| {
         let block = slot.load(Relaxed);
-        if block != 0 {
-            // SAFETY: a pool block from `allocate`; its slot is cleared
-            // below.
-            unsafe { xboxkrnl::ExFreePool(block) };
-            slot.store(0, Relaxed);
-            true
-        } else {
-            false
+        if block == 0 {
+            return false;
         }
+
+        // SAFETY: a pool block from `allocate`; its slot is cleared
+        // below.
+        unsafe { xboxkrnl::ExFreePool(block) };
+        slot.store(0, Relaxed);
+
+        true
     };
-    for block in &s.temporary_blocks {
+
+    for block in &session.temporary_blocks {
         release(block);
     }
-    if release(&s.buffer_table) {
-        s.buffer_count.store(0, Relaxed);
+
+    if release(&session.buffer_table) {
+        session.buffer_count.store(0, Relaxed);
     }
-    for stream in &s.streams {
+
+    for stream in &session.streams {
         release(&stream.queue);
     }
-    for (ring, position) in s.rings.iter().zip(&s.ring_positions) {
+
+    for (ring, position) in session.rings.iter().zip(&session.ring_positions) {
         if release(ring) {
             position.head.store(0, Relaxed);
             position.tail.store(0, Relaxed);
         }
     }
-    let requests = s.requests.load(Relaxed);
+
+    let requests = session.requests.load(Relaxed);
     if requests != 0 {
         if xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE {
             // SAFETY: the nonzero `requests` word.
-            for request in unsafe { requests_at(s, requests) } {
+            for request in unsafe { requests_at(session, requests) } {
                 let event = request.event.load(Relaxed);
                 if event != 0 {
                     // SAFETY: an event this title created for the request.
@@ -392,32 +420,36 @@ pub(super) fn free(s: &PixSession) {
                 }
             }
         }
+
         // SAFETY: the request table from `allocate`; its slot is cleared
         // below.
         unsafe { xboxkrnl::ExFreePool(requests) };
-        s.requests.store(0, Relaxed);
-        s.request_count.store(0, Relaxed);
-        s.next_request.store(0, Relaxed);
+        session.requests.store(0, Relaxed);
+        session.request_count.store(0, Relaxed);
+        session.next_request.store(0, Relaxed);
     }
-    s.allocation_attempted.store(0, Relaxed);
+
+    session.allocation_attempted.store(0, Relaxed);
 }
 
 /// Allocate the buffers, queues and requests the configuration needs
 /// (stock 0x91f5da20); on failure the configuration is turned off and
 /// everything is released.
-pub(super) fn allocate_all(s: &PixSession) {
-    s.allocation_attempted.store(1, Relaxed);
-    if !try_allocate(s) {
-        let configuration = &s.configuration;
-        configuration.set_part(Part::Audio, PartStream::OFF);
-        configuration.set_part(Part::Gpu, PartStream::OFF);
-        configuration.set_part(Part::SecondThread, PartStream::OFF);
-        configuration.set_part(Part::Thread, PartStream::OFF);
-        free(s);
+pub(super) fn allocate_all(session: &PixSession) {
+    session.allocation_attempted.store(1, Relaxed);
+    if try_allocate(session) {
+        return;
     }
+
+    let configuration = &session.configuration;
+    configuration.set_part(Part::Audio, PartStream::OFF);
+    configuration.set_part(Part::Gpu, PartStream::OFF);
+    configuration.set_part(Part::SecondThread, PartStream::OFF);
+    configuration.set_part(Part::Thread, PartStream::OFF);
+    free(session);
 }
 
-fn try_allocate(s: &PixSession) -> bool {
+fn try_allocate(session: &PixSession) -> bool {
     /// Temporary per-thread blocks allocated, one per type of the first
     /// per-thread buffers.
     const TEMPORARY_ALLOCATED: usize = 6;
@@ -431,36 +463,44 @@ fn try_allocate(s: &PixSession) -> bool {
     /// Bytes of a frame buffer or command data ring entry.
     const RING_ENTRY_BYTES: u32 = 8;
     const QUEUE_ENTRY_BYTES: u32 = 4;
-    if s.budget.enabled.load(Relaxed) == 0 || s.stream(StreamId::First).handle.load(Relaxed) == 0 {
+
+    if session.budget.enabled.load(Relaxed) == 0
+        || session.stream(StreamId::First).handle.load(Relaxed) == 0
+    {
         return false;
     }
-    let count = needed(s);
+
+    let count = needed(session);
     if count == 0 {
-        free(s);
+        free(session);
         return true;
     }
-    s.needed_buffers.store(count, Relaxed);
+
+    session.needed_buffers.store(count, Relaxed);
     let need = round_up(count * BUFFER_BYTES + PHYSICAL_EXTRA).wrapping_add(round_up(
         requests_for(count) * REQUEST_SIZE
             + count * POOL_BYTES_PER_BUFFER
             + TEMPORARY_ALLOCATED as u32 * TEMPORARY_BYTES,
     ));
-    let routine = s.capture_size_routine.load(Relaxed);
+
+    let routine = session.capture_size_routine.load(Relaxed);
     let system = if routine != 0 {
         // SAFETY: XAM export 0x1f0 takes no arguments and returns a size.
         unsafe { crate::kernel::call_export(routine, 0, 0, 0, 0) }
     } else {
         session::capture_buffer_size()
     };
-    let title_budget = &s.budgets[MemoryKind::Title.index()];
-    let system_budget = &s.budgets[MemoryKind::System.index()];
-    let title_used = &s.used[MemoryKind::Title.index()];
-    let system_used = &s.used[MemoryKind::System.index()];
-    let title_size = &s.physical_sizes[MemoryKind::Title.index()];
-    let system_size = &s.physical_sizes[MemoryKind::System.index()];
-    let budget = &s.budget;
+
+    let title_budget = &session.budgets[MemoryKind::Title.index()];
+    let system_budget = &session.budgets[MemoryKind::System.index()];
+    let title_used = &session.used[MemoryKind::Title.index()];
+    let system_used = &session.used[MemoryKind::System.index()];
+    let title_size = &session.physical_sizes[MemoryKind::Title.index()];
+    let system_size = &session.physical_sizes[MemoryKind::System.index()];
+    let budget = &session.budget;
+
     system_budget.store(system, Relaxed);
-    title_budget.store(s.configuration.title_budget.load(Relaxed), Relaxed);
+    title_budget.store(session.configuration.title_budget.load(Relaxed), Relaxed);
     if budget.override_title.load(Relaxed) != 0 {
         title_budget.store(budget.title_size.load(Relaxed), Relaxed);
     }
@@ -477,6 +517,7 @@ fn try_allocate(s: &PixSession) -> bool {
     {
         title_budget.store(need.wrapping_sub(system_budget.load(Relaxed)), Relaxed);
     }
+
     system_used.store(
         if system_budget.load(Relaxed) >= SYSTEM_RESERVED {
             SYSTEM_RESERVED
@@ -488,39 +529,48 @@ fn try_allocate(s: &PixSession) -> bool {
     title_used.store(0, Relaxed);
     system_size.store(0, Relaxed);
     title_size.store(0, Relaxed);
-    for block in &s.temporary_blocks[..TEMPORARY_ALLOCATED] {
-        if allocate_into(s, block, TEMPORARY_BYTES).is_none() {
+
+    for block in &session.temporary_blocks[..TEMPORARY_ALLOCATED] {
+        if allocate_into(session, block, TEMPORARY_BYTES).is_none() {
             return false;
         }
     }
+
     let total = (title_budget.load(Relaxed) - title_used.load(Relaxed)) / BUFFER_BYTES
         + (system_budget.load(Relaxed) - system_used.load(Relaxed)) / BUFFER_BYTES;
-    let Some(table) = allocate_into(s, &s.buffer_table, total * size_of::<BufferEntry>() as u32)
-    else {
+    let Some(table) = allocate_into(
+        session,
+        &session.buffer_table,
+        total * size_of::<BufferEntry>() as u32,
+    ) else {
         return false;
     };
+
     if allocate_into(
-        s,
-        &s.stream(StreamId::First).queue,
+        session,
+        &session.stream(StreamId::First).queue,
         total * QUEUE_ENTRY_BYTES,
     )
     .is_none()
         || allocate_into(
-            s,
-            &s.stream(StreamId::Second).queue,
+            session,
+            &session.stream(StreamId::Second).queue,
             total * QUEUE_ENTRY_BYTES,
         )
         .is_none()
-        || allocate_into(s, &s.rings[0], total * RING_ENTRY_BYTES).is_none()
-        || allocate_into(s, &s.rings[1], total * RING_ENTRY_BYTES).is_none()
+        || allocate_into(session, &session.rings[0], total * RING_ENTRY_BYTES).is_none()
+        || allocate_into(session, &session.rings[1], total * RING_ENTRY_BYTES).is_none()
     {
         return false;
     }
+
     let requests = requests_for(total);
-    s.request_count.store(requests, Relaxed);
-    let Some(request_table) = allocate_into(s, &s.requests, requests * REQUEST_SIZE) else {
+    session.request_count.store(requests, Relaxed);
+    let Some(request_table) = allocate_into(session, &session.requests, requests * REQUEST_SIZE)
+    else {
         return false;
     };
+
     // Physical memory after the pool allocations of each budget, system
     // first.
     for index in (MemoryKind::Title.index()..=MemoryKind::System.index()).rev() {
@@ -529,53 +579,62 @@ fn try_allocate(s: &PixSession) -> bool {
         } else {
             MemoryKind::System
         };
-        let used = &s.used[index];
-        let size = &s.physical_sizes[index];
+        let used = &session.used[index];
+        let size = &session.physical_sizes[index];
+
         let start = round_up(used.load(Relaxed));
         used.store(start, Relaxed);
-        let limit = s.budgets[index].load(Relaxed);
-        if limit > start {
-            let bytes = limit - start;
-            size.store(bytes, Relaxed);
-            // SAFETY: no pointer arguments.
-            let address = unsafe {
-                xboxkrnl::MmAllocatePhysicalMemoryEx(
-                    kind.region(),
-                    bytes,
-                    PageProtection::READWRITE
-                        | PageProtection::WRITECOMBINE
-                        | PageProtection::LARGE_PAGES,
-                    0,
-                    u32::MAX,
-                    0,
-                )
-            };
-            s.physical_blocks[index].store(address, Relaxed);
-            if address == 0 {
-                size.store(0, Relaxed);
-                if kind == MemoryKind::Title {
-                    super::super::status::post_without_text(
-                        super::super::status::Status::StreamEngineOutOfMemory,
-                    );
-                }
-            }
-        } else {
+
+        let limit = session.budgets[index].load(Relaxed);
+        if limit <= start {
             size.store(0, Relaxed);
+            continue;
+        }
+
+        let bytes = limit - start;
+        size.store(bytes, Relaxed);
+        // SAFETY: no pointer arguments.
+        let address = unsafe {
+            xboxkrnl::MmAllocatePhysicalMemoryEx(
+                kind.region(),
+                bytes,
+                PageProtection::READWRITE
+                    | PageProtection::WRITECOMBINE
+                    | PageProtection::LARGE_PAGES,
+                0,
+                u32::MAX,
+                0,
+            )
+        };
+        session.physical_blocks[index].store(address, Relaxed);
+
+        if address == 0 {
+            size.store(0, Relaxed);
+            if kind == MemoryKind::Title {
+                super::super::status::post_without_text(
+                    super::super::status::Status::StreamEngineOutOfMemory,
+                );
+            }
         }
     }
+
     let system = system_size.load(Relaxed) / BUFFER_BYTES;
     let title = title_size.load(Relaxed) / BUFFER_BYTES;
-    s.needed_buffers.store(count, Relaxed);
-    s.configuration
+    session.needed_buffers.store(count, Relaxed);
+    session
+        .configuration
         .title_budget
         .store(title_size.load(Relaxed) + title_used.load(Relaxed), Relaxed);
+
     if system + title < count {
         return false;
     }
+
     // At most `total`: the physical blocks come from the same budgets less
     // the pool allocations made since.
     let entries = system + title;
-    s.buffer_count.store(entries, Relaxed);
+    session.buffer_count.store(entries, Relaxed);
+
     // SAFETY: the buffer table allocated above for `total` entries.
     let table = unsafe {
         core::slice::from_raw_parts(
@@ -583,10 +642,11 @@ fn try_allocate(s: &PixSession) -> bool {
             entries as usize,
         )
     };
+
     // Title blocks first, then system blocks; the system base is offset so
     // that the entry index keeps counting past the title entries.
-    let title_data = s.physical_blocks[MemoryKind::Title.index()].load(Relaxed);
-    let system_data = s.physical_blocks[MemoryKind::System.index()]
+    let title_data = session.physical_blocks[MemoryKind::Title.index()].load(Relaxed);
+    let system_data = session.physical_blocks[MemoryKind::System.index()]
         .load(Relaxed)
         .wrapping_sub(title * BUFFER_BYTES);
     for (index, entry) in (0u32..).zip(table) {
@@ -599,8 +659,9 @@ fn try_allocate(s: &PixSession) -> bool {
             .data
             .store(data.wrapping_add(index * BUFFER_BYTES), Relaxed);
     }
+
     // SAFETY: the `requests` word stored above.
-    for request in unsafe { requests_at(s, request_table.get()) } {
+    for request in unsafe { requests_at(session, request_table.get()) } {
         request.status.store(NtStatus::SUCCESS.0, Relaxed);
         // SAFETY: the handle slot lies in the request table allocated above.
         let status = unsafe {
@@ -615,44 +676,53 @@ fn try_allocate(s: &PixSession) -> bool {
             return false;
         }
     }
+
     true
 }
 
 /// Whether `need` buffers can be had: unused ones plus eight for each
 /// completed request (stock 0x91f5c8b8).
-pub(super) fn available(s: &PixSession, need: u32) -> bool {
-    let mut free = s
+pub(super) fn available(session: &PixSession, need: u32) -> bool {
+    let mut free = session
         .buffer_count
         .load(Relaxed)
-        .wrapping_sub(s.buffers_used.load(Relaxed));
-    if s.completed_request.load(Relaxed) != 0 {
+        .wrapping_sub(session.buffers_used.load(Relaxed));
+
+    if session.completed_request.load(Relaxed) != 0 {
         free = free
-            .wrapping_sub(s.completed_index.load(Relaxed))
+            .wrapping_sub(session.completed_index.load(Relaxed))
             .wrapping_add(REQUEST_BUFFERS);
     }
+
     if free >= need {
         return true;
     }
-    for stream in &s.streams {
+
+    for stream in &session.streams {
         let tail = stream.tail.load(Relaxed);
         let mut index = stream.head.load(Relaxed);
+
         while index != tail {
             if queued(stream, index).pending() {
                 break;
             }
+
             free = free.wrapping_add(REQUEST_BUFFERS);
             if free >= need {
                 return true;
             }
-            index = wrap(index + 1, s.request_count.load(Relaxed));
+
+            index = wrap(index + 1, session.request_count.load(Relaxed));
         }
     }
+
     false
 }
 
 /// `STRE` stream record marking a wait for the writer (stock 0x91f5c968).
 fn stream_wait_record(waiting: bool) {
     let time = Timebase::now().ticks();
+
     super::super::write_tagged_words(
         RecordTag::STRE.raw(),
         &[(time >> 32) as u32, time as u32, u32::from(waiting)],
@@ -661,24 +731,29 @@ fn stream_wait_record(waiting: bool) {
 
 /// Wait until a queued request completes (stock 0x91f5c9b0): titles wait
 /// on the request events, the system process polls every 100 us.
-fn wait_for_request(s: &PixSession) {
+fn wait_for_request(session: &PixSession) {
     let mut events = [0u32; 2];
     // One slot per stream, so a slot is free for each event.
     let mut slots = events.iter_mut();
     let mut wait = xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE;
-    for stream in &s.streams {
+
+    for stream in &session.streams {
         let head = stream.head.load(Relaxed);
-        if head != stream.tail.load(Relaxed) {
-            let request = queued(stream, head);
-            if request.has_event.load(Relaxed) != 0 {
-                if let Some(slot) = slots.next() {
-                    *slot = request.event.load(Relaxed);
-                }
-            } else {
-                wait = false;
-            }
+        if head == stream.tail.load(Relaxed) {
+            continue;
+        }
+
+        let request = queued(stream, head);
+        if request.has_event.load(Relaxed) == 0 {
+            wait = false;
+            continue;
+        }
+
+        if let Some(slot) = slots.next() {
+            *slot = request.event.load(Relaxed);
         }
     }
+
     let count = 2 - slots.len();
     if wait {
         // SAFETY: `events` holds `count` request event handles.
@@ -694,9 +769,11 @@ fn wait_for_request(s: &PixSession) {
         };
         return;
     }
+
     loop {
         delay();
-        for stream in &s.streams {
+
+        for stream in &session.streams {
             let head = stream.head.load(Relaxed);
             if head != stream.tail.load(Relaxed) && !queued(stream, head).pending() {
                 return;
@@ -709,6 +786,7 @@ fn wait_for_request(s: &PixSession) {
 pub(super) fn delay() {
     /// Relative interval in 100 ns units.
     const INTERVAL: i64 = -1000;
+
     // SAFETY: the interval is a live constant.
     unsafe { xboxkrnl::KeDelayExecutionThread(ProcessorMode::Kernel, false, &INTERVAL) };
 }
@@ -724,6 +802,7 @@ fn handle(stream: &Stream) -> Handle {
         };
         stream.title_handle.store(handle, Relaxed);
     }
+
     Handle::from_raw(if title {
         stream.title_handle.load(Relaxed)
     } else {
@@ -731,82 +810,93 @@ fn handle(stream: &Stream) -> Handle {
     })
 }
 
-/// Partition handle of stream `k` for the calling process.
-pub(super) fn stream_handle(s: &PixSession, k: StreamId) -> u32 {
-    handle(s.stream(k)).raw()
+/// Partition handle of stream `stream` for the calling process.
+pub(super) fn stream_handle(session: &PixSession, stream: StreamId) -> u32 {
+    handle(session.stream(stream)).raw()
 }
 
 /// Take the next buffer of a completed request (stock 0x91f5de90). With
 /// completions on both streams the first one's buffers are lost, as in
 /// stock.
-fn next_completed(s: &PixSession) -> Option<&BufferEntry> {
-    let mut address = s.completed_request.load(Relaxed);
+fn next_completed(session: &PixSession) -> Option<&BufferEntry> {
+    let mut address = session.completed_request.load(Relaxed);
     if address == 0 {
-        s.enter_engine_lock();
-        for stream in &s.streams {
+        session.enter_engine_lock();
+        for stream in &session.streams {
             let head = stream.head.load(Relaxed);
-            if head != stream.tail.load(Relaxed) {
-                let candidate = queued(stream, head);
-                if !candidate.pending() {
-                    address = candidate.address();
-                    stream
-                        .head
-                        .store(wrap(head + 1, s.request_count.load(Relaxed)), Relaxed);
-                }
+            if head == stream.tail.load(Relaxed) {
+                continue;
             }
+
+            let candidate = queued(stream, head);
+            if candidate.pending() {
+                continue;
+            }
+
+            address = candidate.address();
+            stream
+                .head
+                .store(wrap(head + 1, session.request_count.load(Relaxed)), Relaxed);
         }
-        s.leave_engine_lock();
+        session.leave_engine_lock();
+
         if address == 0 {
             return None;
         }
-        s.completed_request.store(address, Relaxed);
-        s.completed_index.store(0, Relaxed);
+
+        session.completed_request.store(address, Relaxed);
+        session.completed_index.store(0, Relaxed);
     }
+
     // SAFETY: `completed_request` holds a request taken from a queue.
     let request = unsafe { WriteRequest::at(address) };
+
     // Below `REQUEST_BUFFERS` while `completed_request` is set; the mask
     // only drops the bounds check.
-    let index = s.completed_index.load(Relaxed) % REQUEST_BUFFERS;
+    let index = session.completed_index.load(Relaxed) % REQUEST_BUFFERS;
     let entry = request.buffers[index as usize].load(Relaxed);
-    s.completed_index.store(index + 1, Relaxed);
+    session.completed_index.store(index + 1, Relaxed);
     if index + 1 >= REQUEST_BUFFERS {
-        s.completed_request.store(0, Relaxed);
+        session.completed_request.store(0, Relaxed);
     }
+
     // SAFETY: `submit` stores buffer table entries in a request before it
     // can complete.
     Some(unsafe { BufferEntry::at(entry) })
 }
 
-/// Next free buffer entry for `kind` on stream `k` (stock 0x91f5e360);
-/// waits for the writer when none is free.
-pub(super) fn take(s: &PixSession, kind: BufferType, k: u32) -> &BufferEntry {
-    let used = s.buffers_used.load(Relaxed);
-    let entry = if used < s.buffer_count.load(Relaxed) {
-        s.buffers_used.store(used + 1, Relaxed);
+/// Next free buffer entry for `kind` on stream `raw_stream` (stock
+/// 0x91f5e360); waits for the writer when none is free.
+pub(super) fn take(session: &PixSession, kind: BufferType, raw_stream: u32) -> &BufferEntry {
+    let used = session.buffers_used.load(Relaxed);
+    let entry = if used < session.buffer_count.load(Relaxed) {
+        session.buffers_used.store(used + 1, Relaxed);
         // SAFETY: checked against `buffer_count`.
-        unsafe { entry_at(s, used) }
+        unsafe { entry_at(session, used) }
     } else {
         // Stock retries once after the wait and then writes through a null
         // entry; this waits until a request completes.
         loop {
-            if let Some(entry) = next_completed(s) {
+            if let Some(entry) = next_completed(session) {
                 break entry;
             }
             stream_wait_record(true);
-            wait_for_request(s);
+            wait_for_request(session);
             stream_wait_record(false);
         }
     };
+
     entry.info.store(
-        BufferInfo::new(k, kind, s.engine_flags(), entry.info()).0,
+        BufferInfo::new(raw_stream, kind, session.engine_flags(), entry.info()).0,
         Relaxed,
     );
+
     entry
 }
 
 /// Queue `entry` for writing (stock 0x91f5e090); every eighth buffer of a
 /// stream starts a gather write of the eight.
-pub(super) fn submit(s: &PixSession, entry: &BufferEntry, frame: u32) {
+pub(super) fn submit(session: &PixSession, entry: &BufferEntry, frame: u32) {
     /// Bytes one request writes (eight buffers).
     const REQUEST_BYTES: u64 = REQUEST_BUFFERS as u64 * BUFFER_BYTES as u64;
     /// Generation bits of a stream sequence; the rest counts buffers.
@@ -816,36 +906,49 @@ pub(super) fn submit(s: &PixSession, entry: &BufferEntry, frame: u32) {
     const PAGES: usize = (BUFFER_BYTES / PAGE_SIZE) as usize;
     /// Frame index bits of a frame table entry.
     const FRAME_BITS: u32 = 0x00ff_ffff;
+
     let info = entry.info();
-    let k = StreamId::from_raw(info.stream());
-    let stream = s.stream(k);
+    let id = StreamId::from_raw(info.stream());
+    let stream = session.stream(id);
     let sequence = stream.sequence.load(Relaxed);
     let mut next = (sequence & GENERATION_MASK) | (sequence.wrapping_add(1) & SEQUENCE_MASK);
+
     // `pending_count` wraps below `REQUEST_BUFFERS`; the mask only drops the
     // bounds check.
     let slot = stream.pending_count.load(Relaxed) % REQUEST_BUFFERS;
     stream.pending[slot as usize].store(entry.address(), Relaxed);
+
     if slot + 1 < REQUEST_BUFFERS {
         stream.pending_count.store(slot + 1, Relaxed);
     } else {
         stream.pending_count.store(0, Relaxed);
-        let index = s.next_request.load(Relaxed);
-        s.next_request
-            .store(wrap(index + 1, s.request_count.load(Relaxed)), Relaxed);
+
+        let index = session.next_request.load(Relaxed);
+        session.next_request.store(
+            wrap(index + 1, session.request_count.load(Relaxed)),
+            Relaxed,
+        );
         // SAFETY: `next_request` wraps below `request_count`, so this is a
         // request of the table `try_allocate` allocated; buffers are
         // submitted only while it is allocated.
         let request = unsafe {
-            WriteRequest::at(s.requests.load(Relaxed).wrapping_add(index * REQUEST_SIZE))
+            WriteRequest::at(
+                session
+                    .requests
+                    .load(Relaxed)
+                    .wrapping_add(index * REQUEST_SIZE),
+            )
         };
         request.status.store(NtStatus::PENDING.0, Relaxed);
-        s.enter_engine_lock();
+
+        session.enter_engine_lock();
         let tail = stream.tail.load(Relaxed);
         queue_slot(stream, tail).store(request.address(), Relaxed);
         stream
             .tail
-            .store(wrap(tail + 1, s.request_count.load(Relaxed)), Relaxed);
-        s.leave_engine_lock();
+            .store(wrap(tail + 1, session.request_count.load(Relaxed)), Relaxed);
+        session.leave_engine_lock();
+
         // Stock's segment array has one more, unused element.
         let mut segments = [0u32; REQUEST_BUFFERS as usize * PAGES + 1];
         for ((pending, buffer), pages) in stream
@@ -858,13 +961,15 @@ pub(super) fn submit(s: &PixSession, entry: &BufferEntry, frame: u32) {
             buffer.store(pending, Relaxed);
             // SAFETY: `pending` holds the entries submitted to this stream.
             let data = unsafe { BufferEntry::at(pending) }.data();
+
             for (page, segment) in (0u32..).zip(pages) {
                 *segment = data + page * PAGE_SIZE;
             }
         }
+
         if super::super::discard_output() {
             request.status.store(NtStatus::SUCCESS.0, Relaxed);
-        } else if k == StreamId::First {
+        } else if id == StreamId::First {
             let title = xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE;
             let event = if title {
                 request.event.load(Relaxed)
@@ -889,6 +994,7 @@ pub(super) fn submit(s: &PixSession, entry: &BufferEntry, frame: u32) {
             request.has_event.store(u32::from(title), Relaxed);
             request.thread.store(processor::current_thread(), Relaxed);
         }
+
         let offset = stream.offset.get() + REQUEST_BYTES;
         stream.offset.set(offset);
         if offset as i64 >= stream.size.get() as i64 {
@@ -896,13 +1002,15 @@ pub(super) fn submit(s: &PixSession, entry: &BufferEntry, frame: u32) {
             next = (next & GENERATION_MASK).wrapping_add(GENERATION_ONE);
         }
     }
+
     stream.sequence.store(next, Relaxed);
+
     let kind = info.kind();
     if kind.0 < BufferType::COMMAND_DATA.0 {
         if info.frame() != frame {
             append(
-                s,
-                k,
+                session,
+                id,
                 &[
                     StreamRecordKind::Buffer as u32 | kind.0 << 3 | frame << 8,
                     sequence,
@@ -932,18 +1040,20 @@ pub(super) fn submit(s: &PixSession, entry: &BufferEntry, frame: u32) {
     }
 }
 
-/// Append `record` to record stream `k` (stock 0x91f5e418); a full buffer
+/// Append `record` to record stream `id` (stock 0x91f5e418); a full buffer
 /// is queued and replaced.
-pub(super) fn append(s: &PixSession, k: StreamId, record: &[u32]) {
+pub(super) fn append(session: &PixSession, id: StreamId, record: &[u32]) {
     let bytes = record.len() as u32 * 4;
-    let cursor_slot = &s.record_cursors[k as usize];
-    let end_slot = &s.record_ends[k as usize];
-    let entry_slot = &s.record_entries[k as usize];
-    let kind = BufferType::records(k);
-    if k == StreamId::First {
+    let cursor_slot = &session.record_cursors[id as usize];
+    let end_slot = &session.record_ends[id as usize];
+    let entry_slot = &session.record_entries[id as usize];
+    let kind = BufferType::records(id);
+
+    if id == StreamId::First {
         const LAST_FRAME: u32 = StreamRecordKind::LastFrame as u32;
         const AUDIO: u32 = StreamRecordKind::Audio as u32;
-        let stream = s.stream(StreamId::First);
+
+        let stream = session.stream(StreamId::First);
         // Frame records keep their key in the third word, the other kinds
         // in the second. A record too short for its key has none; stock
         // reads past it.
@@ -954,6 +1064,7 @@ pub(super) fn append(s: &PixSession, k: StreamId, record: &[u32]) {
         };
         let key = key_word.and_then(|index| record.get(index));
         stream.last_key.store(key.copied().unwrap_or(0), Relaxed);
+
         // Stock copies ten words from the record's address whatever its
         // size: stack bytes, or the session's frame times after the
         // pending GPU frame. The words past a short record are zero here.
@@ -961,18 +1072,21 @@ pub(super) fn append(s: &PixSession, k: StreamId, record: &[u32]) {
             target.store(record.get(index).copied().unwrap_or(0), Relaxed);
         }
     }
+
     let mut cursor = cursor_slot.load(Relaxed);
     if cursor + bytes > end_slot.load(Relaxed) {
         // SAFETY: the record entry of a running stream is a buffer table
         // entry `start` or this function took.
         let full = unsafe { BufferEntry::at(entry_slot.load(Relaxed)) };
         close(full, kind, cursor);
-        submit(s, full, s.frame_index());
-        let entry = take(s, kind, k.raw());
+        submit(session, full, session.frame_index());
+
+        let entry = take(session, kind, id.raw());
         entry_slot.store(entry.address(), Relaxed);
         end_slot.store(entry.data() + BUFFER_BYTES, Relaxed);
         cursor = entry.data() + HEADER_BYTES;
     }
+
     // SAFETY: the record fits in the current buffer before its end; the
     // engine alone writes the buffer past the cursor.
     unsafe {
@@ -987,14 +1101,17 @@ pub(super) fn append(s: &PixSession, k: StreamId, record: &[u32]) {
 
 /// Wait for the calling thread's writes before it ends (stock 0x91f5df80,
 /// from the thread notification).
-pub(super) fn wait_for_thread(s: &PixSession) {
-    s.thread_writes
-        .store(s.thread_writes.load(Relaxed).wrapping_add(1), Relaxed);
-    s.enter_engine_lock();
+pub(super) fn wait_for_thread(session: &PixSession) {
+    session
+        .thread_writes
+        .store(session.thread_writes.load(Relaxed).wrapping_add(1), Relaxed);
+
+    session.enter_engine_lock();
     let thread = processor::current_thread();
-    for stream in &s.streams {
+    for stream in &session.streams {
         let tail = stream.tail.load(Relaxed);
         let mut index = stream.head.load(Relaxed);
+
         while index != tail {
             let request = queued(stream, index);
             if request.thread.load(Relaxed) == thread && request.pending() {
@@ -1014,38 +1131,42 @@ pub(super) fn wait_for_thread(s: &PixSession) {
                     }
                 }
             }
-            index = wrap(index + 1, s.request_count.load(Relaxed));
+
+            index = wrap(index + 1, session.request_count.load(Relaxed));
         }
     }
-    s.leave_engine_lock();
+    session.leave_engine_lock();
 }
 
 /// Wait until no request is pending, then empty the queues (end of stock
 /// 0x91f60800).
-pub(super) fn drain(s: &PixSession) {
-    for request in request_table(s) {
+pub(super) fn drain(session: &PixSession) {
+    for request in request_table(session) {
         while request.pending() {
             delay();
         }
     }
-    s.enter_engine_lock();
-    for stream in &s.streams {
+
+    session.enter_engine_lock();
+    for stream in &session.streams {
         stream.head.store(0, Relaxed);
         stream.tail.store(0, Relaxed);
     }
-    s.leave_engine_lock();
+    session.leave_engine_lock();
 }
 
 /// Read the 16 KiB at partition unit `unit` into buffer `position` and
 /// wait for it (stock 0x91f5e8c0); the address of the data.
-pub(super) fn read_unit(s: &PixSession, unit: u32, position: u32) -> u32 {
+pub(super) fn read_unit(session: &PixSession, unit: u32, position: u32) -> u32 {
     // Both bounds panic where stock reads through an unallocated or too
     // small table (`pixcmd d` without buffers); neither implies the other
     // for a single buffer.
-    let request = &request_table(s)[position as usize];
-    assert!(position < s.buffer_count.load(Relaxed));
+    let request = &request_table(session)[position as usize];
+    assert!(position < session.buffer_count.load(Relaxed));
+
     // SAFETY: checked against `buffer_count`.
-    let address = unsafe { entry_at(s, position) }.data();
+    let address = unsafe { entry_at(session, position) }.data();
+
     request.status.store(NtStatus::PENDING.0, Relaxed);
     let offset = u64::from(unit) * u64::from(BUFFER_BYTES);
     // SAFETY: the status block, buffer and event belong to request
@@ -1053,7 +1174,7 @@ pub(super) fn read_unit(s: &PixSession, unit: u32, position: u32) -> u32 {
     // until the wait below completes the read.
     unsafe {
         xboxkrnl::NtReadFile(
-            handle(s.stream(StreamId::First)),
+            handle(session.stream(StreamId::First)),
             Handle::from_raw(request.event.load(Relaxed)),
             0,
             0,
@@ -1065,6 +1186,7 @@ pub(super) fn read_unit(s: &PixSession, unit: u32, position: u32) -> u32 {
     };
     let start = cached(address);
     flush(start, start + BUFFER_BYTES);
+
     // SAFETY: the request's event.
     unsafe {
         xboxkrnl::NtWaitForSingleObjectEx(
@@ -1074,5 +1196,6 @@ pub(super) fn read_unit(s: &PixSession, unit: u32, position: u32) -> u32 {
             core::ptr::null(),
         )
     };
+
     start
 }

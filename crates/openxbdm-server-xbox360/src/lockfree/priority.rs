@@ -67,79 +67,7 @@ const _: () = {
     assert!(size_of::<SortedOptions>() == 0x24);
 };
 
-/// Compare descriptor (caller record, 0xc bytes).
-#[repr(C)]
-struct CompareDescriptor {
-    compare: Option<Routine>,
-    hash: Option<Routine>,
-    /// [`CompareDescriptor::SIZE`].
-    size: u32,
-}
-
-impl CompareDescriptor {
-    const SIZE: u32 = size_of::<Self>() as u32;
-}
-
-/// Unsigned order of two keys: -1, 0 or 1.
-extern "C" fn default_compare(left: u32, right: u32) -> u32 {
-    left.cmp(&right) as i32 as u32
-}
-
-/// Bucket of `key` among a power-of-two count of `buckets`.
-extern "C" fn default_hash(key: u32, buckets: u32) -> u32 {
-    let mixed = u64::from(key)
-        .wrapping_mul(SortedOptions::HASH_MULTIPLIER)
-        .wrapping_add(SortedOptions::HASH_INCREMENT);
-    (mixed >> 32) as u32 & buckets.wrapping_sub(1)
-}
-
-/// Options of a sorted container and whether the compare descriptor
-/// supplied a hash routine.
-pub(super) struct Sorted {
-    pub(super) options: SortedOptions,
-    pub(super) custom_hash: bool,
-}
-
 impl SortedOptions {
-    const HASH_MULTIPLIER: u64 = 0xfaf5_7cee_8543_3e40;
-    const HASH_INCREMENT: u64 = 0xfc2d_7230_d92f_2eac;
-
-    /// Options from a creation and the compare descriptor at `compare` (0
-    /// for none): the routines default to unsigned order and
-    /// multiplicative hashing.
-    ///
-    /// # Safety
-    ///
-    /// `compare` is 0 or the address of a compare descriptor (export
-    /// contract), whose routine fields hold console routines.
-    pub(super) unsafe fn read(creation: &Creation, compare: u32) -> Result<Sorted, Error> {
-        let mut options = Self {
-            compare: Routine::from(default_compare as extern "C" fn(u32, u32) -> u32),
-            hash: Routine::from(default_hash as extern "C" fn(u32, u32) -> u32),
-            options: creation.options(),
-        };
-        let mut custom_hash = false;
-        // SAFETY: the caller guarantees the descriptor.
-        let descriptor =
-            unsafe { ptr::with_exposed_provenance::<CompareDescriptor>(compare as usize).as_ref() };
-        if let Some(descriptor) = descriptor {
-            if descriptor.size != CompareDescriptor::SIZE {
-                return Err(Error::InvalidArgument);
-            }
-            if let Some(routine) = descriptor.compare {
-                options.compare = routine;
-            }
-            if let Some(hash) = descriptor.hash {
-                options.hash = hash;
-                custom_hash = true;
-            }
-        }
-        Ok(Sorted {
-            options,
-            custom_hash,
-        })
-    }
-
     /// Wait behavior and search of an insertion.
     pub(super) fn insert_wait(&self) -> (Wait, Search) {
         let flags = self.options.flags;
@@ -148,6 +76,7 @@ impl SortedOptions {
         } else {
             Search::After
         };
+
         (
             self.options
                 .wait_with(flags, Side::Insert)
@@ -159,6 +88,68 @@ impl SortedOptions {
     pub(super) fn remove_wait(&self) -> Wait {
         self.options.wait(Side::Remove).unwrap_or(Wait::NONE)
     }
+}
+
+/// Options of a sorted container and whether the compare descriptor
+/// supplied a hash routine.
+pub(super) struct Sorted {
+    pub(super) options: SortedOptions,
+    pub(super) custom_hash: bool,
+}
+
+impl Sorted {
+    /// Options from a creation and the compare descriptor at `compare` (0
+    /// for none): the routines default to unsigned order and
+    /// multiplicative hashing.
+    ///
+    /// # Safety
+    ///
+    /// `compare` is 0 or the address of a compare descriptor (export
+    /// contract), whose routine fields hold console routines.
+    pub(super) unsafe fn from_creation(creation: &Creation, compare: u32) -> Result<Self, Error> {
+        let mut options = SortedOptions {
+            compare: Routine::from(default_compare as extern "C" fn(u32, u32) -> u32),
+            hash: Routine::from(default_hash as extern "C" fn(u32, u32) -> u32),
+            options: creation.options(),
+        };
+        let mut custom_hash = false;
+
+        // SAFETY: the caller guarantees the descriptor.
+        let descriptor =
+            unsafe { ptr::with_exposed_provenance::<CompareDescriptor>(compare as usize).as_ref() };
+        if let Some(descriptor) = descriptor {
+            if descriptor.size != CompareDescriptor::SIZE {
+                return Err(Error::InvalidArgument);
+            }
+
+            if let Some(routine) = descriptor.compare {
+                options.compare = routine;
+            }
+
+            if let Some(hash) = descriptor.hash {
+                options.hash = hash;
+                custom_hash = true;
+            }
+        }
+
+        Ok(Self {
+            options,
+            custom_hash,
+        })
+    }
+}
+
+/// Compare descriptor (caller record, 0xc bytes).
+#[repr(C)]
+struct CompareDescriptor {
+    compare: Option<Routine>,
+    hash: Option<Routine>,
+    /// [`CompareDescriptor::SIZE`].
+    size: u32,
+}
+
+impl CompareDescriptor {
+    const SIZE: u32 = size_of::<Self>() as u32;
 }
 
 /// Search mode of a list walk.
@@ -186,8 +177,10 @@ enum Outcome {
 /// link, and the link of `current`.
 struct Position<'a> {
     outcome: Outcome,
+
     previous: &'a ListNode,
     link: Tagged,
+
     current: Option<NodeAddress>,
     next: Tagged,
 }
@@ -255,9 +248,11 @@ impl<'a> SortedList<'a> {
     fn find(&self, key: Key, search: Search) -> Position<'a> {
         let mut next = Tagged(0);
         let mut visited = false;
+
         'restart: loop {
             let mut previous = self.sentinel();
             let mut link = previous.next.load();
+
             loop {
                 let Some(current) = link.address() else {
                     let outcome = if visited {
@@ -265,6 +260,7 @@ impl<'a> SortedList<'a> {
                     } else {
                         Outcome::Empty
                     };
+
                     return Position {
                         outcome,
                         previous,
@@ -273,6 +269,7 @@ impl<'a> SortedList<'a> {
                         next,
                     };
                 };
+
                 let current_node = self.node(current);
                 next = current_node.next.load();
                 visited = true;
@@ -280,6 +277,7 @@ impl<'a> SortedList<'a> {
                 if link.is_deleted() || previous.next.load() != link {
                     continue 'restart;
                 }
+
                 if next.is_deleted() {
                     if !previous
                         .next
@@ -287,8 +285,10 @@ impl<'a> SortedList<'a> {
                     {
                         continue 'restart;
                     }
+
                     // SAFETY: the exchange unlinked the deleted node.
                     unsafe { self.nodes.release_node(current) };
+
                     // Stock keeps the deleted node's mark in the expected
                     // link, so the walk restarts unless the list ends here.
                     link = Tagged::new(
@@ -299,6 +299,7 @@ impl<'a> SortedList<'a> {
                     next = link;
                     continue;
                 }
+
                 let outcome = match search {
                     Search::First => Outcome::Found,
                     Search::After if self.compare(key, current_key) >= 0 => {
@@ -317,6 +318,7 @@ impl<'a> SortedList<'a> {
                         _ => Outcome::Missing,
                     },
                 };
+
                 return Position {
                     outcome,
                     previous,
@@ -331,6 +333,7 @@ impl<'a> SortedList<'a> {
     /// Insert an item; with unique keys a present key fails.
     pub(super) fn insert(&self, item: Item, wait: &Wait, search: Search) -> Result<(), Error> {
         let address = self.nodes.acquire_node(wait)?;
+
         let node = self.node(address);
         node.next.high.store(0, Relaxed);
         node.next.low.store(
@@ -339,6 +342,7 @@ impl<'a> SortedList<'a> {
         );
         node.item.high.store(item.value, Relaxed);
         node.item.low.store(item.key.0, Relaxed);
+
         loop {
             let position = self.find(item.key, search);
             if position.outcome == Outcome::Found {
@@ -346,6 +350,7 @@ impl<'a> SortedList<'a> {
                 unsafe { self.nodes.release_node(address) };
                 return Err(Error::DuplicateKey);
             }
+
             node.next
                 .high
                 .store(position.current.map_or(0, NodeAddress::raw), Relaxed);
@@ -360,8 +365,10 @@ impl<'a> SortedList<'a> {
                 break;
             }
         }
+
         self.nodes.count_added();
         self.nodes.signal_item();
+
         Ok(())
     }
 
@@ -369,10 +376,12 @@ impl<'a> SortedList<'a> {
     /// its item there.
     fn try_remove(&self, item: &mut Item, search: Search) -> Outcome {
         let mut position = self.find(item.key, search);
+
         loop {
             let (Outcome::Found, Some(current)) = (position.outcome, position.current) else {
                 return position.outcome;
             };
+
             let node = self.node(current);
             let removed = node.item.load();
             let next = position.next;
@@ -389,12 +398,14 @@ impl<'a> SortedList<'a> {
                 } else {
                     self.find(item.key, search);
                 }
+
                 *item = Item {
                     value: removed.high(),
                     key: Key(removed.low()),
                 };
                 return Outcome::Found;
             }
+
             position = self.find(item.key, search);
         }
     }
@@ -411,16 +422,20 @@ impl<'a> SortedList<'a> {
     ) -> Result<(), Error> {
         let nodes = self.nodes;
         let mut attempt = || self.try_remove(item, search);
+
         let found = 'found: {
             let Some(semaphore) = nodes.item_semaphore() else {
                 break 'found attempt() == Outcome::Found;
             };
+
             if attempt() == Outcome::Found {
                 break 'found true;
             }
+
             if blocking == Blocking::Once {
                 break 'found false;
             }
+
             let mut backoff = Backoff::new();
             if wait.spin {
                 for _ in 0..Backoff::SPIN_ATTEMPTS {
@@ -430,17 +445,21 @@ impl<'a> SortedList<'a> {
                     }
                 }
             }
+
             let waiters = &nodes.supply().waiters;
             waiters.fetch_add_relaxed(1);
+
             let mut outcome = attempt();
             while outcome != Outcome::Found {
                 if wait.spin {
                     backoff.pause();
                 }
+
                 if let Err(error) = wait.block(semaphore) {
                     waiters.fetch_add_relaxed(1_u32.wrapping_neg());
                     return Err(error);
                 }
+
                 outcome = attempt();
                 let pass_on = match handoff {
                     Handoff::Missing => outcome == Outcome::Missing,
@@ -450,13 +469,17 @@ impl<'a> SortedList<'a> {
                     semaphore.release(1);
                 }
             }
+
             waiters.fetch_add_relaxed(1_u32.wrapping_neg());
+
             true
         };
         if !found {
             return Err(Error::Timeout);
         }
+
         nodes.count_removed();
+
         Ok(())
     }
 
@@ -469,6 +492,7 @@ impl<'a> SortedList<'a> {
     /// nonzero.
     pub(super) fn enumerate(&self, context: u32, callback: Routine) -> Result<(), Error> {
         let first = self.sentinel().next.high.load(Relaxed);
+
         // SAFETY: the nodes linked in this list (module invariants).
         unsafe { walk(first, NodeWord::Word2, context, callback) }
     }
@@ -512,10 +536,29 @@ impl PriorityQueue {
         let nodes = self.0.nodes();
         let list = self.list(&nodes);
         let wait = list.options.remove_wait();
+
         let mut item = Item { value: 0, key };
         list.remove(&mut item, &wait, search, Blocking::Wait, Handoff::Missing)?;
+
         Ok(item.value)
     }
+}
+
+/// Unsigned order of two keys: -1, 0 or 1.
+extern "C" fn default_compare(left: u32, right: u32) -> u32 {
+    left.cmp(&right) as i32 as u32
+}
+
+/// Bucket of `key` among a power-of-two count of `buckets`.
+extern "C" fn default_hash(key: u32, buckets: u32) -> u32 {
+    const MULTIPLIER: u64 = 0xfaf5_7cee_8543_3e40;
+    const INCREMENT: u64 = 0xfc2d_7230_d92f_2eac;
+
+    let mixed = u64::from(key)
+        .wrapping_mul(MULTIPLIER)
+        .wrapping_add(INCREMENT);
+
+    (mixed >> 32) as u32 & buckets.wrapping_sub(1)
 }
 
 extern "C" fn insert(queue: u32, key: u32, value: u32) -> Hresult {
@@ -524,9 +567,11 @@ extern "C" fn insert(queue: u32, key: u32, value: u32) -> Hresult {
     let Some(queue) = (unsafe { PriorityQueue::from_handle(queue) }) else {
         return Hresult::INVALID_ARGUMENT;
     };
+
     let nodes = queue.0.nodes();
     let list = queue.list(&nodes);
     let (wait, search) = list.options.insert_wait();
+
     insert_result(list.insert(
         Item {
             value,
@@ -547,6 +592,7 @@ extern "C" fn memory(queue: u32, output_word: u32) -> Hresult {
             OutputWord::new(output_word),
         )
     };
+
     report(
         queue.map(|queue| queue.0.supply.memory.load(Relaxed)),
         output_word,
@@ -560,12 +606,15 @@ extern "C" fn create(descriptor: u32, compare: u32, output_word: u32) -> Hresult
     let Some(output_word) = (unsafe { OutputWord::new(output_word) }) else {
         return Hresult::INVALID_ARGUMENT;
     };
+
     output_word.store(0);
+
     // SAFETY: export 322 contract: `descriptor` is 0 or a creation
     // descriptor and `compare` 0 or a compare descriptor.
-    let created = unsafe { Creation::read(descriptor) }.and_then(|creation| {
+    let created = unsafe { Creation::from_address(descriptor) }.and_then(|creation| {
         // SAFETY: as above.
-        let sorted = unsafe { SortedOptions::read(&creation, compare) }?;
+        let sorted = unsafe { Sorted::from_creation(&creation, compare) }?;
+
         Queue::create(
             &creation,
             Signature::PRIORITY_QUEUE,
@@ -587,6 +636,7 @@ extern "C" fn destroy(queue: u32) -> u32 {
     // SAFETY: export 323 contract: `queue` is 0 or a priority queue of
     // export 322 on which no other operation runs.
     unsafe { Queue::destroy_with(queue, Signature::PRIORITY_QUEUE) };
+
     1
 }
 export!(323, destroy);
@@ -599,6 +649,7 @@ extern "C" fn count(queue: u32, output_word: u32) -> Hresult {
             OutputWord::new(output_word),
         )
     };
+
     report(
         queue.map(|queue| queue.0.nodes().count().load(Relaxed)),
         output_word,
@@ -635,6 +686,7 @@ unsafe fn remove(queue: u32, key: Key, search: Search, output_word: u32) -> Hres
     let Some(queue) = queue else {
         return Hresult::INVALID_ARGUMENT;
     };
+
     removed(queue.take(key, search), output_word)
 }
 
@@ -658,12 +710,15 @@ extern "C" fn enumerate(queue: u32, context: u32, callback: u32) -> Hresult {
     let Some(callback) = (unsafe { Routine::new(callback) }) else {
         return success_result(Err(Error::InvalidArgument));
     };
+
     // SAFETY: export 328 contract: `queue` is 0 or a priority queue of
     // export 322.
     let Some(queue) = (unsafe { PriorityQueue::from_handle(queue) }) else {
         return success_result(Err(Error::InvalidArgument));
     };
+
     let nodes = queue.0.nodes();
+
     success_result(queue.list(&nodes).enumerate(context, callback))
 }
 export!(328, enumerate);

@@ -3,6 +3,8 @@
 //! does. IPTV settings go through the console domain's configuration
 //! store.
 
+mod error;
+
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::NtStatus;
 use openxbdm_server::commands;
@@ -28,29 +30,123 @@ use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::FirmwareRequest;
 use xbox360_sys::xboxkrnl::ThreadCreationFlags;
 
+use self::error::Unresolved;
 use super::Console;
 use crate::kernel;
 
-/// Why a XAM export could not be called. The failure is stored as the
-/// calling thread's last error, as stock stores it.
-#[derive(Debug)]
-enum Unresolved {
-    /// xam.xex is not loaded.
-    Module,
-    /// The export is absent.
-    Export,
-}
+impl commands::services::Backend for Console {
+    fn start_civ_failure_thread(&mut self, reboot: bool) -> Result<ThreadHandle, LastError> {
+        /// Stock's creation flags of the thread.
+        const FLAGS: ThreadCreationFlags = ThreadCreationFlags::PRIORITY_CLASS_13;
 
-impl core::fmt::Display for Unresolved {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            Unresolved::Module => "xam.xex is not loaded",
-            Unresolved::Export => "the XAM export is absent",
+        let mut handle = 0u32;
+        let mut thread_id = 0u32;
+        // SAFETY: `handle` and `thread_id` are live locals; `failure_thread`
+        // has the thread start signature.
+        let status = unsafe {
+            xboxkrnl::ExCreateThread(
+                &mut handle,
+                0,
+                &mut thread_id,
+                0,
+                failure_thread as *const () as usize as u32,
+                u32::from(reboot),
+                FLAGS,
+            )
+        };
+
+        // Thread creation does not set the last error; stock reports
+        // whatever the thread held before.
+        if !status.is_success() || handle == 0 {
+            return Err(stored_last_error());
+        }
+
+        Ok(ThreadHandle(handle))
+    }
+
+    fn inject_civ_errors(&mut self, hash_errors: u32, read_errors: u32) {
+        let Ok(function) = xam_export(xam::ordinal::MEDIA_VERIFICATION_INJECT) else {
+            return;
+        };
+
+        // SAFETY: the export takes two dword arguments.
+        unsafe { kernel::call_export(function, hash_errors, read_errors, 0, 0) };
+    }
+
+    fn update_civ_detection(
+        &mut self,
+        bit: Option<DetectionBit>,
+    ) -> Result<DetectionUpdate, DetectionRoutineMissing> {
+        let ([set, get, initialize, save], last_status) = detection_exports()?;
+
+        // SAFETY: the detection exports take at most one dword argument.
+        unsafe {
+            let old_mask = DetectionMask(kernel::call_export(get, 0, 0, 0, 0));
+
+            kernel::call_export(initialize, 0, 0, 0, 0);
+            kernel::call_export(save, 0, 0, 0, 0);
+
+            let status = bit.map_or(last_status, |bit| {
+                NtStatus(kernel::call_export(set, bit.0, 0, 0, 0))
+            });
+
+            let new_mask = DetectionMask(kernel::call_export(get, 0, 0, 0, 0));
+
+            Ok(DetectionUpdate {
+                status,
+                old_mask,
+                new_mask,
+            })
+        }
+    }
+
+    fn create_civ_process(&mut self, thread_id: u32) -> CivResult {
+        call_reporting(xam::ordinal::MEDIA_VERIFICATION_CREATE, thread_id, 0, 0)
+    }
+
+    fn close_civ_process(&mut self) {
+        let Ok(function) = xam_export(xam::ordinal::MEDIA_VERIFICATION_CLOSE) else {
+            return;
+        };
+
+        // SAFETY: the export takes no arguments.
+        unsafe { kernel::call_export(function, 0, 0, 0, 0) };
+    }
+
+    fn verify_civ(&mut self, milliseconds: u32) -> CivResult {
+        call_reporting(xam::ordinal::MEDIA_VERIFICATION_VERIFY, milliseconds, 0, 0)
+    }
+
+    fn civ_progress(&mut self) -> Result<CivProgress, CivResult> {
+        let mut record = MediaVerificationFailedBlocks::new();
+
+        match xam_export(xam::ordinal::MEDIA_VERIFICATION_FAILED_BLOCKS) {
+            Ok(function) => {
+                let address = core::ptr::from_mut(&mut record).expose_provenance() as u32;
+                // SAFETY: the export fills the record it is given, which is a
+                // live local of the size its first word states.
+                let result = unsafe { kernel::call_export(function, address, 0, 0, 0) };
+                if result != 0 {
+                    return Err(CivResult::Returned(Hresult(result)));
+                }
+            }
+            Err(Unresolved::Module) => return Err(CivResult::NoModule(stored_last_error())),
+            Err(Unresolved::Export) => match stored_last_error() {
+                // Without the export the verification counts as complete.
+                LastError::ProcNotFound => record.completed = 1,
+                error => return Err(CivResult::NoExport(error)),
+            },
+        }
+
+        Ok(CivProgress {
+            failed_reads: record.failed_reads,
+            failed_hashes: record.failed_hashes,
+            blocks_checked: record.blocks_checked,
+            total_blocks: record.total_blocks,
+            completed: record.completed != 0,
         })
     }
 }
-
-impl core::error::Error for Unresolved {}
 
 /// The calling thread's last error.
 fn stored_last_error() -> LastError {
@@ -63,6 +159,7 @@ fn xam_export(ordinal: Ordinal) -> Result<u32, Unresolved> {
         set_last_error(error);
         Unresolved::Module
     })?;
+
     resolve_export(module, ordinal)
         .map(ExportAddress::raw)
         .map_err(|error| {
@@ -94,12 +191,15 @@ extern "C" fn failure_thread(context: u32) -> u32 {
         Ok(function) => unsafe {
             kernel::call_export(function, UserIndex::Any.raw(), 0, 0, 0);
         },
+        // Without the export the reboot request still applies.
         Err(Unresolved::Export) => {}
     }
+
     if context != 0 {
         // SAFETY: the civfail thread reboots by request; no state survives.
         unsafe { xboxkrnl::HalReturnToFirmware(FirmwareRequest::Reboot) };
     }
+
     0
 }
 
@@ -113,8 +213,10 @@ fn detection_exports() -> Result<([u32; 4], NtStatus), DetectionRoutineMissing> 
             routine: DetectionRoutine::SetDetected,
             error,
         })?;
+
     let mut addresses = [0u32; 4];
     let mut last_status = NtStatus::SUCCESS;
+
     for (address, routine) in addresses.iter_mut().zip(DetectionRoutine::ORDER) {
         // SAFETY: `address` is a live array element.
         let status = unsafe {
@@ -125,106 +227,6 @@ fn detection_exports() -> Result<([u32; 4], NtStatus), DetectionRoutineMissing> 
             .map_err(|error| DetectionRoutineMissing { routine, error })?;
         last_status = status;
     }
+
     Ok((addresses, last_status))
-}
-
-impl commands::services::Backend for Console {
-    fn start_civ_failure_thread(&mut self, reboot: bool) -> Result<ThreadHandle, LastError> {
-        /// Stock's creation flags of the thread.
-        const FLAGS: ThreadCreationFlags = ThreadCreationFlags::PRIORITY_CLASS_13;
-        let mut handle = 0u32;
-        let mut thread_id = 0u32;
-        // SAFETY: `handle` and `thread_id` are live locals; `failure_thread`
-        // has the thread start signature.
-        let status = unsafe {
-            xboxkrnl::ExCreateThread(
-                &mut handle,
-                0,
-                &mut thread_id,
-                0,
-                failure_thread as *const () as usize as u32,
-                u32::from(reboot),
-                FLAGS,
-            )
-        };
-        // Thread creation does not set the last error; stock reports
-        // whatever the thread held before.
-        if !status.is_success() || handle == 0 {
-            Err(stored_last_error())
-        } else {
-            Ok(ThreadHandle(handle))
-        }
-    }
-
-    fn inject_civ_errors(&mut self, hash_errors: u32, read_errors: u32) {
-        if let Ok(function) = xam_export(xam::ordinal::MEDIA_VERIFICATION_INJECT) {
-            // SAFETY: the export takes two dword arguments.
-            unsafe { kernel::call_export(function, hash_errors, read_errors, 0, 0) };
-        }
-    }
-
-    fn update_civ_detection(
-        &mut self,
-        bit: Option<DetectionBit>,
-    ) -> Result<DetectionUpdate, DetectionRoutineMissing> {
-        let ([set, get, initialize, save], last_status) = detection_exports()?;
-        // SAFETY: the detection exports take at most one dword argument.
-        unsafe {
-            let old_mask = DetectionMask(kernel::call_export(get, 0, 0, 0, 0));
-            kernel::call_export(initialize, 0, 0, 0, 0);
-            kernel::call_export(save, 0, 0, 0, 0);
-            let status = bit.map_or(last_status, |bit| {
-                NtStatus(kernel::call_export(set, bit.0, 0, 0, 0))
-            });
-            let new_mask = DetectionMask(kernel::call_export(get, 0, 0, 0, 0));
-            Ok(DetectionUpdate {
-                status,
-                old_mask,
-                new_mask,
-            })
-        }
-    }
-
-    fn create_civ_process(&mut self, thread_id: u32) -> CivResult {
-        call_reporting(xam::ordinal::MEDIA_VERIFICATION_CREATE, thread_id, 0, 0)
-    }
-
-    fn close_civ_process(&mut self) {
-        if let Ok(function) = xam_export(xam::ordinal::MEDIA_VERIFICATION_CLOSE) {
-            // SAFETY: the export takes no arguments.
-            unsafe { kernel::call_export(function, 0, 0, 0, 0) };
-        }
-    }
-
-    fn verify_civ(&mut self, milliseconds: u32) -> CivResult {
-        call_reporting(xam::ordinal::MEDIA_VERIFICATION_VERIFY, milliseconds, 0, 0)
-    }
-
-    fn civ_progress(&mut self) -> Result<CivProgress, CivResult> {
-        let mut record = MediaVerificationFailedBlocks::new();
-        match xam_export(xam::ordinal::MEDIA_VERIFICATION_FAILED_BLOCKS) {
-            Ok(function) => {
-                let address = core::ptr::from_mut(&mut record).expose_provenance() as u32;
-                // SAFETY: the export fills the record it is given, which is a
-                // live local of the size its first word states.
-                let result = unsafe { kernel::call_export(function, address, 0, 0, 0) };
-                if result != 0 {
-                    return Err(CivResult::Returned(Hresult(result)));
-                }
-            }
-            Err(Unresolved::Module) => return Err(CivResult::NoModule(stored_last_error())),
-            Err(Unresolved::Export) => match stored_last_error() {
-                // Without the export the verification counts as complete.
-                LastError::ProcNotFound => record.completed = 1,
-                error => return Err(CivResult::NoExport(error)),
-            },
-        }
-        Ok(CivProgress {
-            failed_reads: record.failed_reads,
-            failed_hashes: record.failed_hashes,
-            blocks_checked: record.blocks_checked,
-            total_blocks: record.total_blocks,
-            completed: record.completed != 0,
-        })
-    }
 }

@@ -44,6 +44,13 @@ use super::success_result;
 use super::walk;
 use crate::exports::export;
 
+static LAYOUT: Layout = Layout {
+    node_size: size_of::<ListNode>() as u32,
+    link: NodeWord::Word2,
+    semaphores: SemaphoreKind::Object,
+    items: ItemOrder::SemaphoreFirst,
+};
+
 /// Queue object (caller-visible, 0x80 bytes, then the allocator record and
 /// the options).
 #[repr(C, align(8))]
@@ -56,8 +63,10 @@ pub(crate) struct Queue {
     pub(super) head: DoubleWord,
     pub(super) supply: Supply,
     pub(super) signature: AtomicU32,
+
     item_object: Ksemaphore,
     free_object: Ksemaphore,
+
     /// Base of the allocation that holds the queue.
     allocation: AtomicU32,
     /// Address of the allocator record after the queue.
@@ -67,7 +76,6 @@ pub(crate) struct Queue {
 }
 
 const _: () = {
-    use core::mem::offset_of;
     assert!(offset_of!(Queue, tail) == 0x08);
     assert!(offset_of!(Queue, head) == 0x10);
     assert!(offset_of!(Queue, supply) == 0x18);
@@ -80,42 +88,7 @@ const _: () = {
     assert!(size_of::<Queue>() == 0x80);
 };
 
-static LAYOUT: Layout = Layout {
-    node_size: size_of::<ListNode>() as u32,
-    link: NodeWord::Word2,
-    semaphores: SemaphoreKind::Object,
-    items: ItemOrder::SemaphoreFirst,
-};
-
-/// Options a queue-layout object keeps after its allocator record.
-pub(super) enum Kept<'a> {
-    Nothing,
-    Options(&'a OptionsRecord),
-    Sorted(&'a SortedOptions),
-}
-
-impl Kept<'_> {
-    /// The bytes of the kept record.
-    fn bytes(&self) -> &[u8] {
-        let (data, size) = match self {
-            Self::Nothing => return &[],
-            Self::Options(options) => (
-                ptr::from_ref(*options).cast::<u8>(),
-                size_of::<OptionsRecord>(),
-            ),
-            Self::Sorted(options) => (
-                ptr::from_ref(*options).cast::<u8>(),
-                size_of::<SortedOptions>(),
-            ),
-        };
-        // SAFETY: both records are words without padding.
-        unsafe { slice::from_raw_parts(data, size) }
-    }
-}
-
 impl Queue {
-    const SIZE: u32 = size_of::<Self>() as u32;
-
     /// The queue at `handle`.
     ///
     /// # Safety
@@ -135,6 +108,137 @@ impl Queue {
     pub(super) unsafe fn with_signature<'a>(handle: u32, signature: Signature) -> Option<&'a Self> {
         // SAFETY: the caller guarantees the object.
         unsafe { container(handle, signature, offset_of!(Self, signature)) }
+    }
+
+    /// Create a queue that keeps the descriptor's options when any is set;
+    /// its handle.
+    pub(crate) fn create_with(creation: &Creation) -> Result<NonZeroU32, Error> {
+        let kept = creation.kept_options().map_or(Kept::Nothing, Kept::Options);
+        let queue = Self::create(creation, Signature::QUEUE, kept)?;
+
+        // SAFETY: a reference is not null.
+        Ok(unsafe { NonZeroU32::new_unchecked(queue.handle()) })
+    }
+
+    /// Create a queue-layout object with `signature`, its sentinel node and
+    /// the `kept` options.
+    pub(super) fn create(
+        creation: &Creation,
+        signature: Signature,
+        kept: Kept<'_>,
+    ) -> Result<&'static Self, Error> {
+        const SIZE: u32 = size_of::<Queue>() as u32;
+
+        let kept = kept.bytes();
+        let memory = AtomicU32::new(0);
+        let allocation = creation
+            .allocator
+            .allocate_aligned(SIZE + AllocatorRecord::SIZE + kept.len() as u32, &memory)
+            .ok_or(Error::NotEnoughMemory)?;
+
+        let object = ptr::with_exposed_provenance_mut::<Self>(allocation.aligned.get() as usize);
+        // SAFETY: the new allocation holds the object, the allocator record
+        // and the kept options, aligned to 128 bytes; zero bytes are a valid
+        // queue.
+        let queue = unsafe {
+            object.write_bytes(0, 1);
+            &*object
+        };
+        queue.allocation.store(allocation.base, Relaxed);
+        queue.supply.memory.store(memory.load(Relaxed), Relaxed);
+
+        let record = object.wrapping_add(1).cast::<AllocatorRecord>();
+        queue
+            .allocator
+            .store(record.expose_provenance() as u32, Relaxed);
+        let options = record.wrapping_add(1).cast::<u8>();
+        // SAFETY: the record follows the object inside the allocation.
+        unsafe { record.write(creation.allocator) };
+        if !kept.is_empty() {
+            queue
+                .options
+                .store(options.expose_provenance() as u32, Relaxed);
+        }
+
+        let counts = creation.counts(LAYOUT.node_size);
+        queue.supply.per_block.store(counts.per_block, Relaxed);
+        queue.supply.remaining.set(counts.limit);
+
+        let nodes = queue.nodes();
+        if creation.item_wait() {
+            initialize_semaphore(&queue.item_object, nodes.item_words().semaphore);
+        }
+
+        if creation.free_wait() && counts.limit.is_some() {
+            initialize_semaphore(&queue.free_object, &queue.supply.free_semaphore);
+        }
+
+        let Some(sentinel) = nodes.grow() else {
+            creation.allocator.free(allocation.base);
+            return Err(Error::NotEnoughMemory);
+        };
+
+        if nodes.free_semaphore().is_some() {
+            let credits = &queue.supply.credits;
+            credits.store(credits.load(Relaxed).wrapping_sub(1), Relaxed);
+        }
+
+        // SAFETY: the first node of the new block.
+        let node = unsafe { sentinel.get::<ListNode, _>(queue) };
+        node.next.high.store(0, Relaxed);
+        node.next.low.store(0, Relaxed);
+
+        for end in [&queue.head, &queue.tail] {
+            end.high.store(sentinel.raw(), Relaxed);
+            end.low.store(0, Relaxed);
+        }
+
+        queue.signature.store(signature.0, Relaxed);
+        lwsync();
+
+        // Stock copies the options after the barrier that publishes the
+        // queue, before it returns the handle.
+        // SAFETY: the kept bytes follow the record inside the allocation.
+        unsafe { ptr::copy_nonoverlapping(kept.as_ptr(), options, kept.len()) };
+
+        Ok(queue)
+    }
+
+    /// Clear the signature of the queue-layout object at `handle` and free
+    /// it; whether it carried `signature`.
+    ///
+    /// # Safety
+    ///
+    /// `handle` is 0 or the address of a queue-layout object (export
+    /// contract) on which no other operation runs, now or later.
+    pub(super) unsafe fn destroy_with(handle: u32, signature: Signature) -> bool {
+        // SAFETY: the caller guarantees the object. The reference is not
+        // used once the object is freed.
+        let Some(queue) =
+            (unsafe { claim::<Self>(handle, signature, offset_of!(Self, signature)) })
+        else {
+            return false;
+        };
+
+        let allocation = queue.allocation.load(Relaxed);
+        let allocator = *queue.nodes().allocator();
+        // SAFETY: the block list of the queue, which no operation uses
+        // anymore.
+        unsafe { allocator.free_blocks(&queue.supply.blocks) };
+        allocator.free(allocation);
+        lwsync();
+
+        true
+    }
+
+    /// Free the queue at `handle`.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Queue::destroy_with`].
+    pub(crate) unsafe fn destroy(handle: u32) {
+        // SAFETY: the caller guarantees the queue.
+        unsafe { Self::destroy_with(handle, Signature::QUEUE) };
     }
 
     /// The address callers know the queue by.
@@ -162,132 +266,17 @@ impl Queue {
 
     fn options(&self) -> Option<&OptionsRecord> {
         let address = self.options.load(Relaxed);
+
         // SAFETY: a nonzero options word of a queue holds the address of the
         // options record creation wrote after the allocator record.
         unsafe { ptr::with_exposed_provenance::<OptionsRecord>(address as usize).as_ref() }
-    }
-
-    /// Create a queue that keeps the descriptor's options when any is set;
-    /// its handle.
-    pub(crate) fn create_with(creation: &Creation) -> Result<NonZeroU32, Error> {
-        let kept = creation.kept_options().map_or(Kept::Nothing, Kept::Options);
-        let queue = Self::create(creation, Signature::QUEUE, kept)?;
-        // SAFETY: a reference is not null.
-        Ok(unsafe { NonZeroU32::new_unchecked(queue.handle()) })
-    }
-
-    /// Create a queue-layout object with `signature`, its sentinel node and
-    /// the `kept` options.
-    pub(super) fn create(
-        creation: &Creation,
-        signature: Signature,
-        kept: Kept<'_>,
-    ) -> Result<&'static Self, Error> {
-        let kept = kept.bytes();
-        let memory = AtomicU32::new(0);
-        let allocation = creation
-            .allocator
-            .allocate_aligned(
-                Self::SIZE + AllocatorRecord::SIZE + kept.len() as u32,
-                &memory,
-            )
-            .ok_or(Error::NotEnoughMemory)?;
-        let object = ptr::with_exposed_provenance_mut::<Self>(allocation.aligned.get() as usize);
-        // SAFETY: the new allocation holds the object, the allocator record
-        // and the kept options, aligned to 128 bytes; zero bytes are a valid
-        // queue.
-        let queue = unsafe {
-            object.write_bytes(0, 1);
-            &*object
-        };
-        queue.allocation.store(allocation.base, Relaxed);
-        queue.supply.memory.store(memory.load(Relaxed), Relaxed);
-        let record = object.wrapping_add(1).cast::<AllocatorRecord>();
-        queue
-            .allocator
-            .store(record.expose_provenance() as u32, Relaxed);
-        let options = record.wrapping_add(1).cast::<u8>();
-        // SAFETY: the record follows the object inside the allocation.
-        unsafe { record.write(creation.allocator) };
-        if !kept.is_empty() {
-            queue
-                .options
-                .store(options.expose_provenance() as u32, Relaxed);
-        }
-        let counts = creation.counts(LAYOUT.node_size);
-        queue.supply.per_block.store(counts.per_block, Relaxed);
-        queue.supply.remaining.set(counts.limit);
-        let nodes = queue.nodes();
-        if creation.item_wait() {
-            initialize_semaphore(&queue.item_object, nodes.item_words().0);
-        }
-        if creation.free_wait() && counts.limit.is_some() {
-            initialize_semaphore(&queue.free_object, &queue.supply.free_semaphore);
-        }
-        let Some(sentinel) = nodes.grow() else {
-            creation.allocator.free(allocation.base);
-            return Err(Error::NotEnoughMemory);
-        };
-        if nodes.free_semaphore().is_some() {
-            let credits = &queue.supply.credits;
-            credits.store(credits.load(Relaxed).wrapping_sub(1), Relaxed);
-        }
-        // SAFETY: the first node of the new block.
-        let node = unsafe { sentinel.get::<ListNode, _>(queue) };
-        node.next.high.store(0, Relaxed);
-        node.next.low.store(0, Relaxed);
-        for end in [&queue.head, &queue.tail] {
-            end.high.store(sentinel.raw(), Relaxed);
-            end.low.store(0, Relaxed);
-        }
-        queue.signature.store(signature.0, Relaxed);
-        lwsync();
-        // Stock copies the options after the barrier that publishes the
-        // queue, before it returns the handle.
-        // SAFETY: the kept bytes follow the record inside the allocation.
-        unsafe { ptr::copy_nonoverlapping(kept.as_ptr(), options, kept.len()) };
-        Ok(queue)
-    }
-
-    /// Clear the signature of the queue-layout object at `handle` and free
-    /// it; whether it carried `signature`.
-    ///
-    /// # Safety
-    ///
-    /// `handle` is 0 or the address of a queue-layout object (export
-    /// contract) on which no other operation runs, now or later.
-    pub(super) unsafe fn destroy_with(handle: u32, signature: Signature) -> bool {
-        // SAFETY: the caller guarantees the object. The reference is not
-        // used once the object is freed.
-        let Some(queue) =
-            (unsafe { claim::<Self>(handle, signature, offset_of!(Self, signature)) })
-        else {
-            return false;
-        };
-        let allocation = queue.allocation.load(Relaxed);
-        let allocator = *queue.nodes().allocator();
-        // SAFETY: the block list of the queue, which no operation uses
-        // anymore.
-        unsafe { allocator.free_blocks(&queue.supply.blocks) };
-        allocator.free(allocation);
-        lwsync();
-        true
-    }
-
-    /// Free the queue at `handle`.
-    ///
-    /// # Safety
-    ///
-    /// As for [`Queue::destroy_with`].
-    pub(crate) unsafe fn destroy(handle: u32) {
-        // SAFETY: the caller guarantees the queue.
-        unsafe { Self::destroy_with(handle, Signature::QUEUE) };
     }
 
     /// Link `value` behind the tail.
     fn append(&self, value: u32, wait: &Wait) -> Result<(), Error> {
         let nodes = self.nodes();
         let address = nodes.acquire_node(wait)?;
+
         // SAFETY: a node of this queue's supply.
         let node = unsafe { address.get::<ListNode, _>(self) };
         node.item.high.store(value, Relaxed);
@@ -297,6 +286,7 @@ impl Queue {
             (node.next.low.load(Relaxed) & !Tagged::DELETED).wrapping_add(1),
             Relaxed,
         );
+
         loop {
             let last = self.tail.load();
             // SAFETY: read from the tail.
@@ -305,11 +295,13 @@ impl Queue {
             if self.tail.load() != last {
                 continue;
             }
+
             if next.high() != 0 {
                 self.tail
                     .compare_exchange(last, last.successor(next.high()));
                 continue;
             }
+
             if last_node
                 .next
                 .compare_exchange(next, next.successor(address.raw()))
@@ -319,8 +311,10 @@ impl Queue {
                 break;
             }
         }
+
         nodes.signal_item();
         nodes.count_added();
+
         Ok(())
     }
 
@@ -334,16 +328,20 @@ impl Queue {
             if self.head.load() != first {
                 continue;
             }
+
             if first.high() == last.high() {
                 if next == 0 {
                     return None;
                 }
+
                 self.tail.compare_exchange(last, last.successor(next));
                 continue;
             }
+
             let Some(next) = NodeAddress::new(next) else {
                 continue;
             };
+
             // SAFETY: a node linked in this queue (module invariants).
             let value = unsafe { next.get::<ListNode, _>(self) }
                 .item
@@ -372,6 +370,7 @@ impl Queue {
             .options()
             .and_then(|options| options.wait(Side::Insert))
             .unwrap_or(Wait::NONE);
+
         self.append(value, &wait)
     }
 
@@ -388,7 +387,9 @@ impl Queue {
             }
             _ => self.take().ok_or(Error::Timeout)?,
         };
+
         nodes.count_removed();
+
         Ok(value)
     }
 
@@ -402,12 +403,15 @@ impl Queue {
             if self.head.load() != first {
                 continue;
             }
+
             if first.high() != last.high() {
                 return false;
             }
+
             if next == 0 {
                 return true;
             }
+
             self.tail.compare_exchange(last, last.successor(next));
         }
     }
@@ -420,8 +424,36 @@ impl Queue {
             .next
             .high
             .load(Relaxed);
+
         // SAFETY: the nodes linked in this queue (module invariants).
         unsafe { walk(first, NodeWord::Word2, context, callback) }
+    }
+}
+
+/// Options a queue-layout object keeps after its allocator record.
+pub(super) enum Kept<'a> {
+    Nothing,
+    Options(&'a OptionsRecord),
+    Sorted(&'a SortedOptions),
+}
+
+impl Kept<'_> {
+    /// The bytes of the kept record.
+    fn bytes(&self) -> &[u8] {
+        let (data, size) = match self {
+            Self::Nothing => return &[],
+            Self::Options(options) => (
+                ptr::from_ref(*options).cast::<u8>(),
+                size_of::<OptionsRecord>(),
+            ),
+            Self::Sorted(options) => (
+                ptr::from_ref(*options).cast::<u8>(),
+                size_of::<SortedOptions>(),
+            ),
+        };
+
+        // SAFETY: both records are words without padding.
+        unsafe { slice::from_raw_parts(data, size) }
     }
 }
 
@@ -438,6 +470,7 @@ extern "C" fn enqueue(queue: u32, value: u32) -> Hresult {
     let Some(queue) = (unsafe { Queue::from_handle(queue) }) else {
         return Hresult::INVALID_ARGUMENT;
     };
+
     insert_result(queue.enqueue(value))
 }
 export!(302, enqueue);
@@ -446,6 +479,7 @@ extern "C" fn memory(queue: u32, output_word: u32) -> Hresult {
     // SAFETY: export 303 contract: `queue` is 0 or a queue of export 304;
     // `output_word` is 0 or a writable word.
     let (queue, output_word) = unsafe { (Queue::from_handle(queue), OutputWord::new(output_word)) };
+
     report(
         queue.map(|queue| queue.supply.memory.load(Relaxed)),
         output_word,
@@ -458,11 +492,13 @@ extern "C" fn create(descriptor: u32, output_word: u32) -> Hresult {
     let Some(output_word) = (unsafe { OutputWord::new(output_word) }) else {
         return Hresult::INVALID_ARGUMENT;
     };
+
     output_word.store(0);
+
     // SAFETY: export 304 contract: `descriptor` is 0 or a creation
     // descriptor.
-    let created =
-        unsafe { Creation::read(descriptor) }.and_then(|creation| Queue::create_with(&creation));
+    let created = unsafe { Creation::from_address(descriptor) }
+        .and_then(|creation| Queue::create_with(&creation));
     match created {
         Ok(queue) => {
             output_word.store(queue.get());
@@ -478,6 +514,7 @@ extern "C" fn destroy(queue: u32) -> u32 {
     // SAFETY: export 305 contract: `queue` is 0 or a queue of export 304 on
     // which no other operation runs.
     unsafe { Queue::destroy(queue) };
+
     1
 }
 export!(305, destroy);
@@ -485,6 +522,7 @@ export!(305, destroy);
 extern "C" fn count(queue: u32, output_word: u32) -> Hresult {
     // SAFETY: export 306 contract: as for export 303.
     let (queue, output_word) = unsafe { (Queue::from_handle(queue), OutputWord::new(output_word)) };
+
     report(
         queue.map(|queue| queue.nodes().count().load(Relaxed)),
         output_word,
@@ -506,6 +544,7 @@ extern "C" fn dequeue(queue: u32, output_word: u32) -> Hresult {
     let Some(queue) = queue else {
         return Hresult::INVALID_ARGUMENT;
     };
+
     removed(queue.dequeue(), output_word)
 }
 export!(308, dequeue);
@@ -518,10 +557,12 @@ extern "C" fn enumerate(queue: u32, context: u32, callback: u32) -> Hresult {
     let Some(callback) = (unsafe { Routine::new(callback) }) else {
         return success_result(Err(Error::InvalidArgument));
     };
+
     // SAFETY: export 309 contract: `queue` is 0 or a queue of export 304.
     let Some(queue) = (unsafe { Queue::from_handle(queue) }) else {
         return success_result(Err(Error::InvalidArgument));
     };
+
     success_result(queue.enumerate(context, callback))
 }
 export!(309, enumerate);

@@ -146,181 +146,6 @@ impl Snapshot {
     }
 }
 
-fn contains(lock: &LoaderLock, list: ModuleList, base: u32) -> bool {
-    lock.entries(list).any(|entry| entry.dll_base == base)
-}
-
-/// Debug directory of a loaded image, looked up as stock 0x91f280d8 does
-/// with the loader lock already held.
-fn debug_directory(lock: &LoaderLock, base: u32) -> Option<&[ImageDebugDirectory]> {
-    let mut size = 0u32;
-    // Iterated by reference: the by-value array iterator is not inlined.
-    for &list in &[ModuleList::Loaded, ModuleList::Usermode] {
-        if contains(lock, list, base) {
-            // SAFETY: `base` is a loaded image on a list whose lock `lock`
-            // holds; `size` is a live u32.
-            let directory = unsafe {
-                RtlImageDirectoryEntryToData(base, true, ImageDirectory::Debug, &mut size)
-            };
-            if directory != 0 && size != 0 {
-                // SAFETY: the debug directory of a mapped image holds `size`
-                // bytes and stays mapped under the loader lock.
-                return Some(unsafe {
-                    core::slice::from_raw_parts(
-                        core::ptr::with_exposed_provenance::<ImageDebugDirectory>(
-                            directory as usize,
-                        ),
-                        size as usize / size_of::<ImageDebugDirectory>(),
-                    )
-                });
-            }
-        }
-    }
-    None
-}
-
-/// Store the CodeView age, GUID, and debug file path of `base` in
-/// `record`; any CodeView entry selects the record named by the first
-/// entry, as in stock 0x91f280d8.
-fn store_code_view(record: &mut ModuleRecord, lock: &LoaderLock, base: u32) {
-    let Some(entries) = debug_directory(lock, base) else {
-        return;
-    };
-    if !entries
-        .iter()
-        .any(|entry| entry.debug_type() == DebugType::CODEVIEW)
-    {
-        return;
-    }
-    let Some(first) = entries.first() else {
-        return;
-    };
-    let code_view = base.wrapping_add(first.address_of_raw_data.get());
-    if code_view == 0 {
-        return;
-    }
-    let code_view = core::ptr::with_exposed_provenance::<CodeViewRsds>(code_view as usize);
-    // SAFETY: the debug data of a mapped image lies in the image, which
-    // the loader lock keeps mapped.
-    let rsds = unsafe { &*code_view };
-    if rsds.signature != CodeViewRsds::SIGNATURE {
-        return;
-    }
-    record.age = rsds.age;
-    record.guid = rsds.guid;
-    let path = code_view
-        .cast::<u8>()
-        .wrapping_add(offset_of!(CodeViewRsds, path));
-    for index in 0..PATH_LIMIT {
-        // SAFETY: the record's path is NUL-terminated in the image; the
-        // loop stops at the NUL.
-        let byte = unsafe { path.add(index).read() };
-        if byte == 0 {
-            return;
-        }
-        record.debug_path[index] = byte;
-    }
-}
-
-/// Write one module record; false when the name does not fit.
-fn store_module(record: &mut ModuleRecord, entry: &LdrDataTableEntry, lock: &LoaderLock) -> bool {
-    let base = entry.dll_base;
-    record.base = base;
-    record.time_date_stamp = entry.time_date_stamp.swap_bytes();
-    record.size = entry.image_size;
-    let characters = u32::from(entry.base_dll_name.length) >> 1;
-    if characters > NAME_LIMIT {
-        super::pmc::print(
-            c"PERF: ignore module \"%wZ\" because the name is too long.\n",
-            &[core::ptr::from_ref(&entry.base_dll_name).addr() as u64],
-        );
-        return false;
-    }
-    let name = core::ptr::with_exposed_provenance::<u16>(entry.base_dll_name.buffer as usize);
-    // Index loops: the slice iterator adapters here are not inlined.
-    for index in 0..characters as usize {
-        // SAFETY: the name buffer of a loader entry holds `characters` code
-        // units and stays mapped under the loader lock.
-        record.name[index] = unsafe { name.add(index).read() } as u8;
-    }
-    store_code_view(record, lock, base);
-    true
-}
-
-/// Allocate and fill a snapshot block. `executable` is the drive path of
-/// the running executable (stock converts the object path through the
-/// drive table, 0x91f33c38).
-pub(crate) fn build(executable: &[u8], capture: CaptureFields) -> Option<Snapshot> {
-    // SAFETY: physical allocation of SIZE bytes; the result is checked below.
-    let block = unsafe {
-        xboxkrnl::MmAllocatePhysicalMemoryEx(
-            MemoryRegion::Title,
-            SIZE,
-            PageProtection::READWRITE,
-            0,
-            u32::MAX,
-            PAGE_SIZE,
-        )
-    };
-    let mut block = NonNull::new(core::ptr::with_exposed_provenance_mut::<ModuleSnapshot>(
-        block as usize,
-    ))?;
-    // SAFETY: the allocation holds `SIZE` bytes, page aligned, owned here
-    // until it is returned; zero bytes are a valid `ModuleSnapshot`.
-    let snapshot = unsafe {
-        block.write_bytes(0, 1);
-        block.as_mut()
-    };
-    let data = kernel::debug_monitor_data();
-    snapshot.version = ModuleSnapshot::VERSION;
-    snapshot.processor_count = data.processor_count.load(Ordering::Relaxed);
-    snapshot.magic = ModuleSnapshot::MAGIC;
-    snapshot.capture_previous_flags = capture.previous_flags;
-    let frequency = kernel::performance_frequency();
-    snapshot.performance_frequency = [(frequency >> 32) as u32, frequency as u32];
-    let length = executable.len().min(PATH_LIMIT);
-    snapshot.executable[..length].copy_from_slice(&executable[..length]);
-
-    let lock = LoaderLock::acquire();
-    let mut count = 0;
-    for entry in lock.all_entries() {
-        if count >= MODULE_CAPACITY {
-            break;
-        }
-        if entry.dll_base != 0 && store_module(&mut snapshot.records[count], entry, &lock) {
-            count += 1;
-        }
-    }
-    drop(lock);
-
-    snapshot.count = count as u32;
-    snapshot.capture_start_time = [(capture.start_time >> 32) as u32, capture.start_time as u32];
-    let name = console::debug_name();
-    let name = &name.as_bytes()[..name.as_bytes().len().min(snapshot.xbox_name.len() - 1)];
-    snapshot.xbox_name[..name.len()].copy_from_slice(name);
-    Some(Snapshot(block))
-}
-
-/// Inlined: the call of [`free_title_memory`] is the whole body.
-#[inline(always)]
-pub(crate) fn free(snapshot: Snapshot) {
-    // SAFETY: the snapshot owns a block from `build`, consumed here.
-    unsafe { free_title_memory(snapshot.address()) };
-}
-
-/// Free physical title memory; the snapshot and the capture buffers share
-/// this one copy.
-///
-/// # Safety
-///
-/// `address` must be 0 or a block from `MmAllocatePhysicalMemoryEx` in
-/// [`MemoryRegion::Title`] that nothing uses any more.
-#[inline(never)]
-pub(super) unsafe fn free_title_memory(address: u32) {
-    // SAFETY: guaranteed by the caller.
-    unsafe { xboxkrnl::MmFreePhysicalMemory(MemoryRegion::Title, address) };
-}
-
 /// Copy of the object path of the running executable. The kernel rewrites
 /// the path when it starts a title, so it is copied before use.
 pub(crate) struct ExecutableObjectPath {
@@ -348,19 +173,218 @@ impl ExecutableObjectPath {
     }
 }
 
+/// Request of [`drive_path_on_server`].
+struct DrivePath<'a> {
+    object: &'a [u8],
+    output: &'a mut [u8],
+    length: usize,
+}
+
+fn contains(lock: &LoaderLock, list: ModuleList, base: u32) -> bool {
+    lock.entries(list).any(|entry| entry.dll_base == base)
+}
+
+/// Debug directory of a loaded image, looked up as stock 0x91f280d8 does
+/// with the loader lock already held.
+fn debug_directory(lock: &LoaderLock, base: u32) -> Option<&[ImageDebugDirectory]> {
+    let mut size = 0u32;
+
+    // Iterated by reference: the by-value array iterator is not inlined.
+    for &list in &[ModuleList::Loaded, ModuleList::Usermode] {
+        if !contains(lock, list, base) {
+            continue;
+        }
+
+        // SAFETY: `base` is a loaded image on a list whose lock `lock`
+        // holds; `size` is a live u32.
+        let directory =
+            unsafe { RtlImageDirectoryEntryToData(base, true, ImageDirectory::Debug, &mut size) };
+        if directory != 0 && size != 0 {
+            // SAFETY: the debug directory of a mapped image holds `size`
+            // bytes and stays mapped under the loader lock.
+            return Some(unsafe {
+                core::slice::from_raw_parts(
+                    core::ptr::with_exposed_provenance::<ImageDebugDirectory>(directory as usize),
+                    size as usize / size_of::<ImageDebugDirectory>(),
+                )
+            });
+        }
+    }
+
+    None
+}
+
+/// Store the CodeView age, GUID, and debug file path of `base` in
+/// `record`; any CodeView entry selects the record named by the first
+/// entry, as in stock 0x91f280d8.
+fn store_code_view(record: &mut ModuleRecord, lock: &LoaderLock, base: u32) {
+    let Some(entries) = debug_directory(lock, base) else {
+        return;
+    };
+
+    if !entries
+        .iter()
+        .any(|entry| entry.debug_type() == DebugType::CODEVIEW)
+    {
+        return;
+    }
+
+    let Some(first) = entries.first() else {
+        return;
+    };
+
+    let code_view = base.wrapping_add(first.address_of_raw_data.get());
+    if code_view == 0 {
+        return;
+    }
+
+    let code_view = core::ptr::with_exposed_provenance::<CodeViewRsds>(code_view as usize);
+    // SAFETY: the debug data of a mapped image lies in the image, which
+    // the loader lock keeps mapped.
+    let header = unsafe { &*code_view };
+    if header.signature != CodeViewRsds::SIGNATURE {
+        return;
+    }
+
+    record.age = header.age;
+    record.guid = header.guid;
+
+    let path = code_view
+        .cast::<u8>()
+        .wrapping_add(offset_of!(CodeViewRsds, path));
+
+    for index in 0..PATH_LIMIT {
+        // SAFETY: the record's path is NUL-terminated in the image; the
+        // loop stops at the NUL.
+        let byte = unsafe { path.add(index).read() };
+        if byte == 0 {
+            return;
+        }
+
+        record.debug_path[index] = byte;
+    }
+}
+
+/// Write one module record; false when the name does not fit.
+fn store_module(record: &mut ModuleRecord, entry: &LdrDataTableEntry, lock: &LoaderLock) -> bool {
+    let base = entry.dll_base;
+    record.base = base;
+    record.time_date_stamp = entry.time_date_stamp.swap_bytes();
+    record.size = entry.image_size;
+
+    let characters = u32::from(entry.base_dll_name.length) >> 1;
+    if characters > NAME_LIMIT {
+        super::pmc::print(
+            c"PERF: ignore module \"%wZ\" because the name is too long.\n",
+            &[core::ptr::from_ref(&entry.base_dll_name).addr() as u64],
+        );
+        return false;
+    }
+
+    let name = core::ptr::with_exposed_provenance::<u16>(entry.base_dll_name.buffer as usize);
+    // Index loops: the slice iterator adapters here are not inlined.
+    for index in 0..characters as usize {
+        // SAFETY: the name buffer of a loader entry holds `characters` code
+        // units and stays mapped under the loader lock.
+        record.name[index] = unsafe { name.add(index).read() } as u8;
+    }
+
+    store_code_view(record, lock, base);
+
+    true
+}
+
+/// Allocate and fill a snapshot block. `executable` is the drive path of
+/// the running executable (stock converts the object path through the
+/// drive table, 0x91f33c38).
+pub(crate) fn build(executable: &[u8], capture: CaptureFields) -> Option<Snapshot> {
+    // SAFETY: physical allocation of SIZE bytes; the result is checked below.
+    let block = unsafe {
+        xboxkrnl::MmAllocatePhysicalMemoryEx(
+            MemoryRegion::Title,
+            SIZE,
+            PageProtection::READWRITE,
+            0,
+            u32::MAX,
+            PAGE_SIZE,
+        )
+    };
+
+    let mut block = NonNull::new(core::ptr::with_exposed_provenance_mut::<ModuleSnapshot>(
+        block as usize,
+    ))?;
+
+    // SAFETY: the allocation holds `SIZE` bytes, page aligned, owned here
+    // until it is returned; zero bytes are a valid `ModuleSnapshot`.
+    let snapshot = unsafe {
+        block.write_bytes(0, 1);
+        block.as_mut()
+    };
+
+    let data = kernel::debug_monitor_data();
+    snapshot.version = ModuleSnapshot::VERSION;
+    snapshot.processor_count = data.processor_count.load(Ordering::Relaxed);
+    snapshot.magic = ModuleSnapshot::MAGIC;
+    snapshot.capture_previous_flags = capture.previous_flags;
+
+    let frequency = kernel::performance_frequency();
+    snapshot.performance_frequency = [(frequency >> 32) as u32, frequency as u32];
+
+    let length = executable.len().min(PATH_LIMIT);
+    snapshot.executable[..length].copy_from_slice(&executable[..length]);
+
+    let count = {
+        let lock = LoaderLock::acquire();
+        let mut count = 0;
+        for entry in lock.all_entries() {
+            if count >= MODULE_CAPACITY {
+                break;
+            }
+
+            if entry.dll_base != 0 && store_module(&mut snapshot.records[count], entry, &lock) {
+                count += 1;
+            }
+        }
+
+        count
+    };
+
+    snapshot.count = count as u32;
+    snapshot.capture_start_time = [(capture.start_time >> 32) as u32, capture.start_time as u32];
+
+    let name = console::debug_name();
+    let name = &name.as_bytes()[..name.as_bytes().len().min(snapshot.xbox_name.len() - 1)];
+    snapshot.xbox_name[..name.len()].copy_from_slice(name);
+
+    Some(Snapshot(block))
+}
+
+/// Inlined: the call of [`free_title_memory`] is the whole body.
+#[inline(always)]
+pub(crate) fn free(snapshot: Snapshot) {
+    // SAFETY: the snapshot owns a block from `build`, consumed here.
+    unsafe { free_title_memory(snapshot.address()) };
+}
+
+/// Free physical title memory; the snapshot and the capture buffers share
+/// this one copy.
+///
+/// # Safety
+///
+/// `address` must be 0 or a block from `MmAllocatePhysicalMemoryEx` in
+/// [`MemoryRegion::Title`] that nothing uses any more.
+#[inline(never)]
+pub(super) unsafe fn free_title_memory(address: u32) {
+    // SAFETY: guaranteed by the caller.
+    unsafe { xboxkrnl::MmFreePhysicalMemory(MemoryRegion::Title, address) };
+}
+
 /// Copy the object path of the running executable into `output`, up to its
 /// terminator or the end of `output`; returns the bytes copied.
 #[inline(always)]
 pub(crate) fn copy_executable_object_path(output: &mut [u8]) -> usize {
     // SAFETY: `data_imports_resolved` held at module load.
     unsafe { ExLoadedImageName.get_unchecked() }.copy_to(output)
-}
-
-/// Request of [`drive_path_on_server`].
-struct DrivePath<'a> {
-    object: &'a [u8],
-    output: &'a mut [u8],
-    length: usize,
 }
 
 fn drive_path_on_server(
@@ -374,6 +398,7 @@ fn drive_path_on_server(
         request.object,
         request.output,
     );
+
     0
 }
 
@@ -388,12 +413,15 @@ pub(crate) fn executable_drive_path(output: &mut [u8; PATH_LIMIT + 2]) -> usize 
         output,
         length: 0,
     };
+
     if dispatcher::call_on_server_with(&mut request, drive_path_on_server).is_some() {
         return request.length;
     }
+
     let object = object.as_bytes();
     let length = object.len().min(PATH_LIMIT + 1);
     request.output[..length].copy_from_slice(&object[..length]);
+
     length
 }
 
@@ -401,6 +429,7 @@ pub(crate) fn executable_drive_path(output: &mut [u8; PATH_LIMIT + 2]) -> usize 
 extern "C" fn export_build() -> u32 {
     let mut executable = [0u8; PATH_LIMIT + 2];
     let length = executable_drive_path(&mut executable);
+
     build(&executable[..length], super::capture::snapshot_fields())
         .map_or(0, |snapshot| snapshot.address())
 }

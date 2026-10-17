@@ -19,8 +19,18 @@ use xbox360_sys::xboxkrnl::Kevent;
 
 use crate::kernel;
 
-/// Kernel export: NuiCam control routine `(&ControlRequest)`.
-const NUICAM_CONTROL: Ordinal = Ordinal::new(0x30d).unwrap();
+static REQUESTS: SpinLock<Requests> = SpinLock::new(Requests {
+    control: None,
+    missed: false,
+    mode: CaptureMode::OFF,
+});
+
+/// Head of the queued nodes; changed with the `REQUESTS` lock held, or
+/// before the dispatcher is published.
+static LIST: Link = Link {
+    next: AtomicPtr::new(core::ptr::null_mut()),
+    previous: AtomicPtr::new(core::ptr::null_mut()),
+};
 
 /// Code of a NuiCam control routine request.
 #[repr(u32)]
@@ -90,6 +100,65 @@ struct Link {
     previous: AtomicPtr<Link>,
 }
 
+impl Link {
+    fn as_ptr(&self) -> *mut Link {
+        core::ptr::from_ref(self).cast_mut()
+    }
+
+    /// Empty the list, forgetting every queued node.
+    fn reset(&self) {
+        let head = self.as_ptr();
+        self.next.store(head, Ordering::Relaxed);
+        self.previous.store(head, Ordering::Relaxed);
+    }
+
+    /// Append `node` to the list headed by `self`.
+    ///
+    /// # Safety
+    ///
+    /// The list is reset. Until `node` and every queued node are completed
+    /// or flushed, each stays valid and only this list touches its links,
+    /// its `buffer` holds `size` writable bytes, and its `event`, when
+    /// present, is an initialized event.
+    unsafe fn push_back(&self, node: NonNull<RawDataNode>) {
+        let head = self.as_ptr();
+        let last = self.previous.load(Ordering::Relaxed);
+        let link = node.cast::<Link>().as_ptr();
+
+        // SAFETY: `node` and `last` (a queued node or the head) are valid
+        // links per the caller contract.
+        unsafe {
+            (*link).next.store(head, Ordering::Relaxed);
+            (*link).previous.store(last, Ordering::Relaxed);
+            (*last).next.store(link, Ordering::Relaxed);
+        }
+
+        self.previous.store(link, Ordering::Relaxed);
+    }
+
+    /// Unlink the first node of the list headed by `self`.
+    ///
+    /// # Safety
+    ///
+    /// As [`Link::push_back`].
+    unsafe fn pop_front(&self) -> Option<NonNull<RawDataNode>> {
+        let first = self.next.load(Ordering::Relaxed);
+        if first == self.as_ptr() {
+            return None;
+        }
+
+        // SAFETY: `first` and its neighbors are queued nodes or the head,
+        // valid per the caller contract.
+        unsafe {
+            let next = (*first).next.load(Ordering::Relaxed);
+            let previous = (*first).previous.load(Ordering::Relaxed);
+            (*previous).next.store(next, Ordering::Relaxed);
+            (*next).previous.store(previous, Ordering::Relaxed);
+            Some(NonNull::new_unchecked(first).cast())
+        }
+    }
+}
+
 /// Requester node (caller memory): queued by monitor control 0x97,
 /// completed by 0x96 with a copy of the raw data block.
 #[repr(C)]
@@ -148,12 +217,6 @@ struct Requests {
     mode: CaptureMode,
 }
 
-static REQUESTS: SpinLock<Requests> = SpinLock::new(Requests {
-    control: None,
-    missed: false,
-    mode: CaptureMode::OFF,
-});
-
 impl Requests {
     /// Queue `node`; the control routine when this request turns capture
     /// on.
@@ -164,12 +227,16 @@ impl Requests {
     /// the contract of [`Link::push_back`].
     unsafe fn queue(&mut self, node: *mut RawDataNode) -> Option<u32> {
         let control = self.control?;
+
         // SAFETY: forwarded to the caller.
         unsafe { LIST.push_back(NonNull::new_unchecked(node)) };
+
         if self.mode != CaptureMode::OFF {
             return None;
         }
+
         self.mode = CaptureMode::CAPTURING;
+
         Some(control)
     }
 
@@ -187,22 +254,27 @@ impl Requests {
             self.missed = true;
             return;
         };
+
         // SAFETY: as above; the node was queued until now.
         let node = unsafe { node.as_ref() };
         let length = block.length;
         let copied = node.size.min(length);
+
         // SAFETY: the block holds `length` readable bytes (caller
         // contract) and the node's buffer `size` writable bytes (queue
         // contract).
         unsafe { core::ptr::copy_nonoverlapping(block.data, node.buffer, copied as usize) };
+
         node.received.store(length, Ordering::Relaxed);
         node.tag.store(block.tag, Ordering::Relaxed);
         node.kind.store(block.kind, Ordering::Relaxed);
         node.missed.store(u8::from(self.missed), Ordering::Relaxed);
+
         if let Some(event) = node.event {
             // SAFETY: a present event is initialized (queue contract).
             unsafe { xboxkrnl::KeSetEvent(event.as_ptr(), xboxkrnl::EVENT_INCREMENT, false) };
         }
+
         self.missed = false;
     }
 
@@ -214,85 +286,29 @@ impl Requests {
         request: &mut CaptureModeRequest,
     ) -> Option<u32> {
         let control = self.control?;
+
         if operation == CaptureOperation::Exchange {
             request.value = self.mode;
             self.mode = CaptureMode::CAPTURING;
         } else {
             self.mode = request.value;
         }
+
         Some(control)
-    }
-}
-
-/// Head of the queued nodes; changed with the `REQUESTS` lock held, or
-/// before the dispatcher is published.
-static LIST: Link = Link {
-    next: AtomicPtr::new(core::ptr::null_mut()),
-    previous: AtomicPtr::new(core::ptr::null_mut()),
-};
-
-impl Link {
-    fn as_ptr(&self) -> *mut Link {
-        core::ptr::from_ref(self).cast_mut()
-    }
-
-    /// Empty the list, forgetting every queued node.
-    fn reset(&self) {
-        let head = self.as_ptr();
-        self.next.store(head, Ordering::Relaxed);
-        self.previous.store(head, Ordering::Relaxed);
-    }
-
-    /// Append `node` to the list headed by `self`.
-    ///
-    /// # Safety
-    ///
-    /// The list is reset. Until `node` and every queued node are completed
-    /// or flushed, each stays valid and only this list touches its links,
-    /// its `buffer` holds `size` writable bytes, and its `event`, when
-    /// present, is an initialized event.
-    unsafe fn push_back(&self, node: NonNull<RawDataNode>) {
-        let head = self.as_ptr();
-        let last = self.previous.load(Ordering::Relaxed);
-        let link = node.cast::<Link>().as_ptr();
-        // SAFETY: `node` and `last` (a queued node or the head) are valid
-        // links per the caller contract.
-        unsafe {
-            (*link).next.store(head, Ordering::Relaxed);
-            (*link).previous.store(last, Ordering::Relaxed);
-            (*last).next.store(link, Ordering::Relaxed);
-        }
-        self.previous.store(link, Ordering::Relaxed);
-    }
-
-    /// Unlink the first node of the list headed by `self`.
-    ///
-    /// # Safety
-    ///
-    /// As [`Link::push_back`].
-    unsafe fn pop_front(&self) -> Option<NonNull<RawDataNode>> {
-        let first = self.next.load(Ordering::Relaxed);
-        if first == self.as_ptr() {
-            return None;
-        }
-        // SAFETY: `first` and its neighbors are queued nodes or the head,
-        // valid per the caller contract.
-        unsafe {
-            let next = (*first).next.load(Ordering::Relaxed);
-            let previous = (*first).previous.load(Ordering::Relaxed);
-            (*previous).next.store(next, Ordering::Relaxed);
-            (*next).previous.store(previous, Ordering::Relaxed);
-            Some(NonNull::new_unchecked(first).cast())
-        }
     }
 }
 
 /// Startup (stock 0x91f652b8).
 pub(super) fn initialize() {
+    /// Kernel export: NuiCam control routine `(&ControlRequest)`.
+    const NUICAM_CONTROL: Ordinal = Ordinal::new(0x30d).unwrap();
+
     LIST.reset();
+
     let Ok(module) = SystemModule::Kernel.handle() else {
         return;
     };
+
     let mut address = 0u32;
     // SAFETY: `module` is the loaded kernel image and `address` a local word.
     if unsafe {
@@ -328,8 +344,10 @@ fn switch_capture(control: u32, value: CaptureMode) {
 /// when present, is an initialized event.
 pub(crate) unsafe fn service_queue_raw_data_request(argument: u32) -> u32 {
     let node = core::ptr::with_exposed_provenance_mut::<RawDataNode>(argument as usize);
+
     // SAFETY: left below on the same thread.
     unsafe { xboxkrnl::KeEnterCriticalRegion() };
+
     // SAFETY: the caller's contract for `node`. `initialize` reset the list
     // before the control routine resolved, and `queue` queues only after
     // that.
@@ -337,8 +355,10 @@ pub(crate) unsafe fn service_queue_raw_data_request(argument: u32) -> u32 {
     if let Some(control) = enable {
         switch_capture(control, CaptureMode::CAPTURING);
     }
+
     // SAFETY: entered above on the same thread.
     unsafe { xboxkrnl::KeLeaveCriticalRegion() };
+
     0
 }
 
@@ -353,8 +373,10 @@ pub(crate) unsafe fn service_queue_raw_data_request(argument: u32) -> u32 {
 pub(crate) unsafe fn service_complete_raw_data_request(argument: u32) -> u32 {
     // SAFETY: the caller's contract.
     let block = unsafe { kernel::object_at::<RawDataBlock>(argument) };
+
     // SAFETY: see `block`.
     unsafe { REQUESTS.lock().complete(block) };
+
     0
 }
 
@@ -362,11 +384,13 @@ pub(crate) unsafe fn service_complete_raw_data_request(argument: u32) -> u32 {
 /// it.
 pub(crate) fn service_flush_raw_data_requests(_argument: u32) -> u32 {
     flush();
+
     0
 }
 
 fn flush() {
     let requests = REQUESTS.lock();
+
     if requests.control.is_some() {
         LIST.reset();
     }
@@ -382,23 +406,26 @@ fn flush() {
 pub(crate) unsafe fn service_set_capture_mode(argument: u32) -> u32 {
     // SAFETY: the caller's contract.
     let request = unsafe { kernel::object_at_mut::<CaptureModeRequest>(argument) };
+
     // SAFETY: left below on the same thread.
     unsafe { xboxkrnl::KeEnterCriticalRegion() };
+
     let operation = CaptureOperation::from_raw(request.operation);
     let control = REQUESTS.lock().set_mode(operation, request);
     if let Some(control) = control {
         flush();
-        switch_capture(
-            control,
-            if operation == CaptureOperation::Apply {
-                request.value
-            } else {
-                CaptureMode::OFF
-            },
-        );
+
+        let mode = if operation == CaptureOperation::Apply {
+            request.value
+        } else {
+            CaptureMode::OFF
+        };
+        switch_capture(control, mode);
     }
+
     // SAFETY: entered above on the same thread.
     unsafe { xboxkrnl::KeLeaveCriticalRegion() };
+
     0
 }
 

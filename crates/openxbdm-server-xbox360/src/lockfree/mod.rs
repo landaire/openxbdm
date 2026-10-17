@@ -27,7 +27,10 @@
 //!   those of the caller records, which the export contract requires to be
 //!   console routines.
 
+mod error;
 mod hash;
+mod memory;
+mod nodes;
 mod pool;
 mod priority;
 mod queue;
@@ -50,7 +53,6 @@ use xbox360::status::set_last_error_value;
 use xbox360::time::relative_interval;
 use xbox360_sys::interlocked;
 use xbox360_sys::processor;
-use xbox360_sys::status::Facility;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::DispatcherObject;
 use xbox360_sys::xboxkrnl::Handle;
@@ -59,111 +61,16 @@ use xbox360_sys::xboxkrnl::KeReleaseSemaphore;
 use xbox360_sys::xboxkrnl::Ksemaphore;
 use xbox360_sys::xboxkrnl::NtCreateSemaphore;
 use xbox360_sys::xboxkrnl::NtReleaseSemaphore;
-use xbox360_sys::xboxkrnl::PoolType;
 use xbox360_sys::xboxkrnl::ProcessorMode;
 use xbox360_sys::xboxkrnl::WaitReason;
 
-use crate::exports::export;
+use self::nodes::Nodes;
 use crate::kernel;
-use crate::kernel::pool_tag;
 
-pub(crate) use queue::Queue;
-
-/// Failure of a container operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Error {
-    /// A container, record or argument is not valid.
-    InvalidArgument,
-    /// The allocator returned no memory.
-    NotEnoughMemory,
-    /// No node or item in time, or a wait that timed out.
-    Timeout,
-    /// A sorted container with unique keys already holds the key.
-    DuplicateKey,
-    /// Another wait status or caller wait routine result.
-    Wait(Win32Error),
-    /// The first nonzero result of an enumeration callback.
-    Callback(Win32Error),
-}
-
-impl Error {
-    /// Facility of the container result codes.
-    const FACILITY: Facility = Facility::new(0x31);
-    /// An insertion found no free node in time, or its unique key present.
-    const INSERT_TIMEOUT: Hresult = Hresult::failure(Self::FACILITY, 1);
-    /// A removal found no item in time.
-    const REMOVE_TIMEOUT: Hresult = Hresult::failure(Self::FACILITY, 2);
-
-    /// Outcome of a wait status or caller wait routine result; stock
-    /// treats both as Win32 codes.
-    fn of_wait(status: u32) -> Result<(), Self> {
-        match Win32Error::new(status) {
-            None => Ok(()),
-            Some(error) if error == Win32Error::WAIT_TIMEOUT => Err(Self::Timeout),
-            Some(error) => Err(Self::Wait(error)),
-        }
-    }
-
-    /// Export result of a failed insertion.
-    pub(crate) fn insert_result(self) -> Hresult {
-        match self {
-            Self::Timeout | Self::DuplicateKey => Self::INSERT_TIMEOUT,
-            error => error.into(),
-        }
-    }
-
-    /// Export result of a failed removal.
-    fn remove_result(self) -> Hresult {
-        match self {
-            Self::Timeout => Self::REMOVE_TIMEOUT,
-            error => error.into(),
-        }
-    }
-}
-
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::InvalidArgument => f.write_str("invalid container or argument"),
-            Self::NotEnoughMemory => f.write_str("not enough memory"),
-            Self::Timeout => f.write_str("timed out"),
-            Self::DuplicateKey => f.write_str("key already present"),
-            Self::Wait(error) => write!(f, "wait failed with {:#x}", error.code()),
-            Self::Callback(error) => write!(f, "callback failed with {:#x}", error.code()),
-        }
-    }
-}
-
-impl core::error::Error for Error {}
-
-/// HRESULT of an operation without a timeout result of its own.
-impl From<Error> for Hresult {
-    fn from(error: Error) -> Self {
-        match error {
-            // Equal to HRESULT_FROM_WIN32(ERROR_INVALID_PARAMETER).
-            Error::InvalidArgument => Self::INVALID_ARGUMENT,
-            Error::NotEnoughMemory => Win32Error::NOT_ENOUGH_MEMORY.into(),
-            Error::Timeout => Win32Error::WAIT_TIMEOUT.into(),
-            Error::DuplicateKey => Error::INSERT_TIMEOUT,
-            Error::Wait(error) | Error::Callback(error) => error.into(),
-        }
-    }
-}
-
-/// Result of an operation without a timeout result of its own.
-fn success_result(result: Result<(), Error>) -> Hresult {
-    match result {
-        Ok(()) => Hresult::SUCCESS,
-        Err(error) => error.into(),
-    }
-}
-
-fn insert_result(result: Result<(), Error>) -> Hresult {
-    match result {
-        Ok(()) => Hresult::SUCCESS,
-        Err(error) => error.insert_result(),
-    }
-}
+pub(crate) use self::error::Error;
+pub(crate) use self::memory::pool_allocate;
+pub(crate) use self::memory::pool_free;
+pub(crate) use self::queue::Queue;
 
 /// A caller's output word. No reference to it exists before
 /// [`OutputWord::store`], so none lives across the waits and caller
@@ -188,32 +95,6 @@ impl<'a> OutputWord<'a> {
     }
 }
 
-/// Store `value` through `output`: E_INVALIDARG without a container or an
-/// output word.
-fn report(value: Option<u32>, output: Option<OutputWord<'_>>) -> Hresult {
-    match (value, output) {
-        (Some(value), Some(output)) => {
-            output.store(value);
-            Hresult::SUCCESS
-        }
-        _ => Hresult::INVALID_ARGUMENT,
-    }
-}
-
-/// Export result of a removal: the value goes through `output` when the
-/// caller passed one.
-fn removed(result: Result<u32, Error>, output: Option<OutputWord<'_>>) -> Hresult {
-    match result {
-        Ok(value) => {
-            if let Some(output) = output {
-                output.store(value);
-            }
-            Hresult::SUCCESS
-        }
-        Err(error) => error.remove_result(),
-    }
-}
-
 /// Address of a console routine that takes up to four register arguments
 /// and returns in r3: from a caller record, or one of this crate's. Caller
 /// records hold one in caller-visible memory under the module invariants.
@@ -232,6 +113,11 @@ impl Routine {
         NonZeroU32::new(address).map(Self)
     }
 
+    fn from_function_address(address: usize) -> Self {
+        // SAFETY: function addresses are not zero.
+        Self(unsafe { NonZeroU32::new_unchecked(address as u32) })
+    }
+
     pub(crate) fn raw(self) -> u32 {
         self.0.get()
     }
@@ -241,28 +127,23 @@ impl Routine {
         // arguments (`Routine::new`, or a function of this crate).
         unsafe { kernel::call_export(self.0.get(), a0, a1, a2, a3) }
     }
-
-    fn of_function(address: usize) -> Self {
-        // SAFETY: function addresses are not zero.
-        Self(unsafe { NonZeroU32::new_unchecked(address as u32) })
-    }
 }
 
 impl From<extern "C" fn(u32, u32) -> u32> for Routine {
     fn from(function: extern "C" fn(u32, u32) -> u32) -> Self {
-        Self::of_function(function as usize)
+        Self::from_function_address(function as usize)
     }
 }
 
 impl From<extern "C" fn(u32, u32, u32) -> Hresult> for Routine {
     fn from(function: extern "C" fn(u32, u32, u32) -> Hresult) -> Self {
-        Self::of_function(function as usize)
+        Self::from_function_address(function as usize)
     }
 }
 
 impl From<extern "C" fn(u32, u32, u32, u32) -> NtStatus> for Routine {
     fn from(function: extern "C" fn(u32, u32, u32, u32) -> NtStatus) -> Self {
-        Self::of_function(function as usize)
+        Self::from_function_address(function as usize)
     }
 }
 
@@ -357,31 +238,32 @@ impl OptionsRecord {
 
     /// [`OptionsRecord::wait`] with the flags word already read.
     fn wait_with(&self, flags: OptionFlags, side: Side) -> Option<Wait> {
-        let (waits, spin, alertable, context, timeout, routine) = match side {
-            Side::Insert => (
-                OptionFlags::INSERT_WAITS,
-                OptionFlags::INSERT_SPIN,
-                OptionFlags::INSERT_ALERTABLE,
-                &self.insert_context,
-                &self.insert_timeout,
-                &self.insert_routine,
-            ),
-            Side::Remove => (
-                OptionFlags::REMOVE_WAITS,
-                OptionFlags::REMOVE_SPIN,
-                OptionFlags::REMOVE_ALERTABLE,
-                &self.remove_context,
-                &self.remove_timeout,
-                &self.remove_routine,
-            ),
+        let waits = match side {
+            Side::Insert => OptionFlags::INSERT_WAITS,
+            Side::Remove => OptionFlags::REMOVE_WAITS,
         };
-        flags.contains(waits).then(|| Wait {
-            context: *context,
-            routine: *routine,
-            spin: flags.contains(spin),
-            timeout: *timeout,
-            alertable: flags.contains(alertable),
-        })
+        if !flags.contains(waits) {
+            return None;
+        }
+
+        let wait = match side {
+            Side::Insert => Wait {
+                context: self.insert_context,
+                routine: self.insert_routine,
+                spin: flags.contains(OptionFlags::INSERT_SPIN),
+                timeout: self.insert_timeout,
+                alertable: flags.contains(OptionFlags::INSERT_ALERTABLE),
+            },
+            Side::Remove => Wait {
+                context: self.remove_context,
+                routine: self.remove_routine,
+                spin: flags.contains(OptionFlags::REMOVE_SPIN),
+                timeout: self.remove_timeout,
+                alertable: flags.contains(OptionFlags::REMOVE_ALERTABLE),
+            },
+        };
+
+        Some(wait)
     }
 
     /// Whether a queue or stack keeps the record: a kept flag or any wait
@@ -404,6 +286,7 @@ struct Wait {
     /// `routine(context, object, timeout, alertable)` replacing the
     /// semaphore wait.
     routine: Option<Routine>,
+
     spin: bool,
     timeout: Timeout,
     alertable: bool,
@@ -434,23 +317,25 @@ impl Wait {
 }
 
 /// Spin delay between attempts: `count + 1` low-priority pauses, the count
-/// doubling plus one up to [`Backoff::MAX_COUNT`].
+/// doubling plus one up to 1023.
 struct Backoff(u32);
 
 impl Backoff {
     /// Attempts of a spinning operation before it blocks.
     const SPIN_ATTEMPTS: u32 = 1000;
-    const MAX_COUNT: u32 = 1023;
 
     const fn new() -> Self {
         Self(0)
     }
 
     fn pause(&mut self) {
+        const MAX_COUNT: u32 = 1023;
+
         for _ in 0..=self.0 {
             processor::low_priority_hint();
         }
-        if self.0 <= Self::MAX_COUNT / 2 {
+
+        if self.0 <= MAX_COUNT / 2 {
             self.0 = 2 * self.0 + 1;
         }
     }
@@ -576,7 +461,10 @@ impl NodeAddress {
     /// borrowed: a node of the container `_owner` belongs to (module
     /// invariants), or a new allocation.
     #[inline(always)]
-    unsafe fn get<'a, N, O: ?Sized>(self, _owner: &'a O) -> &'a N {
+    unsafe fn get<'a, N, O>(self, _owner: &'a O) -> &'a N
+    where
+        O: ?Sized,
+    {
         // SAFETY: the caller guarantees the node.
         unsafe { &*ptr::with_exposed_provenance(self.0.get() as usize) }
     }
@@ -590,6 +478,7 @@ impl NodeAddress {
     #[inline(always)]
     unsafe fn word<'a>(self, word: NodeWord) -> &'a AtomicU32 {
         let address = self.0.get().wrapping_add(word as u32);
+
         // SAFETY: the caller guarantees the node.
         unsafe { &*ptr::with_exposed_provenance(address as usize) }
     }
@@ -609,6 +498,7 @@ impl TaggedList {
     unsafe fn push(&self, node: NodeAddress, link: NodeWord) {
         // SAFETY: the caller guarantees the node.
         let word = unsafe { node.word(link) };
+
         loop {
             let head = self.0.load();
             word.store(head.high(), Relaxed);
@@ -629,6 +519,7 @@ impl TaggedList {
         loop {
             let head = self.0.load();
             let node = head.address()?;
+
             // SAFETY: the caller guarantees the nodes of the list.
             let next = unsafe { node.word(link) }.load(Relaxed);
             if self.0.compare_exchange(head, head.successor(next)) {
@@ -661,47 +552,6 @@ impl Signature {
     /// Clear `word` and report whether it held this signature.
     fn take_from(self, word: &AtomicU32) -> bool {
         word.swap_relaxed(0) == self.0
-    }
-}
-
-/// The container at `handle`, when its signature word at `offset` holds
-/// `signature`.
-///
-/// # Safety
-///
-/// `handle` is 0 or the address of a container of this library (export
-/// contract) whose word at `offset` is readable, and that is a `T` valid
-/// for `'a` when the word holds `signature`.
-unsafe fn container<'a, T>(handle: u32, signature: Signature, offset: usize) -> Option<&'a T> {
-    let container = ptr::with_exposed_provenance::<T>(handle as usize);
-    if container.is_null() {
-        return None;
-    }
-    // SAFETY: the caller guarantees the word, and the type once it matches.
-    unsafe {
-        let word = &*container.byte_add(offset).cast::<AtomicU32>();
-        signature.is_in(word).then(|| &*container)
-    }
-}
-
-/// The container at `handle` with its signature cleared, when the
-/// signature word at `offset` held `signature`.
-///
-/// # Safety
-///
-/// As for [`container`]; in addition no other operation uses the
-/// container, now or later, and the caller does not use the reference
-/// once it frees the container.
-unsafe fn claim<'a, T>(handle: u32, signature: Signature, offset: usize) -> Option<&'a T> {
-    let container = ptr::with_exposed_provenance::<T>(handle as usize);
-    if container.is_null() {
-        return None;
-    }
-    // SAFETY: the caller guarantees the word, and the type once it held the
-    // signature.
-    unsafe {
-        let word = &*container.byte_add(offset).cast::<AtomicU32>();
-        signature.take_from(word).then(|| &*container)
     }
 }
 
@@ -762,7 +612,8 @@ impl WaitObject<'_> {
     fn wait(self, timeout: Timeout, alertable: bool) -> Result<(), Error> {
         let interval = timeout.interval();
         let pointer = interval.as_ref().map_or(ptr::null(), ptr::from_ref);
-        Error::of_wait(match self {
+
+        let status = match self {
             // SAFETY: the semaphore is initialized and lies in a live queue;
             // `pointer` is null or a live local.
             Self::Object(semaphore) => unsafe {
@@ -781,8 +632,599 @@ impl WaitObject<'_> {
                 xboxkrnl::NtWaitForSingleObjectEx(handle, ProcessorMode::Kernel, alertable, pointer)
                     .0
             },
+        };
+
+        Error::of_wait(status)
+    }
+}
+
+/// Allocator record (caller-visible, 0x10 bytes), copied after each
+/// container.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AllocatorRecord {
+    /// Alignment that the allocate routine guarantees.
+    alignment: u32,
+    context: u32,
+    /// `allocate(context, size)`.
+    allocate: Routine,
+    /// `free(context, address)`.
+    free: Routine,
+}
+
+const _: () = assert!(size_of::<AllocatorRecord>() == 0x10);
+
+impl AllocatorRecord {
+    /// Alignment every stock allocator record states.
+    const DEFAULT_ALIGNMENT: u32 = 16;
+    const SIZE: u32 = size_of::<Self>() as u32;
+
+    /// The routines stock uses when the caller supplies none.
+    fn new() -> Self {
+        Self {
+            alignment: Self::DEFAULT_ALIGNMENT,
+            context: 0,
+            allocate: Routine::from(default_allocate as extern "C" fn(u32, u32) -> u32),
+            free: Routine::from(default_free as extern "C" fn(u32, u32) -> u32),
+        }
+    }
+
+    /// The record whose address `word` holds.
+    ///
+    /// # Safety
+    ///
+    /// `word` is the allocator word of a live container, which holds the
+    /// address of the record creation wrote after it; the record keeps the
+    /// routines creation copied (module invariants).
+    unsafe fn from_word(word: &AtomicU32) -> &Self {
+        // SAFETY: the caller guarantees the record.
+        unsafe { &*ptr::with_exposed_provenance(word.load(Relaxed) as usize) }
+    }
+
+    /// Allocate `size` bytes and add the request to `memory`.
+    fn allocate(&self, size: u32, memory: &AtomicU32) -> Option<NonZeroU32> {
+        if size as i32 <= 0 {
+            return None;
+        }
+
+        let address = self.allocate.call(self.context, size, 0, 0);
+        memory.fetch_add_relaxed(size);
+
+        NonZeroU32::new(address)
+    }
+
+    fn free(&self, address: u32) {
+        self.free.call(self.context, address, 0, 0);
+    }
+
+    /// Allocate `size` bytes aligned to the next power of two up to 64, or
+    /// to 128 above that, unless the record guarantees that alignment.
+    fn allocate_aligned(&self, size: u32, memory: &AtomicU32) -> Option<Allocation> {
+        if size as i32 <= 0 {
+            return None;
+        }
+
+        let alignment = if size <= 64 {
+            let mut alignment = 64;
+            while size <= alignment >> 1 {
+                alignment >>= 1;
+            }
+
+            alignment
+        } else {
+            128
+        };
+        let alignment = if alignment <= self.alignment {
+            1
+        } else {
+            alignment
+        };
+
+        let total = alignment.wrapping_add(size);
+        if total as i32 <= 1 {
+            return None;
+        }
+
+        let base = self.allocate(total - 1, memory)?.get();
+        let aligned = base.wrapping_add(alignment.wrapping_sub(base) & (alignment - 1));
+
+        Some(Allocation {
+            aligned: NonZeroU32::new(aligned)?,
+            base,
         })
     }
+
+    /// Allocate a `size`-byte block followed by a trailer that links it on
+    /// `blocks` and keeps the allocation base.
+    ///
+    /// # Safety
+    ///
+    /// `blocks` is the block list of a live container, which holds only
+    /// block trailers.
+    unsafe fn allocate_block(
+        &self,
+        blocks: &TaggedList,
+        size: u32,
+        memory: &AtomicU32,
+    ) -> Option<NodeAddress> {
+        let padded = size.wrapping_add(size_of::<BlockTrailer>() as u32);
+        if size as i32 <= 0 || padded == 0 || (padded as i32) < size as i32 {
+            return None;
+        }
+
+        let block = self.allocate_aligned(padded, memory)?;
+
+        // SAFETY: the trailer is the 8 bytes after the block, inside the new
+        // allocation.
+        let trailer = unsafe { NodeAddress::new_unchecked(block.aligned.get().wrapping_add(size)) };
+        // SAFETY: as above.
+        unsafe { trailer.get::<BlockTrailer, _>(blocks) }
+            .base
+            .store(block.base, Relaxed);
+
+        // SAFETY: as above; the caller guarantees the list, which links
+        // trailers through word 0.
+        unsafe { blocks.push(trailer, NodeWord::Word0) };
+
+        Some(NodeAddress(block.aligned))
+    }
+
+    /// Free every block on `blocks`.
+    ///
+    /// # Safety
+    ///
+    /// `blocks` is the block list of a container, which holds only trailers
+    /// of [`AllocatorRecord::allocate_block`] for blocks of this allocator,
+    /// and no other operation uses the container.
+    unsafe fn free_blocks(&self, blocks: &TaggedList) {
+        // SAFETY: the caller guarantees the list; each trailer lies in its
+        // block, which stays allocated until freed here.
+        while let Some(trailer) = unsafe { blocks.pop(NodeWord::Word0) } {
+            // SAFETY: as above.
+            let base = unsafe { trailer.get::<BlockTrailer, _>(blocks) }
+                .base
+                .load(Relaxed);
+            self.free(base);
+        }
+    }
+}
+
+/// An allocation aligned inside the block the allocator returned.
+struct Allocation {
+    aligned: NonZeroU32,
+    /// Address to free.
+    base: u32,
+}
+
+/// Trailer after each node block.
+#[repr(C)]
+struct BlockTrailer {
+    /// Link on the container's block list.
+    link: AtomicU32,
+    /// Allocation base of the block.
+    base: AtomicU32,
+}
+
+/// Node of a queue, priority queue or hash table (0x10 bytes).
+#[repr(C, align(8))]
+struct ListNode {
+    /// Link to the next node; a sorted list marks it once the node is
+    /// deleted.
+    next: DoubleWord,
+    /// Value in the high word, which also links a free node; the key of a
+    /// sorted node, or 0, in the low word.
+    item: DoubleWord,
+}
+
+const _: () = assert!(core::mem::offset_of!(ListNode, item) == NodeWord::Word2 as usize);
+
+/// Creation descriptor (caller record, 0x34 bytes) of the queue, stack,
+/// priority queue and hash table.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CreationDescriptor {
+    pub(crate) options: OptionsRecord,
+    /// [`CreationDescriptor::SIZE`].
+    pub(crate) size: u32,
+
+    pub(crate) per_block: u32,
+    /// Node limit; zero or less is unlimited.
+    pub(crate) node_limit: u32,
+
+    /// Allocate routine; the free routine must come with it.
+    pub(crate) allocate: Option<Routine>,
+    pub(crate) free: Option<Routine>,
+    /// Context of both routines.
+    pub(crate) context: u32,
+}
+
+const _: () = {
+    use core::mem::offset_of;
+    assert!(offset_of!(CreationDescriptor, size) == 0x1c);
+    assert!(offset_of!(CreationDescriptor, per_block) == 0x20);
+    assert!(offset_of!(CreationDescriptor, node_limit) == 0x24);
+    assert!(offset_of!(CreationDescriptor, allocate) == 0x28);
+    assert!(offset_of!(CreationDescriptor, context) == 0x30);
+    assert!(size_of::<CreationDescriptor>() == 0x34);
+};
+
+impl CreationDescriptor {
+    pub(crate) const SIZE: u32 = size_of::<Self>() as u32;
+}
+
+/// A validated creation descriptor.
+pub(crate) struct Creation<'a> {
+    /// The caller's descriptor; nothing when it passed none.
+    descriptor: Option<&'a CreationDescriptor>,
+    allocator: AllocatorRecord,
+}
+
+impl<'a> Creation<'a> {
+    pub(crate) fn new(descriptor: Option<&'a CreationDescriptor>) -> Result<Self, Error> {
+        let mut allocator = AllocatorRecord::new();
+        if let Some(descriptor) = descriptor {
+            if descriptor.size != CreationDescriptor::SIZE {
+                return Err(Error::InvalidArgument);
+            }
+
+            if let Some(allocate) = descriptor.allocate {
+                let Some(free) = descriptor.free else {
+                    return Err(Error::InvalidArgument);
+                };
+
+                allocator = AllocatorRecord {
+                    alignment: AllocatorRecord::DEFAULT_ALIGNMENT,
+                    context: descriptor.context,
+                    allocate,
+                    free,
+                };
+            }
+        }
+
+        Ok(Self {
+            descriptor,
+            allocator,
+        })
+    }
+
+    /// The descriptor at `address`, or none for 0.
+    ///
+    /// # Safety
+    ///
+    /// `address` is 0 or the address of a creation descriptor (export
+    /// contract) that stays unchanged for `'a`, whose routine fields hold
+    /// console routines.
+    unsafe fn from_address(address: u32) -> Result<Self, Error> {
+        // SAFETY: the caller guarantees the record.
+        Self::new(unsafe {
+            ptr::with_exposed_provenance::<CreationDescriptor>(address as usize).as_ref()
+        })
+    }
+
+    fn flags(&self) -> OptionFlags {
+        self.descriptor
+            .map_or(OptionFlags::empty(), |descriptor| descriptor.options.flags)
+    }
+
+    /// The options a queue or stack keeps, when any is set.
+    fn kept_options(&self) -> Option<&'a OptionsRecord> {
+        self.descriptor
+            .map(|descriptor| &descriptor.options)
+            .filter(|options| options.is_kept())
+    }
+
+    /// The options record of the descriptor, zero without one.
+    fn options(&self) -> OptionsRecord {
+        self.descriptor
+            .map_or(OptionsRecord::default(), |descriptor| descriptor.options)
+    }
+
+    fn counts(&self, node_size: u32) -> NodeCounts {
+        let per_block = self.descriptor.map_or(0, |descriptor| descriptor.per_block);
+        let limit = self
+            .descriptor
+            .map_or(0, |descriptor| descriptor.node_limit);
+
+        NodeCounts::new(per_block, limit, node_size)
+    }
+
+    /// Creation flag: removals wait, so creation makes the item semaphore.
+    fn item_wait(&self) -> bool {
+        self.flags().contains(OptionFlags::REMOVE_WAITS)
+    }
+
+    /// Creation flag: insertions wait, so a limited container makes the
+    /// free node semaphore.
+    fn free_wait(&self) -> bool {
+        self.flags().contains(OptionFlags::INSERT_WAITS)
+    }
+}
+
+/// Node counts of a creation.
+struct NodeCounts {
+    per_block: u32,
+    /// Node limit; nothing when unlimited.
+    limit: Option<u32>,
+}
+
+impl NodeCounts {
+    /// The node limit stays below `i32::MAX` / `node_size` bytes; a limit
+    /// of zero or less is unlimited.
+    fn new(per_block: u32, limit: u32, node_size: u32) -> Self {
+        /// Bound on the bytes of the node limit, so that they stay a
+        /// positive `i32`.
+        const MAX_BYTES: u32 = i32::MAX as u32;
+
+        let per_block = Self::clamp_per_block(per_block);
+
+        let ceiling = (MAX_BYTES / node_size) as i32;
+        let limit = if limit as i32 >= ceiling {
+            ceiling - 1
+        } else {
+            limit as i32
+        };
+        if limit <= 0 {
+            return Self {
+                per_block,
+                limit: None,
+            };
+        }
+
+        Self {
+            per_block: per_block.min(limit as u32),
+            limit: Some(limit as u32),
+        }
+    }
+
+    /// Nodes per block clamped to 16..=0x100_0000.
+    fn clamp_per_block(per_block: u32) -> u32 {
+        const MIN_PER_BLOCK: i32 = 16;
+        const MAX_PER_BLOCK: i32 = 0x100_0000;
+
+        (per_block as i32).clamp(MIN_PER_BLOCK, MAX_PER_BLOCK) as u32
+    }
+}
+
+/// Nodes the limit still allows (caller-visible word).
+#[repr(transparent)]
+struct Remaining(AtomicU32);
+
+impl Remaining {
+    fn set(&self, limit: Option<u32>) {
+        /// Stock encoding of an unlimited count; any negative value reads
+        /// as unlimited.
+        const UNLIMITED: u32 = u32::MAX;
+
+        self.0.store(limit.unwrap_or(UNLIMITED), Relaxed);
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.0.load(Relaxed) == 0
+    }
+
+    /// End growth after a failed allocation.
+    fn exhaust(&self) {
+        self.0.store(0, Relaxed);
+    }
+
+    /// Claim up to `wanted` nodes; nothing once the limit is reached.
+    fn claim(&self, wanted: u32) -> Option<u32> {
+        let mut nodes = wanted;
+        loop {
+            let left = self.0.load(Relaxed);
+            if (left as i32) < 0 {
+                return Some(nodes);
+            }
+
+            if left == 0 {
+                return None;
+            }
+
+            if nodes as i32 > left as i32 {
+                nodes = left;
+            }
+
+            if self
+                .0
+                .compare_exchange_release(left, left.wrapping_sub(nodes))
+                .is_ok()
+            {
+                return Some(nodes);
+            }
+        }
+    }
+
+    /// Claim up to `wanted` but at least `minimum` nodes.
+    fn claim_at_least(&self, wanted: u32, minimum: u32) -> Option<u32> {
+        let mut nodes = wanted;
+        loop {
+            let left = self.0.load(Relaxed);
+            if (left as i32) < 0 {
+                return Some(nodes);
+            }
+
+            if left == 0 {
+                return None;
+            }
+
+            if nodes as i32 > left as i32 {
+                nodes = left;
+            }
+
+            if (nodes as i32) < minimum as i32 {
+                return None;
+            }
+
+            if self
+                .0
+                .compare_exchange_release(left, left.wrapping_sub(nodes))
+                .is_ok()
+            {
+                return Some(nodes);
+            }
+        }
+    }
+}
+
+/// Node supply and item accounting, the same run of fields in every node
+/// container: +0x18 in a queue, +0x10 in a stack or hash table.
+#[repr(C, align(8))]
+struct Supply {
+    /// Free node credits; below zero, insertions wait.
+    credits: AtomicU32,
+    /// Free node semaphore ([`SemaphoreKind`]); 0 when insertions do not
+    /// wait.
+    free_semaphore: AtomicU32,
+    /// Removers blocked on the item semaphore.
+    waiters: AtomicU32,
+    /// Item semaphore and item count, in the order of [`ItemOrder`].
+    items: [AtomicU32; 2],
+    _reserved: AtomicU32,
+
+    /// Node blocks, linked through their trailers.
+    blocks: TaggedList,
+    per_block: AtomicU32,
+    remaining: Remaining,
+    /// Nodes allocated.
+    total: AtomicU32,
+    /// Bytes requested from the allocator.
+    memory: AtomicU32,
+}
+
+const _: () = {
+    use core::mem::offset_of;
+    assert!(offset_of!(Supply, items) == 0xc);
+    assert!(offset_of!(Supply, blocks) == 0x18);
+    assert!(offset_of!(Supply, remaining) == 0x24);
+    assert!(offset_of!(Supply, memory) == 0x2c);
+    assert!(size_of::<Supply>() == 0x30);
+};
+
+/// Order of the item words of a [`Supply`].
+#[derive(Clone, Copy)]
+enum ItemOrder {
+    /// Item semaphore, then item count (queue, stack).
+    SemaphoreFirst,
+    /// Item count, then item semaphore (hash table).
+    CountFirst,
+}
+
+/// Node layout of a container type.
+struct Layout {
+    node_size: u32,
+    /// Free list link of a node.
+    link: NodeWord,
+    semaphores: SemaphoreKind,
+    items: ItemOrder,
+}
+
+/// Result of an operation without a timeout result of its own.
+fn success_result(result: Result<(), Error>) -> Hresult {
+    match result {
+        Ok(()) => Hresult::SUCCESS,
+        Err(error) => error.into(),
+    }
+}
+
+fn insert_result(result: Result<(), Error>) -> Hresult {
+    match result {
+        Ok(()) => Hresult::SUCCESS,
+        Err(error) => error.insert_result(),
+    }
+}
+
+/// Store `value` through `output`: E_INVALIDARG without a container or an
+/// output word.
+fn report(value: Option<u32>, output: Option<OutputWord<'_>>) -> Hresult {
+    match (value, output) {
+        (Some(value), Some(output)) => {
+            output.store(value);
+            Hresult::SUCCESS
+        }
+        _ => Hresult::INVALID_ARGUMENT,
+    }
+}
+
+/// Export result of a removal: the value goes through `output` when the
+/// caller passed one.
+fn removed(result: Result<u32, Error>, output: Option<OutputWord<'_>>) -> Hresult {
+    match result {
+        Ok(value) => {
+            if let Some(output) = output {
+                output.store(value);
+            }
+
+            Hresult::SUCCESS
+        }
+        Err(error) => error.remove_result(),
+    }
+}
+
+/// The container at `handle`, when its signature word at `offset` holds
+/// `signature`.
+///
+/// # Safety
+///
+/// `handle` is 0 or the address of a container of this library (export
+/// contract) whose word at `offset` is readable, and that is a `T` valid
+/// for `'a` when the word holds `signature`.
+unsafe fn container<'a, T>(handle: u32, signature: Signature, offset: usize) -> Option<&'a T> {
+    let container = ptr::with_exposed_provenance::<T>(handle as usize);
+    if container.is_null() {
+        return None;
+    }
+
+    // SAFETY: the caller guarantees the word, and the type once it matches.
+    unsafe {
+        let word = &*container.byte_add(offset).cast::<AtomicU32>();
+        signature.is_in(word).then(|| &*container)
+    }
+}
+
+/// The container at `handle` with its signature cleared, when the
+/// signature word at `offset` held `signature`.
+///
+/// # Safety
+///
+/// As for [`container`]; in addition no other operation uses the
+/// container, now or later, and the caller does not use the reference
+/// once it frees the container.
+unsafe fn claim<'a, T>(handle: u32, signature: Signature, offset: usize) -> Option<&'a T> {
+    let container = ptr::with_exposed_provenance::<T>(handle as usize);
+    if container.is_null() {
+        return None;
+    }
+
+    // SAFETY: the caller guarantees the word, and the type once it held the
+    // signature.
+    unsafe {
+        let word = &*container.byte_add(offset).cast::<AtomicU32>();
+        signature.take_from(word).then(|| &*container)
+    }
+}
+
+/// Call `callback(context, value, node)` for each node from `first`,
+/// following the address word at +0, until a callback returns nonzero.
+///
+/// # Safety
+///
+/// Every node from `first` is a live node of a container borrowed for the
+/// call, with its value at `value`.
+unsafe fn walk(first: u32, value: NodeWord, context: u32, callback: Routine) -> Result<(), Error> {
+    let mut node = NodeAddress::new(first);
+    while let Some(address) = node {
+        // SAFETY: the caller guarantees the nodes.
+        let item = unsafe { address.word(value) }.load(Relaxed);
+        let result = callback.call(context, item, address.raw(), 0);
+        if let Some(result) = Win32Error::new(result) {
+            return Err(Error::Callback(result));
+        }
+
+        // SAFETY: as above.
+        node = NodeAddress::new(unsafe { address.word(NodeWord::Word0) }.load(Relaxed));
+    }
+
+    Ok(())
 }
 
 /// Unnamed semaphore at count 0. Records the outcome as the thread's last
@@ -797,8 +1239,10 @@ fn create_semaphore() -> Option<Handle> {
         set_last_error(error);
         return None;
     }
+
     // Stock records ERROR_SUCCESS, the conversion of STATUS_SUCCESS.
     set_last_error_value(None);
+
     Some(handle)
 }
 
@@ -844,786 +1288,3 @@ extern "C" fn default_allocate(_context: u32, size: u32) -> u32 {
 extern "C" fn default_free(_context: u32, _address: u32) -> u32 {
     core::arch::naked_asm!("mr 3, 4", "b {free}", free = sym xboxkrnl::ExFreePool)
 }
-
-/// Allocator record (caller-visible, 0x10 bytes), copied after each
-/// container.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct AllocatorRecord {
-    /// Alignment that the allocate routine guarantees.
-    alignment: u32,
-    context: u32,
-    /// `allocate(context, size)`.
-    allocate: Routine,
-    /// `free(context, address)`.
-    free: Routine,
-}
-
-const _: () = assert!(size_of::<AllocatorRecord>() == 0x10);
-
-/// An allocation aligned inside the block the allocator returned.
-struct Allocation {
-    aligned: NonZeroU32,
-    /// Address to free.
-    base: u32,
-}
-
-impl AllocatorRecord {
-    /// Alignment every stock allocator record states.
-    const DEFAULT_ALIGNMENT: u32 = 16;
-    const SIZE: u32 = size_of::<Self>() as u32;
-
-    /// The routines stock uses when the caller supplies none.
-    fn default_routines() -> Self {
-        Self {
-            alignment: Self::DEFAULT_ALIGNMENT,
-            context: 0,
-            allocate: Routine::from(default_allocate as extern "C" fn(u32, u32) -> u32),
-            free: Routine::from(default_free as extern "C" fn(u32, u32) -> u32),
-        }
-    }
-
-    /// The record at `address`.
-    ///
-    /// # Safety
-    ///
-    /// `address` is the allocator word of a live container, which holds the
-    /// address of the record creation wrote after it; the record keeps the
-    /// routines creation copied (module invariants).
-    unsafe fn at<'a>(address: &'a AtomicU32) -> &'a Self {
-        // SAFETY: the caller guarantees the record.
-        unsafe { &*ptr::with_exposed_provenance(address.load(Relaxed) as usize) }
-    }
-
-    /// Allocate `size` bytes and add the request to `memory`.
-    fn allocate(&self, size: u32, memory: &AtomicU32) -> Option<NonZeroU32> {
-        if size as i32 <= 0 {
-            return None;
-        }
-        let address = self.allocate.call(self.context, size, 0, 0);
-        memory.fetch_add_relaxed(size);
-        NonZeroU32::new(address)
-    }
-
-    fn free(&self, address: u32) {
-        self.free.call(self.context, address, 0, 0);
-    }
-
-    /// Allocate `size` bytes aligned to the next power of two up to 64, or
-    /// to 128 above that, unless the record guarantees that alignment.
-    fn allocate_aligned(&self, size: u32, memory: &AtomicU32) -> Option<Allocation> {
-        if size as i32 <= 0 {
-            return None;
-        }
-        let mut alignment = 128;
-        if size <= 64 {
-            let mut half = 64;
-            loop {
-                alignment = half;
-                half >>= 1;
-                if size > half {
-                    break;
-                }
-            }
-        }
-        if alignment <= self.alignment {
-            alignment = 1;
-        }
-        let total = alignment.wrapping_add(size);
-        if total as i32 <= 1 {
-            return None;
-        }
-        let base = self.allocate(total - 1, memory)?.get();
-        let aligned = base.wrapping_add(alignment.wrapping_sub(base) & (alignment - 1));
-        Some(Allocation {
-            aligned: NonZeroU32::new(aligned)?,
-            base,
-        })
-    }
-
-    /// Allocate a `size`-byte block followed by a trailer that links it on
-    /// `blocks` and keeps the allocation base.
-    ///
-    /// # Safety
-    ///
-    /// `blocks` is the block list of a live container, which holds only
-    /// block trailers.
-    unsafe fn allocate_block(
-        &self,
-        blocks: &TaggedList,
-        size: u32,
-        memory: &AtomicU32,
-    ) -> Option<NodeAddress> {
-        let padded = size.wrapping_add(size_of::<BlockTrailer>() as u32);
-        if size as i32 <= 0 || padded == 0 || (padded as i32) < size as i32 {
-            return None;
-        }
-        let block = self.allocate_aligned(padded, memory)?;
-        // SAFETY: the trailer is the 8 bytes after the block, inside the new
-        // allocation.
-        let trailer = unsafe { NodeAddress::new_unchecked(block.aligned.get().wrapping_add(size)) };
-        // SAFETY: as above.
-        unsafe { trailer.get::<BlockTrailer, _>(blocks) }
-            .base
-            .store(block.base, Relaxed);
-        // SAFETY: as above; the caller guarantees the list, which links
-        // trailers through word 0.
-        unsafe { blocks.push(trailer, NodeWord::Word0) };
-        Some(NodeAddress(block.aligned))
-    }
-
-    /// Free every block on `blocks`.
-    ///
-    /// # Safety
-    ///
-    /// `blocks` is the block list of a container, which holds only trailers
-    /// of [`AllocatorRecord::allocate_block`] for blocks of this allocator,
-    /// and no other operation uses the container.
-    unsafe fn free_blocks(&self, blocks: &TaggedList) {
-        // SAFETY: the caller guarantees the list; each trailer lies in its
-        // block, which stays allocated until freed here.
-        while let Some(trailer) = unsafe { blocks.pop(NodeWord::Word0) } {
-            // SAFETY: as above.
-            let base = unsafe { trailer.get::<BlockTrailer, _>(blocks) }
-                .base
-                .load(Relaxed);
-            self.free(base);
-        }
-    }
-}
-
-/// Trailer after each node block.
-#[repr(C)]
-struct BlockTrailer {
-    /// Link on the container's block list.
-    link: AtomicU32,
-    /// Allocation base of the block.
-    base: AtomicU32,
-}
-
-/// Node of a queue, priority queue or hash table (0x10 bytes).
-#[repr(C, align(8))]
-struct ListNode {
-    /// Link to the next node; a sorted list marks it once the node is
-    /// deleted.
-    next: DoubleWord,
-    /// Value in the high word, which also links a free node; the key of a
-    /// sorted node, or 0, in the low word.
-    item: DoubleWord,
-}
-
-const _: () = assert!(core::mem::offset_of!(ListNode, item) == NodeWord::Word2 as usize);
-
-/// Creation descriptor (caller record, 0x34 bytes) of the queue, stack,
-/// priority queue and hash table.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub(crate) struct CreationDescriptor {
-    pub(crate) options: OptionsRecord,
-    /// [`CreationDescriptor::SIZE`].
-    pub(crate) size: u32,
-    pub(crate) per_block: u32,
-    /// Node limit; zero or less is unlimited.
-    pub(crate) node_limit: u32,
-    /// Allocate routine; the free routine must come with it.
-    pub(crate) allocate: Option<Routine>,
-    pub(crate) free: Option<Routine>,
-    /// Context of both routines.
-    pub(crate) context: u32,
-}
-
-const _: () = {
-    use core::mem::offset_of;
-    assert!(offset_of!(CreationDescriptor, size) == 0x1c);
-    assert!(offset_of!(CreationDescriptor, per_block) == 0x20);
-    assert!(offset_of!(CreationDescriptor, node_limit) == 0x24);
-    assert!(offset_of!(CreationDescriptor, allocate) == 0x28);
-    assert!(offset_of!(CreationDescriptor, context) == 0x30);
-    assert!(size_of::<CreationDescriptor>() == 0x34);
-};
-
-impl CreationDescriptor {
-    pub(crate) const SIZE: u32 = size_of::<Self>() as u32;
-}
-
-/// A validated creation descriptor.
-pub(crate) struct Creation<'a> {
-    /// The caller's descriptor; nothing when it passed none.
-    descriptor: Option<&'a CreationDescriptor>,
-    allocator: AllocatorRecord,
-}
-
-impl<'a> Creation<'a> {
-    pub(crate) fn new(descriptor: Option<&'a CreationDescriptor>) -> Result<Self, Error> {
-        let mut allocator = AllocatorRecord::default_routines();
-        if let Some(descriptor) = descriptor {
-            if descriptor.size != CreationDescriptor::SIZE {
-                return Err(Error::InvalidArgument);
-            }
-            if let Some(allocate) = descriptor.allocate {
-                let Some(free) = descriptor.free else {
-                    return Err(Error::InvalidArgument);
-                };
-                allocator = AllocatorRecord {
-                    alignment: AllocatorRecord::DEFAULT_ALIGNMENT,
-                    context: descriptor.context,
-                    allocate,
-                    free,
-                };
-            }
-        }
-        Ok(Self {
-            descriptor,
-            allocator,
-        })
-    }
-
-    /// The descriptor at `address`, or none for 0.
-    ///
-    /// # Safety
-    ///
-    /// `address` is 0 or the address of a creation descriptor (export
-    /// contract) that stays unchanged for `'a`, whose routine fields hold
-    /// console routines.
-    unsafe fn read(address: u32) -> Result<Self, Error> {
-        // SAFETY: the caller guarantees the record.
-        Self::new(unsafe {
-            ptr::with_exposed_provenance::<CreationDescriptor>(address as usize).as_ref()
-        })
-    }
-
-    fn flags(&self) -> OptionFlags {
-        self.descriptor
-            .map_or(OptionFlags::empty(), |descriptor| descriptor.options.flags)
-    }
-
-    /// The options a queue or stack keeps, when any is set.
-    fn kept_options(&self) -> Option<&'a OptionsRecord> {
-        self.descriptor
-            .map(|descriptor| &descriptor.options)
-            .filter(|options| options.is_kept())
-    }
-
-    /// The options record of the descriptor, zero without one.
-    fn options(&self) -> OptionsRecord {
-        self.descriptor
-            .map_or(OptionsRecord::default(), |descriptor| descriptor.options)
-    }
-
-    fn counts(&self, node_size: u32) -> NodeCounts {
-        let (per_block, limit) = self.descriptor.map_or((0, 0), |descriptor| {
-            (descriptor.per_block, descriptor.node_limit)
-        });
-        NodeCounts::new(per_block, limit, node_size)
-    }
-
-    /// Creation flag: removals wait, so creation makes the item semaphore.
-    fn item_wait(&self) -> bool {
-        self.flags().contains(OptionFlags::REMOVE_WAITS)
-    }
-
-    /// Creation flag: insertions wait, so a limited container makes the
-    /// free node semaphore.
-    fn free_wait(&self) -> bool {
-        self.flags().contains(OptionFlags::INSERT_WAITS)
-    }
-}
-
-/// Node counts of a creation.
-struct NodeCounts {
-    per_block: u32,
-    /// Node limit; nothing when unlimited.
-    limit: Option<u32>,
-}
-
-impl NodeCounts {
-    const MIN_PER_BLOCK: i32 = 16;
-    const MAX_PER_BLOCK: i32 = 0x100_0000;
-    /// Bound on the bytes of the node limit, so that they stay a positive
-    /// `i32`.
-    const MAX_BYTES: u32 = i32::MAX as u32;
-
-    /// Nodes per block clamped to 16..=0x100_0000.
-    fn clamp_per_block(per_block: u32) -> u32 {
-        (per_block as i32).clamp(Self::MIN_PER_BLOCK, Self::MAX_PER_BLOCK) as u32
-    }
-
-    /// The node limit stays below [`NodeCounts::MAX_BYTES`] / `node_size`;
-    /// a limit of zero or less is unlimited.
-    fn new(per_block: u32, limit: u32, node_size: u32) -> Self {
-        let per_block = Self::clamp_per_block(per_block);
-        let ceiling = (Self::MAX_BYTES / node_size) as i32;
-        let limit = if limit as i32 >= ceiling {
-            ceiling - 1
-        } else {
-            limit as i32
-        };
-        if limit <= 0 {
-            return Self {
-                per_block,
-                limit: None,
-            };
-        }
-        Self {
-            per_block: per_block.min(limit as u32),
-            limit: Some(limit as u32),
-        }
-    }
-}
-
-/// Nodes the limit still allows (caller-visible word).
-#[repr(transparent)]
-struct Remaining(AtomicU32);
-
-impl Remaining {
-    /// Stock encoding of an unlimited count; any negative value reads as
-    /// unlimited.
-    const UNLIMITED: u32 = u32::MAX;
-
-    fn set(&self, limit: Option<u32>) {
-        self.0.store(limit.unwrap_or(Self::UNLIMITED), Relaxed);
-    }
-
-    fn is_exhausted(&self) -> bool {
-        self.0.load(Relaxed) == 0
-    }
-
-    /// End growth after a failed allocation.
-    fn exhaust(&self) {
-        self.0.store(0, Relaxed);
-    }
-
-    /// Claim up to `wanted` nodes; nothing once the limit is reached.
-    fn claim(&self, wanted: u32) -> Option<u32> {
-        let mut nodes = wanted;
-        loop {
-            let left = self.0.load(Relaxed);
-            if (left as i32) < 0 {
-                return Some(nodes);
-            }
-            if left == 0 {
-                return None;
-            }
-            if nodes as i32 > left as i32 {
-                nodes = left;
-            }
-            if self
-                .0
-                .compare_exchange_release(left, left.wrapping_sub(nodes))
-                .is_ok()
-            {
-                return Some(nodes);
-            }
-        }
-    }
-
-    /// Claim up to `wanted` but at least `minimum` nodes.
-    fn claim_at_least(&self, wanted: u32, minimum: u32) -> Option<u32> {
-        let mut nodes = wanted;
-        loop {
-            let left = self.0.load(Relaxed);
-            if (left as i32) < 0 {
-                return Some(nodes);
-            }
-            if left == 0 {
-                return None;
-            }
-            if nodes as i32 > left as i32 {
-                nodes = left;
-            }
-            if (nodes as i32) < minimum as i32 {
-                return None;
-            }
-            if self
-                .0
-                .compare_exchange_release(left, left.wrapping_sub(nodes))
-                .is_ok()
-            {
-                return Some(nodes);
-            }
-        }
-    }
-}
-
-/// Node supply and item accounting, the same run of fields in every node
-/// container: +0x18 in a queue, +0x10 in a stack or hash table.
-#[repr(C, align(8))]
-struct Supply {
-    /// Free node credits; below zero, insertions wait.
-    credits: AtomicU32,
-    /// Free node semaphore ([`SemaphoreKind`]); 0 when insertions do not
-    /// wait.
-    free_semaphore: AtomicU32,
-    /// Removers blocked on the item semaphore.
-    waiters: AtomicU32,
-    /// Item semaphore and item count, in the order of [`ItemOrder`].
-    items: [AtomicU32; 2],
-    _reserved: AtomicU32,
-    /// Node blocks, linked through their trailers.
-    blocks: TaggedList,
-    per_block: AtomicU32,
-    remaining: Remaining,
-    /// Nodes allocated.
-    total: AtomicU32,
-    /// Bytes requested from the allocator.
-    memory: AtomicU32,
-}
-
-const _: () = {
-    use core::mem::offset_of;
-    assert!(offset_of!(Supply, items) == 0xc);
-    assert!(offset_of!(Supply, blocks) == 0x18);
-    assert!(offset_of!(Supply, remaining) == 0x24);
-    assert!(offset_of!(Supply, memory) == 0x2c);
-    assert!(size_of::<Supply>() == 0x30);
-};
-
-/// Order of the item words of a [`Supply`].
-#[derive(Clone, Copy)]
-enum ItemOrder {
-    /// Item semaphore, then item count (queue, stack).
-    SemaphoreFirst,
-    /// Item count, then item semaphore (hash table).
-    CountFirst,
-}
-
-/// Node layout of a container type.
-struct Layout {
-    node_size: u32,
-    /// Free list link of a node.
-    link: NodeWord,
-    semaphores: SemaphoreKind,
-    items: ItemOrder,
-}
-
-mod nodes {
-    use core::ptr;
-    use core::sync::atomic::AtomicU32;
-    use core::sync::atomic::Ordering::Relaxed;
-
-    use xbox360_sys::xboxkrnl::Handle;
-
-    use super::AllocatorRecord;
-    use super::ItemOrder;
-    use super::Layout;
-    use super::NodeAddress;
-    use super::SemaphoreKind;
-    use super::Supply;
-    use super::TaggedList;
-    use super::WaitObject;
-
-    /// The node supply of one container, for the routines every container
-    /// layout shares. The fields are private to this module, so a `Nodes`
-    /// always comes from [`Nodes::new`].
-    #[derive(Clone, Copy)]
-    pub(super) struct Nodes<'a> {
-        /// Free nodes, at +0 of every container.
-        free: &'a TaggedList,
-        supply: &'a Supply,
-        /// Allocator word of the container.
-        allocator: &'a AtomicU32,
-        layout: &'static Layout,
-    }
-
-    impl<'a> Nodes<'a> {
-        /// # Safety
-        ///
-        /// `free`, `supply` and `allocator` are the free list, the supply
-        /// fields and the allocator word of one container that creation set
-        /// up, whose nodes have `layout`, and that stays allocated for `'a`.
-        pub(super) const unsafe fn new(
-            free: &'a TaggedList,
-            supply: &'a Supply,
-            allocator: &'a AtomicU32,
-            layout: &'static Layout,
-        ) -> Self {
-            Self {
-                free,
-                supply,
-                allocator,
-                layout,
-            }
-        }
-
-        pub(super) fn free(&self) -> &'a TaggedList {
-            self.free
-        }
-
-        pub(super) fn supply(&self) -> &'a Supply {
-            self.supply
-        }
-
-        pub(super) fn layout(&self) -> &'static Layout {
-            self.layout
-        }
-
-        pub(super) fn allocator(&self) -> &'a AllocatorRecord {
-            // SAFETY: the allocator word of the container (`Nodes::new`).
-            unsafe { AllocatorRecord::at(self.allocator) }
-        }
-
-        fn wait_object(&self, word: &'a AtomicU32) -> Option<WaitObject<'a>> {
-            let raw = word.load(Relaxed);
-            if raw == 0 {
-                return None;
-            }
-            Some(match self.layout.semaphores {
-                // SAFETY: an object-kind container stores the address of its
-                // own initialized KSEMAPHORE in its semaphore words.
-                SemaphoreKind::Object => {
-                    WaitObject::Object(unsafe { &*ptr::with_exposed_provenance(raw as usize) })
-                }
-                SemaphoreKind::Handle => WaitObject::Handle(Handle::from_raw(raw)),
-                SemaphoreKind::GatedHandle => WaitObject::GatedHandle(Handle::from_raw(raw)),
-            })
-        }
-
-        /// The item semaphore word and the item count.
-        pub(super) fn item_words(&self) -> (&'a AtomicU32, &'a AtomicU32) {
-            let [first, second] = &self.supply.items;
-            match self.layout.items {
-                ItemOrder::SemaphoreFirst => (first, second),
-                ItemOrder::CountFirst => (second, first),
-            }
-        }
-
-        pub(super) fn free_semaphore(&self) -> Option<WaitObject<'a>> {
-            self.wait_object(&self.supply.free_semaphore)
-        }
-
-        pub(super) fn item_semaphore(&self) -> Option<WaitObject<'a>> {
-            self.wait_object(self.item_words().0)
-        }
-
-        pub(super) fn pop_free(&self) -> Option<NodeAddress> {
-            // SAFETY: the free list holds nodes of the container's blocks,
-            // linked at the layout's link (module invariants).
-            unsafe { self.free.pop(self.layout.link) }
-        }
-
-        /// # Safety
-        ///
-        /// `node` is a node of this container that no list holds.
-        pub(super) unsafe fn push_free(&self, node: NodeAddress) {
-            // SAFETY: the caller guarantees the node; nodes of the layout
-            // hold its link word.
-            unsafe { self.free.push(node, self.layout.link) };
-        }
-
-        /// Allocate a block of `size` bytes for nodes.
-        pub(super) fn allocate_block(&self, size: u32) -> Option<NodeAddress> {
-            // SAFETY: the block list of the container.
-            unsafe {
-                self.allocator()
-                    .allocate_block(&self.supply.blocks, size, &self.supply.memory)
-            }
-        }
-    }
-}
-
-use nodes::Nodes;
-
-impl<'a> Nodes<'a> {
-    fn count(&self) -> &'a AtomicU32 {
-        self.item_words().1
-    }
-
-    fn count_added(&self) {
-        self.count().fetch_add_relaxed(1);
-    }
-
-    fn count_removed(&self) {
-        self.count().fetch_add_relaxed(1_u32.wrapping_neg());
-    }
-
-    /// Return a node to the free list and wake an insertion waiting for one.
-    ///
-    /// # Safety
-    ///
-    /// `node` is a node of this container that no list holds.
-    unsafe fn release_node(&self, node: NodeAddress) {
-        // SAFETY: the caller guarantees the node.
-        unsafe { self.push_free(node) };
-        if let Some(semaphore) = self.free_semaphore()
-            && (self.supply().credits.fetch_add_relaxed(1) as i32).wrapping_add(1) <= 0
-        {
-            semaphore.release(1);
-        }
-    }
-
-    /// Wake a remover blocked on the item semaphore.
-    fn signal_item(&self) {
-        if let Some(semaphore) = self.item_semaphore()
-            && self.supply().waiters.load(Relaxed) as i32 > 0
-        {
-            semaphore.release(1);
-        }
-    }
-
-    /// Take a block of nodes within the limit: all but the first go to the
-    /// free list and the first is returned.
-    fn grow(&self) -> Option<NodeAddress> {
-        let supply = self.supply();
-        let nodes = supply.remaining.claim(supply.per_block.load(Relaxed))?;
-        self.populate(nodes)
-    }
-
-    /// Allocate `nodes` nodes, free all but the first and pass the new
-    /// credits to waiting insertions; a failed allocation ends growth.
-    fn populate(&self, nodes: u32) -> Option<NodeAddress> {
-        let node_size = self.layout().node_size;
-        let size = nodes.wrapping_mul(node_size);
-        let Some(block) = self.allocate_block(size) else {
-            self.supply().remaining.exhaust();
-            return None;
-        };
-        self.supply().total.fetch_add_relaxed(nodes);
-        let mut node = block.raw().wrapping_add(size);
-        for _ in 1..nodes {
-            node = node.wrapping_sub(node_size);
-            // SAFETY: a node inside the new block, which holds `nodes` nodes.
-            unsafe { self.push_free(NodeAddress::new_unchecked(node)) };
-        }
-        if let Some(semaphore) = self.free_semaphore() {
-            let previous = self.supply().credits.fetch_add_relaxed(nodes) as i32;
-            let spare = (nodes as i32).wrapping_sub(1);
-            if previous < -1 && spare > 0 {
-                semaphore.release((!previous).min(spare) as u32);
-            }
-        }
-        Some(block)
-    }
-
-    /// Take a node for an insertion; with a node limit, wait per `wait`.
-    fn acquire_node(&self, wait: &Wait) -> Result<NodeAddress, Error> {
-        let Some(semaphore) = self.free_semaphore() else {
-            if let Some(node) = self.pop_free() {
-                return Ok(node);
-            }
-            if self.supply().remaining.is_exhausted() {
-                return Err(Error::Timeout);
-            }
-            return self.grow().ok_or(Error::Timeout);
-        };
-        let credits = &self.supply().credits;
-        let mut node = None;
-        if (credits.fetch_add_relaxed(1_u32.wrapping_neg()) as i32).wrapping_sub(1) >= 0 {
-            node = self.pop_free();
-        }
-        if node.is_none() && !self.supply().remaining.is_exhausted() {
-            node = self.grow();
-        }
-        let mut backoff = Backoff::new();
-        if wait.spin {
-            for _ in 0..Backoff::SPIN_ATTEMPTS {
-                if node.is_some() {
-                    break;
-                }
-                backoff.pause();
-                node = self.pop_free();
-            }
-        }
-        loop {
-            if let Some(node) = node {
-                return Ok(node);
-            }
-            if wait.spin {
-                backoff.pause();
-            }
-            if let Err(error) = wait.block(semaphore) {
-                credits.fetch_add_relaxed(1);
-                return Err(error);
-            }
-            node = self.pop_free();
-        }
-    }
-
-    /// Run `attempt` until it yields an item: at once, then spinning when
-    /// asked, then counted among the waiters and blocking on `semaphore`
-    /// between attempts.
-    fn remove_waiting<T>(
-        &self,
-        semaphore: WaitObject<'_>,
-        wait: &Wait,
-        mut attempt: impl FnMut() -> Option<T>,
-    ) -> Result<T, Error> {
-        if let Some(item) = attempt() {
-            return Ok(item);
-        }
-        let mut backoff = Backoff::new();
-        if wait.spin {
-            for _ in 0..Backoff::SPIN_ATTEMPTS {
-                backoff.pause();
-                if let Some(item) = attempt() {
-                    return Ok(item);
-                }
-            }
-        }
-        let waiters = &self.supply().waiters;
-        waiters.fetch_add_relaxed(1);
-        loop {
-            if let Some(item) = attempt() {
-                waiters.fetch_add_relaxed(1_u32.wrapping_neg());
-                return Ok(item);
-            }
-            if wait.spin {
-                backoff.pause();
-            }
-            if let Err(error) = wait.block(semaphore) {
-                waiters.fetch_add_relaxed(1_u32.wrapping_neg());
-                return Err(error);
-            }
-        }
-    }
-}
-
-/// Call `callback(context, value, node)` for each node from `first`,
-/// following the address word at +0, until a callback returns nonzero.
-///
-/// # Safety
-///
-/// Every node from `first` is a live node of a container borrowed for the
-/// call, with its value at `value`.
-unsafe fn walk(first: u32, value: NodeWord, context: u32, callback: Routine) -> Result<(), Error> {
-    let mut node = NodeAddress::new(first);
-    while let Some(address) = node {
-        // SAFETY: the caller guarantees the nodes.
-        let item = unsafe { address.word(value) }.load(Relaxed);
-        let result = callback.call(context, item, address.raw(), 0);
-        if let Some(result) = Win32Error::new(result) {
-            return Err(Error::Callback(result));
-        }
-        // SAFETY: as above.
-        node = NodeAddress::new(unsafe { address.word(NodeWord::Word0) }.load(Relaxed));
-    }
-    Ok(())
-}
-
-/// Pool allocation of the library; nothing when the pool has no memory.
-pub(crate) fn pool_allocate(size: u32) -> Option<NonZeroU32> {
-    // SAFETY: pool allocation of any size is valid; failure is null.
-    NonZeroU32::new(unsafe {
-        xboxkrnl::ExAllocatePoolTypeWithTag(size, pool_tag::DETOUR, PoolType::Default)
-    })
-}
-
-/// Free a block of [`pool_allocate`].
-///
-/// # Safety
-///
-/// `address` is a block of [`pool_allocate`] that is not used after.
-pub(crate) unsafe fn pool_free(address: NonZeroU32) {
-    // SAFETY: the caller guarantees the block.
-    unsafe { xboxkrnl::ExFreePool(address.get()) }
-}
-
-extern "C" fn allocate(size: u32) -> u32 {
-    pool_allocate(size).map_or(0, NonZeroU32::get)
-}
-export!(300, allocate);
-
-crate::kernel::forward!(
-    /// Stock tail-calls ExFreePool, so its r3 passes through.
-    fn free(u32) -> u32 => xboxkrnl::ExFreePool
-);
-export!(301, free);

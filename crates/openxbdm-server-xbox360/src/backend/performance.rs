@@ -4,6 +4,7 @@
 
 mod capture;
 mod counters;
+mod error;
 pub(crate) mod module_snapshot;
 pub(crate) mod pix;
 mod pmc;
@@ -60,6 +61,15 @@ use crate::kernel;
 
 pub(crate) use counters::memory_statistics;
 
+/// `NtAllocateVirtualMemory` type: commit, reserve, 64 KiB pages.
+pub(crate) const COMMIT_RESERVE_LARGE: AllocationType = AllocationType::COMMIT
+    .union(AllocationType::RESERVE)
+    .union(AllocationType::LARGE_PAGES);
+
+/// Title terminate registration of stock 0x91f97444, which runs after the
+/// main one (0x91f32398).
+static TITLE_ENDED: NotificationRegistration = NotificationRegistration::new();
+
 /// Bytes of an `SmcCommand::I2c` message.
 mod i2c {
     /// Byte of the operation and its flags.
@@ -109,12 +119,352 @@ impl Data {
     }
 }
 
+impl Console {
+    fn encoder_extended(&mut self) -> bool {
+        /// Video encoder identification register; identifications from
+        /// 0x10000 have the extended banks.
+        const ID_REGISTER: u32 = 0xfe;
+        const EXTENDED_ID: u32 = 0x1_0000;
+
+        *self.performance.encoder_extended.get_or_insert_with(|| {
+            // SAFETY: reads a video encoder register; no memory is involved.
+            let id = unsafe { VdReadDVERegisterUlong(ID_REGISTER) };
+
+            id >= EXTENDED_ID
+        })
+    }
+}
+
+impl performance::Backend for Console {
+    fn performance_frequency(&mut self) -> u64 {
+        kernel::performance_frequency()
+    }
+
+    fn next_counter(
+        &mut self,
+        context: &mut u32,
+        name: &mut [u8; COUNTER_NAME_CAPACITY],
+    ) -> Result<CounterEntry, CounterError> {
+        counters::next(context, name)
+    }
+
+    fn query_counter(
+        &mut self,
+        name: &[u8],
+        query: CounterQuery,
+        out: &mut CounterSample,
+    ) -> Result<Evaluation, CounterError> {
+        let handle = counters::open(name)?;
+        let result = counters::reference(handle)
+            .map_err(CounterError::Kernel)
+            .and_then(|mut counter| {
+                let result = counters::query(&mut counter, query, out);
+                counter.release();
+                result
+            });
+
+        handle.close();
+
+        result
+    }
+
+    fn capture_display(&mut self) -> DisplayCapture {
+        /// Longest wait for a pending flip.
+        const FLIP_WAIT_MS: u32 = 500;
+
+        let gpu = GpuRegisters::get();
+        let flip_pending = || gpu.status().read().contains(GpuStatus::BUSY);
+        if flip_pending() {
+            let start = TickCount::now().milliseconds();
+            while TickCount::now().milliseconds().wrapping_sub(start) <= FLIP_WAIT_MS
+                && flip_pending()
+            {}
+        }
+
+        let front_buffer = gpu.display_primary_surface().read();
+        let mut information = xboxkrnl::DisplayInformation::new();
+        // SAFETY: `information` is a live display information block.
+        unsafe { VdGetCurrentDisplayInformation(information.as_mut_ptr()) };
+
+        // Bits 8 to 10 hold the gamma setting.
+        let gamma = (gpu.display_graphics_control().read() >> 8) & 7 != 0;
+
+        DisplayCapture {
+            display: DisplayInformation {
+                surface_width: information.surface_width,
+                colorspace: information.colorspace,
+                left: information.left,
+                top: information.top,
+                right: information.right,
+                bottom: information.bottom,
+                scaled_width: information.scaled_width,
+                scaled_height: information.scaled_height,
+            },
+            front_buffer,
+            gamma,
+        }
+    }
+
+    unsafe fn read_framebuffer_page(&mut self, address: u32, page: &mut [u8; TILE_SIZE as usize]) {
+        // SAFETY: the caller passes a tile of the front buffer the display
+        // controller scans out.
+        unsafe { xboxkrnl::KeFlushCacheRange(address, TILE_SIZE) };
+        // SAFETY: as above.
+        let source = unsafe {
+            core::slice::from_raw_parts(address as usize as *const u8, TILE_SIZE as usize)
+        };
+        page.copy_from_slice(source);
+        // SAFETY: as above.
+        unsafe { xboxkrnl::KeFlushCacheRange(address, TILE_SIZE) };
+    }
+
+    fn read_video_encoder(&mut self, register: u32) -> u32 {
+        // SAFETY: reads a video encoder register; no memory is involved.
+        unsafe { VdReadDVERegisterUlong(register) }
+    }
+
+    fn write_video_encoder(&mut self, register: u32, value: u32) {
+        // SAFETY: writes a video encoder register; no memory is involved.
+        unsafe { VdWriteDVERegisterUlong(register, value) };
+    }
+
+    fn video_encoder_extended(&mut self) -> bool {
+        self.encoder_extended()
+    }
+
+    /// One-byte I2C write to device 0x39 (0x100..0x1ff) or 0x3d
+    /// (0x200..0x2ff), as stock 0x91f23f00.
+    fn write_video_encoder_extended(&mut self, register: u32, value: u8) {
+        /// Extended registers whose writes are bracketed by bus requests.
+        const BRACKETED_REGISTERS: core::ops::RangeInclusive<u32> = 0x1d0..=0x1f5;
+
+        let mut message = SmcMessage::new(SmcCommand::I2c);
+        let mut reply = SmcMessage::default();
+        message.0[i2c::CONTROL] = I2cControl::WRITE_BYTE.bits();
+        message.0[i2c::DEVICE] = i2c::DEVICE_SELECT
+            | if register > 0x1ff {
+                i2c::ENCODER_HIGH
+            } else {
+                i2c::ENCODER
+            };
+        message.0[i2c::REGISTER] = register as u8;
+        message.0[i2c::VALUE] = value;
+
+        let bracketed = BRACKETED_REGISTERS.contains(&register);
+        let bus_requests = hardware_flags().generation().get() != 0;
+        if bracketed {
+            message.0[i2c::CONTROL] |= I2cControl::BRACKETED.bits();
+            if bus_requests {
+                send_i2c_request(I2cControl::BUS_REQUEST);
+            }
+        }
+
+        // SAFETY: `message` and `reply` are live SMC messages.
+        unsafe { xboxkrnl::HalSendSMCMessage(&message, &mut reply) };
+
+        if bracketed && bus_requests {
+            send_i2c_request(I2cControl::BUS_RELEASE);
+        }
+
+        // Byte 1 of the reply is the error code.
+        if reply.0[i2c::CONTROL] != 0 {
+            pmc::print(
+                c"BD: Failed to write I2C bus address %X, error code %u\n",
+                &[u64::from(register), u64::from(reply.0[i2c::CONTROL])],
+            );
+        }
+    }
+
+    fn read_gpu_register(&mut self, index: u32) -> u32 {
+        // The command accepts indexes up to 0xfffc.
+        GpuRegisters::get().register(index as u16).read()
+    }
+
+    fn write_gpu_register(&mut self, index: u32, value: u32) {
+        // SAFETY: `gpoke` stores any GPU register at the debugger's request,
+        // as stock XBDM does; the debugger answers for the effects. Stock
+        // issues no `eieio` after the store.
+        unsafe {
+            GpuRegisters::get()
+                .register(index as u16)
+                .write_unordered(value)
+        }
+    }
+
+    fn read_edid(&mut self, block: u8, output: &mut [u8; EDID_BLOCK_SIZE]) -> EdidRead {
+        /// Kernel export that reads an EDID block.
+        const EDID_EXPORT: Ordinal = Ordinal::new(623).unwrap();
+
+        let Ok(function) = SystemModule::Kernel
+            .handle()
+            .and_then(|module| resolve_export(module, EDID_EXPORT))
+        else {
+            return EdidRead::Unsupported;
+        };
+
+        // SAFETY: the export takes (block, 128-byte buffer).
+        let read = unsafe {
+            kernel::call_export(
+                function.raw(),
+                u32::from(block),
+                output.as_mut_ptr() as usize as u32,
+                0,
+                0,
+            )
+        };
+
+        if read == 0 {
+            EdidRead::Failed
+        } else {
+            EdidRead::Read
+        }
+    }
+
+    fn dedicate_studio_socket(&mut self) -> Result<u16, StudioError> {
+        studio::dedicate()
+    }
+
+    fn capture_start(
+        &mut self,
+        name: &[u8],
+        path: &[u8],
+        buffer: BufferRequest,
+    ) -> Result<Started, CaptureError> {
+        capture::start(name, path, buffer)
+    }
+
+    fn fast_cap_present(&mut self) -> bool {
+        capture::fast_cap_present()
+    }
+
+    fn call_cap_present(&mut self) -> bool {
+        capture::call_cap_present()
+    }
+
+    fn capture_stop(&mut self, drives: &DriveTable) -> Result<(), CaptureError> {
+        capture::stop(self, drives)
+    }
+
+    fn capture_set_flags(&mut self, flags: CaptureFlags) {
+        capture::set_flags(flags);
+    }
+
+    fn capture_status(&mut self) -> Result<(), CaptureError> {
+        capture::status()
+    }
+
+    fn capture_abort(&mut self) -> Result<(), CaptureError> {
+        capture::abort()
+    }
+
+    fn cpu_profiler_start(
+        &mut self,
+        drives: &DriveTable,
+        name: &[u8],
+        interval: u32,
+        flags: ProfilerFlags,
+    ) -> Result<(), ProfilerError> {
+        let path = drives.translate(self, name);
+
+        let mut executable = [0u8; module_snapshot::PATH_LIMIT + 2];
+        let length = drives.object_path_to_drive_path(
+            self,
+            module_snapshot::ExecutableObjectPath::read().as_bytes(),
+            &mut executable,
+        );
+
+        profiler::start(
+            path.as_ref().map(|path| path.as_bytes()),
+            &executable[..length],
+            interval,
+            flags,
+        )
+    }
+
+    fn cpu_profiler_stop(&mut self) -> Result<(), ProfilerError> {
+        profiler::stop()
+    }
+
+    fn cpu_profiler_info(&mut self) -> Result<CpuProfilerInfo, ProfilerError> {
+        profiler::info()
+    }
+
+    unsafe fn pix_post(&mut self, code: u32, payload: &[u32]) -> bool {
+        // SAFETY: the caller upholds the same contract.
+        unsafe { pix::backend::post(code, payload) }
+    }
+
+    fn pix_status(&mut self, version: u32, flags: u32) -> Option<[u32; 12]> {
+        pix::backend::status(version, flags)
+    }
+
+    fn pix_frame_statistics(&mut self, frame: u32) -> Option<[u32; 3]> {
+        pix::backend::frame_statistics(frame)
+    }
+
+    fn pix_frame_number(&mut self) -> i32 {
+        pix::backend::frame_number()
+    }
+
+    fn pix_signal_event(&mut self, event: u32) {
+        pix::backend::signal_event(event);
+    }
+
+    fn pix_set_trace(&mut self, enabled: bool) {
+        pix::set_trace(enabled);
+    }
+
+    fn pix_counter_control(&mut self, group: u32, id: u32, enabled: bool) {
+        pix::backend::counter_control(group, id, enabled);
+    }
+
+    fn pix_set_capture_value(&mut self, value: CaptureValue, data: u32) {
+        pix::backend::set_capture_value(value, data);
+    }
+
+    fn pix_set_capture_text(&mut self, text: &[u8]) {
+        pix::backend::set_capture_text(text);
+    }
+
+    fn pix_set_legacy_protocol(&mut self, legacy: bool) {
+        pix::backend::set_legacy_protocol(legacy);
+    }
+
+    fn pix_set_gpu_capture(&mut self, enabled: bool) {
+        pix::backend::set_gpu_capture(enabled);
+    }
+
+    fn pix_dogma(&mut self) -> Option<PixDogma> {
+        pix::backend::dogma()
+    }
+
+    fn pix_boot_animation_loaded(&mut self) -> bool {
+        // SAFETY: only the result is used, not the handle.
+        unsafe { module_handle(c"bootanim.xex") }.is_ok()
+    }
+
+    fn pix_capture_ready(&mut self) -> bool {
+        pix::backend::capture_ready()
+    }
+
+    fn pix_trace_snapshot(&mut self) -> u32 {
+        pix::backend::trace_snapshot()
+    }
+
+    fn pix_trace_read(&mut self, output: &mut [u8]) -> usize {
+        pix::backend::trace_read(output)
+    }
+}
+
 /// Start the engines during module initialization, after the control
 /// dispatcher is published (stock order in 0x91f32628).
 pub(crate) fn initialize() {
+    const TITLE_ENDED_PRIORITY: u32 = 0x6d80_0000;
+
     counters::initialize();
     capture::initialize();
     pix::initialize();
+
     // SAFETY: the record is not registered yet. The routine stays loaded
     // until `shut_down` removes the record.
     unsafe {
@@ -150,11 +500,6 @@ pub(crate) fn title_terminated() {
     pmc::title_terminated();
     pix::title_terminated();
 }
-
-/// Title terminate registration of stock 0x91f97444, which runs after the
-/// main one (0x91f32398).
-static TITLE_ENDED: NotificationRegistration = NotificationRegistration::new();
-const TITLE_ENDED_PRIORITY: u32 = 0x6d80_0000;
 
 /// Second title terminate routine (stock 0x91f32418): the title's handles
 /// are gone with its process.
@@ -237,25 +582,6 @@ pub(super) fn store_pair(pair: &[AtomicU32; 2], value: u64) {
     pair[1].store(value as u32, Ordering::Relaxed);
 }
 
-/// `NtAllocateVirtualMemory` type: commit, reserve, 64 KiB pages.
-pub(crate) const COMMIT_RESERVE_LARGE: AllocationType = AllocationType::COMMIT
-    .union(AllocationType::RESERVE)
-    .union(AllocationType::LARGE_PAGES);
-
-impl Console {
-    fn encoder_extended(&mut self) -> bool {
-        /// Video encoder identification register; identifications from
-        /// 0x10000 have the extended banks.
-        const ID_REGISTER: u32 = 0xfe;
-        const EXTENDED_ID: u32 = 0x1_0000;
-        *self.performance.encoder_extended.get_or_insert_with(|| {
-            // SAFETY: reads a video encoder register; no memory is involved.
-            let id = unsafe { VdReadDVERegisterUlong(ID_REGISTER) };
-            id >= EXTENDED_ID
-        })
-    }
-}
-
 /// Send one SMC I2C message carrying `control`.
 fn send_i2c_request(control: I2cControl) {
     let mut message = SmcMessage::new(SmcCommand::I2c);
@@ -263,309 +589,4 @@ fn send_i2c_request(control: I2cControl) {
     message.0[i2c::CONTROL] = control.bits();
     // SAFETY: `message` and `reply` are live SMC messages.
     unsafe { xboxkrnl::HalSendSMCMessage(&message, &mut reply) };
-}
-
-impl performance::Backend for Console {
-    fn performance_frequency(&mut self) -> u64 {
-        kernel::performance_frequency()
-    }
-
-    fn next_counter(
-        &mut self,
-        context: &mut u32,
-        name: &mut [u8; COUNTER_NAME_CAPACITY],
-    ) -> Result<CounterEntry, CounterError> {
-        counters::next(context, name)
-    }
-
-    fn query_counter(
-        &mut self,
-        name: &[u8],
-        query: CounterQuery,
-        out: &mut CounterSample,
-    ) -> Result<Evaluation, CounterError> {
-        let handle = counters::open(name)?;
-        let result = counters::reference(handle)
-            .map_err(CounterError::Kernel)
-            .and_then(|mut counter| {
-                let result = counters::query(&mut counter, query, out);
-                counter.release();
-                result
-            });
-        handle.close();
-        result
-    }
-
-    fn capture_display(&mut self) -> DisplayCapture {
-        /// Longest wait for a pending flip.
-        const FLIP_WAIT_MS: u32 = 500;
-        let gpu = GpuRegisters::get();
-        let flip_pending = || gpu.status().read().contains(GpuStatus::BUSY);
-        if flip_pending() {
-            let start = TickCount::now().milliseconds();
-            while TickCount::now().milliseconds().wrapping_sub(start) <= FLIP_WAIT_MS
-                && flip_pending()
-            {}
-        }
-        let front_buffer = gpu.display_primary_surface().read();
-        let mut information = xboxkrnl::DisplayInformation::new();
-        // SAFETY: `information` is a live display information block.
-        unsafe { VdGetCurrentDisplayInformation(information.as_mut_ptr()) };
-        // Bits 8 to 10 hold the gamma setting.
-        let gamma = (gpu.display_graphics_control().read() >> 8) & 7 != 0;
-        DisplayCapture {
-            display: DisplayInformation {
-                surface_width: information.surface_width,
-                colorspace: information.colorspace,
-                left: information.left,
-                top: information.top,
-                right: information.right,
-                bottom: information.bottom,
-                scaled_width: information.scaled_width,
-                scaled_height: information.scaled_height,
-            },
-            front_buffer,
-            gamma,
-        }
-    }
-
-    unsafe fn read_framebuffer_page(&mut self, address: u32, page: &mut [u8; TILE_SIZE as usize]) {
-        // SAFETY: the caller passes a tile of the front buffer the display
-        // controller scans out.
-        unsafe { xboxkrnl::KeFlushCacheRange(address, TILE_SIZE) };
-        // SAFETY: as above.
-        let source = unsafe {
-            core::slice::from_raw_parts(address as usize as *const u8, TILE_SIZE as usize)
-        };
-        page.copy_from_slice(source);
-        // SAFETY: as above.
-        unsafe { xboxkrnl::KeFlushCacheRange(address, TILE_SIZE) };
-    }
-
-    fn read_video_encoder(&mut self, register: u32) -> u32 {
-        // SAFETY: reads a video encoder register; no memory is involved.
-        unsafe { VdReadDVERegisterUlong(register) }
-    }
-
-    fn write_video_encoder(&mut self, register: u32, value: u32) {
-        // SAFETY: writes a video encoder register; no memory is involved.
-        unsafe { VdWriteDVERegisterUlong(register, value) };
-    }
-
-    fn video_encoder_extended(&mut self) -> bool {
-        self.encoder_extended()
-    }
-
-    /// One-byte I2C write to device 0x39 (0x100..0x1ff) or 0x3d
-    /// (0x200..0x2ff), as stock 0x91f23f00.
-    fn write_video_encoder_extended(&mut self, register: u32, value: u8) {
-        /// Extended registers whose writes are bracketed by bus requests.
-        const BRACKETED_REGISTERS: core::ops::RangeInclusive<u32> = 0x1d0..=0x1f5;
-        let mut message = SmcMessage::new(SmcCommand::I2c);
-        let mut reply = SmcMessage::default();
-        message.0[i2c::CONTROL] = I2cControl::WRITE_BYTE.bits();
-        message.0[i2c::DEVICE] = i2c::DEVICE_SELECT
-            | if register > 0x1ff {
-                i2c::ENCODER_HIGH
-            } else {
-                i2c::ENCODER
-            };
-        message.0[i2c::REGISTER] = register as u8;
-        message.0[i2c::VALUE] = value;
-        let bracketed = BRACKETED_REGISTERS.contains(&register);
-        let bus_requests = hardware_flags().generation().get() != 0;
-        if bracketed {
-            message.0[i2c::CONTROL] |= I2cControl::BRACKETED.bits();
-            if bus_requests {
-                send_i2c_request(I2cControl::BUS_REQUEST);
-            }
-        }
-        // SAFETY: `message` and `reply` are live SMC messages.
-        unsafe { xboxkrnl::HalSendSMCMessage(&message, &mut reply) };
-        if bracketed && bus_requests {
-            send_i2c_request(I2cControl::BUS_RELEASE);
-        }
-        // Byte 1 of the reply is the error code.
-        if reply.0[i2c::CONTROL] != 0 {
-            pmc::print(
-                c"BD: Failed to write I2C bus address %X, error code %u\n",
-                &[u64::from(register), u64::from(reply.0[i2c::CONTROL])],
-            );
-        }
-    }
-
-    fn read_gpu_register(&mut self, index: u32) -> u32 {
-        // The command accepts indexes up to 0xfffc.
-        GpuRegisters::get().register(index as u16).read()
-    }
-
-    fn write_gpu_register(&mut self, index: u32, value: u32) {
-        // SAFETY: `gpoke` stores any GPU register at the debugger's request,
-        // as stock XBDM does; the debugger answers for the effects. Stock
-        // issues no `eieio` after the store.
-        unsafe {
-            GpuRegisters::get()
-                .register(index as u16)
-                .write_unordered(value)
-        }
-    }
-
-    fn read_edid(&mut self, block: u8, output: &mut [u8; EDID_BLOCK_SIZE]) -> EdidRead {
-        /// Kernel export that reads an EDID block.
-        const EDID_EXPORT: Ordinal = Ordinal::new(623).unwrap();
-        let Ok(function) = SystemModule::Kernel
-            .handle()
-            .and_then(|module| resolve_export(module, EDID_EXPORT))
-        else {
-            return EdidRead::Unsupported;
-        };
-        // SAFETY: the export takes (block, 128-byte buffer).
-        let read = unsafe {
-            kernel::call_export(
-                function.raw(),
-                u32::from(block),
-                output.as_mut_ptr() as usize as u32,
-                0,
-                0,
-            )
-        };
-        if read == 0 {
-            EdidRead::Failed
-        } else {
-            EdidRead::Read
-        }
-    }
-
-    fn dedicate_studio_socket(&mut self) -> Result<u16, StudioError> {
-        studio::dedicate()
-    }
-
-    fn capture_start(
-        &mut self,
-        name: &[u8],
-        path: &[u8],
-        buffer: BufferRequest,
-    ) -> Result<Started, CaptureError> {
-        capture::start(name, path, buffer)
-    }
-
-    fn fast_cap_present(&mut self) -> bool {
-        capture::fast_cap_present()
-    }
-
-    fn call_cap_present(&mut self) -> bool {
-        capture::call_cap_present()
-    }
-
-    fn capture_stop(&mut self, drives: &DriveTable) -> Result<(), CaptureError> {
-        capture::stop(self, drives)
-    }
-
-    fn capture_set_flags(&mut self, flags: CaptureFlags) {
-        capture::set_flags(flags);
-    }
-
-    fn capture_status(&mut self) -> Result<(), CaptureError> {
-        capture::status()
-    }
-
-    fn capture_abort(&mut self) -> Result<(), CaptureError> {
-        capture::abort()
-    }
-
-    fn cpu_profiler_start(
-        &mut self,
-        drives: &DriveTable,
-        name: &[u8],
-        interval: u32,
-        flags: ProfilerFlags,
-    ) -> Result<(), ProfilerError> {
-        let path = drives.translate(self, name);
-        let mut executable = [0u8; module_snapshot::PATH_LIMIT + 2];
-        let length = drives.object_path_to_drive_path(
-            self,
-            module_snapshot::ExecutableObjectPath::read().as_bytes(),
-            &mut executable,
-        );
-        profiler::start(
-            path.as_ref().map(|path| path.as_bytes()),
-            &executable[..length],
-            interval,
-            flags,
-        )
-    }
-
-    fn cpu_profiler_stop(&mut self) -> Result<(), ProfilerError> {
-        profiler::stop()
-    }
-
-    fn cpu_profiler_info(&mut self) -> Result<CpuProfilerInfo, ProfilerError> {
-        profiler::info()
-    }
-
-    unsafe fn pix_post(&mut self, code: u32, payload: &[u32]) -> bool {
-        // SAFETY: the caller upholds the same contract.
-        unsafe { pix::backend::post(code, payload) }
-    }
-
-    fn pix_status(&mut self, version: u32, flags: u32) -> Option<[u32; 12]> {
-        pix::backend::status(version, flags)
-    }
-
-    fn pix_frame_statistics(&mut self, frame: u32) -> Option<[u32; 3]> {
-        pix::backend::frame_statistics(frame)
-    }
-
-    fn pix_frame_number(&mut self) -> i32 {
-        pix::backend::frame_number()
-    }
-
-    fn pix_signal_event(&mut self, event: u32) {
-        pix::backend::signal_event(event);
-    }
-
-    fn pix_set_trace(&mut self, enabled: bool) {
-        pix::set_trace(enabled);
-    }
-
-    fn pix_counter_control(&mut self, group: u32, id: u32, enabled: bool) {
-        pix::backend::counter_control(group, id, enabled);
-    }
-
-    fn pix_set_capture_value(&mut self, value: CaptureValue, data: u32) {
-        pix::backend::set_capture_value(value, data);
-    }
-
-    fn pix_set_capture_text(&mut self, text: &[u8]) {
-        pix::backend::set_capture_text(text);
-    }
-
-    fn pix_set_legacy_protocol(&mut self, legacy: bool) {
-        pix::backend::set_legacy_protocol(legacy);
-    }
-
-    fn pix_set_gpu_capture(&mut self, enabled: bool) {
-        pix::backend::set_gpu_capture(enabled);
-    }
-
-    fn pix_dogma(&mut self) -> Option<PixDogma> {
-        pix::backend::dogma()
-    }
-
-    fn pix_boot_animation_loaded(&mut self) -> bool {
-        // SAFETY: only the result is used, not the handle.
-        unsafe { module_handle(c"bootanim.xex") }.is_ok()
-    }
-
-    fn pix_capture_ready(&mut self) -> bool {
-        pix::backend::capture_ready()
-    }
-
-    fn pix_trace_snapshot(&mut self) -> u32 {
-        pix::backend::trace_snapshot()
-    }
-
-    fn pix_trace_read(&mut self, output: &mut [u8]) -> usize {
-        pix::backend::trace_read(output)
-    }
 }

@@ -31,19 +31,16 @@ use super::buffers;
 use super::buffers::BufferEntry;
 use super::buffers::BufferType;
 use super::buffers::HEADER_BYTES;
-use super::gpu::CommandBufferError;
+use super::error::CommandBufferError;
 use super::gpu::StreamRecordKind;
 use super::gpu::fence_header;
 use super::timing;
 use super::timing::RecordKind;
 use crate::kernel;
 
-/// Limits of the per-thread buffers the kernel and titles fill and of the
-/// second buffers, as offsets from the buffer data.
+/// Limit of the per-thread buffers the kernel and titles fill, as an offset
+/// from the buffer data.
 pub(super) const THREAD_LIMIT: u32 = 0x3f2c;
-const SECOND_THREAD_LIMIT: u32 = 0x3ff0;
-/// Frame record kind of [`stop`].
-const STOP_RECORD: u32 = 1;
 /// Return addresses of a call stack in a context swap record.
 const STACK_FRAMES: u32 = 0x13;
 /// Dwords of a call stack in a context swap record, with its terminator.
@@ -104,29 +101,35 @@ struct UninstallContext {
 const _: () = assert!(size_of::<UninstallContext>() == size_of::<[u32; 3]>());
 
 /// Start capturing with the current configuration (stock 0x91f5fb68).
-pub(super) fn start(s: &PixSession) {
+pub(super) fn start(session: &PixSession) {
     /// Bounds of a buffer that is always full: while tracing, every writer
     /// asks code 0x50.
     const FULL_CURSOR: u32 = 0x8000_0000;
     const FULL_LIMIT: u32 = 1;
+    /// Limit of the second buffers, as an offset from the buffer data.
+    const SECOND_THREAD_LIMIT: u32 = 0x3ff0;
     /// The marker timer expires 100 ms from now (relative, in 100 ns
     /// units), then every 100 ms.
     const MARKER_DUE: i64 = -1_000_000;
     const MARKER_PERIOD_MS: u32 = 100;
 
     let context = [const { InstallContext::new() }; HARDWARE_THREAD_COUNT];
-    let configuration = &s.configuration;
+    let configuration = &session.configuration;
     let mut streams = 0u32;
-    s.set_engine_flags(s.engine_flags() | EngineFlags::RUNNING);
-    let (first_entries, second_entries) = s.entries.split_at(BufferType::SECOND_THREAD as usize);
+    session.set_engine_flags(session.engine_flags() | EngineFlags::RUNNING);
+
+    let (first_entries, second_entries) =
+        session.entries.split_at(BufferType::SECOND_THREAD as usize);
     let slots = context.iter().zip(first_entries).zip(second_entries);
+
     for (index, ((slot, first_entry), second_entry)) in slots.enumerate() {
         let [first, second] = &slot.buffers;
-        slot.session.store(s.address(), Relaxed);
+        slot.session.store(session.address(), Relaxed);
+
         let part = configuration.part(Part::Thread);
         if !part.is_off() {
             streams |= part.bit();
-            let entry = buffers::take(s, BufferType(index as u32), part.0);
+            let entry = buffers::take(session, BufferType(index as u32), part.0);
             first_entry.store(entry.address(), Relaxed);
             let data = entry.data();
             first.cursor.store(data + HEADER_BYTES, Relaxed);
@@ -135,11 +138,12 @@ pub(super) fn start(s: &PixSession) {
             first.limit.store(FULL_LIMIT, Relaxed);
             first.cursor.store(FULL_CURSOR, Relaxed);
         }
+
         let part = configuration.part(Part::SecondThread);
         if !part.is_off() && configuration.second_threads.load(Relaxed) & 1 << index != 0 {
             streams |= part.bit();
             let kind = BufferType(index as u32 + BufferType::SECOND_THREAD);
-            let entry = buffers::take(s, kind, part.0);
+            let entry = buffers::take(session, kind, part.0);
             second_entry.store(entry.address(), Relaxed);
             slot.flags
                 .store(configuration.second_flags.load(Relaxed), Relaxed);
@@ -147,6 +151,7 @@ pub(super) fn start(s: &PixSession) {
             second.cursor.store(data + HEADER_BYTES, Relaxed);
             second.limit.store(data + SECOND_THREAD_LIMIT, Relaxed);
         }
+
         for &part in &[Part::Gpu, Part::Audio] {
             let part = configuration.part(part);
             if !part.is_off() {
@@ -154,6 +159,7 @@ pub(super) fn start(s: &PixSession) {
             }
         }
     }
+
     // SAFETY: `install_entry` is an IPI routine; `context` outlives the
     // call, which returns after every processor ran it.
     unsafe {
@@ -162,16 +168,21 @@ pub(super) fn start(s: &PixSession) {
             context.as_ptr().expose_provenance() as u32,
         )
     };
+
     if !configuration.part(Part::Thread).is_off() {
         // SAFETY: the DPC and timer lie in the session block, which is
         // never freed; `stop` cancels the timer.
         unsafe {
-            xboxkrnl::KeInitializeDpc(s.marker_dpc.as_ptr(), marker_entry as *const () as usize, 0)
+            xboxkrnl::KeInitializeDpc(
+                session.marker_dpc.as_ptr(),
+                marker_entry as *const () as usize,
+                0,
+            )
         };
         // SAFETY: as above.
         unsafe {
             xboxkrnl::KeInitializeTimerEx(
-                s.marker_timer.as_ptr(),
+                session.marker_timer.as_ptr(),
                 xboxkrnl::TimerType::Notification,
                 xboxkrnl::ProcessType::SYSTEM,
             )
@@ -179,46 +190,53 @@ pub(super) fn start(s: &PixSession) {
         // SAFETY: as above; the timer and the DPC were just initialized.
         unsafe {
             xboxkrnl::KeSetTimerEx(
-                s.marker_timer.as_ptr(),
+                session.marker_timer.as_ptr(),
                 MARKER_DUE,
                 MARKER_PERIOD_MS,
-                s.marker_dpc.as_ptr(),
+                session.marker_dpc.as_ptr(),
             )
         };
     }
-    for k in 0..2 {
-        if streams & 1 << k != 0 {
-            let id = StreamId::from_raw(k);
-            let entry = buffers::take(s, BufferType::records(id), k);
-            s.record_entries[id as usize].store(entry.address(), Relaxed);
-            let data = entry.data();
-            s.record_cursors[id as usize].store(data + HEADER_BYTES, Relaxed);
-            s.record_ends[id as usize].store(data + buffers::BUFFER_BYTES, Relaxed);
+
+    for raw_stream in 0..2 {
+        if streams & 1 << raw_stream == 0 {
+            continue;
         }
+
+        let id = StreamId::from_raw(raw_stream);
+        let entry = buffers::take(session, BufferType::records(id), raw_stream);
+        session.record_entries[id as usize].store(entry.address(), Relaxed);
+        let data = entry.data();
+        session.record_cursors[id as usize].store(data + HEADER_BYTES, Relaxed);
+        session.record_ends[id as usize].store(data + buffers::BUFFER_BYTES, Relaxed);
     }
-    s.streams_mask.store(streams, Relaxed);
+
+    session.streams_mask.store(streams, Relaxed);
     if !configuration.part(Part::Audio).is_off() {
-        s.audio_enabled.store(1, Relaxed);
+        session.audio_enabled.store(1, Relaxed);
     }
-    update_swap_routine(s);
+
+    update_swap_routine(session);
 }
 
 /// Register the swap routine while capturing per-thread data and not
 /// paused, else remove it (stock 0x91f5fad0).
-pub(super) fn update_swap_routine(s: &PixSession) {
-    let flags = s.engine_flags();
+pub(super) fn update_swap_routine(session: &PixSession) {
+    let flags = session.engine_flags();
     let wanted = flags.contains(EngineFlags::RUNNING)
         & !flags.contains(EngineFlags::PAUSED)
-        & !s.configuration.part(Part::Thread).is_off();
-    let registered = &s.swap_routine_registered;
-    if wanted != (registered.load(Relaxed) != 0) {
-        if wanted {
-            crate::backend::session::register_swap_routine(swap_record, false);
-        } else {
-            crate::backend::session::unregister_swap_routine(swap_record);
-        }
-        registered.store(u32::from(wanted), Relaxed);
+        & !session.configuration.part(Part::Thread).is_off();
+    let registered = &session.swap_routine_registered;
+    if wanted == (registered.load(Relaxed) != 0) {
+        return;
     }
+
+    if wanted {
+        crate::backend::session::register_swap_routine(swap_record, false);
+    } else {
+        crate::backend::session::unregister_swap_routine(swap_record);
+    }
+    registered.store(u32::from(wanted), Relaxed);
 }
 
 crate::exports::bridged!(install_entry, install);
@@ -245,17 +263,19 @@ extern "C" fn install(context: u32) -> u32 {
     let contexts = unsafe { kernel::object_at::<[InstallContext; HARDWARE_THREAD_COUNT]>(context) };
     let slot = &contexts[processor];
     // SAFETY: `start` puts the session's address in every slot.
-    let s = unsafe { context_session(slot.session.load(Relaxed)) };
+    let session = unsafe { context_session(slot.session.load(Relaxed)) };
     let pcr = Kpcr::current();
+
     super::interrupts_off();
-    s.cursors[processor].store(
+    session.cursors[processor].store(
         crate::kernel::address_of(&pcr.pix_buffers[0].cursor),
         Relaxed,
     );
-    s.second_cursors[processor].store(
+    session.second_cursors[processor].store(
         crate::kernel::address_of(&pcr.pix_buffers[1].cursor),
         Relaxed,
     );
+
     let [first, second] = &pcr.pix_buffers;
     let [first_bounds, second_bounds] = &slot.buffers;
     // SAFETY: the bounds of this processor's buffers in the session, which
@@ -266,12 +286,14 @@ extern "C" fn install(context: u32) -> u32 {
         super::set_pcr_word(&second.cursor, second_bounds.cursor.load(Relaxed));
         super::set_pcr_word(&second.limit, second_bounds.limit.load(Relaxed));
     }
+
     let flags = PixFlags::from_bits_retain(slot.flags.load(Relaxed)).difference(PixFlags::TRACE)
         | PixFlags::from_bits_retain(pcr.pix_flags.load(Relaxed)) & PixFlags::TRACE;
     // SAFETY: the flags the configuration selects for the second buffer,
     // which is installed or empty.
     unsafe { super::set_pcr_word(&pcr.pix_flags, flags.bits()) };
     super::interrupts_on();
+
     0
 }
 
@@ -285,42 +307,49 @@ extern "C" fn uninstall(context: u32) -> u32 {
         unsafe { kernel::object_at::<[UninstallContext; HARDWARE_THREAD_COUNT]>(context) };
     let slot = &contexts[processor];
     // SAFETY: `stop` puts the session's address in every slot.
-    let s = unsafe { context_session(slot.session.load(Relaxed)) };
+    let session = unsafe { context_session(slot.session.load(Relaxed)) };
     let pcr = Kpcr::current();
+
     super::interrupts_off();
+
     for (second, buffer) in pcr.pix_buffers.iter().enumerate() {
         let index = processor + second * BufferType::SECOND_THREAD as usize;
         // SAFETY: `processor` is below 6 and `second` below 2.
         unsafe { core::hint::assert_unchecked(index < TEMPORARY_BLOCKS) };
+
         let cursor = buffer.cursor.load(Relaxed);
-        let base = s.temporary_blocks[index].load(Relaxed);
-        if (base..base.wrapping_add(TEMPORARY_BYTES)).contains(&cursor) {
-            // The raw word: values above 2 do nothing here, as in stock,
-            // where `TemporaryState::from_raw` would merge.
-            let state = s.temporary_states[index].load(Relaxed);
-            if state == TemporaryState::InUse as u32 {
-                // SAFETY: the saved cursor lies in this processor's buffer;
-                // interrupts stay off until both words are cleared below, so
-                // no writer uses the range meanwhile.
-                unsafe {
-                    super::set_pcr_word(&buffer.cursor, s.saved_cursors[index].load(Relaxed))
-                };
-                super::fence();
-                s.set_temporary_state(index, TemporaryState::None);
-                super::fence();
-                if second == 0 {
-                    kernel::debug_print(
-                        c"WRN[PIX]: EndStreaming discarded overflowed raised-IRQL data.\n",
-                    );
-                }
-            } else if state == TemporaryState::Merge as u32 {
-                timing::merge(s);
+        let base = session.temporary_blocks[index].load(Relaxed);
+        if !(base..base.wrapping_add(TEMPORARY_BYTES)).contains(&cursor) {
+            continue;
+        }
+
+        // The raw word: values above 2 do nothing here, as in stock,
+        // where `TemporaryState::from_raw` would merge.
+        let state = session.temporary_states[index].load(Relaxed);
+        if state == TemporaryState::InUse as u32 {
+            // SAFETY: the saved cursor lies in this processor's buffer;
+            // interrupts stay off until both words are cleared below, so
+            // no writer uses the range meanwhile.
+            unsafe {
+                super::set_pcr_word(&buffer.cursor, session.saved_cursors[index].load(Relaxed))
+            };
+            super::fence();
+            session.set_temporary_state(index, TemporaryState::None);
+            super::fence();
+            if second == 0 {
+                kernel::debug_print(
+                    c"WRN[PIX]: EndStreaming discarded overflowed raised-IRQL data.\n",
+                );
             }
+        } else if state == TemporaryState::Merge as u32 {
+            timing::merge(session);
         }
     }
+
     let [first, second] = &pcr.pix_buffers;
     slot.cursors[0].store(first.cursor.load(Relaxed), Relaxed);
     slot.cursors[1].store(second.cursor.load(Relaxed), Relaxed);
+
     // SAFETY: empty buffers stop the kernel and titles from writing records
     // on this processor.
     unsafe {
@@ -329,10 +358,12 @@ extern "C" fn uninstall(context: u32) -> u32 {
         super::set_pcr_word(&second.cursor, 0);
         super::set_pcr_word(&second.limit, 0);
     }
+
     let flags = PixFlags::from_bits_retain(pcr.pix_flags.load(Relaxed)) & PixFlags::TRACE;
     // SAFETY: cleared capture flags; the trace switch stays.
     unsafe { super::set_pcr_word(&pcr.pix_flags, flags.bits()) };
     super::interrupts_on();
+
     0
 }
 
@@ -345,15 +376,17 @@ extern "C" fn marker_dpc(_dpc: u32, _context: u32, _argument1: u32, _argument2: 
 /// Stock 0x91f5cef0.
 extern "C" fn marker_ipi(_context: u32) -> u32 {
     timing::write_record(TimingRecordId::Marker, &[]);
+
     0
 }
 
 /// Context swap routine (stock 0x91f5f948): a record with both threads'
 /// call stacks and identifiers in the outgoing processor's buffer.
 extern "C" fn swap_record(old: u32, frame: u32, new: u32) {
-    let Some(s) = session::session() else {
+    let Some(session) = session::session() else {
         return;
     };
+
     let processor = super::processor();
     let pcr = Kpcr::current();
     // SAFETY: the kernel passes the objects of the outgoing and the
@@ -362,25 +395,28 @@ extern "C" fn swap_record(old: u32, frame: u32, new: u32) {
     let old_id = old.id;
     let new_id = timing::record_thread_id(pcr, new);
     let buffer = &pcr.pix_buffers[0];
+
     super::interrupts_off();
     let mut cursor = buffer.cursor.load(Relaxed);
     if cursor >= buffer.limit.load(Relaxed) {
         super::interrupts_on();
-        timing::request_at_raised_level(s);
+        timing::request_at_raised_level(session);
         super::interrupts_off();
         cursor = buffer.cursor.load(Relaxed);
         if cursor >= buffer.limit.load(Relaxed) {
-            s.lost[processor].store(1, Relaxed);
+            session.lost[processor].store(1, Relaxed);
             super::interrupts_on();
             return;
         }
     }
+
     // SAFETY: the cursor, read with interrupts off, is below the limit, so
     // the longest record fits in the reserve after it; only this processor
     // writes there.
     let record = unsafe { crate::kernel::object_at::<[AtomicU32; SWAP_RECORD_WORDS]>(cursor) };
     record[0].store(RecordKind::Data.header(), Relaxed);
     record[2].store(new_id, Relaxed);
+
     let first = walk_stack(stack_slots(record, 3), frame, old, 1);
     let second_start = 3 + first;
     let second = walk_stack(
@@ -389,12 +425,14 @@ extern "C" fn swap_record(old: u32, frame: u32, new: u32) {
         new,
         0,
     );
+
     // SAFETY: `walk_stack` stores at most `STACK_SLOTS` dwords.
     unsafe { core::hint::assert_unchecked(second <= STACK_SLOTS) };
     let end = second_start + second;
     record[end].store(old_id, Relaxed);
     let total = end as u32 + 1;
     record[1].store(timing::id_word(TimingRecordId::ContextSwap, total), Relaxed);
+
     // SAFETY: the new cursor ends the record written inside the buffer.
     unsafe { super::set_pcr_word(&buffer.cursor, cursor + total * 4) };
     super::interrupts_on();
@@ -407,6 +445,7 @@ fn stack_slots(record: &[AtomicU32; SWAP_RECORD_WORDS], start: usize) -> &[Atomi
     // SAFETY: the first call stack starts at 3 and holds at most
     // `STACK_SLOTS` dwords, as `walk_stack` stores.
     unsafe { core::hint::assert_unchecked(start <= 3 + STACK_SLOTS) };
+
     match record[start..].first_chunk() {
         Some(slots) => slots,
         None => unreachable!(),
@@ -447,6 +486,7 @@ fn walk_stack(
         // SAFETY: the back chain word of a frame inside the stack.
         frame = unsafe { stack_word(frame) };
     }
+
     let mut count = 0;
     while count < STACK_FRAMES as usize
         && in_stack(thread, frame)
@@ -461,35 +501,43 @@ fn walk_stack(
         // SAFETY: the back chain word of a frame inside the stack.
         frame = unsafe { stack_word(frame) };
     }
+
     // SAFETY: the loop stores while `count` is below STACK_FRAMES and adds
     // one per store.
     unsafe { core::hint::assert_unchecked(count <= STACK_FRAMES as usize) };
     slots[count].store(0, Relaxed);
+
     count + 1
 }
 
 /// Stop capturing (stock 0x91f60800): take the buffers back, close and
 /// queue every open buffer, and wait for the writes. `closing` writes the
 /// final GPU records; `notify` reports an execution state change.
-pub(super) fn stop(s: &PixSession, record: &FrameRecord, closing: bool, notify: bool) {
+pub(super) fn stop(session: &PixSession, record: &FrameRecord, closing: bool, notify: bool) {
     /// Fence record header of the two frame records that close a capture:
     /// the refusal status of GPU capture off.
     const CLOSING_HEADER: u32 = (CommandBufferError::Off as u32) << fence_header::STATUS_SHIFT
         | StreamRecordKind::GpuFrame as u32;
+    /// Frame record kind of a stop.
+    const STOP_RECORD: u32 = 1;
 
-    s.set_engine_flags(s.engine_flags().difference(EngineFlags::RUNNING));
-    update_swap_routine(s);
+    session.set_engine_flags(session.engine_flags().difference(EngineFlags::RUNNING));
+    update_swap_routine(session);
+
     // SAFETY: the audio lock of the session block.
-    let irql = unsafe { xboxkrnl::KfAcquireSpinLock(s.audio_lock.as_ptr()) };
-    s.audio_enabled.store(0, Relaxed);
+    let irql = unsafe { xboxkrnl::KfAcquireSpinLock(session.audio_lock.as_ptr()) };
+    session.audio_enabled.store(0, Relaxed);
     // SAFETY: as above; the lock is held.
-    unsafe { xboxkrnl::KfReleaseSpinLock(s.audio_lock.as_ptr(), irql) };
-    super::gpu::service(s, false);
-    let mut context = [[s.address(), 0, 0]; HARDWARE_THREAD_COUNT];
-    if !s.configuration.part(Part::Thread).is_off() {
+    unsafe { xboxkrnl::KfReleaseSpinLock(session.audio_lock.as_ptr(), irql) };
+
+    super::gpu::service(session, false);
+
+    let mut context = [[session.address(), 0, 0]; HARDWARE_THREAD_COUNT];
+    if !session.configuration.part(Part::Thread).is_off() {
         // SAFETY: the timer `start` initialized in the session block.
-        unsafe { xboxkrnl::KeCancelTimer(s.marker_timer.as_ptr()) };
+        unsafe { xboxkrnl::KeCancelTimer(session.marker_timer.as_ptr()) };
     }
+
     // SAFETY: `uninstall_entry` is an IPI routine; `context` outlives the
     // call.
     unsafe {
@@ -498,53 +546,63 @@ pub(super) fn stop(s: &PixSession, record: &FrameRecord, closing: bool, notify: 
             context.as_mut_ptr().expose_provenance() as u32,
         )
     };
-    if !s.configuration.part(Part::Thread).is_off() || !s.configuration.part(Part::Gpu).is_off() {
+
+    if !session.configuration.part(Part::Thread).is_off()
+        || !session.configuration.part(Part::Gpu).is_off()
+    {
         let routine = record.stop_routine.load(Relaxed);
         if routine != 0 {
-            s.lock_override.store(1, Relaxed);
+            session.lock_override.store(1, Relaxed);
             // SAFETY: the title's frame record names a routine taking one
             // argument.
             unsafe { kernel::call_export(routine, record.routine_argument.load(Relaxed), 0, 0, 0) };
-            s.lock_override.store(0, Relaxed);
+            session.lock_override.store(0, Relaxed);
         } else {
             super::gpu::wait_for_idle();
-            s.set_engine_flags(s.engine_flags() | EngineFlags::PAUSED_OUTPUT);
+            session.set_engine_flags(session.engine_flags() | EngineFlags::PAUSED_OUTPUT);
         }
     }
+
     if notify {
         crate::backend::debugger::request_execution(ExecutionState::Stopped, true);
     }
+
     frame_record(
-        s,
+        session,
         record.gpu_cursor.load(Relaxed),
         Some(&context),
         STOP_RECORD,
     );
-    let frame_buffer = &s.entries[BufferType::FRAME_BUFFER.0 as usize];
+
+    let frame_buffer = &session.entries[BufferType::FRAME_BUFFER.0 as usize];
     if frame_buffer.load(Relaxed) != 0 {
-        super::gpu::close_frame_buffer(s);
+        super::gpu::close_frame_buffer(session);
         frame_buffer.store(0, Relaxed);
     }
-    super::gpu::poll(s, false);
+
+    super::gpu::poll(session, false);
+
     if closing {
         let header = |frame: u32| {
             CLOSING_HEADER | (frame << fence_header::FRAME_SHIFT & fence_header::FRAME_FIELD)
         };
         super::gpu::write_frame(
-            s,
-            [header(s.frame_index().wrapping_sub(1)), 0, 0, 0, 0],
+            session,
+            [header(session.frame_index().wrapping_sub(1)), 0, 0, 0, 0],
             false,
         );
-        super::gpu::write_frame(s, [header(s.frame_index()), 0, 0, 0, 0], false);
-        s.fence_done.store(0, Relaxed);
-        s.fence_ready.store(0, Relaxed);
-        s.fence_next.store(0, Relaxed);
+        super::gpu::write_frame(session, [header(session.frame_index()), 0, 0, 0, 0], false);
+        session.fence_done.store(0, Relaxed);
+        session.fence_ready.store(0, Relaxed);
+        session.fence_next.store(0, Relaxed);
     }
-    let frame = s.frame_index();
-    super::gpu::flush_frame_buffers(s, frame.wrapping_sub(1));
-    super::gpu::flush_frame_buffers(s, frame);
+
+    let frame = session.frame_index();
+    super::gpu::flush_frame_buffers(session, frame.wrapping_sub(1));
+    super::gpu::flush_frame_buffers(session, frame);
+
     // Buffer types 0 to 0xc: the per-thread buffers and the audio buffer.
-    for (index, word) in s.entries[..BufferType::COMMAND_DATA.0 as usize]
+    for (index, word) in session.entries[..BufferType::COMMAND_DATA.0 as usize]
         .iter()
         .enumerate()
     {
@@ -552,72 +610,85 @@ pub(super) fn stop(s: &PixSession, record: &FrameRecord, closing: bool, notify: 
         if address == 0 {
             continue;
         }
+
         // SAFETY: a nonzero entry word holds an entry of the session's
         // buffer table.
         let entry = unsafe { BufferEntry::at(address) };
-        let mut cursor = match index {
+        let cursor = match index {
             0..=5 => context[index][1],
             6..=11 => context[index - 6][2],
             _ => 0,
         };
-        if cursor == 0 {
-            cursor = entry.data() + HEADER_BYTES;
-        }
+        let cursor = if cursor == 0 {
+            entry.data() + HEADER_BYTES
+        } else {
+            cursor
+        };
         buffers::close(entry, BufferType(index as u32), cursor);
-        buffers::submit(s, entry, s.frame_index());
+        buffers::submit(session, entry, session.frame_index());
         word.store(0, Relaxed);
     }
-    let command_data = &s.entries[BufferType::COMMAND_DATA.0 as usize];
+
+    let command_data = &session.entries[BufferType::COMMAND_DATA.0 as usize];
     let address = command_data.load(Relaxed);
     if address != 0 {
         // SAFETY: as above.
         let entry = unsafe { BufferEntry::at(address) };
-        let header = s.pending_frame.header.load(Relaxed);
-        super::gpu::push_finished(s, entry, fence_header::frame(header));
-        super::gpu::write_pending_frame(s, true);
+        let header = session.pending_frame.header.load(Relaxed);
+        super::gpu::push_finished(session, entry, fence_header::frame(header));
+        super::gpu::write_pending_frame(session, true);
         command_data.store(0, Relaxed);
     }
-    for k in 0..2 {
-        let id = StreamId::from_raw(k);
-        let word = &s.record_entries[id as usize];
+
+    for raw_stream in 0..2 {
+        let id = StreamId::from_raw(raw_stream);
+        let word = &session.record_entries[id as usize];
         let address = word.load(Relaxed);
-        if address != 0 {
-            // SAFETY: as above.
-            let entry = unsafe { BufferEntry::at(address) };
-            // Stock indexes the cursors with the entry's stream, which is
-            // `id`; bit 0 selects, as everywhere.
-            let stream = StreamId::from_raw(entry.info().stream());
-            buffers::close(
-                entry,
-                BufferType::records(id),
-                s.record_cursors[stream as usize].load(Relaxed),
-            );
-            buffers::submit(s, entry, s.frame_index());
-            word.store(0, Relaxed);
+        if address == 0 {
+            continue;
         }
+
+        // SAFETY: as above.
+        let entry = unsafe { BufferEntry::at(address) };
+        // Stock indexes the cursors with the entry's stream, which is
+        // `id`; bit 0 selects, as everywhere.
+        let stream = StreamId::from_raw(entry.info().stream());
+        buffers::close(
+            entry,
+            BufferType::records(id),
+            session.record_cursors[stream as usize].load(Relaxed),
+        );
+        buffers::submit(session, entry, session.frame_index());
+        word.store(0, Relaxed);
     }
-    for k in 0..2 {
-        let id = StreamId::from_raw(k);
-        while s.stream(id).pending_count.load(Relaxed) != 0 {
-            let entry = buffers::take(s, BufferType::FILLER, id.raw());
+
+    for raw_stream in 0..2 {
+        let id = StreamId::from_raw(raw_stream);
+        while session.stream(id).pending_count.load(Relaxed) != 0 {
+            let entry = buffers::take(session, BufferType::FILLER, id.raw());
             // SAFETY: the data of a buffer table entry is a 16 KiB block the
             // engine owns while the entry is out of the queues.
             let header = unsafe { crate::kernel::object_at::<AtomicU32>(entry.data()) };
             // The header of an empty buffer, as `buffers::close` writes it.
             header.store(BufferType::FILLER.0, Relaxed);
-            buffers::submit(s, entry, s.frame_index());
+            buffers::submit(session, entry, session.frame_index());
         }
     }
-    buffers::drain(s);
-    s.buffers_used.store(0, Relaxed);
-    s.completed_request.store(0, Relaxed);
-    s.completed_index.store(0, Relaxed);
-    s.audio_ready_head.store(0, Relaxed);
-    s.audio_ready_tail.store(0, Relaxed);
-    s.audio_queue_head.store(0, Relaxed);
-    s.staged.store(0, Relaxed);
-    s.audio_queue_tail.store(0, Relaxed);
-    s.set_engine_flags(s.engine_flags().difference(EngineFlags::PAUSED_OUTPUT));
+
+    buffers::drain(session);
+    session.buffers_used.store(0, Relaxed);
+    session.completed_request.store(0, Relaxed);
+    session.completed_index.store(0, Relaxed);
+    session.audio_ready_head.store(0, Relaxed);
+    session.audio_ready_tail.store(0, Relaxed);
+    session.audio_queue_head.store(0, Relaxed);
+    session.staged.store(0, Relaxed);
+    session.audio_queue_tail.store(0, Relaxed);
+    session.set_engine_flags(
+        session
+            .engine_flags()
+            .difference(EngineFlags::PAUSED_OUTPUT),
+    );
 }
 
 /// Frame record of 0x28 bytes on every record stream (stock 0x91f5e5b8):
@@ -626,7 +697,7 @@ pub(super) fn stop(s: &PixSession, record: &FrameRecord, closing: bool, notify: 
 /// `gpu_cursor` stand. `context` holds the cursors [`uninstall`]
 /// reported.
 pub(super) fn frame_record(
-    s: &PixSession,
+    session: &PixSession,
     gpu_cursor: u32,
     context: Option<&[[u32; 3]; HARDWARE_THREAD_COUNT]>,
     kind: u32,
@@ -636,16 +707,16 @@ pub(super) fn frame_record(
     /// Position of a buffer type without a buffer.
     const NO_BUFFER: u32 = 0xffff;
 
-    let configuration = &s.configuration;
-    let configuration = (configuration.part(Part::Thread).0 & 3)
+    let configuration = &session.configuration;
+    let parts = (configuration.part(Part::Thread).0 & 3)
         | (configuration.part(Part::SecondThread).0 & 3) << 2
         | (configuration.part(Part::Gpu).0 & 3) << 4
         | (configuration.part(Part::Audio).0 & 3) << 6;
     let mut words = [
-        configuration << 3 | (kind & 7),
-        s.frame_index(),
-        s.stream(StreamId::First).sequence.load(Relaxed),
-        s.stream(StreamId::Second).sequence.load(Relaxed),
+        parts << 3 | (kind & 7),
+        session.frame_index(),
+        session.stream(StreamId::First).sequence.load(Relaxed),
+        session.stream(StreamId::Second).sequence.load(Relaxed),
         super::timebase_low(),
         GpuRegisters::get().register(GPU_READ_POINTER).read(),
         0,
@@ -653,6 +724,7 @@ pub(super) fn frame_record(
         0,
         0,
     ];
+
     // Halfword slots from word 6, odd slots in the high half: buffers 0
     // to 5, then the frame buffer.
     for slot in 0..7usize {
@@ -661,13 +733,14 @@ pub(super) fn frame_record(
         } else {
             slot
         };
-        let value = position(s, gpu_cursor, context, index).unwrap_or(NO_BUFFER);
+        let value = position(session, gpu_cursor, context, index).unwrap_or(NO_BUFFER);
         words[6 + slot / 2] |= (value & 0xffff) << (slot % 2 * 16);
     }
-    for k in 0..2 {
-        let id = StreamId::from_raw(k);
-        if s.streams_mask.load(Relaxed) & 1 << id.raw() != 0 {
-            buffers::append(s, id, &words);
+
+    for raw_stream in 0..2 {
+        let id = StreamId::from_raw(raw_stream);
+        if session.streams_mask.load(Relaxed) & 1 << id.raw() != 0 {
+            buffers::append(session, id, &words);
         }
     }
 }
@@ -684,24 +757,25 @@ fn published_cursor(published: &AtomicU32) -> u32 {
 /// Dword position of buffer type `index`'s cursor (part of stock
 /// 0x91f5e5b8); `None` without a buffer.
 fn position(
-    s: &PixSession,
+    session: &PixSession,
     gpu_cursor: u32,
     context: Option<&[[u32; 3]; HARDWARE_THREAD_COUNT]>,
     index: usize,
 ) -> Option<u32> {
-    let address = s.entries[index].load(Relaxed);
+    let address = session.entries[index].load(Relaxed);
     if address == 0 {
         return (index == BufferType::FRAME_BUFFER.0 as usize
-            && !s.configuration.part(Part::Thread).is_off())
+            && !session.configuration.part(Part::Thread).is_off())
         .then_some(0);
     }
+
     let cursor = match index {
         0..=5 => context.map_or_else(
-            || published_cursor(&s.cursors[index]),
+            || published_cursor(&session.cursors[index]),
             |context| context[index][1],
         ),
         6..=11 => context.map_or_else(
-            || published_cursor(&s.second_cursors[index - 6]),
+            || published_cursor(&session.second_cursors[index - 6]),
             |context| context[index - 6][2],
         ),
         0xe => gpu_cursor,
@@ -710,15 +784,20 @@ fn position(
     if cursor == 0 {
         return Some(0);
     }
+
     // SAFETY: a nonzero entry word holds an entry of the session's buffer
     // table.
     let entry = unsafe { BufferEntry::at(address) };
-    let bytes = match s.temporary_blocks.get(index).map(|base| base.load(Relaxed)) {
+    let bytes = match session
+        .temporary_blocks
+        .get(index)
+        .map(|base| base.load(Relaxed))
+    {
         Some(base) if (base..base.wrapping_add(TEMPORARY_BYTES)).contains(&cursor) => {
             super::fence();
-            if s.temporary_state(index) == TemporaryState::InUse {
+            if session.temporary_state(index) == TemporaryState::InUse {
                 super::fence();
-                s.saved_cursors[index]
+                session.saved_cursors[index]
                     .load(Relaxed)
                     .wrapping_sub(entry.data())
                     .wrapping_sub(HEADER_BYTES)
@@ -728,15 +807,21 @@ fn position(
         }
         _ => cursor.wrapping_sub(entry.data()).wrapping_sub(HEADER_BYTES),
     };
+
     Some(((bytes as i32) >> 2) as u32)
 }
 
 /// `Ccap` stream record of the active parts (stock 0x91f5ce58); retried at
 /// the next frame when the ring dropped it.
-pub(super) fn capture_record(s: &PixSession) {
+pub(super) fn capture_record(session: &PixSession) {
     let time = Timebase::now().ticks();
-    let words = [super::active_parts(s), (time >> 32) as u32, time as u32];
-    s.capture_record_dropped.store(
+    let words = [
+        super::active_parts(session),
+        (time >> 32) as u32,
+        time as u32,
+    ];
+
+    session.capture_record_dropped.store(
         u32::from(!super::super::write_tagged_words(
             RecordTag::CCAP.raw(),
             &words,

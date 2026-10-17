@@ -1,6 +1,8 @@
 //! Lock pool 'LfPl' (exports 340-351): reader/writer locks whose waiters
 //! block on shared wait entries, and a free list of lock records.
 
+mod error;
+
 use core::mem::offset_of;
 use core::num::NonZeroU32;
 use core::ptr;
@@ -14,6 +16,7 @@ use xbox360_sys::xam::CreateEventA;
 use xbox360_sys::xam::GetCurrentThreadId;
 use xbox360_sys::xboxkrnl::Handle;
 
+use self::error::LockError;
 use super::AllocatorRecord;
 use super::Backoff;
 use super::DoubleWord;
@@ -44,11 +47,12 @@ struct Pool {
     /// Free wait entries, linked through their link word.
     free_entries: TaggedList,
     signature: AtomicU32,
-    /// Lock record kind ([`Kind::encode`]).
+    /// Lock record kind ([`Kind::to_word`]).
     kind: AtomicU32,
     /// Address of the entry table, and the entry count under
     /// [`Pool::COUNT_MASK`]. Slot 0 stays empty.
     table: DoubleWord,
+
     /// Free lock records, linked through their holders word.
     records: TaggedList,
     /// Record blocks, linked through their trailers.
@@ -58,9 +62,11 @@ struct Pool {
     /// Lock records allocated.
     total: AtomicU32,
     per_block: AtomicU32,
+
     /// Entry tables made by growth, by log2 of the count at growth.
     grown_tables: [AtomicU32; 15],
     initial_table: [AtomicU32; 32],
+
     /// Base of the allocation that holds the pool.
     allocation: AtomicU32,
     /// Address of the allocator record after the pool.
@@ -71,7 +77,6 @@ struct Pool {
 }
 
 const _: () = {
-    use core::mem::offset_of;
     assert!(offset_of!(Pool, signature) == 0x08);
     assert!(offset_of!(Pool, kind) == 0x0c);
     assert!(offset_of!(Pool, table) == 0x10);
@@ -87,6 +92,383 @@ const _: () = {
     assert!(offset_of!(Pool, attributes) == 0xf8);
     assert!(size_of::<Pool>() == 0x100);
 };
+
+impl Pool {
+    /// Entry count bits of the table count word.
+    const COUNT_MASK: u32 = 0x7fff_ffff;
+    /// Entry count that marks the table full.
+    const ENTRY_LIMIT: u32 = 0x8000;
+    const INITIAL_CAPACITY: u32 = 32;
+
+    /// The pool at `handle`.
+    ///
+    /// # Safety
+    ///
+    /// `handle` is 0 or the address of a pool (export contract) that stays
+    /// allocated for `'a`.
+    unsafe fn from_handle<'a>(handle: u32) -> Option<&'a Self> {
+        // SAFETY: the caller guarantees the pool.
+        unsafe { container(handle, Signature::POOL, offset_of!(Self, signature)) }
+    }
+
+    fn create(attributes: Option<&PoolAttributes>) -> Result<&'static Self, Error> {
+        /// Lock records per block without attributes.
+        const DEFAULT_PER_BLOCK: u32 = 16;
+        /// Entry count of a new pool: slot 0 stays empty.
+        const INITIAL_COUNT: u32 = 1;
+        const SIZE: u32 = size_of::<Pool>() as u32;
+
+        let (flags, per_block) =
+            attributes.map_or((PoolFlags::empty(), DEFAULT_PER_BLOCK), |attributes| {
+                (
+                    attributes.flags,
+                    NodeCounts::clamp_per_block(attributes.per_block),
+                )
+            });
+        let kept = attributes.filter(|_| flags.intersects(PoolFlags::KEPT));
+
+        let allocator = AllocatorRecord::new();
+        let memory = AtomicU32::new(0);
+        let size = SIZE + AllocatorRecord::SIZE + kept.map_or(0, |_| PoolAttributes::SIZE);
+        let allocation = allocator
+            .allocate_aligned(size, &memory)
+            .ok_or(Error::NotEnoughMemory)?;
+
+        let object = ptr::with_exposed_provenance_mut::<Self>(allocation.aligned.get() as usize);
+        // SAFETY: the new allocation holds the pool, the allocator record and
+        // the kept attributes, aligned to 128 bytes; zero bytes are a valid
+        // pool.
+        let pool = unsafe {
+            object.write_bytes(0, 1);
+            &*object
+        };
+        pool.allocation.store(allocation.base, Relaxed);
+        pool.memory.store(memory.load(Relaxed), Relaxed);
+
+        let record = object.wrapping_add(1).cast::<AllocatorRecord>();
+        pool.allocator
+            .store(record.expose_provenance() as u32, Relaxed);
+        // SAFETY: the record and the attributes follow the pool inside the
+        // allocation.
+        unsafe {
+            record.write(allocator);
+            if let Some(kept) = kept {
+                let copy = record.wrapping_add(1).cast::<PoolAttributes>();
+                pool.attributes
+                    .store(copy.expose_provenance() as u32, Relaxed);
+                copy.write(*kept);
+            }
+        }
+
+        pool.kind.store(Kind::from_flags(flags).to_word(), Relaxed);
+        pool.per_block.store(per_block, Relaxed);
+        pool.table.high.store(
+            ptr::from_ref(&pool.initial_table).expose_provenance() as u32,
+            Relaxed,
+        );
+        pool.table.low.store(INITIAL_COUNT, Relaxed);
+        pool.signature.store(Signature::POOL.0, Relaxed);
+        lwsync();
+
+        Ok(pool)
+    }
+
+    /// Clear the signature of the pool at `handle` and free it with its
+    /// entries; whether it was a pool.
+    ///
+    /// # Safety
+    ///
+    /// `handle` is 0 or the address of a pool (export contract) on which no
+    /// other operation runs, now or later.
+    unsafe fn destroy(handle: u32) -> bool {
+        // SAFETY: the caller guarantees the pool. The reference is not used
+        // once the pool is freed.
+        let Some(pool) =
+            (unsafe { claim::<Self>(handle, Signature::POOL, offset_of!(Self, signature)) })
+        else {
+            return false;
+        };
+
+        let allocator = *pool.allocator();
+        let table = pool.table.high.load(Relaxed);
+        let count = pool.table.low.load(Relaxed) & Self::COUNT_MASK;
+
+        // Stock walks to the count even when a failure set it to the full
+        // mark past the end of the table; the walk stays within the table
+        // here, and a table of unknown origin is not walked.
+        let slots = pool
+            .capacity(table)
+            .map_or(0, |capacity| count.min(capacity));
+        for index in (0..slots).rev() {
+            // SAFETY: below both the count and the table's capacity.
+            if let Some(entry) = unsafe { pool.entry(index) } {
+                close_handle(entry.semaphore());
+                close_handle(entry.event());
+                allocator.free(entry.address().raw());
+            }
+        }
+
+        for grown in &pool.grown_tables {
+            let grown = grown.load(Relaxed);
+            if grown != 0 {
+                allocator.free(grown);
+            }
+        }
+
+        // SAFETY: the block list of the pool, which no operation uses
+        // anymore.
+        unsafe { allocator.free_blocks(&pool.blocks) };
+        allocator.free(pool.allocation.load(Relaxed));
+        lwsync();
+
+        true
+    }
+
+    fn kind(&self) -> Kind {
+        Kind::from_word(self.kind.load(Relaxed))
+    }
+
+    fn allocator(&self) -> &AllocatorRecord {
+        // SAFETY: the allocator word of a live pool (module invariants).
+        unsafe { AllocatorRecord::from_word(&self.allocator) }
+    }
+
+    fn attributes(&self) -> Option<&PoolAttributes> {
+        let address = self.attributes.load(Relaxed);
+
+        // SAFETY: a nonzero attributes word holds the address of the
+        // attributes creation copied after the allocator record.
+        unsafe { ptr::with_exposed_provenance::<PoolAttributes>(address as usize).as_ref() }
+    }
+
+    /// Slot `index` of the entry table at `table`.
+    ///
+    /// # Safety
+    ///
+    /// `table` is an entry table of this pool with more than `index`
+    /// slots.
+    unsafe fn slot(&self, table: u32, index: u32) -> &AtomicU32 {
+        let address = table.wrapping_add(4 * index);
+
+        // SAFETY: the caller guarantees the slot.
+        unsafe { &*ptr::with_exposed_provenance(address as usize) }
+    }
+
+    /// The entry an installed slot `index` of the current table holds.
+    ///
+    /// # Safety
+    ///
+    /// `index` is below the entry count, and the current table has more
+    /// than `index` slots.
+    unsafe fn entry(&self, index: u32) -> Option<&WaitEntry> {
+        // SAFETY: the caller guarantees the slot.
+        let entry = unsafe { self.slot(self.table.high.load(Relaxed), index) }.load(Relaxed);
+
+        // SAFETY: table slots hold 0 or entries this pool allocated, which
+        // stay until destroy.
+        NodeAddress::new(entry).map(|entry| unsafe { entry.get(self) })
+    }
+
+    /// The entry a waiters word names.
+    ///
+    /// # Safety
+    ///
+    /// `waiters` was read from a lock record of this pool (export 340 and
+    /// 351 contract) while it named an entry: the slot of an installed
+    /// entry, which install placed in the current table or copied into it.
+    unsafe fn entry_of(&self, waiters: Waiters) -> &WaitEntry {
+        let index = waiters.index();
+
+        // SAFETY: the caller guarantees the slot.
+        unsafe {
+            let entry = self
+                .slot(self.table.high.load(Relaxed), index)
+                .load(Relaxed);
+            NodeAddress::new_unchecked(entry).get(self)
+        }
+    }
+
+    fn free_entry(&self, entry: &WaitEntry) {
+        // SAFETY: an entry of this pool, on no list.
+        unsafe { self.free_entries.push(entry.address(), NodeWord::Word3) };
+    }
+
+    fn take_entry(&self) -> Option<&WaitEntry> {
+        // SAFETY: the free entry list holds entries of this pool, which stay
+        // until destroy.
+        unsafe { self.free_entries.pop(NodeWord::Word3) }
+            // SAFETY: as above.
+            .map(|entry| unsafe { entry.get(self) })
+            .or_else(|| self.create_entry())
+    }
+
+    /// Allocate a wait entry with its semaphore and event and give it a
+    /// table slot; any failure marks the table full.
+    fn create_entry(&self) -> Option<&WaitEntry> {
+        if self.table.low.load(Relaxed) & Self::COUNT_MASK == Self::ENTRY_LIMIT {
+            return None;
+        }
+
+        let allocator = self.allocator();
+        if let Some(address) = allocator.allocate(size_of::<WaitEntry>() as u32, &self.memory) {
+            // SAFETY: a new allocation of an entry.
+            let entry = unsafe { NodeAddress(address).get::<WaitEntry, _>(self) };
+            let semaphore = create_semaphore();
+            entry
+                .semaphore
+                .store(semaphore.map_or(0, Handle::raw), Relaxed);
+            if let Some(semaphore) = semaphore {
+                // SAFETY: a null name creates an unnamed auto-reset event.
+                let event = unsafe { CreateEventA(0, false, false, ptr::null()) };
+                entry.event.store(event.raw(), Relaxed);
+                if !event.is_null() {
+                    if self.install(entry) {
+                        return Some(entry);
+                    }
+
+                    close_handle(event);
+                }
+
+                close_handle(semaphore);
+            }
+
+            allocator.free(address.get());
+        }
+
+        loop {
+            let current = self.table.load();
+            if current.low() & Self::COUNT_MASK == Self::ENTRY_LIMIT
+                || self
+                    .table
+                    .compare_exchange(current, Tagged::new(current.high(), Self::ENTRY_LIMIT))
+            {
+                return None;
+            }
+        }
+    }
+
+    /// Store `entry` at the next table slot, doubling the table when a
+    /// power-of-two count of at least 32 fills it.
+    fn install(&self, entry: &WaitEntry) -> bool {
+        /// Bound on the entry count at which the table grows, so that the
+        /// bytes of the doubled table stay a positive `i32`.
+        const MAX_GROWTH_COUNT: u32 = 0x0fff_ffff;
+
+        let address = entry.address().raw();
+        loop {
+            let current = self.table.load();
+            let count = current.low() & Self::COUNT_MASK;
+            if count == Self::ENTRY_LIMIT {
+                return false;
+            }
+
+            let table = current.high();
+            if count >= Self::INITIAL_CAPACITY && count.is_power_of_two() {
+                if count >= MAX_GROWTH_COUNT {
+                    return false;
+                }
+
+                let allocator = self.allocator();
+                // The doubled table: twice the slots of the current one.
+                let size = count * (2 * size_of::<AtomicU32>() as u32);
+                let Some(grown) = allocator.allocate(size, &self.memory) else {
+                    return false;
+                };
+
+                let slots = ptr::with_exposed_provenance_mut::<u32>(grown.get() as usize);
+                let count_slots = count as usize;
+                for index in 0..count {
+                    // SAFETY: the current table holds `count` slots.
+                    let value = unsafe { self.slot(table, index) }.load(Relaxed);
+                    // SAFETY: the new allocation holds 2 * `count` slots and
+                    // no other thread sees it yet.
+                    unsafe { slots.add(index as usize).write(value) };
+                }
+
+                // SAFETY: as above.
+                unsafe {
+                    slots.add(count_slots).write(address);
+                    slots.add(count_slots + 1).write_bytes(0, count_slots - 1);
+                }
+
+                if self
+                    .table
+                    .compare_exchange(current, Tagged::new(grown.get(), count + 1))
+                {
+                    entry.index.store(count, Relaxed);
+                    if let Some(slot) = self.grown_tables.get(count.trailing_zeros() as usize) {
+                        slot.swap_relaxed(grown.get());
+                    }
+
+                    return true;
+                }
+
+                allocator.free(grown.get());
+                continue;
+            }
+
+            // SAFETY: a count below 32 is within the initial table, and any
+            // other count lies below twice the count the current table grew
+            // at.
+            let claimed = unsafe { self.slot(table, count) }
+                .compare_exchange_release(0, address)
+                .is_ok();
+            if claimed {
+                entry.index.store(count, Relaxed);
+            }
+
+            self.table
+                .compare_exchange(current, Tagged::new(table, count + 1));
+            if claimed {
+                return true;
+            }
+        }
+    }
+
+    /// Slots of the current entry table: the initial table or the newest
+    /// grown one.
+    fn capacity(&self, table: u32) -> Option<u32> {
+        if table == ptr::from_ref(&self.initial_table).expose_provenance() as u32 {
+            return Some(Self::INITIAL_CAPACITY);
+        }
+
+        (0..self.grown_tables.len())
+            .find(|&order| self.grown_tables[order].load(Relaxed) == table)
+            .map(|order| 2 << order)
+    }
+
+    /// Allocate `count` lock records and put them on the free list, or all
+    /// but the first, which is returned, with [`FirstRecord::Keep`].
+    fn add_records(&self, count: u32, first: FirstRecord) -> Option<NodeAddress> {
+        let record_size = self.kind().record_size();
+        let size = count.wrapping_mul(record_size);
+        // SAFETY: the block list of this pool.
+        let block = unsafe {
+            self.allocator()
+                .allocate_block(&self.blocks, size, &self.memory)
+        }?;
+
+        self.total.fetch_add_relaxed(count);
+
+        let mut record = block.raw().wrapping_add(size);
+        for _ in u32::from(first == FirstRecord::Keep)..count {
+            record = record.wrapping_sub(self.kind().record_size());
+            // SAFETY: a record inside the new block, on no list.
+            unsafe {
+                self.records
+                    .push(NodeAddress::new_unchecked(record), NodeWord::Word0)
+            };
+        }
+
+        Some(block)
+    }
+
+    fn pop_record(&self) -> Option<NodeAddress> {
+        // SAFETY: the free record list holds records of this pool's blocks
+        // or records callers returned with export 345.
+        unsafe { self.records.pop(NodeWord::Word0) }
+    }
+}
 
 xbox360_sys::flags! {
     /// Flags of the pool attributes. Stock tests no other bit: bit 0x8 and
@@ -117,16 +499,17 @@ impl PoolFlags {
 struct PoolAttributes {
     flags: PoolFlags,
     per_block: u32,
+
     wait_context: u32,
     timeout: Timeout,
     /// `routine(context, object, timeout, alertable)` replacing the wait.
     wait_routine: Option<Routine>,
+
     /// [`PoolAttributes::SIZE`].
     size: u32,
 }
 
 const _: () = {
-    use core::mem::offset_of;
     assert!(offset_of!(PoolAttributes, timeout) == 0xc);
     assert!(offset_of!(PoolAttributes, wait_routine) == 0x10);
     assert!(offset_of!(PoolAttributes, size) == 0x14);
@@ -141,16 +524,18 @@ impl PoolAttributes {
     ///
     /// `address` is 0 or the address of pool attributes (export contract),
     /// whose routine field holds a console routine.
-    unsafe fn read(address: u32) -> Result<Option<Self>, Error> {
+    unsafe fn from_address(address: u32) -> Result<Option<Self>, Error> {
         let attributes = ptr::with_exposed_provenance::<Self>(address as usize);
         if attributes.is_null() {
             return Ok(None);
         }
+
         // Stock reads the size before the rest of the record.
         // SAFETY: the caller guarantees the record.
         if unsafe { ptr::read(&raw const (*attributes).size) } != Self::SIZE {
             return Err(Error::InvalidArgument);
         }
+
         // SAFETY: as above.
         Ok(Some(unsafe { attributes.read() }))
     }
@@ -170,7 +555,7 @@ struct WaitEntry {
     _link: AtomicU32,
 }
 
-const _: () = assert!(core::mem::offset_of!(WaitEntry, _link) == NodeWord::Word3 as usize);
+const _: () = assert!(offset_of!(WaitEntry, _link) == NodeWord::Word3 as usize);
 
 impl WaitEntry {
     fn semaphore(&self) -> Handle {
@@ -381,76 +766,6 @@ impl Waiters {
     }
 }
 
-/// A failed lock operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LockError {
-    Container(Error),
-    /// Export 351 with a mode other than shared or exclusive.
-    BadMode,
-    NotHeld,
-    UpgradePending,
-    ExclusiveWaiting,
-    NotRecursive,
-}
-
-/// Stock keeps its internal codes of the lock failures and wait routine
-/// results in one status word, so a wait result equal to a code reports as
-/// that code.
-impl From<Error> for LockError {
-    fn from(error: Error) -> Self {
-        const NOT_HELD: u32 = 0xe000_0001;
-        const UPGRADE_PENDING: u32 = 0xe000_0002;
-        const EXCLUSIVE_WAITING: u32 = 0xe000_0003;
-        const NOT_RECURSIVE: u32 = 0xe000_0004;
-        match error {
-            Error::Wait(status) => match status.code() {
-                NOT_HELD => Self::NotHeld,
-                UPGRADE_PENDING => Self::UpgradePending,
-                EXCLUSIVE_WAITING => Self::ExclusiveWaiting,
-                NOT_RECURSIVE => Self::NotRecursive,
-                _ => Self::Container(error),
-            },
-            error => Self::Container(error),
-        }
-    }
-}
-
-impl From<LockError> for Hresult {
-    fn from(error: LockError) -> Self {
-        let code = match error {
-            LockError::Container(error) => return error.into(),
-            LockError::BadMode => 3,
-            LockError::NotHeld => 4,
-            LockError::UpgradePending => 5,
-            LockError::ExclusiveWaiting => 6,
-            LockError::NotRecursive => 7,
-        };
-        Self::failure(Error::FACILITY, code)
-    }
-}
-
-impl core::fmt::Display for LockError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Container(error) => error.fmt(f),
-            Self::BadMode => f.write_str("release mode is neither shared nor exclusive"),
-            Self::NotHeld => f.write_str("lock not held"),
-            Self::UpgradePending => f.write_str("another upgrade is pending"),
-            Self::ExclusiveWaiting => f.write_str("an exclusive acquirer waits"),
-            Self::NotRecursive => f.write_str("lock is not recursive"),
-        }
-    }
-}
-
-impl core::error::Error for LockError {}
-
-fn lock_result(result: Result<(), LockError>) -> Hresult {
-    match result {
-        Ok(()) => Hresult::SUCCESS,
-        Err(error) => error.into(),
-    }
-}
-
 /// Lock record kind of a pool.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -473,21 +788,21 @@ impl Kind {
         }
     }
 
-    /// Pool word: -1, 0 or 1.
-    fn encode(self) -> u32 {
-        match self {
-            Self::Plain => -1i32 as u32,
-            Self::Owned => 0,
-            Self::Recursive => 1,
-        }
-    }
-
     /// Pool word: negative, 0 or positive.
-    fn decode(word: u32) -> Self {
+    fn from_word(word: u32) -> Self {
         match word as i32 {
             kind if kind < 0 => Self::Plain,
             0 => Self::Owned,
             _ => Self::Recursive,
+        }
+    }
+
+    /// Pool word: -1, 0 or 1.
+    fn to_word(self) -> u32 {
+        match self {
+            Self::Plain => -1i32 as u32,
+            Self::Owned => 0,
+            Self::Recursive => 1,
         }
     }
 
@@ -506,354 +821,6 @@ enum FirstRecord {
     Free,
 }
 
-impl Pool {
-    const SIZE: u32 = size_of::<Self>() as u32;
-    /// Entry count bits of the table count word.
-    const COUNT_MASK: u32 = 0x7fff_ffff;
-    /// Entry count that marks the table full.
-    const ENTRY_LIMIT: u32 = 0x8000;
-    const INITIAL_CAPACITY: u32 = 32;
-    /// Entry count of a new pool: slot 0 stays empty.
-    const INITIAL_COUNT: u32 = 1;
-    /// Bound on the entry count at which the table grows, so that the
-    /// bytes of the doubled table stay a positive `i32`.
-    const MAX_GROWTH_COUNT: u32 = 0x0fff_ffff;
-    /// Bound on the records that export 347 adds to an owned or recursive
-    /// pool, so that their bytes stay a positive `i32`.
-    const MAX_RESERVED_RECORDS: u32 = 0x07ff_ffff;
-    /// Lock records per block without attributes.
-    const DEFAULT_PER_BLOCK: u32 = 16;
-
-    /// The pool at `handle`.
-    ///
-    /// # Safety
-    ///
-    /// `handle` is 0 or the address of a pool (export contract) that stays
-    /// allocated for `'a`.
-    unsafe fn from_handle<'a>(handle: u32) -> Option<&'a Self> {
-        // SAFETY: the caller guarantees the pool.
-        unsafe { container(handle, Signature::POOL, offset_of!(Self, signature)) }
-    }
-
-    fn kind(&self) -> Kind {
-        Kind::decode(self.kind.load(Relaxed))
-    }
-
-    fn allocator(&self) -> &AllocatorRecord {
-        // SAFETY: the allocator word of a live pool (module invariants).
-        unsafe { AllocatorRecord::at(&self.allocator) }
-    }
-
-    fn attributes(&self) -> Option<&PoolAttributes> {
-        let address = self.attributes.load(Relaxed);
-        // SAFETY: a nonzero attributes word holds the address of the
-        // attributes creation copied after the allocator record.
-        unsafe { ptr::with_exposed_provenance::<PoolAttributes>(address as usize).as_ref() }
-    }
-
-    /// Slot `index` of the entry table at `table`.
-    ///
-    /// # Safety
-    ///
-    /// `table` is an entry table of this pool with more than `index`
-    /// slots.
-    unsafe fn slot(&self, table: u32, index: u32) -> &AtomicU32 {
-        let address = table.wrapping_add(4 * index);
-        // SAFETY: the caller guarantees the slot.
-        unsafe { &*ptr::with_exposed_provenance(address as usize) }
-    }
-
-    /// The entry an installed slot `index` of the current table holds.
-    ///
-    /// # Safety
-    ///
-    /// `index` is below the entry count, and the current table has more
-    /// than `index` slots.
-    unsafe fn entry(&self, index: u32) -> Option<&WaitEntry> {
-        // SAFETY: the caller guarantees the slot.
-        let entry = unsafe { self.slot(self.table.high.load(Relaxed), index) }.load(Relaxed);
-        // SAFETY: table slots hold 0 or entries this pool allocated, which
-        // stay until destroy.
-        NodeAddress::new(entry).map(|entry| unsafe { entry.get(self) })
-    }
-
-    /// The entry a waiters word names.
-    ///
-    /// # Safety
-    ///
-    /// `waiters` was read from a lock record of this pool (export 340 and
-    /// 351 contract) while it named an entry: the slot of an installed
-    /// entry, which install placed in the current table or copied into it.
-    unsafe fn entry_of(&self, waiters: Waiters) -> &WaitEntry {
-        let index = waiters.index();
-        // SAFETY: the caller guarantees the slot.
-        unsafe {
-            let entry = self
-                .slot(self.table.high.load(Relaxed), index)
-                .load(Relaxed);
-            NodeAddress::new_unchecked(entry).get(self)
-        }
-    }
-
-    fn free_entry(&self, entry: &WaitEntry) {
-        // SAFETY: an entry of this pool, on no list.
-        unsafe { self.free_entries.push(entry.address(), NodeWord::Word3) };
-    }
-
-    fn take_entry(&self) -> Option<&WaitEntry> {
-        // SAFETY: the free entry list holds entries of this pool, which stay
-        // until destroy.
-        unsafe { self.free_entries.pop(NodeWord::Word3) }
-            // SAFETY: as above.
-            .map(|entry| unsafe { entry.get(self) })
-            .or_else(|| self.create_entry())
-    }
-
-    /// Allocate a wait entry with its semaphore and event and give it a
-    /// table slot; any failure marks the table full.
-    fn create_entry(&self) -> Option<&WaitEntry> {
-        if self.table.low.load(Relaxed) & Self::COUNT_MASK == Self::ENTRY_LIMIT {
-            return None;
-        }
-        let allocator = self.allocator();
-        if let Some(address) = allocator.allocate(size_of::<WaitEntry>() as u32, &self.memory) {
-            // SAFETY: a new allocation of an entry.
-            let entry = unsafe { NodeAddress(address).get::<WaitEntry, _>(self) };
-            let semaphore = create_semaphore();
-            entry
-                .semaphore
-                .store(semaphore.map_or(0, Handle::raw), Relaxed);
-            if let Some(semaphore) = semaphore {
-                // SAFETY: a null name creates an unnamed auto-reset event.
-                let event = unsafe { CreateEventA(0, false, false, ptr::null()) };
-                entry.event.store(event.raw(), Relaxed);
-                if !event.is_null() {
-                    if self.install(entry) {
-                        return Some(entry);
-                    }
-                    close_handle(event);
-                }
-                close_handle(semaphore);
-            }
-            allocator.free(address.get());
-        }
-        loop {
-            let current = self.table.load();
-            if current.low() & Self::COUNT_MASK == Self::ENTRY_LIMIT
-                || self
-                    .table
-                    .compare_exchange(current, Tagged::new(current.high(), Self::ENTRY_LIMIT))
-            {
-                return None;
-            }
-        }
-    }
-
-    /// Store `entry` at the next table slot, doubling the table when a
-    /// power-of-two count of at least 32 fills it.
-    fn install(&self, entry: &WaitEntry) -> bool {
-        let address = entry.address().raw();
-        loop {
-            let current = self.table.load();
-            let count = current.low() & Self::COUNT_MASK;
-            if count == Self::ENTRY_LIMIT {
-                return false;
-            }
-            let table = current.high();
-            if count >= Self::INITIAL_CAPACITY && count.is_power_of_two() {
-                if count >= Self::MAX_GROWTH_COUNT {
-                    return false;
-                }
-                let allocator = self.allocator();
-                // The doubled table: twice the slots of the current one.
-                let size = count * (2 * size_of::<AtomicU32>() as u32);
-                let Some(grown) = allocator.allocate(size, &self.memory) else {
-                    return false;
-                };
-                let slots = ptr::with_exposed_provenance_mut::<u32>(grown.get() as usize);
-                let count_slots = count as usize;
-                for index in 0..count {
-                    // SAFETY: the current table holds `count` slots.
-                    let value = unsafe { self.slot(table, index) }.load(Relaxed);
-                    // SAFETY: the new allocation holds 2 * `count` slots and
-                    // no other thread sees it yet.
-                    unsafe { slots.add(index as usize).write(value) };
-                }
-                // SAFETY: as above.
-                unsafe {
-                    slots.add(count_slots).write(address);
-                    slots.add(count_slots + 1).write_bytes(0, count_slots - 1);
-                }
-                if self
-                    .table
-                    .compare_exchange(current, Tagged::new(grown.get(), count + 1))
-                {
-                    entry.index.store(count, Relaxed);
-                    if let Some(slot) = self.grown_tables.get(count.trailing_zeros() as usize) {
-                        slot.swap_relaxed(grown.get());
-                    }
-                    return true;
-                }
-                allocator.free(grown.get());
-                continue;
-            }
-            // SAFETY: a count below 32 is within the initial table, and any
-            // other count lies below twice the count the current table grew
-            // at.
-            let claimed = unsafe { self.slot(table, count) }
-                .compare_exchange_release(0, address)
-                .is_ok();
-            if claimed {
-                entry.index.store(count, Relaxed);
-            }
-            self.table
-                .compare_exchange(current, Tagged::new(table, count + 1));
-            if claimed {
-                return true;
-            }
-        }
-    }
-
-    /// Slots of the current entry table: the initial table or the newest
-    /// grown one.
-    fn capacity(&self, table: u32) -> Option<u32> {
-        if table == ptr::from_ref(&self.initial_table).expose_provenance() as u32 {
-            return Some(Self::INITIAL_CAPACITY);
-        }
-        (0..self.grown_tables.len())
-            .find(|&order| self.grown_tables[order].load(Relaxed) == table)
-            .map(|order| 2 << order)
-    }
-
-    /// Allocate `count` lock records and put them on the free list, or all
-    /// but the first, which is returned, with [`FirstRecord::Keep`].
-    fn add_records(&self, count: u32, first: FirstRecord) -> Option<NodeAddress> {
-        let record_size = self.kind().record_size();
-        let size = count.wrapping_mul(record_size);
-        // SAFETY: the block list of this pool.
-        let block = unsafe {
-            self.allocator()
-                .allocate_block(&self.blocks, size, &self.memory)
-        }?;
-        self.total.fetch_add_relaxed(count);
-        let mut record = block.raw().wrapping_add(size);
-        for _ in u32::from(first == FirstRecord::Keep)..count {
-            record = record.wrapping_sub(self.kind().record_size());
-            // SAFETY: a record inside the new block, on no list.
-            unsafe {
-                self.records
-                    .push(NodeAddress::new_unchecked(record), NodeWord::Word0)
-            };
-        }
-        Some(block)
-    }
-
-    fn pop_record(&self) -> Option<NodeAddress> {
-        // SAFETY: the free record list holds records of this pool's blocks
-        // or records callers returned with export 345.
-        unsafe { self.records.pop(NodeWord::Word0) }
-    }
-
-    fn create(attributes: Option<&PoolAttributes>) -> Result<&'static Self, Error> {
-        let (flags, per_block) = attributes.map_or(
-            (PoolFlags::empty(), Self::DEFAULT_PER_BLOCK),
-            |attributes| {
-                (
-                    attributes.flags,
-                    NodeCounts::clamp_per_block(attributes.per_block),
-                )
-            },
-        );
-        let kept = attributes.filter(|_| flags.intersects(PoolFlags::KEPT));
-        let allocator = AllocatorRecord::default_routines();
-        let memory = AtomicU32::new(0);
-        let size = Self::SIZE + AllocatorRecord::SIZE + kept.map_or(0, |_| PoolAttributes::SIZE);
-        let allocation = allocator
-            .allocate_aligned(size, &memory)
-            .ok_or(Error::NotEnoughMemory)?;
-        let object = ptr::with_exposed_provenance_mut::<Self>(allocation.aligned.get() as usize);
-        // SAFETY: the new allocation holds the pool, the allocator record and
-        // the kept attributes, aligned to 128 bytes; zero bytes are a valid
-        // pool.
-        let pool = unsafe {
-            object.write_bytes(0, 1);
-            &*object
-        };
-        pool.allocation.store(allocation.base, Relaxed);
-        pool.memory.store(memory.load(Relaxed), Relaxed);
-        let record = object.wrapping_add(1).cast::<AllocatorRecord>();
-        pool.allocator
-            .store(record.expose_provenance() as u32, Relaxed);
-        // SAFETY: the record and the attributes follow the pool inside the
-        // allocation.
-        unsafe {
-            record.write(allocator);
-            if let Some(kept) = kept {
-                let copy = record.wrapping_add(1).cast::<PoolAttributes>();
-                pool.attributes
-                    .store(copy.expose_provenance() as u32, Relaxed);
-                copy.write(*kept);
-            }
-        }
-        pool.kind.store(Kind::from_flags(flags).encode(), Relaxed);
-        pool.per_block.store(per_block, Relaxed);
-        pool.table.high.store(
-            ptr::from_ref(&pool.initial_table).expose_provenance() as u32,
-            Relaxed,
-        );
-        pool.table.low.store(Self::INITIAL_COUNT, Relaxed);
-        pool.signature.store(Signature::POOL.0, Relaxed);
-        lwsync();
-        Ok(pool)
-    }
-
-    /// Clear the signature of the pool at `handle` and free it with its
-    /// entries; whether it was a pool.
-    ///
-    /// # Safety
-    ///
-    /// `handle` is 0 or the address of a pool (export contract) on which no
-    /// other operation runs, now or later.
-    unsafe fn destroy(handle: u32) -> bool {
-        // SAFETY: the caller guarantees the pool. The reference is not used
-        // once the pool is freed.
-        let Some(pool) =
-            (unsafe { claim::<Self>(handle, Signature::POOL, offset_of!(Self, signature)) })
-        else {
-            return false;
-        };
-        let allocator = *pool.allocator();
-        let table = pool.table.high.load(Relaxed);
-        let count = pool.table.low.load(Relaxed) & Self::COUNT_MASK;
-        // Stock walks to the count even when a failure set it to the full
-        // mark past the end of the table; the walk stays within the table
-        // here, and a table of unknown origin is not walked.
-        let slots = pool
-            .capacity(table)
-            .map_or(0, |capacity| count.min(capacity));
-        for index in (0..slots).rev() {
-            // SAFETY: below both the count and the table's capacity.
-            if let Some(entry) = unsafe { pool.entry(index) } {
-                close_handle(entry.semaphore());
-                close_handle(entry.event());
-                allocator.free(entry.address().raw());
-            }
-        }
-        for grown in &pool.grown_tables {
-            let grown = grown.load(Relaxed);
-            if grown != 0 {
-                allocator.free(grown);
-            }
-        }
-        // SAFETY: the block list of the pool, which no operation uses
-        // anymore.
-        unsafe { allocator.free_blocks(&pool.blocks) };
-        allocator.free(pool.allocation.load(Relaxed));
-        lwsync();
-        true
-    }
-}
-
 /// Holders and waiters words of a lock record, read in one access.
 #[derive(Clone, Copy)]
 struct State {
@@ -862,7 +829,7 @@ struct State {
 }
 
 impl State {
-    fn of(word: Tagged) -> Self {
+    fn from_word(word: Tagged) -> Self {
         Self {
             holders: Holders(word.high()),
             waiters: Waiters(word.low()),
@@ -931,12 +898,14 @@ struct Request<'a> {
     lock: &'a LockRecord,
     /// Owner fields; none in a plain pool.
     ownership: Option<&'a Ownership>,
+
     wait: Wait,
     /// Fail rather than wait.
     immediate: bool,
     /// Wait entry this operation holds.
     entry: Option<&'a WaitEntry>,
     backoff: Backoff,
+
     /// Calling thread, read when the pool records owners.
     owner: Option<u32>,
 }
@@ -953,12 +922,14 @@ impl<'a> Request<'a> {
     unsafe fn new(pool: &'a Pool, lock: NonZeroU32) -> Self {
         let address = lock.get() as usize;
         let kind = pool.kind();
+
         // SAFETY: the caller guarantees the record.
         let record = unsafe { &*ptr::with_exposed_provenance::<LockRecord>(address) };
         let ownership = (kind != Kind::Plain).then(|| {
             // SAFETY: as above.
             unsafe { &(*ptr::with_exposed_provenance::<OwnedLockRecord>(address)).ownership }
         });
+
         Self {
             pool,
             kind,
@@ -973,7 +944,7 @@ impl<'a> Request<'a> {
     }
 
     fn read(&self) -> State {
-        State::of(self.lock.state.load())
+        State::from_word(self.lock.state.load())
     }
 
     fn swap(&self, old: State, new: State) -> bool {
@@ -986,8 +957,10 @@ impl<'a> Request<'a> {
         let Some(ownership) = self.ownership else {
             return false;
         };
+
         let thread = GetCurrentThreadId();
         self.owner = Some(thread);
+
         ownership.owner.load(Relaxed) == thread
     }
 
@@ -1013,11 +986,13 @@ impl<'a> Request<'a> {
         if waiters.has_entry() {
             return Ok(waiters);
         }
+
         let entry = match self.entry {
             Some(entry) => entry,
             None => self.pool.take_entry().ok_or(Error::NotEnoughMemory)?,
         };
         self.entry = Some(entry);
+
         Ok(waiters.with_entry(entry.index.load(Relaxed)))
     }
 
@@ -1042,6 +1017,7 @@ impl<'a> Request<'a> {
         if !waiters.spins() {
             return None;
         }
+
         for _ in 0..Backoff::SPIN_ATTEMPTS {
             self.backoff.pause();
             match take(self) {
@@ -1053,6 +1029,7 @@ impl<'a> Request<'a> {
                 }
             }
         }
+
         None
     }
 
@@ -1062,12 +1039,15 @@ impl<'a> Request<'a> {
         if !stored.has_entry() {
             self.release_entry();
         }
+
         if taker != Taker::Shared {
             self.record_owner();
         }
+
         if taker == Taker::SpinningExclusive {
             lwsync();
         }
+
         Ok(())
     }
 
@@ -1082,6 +1062,7 @@ impl<'a> Request<'a> {
         if old.holders.is_held() {
             return Take::Busy(old);
         }
+
         let holders = old.holders.add_shared();
         let waiters = State {
             holders,
@@ -1100,6 +1081,7 @@ impl<'a> Request<'a> {
             if self.kind == Kind::Owned {
                 return Err(LockError::NotRecursive);
             }
+
             loop {
                 let old = self.read();
                 let waiters = old.shared_spin(self.wait.spin);
@@ -1114,9 +1096,10 @@ impl<'a> Request<'a> {
                 }
             }
         }
+
         let registered = loop {
             let old = self.read();
-            let (holders, waiters) = (old.holders, old.waiters);
+            let State { holders, waiters } = old;
             if !holders.is_held() {
                 if self.swap(
                     old,
@@ -1128,24 +1111,26 @@ impl<'a> Request<'a> {
                     self.release_entry();
                     return Ok(());
                 }
+
                 continue;
             }
+
             if !self.may_wait(waiters) {
                 self.release_entry();
                 return Err(Error::Timeout.into());
             }
-            let waiters = match self.attach(waiters) {
-                Ok(waiters) => waiters.add_shared(),
-                Err(error) => return Err(error.into()),
-            };
+
+            let waiters = self.attach(waiters)?.add_shared();
             if self.swap(old, State { holders, waiters }) {
                 break waiters;
             }
         };
+
         let entry = self.adopt(registered);
         if let Some(stored) = self.spin(registered, Self::take_shared) {
             return self.taken(stored, Taker::Shared);
         }
+
         loop {
             if let Err(error) = self.block(entry.semaphore()) {
                 let stored = loop {
@@ -1168,12 +1153,15 @@ impl<'a> Request<'a> {
                 if !stored.has_entry() {
                     self.release_entry();
                 }
+
                 return Err(error);
             }
+
             loop {
                 match self.take_shared() {
                     Take::Taken(stored) => return self.taken(stored, Taker::Shared),
                     Take::Busy(..) => break,
+                    // Another thread changed the record: try again at once.
                     Take::Lost(_) => {}
                 }
             }
@@ -1182,10 +1170,11 @@ impl<'a> Request<'a> {
 
     fn take_exclusive(&self) -> Take {
         let old = self.read();
-        let (holders, waiters) = (old.holders, old.waiters);
+        let State { holders, waiters } = old;
         if holders.has_holder_or_upgrade() {
             return Take::Busy(old);
         }
+
         let holders = holders.with_exclusive().remove_waiter();
         let waiters = State {
             holders,
@@ -1220,12 +1209,15 @@ impl<'a> Request<'a> {
                 break (holders, waiters);
             }
         };
+
         if !waiters.has_entry() {
             self.release_entry();
         }
+
         if !holders.is_held() && waiters.shared() != 0 {
             release_semaphore(entry.semaphore(), waiters.shared());
         }
+
         Err(error)
     }
 
@@ -1236,8 +1228,10 @@ impl<'a> Request<'a> {
             if self.kind == Kind::Owned {
                 return Err(LockError::NotRecursive);
             }
+
             let recursion = &ownership.recursion;
             recursion.store(recursion.load(Relaxed).wrapping_add(1), Relaxed);
+
             // Stock passes the compare and exchange values of this update
             // swapped and spins until another thread clears the bit; the
             // bit is cleared here.
@@ -1255,12 +1249,14 @@ impl<'a> Request<'a> {
                     }
                 }
             }
+
             lwsync();
             return Ok(());
         }
+
         let registered = loop {
             let old = self.read();
-            let (holders, waiters) = (old.holders, old.waiters);
+            let State { holders, waiters } = old;
             if holders == Holders::NONE || (waiters.spins() && !holders.has_holder_or_upgrade()) {
                 if self.swap(
                     old,
@@ -1273,16 +1269,16 @@ impl<'a> Request<'a> {
                     self.record_owner();
                     return Ok(());
                 }
+
                 continue;
             }
+
             if !self.may_wait(waiters) {
                 self.release_entry();
                 return Err(Error::Timeout.into());
             }
-            let waiters = match self.attach(waiters) {
-                Ok(waiters) => waiters,
-                Err(error) => return Err(error.into()),
-            };
+
+            let waiters = self.attach(waiters)?;
             if self.swap(
                 old,
                 State {
@@ -1293,14 +1289,17 @@ impl<'a> Request<'a> {
                 break waiters;
             }
         };
+
         let entry = self.adopt(registered);
         if let Some(stored) = self.spin(registered, Self::take_exclusive) {
             return self.taken(stored, Taker::SpinningExclusive);
         }
+
         loop {
             if let Err(error) = self.block(entry.event()) {
                 return self.abandon(entry, error, |holders| holders.remove_waiter());
             }
+
             loop {
                 match self.take_exclusive() {
                     Take::Taken(stored) => return self.taken(stored, Taker::Exclusive),
@@ -1311,6 +1310,7 @@ impl<'a> Request<'a> {
                         }
                         break;
                     }
+                    // Another thread changed the record: try again at once.
                     Take::Lost(_) => {}
                 }
             }
@@ -1323,28 +1323,33 @@ impl<'a> Request<'a> {
             if ownership.owner.load(Relaxed) != GetCurrentThreadId() {
                 return Err(LockError::NotHeld);
             }
+
             if ownership.recursion.load(Relaxed) == 0 {
                 ownership.owner.store(0, Relaxed);
             }
         }
+
         let (holders, waiters) = loop {
             let old = self.read();
-            let mut holders = old.holders;
-            if self
+            let holders = if self
                 .ownership
                 .is_none_or(|ownership| ownership.recursion.load(Relaxed) == 0)
             {
-                if !holders.is_exclusive() {
+                if !old.holders.is_exclusive() {
                     return Err(LockError::NotHeld);
                 }
-                holders = holders.without_exclusive();
-            }
+
+                old.holders.without_exclusive()
+            } else {
+                old.holders
+            };
             let holders = holders.add_shared();
             let waiters = old.waiters.spin_as(self.wait.spin);
             if self.swap(old, State { holders, waiters }) {
                 break (holders, waiters);
             }
         };
+
         if let Some(ownership) = self.ownership {
             let recursion = &ownership.recursion;
             if recursion.load(Relaxed) != 0 {
@@ -1352,20 +1357,23 @@ impl<'a> Request<'a> {
                 return Ok(());
             }
         }
+
         if !holders.has_waiters() && waiters.shared() != 0 {
             // SAFETY: shared waiters attached an entry to the waiters word.
             let entry = unsafe { self.pool.entry_of(waiters) };
             release_semaphore(entry.semaphore(), waiters.shared());
         }
+
         Ok(())
     }
 
     fn take_upgrade(&self) -> Take {
         let old = self.read();
-        let (holders, waiters) = (old.holders, old.waiters);
+        let State { holders, waiters } = old;
         if holders.has_holder() {
             return Take::Busy(old);
         }
+
         let holders = holders.with_exclusive().remove_waiter().without_upgrading();
         let waiters = State {
             holders,
@@ -1389,6 +1397,7 @@ impl<'a> Request<'a> {
                 if !old.holders.has_shared() {
                     return Err(Error::InvalidArgument.into());
                 }
+
                 let waiters = if self.wait.spin {
                     old.waiters
                 } else {
@@ -1404,13 +1413,15 @@ impl<'a> Request<'a> {
                     break;
                 }
             }
+
             let recursion = &ownership.recursion;
             recursion.store(recursion.load(Relaxed).wrapping_add(1), Relaxed);
             return Ok(());
         }
+
         let registered = loop {
             let old = self.read();
-            let (holders, waiters) = (old.holders, old.waiters);
+            let State { holders, waiters } = old;
             let error = if !holders.has_shared() {
                 Some(LockError::Container(Error::InvalidArgument))
             } else if holders.is_upgrading() {
@@ -1424,6 +1435,7 @@ impl<'a> Request<'a> {
                 self.release_entry();
                 return Err(error);
             }
+
             let remaining = holders.remove_shared();
             if !remaining.has_holder() {
                 if self.swap(
@@ -1437,16 +1449,16 @@ impl<'a> Request<'a> {
                     self.record_owner();
                     return Ok(());
                 }
+
                 continue;
             }
+
             if !self.may_wait(waiters) {
                 self.release_entry();
                 return Err(Error::Timeout.into());
             }
-            let waiters = match self.attach(waiters) {
-                Ok(waiters) => waiters,
-                Err(error) => return Err(error.into()),
-            };
+
+            let waiters = self.attach(waiters)?;
             if self.swap(
                 old,
                 State {
@@ -1457,20 +1469,24 @@ impl<'a> Request<'a> {
                 break waiters;
             }
         };
+
         let entry = self.adopt(registered);
         if let Some(stored) = self.spin(registered, Self::take_upgrade) {
             return self.taken(stored, Taker::Exclusive);
         }
+
         loop {
             if let Err(error) = self.block(entry.event()) {
                 return self.abandon(entry, error, |holders| {
                     holders.remove_waiter().without_upgrading().add_shared()
                 });
             }
+
             loop {
                 match self.take_upgrade() {
                     Take::Taken(stored) => return self.taken(stored, Taker::Exclusive),
                     Take::Busy(..) => break,
+                    // Another thread changed the record: try again at once.
                     Take::Lost(_) => {}
                 }
             }
@@ -1483,6 +1499,7 @@ impl<'a> Request<'a> {
             if !old.holders.has_shared() {
                 return Err(LockError::NotHeld);
             }
+
             let holders = old.holders.remove_shared();
             if self.swap(
                 old,
@@ -1494,6 +1511,7 @@ impl<'a> Request<'a> {
                 break (holders, old.waiters);
             }
         };
+
         // Waiters but no holder, tested on the word: the method form compiles
         // to a longer sequence here.
         if holders.0 & (Holders::EXCLUSIVE | Holders::SHARED) == 0
@@ -1502,6 +1520,7 @@ impl<'a> Request<'a> {
             // SAFETY: exclusive waiters attached an entry to the waiters word.
             set_event(unsafe { self.pool.entry_of(waiters) }.event());
         }
+
         Ok(())
     }
 
@@ -1510,19 +1529,23 @@ impl<'a> Request<'a> {
             if ownership.owner.load(Relaxed) != GetCurrentThreadId() {
                 return Err(LockError::NotHeld);
             }
+
             let recursion = &ownership.recursion;
             let depth = recursion.load(Relaxed);
             if depth != 0 {
                 recursion.store(depth.wrapping_sub(1), Relaxed);
                 return Ok(());
             }
+
             ownership.owner.store(0, Relaxed);
         }
+
         let (holders, waiters) = loop {
             let old = self.read();
             if !old.holders.is_exclusive() {
                 return Err(LockError::NotHeld);
             }
+
             let holders = old.holders.without_exclusive();
             if self.swap(
                 old,
@@ -1534,6 +1557,7 @@ impl<'a> Request<'a> {
                 break (holders, old.waiters);
             }
         };
+
         if holders.has_waiters() {
             if !holders.has_shared() {
                 // SAFETY: exclusive waiters attached an entry to the waiters
@@ -1545,6 +1569,7 @@ impl<'a> Request<'a> {
             let entry = unsafe { self.pool.entry_of(waiters) };
             release_semaphore(entry.semaphore(), waiters.shared());
         }
+
         Ok(())
     }
 }
@@ -1567,7 +1592,7 @@ struct OperationWord(u32);
 impl OperationWord {
     const IMMEDIATE: u32 = 0x8;
 
-    fn immediate(self) -> bool {
+    fn is_immediate(self) -> bool {
         self.0 & Self::IMMEDIATE != 0
     }
 
@@ -1583,6 +1608,28 @@ impl OperationWord {
     }
 }
 
+fn lock_result(result: Result<(), LockError>) -> Hresult {
+    match result {
+        Ok(()) => Hresult::SUCCESS,
+        Err(error) => error.into(),
+    }
+}
+
+/// A pool word that stock reports as E_FAIL when it reads -1.
+fn count_result(value: Option<u32>, output_word: Option<OutputWord<'_>>) -> Hresult {
+    let (Some(value), Some(output_word)) = (value, output_word) else {
+        return Hresult::INVALID_ARGUMENT;
+    };
+
+    if value == u32::MAX {
+        return Hresult::FAIL;
+    }
+
+    output_word.store(value);
+
+    Hresult::SUCCESS
+}
+
 /// The pool and record address of export 340 or 351: none for an invalid
 /// pool, a null record or one that is not 4-byte aligned, the checks stock
 /// makes. `ldarx` needs the 8-byte alignment that the export contract
@@ -1595,9 +1642,11 @@ impl OperationWord {
 unsafe fn request_target<'a>(pool: u32, lock: u32) -> Option<(&'a Pool, NonZeroU32)> {
     /// Alignment bits stock checks.
     const CHECKED_ALIGNMENT_MASK: u32 = 3;
+
     // SAFETY: the caller guarantees the pool.
     let pool = unsafe { Pool::from_handle(pool) }?;
     let lock = NonZeroU32::new(lock).filter(|lock| lock.get() & CHECKED_ALIGNMENT_MASK == 0)?;
+
     Some((pool, lock))
 }
 
@@ -1606,10 +1655,12 @@ extern "C" fn operate(pool: u32, operation: u32, lock: u32) -> Hresult {
     let Some((pool, lock)) = (unsafe { request_target(pool, lock) }) else {
         return Hresult::INVALID_ARGUMENT;
     };
-    let operation = OperationWord(operation);
-    let Some(kind) = operation.operation() else {
+
+    let word = OperationWord(operation);
+    let Some(operation) = word.operation() else {
         return Error::InvalidArgument.into();
     };
+
     // SAFETY: export 340 contract: `lock` is a lock record of the pool,
     // 8-byte aligned.
     let mut request = unsafe { Request::new(pool, lock) };
@@ -1624,34 +1675,25 @@ extern "C" fn operate(pool: u32, operation: u32, lock: u32) -> Hresult {
         };
         request.immediate = !flags.contains(PoolFlags::MAY_WAIT);
     }
-    request.immediate |= operation.immediate();
-    let outcome = match kind {
+    request.immediate |= word.is_immediate();
+
+    let outcome = match operation {
         Operation::Shared => request.shared(),
         Operation::Exclusive => request.exclusive(),
         Operation::Downgrade => request.downgrade(),
         Operation::Upgrade => request.upgrade(Precedence::Behind),
         Operation::UpgradeAhead => request.upgrade(Precedence::Ahead),
     };
+
     lock_result(outcome)
 }
 export!(340, operate);
-
-/// A pool word that stock reports as E_FAIL when it reads -1.
-fn count_result(value: Option<u32>, output_word: Option<OutputWord<'_>>) -> Hresult {
-    let (Some(value), Some(output_word)) = (value, output_word) else {
-        return Hresult::INVALID_ARGUMENT;
-    };
-    if value == u32::MAX {
-        return Hresult::FAIL;
-    }
-    output_word.store(value);
-    Hresult::SUCCESS
-}
 
 extern "C" fn memory(pool: u32, output_word: u32) -> Hresult {
     // SAFETY: export 341 contract: `pool` is 0 or a pool of export 342 and
     // `output_word` 0 or a writable word.
     let (pool, output_word) = unsafe { (Pool::from_handle(pool), OutputWord::new(output_word)) };
+
     count_result(pool.map(|pool| pool.memory.load(Relaxed)), output_word)
 }
 export!(341, memory);
@@ -1662,9 +1704,11 @@ extern "C" fn create(attributes: u32, output_word: u32) -> Hresult {
     let Some(output_word) = (unsafe { OutputWord::new(output_word) }) else {
         return Hresult::INVALID_ARGUMENT;
     };
+
     output_word.store(0);
+
     // SAFETY: export 342 contract: `attributes` is 0 or pool attributes.
-    let created = unsafe { PoolAttributes::read(attributes) }
+    let created = unsafe { PoolAttributes::from_address(attributes) }
         .and_then(|attributes| Pool::create(attributes.as_ref()));
     match created {
         Ok(pool) => {
@@ -1684,6 +1728,7 @@ extern "C" fn allocate_lock(pool: u32, output_word: u32) -> Hresult {
     let (Some(pool), Some(output_word)) = (pool, output_word) else {
         return Hresult::INVALID_ARGUMENT;
     };
+
     let Some(record) = pool
         .pop_record()
         .or_else(|| pool.add_records(pool.per_block.load(Relaxed), FirstRecord::Keep))
@@ -1691,6 +1736,7 @@ extern "C" fn allocate_lock(pool: u32, output_word: u32) -> Hresult {
         output_word.store(0);
         return Error::NotEnoughMemory.into();
     };
+
     // SAFETY: a record of this pool's blocks or one returned through export
     // 345, an `OwnedLockRecord` in owned and recursive pools by its
     // contract.
@@ -1703,7 +1749,9 @@ extern "C" fn allocate_lock(pool: u32, output_word: u32) -> Hresult {
         }
     }
     lwsync();
+
     output_word.store(record.raw());
+
     Hresult::SUCCESS
 }
 export!(343, allocate_lock);
@@ -1722,6 +1770,7 @@ extern "C" fn free_lock(pool: u32, lock: u32) -> Hresult {
     let Some(pool) = (unsafe { Pool::from_handle(pool) }) else {
         return Hresult::INVALID_ARGUMENT;
     };
+
     // Stock also requires records of owned and recursive pools to be
     // aligned to their size.
     let alignment_mask = pool.kind().record_size() - 1;
@@ -1729,6 +1778,7 @@ extern "C" fn free_lock(pool: u32, lock: u32) -> Hresult {
     else {
         return Hresult::INVALID_ARGUMENT;
     };
+
     // SAFETY: export 345 contract: `lock` is a lock record of the pool.
     let state = &unsafe { record.get::<LockRecord, _>(pool) }.state;
     let waiters = Waiters(state.low.load(Relaxed));
@@ -1736,8 +1786,10 @@ extern "C" fn free_lock(pool: u32, lock: u32) -> Hresult {
     if waiters.without_spin().0 | holders.0 != 0 || lock & alignment_mask != 0 {
         return Hresult::INVALID_ARGUMENT;
     }
+
     // SAFETY: as above; an idle record is on no list.
     unsafe { pool.records.push(record, NodeWord::Word0) };
+
     Hresult::SUCCESS
 }
 export!(345, free_lock);
@@ -1748,14 +1800,17 @@ extern "C" fn reserve_entries(pool: u32, count: u32) -> Hresult {
     let Some(pool) = (unsafe { Pool::from_handle(pool) }).filter(|_| count as i32 >= 0) else {
         return Hresult::INVALID_ARGUMENT;
     };
+
     let mut created = 0;
     while created < count {
         let Some(entry) = pool.create_entry() else {
             break;
         };
+
         pool.free_entry(entry);
         created += 1;
     }
+
     if created == count {
         Hresult::SUCCESS
     } else {
@@ -1767,19 +1822,25 @@ export!(346, reserve_entries);
 /// Add `count` free lock records; a plain pool adds one block whatever the
 /// count. E_FAIL when the records were not added.
 extern "C" fn reserve_locks(pool: u32, count: u32) -> Hresult {
+    /// Bound on the records added to an owned or recursive pool, so that
+    /// their bytes stay a positive `i32`.
+    const MAX_RESERVED_RECORDS: u32 = 0x07ff_ffff;
+
     // SAFETY: export 347 contract: `pool` is 0 or a pool of export 342.
     let Some(pool) = (unsafe { Pool::from_handle(pool) }) else {
         return Hresult::INVALID_ARGUMENT;
     };
+
     let added = if pool.kind() == Kind::Plain {
         pool.add_records(pool.per_block.load(Relaxed), FirstRecord::Free)
             .map_or(0, |_| count)
-    } else if count as i32 > 0 && count < Pool::MAX_RESERVED_RECORDS {
+    } else if count as i32 > 0 && count < MAX_RESERVED_RECORDS {
         pool.add_records(count, FirstRecord::Free)
             .map_or(0, |_| count)
     } else {
         0
     };
+
     if added == count {
         Hresult::SUCCESS
     } else {
@@ -1798,6 +1859,7 @@ extern "C" fn initialize_lock(pool: u32, lock: u32) -> Hresult {
     ) else {
         return Hresult::INVALID_ARGUMENT;
     };
+
     // SAFETY: export 348 contract: `lock` is caller memory for a lock record
     // of the pool, an `OwnedLockRecord` in owned and recursive pools.
     unsafe {
@@ -1812,6 +1874,7 @@ extern "C" fn initialize_lock(pool: u32, lock: u32) -> Hresult {
         }
     }
     lwsync();
+
     Hresult::SUCCESS
 }
 export!(348, initialize_lock);
@@ -1821,6 +1884,7 @@ extern "C" fn entry_count(pool: u32, output_word: u32) -> Hresult {
     // SAFETY: export 349 contract: as for export 341.
     let (pool, output_word) = unsafe { (Pool::from_handle(pool), OutputWord::new(output_word)) };
     let value = pool.map(|pool| (pool.table.low.load(Relaxed) & Pool::COUNT_MASK).wrapping_sub(1));
+
     count_result(value, output_word)
 }
 export!(349, entry_count);
@@ -1828,6 +1892,7 @@ export!(349, entry_count);
 extern "C" fn record_total(pool: u32, output_word: u32) -> Hresult {
     // SAFETY: export 350 contract: as for export 341.
     let (pool, output_word) = unsafe { (Pool::from_handle(pool), OutputWord::new(output_word)) };
+
     count_result(pool.map(|pool| pool.total.load(Relaxed)), output_word)
 }
 export!(350, record_total);
@@ -1838,13 +1903,16 @@ extern "C" fn release(pool: u32, mode: u32, lock: u32) -> Hresult {
     let Some((pool, lock)) = (unsafe { request_target(pool, lock) }) else {
         return Hresult::INVALID_ARGUMENT;
     };
+
     let release = match mode {
         0 => Request::release_shared,
         1 => Request::release_exclusive,
         _ => return LockError::BadMode.into(),
     };
+
     // SAFETY: export 351 contract: `lock` is a lock record of the pool.
     let mut request = unsafe { Request::new(pool, lock) };
+
     lock_result(release(&mut request))
 }
 export!(351, release);

@@ -14,11 +14,17 @@ use super::ring;
 /// Event types with a callback slot, from the D3D type on.
 pub(super) const D3D_EVENT: u32 = 2;
 pub(super) const TYPES: usize = 5;
-/// Bitmap group of `pixcmd n`/`y`.
-const BITMAP_GROUP: u32 = 1;
 const BITMAP_WORDS: usize = 2;
-/// Thread flags the title terminate notification clears.
-const TITLE_THREAD_FLAGS: u32 = 7;
+
+static OWNER: AtomicU32 = AtomicU32::new(0);
+static CALLBACKS: [AtomicU32; TYPES] = [const { AtomicU32::new(0) }; TYPES];
+static BITMAP: [AtomicU32; BITMAP_WORDS] = [const { AtomicU32::new(0) }; BITMAP_WORDS];
+/// Flags word the slots point at (stock 0x91fa282c); titles write it.
+static THREAD_FLAGS: AtomicU32 = AtomicU32::new(0);
+/// Slots of 16 bytes per hardware thread (stock 0x91fa2838); `+0` points
+/// at `THREAD_FLAGS`, the rest belongs to the title.
+static SLOTS: [[AtomicU32; 4]; HARDWARE_THREAD_COUNT] =
+    [const { [const { AtomicU32::new(0) }; 4] }; HARDWARE_THREAD_COUNT];
 
 xbox360_sys::value_enum! {
     /// Operation passed to a title callback `(operation, value)`.
@@ -57,15 +63,12 @@ impl CallbackOperation {
     }
 }
 
-static OWNER: AtomicU32 = AtomicU32::new(0);
-static CALLBACKS: [AtomicU32; TYPES] = [const { AtomicU32::new(0) }; TYPES];
-static BITMAP: [AtomicU32; BITMAP_WORDS] = [const { AtomicU32::new(0) }; BITMAP_WORDS];
-/// Flags word the slots point at (stock 0x91fa282c); titles write it.
-static THREAD_FLAGS: AtomicU32 = AtomicU32::new(0);
-/// Slots of 16 bytes per hardware thread (stock 0x91fa2838); `+0` points
-/// at `THREAD_FLAGS`, the rest belongs to the title.
-static SLOTS: [[AtomicU32; 4]; HARDWARE_THREAD_COUNT] =
-    [const { [const { AtomicU32::new(0) }; 4] }; HARDWARE_THREAD_COUNT];
+/// Code 0x2f argument.
+#[repr(C)]
+struct Registration {
+    event: AtomicU32,
+    callback: AtomicU32,
+}
 
 /// Call a title callback with the stock ABI `(operation, value)`.
 ///
@@ -95,17 +98,11 @@ pub(super) fn notify_owner(operation: CallbackOperation, value: u32) {
     } else {
         CALLBACKS[0].load(Ordering::Acquire)
     };
+
     if target != 0 {
         // SAFETY: a registered callback; registration requires it.
         unsafe { call(target, operation, value) };
     }
-}
-
-/// Code 0x2f argument.
-#[repr(C)]
-struct Registration {
-    event: AtomicU32,
-    callback: AtomicU32,
 }
 
 /// Monitor control code 0x2f (stock 0x91f55eb8): `{+0 type, +4
@@ -122,6 +119,7 @@ pub(crate) unsafe fn service_register_callback(argument: u32) -> u32 {
     let registration = unsafe { crate::kernel::object_at::<Registration>(argument) };
     let event = registration.event.load(Ordering::Relaxed);
     let callback = registration.callback.load(Ordering::Relaxed);
+
     if (D3D_EVENT..D3D_EVENT + TYPES as u32).contains(&event) {
         CALLBACKS[(event - D3D_EVENT) as usize].store(callback, Ordering::Release);
         // SAFETY: the caller's contract covers the callback.
@@ -130,6 +128,7 @@ pub(crate) unsafe fn service_register_callback(argument: u32) -> u32 {
             plugin::start();
         }
     }
+
     1
 }
 
@@ -142,6 +141,7 @@ pub(crate) fn service_unregister_callback(event: u32) -> u32 {
         }
         CALLBACKS[(event - D3D_EVENT) as usize].store(0, Ordering::Release);
     }
+
     1
 }
 
@@ -159,7 +159,9 @@ pub(crate) unsafe fn service_acquire_owner(callback: u32) -> u32 {
     {
         return 0;
     }
+
     plugin::start();
+
     1
 }
 
@@ -168,8 +170,10 @@ pub(crate) fn service_release_owner(callback: u32) -> u32 {
     if OWNER.load(Ordering::Acquire) != callback {
         return 0;
     }
+
     OWNER.store(0, Ordering::Release);
     plugin::stop();
+
     1
 }
 
@@ -181,16 +185,21 @@ pub(crate) fn service_thread_slot(_argument: u32) -> u32 {
     let Some(slot) = SLOTS.get(current_object().hardware_thread().index()) else {
         return 0;
     };
+
     slot[0].store(
         core::ptr::from_ref(&THREAD_FLAGS) as usize as u32,
         Ordering::Release,
     );
+
     slot.as_ptr() as usize as u32
 }
 
 /// `pixcmd n`/`y` (stock 0x91f58aa0 and 0x91f58a10): group 1 clears or
 /// sets bit `id` of the bitmap; groups 2 to 6 tell their callback.
 pub(super) fn counter_control(group: u32, id: u32, enabled: bool) {
+    /// Bitmap group of `pixcmd n`/`y`.
+    const BITMAP_GROUP: u32 = 1;
+
     if group == BITMAP_GROUP {
         // Stock indexes the bitmap without a bound and overwrites the
         // owner and callbacks for identifiers of 64 and up.
@@ -205,6 +214,7 @@ pub(super) fn counter_control(group: u32, id: u32, enabled: bool) {
         }
         return;
     }
+
     let target = callback(group);
     if target != 0 {
         let operation = if enabled {
@@ -238,5 +248,8 @@ pub(super) fn forget_title() {
 
 /// Clear the low bits of the thread flags word (stock 0x91f566f0).
 pub(super) fn clear_thread_flags() {
+    /// Thread flags the title terminate notification clears.
+    const TITLE_THREAD_FLAGS: u32 = 7;
+
     THREAD_FLAGS.fetch_and(!TITLE_THREAD_FLAGS, Ordering::AcqRel);
 }

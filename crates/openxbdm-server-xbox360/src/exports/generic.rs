@@ -38,6 +38,7 @@ extern "C" fn free_pool_if_present(address: u32) -> Hresult {
         // SAFETY: the export contract requires a pool block from the caller.
         unsafe { xboxkrnl::ExFreePool(address) };
     }
+
     Hresult::OK
 }
 export!(4, free_pool_if_present);

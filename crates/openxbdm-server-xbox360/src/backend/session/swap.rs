@@ -14,10 +14,6 @@ use crate::kernel;
 
 const SWAP_SLOTS: usize = 8;
 
-/// A routine run on every thread switch with the outgoing thread object,
-/// the dispatcher's frame, and the incoming thread object.
-pub(crate) type SwapRoutine = extern "C" fn(old: u32, frame: u32, new: u32);
-
 /// Routine addresses, 0 for a free slot. Read by the dispatcher without
 /// the lock, as stock does.
 static ROUTINES: [AtomicU32; SWAP_SLOTS] = [const { AtomicU32::new(0) }; SWAP_SLOTS];
@@ -27,12 +23,38 @@ static CHAIN: SpinLock<Chain> = SpinLock::new(Chain {
     replaced: 0,
 });
 
+/// A routine run on every thread switch with the outgoing thread object,
+/// the dispatcher's frame, and the incoming thread object.
+pub(crate) type SwapRoutine = extern "C" fn(old: u32, frame: u32, new: u32);
+
 struct Chain {
     /// The routine stays registered when the title ends.
     persistent: [bool; SWAP_SLOTS],
+
     installed: bool,
     /// Kernel swap routine replaced by the dispatcher.
     replaced: u32,
+}
+
+impl Chain {
+    /// # Safety
+    ///
+    /// As for [`kernel_swap_routine`].
+    unsafe fn install(&mut self) {
+        // SAFETY: the caller's contract.
+        let kernel_slot = unsafe { kernel_swap_routine() };
+        self.replaced = kernel_slot.load(Ordering::Relaxed);
+
+        // SAFETY: the dispatcher entry takes the kernel's swap routine
+        // arguments and stays loaded while installed.
+        unsafe {
+            kernel_slot.store(
+                dispatch_entry as *const () as usize as u32,
+                Ordering::Relaxed,
+            )
+        };
+        self.installed = true;
+    }
 }
 
 /// `KiContextSwapNotification`, the routine variable the kernel calls on
@@ -51,31 +73,12 @@ fn routine_address(routine: SwapRoutine) -> u32 {
     routine as usize as u32
 }
 
-impl Chain {
-    /// # Safety
-    ///
-    /// As for [`kernel_swap_routine`].
-    unsafe fn install(&mut self) {
-        // SAFETY: the caller's contract.
-        let kernel_slot = unsafe { kernel_swap_routine() };
-        self.replaced = kernel_slot.load(Ordering::Relaxed);
-        // SAFETY: the dispatcher entry takes the kernel's swap routine
-        // arguments and stays loaded while installed.
-        unsafe {
-            kernel_slot.store(
-                dispatch_entry as *const () as usize as u32,
-                Ordering::Relaxed,
-            )
-        };
-        self.installed = true;
-    }
-}
-
 /// Add `routine` in the first free slot (nothing when all are taken) and
 /// install the dispatcher. A `persistent` routine stays registered when
 /// the title ends.
 pub(crate) fn register_swap_routine(routine: SwapRoutine, persistent: bool) {
     let mut chain = CHAIN.lock();
+
     if let Some(slot) = ROUTINES
         .iter()
         .position(|slot| slot.load(Ordering::Relaxed) == 0)
@@ -83,6 +86,7 @@ pub(crate) fn register_swap_routine(routine: SwapRoutine, persistent: bool) {
         ROUTINES[slot].store(routine_address(routine), Ordering::Release);
         chain.persistent[slot] = persistent;
     }
+
     if !chain.installed {
         // SAFETY: the monitor registered with the kernel before any routine
         // registers, so the variable is published, as stock assumes.
@@ -96,8 +100,10 @@ pub(crate) fn unregister_swap_routine(routine: SwapRoutine) {
     let routine = routine_address(routine);
     let mut chain = CHAIN.lock();
     let mut remaining = 0;
+
     for (slot, persistent) in ROUTINES.iter().zip(&mut chain.persistent) {
         match slot.load(Ordering::Relaxed) {
+            // A free slot counts toward nothing.
             0 => {}
             current if current == routine => {
                 slot.store(0, Ordering::Release);
@@ -106,6 +112,7 @@ pub(crate) fn unregister_swap_routine(routine: SwapRoutine) {
             _ => remaining += 1,
         }
     }
+
     if remaining == 0 && chain.installed {
         // SAFETY: `install` found the variable; the routine the dispatcher
         // replaced is the kernel's own.
@@ -122,16 +129,19 @@ pub(crate) fn unregister_swap_routine(routine: SwapRoutine) {
 pub(crate) fn remove_unflagged_swap_routines() {
     let mut chain = CHAIN.lock();
     let mut remaining = 0;
+
     for (slot, persistent) in ROUTINES.iter().zip(&mut chain.persistent) {
         if slot.load(Ordering::Relaxed) == 0 {
             continue;
         }
+
         if *persistent {
             remaining += 1;
         } else {
             slot.store(0, Ordering::Release);
         }
     }
+
     if remaining > 0 {
         // SAFETY: as in `register_swap_routine`.
         unsafe { chain.install() };
@@ -167,11 +177,13 @@ unsafe extern "C" fn dispatch_entry() {
 extern "C" fn dispatch(old: u32, new: u32, frame: u32) {
     for slot in &ROUTINES {
         let routine = slot.load(Ordering::Acquire);
-        if routine != 0 {
-            // SAFETY: nonzero slots hold only `SwapRoutine` addresses stored
-            // by `register_swap_routine`.
-            let routine: SwapRoutine = unsafe { core::mem::transmute(routine as usize) };
-            routine(old, frame, new);
+        if routine == 0 {
+            continue;
         }
+
+        // SAFETY: nonzero slots hold only `SwapRoutine` addresses stored by
+        // `register_swap_routine`.
+        let routine: SwapRoutine = unsafe { core::mem::transmute(routine as usize) };
+        routine(old, frame, new);
     }
 }

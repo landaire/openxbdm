@@ -36,12 +36,10 @@ use crate::kernel::object_at_mut;
 
 /// Export 178's result for a missing or overlong name.
 const BAD_PARAMETER: Hresult = ErrorCode::BadParameter.hresult();
+
 /// Longest extension name export 178 accepts.
 const EXTENSION_NAME_LIMIT: usize = 0x3f;
-/// Return addresses export 82 stores at most.
-const BACK_TRACE_LIMIT: u32 = 0x100;
-/// Stack slack reported by export 89, as `threadinfo` reports it.
-const THREAD_SLACK: u32 = 0x540;
+
 /// `ExCreateThread` flags of export 180: a system thread on hardware
 /// thread 2. Bit 0x4 has no name: no kernel code tests it, and stock
 /// passes it.
@@ -51,25 +49,17 @@ const DEBUG_THREAD_FLAGS: ThreadCreationFlags = ThreadCreationFlags::SYSTEM_PROC
     .union(ThreadCreationFlags::from_bits_retain(0x4));
 const _: () = assert!(DEBUG_THREAD_FLAGS.bits() == 0x0400_0026);
 
+/// Stop-on bits set and cleared while the server state was unreachable,
+/// applied by the server thread before its next pass.
+static PENDING_STOP_ON_SET: AtomicU32 = AtomicU32::new(0);
+static PENDING_STOP_ON_CLEAR: AtomicU32 = AtomicU32::new(0);
+
 xbox360_sys::flags! {
     /// Creation flags a caller passes to export 180 (`CreateThread`
     /// flags).
     pub struct CreateThreadFlags(u32) {
         /// Create the thread suspended (`CREATE_SUSPENDED`).
         SUSPENDED = 0x4,
-    }
-}
-
-/// The result of a failed export.
-fn error_result(error: impl Into<CommandError>) -> Hresult {
-    Hresult::from(error.into())
-}
-
-/// The result of an export without outputs.
-fn command_result(result: Result<(), impl Into<CommandError>>) -> Hresult {
-    match result {
-        Ok(()) => Hresult::OK,
-        Err(error) => error_result(error),
     }
 }
 
@@ -106,6 +96,7 @@ impl Request {
     /// caller guarantees for its output.
     unsafe fn store(&self, address: u32) {
         let out = core::ptr::with_exposed_provenance_mut::<u32>(address as usize);
+
         for (index, &word) in self.words[..self.count].iter().enumerate() {
             // SAFETY: the caller guarantees the output words.
             unsafe { out.add(index).write(word) };
@@ -115,6 +106,63 @@ impl Request {
 
 /// The work of an export on the server thread.
 type ExportService = HresultService<Request>;
+
+/// Bounds of the calling thread's stack.
+struct StackLimits {
+    low: u32,
+    high: u32,
+}
+
+/// `DM_THREADINFO_EX` as export 89 fills it.
+#[repr(C)]
+struct ThreadInfoEx {
+    size: u32,
+    suspend_count: u32,
+    priority: u32,
+    tls_base: u32,
+    start_address: u32,
+    stack_base: u32,
+    stack_limit: u32,
+    create_time_high: u32,
+    create_time_low: u32,
+    stack_slack: u32,
+    name_address: u32,
+    name_length: u32,
+    processor: u8,
+    _reserved_31: [u8; 3],
+    last_error: u32,
+}
+
+const _: () = {
+    use core::mem::offset_of;
+    assert!(offset_of!(ThreadInfoEx, start_address) == 0x10);
+    assert!(offset_of!(ThreadInfoEx, stack_slack) == 0x24);
+    assert!(offset_of!(ThreadInfoEx, processor) == 0x30);
+    assert!(offset_of!(ThreadInfoEx, last_error) == 0x34);
+    assert!(core::mem::size_of::<ThreadInfoEx>() == 0x38);
+};
+
+impl ThreadInfoEx {
+    /// Smallest size a caller may state.
+    const MINIMUM_SIZE: u32 = 0x10;
+    /// Size that holds the fields through the name.
+    const NAME_SIZE: u32 = 0x30;
+    /// Size that holds every field.
+    const FULL_SIZE: u32 = core::mem::size_of::<Self>() as u32;
+}
+
+/// The result of a failed export.
+fn error_result(error: impl Into<CommandError>) -> Hresult {
+    Hresult::from(error.into())
+}
+
+/// The result of an export without outputs.
+fn command_result(result: Result<(), impl Into<CommandError>>) -> Hresult {
+    match result {
+        Ok(()) => Hresult::OK,
+        Err(error) => error_result(error),
+    }
+}
 
 /// Run `service` on the server thread with `request`; `None` when the
 /// server state is unreachable: on the server thread itself, above passive
@@ -158,6 +206,7 @@ extern "C" fn get_thread_context(thread: u32, context: u32) -> Hresult {
     if context == 0 {
         return Hresult::INVALID_ARGUMENT;
     }
+
     // A caller's CONTEXT has the 8-byte alignment of its scalar fields; the
     // 16 bytes of `KernelContext` are not guaranteed, so it is reached only
     // through field pointers.
@@ -177,6 +226,7 @@ extern "C" fn get_thread_context(thread: u32, context: u32) -> Hresult {
             super::context_to_memory(target, &read);
         }
     });
+
     command_result(result)
 }
 export!(13, get_thread_context);
@@ -187,6 +237,7 @@ extern "C" fn get_thread_list(ids: u32, count: u32) -> Hresult {
     if ids == 0 || count == 0 {
         return Hresult::INVALID_ARGUMENT;
     }
+
     // The count word is converted at each access: the caller's id array
     // may overlap it.
     if super::execution_state() == ExecutionState::Pending {
@@ -194,6 +245,7 @@ extern "C" fn get_thread_list(ids: u32, count: u32) -> Hresult {
         *unsafe { object_at_mut::<u32>(count) } = 0;
         return Hresult::OK;
     }
+
     // SAFETY: as above.
     let capacity = *unsafe { object_at::<u32>(count) } as usize;
     let ids = core::ptr::with_exposed_provenance_mut::<u32>(ids as usize);
@@ -237,6 +289,7 @@ extern "C" fn is_thread_stopped(thread: u32, record: u32) -> Hresult {
     if record == 0 {
         return Hresult::INVALID_ARGUMENT;
     }
+
     let mut stop = Request::new(thread, 0, 0);
     let result = run(
         |server, console, _, request| match debugger::stop_reason(
@@ -254,6 +307,7 @@ extern "C" fn is_thread_stopped(thread: u32, record: u32) -> Hresult {
     );
     // SAFETY: the caller passes a stop record that holds the words.
     unsafe { stop.store(record) };
+
     result
 }
 export!(22, is_thread_stopped);
@@ -338,6 +392,7 @@ extern "C" fn set_thread_context(thread: u32, context: u32) -> Hresult {
     if context == 0 {
         return Hresult::INVALID_ARGUMENT;
     }
+
     // Reached through field pointers, as in export 13.
     let source = core::ptr::with_exposed_provenance::<KernelContext>(context as usize);
     // SAFETY: the caller passes its CONTEXT, aligned to at least 8 bytes,
@@ -346,6 +401,7 @@ extern "C" fn set_thread_context(thread: u32, context: u32) -> Hresult {
     let flags = ContextFlags::from_bits_retain(flags.bits()) & ContextFlags::FULL;
     // SAFETY: as above.
     let source = unsafe { super::context_from_memory(source, flags) };
+
     command_result(super::write_thread_context(ThreadId(thread), &source))
 }
 export!(41, set_thread_context);
@@ -366,11 +422,6 @@ extern "C" fn stop() -> Hresult {
     )
 }
 export!(45, stop);
-
-/// Stop-on bits set and cleared while the server state was unreachable,
-/// applied by the server thread before its next pass.
-static PENDING_STOP_ON_SET: AtomicU32 = AtomicU32::new(0);
-static PENDING_STOP_ON_CLEAR: AtomicU32 = AtomicU32::new(0);
 
 /// Apply stop-on changes export 46 could not make directly.
 pub(crate) fn apply_pending_stop_on(state: &mut ServerState) {
@@ -404,6 +455,7 @@ extern "C" fn stop_on(flags: u32, set: u32) -> Hresult {
         add.fetch_or(flags, Ordering::AcqRel);
         remove.fetch_and(!flags, Ordering::AcqRel);
     }
+
     Hresult::OK
 }
 export!(46, stop_on);
@@ -422,9 +474,11 @@ extern "C" fn thread_debug_data(thread: u32, address: u32) -> Hresult {
     if address == 0 {
         return Hresult::INVALID_ARGUMENT;
     }
+
     if thread != u32::MAX && super::ThreadRef::lookup(ThreadId(thread)).is_err() {
         return error_result(NoSuchThread);
     }
+
     match super::current_debug_data() {
         Some(debug_data) => {
             // SAFETY: the caller passes its output word.
@@ -451,6 +505,7 @@ extern "C" fn breakpoint_kind(address: u32, kind: u32) -> Hresult {
     );
     // SAFETY: the caller passes its output word.
     unsafe { query.store(kind) };
+
     result
 }
 export!(56, breakpoint_kind);
@@ -482,9 +537,13 @@ extern "C" fn capture_back_trace(
     stack: u32,
     return_address: u32,
 ) -> Hresult {
+    /// Return addresses export 82 stores at most.
+    const BACK_TRACE_LIMIT: u32 = 0x100;
+
     if count == 0 || count > BACK_TRACE_LIMIT {
         return BAD_PARAMETER;
     }
+
     let (mut low, mut high) = (0u32, 0u32);
     // SAFETY: both outputs are live locals.
     unsafe { RtlGetStackLimits(&mut low, &mut high) };
@@ -499,13 +558,8 @@ extern "C" fn capture_back_trace(
             StackLimits { low, high },
         )
     };
-    Hresult::OK
-}
 
-/// Bounds of the calling thread's stack.
-struct StackLimits {
-    low: u32,
-    high: u32,
+    Hresult::OK
 }
 
 /// Store the return addresses of the frames from `stack` outward into
@@ -525,6 +579,7 @@ unsafe fn back_trace(
 ) {
     let mut stored = 0;
     let mut frame = stack;
+
     while stored < count && frame < limits.high && frame > limits.low {
         let address = if stored == 0 {
             return_address
@@ -538,6 +593,7 @@ unsafe fn back_trace(
         // SAFETY: the caller guarantees the back chain word.
         frame = unsafe { *object_at::<u32>(frame) };
     }
+
     for index in stored..count {
         // SAFETY: `index` is below `count`.
         unsafe { buffer.add(index as usize).write(0) };
@@ -552,64 +608,33 @@ extern "C" fn write_dump(full: u32) -> u32 {
     } else {
         DumpKind::Default
     });
+
     0
 }
 export!(83, write_dump);
-
-/// `DM_THREADINFO_EX` as export 89 fills it.
-#[repr(C)]
-struct ThreadInfoEx {
-    size: u32,
-    suspend_count: u32,
-    priority: u32,
-    tls_base: u32,
-    start_address: u32,
-    stack_base: u32,
-    stack_limit: u32,
-    create_time_high: u32,
-    create_time_low: u32,
-    stack_slack: u32,
-    name_address: u32,
-    name_length: u32,
-    processor: u8,
-    _reserved_31: [u8; 3],
-    last_error: u32,
-}
-
-const _: () = {
-    use core::mem::offset_of;
-    assert!(offset_of!(ThreadInfoEx, start_address) == 0x10);
-    assert!(offset_of!(ThreadInfoEx, stack_slack) == 0x24);
-    assert!(offset_of!(ThreadInfoEx, processor) == 0x30);
-    assert!(offset_of!(ThreadInfoEx, last_error) == 0x34);
-    assert!(core::mem::size_of::<ThreadInfoEx>() == 0x38);
-};
-
-impl ThreadInfoEx {
-    /// Smallest size a caller may state.
-    const MINIMUM_SIZE: u32 = 0x10;
-    /// Size that holds the fields through the name.
-    const NAME_SIZE: u32 = 0x30;
-    /// Size that holds every field.
-    const FULL_SIZE: u32 = core::mem::size_of::<Self>() as u32;
-}
 
 /// Stock export 89 (0x91f265b0): `(thread, info) -> HRESULT`. `info` starts
 /// with its size (at least 0x10); the fields that fit are filled and the
 /// rest of the stated size is zeroed.
 extern "C" fn thread_info(thread: u32, info: u32) -> Hresult {
+    /// Stack slack reported by export 89, as `threadinfo` reports it.
+    const THREAD_SLACK: u32 = 0x540;
+
     if info == 0 {
         return Hresult::INVALID_ARGUMENT;
     }
+
     // SAFETY: the caller passes its `DM_THREADINFO_EX`, a record of words
     // that starts with its size.
     let size = unsafe { *object_at::<u32>(info) };
     if size < ThreadInfoEx::MINIMUM_SIZE {
         return Hresult::INVALID_ARGUMENT;
     }
+
     let Ok(details) = super::thread_information(ThreadId(thread)) else {
         return error_result(NoSuchThread);
     };
+
     let suspend = i32::from(details.suspend_count) - i32::from(details.monitor_suspended);
     let mut filled = ThreadInfoEx {
         size,
@@ -668,6 +693,7 @@ extern "C" fn thread_info(thread: u32, info: u32) -> Hresult {
     let skip = core::mem::size_of::<u32>();
     out[skip..copied].copy_from_slice(&source[skip..copied]);
     out[copied..].fill(0);
+
     Hresult::OK
 }
 export!(89, thread_info);
@@ -712,6 +738,7 @@ extern "C" fn load_extension(name: u32, handle: u32) -> Hresult {
         // SAFETY: as above.
         unsafe { load.store(handle) };
     }
+
     result
 }
 export!(178, load_extension);
@@ -766,6 +793,7 @@ extern "C" fn create_thread(
         set_last_error(error);
         return 0;
     }
+
     handle
 }
 export!(180, create_thread);
@@ -790,6 +818,7 @@ extern "C" fn debugger_address(address: u32, port: u32) -> u32 {
             *port = published.port;
         }
     }
+
     published.attached
 }
 export!(373, debugger_address);

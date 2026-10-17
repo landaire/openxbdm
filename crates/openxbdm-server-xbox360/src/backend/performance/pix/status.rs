@@ -10,6 +10,11 @@ use openxbdm_core::status::Hresult;
 use crate::backend::session;
 use crate::kernel;
 
+/// Status filter a title installs through code 0x45 (stock 0x91fa2cec);
+/// 0 when none. Stock guards it with a spin lock that only serializes the
+/// word access.
+static FILTER: AtomicU32 = AtomicU32::new(0);
+
 /// Status codes of the PIX engine.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u32)]
@@ -58,10 +63,21 @@ impl Status {
     }
 }
 
-/// Status filter a title installs through code 0x45 (stock 0x91fa2cec);
-/// 0 when none. Stock guards it with a spin lock that only serializes the
-/// word access.
-static FILTER: AtomicU32 = AtomicU32::new(0);
+/// Code 0x45 argument record.
+#[repr(C)]
+struct FilterControl {
+    _size: AtomicU32,
+    operation: AtomicU32,
+    data: AtomicU32,
+}
+
+/// Data record of filter control operation 1.
+#[repr(C)]
+struct InstallFilter {
+    _size: AtomicU32,
+    filter: AtomicU32,
+    previous: AtomicU32,
+}
 
 /// Install `filter` and return the previous one (stock 0x91f63d10).
 ///
@@ -82,6 +98,7 @@ pub(super) unsafe fn set_filter(filter: u32) -> u32 {
 /// for the call.
 pub(crate) unsafe fn post(status: Status, argument: u32) {
     let filter = FILTER.load(Ordering::Acquire);
+
     if filter != 0 {
         // SAFETY: the title installed a filter taking two arguments
         // `(status, argument) -> taken`.
@@ -89,6 +106,7 @@ pub(crate) unsafe fn post(status: Status, argument: u32) {
             return;
         }
     }
+
     // SAFETY: the caller's contract.
     unsafe { send(status, argument) };
 }
@@ -100,35 +118,36 @@ pub(crate) fn post_without_text(status: Status) {
     unsafe { post(status, 0) }
 }
 
-/// Text of each status by code: NUL-terminated, or for `VideoOp`,
-/// `VideoOpError` and `Resource` the prefix of the argument text. `Text`
-/// sends the argument itself.
-const TEXTS: [&[u8]; 16] = [
-    b"PIX!CounterDataAvailable\0",
-    b"PIX!StreamEngineOutOfMemory\0",
-    b"PIX!Timing\0",
-    b"PIX!NO\0",
-    b"PIX!BadD3dVersion\0",
-    b"PIX!Gpu\0",
-    b"PIX!NoFrame\0",
-    b"PIX!Trace\0",
-    b"PIX!Pause\0",
-    b"",
-    b"PIX!NoHarddrive\0",
-    b"PIX!VideoOp ",
-    b"PIX!VideoOpError ",
-    b"PIX!MovieData\0",
-    b"PIX!Resource ",
-    b"PIX!Reboot\0",
-];
-
 /// Format and send the text of `status` (stock 0x91f63dd8).
 ///
 /// # Safety
 ///
 /// As [`post`].
 unsafe fn send(status: Status, argument: u32) {
+    /// Text of each status by code: NUL-terminated, or for `VideoOp`,
+    /// `VideoOpError` and `Resource` the prefix of the argument text. `Text`
+    /// sends the argument itself.
+    const TEXTS: [&[u8]; 16] = [
+        b"PIX!CounterDataAvailable\0",
+        b"PIX!StreamEngineOutOfMemory\0",
+        b"PIX!Timing\0",
+        b"PIX!NO\0",
+        b"PIX!BadD3dVersion\0",
+        b"PIX!Gpu\0",
+        b"PIX!NoFrame\0",
+        b"PIX!Trace\0",
+        b"PIX!Pause\0",
+        b"",
+        b"PIX!NoHarddrive\0",
+        b"PIX!VideoOp ",
+        b"PIX!VideoOpError ",
+        b"PIX!MovieData\0",
+        b"PIX!Resource ",
+        b"PIX!Reboot\0",
+    ];
+
     let fixed = TEXTS[status as usize];
+
     let text = match status {
         Status::Text => argument,
         Status::VideoOp | Status::VideoOpError | Status::Resource => {
@@ -151,6 +170,7 @@ unsafe fn send(status: Status, argument: u32) {
         }
         _ => fixed.as_ptr() as usize as u32,
     };
+
     // SAFETY: the caller's text or a static NUL-terminated text.
     unsafe { session::service_send_notification(text) };
 }
@@ -164,6 +184,7 @@ unsafe fn send(status: Status, argument: u32) {
 pub(crate) unsafe fn service_post_text(text: u32) -> u32 {
     // SAFETY: the caller's contract.
     unsafe { post(Status::Text, text) };
+
     1
 }
 
@@ -179,42 +200,26 @@ pub(crate) unsafe fn service_post_text(text: u32) -> u32 {
 /// call; an installed filter takes `(status, argument)` and stays loaded
 /// while installed.
 pub(crate) unsafe fn service_filter_control(argument: u32) -> u32 {
+    /// Operations of code 0x45.
+    const RUN_COMMAND_LINE: u32 = 0;
+    const INSTALL_FILTER: u32 = 1;
+
     // SAFETY: the caller's contract.
     let argument = unsafe { crate::kernel::object_at::<FilterControl>(argument) };
     let data = argument.data.load(Ordering::Relaxed);
+
     match argument.operation.load(Ordering::Relaxed) {
         // SAFETY: the caller's contract.
-        filter_operation::RUN_COMMAND_LINE => unsafe { super::run_command_line(data) },
-        filter_operation::INSTALL_FILTER => {
+        RUN_COMMAND_LINE => unsafe { super::run_command_line(data) },
+        INSTALL_FILTER => {
             // SAFETY: the caller's contract.
             let data = unsafe { crate::kernel::object_at::<InstallFilter>(data) };
             // SAFETY: the caller's contract covers the filter routine.
             let previous = unsafe { set_filter(data.filter.load(Ordering::Relaxed)) };
             data.previous.store(previous, Ordering::Relaxed);
+
             0
         }
         _ => Hresult::UNEXPECTED.0,
     }
-}
-
-/// Code 0x45 argument record.
-#[repr(C)]
-struct FilterControl {
-    _size: AtomicU32,
-    operation: AtomicU32,
-    data: AtomicU32,
-}
-
-/// Data record of filter control operation 1.
-#[repr(C)]
-struct InstallFilter {
-    _size: AtomicU32,
-    filter: AtomicU32,
-    previous: AtomicU32,
-}
-
-/// Operations of code 0x45.
-mod filter_operation {
-    pub(super) const RUN_COMMAND_LINE: u32 = 0;
-    pub(super) const INSTALL_FILTER: u32 = 1;
 }

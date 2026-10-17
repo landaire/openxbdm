@@ -69,115 +69,6 @@ const CONFIG_STATUS_WORDS: usize = 0x3a_usize.div_ceil(4);
 static CONFIG_STATUS: [AtomicU32; CONFIG_STATUS_WORDS] =
     [const { AtomicU32::new(0) }; CONFIG_STATUS_WORDS];
 
-/// `XnpConfig` flags of a static address, subnet, and gateway; stock sets
-/// both bits together.
-const STATIC_ADDRESS: XnetConfigFlags = XnetConfigFlags::from_bits_retain(0xc);
-
-fn address(value: u32) -> Ipv4Address {
-    Ipv4Address(value.to_be_bytes())
-}
-
-fn current_address_settings() -> AddressSettings {
-    AddressSettings {
-        use_static: STATIC_IP_USE.load(Ordering::SeqCst),
-        address: address(STATIC_IP_ADDRESS.load(Ordering::SeqCst)),
-        subnet: address(STATIC_IP_SUBNET.load(Ordering::SeqCst)),
-        gateway: address(STATIC_IP_GATEWAY.load(Ordering::SeqCst)),
-    }
-}
-
-/// Store a control-code value, request the settings write, and return the
-/// stored value (stock cases 0x0c, 0x0e, 0x10, 0x12).
-fn set_and_save(target: &AtomicU32, value: u32) -> u32 {
-    target.store(value, Ordering::SeqCst);
-    crate::backend::dispatcher::request_settings_write();
-    target.load(Ordering::SeqCst)
-}
-
-/// Control code 0x0b (stock 0x91f3b2c8): configure the network stack with
-/// the static address (when enabled) and the debug name as host name. The
-/// address configuration is read through the dispatcher, so extensions see
-/// the queries.
-pub(crate) fn service_apply_xnet_config(_argument: u32) -> u32 {
-    // SAFETY: the address queries take no argument.
-    let query = |code: ControlCode| unsafe { dispatcher::dispatch(code, 0) };
-    for word in &CONFIG_STATUS {
-        word.store(0, Ordering::Relaxed);
-    }
-    let mut config = XnetConfigParams::new();
-    if query(ControlCode::GET_STATIC_IP_ENABLE) != 0 {
-        config.flags = STATIC_ADDRESS;
-        config.address = query(ControlCode::GET_STATIC_IP_ADDRESS);
-        config.subnet = query(ControlCode::GET_SUBNET);
-        config.gateway = query(ControlCode::GET_GATEWAY);
-    }
-    let name = crate::backend::console::debug_name();
-    let name = name.as_bytes();
-    config.host_name[..name.len()].copy_from_slice(name);
-    // The dispatcher case discards the result (0x91f3bb10).
-    // SAFETY: the debug monitor caller with flags 0, as stock passes them.
-    unsafe { xam::xnp_config(XnCaller::DebugMonitor, &config, 0) };
-    0
-}
-
-pub(crate) fn service_set_static_ip_enable(argument: u32) -> u32 {
-    set_and_save(&STATIC_IP_USE, argument)
-}
-
-pub(crate) fn service_get_static_ip_enable(_argument: u32) -> u32 {
-    STATIC_IP_USE.load(Ordering::SeqCst)
-}
-
-pub(crate) fn service_set_static_ip_address(argument: u32) -> u32 {
-    set_and_save(&STATIC_IP_ADDRESS, argument)
-}
-
-pub(crate) fn service_get_static_ip_address(_argument: u32) -> u32 {
-    STATIC_IP_ADDRESS.load(Ordering::SeqCst)
-}
-
-pub(crate) fn service_set_subnet(argument: u32) -> u32 {
-    set_and_save(&STATIC_IP_SUBNET, argument)
-}
-
-pub(crate) fn service_get_subnet(_argument: u32) -> u32 {
-    STATIC_IP_SUBNET.load(Ordering::SeqCst)
-}
-
-pub(crate) fn service_set_gateway(argument: u32) -> u32 {
-    set_and_save(&STATIC_IP_GATEWAY, argument)
-}
-
-pub(crate) fn service_get_gateway(_argument: u32) -> u32 {
-    STATIC_IP_GATEWAY.load(Ordering::SeqCst)
-}
-
-/// Query the configuration status and return its word `index` (stock
-/// cases 0x14..0x16).
-fn config_status_word(index: usize) -> u32 {
-    // SAFETY: the status words are static storage of at least the 0x3a
-    // bytes the network stack writes; atomics allow the shared writes.
-    unsafe {
-        NetDll_XnpGetConfigStatus(
-            XnCaller::DebugMonitor,
-            CONFIG_STATUS.as_ptr().cast::<u8>().cast_mut(),
-        )
-    };
-    CONFIG_STATUS[index].load(Ordering::Relaxed)
-}
-
-pub(crate) fn service_config_status_1(_argument: u32) -> u32 {
-    config_status_word(1)
-}
-
-pub(crate) fn service_config_status_2(_argument: u32) -> u32 {
-    config_status_word(2)
-}
-
-pub(crate) fn service_config_status_3(_argument: u32) -> u32 {
-    config_status_word(3)
-}
-
 /// Intercept flags of the simulator registration and its removal; a
 /// capture registers with none.
 pub(crate) const SIMULATOR_INTERCEPT: EthernetInterceptFlags =
@@ -193,18 +84,6 @@ pub(crate) struct FrameHook {
     pub transmit: FrameCallback,
     pub receive: FrameCallback,
     pub context: usize,
-}
-
-/// Address of a `xam.xex` export (stock 0x91f31010 handle and
-/// `XexGetProcedureAddress`; any success status counts).
-pub(crate) fn xam_procedure(ordinal: Ordinal) -> Option<u32> {
-    let module = SystemModule::Xam.handle().ok()?;
-    let mut address = 0u32;
-    // SAFETY: `module` is the loaded xam.xex handle and `address` is a live u32.
-    let status = unsafe {
-        xboxkrnl::XexGetProcedureAddress(module.raw(), u32::from(ordinal.get()), &mut address)
-    };
-    status.is_success().then_some(address)
 }
 
 /// A pool allocation holding raw table records. It owns the allocation,
@@ -237,6 +116,7 @@ impl Snapshot {
         if index >= self.count {
             return None;
         }
+
         let address = self.buffer + index * Self::record_size(self.table);
         // SAFETY: the pool buffer (8-aligned) holds `count` records of
         // `record_size` bytes, a multiple of 8, written by the network stack.
@@ -328,6 +208,248 @@ const _: () = {
     assert!(core::mem::offset_of!(QosLookupEntry, xnaddr) == 0x34);
     assert!(size_of::<QosLookupEntry>() == 0x88);
 };
+
+/// Platform state of this domain.
+pub struct Data {
+    snapshots: [Option<Snapshot>; MAX_CONNECTIONS],
+    pub netcap: netcap::Data,
+    pub ipproxy: ipproxy::Data,
+}
+
+impl Data {
+    pub const fn new() -> Self {
+        Self {
+            snapshots: [const { None }; MAX_CONNECTIONS],
+            netcap: netcap::Data::new(),
+            ipproxy: ipproxy::Data::new(),
+        }
+    }
+
+    fn release(&mut self, connection: ConnectionIndex) {
+        if let Some(snapshot) = self
+            .snapshots
+            .get_mut(usize::from(connection.0))
+            .and_then(Option::take)
+        {
+            snapshot.free();
+        }
+    }
+}
+
+impl network::Backend for Console {
+    fn system_version(&mut self) -> SystemVersion {
+        SystemVersion(xam::XamGetSystemVersion())
+    }
+
+    fn open_table(&mut self, connection: ConnectionIndex, table: Table) -> Result<u32, TableError> {
+        self.network.release(connection);
+
+        let snapshot = take_snapshot(table)?;
+
+        match self.network.snapshots.get_mut(usize::from(connection.0)) {
+            // The slot was emptied by `release`.
+            Some(slot) => Ok(slot.insert(snapshot).count),
+            None => {
+                snapshot.free();
+                Err(TableError::OutOfMemory)
+            }
+        }
+    }
+
+    fn table_record(&mut self, connection: ConnectionIndex, index: u32) -> Option<Record> {
+        self.network
+            .snapshots
+            .get(usize::from(connection.0))?
+            .as_ref()?
+            .record(index)
+    }
+
+    fn close_table(&mut self, connection: ConnectionIndex) {
+        self.network.release(connection);
+    }
+
+    fn link_status(&mut self) -> LinkStatus {
+        link_status()
+    }
+
+    fn set_link_flags(&mut self, flags: LinkFlags) -> Result<(), WsaError> {
+        set_link_flags(flags)
+    }
+
+    /// The kernel result is ignored, as in stock; a failed query reports
+    /// zeros where stock reports stale stack contents.
+    fn nic_stats(&mut self, device_flags: u32) -> NicStats {
+        let mut block = NicStatistics::default();
+        // SAFETY: the device flags are the caller's, as stock passes them.
+        unsafe { xboxkrnl::nic_get_stats(device_flags, &mut block) };
+
+        NicStats {
+            transmitted_bytes: block.transmitted_bytes,
+            received_unicast_bytes: block.received_unicast_bytes,
+            received_unicast1_bytes: block.received_unicast1_bytes,
+            received_unicast2_bytes: block.received_unicast2_bytes,
+            received_multicast_bytes: block.received_multicast_bytes,
+            received_broadcast_bytes: block.received_broadcast_bytes,
+            transmitted_frames: block.transmitted_frames,
+            received_unicast_frames: block.received_unicast_frames,
+            received_unicast1_frames: block.received_unicast1_frames,
+            received_unicast2_frames: block.received_unicast2_frames,
+            received_multicast_frames: block.received_multicast_frames,
+            received_broadcast_frames: block.received_broadcast_frames,
+            transmit_underrun_errors: block.transmit_underrun_errors,
+            transmit_other_errors: block.transmit_other_errors,
+            receive_frame_errors: block.receive_frame_errors,
+            receive_crc_errors: block.receive_crc_errors,
+            receive_other_errors: block.receive_other_errors,
+        }
+    }
+
+    fn address_settings(&mut self) -> AddressSettings {
+        current_address_settings()
+    }
+
+    fn set_address_field(&mut self, field: AddressField, value: u32) {
+        let target = match field {
+            AddressField::UseStatic => &STATIC_IP_USE,
+            AddressField::Address => &STATIC_IP_ADDRESS,
+            AddressField::Subnet => &STATIC_IP_SUBNET,
+            AddressField::Gateway => &STATIC_IP_GATEWAY,
+        };
+
+        target.store(value, Ordering::SeqCst);
+    }
+}
+
+fn address(value: u32) -> Ipv4Address {
+    Ipv4Address(value.to_be_bytes())
+}
+
+fn current_address_settings() -> AddressSettings {
+    AddressSettings {
+        use_static: STATIC_IP_USE.load(Ordering::SeqCst),
+        address: address(STATIC_IP_ADDRESS.load(Ordering::SeqCst)),
+        subnet: address(STATIC_IP_SUBNET.load(Ordering::SeqCst)),
+        gateway: address(STATIC_IP_GATEWAY.load(Ordering::SeqCst)),
+    }
+}
+
+/// Store a control-code value, request the settings write, and return the
+/// stored value (stock cases 0x0c, 0x0e, 0x10, 0x12).
+fn set_and_save(target: &AtomicU32, value: u32) -> u32 {
+    target.store(value, Ordering::SeqCst);
+
+    dispatcher::request_settings_write();
+
+    target.load(Ordering::SeqCst)
+}
+
+/// Control code 0x0b (stock 0x91f3b2c8): configure the network stack with
+/// the static address (when enabled) and the debug name as host name. The
+/// address configuration is read through the dispatcher, so extensions see
+/// the queries.
+pub(crate) fn service_apply_xnet_config(_argument: u32) -> u32 {
+    /// `XnpConfig` flags of a static address, subnet, and gateway; stock sets
+    /// both bits together.
+    const STATIC_ADDRESS: XnetConfigFlags = XnetConfigFlags::from_bits_retain(0xc);
+
+    // SAFETY: the address queries take no argument.
+    let query = |code: ControlCode| unsafe { dispatcher::dispatch(code, 0) };
+
+    for word in &CONFIG_STATUS {
+        word.store(0, Ordering::Relaxed);
+    }
+
+    let mut config = XnetConfigParams::new();
+    if query(ControlCode::GET_STATIC_IP_ENABLE) != 0 {
+        config.flags = STATIC_ADDRESS;
+        config.address = query(ControlCode::GET_STATIC_IP_ADDRESS);
+        config.subnet = query(ControlCode::GET_SUBNET);
+        config.gateway = query(ControlCode::GET_GATEWAY);
+    }
+
+    let name = crate::backend::console::debug_name();
+    let name = name.as_bytes();
+    config.host_name[..name.len()].copy_from_slice(name);
+
+    // The dispatcher case discards the result (0x91f3bb10).
+    // SAFETY: the debug monitor caller with flags 0, as stock passes them.
+    unsafe { xam::xnp_config(XnCaller::DebugMonitor, &config, 0) };
+
+    0
+}
+
+pub(crate) fn service_set_static_ip_enable(argument: u32) -> u32 {
+    set_and_save(&STATIC_IP_USE, argument)
+}
+
+pub(crate) fn service_get_static_ip_enable(_argument: u32) -> u32 {
+    STATIC_IP_USE.load(Ordering::SeqCst)
+}
+
+pub(crate) fn service_set_static_ip_address(argument: u32) -> u32 {
+    set_and_save(&STATIC_IP_ADDRESS, argument)
+}
+
+pub(crate) fn service_get_static_ip_address(_argument: u32) -> u32 {
+    STATIC_IP_ADDRESS.load(Ordering::SeqCst)
+}
+
+pub(crate) fn service_set_subnet(argument: u32) -> u32 {
+    set_and_save(&STATIC_IP_SUBNET, argument)
+}
+
+pub(crate) fn service_get_subnet(_argument: u32) -> u32 {
+    STATIC_IP_SUBNET.load(Ordering::SeqCst)
+}
+
+pub(crate) fn service_set_gateway(argument: u32) -> u32 {
+    set_and_save(&STATIC_IP_GATEWAY, argument)
+}
+
+pub(crate) fn service_get_gateway(_argument: u32) -> u32 {
+    STATIC_IP_GATEWAY.load(Ordering::SeqCst)
+}
+
+/// Query the configuration status and return its word `index` (stock
+/// cases 0x14..0x16).
+fn config_status_word(index: usize) -> u32 {
+    // SAFETY: the status words are static storage of at least the 0x3a
+    // bytes the network stack writes; atomics allow the shared writes.
+    unsafe {
+        NetDll_XnpGetConfigStatus(
+            XnCaller::DebugMonitor,
+            CONFIG_STATUS.as_ptr().cast::<u8>().cast_mut(),
+        )
+    };
+
+    CONFIG_STATUS[index].load(Ordering::Relaxed)
+}
+
+pub(crate) fn service_config_status_1(_argument: u32) -> u32 {
+    config_status_word(1)
+}
+
+pub(crate) fn service_config_status_2(_argument: u32) -> u32 {
+    config_status_word(2)
+}
+
+pub(crate) fn service_config_status_3(_argument: u32) -> u32 {
+    config_status_word(3)
+}
+
+/// Address of a `xam.xex` export (stock 0x91f31010 handle and
+/// `XexGetProcedureAddress`; any success status counts).
+pub(crate) fn xam_procedure(ordinal: Ordinal) -> Option<u32> {
+    let module = SystemModule::Xam.handle().ok()?;
+
+    let mut address = 0u32;
+    // SAFETY: `module` is the loaded xam.xex handle and `address` is a live u32.
+    let status = unsafe {
+        xboxkrnl::XexGetProcedureAddress(module.raw(), u32::from(ordinal.get()), &mut address)
+    };
+
+    status.is_success().then_some(address)
+}
 
 /// Decode one table record.
 ///
@@ -431,6 +553,7 @@ fn query(function: Option<u32>, buffer: u32, count: &mut u32) -> Result<(), Win3
             NetDll_XnpGetActiveSocketList(XnCaller::DebugMonitor, buffer as usize as *mut u8, count)
         },
     };
+
     Win32Error::result(code)
 }
 
@@ -439,10 +562,12 @@ fn take_snapshot(table: Table) -> Result<Snapshot, TableError> {
     const SOCKET_CAPACITY: u32 = 0x800;
     /// Capacity for keys or security associations.
     const ENTRY_CAPACITY: u32 = 0x400;
+
     let function = match table_ordinal(table) {
         Some(ordinal) => Some(xam_procedure(ordinal).ok_or(TableError::Unavailable)?),
         None => None,
     };
+
     let mut count = match table {
         Table::Sockets => SOCKET_CAPACITY,
         Table::Keys | Table::SecurityAssociations => ENTRY_CAPACITY,
@@ -454,9 +579,11 @@ fn take_snapshot(table: Table) -> Result<Snapshot, TableError> {
                 Ok(()) | Err(Win32Error::NO_BUFFER_SPACE) => {}
                 Err(_) => return Err(TableError::Unavailable),
             }
+
             count.wrapping_add(1)
         }
     };
+
     // SAFETY: pool allocation of a computed size; the result is checked below.
     let buffer = unsafe {
         xboxkrnl::ExAllocatePoolWithTag(
@@ -464,46 +591,22 @@ fn take_snapshot(table: Table) -> Result<Snapshot, TableError> {
             pool_tag::MONITOR,
         )
     };
+
     if buffer == 0 {
         return Err(TableError::OutOfMemory);
     }
+
     if query(function, buffer, &mut count).is_err() {
         // SAFETY: `buffer` was allocated above and is not used afterwards.
         unsafe { xboxkrnl::ExFreePool(buffer) };
         return Err(TableError::Unavailable);
     }
+
     Ok(Snapshot {
         table,
         buffer,
         count,
     })
-}
-
-/// Platform state of this domain.
-pub struct Data {
-    snapshots: [Option<Snapshot>; MAX_CONNECTIONS],
-    pub netcap: netcap::Data,
-    pub ipproxy: ipproxy::Data,
-}
-
-impl Data {
-    pub const fn new() -> Self {
-        Self {
-            snapshots: [const { None }; MAX_CONNECTIONS],
-            netcap: netcap::Data::new(),
-            ipproxy: ipproxy::Data::new(),
-        }
-    }
-
-    fn release(&mut self, connection: ConnectionIndex) {
-        if let Some(snapshot) = self
-            .snapshots
-            .get_mut(usize::from(connection.0))
-            .and_then(Option::take)
-        {
-            snapshot.free();
-        }
-    }
 }
 
 /// Ethernet link state (`XNetGetEthernetLinkStatus`); any thread.
@@ -516,6 +619,7 @@ pub(crate) fn set_link_flags(flags: LinkFlags) -> Result<(), WsaError> {
     let mut value = [0u8; 8];
     value[..4].copy_from_slice(&flags.and.to_be_bytes());
     value[4..].copy_from_slice(&flags.or.to_be_bytes());
+
     // SAFETY: `value` is a live 8-byte option buffer of the stated length.
     let error = unsafe {
         NetDll_XNetSetOpt(
@@ -525,85 +629,6 @@ pub(crate) fn set_link_flags(flags: LinkFlags) -> Result<(), WsaError> {
             value.len() as u32,
         )
     };
+
     WsaError::new(error).map_or(Ok(()), Err)
-}
-
-impl network::Backend for Console {
-    fn system_version(&mut self) -> SystemVersion {
-        SystemVersion(xam::XamGetSystemVersion())
-    }
-
-    fn open_table(&mut self, connection: ConnectionIndex, table: Table) -> Result<u32, TableError> {
-        self.network.release(connection);
-        let snapshot = take_snapshot(table)?;
-        match self.network.snapshots.get_mut(usize::from(connection.0)) {
-            // The slot was emptied by `release`.
-            Some(slot) => Ok(slot.insert(snapshot).count),
-            None => {
-                snapshot.free();
-                Err(TableError::OutOfMemory)
-            }
-        }
-    }
-
-    fn table_record(&mut self, connection: ConnectionIndex, index: u32) -> Option<Record> {
-        self.network
-            .snapshots
-            .get(usize::from(connection.0))?
-            .as_ref()?
-            .record(index)
-    }
-
-    fn close_table(&mut self, connection: ConnectionIndex) {
-        self.network.release(connection);
-    }
-
-    fn link_status(&mut self) -> LinkStatus {
-        link_status()
-    }
-
-    fn set_link_flags(&mut self, flags: LinkFlags) -> Result<(), WsaError> {
-        set_link_flags(flags)
-    }
-
-    /// The kernel result is ignored, as in stock; a failed query reports
-    /// zeros where stock reports stale stack contents.
-    fn nic_stats(&mut self, device_flags: u32) -> NicStats {
-        let mut block = NicStatistics::default();
-        // SAFETY: the device flags are the caller's, as stock passes them.
-        unsafe { xboxkrnl::nic_get_stats(device_flags, &mut block) };
-        NicStats {
-            transmitted_bytes: block.transmitted_bytes,
-            received_unicast_bytes: block.received_unicast_bytes,
-            received_unicast1_bytes: block.received_unicast1_bytes,
-            received_unicast2_bytes: block.received_unicast2_bytes,
-            received_multicast_bytes: block.received_multicast_bytes,
-            received_broadcast_bytes: block.received_broadcast_bytes,
-            transmitted_frames: block.transmitted_frames,
-            received_unicast_frames: block.received_unicast_frames,
-            received_unicast1_frames: block.received_unicast1_frames,
-            received_unicast2_frames: block.received_unicast2_frames,
-            received_multicast_frames: block.received_multicast_frames,
-            received_broadcast_frames: block.received_broadcast_frames,
-            transmit_underrun_errors: block.transmit_underrun_errors,
-            transmit_other_errors: block.transmit_other_errors,
-            receive_frame_errors: block.receive_frame_errors,
-            receive_crc_errors: block.receive_crc_errors,
-            receive_other_errors: block.receive_other_errors,
-        }
-    }
-
-    fn address_settings(&mut self) -> AddressSettings {
-        current_address_settings()
-    }
-
-    fn set_address_field(&mut self, field: AddressField, value: u32) {
-        let target = match field {
-            AddressField::UseStatic => &STATIC_IP_USE,
-            AddressField::Address => &STATIC_IP_ADDRESS,
-            AddressField::Subnet => &STATIC_IP_SUBNET,
-            AddressField::Gateway => &STATIC_IP_GATEWAY,
-        };
-        target.store(value, Ordering::SeqCst);
-    }
 }

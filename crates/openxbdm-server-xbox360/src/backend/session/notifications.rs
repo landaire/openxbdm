@@ -8,7 +8,6 @@ use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
-use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::commands::debugger::ExceptionNotificationFlags;
@@ -25,8 +24,11 @@ use xbox360_sys::xboxkrnl::Irql;
 use xbox360_sys::xboxkrnl::PoolTag;
 use xbox360_sys::xboxkrnl::ProcessType;
 
+use super::error::AddProcessorError;
+use super::error::MissingKind;
 use super::passive;
 use super::post_notification;
+use super::service_rpc_drain;
 use super::swap;
 use super::until_nul;
 use crate::backend::debugger::execution_code;
@@ -40,19 +42,30 @@ export!(24, register_notification_handler);
 export!(25, open_notification_session);
 export!(32, register_notification_processor);
 export!(36, send_notification);
+export!(76, store_value);
+export!(370, load_value);
+export!(371, exchange_value);
+export!(372, drain_named_calls);
 
 /// Tag word of a session block, 'xnot'.
 const SESSION_TAG: u32 = 0x786e_6f74;
-const SESSION_POOL_TAG: PoolTag = PoolTag::new(*b"snmd");
 /// Handler lists of a session, one per kind 1..=0x16.
 const LIST_COUNT: usize = 0x16;
 const HANDLER_SLOTS: usize = 0x20;
 const PROCESSOR_SLOTS: usize = 0x10;
-const PROCESSOR_POOL_TAG: PoolTag = PoolTag::new(*b"hcmd");
 const PROCESSOR_NAME_LIMIT: usize = 0x3f;
-const ASSERT_PASSIVE: &core::ffi::CStr = c"KeGetCurrentIrql() == PASSIVE_LEVEL";
-const ASSERT_FILE: &core::ffi::CStr =
-    c"e:\\xenon\\xdksep13\\core\\private\\xdk\\tools\\debug\\xbdm\\core\\dmnotify.c";
+const NAME_CAPACITY: usize = 0x104;
+const MODULE_LOAD_RECORD_LENGTH: u32 = 0x12c;
+
+/// Head of the session list.
+static SESSIONS: AtomicU32 = AtomicU32::new(0);
+static LOCK: ListLock = ListLock(AtomicU32::new(0));
+/// The thread switch routine is in the swap chain.
+static THREAD_SWITCH_HOOKED: AtomicBool = AtomicBool::new(false);
+/// Word stored by export 76 (stock 0x91fadd20); the monitor never reads it.
+static EXPORT_76_VALUE: AtomicU32 = AtomicU32::new(0);
+/// Word of exports 370 and 371 (stock 0x91fa3afc); only they use it.
+static EXPORT_370_VALUE: AtomicU32 = AtomicU32::new(0);
 
 xbox360_sys::value_enum! {
     /// Notification kinds of the stock event structures.
@@ -230,12 +243,6 @@ const _: () = {
     assert!(core::mem::size_of::<ProcessorBlock>() == 0x44);
 };
 
-/// Head of the session list.
-static SESSIONS: AtomicU32 = AtomicU32::new(0);
-static LOCK: ListLock = ListLock(AtomicU32::new(0));
-/// The thread switch routine is in the swap chain.
-static THREAD_SWITCH_HOOKED: AtomicBool = AtomicBool::new(false);
-
 xbox360_sys::flags! {
     /// Writer bits of the list lock word; the reader count is above them.
     pub struct ListLockState(u32) {
@@ -258,6 +265,7 @@ impl ListLock {
     fn shared(&self) -> ListGuard<'_> {
         // SAFETY: the guard lowers the IRQL back to `irql` on drop.
         let irql = unsafe { xboxkrnl::KfRaiseIrql(Irql::DISPATCH) };
+
         loop {
             let state = self.0.load(Ordering::Relaxed);
             if !ListLockState::from_bits_retain(state)
@@ -285,6 +293,7 @@ impl ListLock {
     fn exclusive(&self) -> ListGuard<'_> {
         // SAFETY: the guard lowers the IRQL back to `irql` on drop.
         let irql = unsafe { xboxkrnl::KfRaiseIrql(Irql::DISPATCH) };
+
         loop {
             let state = ListLockState::from_bits_retain(self.0.load(Ordering::Relaxed));
             if state.difference(ListLockState::WRITER_WAITING).is_empty() {
@@ -327,13 +336,76 @@ impl Drop for ListGuard<'_> {
         } else {
             self.lock.0.fetch_sub(ListLock::READER, Ordering::Release);
         }
+
         // SAFETY: `irql` is the level the guard raised from.
         unsafe { xboxkrnl::KfLowerIrql(self.irql) };
     }
 }
 
+/// Access word of the kind 0xd data breakpoint record.
+#[repr(u32)]
+#[derive(Clone, Copy)]
+enum DataAccessCode {
+    Write = 1,
+    Read = 2,
+    Execute = 3,
+}
+
+/// Module record of kinds 5 and 6 (stock 0x91f39fc0 fills them, formatter
+/// 0x91f39080 reads them). Stock leaves the unload record's fields after
+/// name, base, and size uninitialized; they are zero here.
+#[repr(C)]
+#[derive(Default)]
+struct ModuleRecord {
+    name: NameField,
+    base: u32,
+    size: u32,
+    timestamp: u32,
+    checksum: u32,
+    flags: u32,
+    pdata: u32,
+    pdata_size: u32,
+    thread: u32,
+    image_size: u32,
+}
+
+/// Kind 5 data: the record length, then the module record. Handlers of
+/// kind 5 get the module record, those of a stopping load the length.
+#[repr(C)]
+struct ModuleLoadRecord {
+    length: u32,
+    module: ModuleRecord,
+}
+
+const _: () =
+    assert!(core::mem::size_of::<ModuleLoadRecord>() == MODULE_LOAD_RECORD_LENGTH as usize);
+
+/// A NUL-terminated name of the stock records.
+#[repr(transparent)]
+struct NameField([u8; NAME_CAPACITY]);
+
+impl Default for NameField {
+    fn default() -> Self {
+        Self([0; NAME_CAPACITY])
+    }
+}
+
+/// Section record of kinds 0x10 and 0x11.
+#[repr(C)]
+struct SectionRecord {
+    name: NameField,
+    base: u32,
+    size: u32,
+    index: u16,
+    flags: u16,
+}
+
 /// `RtlAssert` as stock reports a call above passive level.
 fn assert_passive(line: u32) {
+    const ASSERT_PASSIVE: &core::ffi::CStr = c"KeGetCurrentIrql() == PASSIVE_LEVEL";
+    const ASSERT_FILE: &core::ffi::CStr =
+        c"e:\\xenon\\xdksep13\\core\\private\\xdk\\tools\\debug\\xbdm\\core\\dmnotify.c";
+
     if !passive() {
         // SAFETY: the message and file name are static NUL-terminated strings.
         unsafe {
@@ -368,6 +440,7 @@ fn unlink_sessions(
     // The word that links the current session: the head, then a session's
     // next field.
     let mut link = &SESSIONS;
+
     loop {
         let current = link.load(Ordering::Relaxed);
         // SAFETY: the list links sessions, and the guard holds the lock.
@@ -386,14 +459,21 @@ fn unlink_sessions(
 /// Export 25 (stock 0x91f3acc0): open a session with `flags`; sessions of
 /// title processes are marked to go with the title.
 extern "C" fn open_notification_session(flags: u32, session: *mut u32) -> Hresult {
+    const SESSION_POOL_TAG: PoolTag = PoolTag::new(*b"snmd");
+
     if session.is_null() {
         return Hresult::INVALID_ARGUMENT;
     }
+
     assert_passive(0xbf9);
-    let mut flags = SessionFlags::from_bits_retain(flags);
-    if xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE {
-        flags |= SessionFlags::TITLE;
-    }
+
+    let flags = SessionFlags::from_bits_retain(flags);
+    let flags = if xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE {
+        flags | SessionFlags::TITLE
+    } else {
+        flags
+    };
+
     // SAFETY: the allocation takes only a size and tag.
     let block = unsafe {
         xboxkrnl::ExAllocatePoolWithTag(
@@ -406,6 +486,7 @@ extern "C" fn open_notification_session(flags: u32, session: *mut u32) -> Hresul
     if block == 0 {
         return Hresult::OUT_OF_MEMORY;
     }
+
     let _guard = LOCK.exclusive();
     // SAFETY: the pool block holds a session and is not yet shared.
     let new = unsafe {
@@ -418,6 +499,7 @@ extern "C" fn open_notification_session(flags: u32, session: *mut u32) -> Hresul
     new.next
         .store(SESSIONS.load(Ordering::Relaxed), Ordering::Relaxed);
     SESSIONS.store(block, Ordering::Release);
+
     Hresult::OK
 }
 
@@ -438,6 +520,7 @@ extern "C" fn close_notification_session(session: u32) -> Hresult {
     {
         return Hresult::INVALID_ARGUMENT;
     }
+
     let guard = LOCK.exclusive();
     unlink_sessions(
         &guard,
@@ -447,6 +530,7 @@ extern "C" fn close_notification_session(session: u32) -> Hresult {
             unsafe { xboxkrnl::ExFreePool(removed) };
         },
     );
+
     Hresult::OK
 }
 
@@ -463,7 +547,9 @@ extern "C" fn register_notification_handler(session: u32, kind: u32, handler: u3
     let Some(session) = (unsafe { NotificationSession::from_handle(session) }) else {
         return Hresult::INVALID_ARGUMENT;
     };
+
     assert_passive(0xc5c);
+
     let kind = kind & NotificationWord::KIND_MASK;
     let guard = LOCK.exclusive();
     if kind == 0 {
@@ -477,32 +563,38 @@ extern "C" fn register_notification_handler(session: u32, kind: u32, handler: u3
             remove_handler(session, list, handler);
             refresh_kernel_hooks(&guard, list.0);
         }
+
         return Hresult::OK;
     }
+
     let Some(list) = HandlerList::new(kind) else {
         return Hresult::INVALID_ARGUMENT;
     };
     if handler == 0 {
         return Hresult::INVALID_ARGUMENT;
     }
+
     let count = session.count(list).load(Ordering::Relaxed);
     // SAFETY (both): counts stay at most HANDLER_SLOTS; only this module
     // writes them, under the exclusive lock.
     let present = (0..count)
         .any(|index| unsafe { session.handler(list, index) }.load(Ordering::Relaxed) == handler);
-    if !present && count != HANDLER_SLOTS as u32 {
-        // SAFETY: `count` is below HANDLER_SLOTS here.
-        unsafe { session.handler(list, count) }.store(handler, Ordering::Relaxed);
-        session.count(list).store(count + 1, Ordering::Relaxed);
-        refresh_kernel_hooks(&guard, list.0);
-        if list == HandlerList::of(NotificationKind::Execution) {
-            call_handler(
-                handler,
-                NotificationWord::new(NotificationKind::Execution, false),
-                execution_code(execution_state()),
-            );
-        }
+    if present || count == HANDLER_SLOTS as u32 {
+        return Hresult::OK;
     }
+
+    // SAFETY: `count` is below HANDLER_SLOTS here.
+    unsafe { session.handler(list, count) }.store(handler, Ordering::Relaxed);
+    session.count(list).store(count + 1, Ordering::Relaxed);
+    refresh_kernel_hooks(&guard, list.0);
+    if list == HandlerList::of(NotificationKind::Execution) {
+        call_handler(
+            handler,
+            NotificationWord::new(NotificationKind::Execution, false),
+            execution_code(execution_state()),
+        );
+    }
+
     Hresult::OK
 }
 
@@ -511,6 +603,7 @@ extern "C" fn register_notification_handler(session: u32, kind: u32, handler: u3
 fn remove_handler(session: &NotificationSession, list: HandlerList, handler: u32) {
     let count = session.count(list);
     let mut index = 0;
+
     while index < count.load(Ordering::Relaxed) {
         // SAFETY (all): `index` and `last` are below the count, which stays
         // at most HANDLER_SLOTS.
@@ -541,17 +634,19 @@ fn refresh_kernel_hooks(guard: &ListGuard<'_>, kind: u32) {
         let list = HandlerList::of(kind);
         sessions(guard).any(|session| session.count(list).load(Ordering::Relaxed) != 0)
     };
+
     if kind == NotificationKind::KernelCallback.raw() {
-        if let Some(variable) = kernel::routine_variable(kernel::RoutineVariable::Callback) {
-            let routine = if wanted(NotificationKind::KernelCallback) {
-                kernel_callback_entry as *const () as usize as u32
-            } else {
-                0
-            };
-            // SAFETY: the routine is 0 or this module's bridged entry, which
-            // takes no arguments and stays loaded while installed.
-            unsafe { variable.store(routine, Ordering::Relaxed) };
-        }
+        let Some(variable) = kernel::routine_variable(kernel::RoutineVariable::Callback) else {
+            return;
+        };
+        let routine = if wanted(NotificationKind::KernelCallback) {
+            kernel_callback_entry as *const () as usize as u32
+        } else {
+            0
+        };
+        // SAFETY: the routine is 0 or this module's bridged entry, which
+        // takes no arguments and stays loaded while installed.
+        unsafe { variable.store(routine, Ordering::Relaxed) };
     } else if kind == NotificationKind::ThreadSwitch.raw() {
         let hooked = THREAD_SWITCH_HOOKED.load(Ordering::Relaxed);
         if wanted(NotificationKind::ThreadSwitch) {
@@ -573,6 +668,7 @@ extern "C" fn kernel_callback() -> u32 {
         NotificationWord::new(NotificationKind::KernelCallback, false),
         0,
     );
+
     0
 }
 crate::exports::bridged!(kernel_callback_entry, kernel_callback);
@@ -602,6 +698,7 @@ fn notify_sessions(word: NotificationWord, data: u32) {
     if processor::current_irql() > Irql::DISPATCH {
         return;
     }
+
     let list = word.list();
     let guard = LOCK.shared();
     for session in sessions(&guard) {
@@ -614,67 +711,6 @@ fn notify_sessions(word: NotificationWord, data: u32) {
             call_handler(handler, word, data);
         }
     }
-}
-
-/// Access word of the kind 0xd data breakpoint record.
-#[repr(u32)]
-#[derive(Clone, Copy)]
-enum DataAccessCode {
-    Write = 1,
-    Read = 2,
-    Execute = 3,
-}
-
-const NAME_CAPACITY: usize = 0x104;
-
-/// Module record of kinds 5 and 6 (stock 0x91f39fc0 fills them, formatter
-/// 0x91f39080 reads them). Stock leaves the unload record's fields after
-/// name, base, and size uninitialized; they are zero here.
-#[repr(C)]
-#[derive(Default)]
-struct ModuleRecord {
-    name: NameField,
-    base: u32,
-    size: u32,
-    timestamp: u32,
-    checksum: u32,
-    flags: u32,
-    pdata: u32,
-    pdata_size: u32,
-    thread: u32,
-    image_size: u32,
-}
-
-/// Kind 5 data: the record length, then the module record. Handlers of
-/// kind 5 get the module record, those of a stopping load the length.
-#[repr(C)]
-struct ModuleLoadRecord {
-    length: u32,
-    module: ModuleRecord,
-}
-
-const MODULE_LOAD_RECORD_LENGTH: u32 = 0x12c;
-const _: () =
-    assert!(core::mem::size_of::<ModuleLoadRecord>() == MODULE_LOAD_RECORD_LENGTH as usize);
-
-/// A NUL-terminated name of the stock records.
-#[repr(transparent)]
-struct NameField([u8; NAME_CAPACITY]);
-
-impl Default for NameField {
-    fn default() -> Self {
-        Self([0; NAME_CAPACITY])
-    }
-}
-
-/// Section record of kinds 0x10 and 0x11.
-#[repr(C)]
-struct SectionRecord {
-    name: NameField,
-    base: u32,
-    size: u32,
-    index: u16,
-    flags: u16,
 }
 
 /// `name` as a NUL-terminated field, cut to fit; shared by the records, so
@@ -692,6 +728,7 @@ fn name_field(name: &[u8]) -> NameField {
 pub(crate) fn notify_event(event: &Event<'_>) {
     use NotificationKind as K;
     use NotificationWord as W;
+
     match *event {
         Event::Break {
             address,
@@ -882,6 +919,7 @@ fn notify_text(word: NotificationWord, thread: u32, text: Option<&str>) {
     let (length, string) = text.map_or((0, 0), |text| {
         (text.len() as u32, text.as_ptr() as usize as u32)
     });
+
     notify_sessions(word, address_of(&[thread, length, string]));
 }
 
@@ -898,6 +936,7 @@ pub(crate) fn unlink_title_notification_sessions() {
         },
         |_| {},
     );
+
     for kind in 2..LIST_COUNT as u32 + 2 {
         refresh_kernel_hooks(&guard, kind);
     }
@@ -908,115 +947,107 @@ pub(crate) fn unlink_title_notification_sessions() {
 /// the processors whose name equals `name` ignoring case, or all of them
 /// for no name.
 extern "C" fn register_notification_processor(session: u32, name: u32, handler: u32) -> Hresult {
+    const PROCESSOR_POOL_TAG: PoolTag = PoolTag::new(*b"hcmd");
+
     // SAFETY: callers pass a session handle from export 25.
     let Some(session) = (unsafe { NotificationSession::from_handle(session) }) else {
         return Hresult::INVALID_ARGUMENT;
     };
-    let mut block = None;
-    if handler != 0 {
+
+    let block = if handler == 0 {
+        None
+    } else {
         if name == 0 {
             return Hresult::INVALID_ARGUMENT;
         }
+
         // SAFETY: the allocation takes only a size and tag.
-        match unsafe {
+        let allocated = unsafe {
             xboxkrnl::ExAllocatePoolWithTag(
                 core::mem::size_of::<ProcessorBlock>() as u32,
                 PROCESSOR_POOL_TAG,
             )
-        } {
-            0 => return Hresult::OUT_OF_MEMORY,
-            allocated => block = Some(allocated),
+        };
+        if allocated == 0 {
+            return Hresult::OUT_OF_MEMORY;
         }
-    }
-    assert_passive(0xce4);
-    let guard = LOCK.exclusive();
-    let mut processors = session.processors.iter();
-    let result: Result<(), AddProcessorError> = match block {
-        None => {
-            // SAFETY: callers pass 0 or a NUL-terminated name.
-            let name = unsafe { kernel::c_string(name) };
-            for slot in processors {
-                let address = slot.load(Ordering::Relaxed);
-                // SAFETY: a slot holds 0 or a processor block of this module,
-                // which is freed only here under the exclusive lock.
-                let Some(processor) = (unsafe {
-                    core::ptr::with_exposed_provenance::<ProcessorBlock>(address as usize).as_ref()
-                }) else {
-                    continue;
-                };
-                let matches = match name {
-                    None => true,
-                    Some(name) => compare_names(until_nul(&processor.name), name, name.len()) == 0,
-                };
-                if matches {
-                    // SAFETY: the slot holds a processor pool block; the slot
-                    // is cleared below with the lock held.
-                    unsafe { xboxkrnl::ExFreePool(address) };
-                    slot.store(0, Ordering::Relaxed);
-                }
-            }
-            Ok(())
-        }
-        Some(processor) => match processors.find(|slot| slot.load(Ordering::Relaxed) == 0) {
-            None => Err(AddProcessorError::NoFreeSlot),
-            // SAFETY: a block exists only for a nonzero name (checked
-            // above), which callers pass NUL-terminated.
-            Some(slot) => match unsafe {
-                kernel::bounded_c_string(name, PROCESSOR_NAME_LIMIT + 1).unwrap_unchecked()
-            } {
-                name if name.len() > PROCESSOR_NAME_LIMIT => Err(AddProcessorError::NameTooLong),
-                name => {
-                    // SAFETY: the new block holds a processor block and is not
-                    // yet shared; the name fits its field with the NUL.
-                    unsafe {
-                        let pointer = core::ptr::with_exposed_provenance_mut::<ProcessorBlock>(
-                            processor as usize,
-                        );
-                        let bytes = (&raw mut (*pointer).name).cast::<u8>();
-                        core::ptr::copy_nonoverlapping(name.as_ptr(), bytes, name.len());
-                        bytes.add(name.len()).write(0);
-                        (&raw mut (*pointer).handler).write(handler);
-                    }
-                    slot.store(processor, Ordering::Relaxed);
-                    block = None;
-                    Ok(())
-                }
-            },
-        },
+
+        Some(allocated)
     };
-    drop(guard);
-    if let Some(unused) = block {
+
+    assert_passive(0xce4);
+
+    let (result, unused) = {
+        let _guard = LOCK.exclusive();
+        let mut processors = session.processors.iter();
+        match block {
+            None => {
+                // SAFETY: callers pass 0 or a NUL-terminated name.
+                let name = unsafe { kernel::c_string(name) };
+                for slot in processors {
+                    let address = slot.load(Ordering::Relaxed);
+                    // SAFETY: a slot holds 0 or a processor block of this
+                    // module, which is freed only here under the exclusive
+                    // lock.
+                    let Some(processor) = (unsafe {
+                        core::ptr::with_exposed_provenance::<ProcessorBlock>(address as usize)
+                            .as_ref()
+                    }) else {
+                        continue;
+                    };
+                    let selected = match name {
+                        None => true,
+                        Some(name) => {
+                            compare_names(until_nul(&processor.name), name, name.len()) == 0
+                        }
+                    };
+                    if selected {
+                        // SAFETY: the slot holds a processor pool block; the
+                        // slot is cleared below with the lock held.
+                        unsafe { xboxkrnl::ExFreePool(address) };
+                        slot.store(0, Ordering::Relaxed);
+                    }
+                }
+
+                (Ok(()), None)
+            }
+            Some(processor) => match processors.find(|slot| slot.load(Ordering::Relaxed) == 0) {
+                None => (Err(AddProcessorError::NoFreeSlot), block),
+                // SAFETY: a block exists only for a nonzero name (checked
+                // above), which callers pass NUL-terminated.
+                Some(slot) => match unsafe {
+                    kernel::bounded_c_string(name, PROCESSOR_NAME_LIMIT + 1).unwrap_unchecked()
+                } {
+                    name if name.len() > PROCESSOR_NAME_LIMIT => {
+                        (Err(AddProcessorError::NameTooLong), block)
+                    }
+                    name => {
+                        // SAFETY: the new block holds a processor block and is
+                        // not yet shared; the name fits its field with the NUL.
+                        unsafe {
+                            let pointer = core::ptr::with_exposed_provenance_mut::<ProcessorBlock>(
+                                processor as usize,
+                            );
+                            let bytes = (&raw mut (*pointer).name).cast::<u8>();
+                            core::ptr::copy_nonoverlapping(name.as_ptr(), bytes, name.len());
+                            bytes.add(name.len()).write(0);
+                            (&raw mut (*pointer).handler).write(handler);
+                        }
+                        slot.store(processor, Ordering::Relaxed);
+
+                        (Ok(()), None)
+                    }
+                },
+            },
+        }
+    };
+
+    if let Some(unused) = unused {
         // SAFETY: the block was allocated above and never linked.
         unsafe { xboxkrnl::ExFreePool(unused) };
     }
+
     crate::exports::export_result(result)
-}
-
-/// Why export 32 could not add a session processor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AddProcessorError {
-    NoFreeSlot,
-    NameTooLong,
-}
-
-impl core::fmt::Display for AddProcessorError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            Self::NoFreeSlot => "no free processor slot",
-            Self::NameTooLong => "processor name too long",
-        })
-    }
-}
-
-impl core::error::Error for AddProcessorError {}
-
-impl From<AddProcessorError> for Hresult {
-    fn from(error: AddProcessorError) -> Self {
-        match error {
-            AddProcessorError::NoFreeSlot => ErrorCode::MaxConnectionsExceeded.hresult(),
-            AddProcessorError::NameTooLong => Hresult::INVALID_ARGUMENT,
-        }
-    }
 }
 
 /// Export 36 (stock 0x91f3b070): send `text` to every notification
@@ -1032,12 +1063,9 @@ pub(super) extern "C" fn send_notification(text: u32) -> Hresult {
     let Some(text) = (unsafe { kernel::c_string(text) }) else {
         return Hresult::INVALID_ARGUMENT;
     };
+
     notification_result(send_notification_text(text))
 }
-
-/// A notification text that names no kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct MissingKind;
 
 /// The export result of a notification send.
 pub(super) fn notification_result(result: Result<(), MissingKind>) -> Hresult {
@@ -1050,21 +1078,13 @@ pub(super) fn notification_result(result: Result<(), MissingKind>) -> Hresult {
 /// [`send_notification`] for a text formatted by this module.
 pub(super) fn send_notification_text(text: &[u8]) -> Result<(), MissingKind> {
     notification_kind_length(text).ok_or(MissingKind)?;
+
     if passive() {
         post_notification(text);
     }
+
     Ok(())
 }
-
-/// Word stored by export 76 (stock 0x91fadd20); the monitor never reads it.
-static EXPORT_76_VALUE: AtomicU32 = AtomicU32::new(0);
-/// Word of exports 370 and 371 (stock 0x91fa3afc); only they use it.
-static EXPORT_370_VALUE: AtomicU32 = AtomicU32::new(0);
-
-export!(76, store_value);
-export!(370, load_value);
-export!(371, exchange_value);
-export!(372, drain_named_calls);
 
 /// Export 76 (stock 0x91f3b4b8).
 extern "C" fn store_value(value: u32) -> Hresult {
@@ -1087,5 +1107,5 @@ extern "C" fn exchange_value(value: u32) -> u32 {
 extern "C" fn drain_named_calls(name: u32) -> u32 {
     // SAFETY: the importer passes 0 or the NUL-terminated name of the
     // calling thread.
-    unsafe { super::service_rpc_drain(name) }
+    unsafe { service_rpc_drain(name) }
 }

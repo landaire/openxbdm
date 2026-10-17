@@ -38,6 +38,13 @@ use super::success_result;
 use super::walk;
 use crate::exports::export;
 
+static LAYOUT: Layout = Layout {
+    node_size: size_of::<StackNode>() as u32,
+    link: NodeWord::Word0,
+    semaphores: SemaphoreKind::Handle,
+    items: ItemOrder::SemaphoreFirst,
+};
+
 /// Stack object (caller-visible, 0x50 bytes, then the allocator record and
 /// the options).
 #[repr(C, align(8))]
@@ -48,6 +55,7 @@ struct Stack {
     top: TaggedList,
     supply: Supply,
     signature: AtomicU32,
+
     /// Base of the allocation that holds the stack.
     allocation: AtomicU32,
     /// Address of the allocator record after the stack.
@@ -57,7 +65,6 @@ struct Stack {
 }
 
 const _: () = {
-    use core::mem::offset_of;
     assert!(offset_of!(Stack, top) == 0x08);
     assert!(offset_of!(Stack, supply) == 0x10);
     assert!(offset_of!(Stack, signature) == 0x40);
@@ -67,26 +74,7 @@ const _: () = {
     assert!(size_of::<Stack>() == 0x50);
 };
 
-/// Stack node (8 bytes).
-#[repr(C)]
-struct StackNode {
-    /// Address of the next node; links the free list too.
-    _next: AtomicU32,
-    value: AtomicU32,
-}
-
-const _: () = assert!(core::mem::offset_of!(StackNode, value) == NodeWord::Word1 as usize);
-
-static LAYOUT: Layout = Layout {
-    node_size: size_of::<StackNode>() as u32,
-    link: NodeWord::Word0,
-    semaphores: SemaphoreKind::Handle,
-    items: ItemOrder::SemaphoreFirst,
-};
-
 impl Stack {
-    const SIZE: u32 = size_of::<Self>() as u32;
-
     /// The stack at `handle`.
     ///
     /// # Safety
@@ -98,33 +86,17 @@ impl Stack {
         unsafe { container(handle, Signature::STACK, offset_of!(Self, signature)) }
     }
 
-    fn nodes(&self) -> Nodes<'_> {
-        // SAFETY: the parts of this stack, which creation set up with the
-        // stack node layout.
-        unsafe { Nodes::new(&self.free, &self.supply, &self.allocator, &LAYOUT) }
-    }
-
-    fn options(&self) -> Option<&OptionsRecord> {
-        let address = self.options.load(Relaxed);
-        // SAFETY: a nonzero options word of a stack holds the address of the
-        // options record creation wrote after the allocator record.
-        unsafe { ptr::with_exposed_provenance::<OptionsRecord>(address as usize).as_ref() }
-    }
-
-    /// Close the item semaphore, then the free node semaphore.
-    fn close_semaphores(&self) {
-        close_semaphore(self.nodes().item_words().0);
-        close_semaphore(&self.supply.free_semaphore);
-    }
-
     fn create(creation: &Creation) -> Result<&'static Self, Error> {
+        const SIZE: u32 = size_of::<Stack>() as u32;
+
         let kept = creation.kept_options();
         let extra = kept.map_or(0, |_| size_of::<OptionsRecord>() as u32);
         let memory = AtomicU32::new(0);
         let allocation = creation
             .allocator
-            .allocate_aligned(Self::SIZE + AllocatorRecord::SIZE + extra, &memory)
+            .allocate_aligned(SIZE + AllocatorRecord::SIZE + extra, &memory)
             .ok_or(Error::NotEnoughMemory)?;
+
         let object = ptr::with_exposed_provenance_mut::<Self>(allocation.aligned.get() as usize);
         // SAFETY: the new allocation holds the object, the allocator record
         // and the kept options, aligned to 128 bytes; zero bytes are a valid
@@ -135,6 +107,7 @@ impl Stack {
         };
         stack.allocation.store(allocation.base, Relaxed);
         stack.supply.memory.store(memory.load(Relaxed), Relaxed);
+
         let record = object.wrapping_add(1).cast::<AllocatorRecord>();
         stack
             .allocator
@@ -147,54 +120,65 @@ impl Stack {
                 .options
                 .store(options.expose_provenance() as u32, Relaxed);
         }
+
         let counts = creation.counts(LAYOUT.node_size);
         stack.supply.per_block.store(counts.per_block, Relaxed);
         stack.supply.remaining.set(counts.limit);
+
         let nodes = stack.nodes();
-        let (item_semaphore, _) = nodes.item_words();
-        let mut created = true;
-        if creation.item_wait() {
-            let handle = create_semaphore();
-            item_semaphore.store(handle.map_or(0, Handle::raw), Relaxed);
-            created = handle.is_some();
-        }
-        if created && creation.free_wait() && counts.limit.is_some() {
-            let handle = create_semaphore();
-            stack
-                .supply
-                .free_semaphore
-                .store(handle.map_or(0, Handle::raw), Relaxed);
-            if handle.is_none() {
-                stack.close_semaphores();
-                created = false;
+        let item_semaphore = nodes.item_words().semaphore;
+        'failed: {
+            if creation.item_wait() {
+                let handle = create_semaphore();
+                item_semaphore.store(handle.map_or(0, Handle::raw), Relaxed);
+                if handle.is_none() {
+                    break 'failed;
+                }
             }
-        }
-        if created {
+
+            if creation.free_wait() && counts.limit.is_some() {
+                let handle = create_semaphore();
+                stack
+                    .supply
+                    .free_semaphore
+                    .store(handle.map_or(0, Handle::raw), Relaxed);
+                if handle.is_none() {
+                    stack.close_semaphores();
+                    break 'failed;
+                }
+            }
+
             stack.signature.store(Signature::STACK.0, Relaxed);
-            if let Some(node) = nodes.grow() {
-                if nodes.free_semaphore().is_some() {
-                    let credits = &stack.supply.credits;
-                    credits.store(credits.load(Relaxed).wrapping_sub(1), Relaxed);
-                }
-                // SAFETY: the first node of the new block, on no list.
-                unsafe { nodes.push_free(node) };
-                lwsync();
-                // Stock copies the options after the barrier that publishes
-                // the stack, before it returns the handle.
-                if let Some(kept) = kept {
-                    let options = stack.options.load(Relaxed);
-                    // SAFETY: the options word holds the address of the
-                    // options after the record, inside the allocation.
-                    unsafe {
-                        ptr::with_exposed_provenance_mut::<OptionsRecord>(options as usize)
-                            .write(*kept)
-                    };
-                }
-                return Ok(stack);
+            let Some(node) = nodes.grow() else {
+                stack.close_semaphores();
+                break 'failed;
+            };
+
+            if nodes.free_semaphore().is_some() {
+                let credits = &stack.supply.credits;
+                credits.store(credits.load(Relaxed).wrapping_sub(1), Relaxed);
             }
-            stack.close_semaphores();
+
+            // SAFETY: the first node of the new block, on no list.
+            unsafe { nodes.push_free(node) };
+            lwsync();
+
+            // Stock copies the options after the barrier that publishes the
+            // stack, before it returns the handle.
+            if let Some(kept) = kept {
+                let options = stack.options.load(Relaxed);
+                // SAFETY: the options word holds the address of the options
+                // after the record, inside the allocation.
+                unsafe {
+                    ptr::with_exposed_provenance_mut::<OptionsRecord>(options as usize).write(*kept)
+                };
+            }
+
+            return Ok(stack);
         }
+
         creation.allocator.free(allocation.base);
+
         Err(Error::NotEnoughMemory)
     }
 
@@ -213,10 +197,12 @@ impl Stack {
         else {
             return;
         };
+
         // Destroy closes the free node semaphore first, unlike a failed
         // creation.
         close_semaphore(&stack.supply.free_semaphore);
-        close_semaphore(stack.nodes().item_words().0);
+        close_semaphore(stack.nodes().item_words().semaphore);
+
         let allocation = stack.allocation.load(Relaxed);
         let allocator = *stack.nodes().allocator();
         // SAFETY: the block list of the stack, which no operation uses
@@ -224,6 +210,26 @@ impl Stack {
         unsafe { allocator.free_blocks(&stack.supply.blocks) };
         allocator.free(allocation);
         lwsync();
+    }
+
+    fn nodes(&self) -> Nodes<'_> {
+        // SAFETY: the parts of this stack, which creation set up with the
+        // stack node layout.
+        unsafe { Nodes::new(&self.free, &self.supply, &self.allocator, &LAYOUT) }
+    }
+
+    fn options(&self) -> Option<&OptionsRecord> {
+        let address = self.options.load(Relaxed);
+
+        // SAFETY: a nonzero options word of a stack holds the address of the
+        // options record creation wrote after the allocator record.
+        unsafe { ptr::with_exposed_provenance::<OptionsRecord>(address as usize).as_ref() }
+    }
+
+    /// Close the item semaphore, then the free node semaphore.
+    fn close_semaphores(&self) {
+        close_semaphore(self.nodes().item_words().semaphore);
+        close_semaphore(&self.supply.free_semaphore);
     }
 
     fn pop_node(&self) -> Option<NodeAddress> {
@@ -242,10 +248,12 @@ impl Stack {
         let value = unsafe { node.get::<StackNode, _>(self) }
             .value
             .load(Relaxed);
+
         let nodes = self.nodes();
         // SAFETY: as above.
         unsafe { nodes.release_node(node) };
         nodes.count_removed();
+
         value
     }
 
@@ -257,13 +265,16 @@ impl Stack {
     fn push(&self, value: u32, wait: &Wait) -> Result<(), Error> {
         let nodes = self.nodes();
         let node = nodes.acquire_node(wait)?;
+
         // SAFETY: a node of this stack's supply, on no list.
         unsafe {
             node.get::<StackNode, _>(self).value.store(value, Relaxed);
             self.top.push(node, NodeWord::Word0);
         }
+
         nodes.signal_item();
         nodes.count_added();
+
         Ok(())
     }
 
@@ -279,6 +290,7 @@ impl Stack {
                 .filter(|&value| value != 0)
                 .ok_or(Error::Timeout);
         };
+
         let nodes = self.nodes();
         match nodes.item_semaphore() {
             // A waiting remover leaves the waiter count before it frees the
@@ -299,11 +311,22 @@ impl Stack {
     }
 }
 
+/// Stack node (8 bytes).
+#[repr(C)]
+struct StackNode {
+    /// Address of the next node; links the free list too.
+    _next: AtomicU32,
+    value: AtomicU32,
+}
+
+const _: () = assert!(offset_of!(StackNode, value) == NodeWord::Word1 as usize);
+
 /// Stock rechecks the signature and stores -1 when it changed meanwhile.
 extern "C" fn memory(stack: u32, output_word: u32) -> Hresult {
     // SAFETY: export 310 contract: `stack` is 0 or a stack of export 311;
     // `output_word` is 0 or a writable word.
     let (stack, output_word) = unsafe { (Stack::from_handle(stack), OutputWord::new(output_word)) };
+
     let value = stack.map(|stack| {
         if Signature::STACK.is_in(&stack.signature) {
             stack.supply.memory.load(Relaxed)
@@ -311,6 +334,7 @@ extern "C" fn memory(stack: u32, output_word: u32) -> Hresult {
             u32::MAX
         }
     });
+
     report(value, output_word)
 }
 export!(310, memory);
@@ -320,10 +344,14 @@ extern "C" fn create(descriptor: u32, output_word: u32) -> Hresult {
     let Some(output_word) = (unsafe { OutputWord::new(output_word) }) else {
         return Hresult::INVALID_ARGUMENT;
     };
+
     output_word.store(0);
+
     // SAFETY: export 311 contract: `descriptor` is 0 or a creation
     // descriptor.
-    match unsafe { Creation::read(descriptor) }.and_then(|creation| Stack::create(&creation)) {
+    let created =
+        unsafe { Creation::from_address(descriptor) }.and_then(|creation| Stack::create(&creation));
+    match created {
         Ok(stack) => {
             output_word.store(ptr::from_ref(stack).expose_provenance() as u32);
             Hresult::SUCCESS
@@ -343,6 +371,7 @@ export!(312, destroy);
 extern "C" fn count(stack: u32, output_word: u32) -> Hresult {
     // SAFETY: export 313 contract: as for export 310.
     let (stack, output_word) = unsafe { (Stack::from_handle(stack), OutputWord::new(output_word)) };
+
     report(
         stack.map(|stack| stack.nodes().count().load(Relaxed)),
         output_word,
@@ -364,6 +393,7 @@ extern "C" fn pop(stack: u32, output_word: u32) -> Hresult {
     let Some(stack) = stack else {
         return Hresult::INVALID_ARGUMENT;
     };
+
     removed(stack.pop(), output_word)
 }
 export!(315, pop);
@@ -373,12 +403,14 @@ extern "C" fn push(stack: u32, value: u32) -> Hresult {
     let Some(stack) = (unsafe { Stack::from_handle(stack) }) else {
         return Hresult::INVALID_ARGUMENT;
     };
+
     // Without the wait option stock takes a path whose effects match a wait
     // that neither spins nor blocks.
     let wait = stack
         .options()
         .and_then(|options| options.wait(Side::Insert))
         .unwrap_or(Wait::NONE);
+
     insert_result(stack.push(value, &wait))
 }
 export!(316, push);
@@ -391,10 +423,12 @@ extern "C" fn enumerate(stack: u32, context: u32, callback: u32) -> Hresult {
     let Some(callback) = (unsafe { Routine::new(callback) }) else {
         return success_result(Err(Error::InvalidArgument));
     };
+
     // SAFETY: export 317 contract: `stack` is 0 or a stack of export 311.
     let Some(stack) = (unsafe { Stack::from_handle(stack) }) else {
         return success_result(Err(Error::InvalidArgument));
     };
+
     success_result(stack.enumerate(context, callback))
 }
 export!(317, enumerate);

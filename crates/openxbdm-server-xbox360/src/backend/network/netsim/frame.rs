@@ -215,9 +215,6 @@ mod key_exchange_kind {
     pub(super) const KEY_EX_QOS_INIT2: u16 = 0x1158;
 }
 
-/// Hash trailer of an XSP datagram.
-const XSP_TRAILER: usize = 0xc;
-
 /// XSP subtype: a nonzero value that fits the 5-bit field of
 /// [`FrameFlags`]. Names follow the classifier fields; subtypes 3 and 6
 /// have none and are named after header kinds 4 and 0xd, which set them.
@@ -368,10 +365,6 @@ pub(super) struct Ipv4Frame {
     pub(super) protocol: FrameFlags,
 }
 
-fn word(frame: &[u8], offset: usize) -> u16 {
-    u16::from_be_bytes([frame[offset], frame[offset + 1]])
-}
-
 /// A parsed frame: flags and the frame information block (stock 0x40
 /// bytes, big-endian fields).
 pub(super) struct Parsed {
@@ -412,16 +405,12 @@ impl Parsed {
         if !self.flags.contains(FrameFlags::ETHERNET | FrameFlags::IPV4) {
             return None;
         }
+
         Some(Ipv4Frame {
             header_length: header_length(frame[ETHERNET_HEADER]),
             protocol: self.flags & FrameFlags::TRANSPORT,
         })
     }
-}
-
-/// IPv4 header length in bytes from the version and length byte.
-pub(super) fn header_length(version_length: u8) -> usize {
-    usize::from(version_length & ipv4::LENGTH_MASK) * 4
 }
 
 /// The frame library's reader (0x91f6a058): a position and the bytes it
@@ -438,9 +427,11 @@ impl<'a> Reader<'a> {
         if count > self.remaining {
             return None;
         }
+
         let bytes = &self.frame[self.position..self.position + count];
         self.position += count;
         self.remaining -= count;
+
         Some(bytes)
     }
 
@@ -461,6 +452,15 @@ impl<'a> Reader<'a> {
     fn peek_array<const N: usize>(&self, offset: usize) -> Option<&'a [u8; N]> {
         self.peek(offset, N)?.try_into().ok()
     }
+}
+
+/// IPv4 header length in bytes from the version and length byte.
+pub(super) fn header_length(version_length: u8) -> usize {
+    usize::from(version_length & ipv4::LENGTH_MASK) * 4
+}
+
+fn word(frame: &[u8], offset: usize) -> u16 {
+    u16::from_be_bytes([frame[offset], frame[offset + 1]])
 }
 
 #[inline(always)]
@@ -485,6 +485,7 @@ pub(super) fn parse(frame: &[u8]) -> Parsed {
         info: [0; info::SIZE],
     };
     classify(frame, &mut parsed);
+
     parsed
 }
 
@@ -500,6 +501,7 @@ fn classify(frame: &[u8], parsed: &mut Parsed) {
     let Some(header) = reader.take::<ETHERNET_HEADER>() else {
         return;
     };
+
     parsed.flags |= FrameFlags::ETHERNET;
     match be16(header, ethernet::TYPE) {
         ether_type::IPV4 => ipv4(parsed, &mut reader, header),
@@ -525,6 +527,7 @@ fn ipv4(parsed: &mut Parsed, reader: &mut Reader<'_>, ethernet: &[u8; ETHERNET_H
         parsed.flags |= FrameFlags::MALFORMED;
         return;
     };
+
     let length = header_length(header[ipv4::VERSION_LENGTH]);
     let total = usize::from(be16(header, ipv4::TOTAL_LENGTH));
     let source = be32(header, ipv4::SOURCE);
@@ -536,14 +539,17 @@ fn ipv4(parsed: &mut Parsed, reader: &mut Reader<'_>, ethernet: &[u8; ETHERNET_H
         parsed.flags |= FrameFlags::MALFORMED;
         return;
     }
+
     reader.remaining = total - IPV4_HEADER;
     if source == ipv4::BROADCAST || ipv4::is_multicast(source) {
         parsed.flags |= FrameFlags::MALFORMED;
         return;
     }
+
     if length != IPV4_HEADER {
         let _ = reader.read(length - IPV4_HEADER);
     }
+
     parsed.flags |= FrameFlags::IPV4;
     match header[ipv4::PROTOCOL] {
         ip_protocol::ICMP => icmp(parsed, reader),
@@ -561,6 +567,7 @@ fn icmp(parsed: &mut Parsed, reader: &mut Reader<'_>) {
         parsed.flags |= FrameFlags::MALFORMED;
         return;
     };
+
     let (kind, code) = (header[icmp::TYPE], header[icmp::CODE]);
     let valid = match kind {
         icmp::ECHO_REPLY
@@ -574,6 +581,7 @@ fn icmp(parsed: &mut Parsed, reader: &mut Reader<'_>) {
         icmp::TIME_EXCEEDED | icmp::PARAMETER_PROBLEM => code < icmp::TIME_EXCEEDED_CODES,
         _ => false,
     };
+
     if valid {
         parsed.flags |= FrameFlags::ICMP;
         parsed.set(info::KIND, kind);
@@ -589,11 +597,13 @@ fn tcp(parsed: &mut Parsed, reader: &mut Reader<'_>) {
         parsed.flags |= FrameFlags::MALFORMED;
         return;
     };
+
     let offset = usize::from(header[tcp::DATA_OFFSET] >> 4) * 4;
     if offset < TCP_HEADER || reader.read(offset - TCP_HEADER).is_none() {
         parsed.flags |= FrameFlags::MALFORMED;
         return;
     }
+
     parsed.flags |= FrameFlags::TCP;
     parsed.put(
         info::SOURCE_PORT,
@@ -620,11 +630,13 @@ fn udp(
         parsed.flags |= FrameFlags::MALFORMED;
         return;
     };
+
     let length = usize::from(be16(header, udp::LENGTH));
     if length < UDP_HEADER || length - UDP_HEADER > reader.remaining {
         parsed.flags |= FrameFlags::MALFORMED;
         return;
     }
+
     reader.remaining = length - UDP_HEADER;
     parsed.flags |= FrameFlags::UDP;
     parsed.put(
@@ -632,18 +644,22 @@ fn udp(
         &header[transport::SOURCE_PORT..udp::LENGTH],
     );
     payload(parsed, reader);
+
     let broadcast = ethernet[..6] == ethernet::BROADCAST;
     if ethernet[0] & ethernet::GROUP != 0 && !broadcast {
         return;
     }
+
     if ipv4::is_multicast(destination) && destination != ipv4::BROADCAST {
         return;
     }
+
     let (source_port, destination_port) = (
         be16(header, transport::SOURCE_PORT),
         be16(header, transport::DESTINATION_PORT),
     );
     let either = |port: u16| source_port == port || destination_port == port;
+
     if either(port::DNS) {
         parsed.flags |= FrameFlags::DNS;
     } else if (source_port, destination_port) == (port::BOOTP_SERVER, port::BOOTP_CLIENT)
@@ -672,13 +688,16 @@ fn dhcp_option(mut reader: Reader<'_>, code: u8, mut overload: Option<&mut u8>) 
         if option == dhcp::OPTION_END {
             return None;
         }
+
         if option == dhcp::OPTION_PAD {
             continue;
         }
+
         let length = reader.read(1)?[0];
         if length == 0 {
             return None;
         }
+
         if option == dhcp::OPTION_OVERLOAD
             && length == 1
             && overload.as_deref().is_some_and(|value| *value == 0)
@@ -687,8 +706,10 @@ fn dhcp_option(mut reader: Reader<'_>, code: u8, mut overload: Option<&mut u8>) 
             if let Some(slot) = overload.as_deref_mut() {
                 *slot = value;
             }
+
             continue;
         }
+
         if option == code {
             return if length == 1 {
                 Some(reader.read(1)?[0])
@@ -696,6 +717,7 @@ fn dhcp_option(mut reader: Reader<'_>, code: u8, mut overload: Option<&mut u8>) 
                 None
             };
         }
+
         reader.read(usize::from(length))?;
     }
 }
@@ -708,15 +730,18 @@ fn dhcp(parsed: &mut Parsed, reader: &mut Reader<'_>) {
         parsed.flags |= FrameFlags::MALFORMED;
         return;
     };
+
     if bootp[dhcp::HARDWARE_TYPE] != dhcp::HARDWARE_ETHERNET {
         return;
     }
+
     if bootp[dhcp::HARDWARE_LENGTH] != dhcp::ETHERNET_ADDRESS_LENGTH
         || be32(bootp, dhcp::COOKIE) != dhcp::MAGIC_COOKIE
     {
         parsed.flags |= FrameFlags::MALFORMED;
         return;
     }
+
     let mut overload = 0u8;
     let area = |offset: usize, length: usize| Reader {
         frame: reader.frame,
@@ -746,6 +771,7 @@ fn dhcp(parsed: &mut Parsed, reader: &mut Reader<'_>) {
                 None
             }
         });
+
     match found {
         Some(kind) => {
             parsed.flags |= FrameFlags::DHCP;
@@ -787,10 +813,12 @@ fn key_exchange(parsed: &mut Parsed, reader: &mut Reader<'_>) -> Option<()> {
             if reader.remaining != 0 {
                 return None;
             }
+
             parsed.put(info::KEY_IDENTIFIER, &body[8..16]);
             if be16(body, 6) & 0x200 != 0 {
                 parsed.set_bits(info::TCP_FLAGS, 1);
             }
+
             if kind == kinds::KEY_EX_NAT_OPEN_INIT {
                 XspSubtype::KEY_EX_NAT_OPEN_INIT
             } else {
@@ -834,6 +862,7 @@ fn key_exchange(parsed: &mut Parsed, reader: &mut Reader<'_>) -> Option<()> {
             } else {
                 parsed.put(info::IDENTIFIER, &body[0x10..0x14]);
             }
+
             if kind == kinds::KEY_EX_NAT_OPEN2 {
                 XspSubtype::KEY_EX_NAT_OPEN2
             } else {
@@ -857,17 +886,21 @@ fn key_exchange(parsed: &mut Parsed, reader: &mut Reader<'_>) -> Option<()> {
             if size != expected {
                 return None;
             }
+
             let body = reader.take::<0x80>()?;
             reader.read(swapped.checked_sub(0x80)?)?;
             parsed.put(info::KEY_IDENTIFIER, &body[8..16]);
             parsed.put(info::IDENTIFIER, &body[0x10..0x18]);
+
             subtype
         }
         _ => return None,
     };
+
     parsed.put_u32(info::DATA_SIZE, size_field);
     parsed.put_u32(info::PAYLOAD_LENGTH, 0);
     parsed.flags = parsed.flags.with_xsp(subtype);
+
     Some(())
 }
 
@@ -876,6 +909,7 @@ fn xsp(parsed: &mut Parsed, reader: &mut Reader<'_>) {
     /// Port of the secure protocol; a datagram that fails to parse is
     /// malformed only when it uses this port.
     const PORT: u16 = 0xc02;
+
     if xsp_header(parsed, reader).is_none()
         && (parsed.u16_at(info::SOURCE_PORT) == PORT
             || parsed.u16_at(info::DESTINATION_PORT) == PORT)
@@ -886,10 +920,14 @@ fn xsp(parsed: &mut Parsed, reader: &mut Reader<'_>) {
 
 /// The XSP header word and trailer (0x91f69068).
 fn xsp_header(parsed: &mut Parsed, reader: &mut Reader<'_>) -> Option<()> {
+    /// Hash trailer of an XSP datagram.
+    const XSP_TRAILER: usize = 0xc;
+
     let first = be32(reader.take::<4>()?, 0);
     if first == 0 {
         return key_exchange(parsed, reader);
     }
+
     let remaining = reader.remaining;
     let trailer_end = remaining.checked_sub(XSP_TRAILER)?;
     let byte = (first >> 24) as usize;
@@ -903,6 +941,7 @@ fn xsp_header(parsed: &mut Parsed, reader: &mut Reader<'_>) -> Option<()> {
     let mut shown = 0usize;
     let mut data_size;
     let mut tail = 0usize;
+
     if kind == xsp_kind::SECURE_MESSAGE {
         data_size = trailer_end;
     } else {
@@ -913,11 +952,13 @@ fn xsp_header(parsed: &mut Parsed, reader: &mut Reader<'_>) -> Option<()> {
             subtype = XspSubtype::TCP_INFO;
             ports += 0xc;
         }
+
         shown = hidden.min(ports);
         let missing = ports - shown;
         if remaining < missing + hidden + XSP_TRAILER {
             return None;
         }
+
         data_size = remaining - XSP_TRAILER - missing;
         match kind {
             xsp_kind::UNNAMED_4 => subtype = XspSubtype::OF_UNNAMED_KIND_4,
@@ -927,6 +968,7 @@ fn xsp_header(parsed: &mut Parsed, reader: &mut Reader<'_>) -> Option<()> {
                 if remaining < missing + pad + XSP_TRAILER + 1 {
                     return None;
                 }
+
                 tail = remaining - XSP_TRAILER - missing - pad;
                 data_size = pad;
             }
@@ -936,9 +978,11 @@ fn xsp_header(parsed: &mut Parsed, reader: &mut Reader<'_>) -> Option<()> {
                 data_size = 0;
             }
             xsp_kind::UNNAMED_D => subtype = XspSubtype::OF_UNNAMED_KIND_D,
+            // Other base kinds keep the subtype set above.
             _ => {}
         }
     }
+
     let declared = tail
         .wrapping_sub(shown)
         .wrapping_add(ports)
@@ -947,6 +991,7 @@ fn xsp_header(parsed: &mut Parsed, reader: &mut Reader<'_>) -> Option<()> {
     if data_size & 7 != 0 || data_size < hidden || remaining != declared {
         return None;
     }
+
     if kind != xsp_kind::SECURE_MESSAGE {
         if port_form == 0 {
             parsed.put_u16(info::XSP_SOURCE_PORT, port::XSP_BASE);
@@ -960,6 +1005,7 @@ fn xsp_header(parsed: &mut Parsed, reader: &mut Reader<'_>) -> Option<()> {
                         u16::from(reader.peek(base, 1)?[0]) + port::XSP_BASE,
                     );
                 }
+
                 if shown <= 1 {
                     parsed.put_u16(
                         info::XSP_DESTINATION_PORT,
@@ -970,6 +1016,7 @@ fn xsp_header(parsed: &mut Parsed, reader: &mut Reader<'_>) -> Option<()> {
                 if shown == 0 {
                     parsed.put(info::XSP_SOURCE_PORT, reader.peek_array::<2>(base)?);
                 }
+
                 if shown <= 2 {
                     parsed.put(
                         info::XSP_DESTINATION_PORT,
@@ -979,29 +1026,35 @@ fn xsp_header(parsed: &mut Parsed, reader: &mut Reader<'_>) -> Option<()> {
             }
         }
     }
+
     if subtype == XspSubtype::TCP_INFO {
         let segment = reader.peek_array::<0xc>(trailer_end.checked_sub(0xc)?)?;
         let offset = usize::from(segment[8] & 0xf0) >> 2;
         if offset < TCP_HEADER || offset > data_size - hidden + TCP_HEADER {
             return None;
         }
+
         let doubled = port_form * 2;
         if shown <= doubled {
             parsed.set_bits(info::TCP_FIELDS, TcpFields::SEQUENCE.bits());
             parsed.put(info::TCP_SEQUENCE, &segment[0..4]);
         }
+
         if shown <= (port_form + 2) * 2 {
             parsed.set_bits(info::TCP_FIELDS, TcpFields::ACKNOWLEDGMENT.bits());
             parsed.put(info::TCP_ACKNOWLEDGMENT, &segment[4..8]);
         }
+
         if shown <= doubled + 9 {
             parsed.set(info::TCP_FLAGS, segment[9]);
         }
+
         if shown <= (port_form + 5) * 2 {
             parsed.set_bits(info::TCP_FIELDS, TcpFields::WINDOW.bits());
             parsed.put(info::TCP_WINDOW, &segment[10..12]);
         }
     }
+
     parsed.flags = parsed.flags.with_xsp(subtype);
     parsed.put_u32(info::DATA_SIZE, (data_size - hidden) as u32);
     parsed.put_u32(info::XSP_DATA, reader.position as u32);
@@ -1027,6 +1080,7 @@ fn xsp_header(parsed: &mut Parsed, reader: &mut Reader<'_>) -> Option<()> {
     parsed.set(info::KIND, hidden as u8);
     parsed.set(info::CODE, shown as u8);
     parsed.put(info::IDENTIFIER + 1, &first.to_be_bytes()[1..4]);
+
     Some(())
 }
 
@@ -1036,29 +1090,34 @@ fn arp(parsed: &mut Parsed, reader: &mut Reader<'_>) {
         parsed.flags |= FrameFlags::MALFORMED;
         return;
     };
+
     let hardware = be16(header, arp::HARDWARE_TYPE);
     if !matches!(hardware, arp::HARDWARE_ETHERNET | arp::HARDWARE_IEEE_802)
         || be16(header, arp::PROTOCOL_TYPE) != ether_type::IPV4
     {
         return;
     }
+
     if header[arp::HARDWARE_LENGTH] != arp::ETHERNET_ADDRESS_LENGTH
         || header[arp::PROTOCOL_LENGTH] != arp::IPV4_ADDRESS_LENGTH
     {
         parsed.flags |= FrameFlags::MALFORMED;
         return;
     }
+
     if !matches!(be16(header, arp::OPERATION), arp::REQUEST | arp::REPLY) {
         return;
     }
-    let bad = |address: u32| {
+
+    let is_rejected = |address: u32| {
         address == ipv4::BROADCAST || ipv4::is_multicast(address) || ipv4::is_loopback(address)
     };
+
     match reader.take::<{ arp::BODY }>() {
         Some(body)
             if body[arp::SENDER_HARDWARE - arp::HEADER] & ethernet::GROUP == 0
-                && !bad(be32(body, arp::SENDER_PROTOCOL - arp::HEADER))
-                && !bad(be32(body, arp::TARGET_PROTOCOL - arp::HEADER)) =>
+                && !is_rejected(be32(body, arp::SENDER_PROTOCOL - arp::HEADER))
+                && !is_rejected(be32(body, arp::TARGET_PROTOCOL - arp::HEADER)) =>
         {
             parsed.flags |= FrameFlags::ARP;
         }
@@ -1091,6 +1150,7 @@ fn address_offset(transmit: bool) -> usize {
 /// The address the redirects compare.
 pub(super) fn address(frame: &[u8], transmit: bool) -> [u8; 4] {
     let offset = address_offset(transmit);
+
     [
         frame[offset],
         frame[offset + 1],
@@ -1102,12 +1162,15 @@ pub(super) fn address(frame: &[u8], transmit: bool) -> [u8; 4] {
 /// Ones' complement sum of big-endian words (0x91f68360).
 fn sum(mut total: u32, bytes: &[u8]) -> u32 {
     let (pairs, rest) = bytes.as_chunks::<2>();
+
     for &pair in pairs {
         total += u32::from(u16::from_be_bytes(pair));
     }
+
     if let [last] = rest {
         total += u32::from(*last) << 8;
     }
+
     total
 }
 
@@ -1115,6 +1178,7 @@ fn fold(mut total: u32) -> u16 {
     while total > 0xffff {
         total = (total & 0xffff) + (total >> 16);
     }
+
     total as u16
 }
 
@@ -1124,6 +1188,7 @@ fn ip_checksum(frame: &mut [u8]) {
     let length = header_length(ip[ipv4::VERSION_LENGTH]);
     ip[ipv4::CHECKSUM] = 0;
     ip[ipv4::CHECKSUM + 1] = 0;
+
     let checksum = !fold(sum(0, &ip[..length]));
     ip[ipv4::CHECKSUM..ipv4::CHECKSUM + 2].copy_from_slice(&checksum.to_be_bytes());
 }
@@ -1141,13 +1206,16 @@ fn transport_checksum(
     cleared: usize,
 ) {
     ip_checksum(frame);
+
     let transport = ETHERNET_HEADER + IPV4_HEADER;
     frame[transport + checksum_offset] = 0;
     frame[transport + checksum_offset + 1] = 0;
+
     if length > GATHER_CAPACITY {
         frame[..cleared].fill(0);
         return;
     }
+
     // Source and destination addresses, zero, protocol, length.
     let mut pseudo = [0u8; 12];
     pseudo[..8].copy_from_slice(
@@ -1156,6 +1224,7 @@ fn transport_checksum(
     pseudo[9] = protocol;
     pseudo[10..12].copy_from_slice(&(length as u16).to_be_bytes());
     let checksum = !fold(sum(sum(0, &pseudo), &frame[transport..transport + length]));
+
     // Zero means no checksum in UDP; both transports send all ones.
     let checksum = if checksum == 0 { 0xffff } else { checksum };
     frame[transport + checksum_offset..transport + checksum_offset + 2]
@@ -1175,6 +1244,7 @@ pub(super) fn rewrite(
 ) {
     let offset = address_offset(transmit);
     frame[offset..offset + 4].copy_from_slice(&address);
+
     let transport = ETHERNET_HEADER + IPV4_HEADER;
     let port_offset = transport
         + if transmit {
@@ -1182,11 +1252,13 @@ pub(super) fn rewrite(
         } else {
             transport::SOURCE_PORT
         };
+
     match info.protocol {
         FrameFlags::TCP => {
             if info.header_length != IPV4_HEADER {
                 return;
             }
+
             frame[port_offset..port_offset + 2].copy_from_slice(&port.to_be_bytes());
             let length = frame.len().saturating_sub(transport);
             transport_checksum(
@@ -1201,6 +1273,7 @@ pub(super) fn rewrite(
             if info.header_length != IPV4_HEADER {
                 return;
             }
+
             frame[port_offset..port_offset + 2].copy_from_slice(&port.to_be_bytes());
             let length = usize::from(word(frame, transport + udp::LENGTH));
             transport_checksum(

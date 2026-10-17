@@ -11,10 +11,10 @@
 //! more than eight arguments, or is variadic must adapt the console
 //! convention itself and be declared with `export_raw!`.
 
+mod generic;
+
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::XbdmHresult as _;
-
-mod generic;
 
 #[cfg(not(feature = "boot-guard"))]
 pub(crate) use xbox360_sys::entry_bridge as export_bridge;
@@ -73,7 +73,10 @@ pub(crate) use bridged;
 
 /// The result word of an export without outputs: the XBDM success code, or
 /// the failure's result value.
-pub(crate) fn export_result<E: Into<Hresult>>(result: Result<(), E>) -> Hresult {
+pub(crate) fn export_result<E>(result: Result<(), E>) -> Hresult
+where
+    E: Into<Hresult>,
+{
     match result {
         Ok(()) => Hresult::OK,
         Err(error) => error.into(),

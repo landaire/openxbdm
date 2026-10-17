@@ -41,22 +41,6 @@ use xbox360_sys::xam::TimeVal;
 use xbox360_sys::xam::XnCaller;
 use xbox360_sys::xam::XnetOption;
 
-/// `endpoint` as an IPv4 `sockaddr`.
-pub(crate) fn socket_address(endpoint: Endpoint) -> SockAddrIn {
-    SockAddrIn {
-        family: AddressFamily::Inet.raw() as u16,
-        port: endpoint.port,
-        address: u32::from_be_bytes(endpoint.address.octets()),
-        zero: [0; 8],
-    }
-}
-
-/// The XAM socket of a server socket identifier.
-#[inline]
-pub(crate) fn socket_of(id: SocketId) -> Socket {
-    Socket::from_raw(id.0)
-}
-
 /// Membership operations on a Winsock descriptor set.
 pub trait FdSetExt {
     fn insert(&mut self, socket: Socket);
@@ -76,6 +60,210 @@ impl FdSetExt for FdSet {
     }
 }
 
+/// `Network` over XAM sockets. Socket identifiers are socket handles.
+pub struct XamNetwork;
+
+impl Network for XamNetwork {
+    fn receive(&mut self, socket: SocketId, buffer: &mut [u8]) -> Result<usize, NetError> {
+        // SAFETY: `buffer` is live and writable for its length.
+        match unsafe {
+            NetDll_recv(
+                XnCaller::DebugMonitor,
+                socket_of(socket),
+                buffer.as_mut_ptr(),
+                buffer.len() as i32,
+                MessageFlags::empty(),
+            )
+        } {
+            SOCKET_ERROR => Err(last_error()),
+            count => Ok(count as usize),
+        }
+    }
+
+    fn send(&mut self, socket: SocketId, data: &[u8]) -> Result<usize, NetError> {
+        // SAFETY: `data` is live for its length.
+        match unsafe {
+            NetDll_send(
+                XnCaller::DebugMonitor,
+                socket_of(socket),
+                data.as_ptr(),
+                data.len() as i32,
+                MessageFlags::empty(),
+            )
+        } {
+            SOCKET_ERROR => Err(last_error()),
+            count => Ok(count as usize),
+        }
+    }
+
+    fn close(&mut self, socket: SocketId) {
+        close(socket_of(socket));
+    }
+
+    fn peer(&mut self, socket: SocketId) -> Result<Endpoint, NetError> {
+        let mut address = socket_address(Endpoint {
+            address: Ipv4Address::UNSPECIFIED,
+            port: 0,
+        });
+        let mut length = size_of::<SockAddrIn>() as i32;
+        // SAFETY: `address` and `length` are live locals.
+        if unsafe {
+            NetDll_getpeername(
+                XnCaller::DebugMonitor,
+                socket_of(socket),
+                (&mut address as *mut SockAddrIn).cast(),
+                &mut length,
+            )
+        } == SOCKET_ERROR
+        {
+            return Err(last_error());
+        }
+
+        Ok(Endpoint {
+            address: Ipv4Address(address.address.to_be_bytes()),
+            port: address.port,
+        })
+    }
+
+    /// Bind to a random local port in `0x1000..0x5000` with address reuse, as
+    /// the monitor does for notification connections.
+    fn connect(&mut self, endpoint: Endpoint, blocking: bool) -> Result<SocketId, NetError> {
+        /// Local ports are drawn from `LOCAL_PORT_BASE..LOCAL_PORT_BASE + 0x4000`.
+        const LOCAL_PORT_BASE: u16 = 0x1000;
+        const LOCAL_PORT_MASK: u16 = 0x3fff;
+
+        // SAFETY: socket creation takes scalar arguments.
+        let socket = unsafe {
+            NetDll_socket(
+                XnCaller::DebugMonitor,
+                AddressFamily::Inet,
+                SocketType::Stream,
+                Protocol::Tcp,
+            )
+        };
+        if socket == Socket::INVALID {
+            return Err(NetError::Exhausted);
+        }
+
+        let reuse = 1u32.to_be_bytes();
+        // SAFETY: `socket` was created above; `reuse` is a live 4-byte local.
+        unsafe {
+            NetDll_setsockopt(
+                XnCaller::DebugMonitor,
+                socket,
+                SocketLevel::Socket,
+                SocketOption::SO_REUSEADDR,
+                reuse.as_ptr(),
+                reuse.len() as i32,
+            )
+        };
+
+        let mut random = [0u8; 2];
+        random_bytes(&mut random);
+        let local_port = (u16::from_be_bytes(random) & LOCAL_PORT_MASK) + LOCAL_PORT_BASE;
+        let local = socket_address(Endpoint {
+            address: Ipv4Address::UNSPECIFIED,
+            port: local_port,
+        });
+        let remote = socket_address(endpoint);
+        let mut non_blocking = u32::from(!blocking);
+        // SAFETY: `socket` was created above; `local`, `remote` and
+        // `non_blocking` are live locals.
+        let connected = unsafe {
+            NetDll_bind(
+                XnCaller::DebugMonitor,
+                socket,
+                (&local as *const SockAddrIn).cast(),
+                size_of::<SockAddrIn>() as i32,
+            )
+        } != SOCKET_ERROR
+            // SAFETY: as above.
+            && unsafe {
+                NetDll_ioctlsocket(
+                    XnCaller::DebugMonitor,
+                    socket,
+                    IoctlCommand::Fionbio,
+                    &mut non_blocking,
+                )
+            } != SOCKET_ERROR
+            // SAFETY: as above.
+            && unsafe {
+                NetDll_connect(
+                    XnCaller::DebugMonitor,
+                    socket,
+                    (&remote as *const SockAddrIn).cast(),
+                    size_of::<SockAddrIn>() as i32,
+                )
+            } != SOCKET_ERROR;
+        if !connected {
+            close(socket);
+            return Err(NetError::Closed);
+        }
+
+        Ok(SocketId(socket.raw()))
+    }
+
+    fn wait_writable(&mut self, socket: SocketId, timeout_ms: u32) -> Result<(), NetError> {
+        let mut read = FdSet::new();
+        let mut write = FdSet::new();
+        write.insert(socket_of(socket));
+
+        let timeout = TimeVal::from_milliseconds(timeout_ms);
+        match select(&mut read, &mut write, Some(&timeout))? {
+            0 => Err(NetError::WouldBlock),
+            _ => Ok(()),
+        }
+    }
+
+    fn set_blocking(&mut self, socket: SocketId, blocking: bool) -> Result<(), NetError> {
+        let mut non_blocking = u32::from(!blocking);
+        // SAFETY: `non_blocking` is a live local.
+        match unsafe {
+            NetDll_ioctlsocket(
+                XnCaller::DebugMonitor,
+                socket_of(socket),
+                IoctlCommand::Fionbio,
+                &mut non_blocking,
+            )
+        } {
+            SOCKET_ERROR => Err(last_error()),
+            _ => Ok(()),
+        }
+    }
+
+    fn pending_input(&mut self, socket: SocketId) -> Result<usize, NetError> {
+        let mut pending = 0u32;
+        // SAFETY: `pending` is a live local.
+        match unsafe {
+            NetDll_ioctlsocket(
+                XnCaller::DebugMonitor,
+                socket_of(socket),
+                IoctlCommand::Fionread,
+                &mut pending,
+            )
+        } {
+            0 => Ok(pending as usize),
+            _ => Err(last_error()),
+        }
+    }
+}
+
+/// `endpoint` as an IPv4 `sockaddr`.
+pub(crate) fn socket_address(endpoint: Endpoint) -> SockAddrIn {
+    SockAddrIn {
+        family: AddressFamily::Inet.raw() as u16,
+        port: endpoint.port,
+        address: u32::from_be_bytes(endpoint.address.octets()),
+        zero: [0; 8],
+    }
+}
+
+/// The XAM socket of a server socket identifier.
+#[inline]
+pub(crate) fn socket_of(id: SocketId) -> Socket {
+    Socket::from_raw(id.0)
+}
+
 /// Wait until sockets are readable or writable. Returns the number of ready
 /// sockets.
 pub fn select(
@@ -83,7 +271,7 @@ pub fn select(
     write: &mut FdSet,
     timeout: Option<&TimeVal>,
 ) -> Result<u32, NetError> {
-    let timeout = timeout.map_or(core::ptr::null(), |t| t as *const TimeVal);
+    let timeout = timeout.map_or(core::ptr::null(), |timeout| timeout as *const TimeVal);
     // SAFETY: both sets are live for the call; `timeout` is null or live.
     match unsafe {
         NetDll_select(
@@ -115,6 +303,7 @@ pub fn listen(port: u16, backlog: i32) -> Result<Socket, NetError> {
     if socket == Socket::INVALID {
         return Err(NetError::Exhausted);
     }
+
     let enable = 1u32.to_be_bytes();
     let address = socket_address(Endpoint {
         address: Ipv4Address::UNSPECIFIED,
@@ -148,6 +337,7 @@ pub fn listen(port: u16, backlog: i32) -> Result<Socket, NetError> {
         unsafe { NetDll_closesocket(XnCaller::DebugMonitor, socket) };
         return Err(NetError::Closed);
     }
+
     Ok(socket)
 }
 
@@ -180,6 +370,7 @@ pub fn bind_datagram(port: u16) -> Result<Socket, NetError> {
     if socket == Socket::INVALID {
         return Err(NetError::Exhausted);
     }
+
     let enable = 1u32.to_be_bytes();
     // SAFETY: `socket` was created above; `enable` is a live 4-byte local.
     unsafe {
@@ -200,6 +391,7 @@ pub fn bind_datagram(port: u16) -> Result<Socket, NetError> {
             enable.len() as i32,
         );
     }
+
     let address = socket_address(Endpoint {
         address: Ipv4Address::UNSPECIFIED,
         port,
@@ -218,6 +410,7 @@ pub fn bind_datagram(port: u16) -> Result<Socket, NetError> {
         unsafe { NetDll_closesocket(XnCaller::DebugMonitor, socket) };
         return Err(NetError::Closed);
     }
+
     Ok(socket)
 }
 
@@ -298,6 +491,7 @@ pub fn has_secondary_nic() -> bool {
             &mut length,
         )
     } as u32;
+
     // Stock treats every other result, success or failure, as present.
     result != KernelError::DeviceDoesNotExist.status().0
         && Win32ErrorCode(result).error() != Some(Win32Error::INVALID_SOCKET_ARGUMENT)
@@ -308,187 +502,5 @@ fn last_error() -> NetError {
         NetError::WouldBlock
     } else {
         NetError::Closed
-    }
-}
-
-/// `Network` over XAM sockets. Socket identifiers are socket handles.
-pub struct XamNetwork;
-
-impl Network for XamNetwork {
-    fn receive(&mut self, socket: SocketId, buffer: &mut [u8]) -> Result<usize, NetError> {
-        // SAFETY: `buffer` is live and writable for its length.
-        match unsafe {
-            NetDll_recv(
-                XnCaller::DebugMonitor,
-                socket_of(socket),
-                buffer.as_mut_ptr(),
-                buffer.len() as i32,
-                MessageFlags::empty(),
-            )
-        } {
-            SOCKET_ERROR => Err(last_error()),
-            count => Ok(count as usize),
-        }
-    }
-
-    fn send(&mut self, socket: SocketId, data: &[u8]) -> Result<usize, NetError> {
-        // SAFETY: `data` is live for its length.
-        match unsafe {
-            NetDll_send(
-                XnCaller::DebugMonitor,
-                socket_of(socket),
-                data.as_ptr(),
-                data.len() as i32,
-                MessageFlags::empty(),
-            )
-        } {
-            SOCKET_ERROR => Err(last_error()),
-            count => Ok(count as usize),
-        }
-    }
-
-    fn close(&mut self, socket: SocketId) {
-        close(socket_of(socket));
-    }
-
-    fn peer(&mut self, socket: SocketId) -> Result<Endpoint, NetError> {
-        let mut address = socket_address(Endpoint {
-            address: Ipv4Address::UNSPECIFIED,
-            port: 0,
-        });
-        let mut length = size_of::<SockAddrIn>() as i32;
-        // SAFETY: `address` and `length` are live locals.
-        if unsafe {
-            NetDll_getpeername(
-                XnCaller::DebugMonitor,
-                socket_of(socket),
-                (&mut address as *mut SockAddrIn).cast(),
-                &mut length,
-            )
-        } == SOCKET_ERROR
-        {
-            return Err(last_error());
-        }
-        Ok(Endpoint {
-            address: Ipv4Address(address.address.to_be_bytes()),
-            port: address.port,
-        })
-    }
-
-    /// Bind to a random local port in `0x1000..0x5000` with address reuse, as
-    /// the monitor does for notification connections.
-    fn connect(&mut self, endpoint: Endpoint, blocking: bool) -> Result<SocketId, NetError> {
-        // SAFETY: socket creation takes scalar arguments.
-        let socket = unsafe {
-            NetDll_socket(
-                XnCaller::DebugMonitor,
-                AddressFamily::Inet,
-                SocketType::Stream,
-                Protocol::Tcp,
-            )
-        };
-        if socket == Socket::INVALID {
-            return Err(NetError::Exhausted);
-        }
-        let reuse = 1u32.to_be_bytes();
-        // SAFETY: `socket` was created above; `reuse` is a live 4-byte local.
-        unsafe {
-            NetDll_setsockopt(
-                XnCaller::DebugMonitor,
-                socket,
-                SocketLevel::Socket,
-                SocketOption::SO_REUSEADDR,
-                reuse.as_ptr(),
-                reuse.len() as i32,
-            )
-        };
-        let mut random = [0u8; 2];
-        random_bytes(&mut random);
-        /// Local ports are drawn from `LOCAL_PORT_BASE..LOCAL_PORT_BASE + 0x4000`.
-        const LOCAL_PORT_BASE: u16 = 0x1000;
-        const LOCAL_PORT_MASK: u16 = 0x3fff;
-        let local_port = (u16::from_be_bytes(random) & LOCAL_PORT_MASK) + LOCAL_PORT_BASE;
-        let local = socket_address(Endpoint {
-            address: Ipv4Address::UNSPECIFIED,
-            port: local_port,
-        });
-        let remote = socket_address(endpoint);
-        let mut non_blocking = u32::from(!blocking);
-        // SAFETY: `socket` was created above; `local`, `remote` and
-        // `non_blocking` are live locals.
-        let connected = unsafe {
-            NetDll_bind(
-                XnCaller::DebugMonitor,
-                socket,
-                (&local as *const SockAddrIn).cast(),
-                size_of::<SockAddrIn>() as i32,
-            )
-        } != SOCKET_ERROR
-            // SAFETY: as above.
-            && unsafe {
-                NetDll_ioctlsocket(
-                    XnCaller::DebugMonitor,
-                    socket,
-                    IoctlCommand::Fionbio,
-                    &mut non_blocking,
-                )
-            } != SOCKET_ERROR
-            // SAFETY: as above.
-            && unsafe {
-                NetDll_connect(
-                    XnCaller::DebugMonitor,
-                    socket,
-                    (&remote as *const SockAddrIn).cast(),
-                    size_of::<SockAddrIn>() as i32,
-                )
-            } != SOCKET_ERROR;
-        if !connected {
-            close(socket);
-            return Err(NetError::Closed);
-        }
-        Ok(SocketId(socket.raw()))
-    }
-
-    fn wait_writable(&mut self, socket: SocketId, timeout_ms: u32) -> Result<(), NetError> {
-        let mut read = FdSet::new();
-        let mut write = FdSet::new();
-        write.insert(socket_of(socket));
-        let timeout = TimeVal::from_milliseconds(timeout_ms);
-        match select(&mut read, &mut write, Some(&timeout))? {
-            0 => Err(NetError::WouldBlock),
-            _ => Ok(()),
-        }
-    }
-
-    fn set_blocking(&mut self, socket: SocketId, blocking: bool) -> Result<(), NetError> {
-        let mut non_blocking = u32::from(!blocking);
-        // SAFETY: `non_blocking` is a live local.
-        match unsafe {
-            NetDll_ioctlsocket(
-                XnCaller::DebugMonitor,
-                socket_of(socket),
-                IoctlCommand::Fionbio,
-                &mut non_blocking,
-            )
-        } {
-            SOCKET_ERROR => Err(last_error()),
-            _ => Ok(()),
-        }
-    }
-
-    fn pending_input(&mut self, socket: SocketId) -> Result<usize, NetError> {
-        let mut pending = 0u32;
-        // SAFETY: `pending` is a live local.
-        match unsafe {
-            NetDll_ioctlsocket(
-                XnCaller::DebugMonitor,
-                socket_of(socket),
-                IoctlCommand::Fionread,
-                &mut pending,
-            )
-        } {
-            0 => Ok(pending as usize),
-            _ => Err(last_error()),
-        }
     }
 }

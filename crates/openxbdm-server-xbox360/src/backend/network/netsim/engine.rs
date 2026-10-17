@@ -55,15 +55,6 @@ use crate::backend::network::FrameCallback;
 use crate::backend::network::FrameHook;
 use crate::kernel;
 
-/// Idle time after which a redirect session may be reused (120 s).
-const SESSION_IDLE_MILLISECONDS: u32 = 120_000;
-/// XAM export that sends a frame past the intercept.
-const TRANSMIT_UNMODIFIED_ORDINAL: Ordinal =
-    xbox360_sys::xam::ordinal::XNP_ETHERNET_INTERCEPT_XMIT_AS_IP;
-
-/// Hardware thread that runs the release DPC.
-const RELEASE_DPC_PROCESSOR: HardwareThread = HardwareThread::new(2).unwrap();
-
 /// `XeCryptRandom`.
 struct CryptRandom;
 
@@ -71,16 +62,6 @@ impl Random for CryptRandom {
     fn fill(&mut self, buffer: &mut [u8]) {
         // SAFETY: `buffer` is a live slice of the stated length.
         unsafe { XeCryptRandom(buffer.as_mut_ptr(), buffer.len() as u32) };
-    }
-}
-
-/// The time base, read again when its low word is zero as stock does.
-fn now() -> u64 {
-    let time = Timebase::now().ticks();
-    if time as u32 == 0 {
-        Timebase::now().ticks()
-    } else {
-        time
     }
 }
 
@@ -95,6 +76,7 @@ impl StoredProgram {
             .cast::<Program>();
         // SAFETY: the block holds a `Program`; pool blocks are 8-aligned.
         unsafe { block.write(*program) };
+
         Ok(Self(block))
     }
 
@@ -118,18 +100,6 @@ impl Drop for StoredProgram {
     fn drop(&mut self) {
         // SAFETY: the block came from `memory::allocate` and is freed once.
         unsafe { memory::free(self.0.as_ptr().cast()) };
-    }
-}
-
-/// Whether a classifier takes the frame; none takes every frame.
-fn accepts(
-    program: &Option<StoredProgram>,
-    frame: &[u8],
-    parsed: &Parsed,
-) -> Result<bool, filter::EvaluationFailed> {
-    match program {
-        None => Ok(true),
-        Some(program) => filter::matches(program.get(), frame, parsed),
     }
 }
 
@@ -210,7 +180,10 @@ struct Chain<T> {
     count: u32,
 }
 
-impl<T: Chained> Chain<T> {
+impl<T> Chain<T>
+where
+    T: Chained,
+{
     const fn new() -> Self {
         Self {
             head: null_mut(),
@@ -229,6 +202,7 @@ impl<T: Chained> Chain<T> {
             // a live node.
             link = unsafe { T::next(*link) };
         }
+
         link
     }
 
@@ -250,6 +224,7 @@ impl<T: Chained> Chain<T> {
             Some(index) if index < self.count => index,
             Some(_) => return None,
         };
+
         // SAFETY: `index <= count`; `link` is a link of the chain and `node`
         // is live and unlinked.
         unsafe {
@@ -257,7 +232,9 @@ impl<T: Chained> Chain<T> {
             *T::next(node) = *link;
             *link = node;
         }
+
         self.count += 1;
+
         Some(index)
     }
 
@@ -304,6 +281,7 @@ impl SessionList {
                 (*self.0).prev = session;
             }
         }
+
         self.0 = session;
     }
 
@@ -318,6 +296,7 @@ impl SessionList {
             } else {
                 (*prev).next = next;
             }
+
             if !next.is_null() {
                 (*next).prev = prev;
             }
@@ -326,6 +305,7 @@ impl SessionList {
 
     fn find(&self, protocol: FrameFlags, address: [u8; 4], port: u16) -> Option<*mut Session> {
         let mut session = self.0;
+
         // SAFETY: members are live slots.
         unsafe {
             while !session.is_null() {
@@ -341,8 +321,20 @@ impl SessionList {
                 session = slot.next;
             }
         }
+
         None
     }
+}
+
+/// A flow to remember: `lookup` is the direction of the frames that will
+/// be rewritten back.
+struct Flow {
+    lookup: Direction,
+    protocol: FrameFlags,
+    new_address: [u8; 4],
+    original_address: [u8; 4],
+    new_port: u16,
+    original_port: u16,
 }
 
 /// State guarded by the spin lock.
@@ -385,6 +377,7 @@ impl Inner {
 
     fn chained(&self, direction: Direction) -> Option<(FrameCallback, usize)> {
         let hook = self.chain?;
+
         Some(match direction {
             Direction::Outbound => (hook.transmit, hook.context),
             Direction::Inbound => (hook.receive, hook.context),
@@ -399,6 +392,7 @@ impl Inner {
         let Some(release) = next.filter(|&next| pipeline::is_before(next, self.due)) else {
             return;
         };
+
         let next = release.ticks();
         let difference = next.wrapping_sub(now) as i64;
         let difference = if next >= now {
@@ -411,9 +405,11 @@ impl Inner {
         } else {
             0
         };
+
         // SAFETY: the timer and DPC of the instance were initialized by `create`
         // and stay at their pool address until `destroy` cancels them.
         unsafe { KeSetTimerEx(instance.timer.as_ptr(), due, 0, instance.dpc.as_ptr()) };
+
         self.due = Some(release);
     }
 
@@ -427,9 +423,11 @@ impl Inner {
         mut next: Option<ReleaseTime>,
     ) -> Option<ReleaseTime> {
         let mut random = CryptRandom;
+
         for queue in self.queues(direction).iter() {
             // SAFETY: members are live queues.
             let queue = unsafe { &mut *queue };
+
             while let Some(released) = queue.pipeline.dequeue(now, &mut random) {
                 if released.dropped {
                     queue.stats.dropped_packets = queue.stats.dropped_packets.wrapping_add(1);
@@ -441,10 +439,22 @@ impl Inner {
                     batch.push(released.packet);
                 }
             }
+
             next = pipeline::earliest(next, queue.pipeline.next_time(now));
         }
+
         next
     }
+}
+
+enum Redirection {
+    None,
+    /// No session slot is free: the frame is taken and dropped.
+    Drop,
+    /// A copy could not be made or a classifier failed: the frame passes.
+    Pass,
+    /// A rewritten copy of the frame.
+    Rewritten(OwnedPacket),
 }
 
 /// The instance; lives in pool memory at a fixed address because the timer,
@@ -456,26 +466,6 @@ pub(super) struct Instance {
     inner: UnsafeCell<Inner>,
 }
 
-/// The locked state.
-struct Guard<'a> {
-    instance: &'a Instance,
-    irql: Irql,
-}
-
-impl Guard<'_> {
-    fn inner(&mut self) -> &mut Inner {
-        // SAFETY: the spin lock is held.
-        unsafe { &mut *self.instance.inner.get() }
-    }
-}
-
-impl Drop for Guard<'_> {
-    fn drop(&mut self) {
-        // SAFETY: the instance spin lock was acquired by `lock` at `irql`.
-        unsafe { xboxkrnl::KfReleaseSpinLock(self.instance.lock.as_ptr(), self.irql) };
-    }
-}
-
 // SAFETY: `inner` is only reached under the spin lock; the kernel objects
 // are used through kernel calls.
 unsafe impl Sync for Instance {}
@@ -483,9 +473,16 @@ unsafe impl Sync for Instance {}
 impl Instance {
     /// Allocate and initialize (0x91f8ee60, 0x91f8ed88, 0x91f8c758).
     pub(super) fn create() -> Result<NonNull<Instance>, NetsimError> {
+        /// XAM export that sends a frame past the intercept.
+        const TRANSMIT_UNMODIFIED_ORDINAL: Ordinal =
+            xbox360_sys::xam::ordinal::XNP_ETHERNET_INTERCEPT_XMIT_AS_IP;
+        /// Hardware thread that runs the release DPC.
+        const RELEASE_DPC_PROCESSOR: HardwareThread = HardwareThread::new(2).unwrap();
+
         let instance = memory::allocate(core::mem::size_of::<Instance>())
             .ok_or(NetsimError::OutOfMemory)?
             .cast::<Instance>();
+
         // SAFETY: the block is large enough and pool blocks are 8-aligned.
         unsafe {
             instance.write(Instance {
@@ -505,30 +502,33 @@ impl Instance {
                     transmit_unmodified: 0,
                 }),
             });
+
             let this = instance.as_ref();
             KeInitializeTimerEx(
                 this.timer.as_ptr(),
                 TimerType::Notification,
                 ProcessType::SYSTEM,
             );
+
             let dpc = this.dpc.as_ptr();
             KeInitializeDpc(
                 dpc,
                 release_dpc_entry as *const () as usize,
                 instance.as_ptr() as usize,
             );
+
             this.dpc.set_target_processor(Some(RELEASE_DPC_PROCESSOR));
         }
+
         // SAFETY: just initialized.
         let this = unsafe { instance.as_ref() };
-        match super::super::xam_procedure(TRANSMIT_UNMODIFIED_ORDINAL) {
-            Some(address) => this.lock().inner().transmit_unmodified = address,
-            None => {
-                // SAFETY: created here and never published.
-                unsafe { Instance::destroy(instance) };
-                return Err(NetsimError::RoutineMissing);
-            }
-        }
+        let Some(address) = super::super::xam_procedure(TRANSMIT_UNMODIFIED_ORDINAL) else {
+            // SAFETY: created here and never published.
+            unsafe { Instance::destroy(instance) };
+            return Err(NetsimError::RoutineMissing);
+        };
+        this.lock().inner().transmit_unmodified = address;
+
         Ok(instance)
     }
 
@@ -545,9 +545,11 @@ impl Instance {
     pub(super) unsafe fn destroy(instance: NonNull<Instance>) {
         // SAFETY: guaranteed by the caller.
         let this = unsafe { instance.as_ref() };
+
         {
             let mut guard = this.lock();
             let inner = guard.inner();
+
             for direction in [Direction::Inbound, Direction::Outbound] {
                 let queues = inner.queues(direction);
                 while queues.count != 0 {
@@ -555,6 +557,7 @@ impl Instance {
                     unsafe { free_queue(queues.remove(0)) };
                 }
             }
+
             while inner.redirects.count != 0 {
                 // SAFETY: `0 < count`; the removed redirect is owned here.
                 unsafe {
@@ -564,12 +567,14 @@ impl Instance {
                 }
             }
         }
+
         // SAFETY: the timer and DPC were initialized by `create`; the instance
         // is detached, so nothing arms them again.
         unsafe {
             KeCancelTimer(this.timer.as_ptr());
             KeRemoveQueueDpc(this.dpc.as_ptr());
         }
+
         // SAFETY: the block came from `memory::allocate`; nothing uses it now.
         unsafe { memory::free(instance.as_ptr().cast()) };
     }
@@ -577,6 +582,7 @@ impl Instance {
     fn lock(&self) -> Guard<'_> {
         // SAFETY: the spin lock word lives in the instance for its lifetime.
         let irql = unsafe { xboxkrnl::KfAcquireSpinLock(self.lock.as_ptr()) };
+
         Guard {
             instance: self,
             irql,
@@ -591,12 +597,15 @@ impl Instance {
     pub(super) fn chain(&self, hook: Option<FrameHook>, receive_first: bool) {
         let mut guard = self.lock();
         let inner = guard.inner();
+
         match hook {
             Some(hook) if inner.chain.is_none() => {
                 inner.chain = Some(hook);
                 inner.receive_first = receive_first;
             }
-            Some(_) => {}
+            Some(_) => {
+                // Another capture is already chained.
+            }
             None => inner.chain = None,
         }
     }
@@ -625,13 +634,17 @@ impl Instance {
     ) -> Result<QueueIndex, NetsimError> {
         let mut config = QueueConfig::default();
         config.merge(kind, update)?;
+
         let program = StoredProgram::store(program)?;
+
         let queue = memory::allocate(core::mem::size_of::<Queue>())
             .ok_or(NetsimError::OutOfMemory)?
             .cast::<Queue>()
             .as_ptr();
+
         let mut pipeline = Pipeline::new(kind);
         pipeline.configure(update, now());
+
         // SAFETY: the block holds a `Queue`.
         unsafe {
             queue.write(Queue {
@@ -643,6 +656,7 @@ impl Instance {
                 program,
             })
         };
+
         // SAFETY: the queue is live and unlinked; the chain owns it until it
         // is removed.
         let inserted = unsafe {
@@ -651,6 +665,7 @@ impl Instance {
                 .queues(direction)
                 .insert(position.map(|QueueIndex(index)| index), queue)
         };
+
         inserted.map(QueueIndex).ok_or_else(|| {
             // SAFETY: not inserted, so still owned here.
             unsafe { free_queue(queue) };
@@ -671,10 +686,12 @@ impl Instance {
             .queues(direction)
             .get(index.0)
             .ok_or(NetsimError::Invalid)?;
+
         // SAFETY: members are live queues; the lock is held.
         let queue = unsafe { &mut *queue };
         queue.config.merge(queue.kind, update)?;
         queue.pipeline.configure(update, now());
+
         Ok(())
     }
 
@@ -686,6 +703,7 @@ impl Instance {
     ) -> Result<u32, NetsimError> {
         let mut guard = self.lock();
         let queues = guard.inner().queues(direction);
+
         match position {
             None => {
                 let count = queues.count;
@@ -693,6 +711,7 @@ impl Instance {
                     // SAFETY: `0 < count`; the removed queue is owned here.
                     unsafe { free_queue(queues.remove(0)) };
                 }
+
                 Ok(count)
             }
             Some(QueueIndex(index)) if index < queues.count => {
@@ -715,6 +734,7 @@ impl Instance {
             .queues(direction)
             .get(index.0)
             .ok_or(NetsimError::Invalid)?;
+
         // SAFETY: members are live queues.
         Ok(unsafe { (*queue).stats })
     }
@@ -730,8 +750,10 @@ impl Instance {
             .queues(direction)
             .get(index.0)
             .ok_or(NetsimError::Invalid)?;
+
         // SAFETY: members are live queues.
         let queue = unsafe { &*queue };
+
         Ok(QueueSnapshot {
             kind: queue.kind,
             config: queue.config,
@@ -747,12 +769,14 @@ impl Instance {
         program: Option<&Program>,
     ) -> Result<RedirectIndex, NetsimError> {
         let program = StoredProgram::store(program)?;
+
         let size = core::mem::size_of::<Redirect>()
             + usize::from(config.sessions) * core::mem::size_of::<Session>();
         let redirect = memory::allocate(size)
             .ok_or(NetsimError::OutOfMemory)?
             .cast::<Redirect>()
             .as_ptr();
+
         // SAFETY: the block holds the header and then the session slots.
         unsafe {
             redirect.write(Redirect {
@@ -760,6 +784,7 @@ impl Instance {
                 config: *config,
                 program,
             });
+
             let slots = redirect.add(1).cast::<Session>();
             for index in 0..usize::from(config.sessions) {
                 slots.add(index).write(Session {
@@ -775,6 +800,7 @@ impl Instance {
                 });
             }
         }
+
         // SAFETY: the redirect is live and unlinked; the chain owns it until
         // it is removed.
         let inserted = unsafe {
@@ -783,6 +809,7 @@ impl Instance {
                 .redirects
                 .insert(position.map(|RedirectIndex(index)| index), redirect)
         };
+
         inserted.map(RedirectIndex).ok_or_else(|| {
             // SAFETY: not inserted, so still owned here; its slots are in no
             // session list.
@@ -798,11 +825,13 @@ impl Instance {
     ) -> Result<u32, NetsimError> {
         let mut guard = self.lock();
         let inner = guard.inner();
+
         let (first, count) = match position {
             None => (0, inner.redirects.count),
             Some(RedirectIndex(index)) if index < inner.redirects.count => (index, 1),
             Some(_) => return Err(NetsimError::Invalid),
         };
+
         for _ in 0..count {
             // SAFETY: each removal at `first` happens while `first < count`;
             // the removed redirect is owned here.
@@ -812,18 +841,189 @@ impl Instance {
                 free_redirect(redirect);
             }
         }
+
         Ok(count)
     }
 
     pub(super) fn redirect(&self, index: RedirectIndex) -> Option<RedirectSnapshot> {
         let mut guard = self.lock();
         let redirect = guard.inner().redirects.get(index.0)?;
+
         // SAFETY: members are live redirects.
         let redirect = unsafe { &*redirect };
+
         Some(RedirectSnapshot {
             config: redirect.config,
             program: StoredProgram::snapshot(&redirect.program),
         })
+    }
+
+    /// The frame processor (0x91f8e260); returns whether the frame was
+    /// taken from the network stack.
+    fn process(&self, direction: Direction, frame: &mut [u8]) -> bool {
+        let length = frame.len() as u32;
+        let parsed = frame::parse(frame);
+        let classified = parsed.ipv4(frame);
+
+        let mut guard = self.lock();
+        let inner = guard.inner();
+        let mut chained = inner.chained(direction);
+        if inner.bypass {
+            drop(guard);
+            return offer(chained, frame);
+        }
+
+        let before = match direction {
+            Direction::Inbound => inner.receive_first,
+            Direction::Outbound => !inner.receive_first,
+        };
+
+        if before && chained.is_some() {
+            drop(guard);
+
+            if offer(chained, frame) {
+                return true;
+            }
+
+            chained = None;
+            guard = self.lock();
+            if guard.inner().bypass {
+                return false;
+            }
+        }
+
+        let inner = guard.inner();
+        let packet = match classified {
+            None => None,
+            Some(info) => match redirect(inner, direction, frame, &parsed, info) {
+                Redirection::None => None,
+                Redirection::Drop => return true,
+                Redirection::Pass => return false,
+                Redirection::Rewritten(copy) => Some(copy),
+            },
+        };
+
+        let mut target = None;
+        for queue in inner.queues(direction).iter() {
+            // SAFETY: members are live queues; the lock is held.
+            let accepted = accepts(unsafe { &(*queue).program }, frame, &parsed);
+            match accepted {
+                Ok(true) => {
+                    target = Some(queue);
+                    break;
+                }
+                Ok(false) => continue,
+                // Stock leaks a rewritten copy here.
+                Err(_) => {
+                    if let Some(packet) = packet {
+                        packet.free();
+                    }
+
+                    return false;
+                }
+            }
+        }
+
+        let Some(target) = target else {
+            let transmit_unmodified = inner.transmit_unmodified;
+            drop(guard);
+
+            return match packet {
+                Some(packet) => {
+                    emit(direction, packet, chained, transmit_unmodified);
+                    true
+                }
+                None => offer(chained, frame),
+            };
+        };
+
+        let packet = match packet {
+            Some(packet) => packet,
+            None => match OwnedPacket::allocate(frame) {
+                Some(packet) => packet,
+                None => return false,
+            },
+        };
+
+        // SAFETY: members are live queues; the lock is held.
+        let queue = unsafe { &mut *target };
+        queue.stats.total_packets = queue.stats.total_packets.wrapping_add(1);
+        queue.stats.total_bytes = queue.stats.total_bytes.wrapping_add(u64::from(length));
+
+        let now = now();
+        queue.pipeline.enqueue(packet, length, now);
+        let next = queue.pipeline.next_time(now);
+        inner.schedule(self, now, next);
+
+        true
+    }
+
+    /// The release timer (0x91f8dec0): send what every queue releases,
+    /// received frames first, and arm the timer for the earliest next
+    /// release.
+    fn release(&self) {
+        let mut guard = self.lock();
+        let inner = guard.inner();
+        inner.due = None;
+
+        let mut now = now();
+        let mut batch = Batch::new();
+        let mut next = inner.release(Direction::Inbound, now, &mut batch, None);
+
+        if !batch.is_empty() {
+            let chained = if inner.receive_first {
+                None
+            } else {
+                inner.chained(Direction::Inbound)
+            };
+            let transmit_unmodified = inner.transmit_unmodified;
+            drop(guard);
+
+            batch.reverse();
+            while let Some(packet) = batch.pop() {
+                emit(Direction::Inbound, packet, chained, transmit_unmodified);
+            }
+
+            guard = self.lock();
+            now = self::now();
+        }
+
+        let inner = guard.inner();
+        next = inner.release(Direction::Outbound, now, &mut batch, next);
+        inner.schedule(self, now, next);
+
+        let chained = if inner.receive_first {
+            inner.chained(Direction::Outbound)
+        } else {
+            None
+        };
+        let transmit_unmodified = inner.transmit_unmodified;
+        drop(guard);
+
+        batch.reverse();
+        while let Some(packet) = batch.pop() {
+            emit(Direction::Outbound, packet, chained, transmit_unmodified);
+        }
+    }
+}
+
+/// The locked state.
+struct Guard<'a> {
+    instance: &'a Instance,
+    irql: Irql,
+}
+
+impl Guard<'_> {
+    fn inner(&mut self) -> &mut Inner {
+        // SAFETY: the spin lock is held.
+        unsafe { &mut *self.instance.inner.get() }
+    }
+}
+
+impl Drop for Guard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the instance spin lock was acquired by `lock` at `irql`.
+        unsafe { xboxkrnl::KfReleaseSpinLock(self.instance.lock.as_ptr(), self.irql) };
     }
 }
 
@@ -866,17 +1066,6 @@ unsafe fn unlink_sessions(inner: &mut Inner, redirect: *mut Redirect) {
     }
 }
 
-/// A flow to remember: `lookup` is the direction of the frames that will
-/// be rewritten back.
-struct Flow {
-    lookup: Direction,
-    protocol: FrameFlags,
-    new_address: [u8; 4],
-    original_address: [u8; 4],
-    new_port: u16,
-    original_port: u16,
-}
-
 /// Claim a session slot of `redirect` (0x91f8ce98): the first free slot or
 /// the slot already holding the flow, whichever the scan meets first, else
 /// the last slot idle for two minutes. `false` drops the frame.
@@ -884,8 +1073,12 @@ struct Flow {
 /// # Safety
 /// `redirect` is a linked redirect.
 unsafe fn claim_session(inner: &mut Inner, redirect: *mut Redirect, flow: &Flow) -> bool {
+    /// Idle time after which a redirect session may be reused (120 s).
+    const SESSION_IDLE_MILLISECONDS: u32 = 120_000;
+
     let now = TickCount::now().milliseconds();
     let mut idle: Option<*mut Session> = None;
+
     // SAFETY: guaranteed by the caller.
     for slot in unsafe { Redirect::sessions(redirect) }.iter_mut() {
         let Some(protocol) = slot.protocol else {
@@ -893,6 +1086,7 @@ unsafe fn claim_session(inner: &mut Inner, redirect: *mut Redirect, flow: &Flow)
             unsafe { fill_session(inner, slot, flow, now) };
             return true;
         };
+
         if protocol == flow.protocol
             && slot.new_address == flow.new_address
             && slot.original_address == flow.original_address
@@ -902,13 +1096,16 @@ unsafe fn claim_session(inner: &mut Inner, redirect: *mut Redirect, flow: &Flow)
             slot.last_used = now;
             return true;
         }
+
         if now.wrapping_sub(slot.last_used) >= SESSION_IDLE_MILLISECONDS {
             idle = Some(slot);
         }
     }
+
     let Some(session) = idle else {
         return false;
     };
+
     // SAFETY: slots of a live redirect stay valid; a slot in use is a member
     // of the list its `lookup` names, and leaves it before the refill.
     unsafe {
@@ -917,6 +1114,7 @@ unsafe fn claim_session(inner: &mut Inner, redirect: *mut Redirect, flow: &Flow)
         inner.sessions(lookup).unlink(slot);
         fill_session(inner, slot, flow, now);
     }
+
     true
 }
 
@@ -930,8 +1128,20 @@ unsafe fn fill_session(inner: &mut Inner, slot: &mut Session, flow: &Flow, now: 
     slot.original_address = flow.original_address;
     slot.new_port = flow.new_port;
     slot.original_port = flow.original_port;
+
     // SAFETY: guaranteed by the caller.
     unsafe { inner.sessions(flow.lookup).push_front(slot) };
+}
+
+/// The time base, read again when its low word is zero as stock does.
+fn now() -> u64 {
+    let time = Timebase::now().ticks();
+
+    if time as u32 == 0 {
+        Timebase::now().ticks()
+    } else {
+        time
+    }
 }
 
 /// Hand a frame to a chained callback; nonzero means it took the frame.
@@ -952,6 +1162,7 @@ fn emit(
     let redirected = packet.redirected();
     let frame = packet.frame();
     let length = frame.len() as u32;
+
     if !offer(chained, frame) {
         match direction {
             Direction::Outbound if redirected => {
@@ -980,146 +1191,20 @@ fn emit(
             }
         }
     }
+
     packet.free();
 }
 
-impl Instance {
-    /// The frame processor (0x91f8e260); returns whether the frame was
-    /// taken from the network stack.
-    fn process(&self, direction: Direction, frame: &mut [u8]) -> bool {
-        let length = frame.len() as u32;
-        let parsed = frame::parse(frame);
-        let classified = parsed.ipv4(frame);
-        let mut guard = self.lock();
-        let inner = guard.inner();
-        let mut chained = inner.chained(direction);
-        if inner.bypass {
-            drop(guard);
-            return offer(chained, frame);
-        }
-        let before = match direction {
-            Direction::Inbound => inner.receive_first,
-            Direction::Outbound => !inner.receive_first,
-        };
-        if before && chained.is_some() {
-            drop(guard);
-            if offer(chained, frame) {
-                return true;
-            }
-            chained = None;
-            guard = self.lock();
-            if guard.inner().bypass {
-                return false;
-            }
-        }
-        let inner = guard.inner();
-        let mut packet: Option<OwnedPacket> = None;
-        if let Some(info) = classified {
-            match redirect(inner, direction, frame, &parsed, info) {
-                Redirection::None => {}
-                Redirection::Drop => return true,
-                Redirection::Pass => return false,
-                Redirection::Rewritten(copy) => packet = Some(copy),
-            }
-        }
-        let mut target = None;
-        for queue in inner.queues(direction).iter() {
-            // SAFETY: members are live queues; the lock is held.
-            let accepted = accepts(unsafe { &(*queue).program }, frame, &parsed);
-            match accepted {
-                Ok(true) => {
-                    target = Some(queue);
-                    break;
-                }
-                Ok(false) => {}
-                // Stock leaks a rewritten copy here.
-                Err(_) => {
-                    if let Some(packet) = packet {
-                        packet.free();
-                    }
-                    return false;
-                }
-            }
-        }
-        let Some(target) = target else {
-            let transmit_unmodified = inner.transmit_unmodified;
-            drop(guard);
-            return match packet {
-                Some(packet) => {
-                    emit(direction, packet, chained, transmit_unmodified);
-                    true
-                }
-                None => offer(chained, frame),
-            };
-        };
-        let packet = match packet {
-            Some(packet) => packet,
-            None => match OwnedPacket::allocate(frame) {
-                Some(packet) => packet,
-                None => return false,
-            },
-        };
-        // SAFETY: members are live queues; the lock is held.
-        let queue = unsafe { &mut *target };
-        queue.stats.total_packets = queue.stats.total_packets.wrapping_add(1);
-        queue.stats.total_bytes = queue.stats.total_bytes.wrapping_add(u64::from(length));
-        let now = now();
-        queue.pipeline.enqueue(packet, length, now);
-        let next = queue.pipeline.next_time(now);
-        inner.schedule(self, now, next);
-        true
+/// Whether a classifier takes the frame; none takes every frame.
+fn accepts(
+    program: &Option<StoredProgram>,
+    frame: &[u8],
+    parsed: &Parsed,
+) -> Result<bool, filter::EvaluationFailed> {
+    match program {
+        None => Ok(true),
+        Some(program) => filter::matches(program.get(), frame, parsed),
     }
-
-    /// The release timer (0x91f8dec0): send what every queue releases,
-    /// received frames first, and arm the timer for the earliest next
-    /// release.
-    fn release(&self) {
-        let mut guard = self.lock();
-        let inner = guard.inner();
-        inner.due = None;
-        let mut now = now();
-        let mut batch = Batch::new();
-        let mut next = inner.release(Direction::Inbound, now, &mut batch, None);
-        if !batch.is_empty() {
-            let chained = if inner.receive_first {
-                None
-            } else {
-                inner.chained(Direction::Inbound)
-            };
-            let transmit_unmodified = inner.transmit_unmodified;
-            drop(guard);
-            batch.reverse();
-            while let Some(packet) = batch.pop() {
-                emit(Direction::Inbound, packet, chained, transmit_unmodified);
-            }
-            guard = self.lock();
-            now = self::now();
-        }
-        let inner = guard.inner();
-        next = inner.release(Direction::Outbound, now, &mut batch, next);
-        inner.schedule(self, now, next);
-        let chained = if inner.receive_first {
-            inner.chained(Direction::Outbound)
-        } else {
-            None
-        };
-        let transmit_unmodified = inner.transmit_unmodified;
-        drop(guard);
-        batch.reverse();
-        while let Some(packet) = batch.pop() {
-            emit(Direction::Outbound, packet, chained, transmit_unmodified);
-        }
-    }
-}
-
-enum Redirection {
-    None,
-    /// No session slot is free: the frame is taken and dropped.
-    Drop,
-    /// A copy could not be made or a classifier failed: the frame passes.
-    Pass,
-    /// A rewritten copy of the frame.
-    Rewritten(OwnedPacket),
 }
 
 /// Apply a remembered session, else the first matching redirect.
@@ -1138,14 +1223,18 @@ fn redirect(
     } else {
         0
     };
+
     let rewrite = |target_address: [u8; 4], target_port: u16| {
         let Some(mut packet) = OwnedPacket::allocate(frame) else {
             return Redirection::Pass;
         };
+
         packet.set_redirected();
         frame::rewrite(packet.frame(), info, transmit, target_address, target_port);
+
         Redirection::Rewritten(packet)
     };
+
     if transport && let Some(session) = inner.sessions(direction).find(info.protocol, address, port)
     {
         // SAFETY: members are live slots.
@@ -1153,39 +1242,46 @@ fn redirect(
         slot.last_used = TickCount::now().milliseconds();
         return rewrite(slot.original_address, slot.original_port);
     }
+
     let mut matched = None;
     for redirect in inner.redirects.iter() {
         // SAFETY: members are live redirects.
         let entry = unsafe { &*redirect };
         let config = entry.config;
+
         if (config.match_address != [0; 4] && config.match_address != address)
             || (config.match_port != 0 && config.match_port != port)
         {
             continue;
         }
+
         let accepted = accepts(&entry.program, frame, parsed);
         match accepted {
             Ok(true) => {
                 matched = Some((redirect, config));
                 break;
             }
-            Ok(false) => {}
+            Ok(false) => continue,
             Err(_) => return Redirection::Pass,
         }
     }
+
     let Some((redirect, config)) = matched else {
         return Redirection::None;
     };
+
     let target_address = if config.target_address == [0; 4] {
         address
     } else {
         config.target_address
     };
+
     let target_port = if config.target_port == 0 {
         port
     } else {
         config.target_port
     };
+
     if config.sessions > 0 {
         let flow = Flow {
             lookup: if transmit {
@@ -1199,11 +1295,13 @@ fn redirect(
             new_port: target_port,
             original_port: port,
         };
+
         // SAFETY: `redirect` is a member of the chain.
         if !unsafe { claim_session(inner, redirect, &flow) } {
             return Redirection::Drop;
         }
     }
+
     rewrite(target_address, target_port)
 }
 
@@ -1224,6 +1322,7 @@ pub(super) extern "C" fn transmit(context: usize, frame: *mut u8, length: u32) -
             core::slice::from_raw_parts_mut(frame, length as usize),
         )
     };
+
     u32::from(instance.process(Direction::Outbound, frame))
 }
 
@@ -1236,6 +1335,7 @@ pub(super) extern "C" fn receive(context: usize, frame: *mut u8, length: u32) ->
             core::slice::from_raw_parts_mut(frame, length as usize),
         )
     };
+
     u32::from(instance.process(Direction::Inbound, frame))
 }
 

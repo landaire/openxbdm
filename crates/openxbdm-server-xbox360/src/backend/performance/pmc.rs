@@ -6,179 +6,53 @@
 //! monitor's spin lock; the counter controls, print flags, current setup,
 //! and measured clock are read without it, as in stock.
 
+mod error;
+mod exports;
+mod registers;
+mod report;
+
 use core::cell::UnsafeCell;
-use core::mem::offset_of;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
-use openxbdm_core::status::Hresult;
-use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::commands::performance::pmc;
-use openxbdm_server::commands::performance::pmc::BusRegister;
 use openxbdm_server::commands::performance::pmc::COUNTERS;
 use openxbdm_server::commands::performance::pmc::CounterControl;
 use openxbdm_server::commands::performance::pmc::Counting;
 use openxbdm_server::commands::performance::pmc::Event;
 use openxbdm_server::commands::performance::pmc::EventName;
 use openxbdm_server::commands::performance::pmc::Setup;
-use xbox360::time::TickCount;
 use xbox360::time::Timebase;
-use xbox360_sys::export_raw;
-use xbox360_sys::mmio::Register;
 use xbox360_sys::processor;
 use xbox360_sys::processor::Kpcr;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::Handle;
 use xbox360_sys::xboxkrnl::Irql;
 use xbox360_sys::xboxkrnl::KeEnablePPUPerformanceMonitor;
-use xbox360_sys::xboxkrnl::KeGetPMWRegister;
-use xbox360_sys::xboxkrnl::KeGetSpecialPurposeRegister;
-use xbox360_sys::xboxkrnl::KeSetPMWRegister;
-use xbox360_sys::xboxkrnl::KeSetPRVRegister;
 use xbox360_sys::xboxkrnl::KspinLock;
 use xbox360_sys::xboxkrnl::PmwRegister;
 use xbox360_sys::xboxkrnl::PrvRegister;
 use xbox360_sys::xboxkrnl::SpecialPurposeRegister;
 
-use crate::exports::export;
-use crate::exports::export_result;
+use self::registers::BusWidth;
+use self::registers::LiveRegisters;
+use self::registers::MonitorControl;
+use self::registers::MonitorRegisters;
+use self::registers::RunControl;
+use self::registers::TriggerMode;
+use self::registers::monitor_control;
+use self::registers::set_monitor_control;
+use self::registers::set_pmw_value;
+use self::registers::set_prv_value;
+use self::registers::set_spr_value;
+use self::report::pointer;
 use crate::kernel;
+
+pub(super) use self::report::debug_print;
+pub(super) use self::report::print;
 
 /// Trigger selection of processors 0..2.
 const TRIGGERS: [u32; 3] = [0x0842_2108, 0x39ce_8420, 0x6b5a_e738];
-
-/// Memory mapping of the monitor registers the counters read back, each
-/// with one 64-bit load.
-#[repr(C)]
-struct MonitorRegisters {
-    status: Register<u64>,
-    _reserved_08: [Register<u64>; 2],
-    /// Interval timer count in the high word.
-    interval_count: Register<u64>,
-    _reserved_20: [Register<u64>; 3],
-    /// One register per counter, the count in the high word.
-    counter_values: [Register<u64>; COUNTERS],
-}
-
-const _: () = {
-    assert!(offset_of!(MonitorRegisters, interval_count) == 0x18);
-    assert!(offset_of!(MonitorRegisters, counter_values) == 0x38);
-    assert!(size_of::<MonitorRegisters>() == 0xb8);
-};
-
-impl MonitorRegisters {
-    const ADDRESS: usize = 0x8fff_11c8;
-
-    #[inline(always)]
-    fn get() -> &'static Self {
-        // SAFETY: `ADDRESS` maps the monitor registers in this layout for
-        // the life of the system, 8-byte aligned; loads read them without
-        // side effects.
-        unsafe { &*(Self::ADDRESS as *const Self) }
-    }
-
-    #[inline(always)]
-    fn status(&self) -> PmcStatus {
-        PmcStatus(self.status.read())
-    }
-
-    /// The interval timer count, zero-extended.
-    #[inline(always)]
-    fn interval_count(&self) -> u64 {
-        self.interval_count.read() >> 32
-    }
-
-    /// Count of counter `counter`, which callers keep below `COUNTERS`; the
-    /// wrap only spares a bounds check.
-    fn counter_value(&self, counter: usize) -> u64 {
-        self.counter_values[counter % COUNTERS].read() >> 32
-    }
-}
-
-/// Monitor status word, as export 205 reports it in `PmcState::status`.
-#[derive(Clone, Copy)]
-struct PmcStatus(u64);
-
-impl PmcStatus {
-    /// Interval timer overflow; also set while an interval reload is
-    /// pending.
-    const INTERVAL_OVERFLOW: u64 = 1 << 47;
-    /// Overflow of the first counter; each further counter is one bit
-    /// lower, down to bit 48.
-    const FIRST_COUNTER_OVERFLOW: u64 = 1 << 63;
-
-    fn interval_overflow(self) -> bool {
-        self.0 & Self::INTERVAL_OVERFLOW != 0
-    }
-
-    fn counter_overflow(self, counter: usize) -> bool {
-        self.0 & (Self::FIRST_COUNTER_OVERFLOW >> counter) != 0
-    }
-}
-
-xbox360_sys::flags! {
-    /// Value of `SpecialPurposeRegister::MONITOR_CONTROL`.
-    pub struct MonitorControl(u64) {
-        FREEZE = 0x2,
-        ENABLE = 0x4,
-    }
-}
-
-impl MonitorControl {
-    /// Event bus width field, bits 10 to 15.
-    const BUS_WIDTH_SHIFT: u32 = 10;
-    const BUS_WIDTH_MASK: u64 = 0x3f;
-
-    /// The control word with event bus width `width`.
-    #[inline(always)]
-    fn with_bus_width(self, width: BusWidth) -> Self {
-        Self(
-            self.0 & !(Self::BUS_WIDTH_MASK << Self::BUS_WIDTH_SHIFT)
-                | u64::from(width.0) << Self::BUS_WIDTH_SHIFT,
-        )
-    }
-}
-
-/// Event bus width field of [`MonitorControl`].
-#[derive(Clone, Copy)]
-struct BusWidth(u8);
-
-impl BusWidth {
-    /// Width of a reset.
-    const RESET: Self = Self(0xa);
-}
-
-xbox360_sys::flags! {
-    /// High word of `PrvRegister::RUN`; bits 26 and 27 hold the
-    /// [`TriggerMode`].
-    pub struct RunControl(u32) {
-        RUN = 0x8000_0000,
-    }
-}
-
-impl RunControl {
-    const TRIGGER_SHIFT: u32 = 26;
-
-    /// Running in trigger mode `trigger`.
-    #[inline(always)]
-    fn running(trigger: TriggerMode) -> Self {
-        Self(Self::RUN.0 | trigger.0 << Self::TRIGGER_SHIFT)
-    }
-}
-
-/// Trigger mode field of [`RunControl`] (`Setup::trigger`).
-#[derive(Clone, Copy)]
-struct TriggerMode(u32);
-
-impl TriggerMode {
-    /// Mode before any setup.
-    const INITIAL: Self = Self(3);
-
-    /// The mode of setup value `trigger`, of which the field keeps two bits.
-    fn from_setup(trigger: u32) -> Self {
-        Self(trigger & 3)
-    }
-}
 
 xbox360_sys::flags! {
     /// Printout options (export 208 flags and the stored print flags). Any
@@ -199,42 +73,6 @@ impl PrintFlags {
     /// printouts; stock sets them.
     const QUIET: Self = Self(!(Self::NO_FRAME_RATE.0 | Self::NO_TIME.0));
 }
-
-/// Why a counter export failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PmcError {
-    /// The counters could not be acquired.
-    NotAcquired,
-    /// Another owner holds the counters.
-    NotOwner,
-}
-
-impl PmcError {
-    /// `Err(self)` unless `succeeded`.
-    fn unless(self, succeeded: bool) -> Result<(), Self> {
-        if succeeded { Ok(()) } else { Err(self) }
-    }
-}
-
-impl From<PmcError> for Hresult {
-    fn from(error: PmcError) -> Self {
-        match error {
-            PmcError::NotAcquired => Hresult::NOT_ACQUIRED,
-            PmcError::NotOwner => Hresult::NOT_OWNER,
-        }
-    }
-}
-
-impl core::fmt::Display for PmcError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            Self::NotAcquired => "the performance counters could not be acquired",
-            Self::NotOwner => "another owner holds the performance counters",
-        })
-    }
-}
-
-impl core::error::Error for PmcError {}
 
 /// A counter owner; a higher priority preempts a lower one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -402,102 +240,12 @@ impl Drop for Locked {
     }
 }
 
-/// `KeGetSpecialPurposeRegister`, splitting the 64-bit result into r3:r4.
-#[unsafe(naked)]
-extern "C" fn get_spr(register: SpecialPurposeRegister) -> u64 {
-    core::arch::naked_asm!(
-        "stwu 1, -0x20(1)",
-        "mflr 0",
-        "stw 0, 0x24(1)",
-        "bl {get}",
-        "mr 4, 3",
-        // rldicl 3, 3, 32, 32: the high word into the low half of r3.
-        ".long 0x78630022",
-        "lwz 0, 0x24(1)",
-        "mtlr 0",
-        "addi 1, 1, 0x20",
-        "blr",
-        get = sym KeGetSpecialPurposeRegister,
-    )
-}
-
-/// `KeGetPMWRegister`, splitting the 64-bit result into r3:r4.
-#[unsafe(naked)]
-extern "C" fn get_pmw(register: PmwRegister) -> u64 {
-    core::arch::naked_asm!(
-        "stwu 1, -0x20(1)",
-        "mflr 0",
-        "stw 0, 0x24(1)",
-        "bl {get}",
-        "mr 4, 3",
-        ".long 0x78630022",
-        "lwz 0, 0x24(1)",
-        "mtlr 0",
-        "addi 1, 1, 0x20",
-        "blr",
-        get = sym KeGetPMWRegister,
-    )
-}
-
-/// `DbgPrint(format, arguments...)` with each argument in one 64-bit
-/// register, as the console passes variadic arguments.
-#[unsafe(naked)]
-pub(super) unsafe extern "C" fn debug_print(format: *const u8, arguments: *const [u64; 7]) -> u32 {
-    core::arch::naked_asm!(
-        "mr 11, 4",
-        ".irp reg, 4,5,6,7,8,9,10",
-        // ld \reg, 8 * (\reg - 4)(r11)
-        ".long (58 << 26) | (\\reg << 21) | (11 << 16) | (8 * (\\reg - 4))",
-        ".endr",
-        "b {print}",
-        print = sym kernel::DbgPrint,
-    )
-}
-
-/// Print `format` with up to seven arguments.
-pub(super) fn print(format: &core::ffi::CStr, arguments: &[u64]) {
-    let mut slots = [0u64; 7];
-    slots[..arguments.len()].copy_from_slice(arguments);
-    // SAFETY: `format` is NUL-terminated and `slots` holds every argument
-    // it consumes.
-    unsafe { debug_print(format.as_ptr().cast(), &slots) };
-}
-
-fn pointer(text: &[u8]) -> u64 {
-    u64::from(text.as_ptr() as usize as u32)
-}
-
-fn set_prv_value(register: PrvRegister, value: u64) {
-    // SAFETY: PRV register writes reach only the performance monitor.
-    unsafe { KeSetPRVRegister(register, value) };
-}
-
-fn set_spr_value(register: SpecialPurposeRegister, value: u64) {
-    // SAFETY: the callers write only the monitor control and event select
-    // registers.
-    unsafe { xboxkrnl::KeSetSpecialPurposeRegister(register, value) };
-}
-
-#[inline(always)]
-fn monitor_control() -> MonitorControl {
-    MonitorControl::from_bits_retain(get_spr(SpecialPurposeRegister::MONITOR_CONTROL))
-}
-
-#[inline(always)]
-fn set_monitor_control(control: MonitorControl) {
-    set_spr_value(SpecialPurposeRegister::MONITOR_CONTROL, control.bits());
-}
-
-fn set_pmw_value(register: PmwRegister, value: u64) {
-    // SAFETY: PMW register writes reach only the event bus selection.
-    unsafe { KeSetPMWRegister(register, value) };
-}
-
 /// u64 to double by truncating the mantissa (stock 0x91f28f78).
 pub(super) fn to_double(value: u64) -> f64 {
     if value == 0 {
         return 0.0;
     }
+
     let zeros = value.leading_zeros();
     let mantissa = (value << zeros >> 11) & ((1 << 52) - 1);
     f64::from_bits(u64::from(0x43e - zeros) << 52 | mantissa)
@@ -519,19 +267,6 @@ fn print_flags() -> PrintFlags {
     PrintFlags::from_bits_retain(PRINT_FLAGS.load(Ordering::Relaxed))
 }
 
-/// The registers the event decoding reads.
-struct LiveRegisters;
-
-impl pmc::Registers for LiveRegisters {
-    fn select(&mut self) -> u64 {
-        get_spr(SpecialPurposeRegister::EVENT_SELECT)
-    }
-
-    fn bus(&mut self, register: BusRegister) -> u64 {
-        get_pmw(PmwRegister(register.0))
-    }
-}
-
 /// The event of `counter` (stock 0x91f910f8), formatting L2 names into the
 /// static buffer as stock does.
 fn event(counter: usize) -> Event {
@@ -541,6 +276,7 @@ fn event(counter: usize) -> Event {
         // SAFETY: see `NameBuffer`; every L2 name fits the buffer.
         unsafe { (&mut *NAME_BUFFER.0.get())[..text.len()].copy_from_slice(text) };
     }
+
     event
 }
 
@@ -559,9 +295,11 @@ pub(super) fn acquire(owner: Owner) -> bool {
     if locked.preempted(owner) {
         return false;
     }
+
     if locked.hardware().owner.0 > 0 {
         set_prv_value(PrvRegister::RUN, 0);
     }
+
     locked.hardware().owner = owner;
     true
 }
@@ -581,6 +319,7 @@ pub(super) fn start(owner: Owner) -> bool {
     if locked.preempted(owner) {
         return false;
     }
+
     let control = monitor_control().difference(MonitorControl::FREEZE | MonitorControl::ENABLE);
     set_monitor_control(control);
     set_prv_value(
@@ -598,6 +337,7 @@ pub(super) fn stop(owner: Owner) -> bool {
     if locked.hardware().owner != owner {
         return false;
     }
+
     locked.hardware().stopped = Timebase::now().ticks();
     set_monitor_control(monitor_control() | MonitorControl::FREEZE);
     set_prv_value(PrvRegister::RUN, 0);
@@ -610,6 +350,7 @@ pub(super) fn set_trigger_processor(owner: Owner, processor: u32) -> bool {
     if locked.preempted(owner) {
         return false;
     }
+
     let trigger = match TRIGGERS.get(processor as usize) {
         Some(&trigger) => trigger,
         None => {
@@ -621,8 +362,8 @@ pub(super) fn set_trigger_processor(owner: Owner, processor: u32) -> bool {
             0
         }
     };
+
     set_prv_value(PrvRegister::TRIGGER, u64::from(trigger) << 32);
-    drop(locked);
     true
 }
 
@@ -632,8 +373,10 @@ pub(super) fn reset() {
     set_spr_value(SpecialPurposeRegister::EVENT_SELECT, 0);
     // SAFETY: enables the monitor of the current processor; no memory is involved.
     unsafe { KeEnablePPUPerformanceMonitor() };
+
     set_prv_value(PrvRegister::TRIGGER, u64::from(TRIGGERS[0]) << 32);
     set_monitor_control(monitor_control().with_bus_width(BusWidth::RESET));
+
     for counter in 0..COUNTERS {
         set_control(counter, CounterControl::RESET);
     }
@@ -644,9 +387,11 @@ fn clear_locked(locked: &mut Locked, owner: Owner) -> bool {
     if locked.preempted(owner) {
         return false;
     }
+
     for counter in 0..COUNTERS as u8 {
         set_prv_value(PrvRegister::counter_value(counter), 0);
     }
+
     set_prv_value(PrvRegister::INTERVAL, 0);
     set_prv_value(PrvRegister::INTERVAL_RELOAD, 0);
     set_prv_value(PrvRegister::INTERVAL_CONTROL, 0);
@@ -663,6 +408,7 @@ fn fill_state(locked: &mut Locked, state: &mut PmcState) {
     for (index, counter) in state.counters.iter_mut().enumerate() {
         *counter = registers.counter_value(index);
     }
+
     let hardware = locked.hardware();
     state.ticks = hardware.stopped.wrapping_sub(hardware.started);
     state.interval = registers.interval_count() as i64 as f64;
@@ -675,6 +421,7 @@ pub(super) fn read_state(owner: Owner, state: &mut PmcState) -> bool {
     if locked.preempted(owner) {
         return false;
     }
+
     fill_state(&mut locked, state);
     true
 }
@@ -685,6 +432,7 @@ fn read_reported(owner: Owner, state: &mut PmcState) -> bool {
     if locked.preempted(owner) {
         return false;
     }
+
     fill_state(&mut locked, state);
     state.instructions = 0;
     for counter in 0..COUNTERS {
@@ -695,6 +443,7 @@ fn read_reported(owner: Owner, state: &mut PmcState) -> bool {
         }
         state.counters[counter] = value;
     }
+
     true
 }
 
@@ -717,6 +466,7 @@ fn select_events_locked(locked: &mut Locked, owner: Owner, setup: &Setup) -> boo
     if locked.preempted(owner) {
         return false;
     }
+
     reset();
     set_spr_value(SpecialPurposeRegister::EVENT_SELECT, setup.select);
     true
@@ -730,17 +480,21 @@ pub(super) fn select_events(owner: Owner, setup: &Setup) -> bool {
 /// Route the counters, the bus, and the counting mode of a setup, then
 /// clear the counters (stock 0x91f92970).
 fn configure_locked(locked: &mut Locked, owner: Owner, setup: &Setup) -> bool {
+    /// Unit number of the L2 in `pmc::bus_selection`.
+    const L2_UNIT: u32 = 5;
+
     if locked.preempted(owner) {
         return false;
     }
+
     for (counter, route) in setup.routes.iter().enumerate() {
         route_counter(route.source, route.lane, counter);
     }
-    /// Unit number of the L2 in `pmc::bus_selection`.
-    const L2_UNIT: u32 = 5;
+
     for (register, value) in pmc::bus_selection(L2_UNIT) {
         set_pmw_value(PmwRegister(register.0), value);
     }
+
     locked.hardware().trigger = TriggerMode::from_setup(setup.trigger);
     set_pmw_value(PmwRegister::L2_GROUP, setup.group);
     write_controls();
@@ -802,6 +556,7 @@ fn write_controls() {
                 &[counter as u64, name_address(event.name)],
             ),
         }
+
         set_control(counter, control);
         set_prv_value(
             PrvRegister::counter_control(counter as u8),
@@ -826,6 +581,7 @@ fn current_setup(index: u32) -> Option<Setup> {
 /// Run the calling thread on processor `processor` (stock 0x91f78a68).
 fn set_processor(processor: u8) {
     let mut thread = 0u32;
+
     // SAFETY: `data_imports_resolved` held at module load.
     let object_type =
         crate::kernel::address_of(unsafe { xboxkrnl::ExThreadObjectType.get_unchecked() });
@@ -834,6 +590,7 @@ fn set_processor(processor: u8) {
     let status = unsafe {
         xboxkrnl::ObReferenceObjectByHandle(Handle::CURRENT_THREAD, object_type, &mut thread)
     };
+
     if status.is_success() {
         let mut previous = 0u32;
         // SAFETY: `thread` is the referenced calling thread, released here;
@@ -848,18 +605,22 @@ fn set_processor(processor: u8) {
 /// Install built-in setup `index`, selecting its events on each core by
 /// moving the calling thread (stock 0x91f92ae0).
 pub(super) fn install(owner: Owner, index: u32) -> bool {
+    const CORES: u8 = (processor::HARDWARE_THREAD_COUNT / 2) as u8;
+
     let processor = Kpcr::current().processor_number().get();
     if Locked::take().preempted(owner) {
         return false;
     }
+
     let Some(setup) = current_setup(index) else {
         return false;
     };
-    const CORES: u8 = (processor::HARDWARE_THREAD_COUNT / 2) as u8;
+
     for core in 0..CORES {
         set_processor(core * 2);
         select_events(owner, &setup);
     }
+
     set_processor(processor);
     configure(owner, &setup)
 }
@@ -876,6 +637,7 @@ extern "C" fn select_on_processor(request: &SelectRequest<'_>) -> u32 {
     if Kpcr::current().processor_number().get() & 1 != 0 {
         return 1;
     }
+
     u32::from(select_events(request.owner, request.setup))
 }
 
@@ -888,9 +650,11 @@ pub(super) fn install_on_all_processors(owner: Owner, index: u32) -> bool {
     if Locked::take().preempted(owner) {
         return false;
     }
+
     let Some(setup) = current_setup(index) else {
         return false;
     };
+
     let request = SelectRequest {
         owner,
         setup: &setup,
@@ -904,31 +668,8 @@ pub(super) fn install_on_all_processors(owner: Owner, index: u32) -> bool {
             core::ptr::from_ref(&request) as usize as u32,
         )
     };
+
     configure(owner, &setup)
-}
-
-/// Acquire, install setup `index`, and run the counters (stock 0x91f92d68).
-fn begin(owner: Owner, index: u32) -> bool {
-    acquire(owner)
-        && install(owner, index)
-        && clear(owner)
-        && set_trigger_processor(
-            owner,
-            u32::from(Kpcr::current().processor_number().get() >> 1),
-        )
-        && start(owner)
-}
-
-/// Stop the counters, release them, and print the statistics (stock
-/// 0x91f92df0).
-fn end(owner: Owner) -> bool {
-    let mut state = PmcState::new();
-    if !stop(owner) || !read_reported(owner, &mut state) {
-        return false;
-    }
-    release(owner);
-    print_statistics(&mut state, PrintFlags::NO_ECC);
-    true
 }
 
 /// Program the interval timer control (stock 0x91f920f8).
@@ -956,268 +697,10 @@ pub(super) fn wait_interval_reload() -> bool {
     if !pending() {
         return false;
     }
+
     while pending() {}
+
     true
-}
-
-/// Print a counter state (stock export 207, 0x91f919c8).
-fn print_state(state: &PmcState) {
-    let ticks = state.ticks as i64 as f64;
-    let rate = ticks / frequency();
-    // Stock passes the interval's bit pattern for `%u`.
-    print(
-        c"CPU ticks %I64d interval %u frequency %.1f\n",
-        &[
-            state.ticks,
-            state.interval.to_bits(),
-            (state.interval / rate).to_bits(),
-        ],
-    );
-    for (index, &value) in state.counters.iter().enumerate() {
-        print(c"pmc[%d] = %I64u\n", &[index as u64, value]);
-    }
-}
-
-/// Percentages of one counter (stock 0x91f91a60).
-fn print_rates(counter: usize, state: &PmcState) {
-    let event = event(counter);
-    let value = to_double(state.counters[counter]);
-    if pmc::counts_instructions(event.name) {
-        print(c"(%6.2f%%)", &[(value / state.interval * 100.0).to_bits()]);
-        if !PmcStatus(state.status).counter_overflow(counter) {
-            print(c" IPC=|%.3f|", &[(value / state.interval).to_bits()]);
-        }
-        return;
-    }
-    let flag = f64::from(event.flag as i32);
-    print(
-        c"(%6.2f%%)",
-        &[(flag / state.interval * value * 100.0).to_bits()],
-    );
-    if state.instructions != 0 {
-        print(
-            c"[%6.2f%%]",
-            &[(value * 100.0 / state.instructions as i64 as f64).to_bits()],
-        );
-    }
-}
-
-/// Print the statistics of a counter state (stock export 208, 0x91f92438).
-fn print_statistics(state: &mut PmcState, flags: PrintFlags) {
-    const THREADS: [&core::ffi::CStr; 4] = [c"T0", c"T1", c"EE", c""];
-    static SPACE: [u16; 2] = [0x20, 0];
-    let ticks = state.ticks as i64 as f64;
-    let rate = ticks / frequency();
-    print(
-        c"\n\nCPU ticks=|%I64d| interval=|%.0f| frequency=|%.1f|\n",
-        &[
-            state.ticks,
-            state.interval.to_bits(),
-            (state.interval / rate).to_bits(),
-        ],
-    );
-    let print_flags = print_flags();
-    if !print_flags.contains(PrintFlags::NO_TIME) {
-        let time = ticks / frequency();
-        print(c"time=|%.3f| ", &[time.to_bits()]);
-        if !print_flags.contains(PrintFlags::NO_FRAME_RATE) {
-            print(c"FPS=|%7.2f|", &[(1.0 / time).to_bits()]);
-        }
-        match CURRENT_SETUP.load(Ordering::Relaxed).checked_sub(1) {
-            Some(setup) => print(c" using setup %2d", &[u64::from(setup)]),
-            None => print(c"               ", &[]),
-        }
-        print(
-            c"%12ls( /cycle)[ /inst ]\n",
-            &[u64::from(SPACE.as_ptr() as usize as u32)],
-        );
-    }
-    if PmcStatus(state.status).interval_overflow() {
-        let time = ticks / frequency();
-        let clock = CLOCK.load();
-        let interval = time * clock;
-        print(
-            c"Interval overflow, using ticks (freq is %.2fGhz) = |%.0f|\n",
-            &[(clock * 1e-9).to_bits(), interval.to_bits()],
-        );
-        state.interval = interval;
-        state.status &= !PmcStatus::INTERVAL_OVERFLOW;
-    }
-    // Stock advances the overflow bit only for routed counters.
-    let mut overflow = PmcStatus::FIRST_COUNTER_OVERFLOW;
-    for counter in 0..COUNTERS {
-        let Some(input) = control(counter).input() else {
-            continue;
-        };
-        let thread = pmc::thread(counter, control(counter), &mut LiveRegisters);
-        let label = pmc::source_label(counter, input);
-        let value = state.counters[counter];
-        let name = name_address(event(counter).name) + 1;
-        print(
-            c"[%2d]%s%2s(%29s)=%10I64u ",
-            &[
-                counter as u64,
-                pointer(label.to_bytes()),
-                pointer(THREADS[usize::from(thread)].to_bytes()),
-                name,
-                value,
-            ],
-        );
-        if state.status & overflow != 0 {
-            print(c" OVERFLOW\n", &[]);
-        } else {
-            print_rates(counter, state);
-            print(c"\n", &[]);
-        }
-        overflow >>= 1;
-    }
-    if !flags.contains(PrintFlags::NO_ECC) && !print_flags.contains(PrintFlags::NO_ECC) {
-        print_ecc_counts();
-    }
-}
-
-/// Stock 0x91f92020: one line per field, A0Q0 in the top byte.
-fn print_ecc_counts() {
-    let counts = get_pmw(PmwRegister::L2_ECC);
-    print(c"L2 ECC ERROR COUNTS\n", &[]);
-    let words = [(counts >> 32) as u32, counts as u32];
-    for index in 0..8u32 {
-        let word = words[(index >> 2) as usize];
-        let field = word >> (24 - 8 * (index & 3)) & 0x3f;
-        print(
-            c"A%dQ%d = %d\n",
-            &[
-                u64::from(index & 1),
-                u64::from(index >> 1),
-                u64::from(field),
-            ],
-        );
-    }
-}
-
-/// Measure the processor clock over 100 ms of the interval counter (stock
-/// export 211, 0x91f927e0); 0 when the counters are unavailable. A failed
-/// step keeps the counters acquired, as in stock.
-fn measure_clock() -> u64 {
-    const SAMPLE_MILLISECONDS: u32 = 100;
-    /// The clock is truncated to a multiple of 100 kHz.
-    const RESOLUTION: i64 = 100_000;
-    let begun = TickCount::now().milliseconds();
-    let clock = if acquire(Owner::EXPORTS)
-        && {
-            reset();
-            clear(Owner::EXPORTS)
-        }
-        && start(Owner::EXPORTS)
-    {
-        // Stock compares the zero-extended tick counts, which never ends
-        // when the count wraps during the wait.
-        while TickCount::now().milliseconds().wrapping_sub(begun) < SAMPLE_MILLISECONDS {}
-        if stop(Owner::EXPORTS) {
-            let interval = MonitorRegisters::get().interval_count() as i64 as f64;
-            let ticks = {
-                let mut locked = Locked::take();
-                let hardware = locked.hardware();
-                hardware.stopped.wrapping_sub(hardware.started)
-            };
-            release(Owner::EXPORTS);
-            let seconds = ticks as i64 as f64 / frequency();
-            ((interval / seconds) as i64 / RESOLUTION) as f64 * RESOLUTION as f64
-        } else {
-            0.0
-        }
-    } else {
-        0.0
-    };
-    CLOCK.store(clock);
-    clock as i64 as u64
-}
-
-/// Export 196: acquire, install setup `index`, and run the counters.
-extern "C" fn export_begin(index: u32) -> Hresult {
-    export_result(PmcError::NotAcquired.unless(begin(Owner::EXPORTS, index)))
-}
-
-/// Export 197: stop, release, and print the statistics.
-extern "C" fn export_end() -> Hresult {
-    export_result(PmcError::NotOwner.unless(end(Owner::EXPORTS)))
-}
-
-/// Export 198: acquire and install setup `index`.
-extern "C" fn export_install(index: u32) -> Hresult {
-    export_result(
-        PmcError::NotAcquired.unless(acquire(Owner::EXPORTS) && install(Owner::EXPORTS, index)),
-    )
-}
-
-/// Export 199: stop and release.
-extern "C" fn export_stop_and_release() {
-    stop(Owner::EXPORTS);
-    release(Owner::EXPORTS);
-}
-
-/// Export 200.
-extern "C" fn export_clear() -> Hresult {
-    export_result(PmcError::NotOwner.unless(clear(Owner::EXPORTS)))
-}
-
-/// Export 201.
-extern "C" fn export_set_trigger_processor(processor: u32) -> Hresult {
-    export_result(PmcError::NotOwner.unless(set_trigger_processor(Owner::EXPORTS, processor)))
-}
-
-/// Export 202.
-extern "C" fn export_start() -> Hresult {
-    export_result(PmcError::NotOwner.unless(start(Owner::EXPORTS)))
-}
-
-/// Export 203.
-extern "C" fn export_stop() -> Hresult {
-    export_result(PmcError::NotOwner.unless(stop(Owner::EXPORTS)))
-}
-
-/// Export 204 (stock 0x91f92378): count of counter `index` into `value`;
-/// 0 while a higher owner holds the counters.
-extern "C" fn export_query_counter(index: u32, value: *mut u32) -> Hresult {
-    // SAFETY: the caller passes a writable u32.
-    let value = unsafe { &mut *value };
-    let mut locked = Locked::take();
-    let (count, succeeded) = if locked.preempted(Owner::EXPORTS) {
-        (0, false)
-    } else {
-        (counter(index), true)
-    };
-    drop(locked);
-    *value = count;
-    export_result(PmcError::NotOwner.unless(succeeded))
-}
-
-/// Export 205.
-extern "C" fn export_read_state(state: *mut PmcState) -> Hresult {
-    // SAFETY: the caller passes a writable 0xa0-byte state.
-    let state = unsafe { &mut *state };
-    export_result(PmcError::NotOwner.unless(read_reported(Owner::EXPORTS, state)))
-}
-
-/// Export 206 (stock 0x91f91290): event name of counter `counter` without
-/// its counting kind.
-extern "C" fn export_counter_name(counter: i32) -> u32 {
-    match usize::try_from(counter) {
-        Ok(counter) if counter < COUNTERS => name_address(event(counter).name) as u32 + 1,
-        _ => pmc::BAD_COUNTER.text().as_ptr() as usize as u32,
-    }
-}
-
-/// Export 207.
-extern "C" fn export_print_state(state: *const PmcState) {
-    // SAFETY: the caller passes a 0xa0-byte state.
-    print_state(unsafe { &*state });
-}
-
-/// Export 208.
-extern "C" fn export_print_statistics(state: *mut PmcState, flags: u32) {
-    // SAFETY: the caller passes a writable 0xa0-byte state.
-    print_statistics(unsafe { &mut *state }, PrintFlags::from_bits_retain(flags));
 }
 
 /// Table flag of counter `index`, 0 past the last (stock 0x91f912d8).
@@ -1228,69 +711,6 @@ pub(super) fn counter_flag(index: u32) -> u32 {
         event(index as usize).flag
     }
 }
-
-/// Export 209: the counter number is signed, so negative numbers are past
-/// the last as unsigned values.
-extern "C" fn export_counter_flag(counter: i32) -> u32 {
-    counter_flag(counter as u32)
-}
-
-/// Export 210 (stock 0x91f91320): source class of counter `counter`. Stock
-/// does not check the number and reads past the controls; here other
-/// numbers report an unrouted counter.
-extern "C" fn export_counter_source(counter: i32) -> u32 {
-    /// Class `pmc::source_class` reports for an unrouted counter.
-    const UNROUTED: u32 = 7;
-    match usize::try_from(counter) {
-        Ok(counter) if counter < COUNTERS => {
-            pmc::source_class(counter, control(counter), &mut LiveRegisters)
-        }
-        _ => UNROUTED,
-    }
-}
-
-/// Export 211: the measured clock, returned in one 64-bit register.
-#[unsafe(naked)]
-unsafe extern "C" fn export_measure_clock() {
-    core::arch::naked_asm!(
-        "stwu 1, -0x10(1)",
-        "mflr 0",
-        "stw 0, 0x8(1)",
-        "lis 12, {measure}@ha",
-        "addi 12, 12, {measure}@l",
-        "bl {bridge}",
-        // rldimi 4, 3, 32, 0: join r3:r4 into r4.
-        ".long 0x7864000e",
-        "mr 3, 4",
-        "lwz 0, 0x8(1)",
-        "mtlr 0",
-        "addi 1, 1, 0x10",
-        "blr",
-        measure = sym measure_clock_entry,
-        bridge = sym crate::exports::export_bridge,
-    )
-}
-
-extern "C" fn measure_clock_entry() -> u64 {
-    measure_clock()
-}
-
-export!(196, export_begin);
-export!(197, export_end);
-export!(198, export_install);
-export!(199, export_stop_and_release);
-export!(200, export_clear);
-export!(201, export_set_trigger_processor);
-export!(202, export_start);
-export!(203, export_stop);
-export!(204, export_query_counter);
-export!(205, export_read_state);
-export!(206, export_counter_name);
-export!(207, export_print_state);
-export!(208, export_print_statistics);
-export!(209, export_counter_flag);
-export!(210, export_counter_source);
-export_raw!(211, export_measure_clock);
 
 /// PMC part of the title terminate notification (stock 0x91f64e68).
 pub(super) fn title_terminated() {

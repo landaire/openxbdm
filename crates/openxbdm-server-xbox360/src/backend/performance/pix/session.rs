@@ -65,6 +65,26 @@ const STREAMING_FEATURE: u32 = 0x22;
 /// Engine status version, first word of `pixcmd q` and frame record
 /// `+0x20`.
 pub(super) const STATUS_VERSION: u32 = 0x5308;
+pub(super) const MESSAGE_PAYLOAD_SIZE: usize = 0x50;
+const QUEUE_ENTRIES: u32 = 8;
+pub(super) const TABLE_ENTRIES: usize = 0x800;
+pub(super) const AUDIO_BUFFER_SAMPLES: usize = 0x2000;
+/// Per-thread buffer types with a temporary block.
+pub(super) const TEMPORARY_BLOCKS: usize = 13;
+/// Bytes of a temporary block.
+pub(super) const TEMPORARY_BYTES: u32 = 0x800;
+pub(super) const FRAME_TIME_SLOTS: usize = 32;
+/// Generation byte of the frame table sequences of an empty stream.
+pub(super) const EMPTY_GENERATION: u8 = 0xcc;
+const PIX_STREAM: &[u8] = b"\\Device\\Harddisk0\\PixStream";
+const PIX_DUMP: &[u8] = b"\\Device\\Harddisk0\\PixDump";
+/// Priority increment while holding a session lock.
+const LOCK_INCREMENT: u32 = 0xf;
+/// Stored increment of a lock taken without a priority change.
+const PRIORITY_UNCHANGED: u32 = 0x8000_0000;
+
+/// The session block, or 0.
+static SESSION: AtomicU32 = AtomicU32::new(0);
 
 xbox360_sys::flags! {
     /// Engine flags word: state bits, and the frame index in bits 5 to 28.
@@ -315,9 +335,6 @@ impl QueueEntry {
     }
 }
 
-pub(super) const MESSAGE_PAYLOAD_SIZE: usize = 0x50;
-const QUEUE_ENTRIES: u32 = 8;
-
 xbox360_sys::flags! {
     /// Frame record `+0xc` flags.
     pub struct FrameRecordFlags(u32) {
@@ -400,17 +417,6 @@ impl TableEntry {
     }
 }
 
-/// The generation byte of a sequence word: its high byte, the first byte
-/// in memory. Stock stores it alone.
-fn generation_byte(sequence: &AtomicU32) -> &AtomicU8 {
-    // SAFETY: the byte lies in the word and `AtomicU8` needs no alignment.
-    // Byte and word accesses to a sequence happen under the session lock,
-    // so they never race.
-    unsafe { &*sequence.as_ptr().cast::<AtomicU8>() }
-}
-
-pub(super) const TABLE_ENTRIES: usize = 0x800;
-
 /// A record stream: the partition it writes, its write queue, the buffers
 /// waiting for the next gather write and the frame table.
 #[repr(C)]
@@ -491,8 +497,6 @@ pub(super) struct DumpHeader {
 #[repr(C)]
 pub(super) struct AudioStage(pub(super) [AtomicU16; AUDIO_BUFFER_SAMPLES]);
 
-pub(super) const AUDIO_BUFFER_SAMPLES: usize = 0x2000;
-
 /// Temporary block state of a per-thread buffer.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -515,11 +519,6 @@ impl TemporaryState {
     }
 }
 
-/// Per-thread buffer types with a temporary block.
-pub(super) const TEMPORARY_BLOCKS: usize = 13;
-/// Bytes of a temporary block.
-pub(super) const TEMPORARY_BYTES: u32 = 0x800;
-
 /// Memory budget switches and overrides of code 0x56.
 #[repr(C)]
 pub(super) struct Budget {
@@ -529,6 +528,18 @@ pub(super) struct Budget {
     pub(super) title_size: AtomicU32,
     pub(super) override_system: AtomicU32,
     pub(super) system_size: AtomicU32,
+}
+
+impl Budget {
+    #[inline(never)]
+    fn reset(&self) {
+        self.override_title.store(0, Relaxed);
+        self.enabled.store(1, Relaxed);
+        self.title_enabled.store(1, Relaxed);
+        self.title_size.store(0, Relaxed);
+        self.override_system.store(0, Relaxed);
+        self.system_size.store(0, Relaxed);
+    }
 }
 
 /// The session block.
@@ -656,7 +667,60 @@ pub(super) struct PixSession {
     _reserved_122f8: [AtomicU32; 0x22],
 }
 
-pub(super) const FRAME_TIME_SLOTS: usize = 32;
+impl PixSession {
+    /// Address of the block, as title routines receive it.
+    pub(super) fn address(&self) -> u32 {
+        crate::kernel::address_of(self)
+    }
+
+    pub(super) fn engine_flags(&self) -> EngineFlags {
+        EngineFlags::from_bits_retain(self.flags.load(Relaxed))
+    }
+
+    pub(super) fn set_engine_flags(&self, flags: EngineFlags) {
+        self.flags.store(flags.bits(), Relaxed);
+    }
+
+    pub(super) fn frame_index(&self) -> u32 {
+        self.engine_flags().frame_index()
+    }
+
+    pub(super) fn stream(&self, id: StreamId) -> &Stream {
+        &self.streams[id as usize]
+    }
+
+    #[inline(always)]
+    pub(super) fn temporary_state(&self, index: usize) -> TemporaryState {
+        TemporaryState::from_raw(self.temporary_states[index].load(Relaxed))
+    }
+
+    #[inline(always)]
+    pub(super) fn set_temporary_state(&self, index: usize, state: TemporaryState) {
+        self.temporary_states[index].store(state as u32, Relaxed);
+    }
+
+    /// Take the block lock (stock 0x91f5c2b0) and save the priority.
+    #[inline(always)]
+    pub(super) fn enter_lock(&self) {
+        enter(&self.lock, &self.lock_priority);
+    }
+
+    /// Release the block lock and restore the priority (stock 0x91f5c350).
+    #[inline(always)]
+    pub(super) fn leave_lock(&self) {
+        leave(&self.lock, &self.lock_priority);
+    }
+
+    #[inline(always)]
+    pub(super) fn enter_engine_lock(&self) {
+        enter(&self.engine_lock, &self.engine_lock_priority);
+    }
+
+    #[inline(always)]
+    pub(super) fn leave_engine_lock(&self) {
+        leave(&self.engine_lock, &self.engine_lock_priority);
+    }
+}
 
 const _: () = {
     use core::mem::offset_of;
@@ -752,63 +816,49 @@ const _: () = {
     assert!(size_of::<PixSession>() == 0x1_2380);
 };
 
-impl PixSession {
-    /// Address of the block, as title routines receive it.
-    pub(super) fn address(&self) -> u32 {
-        crate::kernel::address_of(self)
-    }
+/// The locked session (stock 0x91f5a7f0); unlocks on drop (0x91f5c350).
+/// Only [`lock`] builds one.
+pub(super) struct Locked(&'static PixSession);
 
-    pub(super) fn engine_flags(&self) -> EngineFlags {
-        EngineFlags::from_bits_retain(self.flags.load(Relaxed))
-    }
-
-    pub(super) fn set_engine_flags(&self, flags: EngineFlags) {
-        self.flags.store(flags.bits(), Relaxed);
-    }
-
-    pub(super) fn frame_index(&self) -> u32 {
-        self.engine_flags().frame_index()
-    }
-
-    pub(super) fn stream(&self, id: StreamId) -> &Stream {
-        &self.streams[id as usize]
-    }
-
-    #[inline(always)]
-    pub(super) fn temporary_state(&self, index: usize) -> TemporaryState {
-        TemporaryState::from_raw(self.temporary_states[index].load(Relaxed))
-    }
-
-    #[inline(always)]
-    pub(super) fn set_temporary_state(&self, index: usize, state: TemporaryState) {
-        self.temporary_states[index].store(state as u32, Relaxed);
-    }
-
-    /// Take the block lock (stock 0x91f5c2b0) and save the priority.
-    #[inline(always)]
-    pub(super) fn enter_lock(&self) {
-        enter(&self.lock, &self.lock_priority);
-    }
-
-    /// Release the block lock and restore the priority (stock 0x91f5c350).
-    #[inline(always)]
-    pub(super) fn leave_lock(&self) {
-        leave(&self.lock, &self.lock_priority);
-    }
-
-    #[inline(always)]
-    pub(super) fn enter_engine_lock(&self) {
-        enter(&self.engine_lock, &self.engine_lock_priority);
-    }
-
-    #[inline(always)]
-    pub(super) fn leave_engine_lock(&self) {
-        leave(&self.engine_lock, &self.engine_lock_priority);
+impl Locked {
+    pub(super) fn session(&self) -> &'static PixSession {
+        self.0
     }
 }
 
-/// The session block, or 0.
-static SESSION: AtomicU32 = AtomicU32::new(0);
+impl Drop for Locked {
+    fn drop(&mut self) {
+        self.0.leave_lock();
+    }
+}
+
+xbox360_sys::flags! {
+    /// Capture state bits of monitor control code 0x44.
+    pub struct CaptureState(u32) {
+        /// Per-thread timing capture, or an event trace message.
+        TIMING = 0x1,
+        /// A capture to file message.
+        CAPTURE_TO_FILE = 0x2,
+        /// An instruction trace records.
+        INSTRUCTION_TRACE = 0x4,
+        /// The performance capture buffer is allocated.
+        CAPTURE_BUFFER = 0x8,
+        PROFILER = 0x10,
+        /// The stream ring is allocated.
+        STREAM = 0x20,
+        GPU = 0x40,
+        AUDIO = 0x80,
+    }
+}
+
+/// The generation byte of a sequence word: its high byte, the first byte
+/// in memory. Stock stores it alone.
+fn generation_byte(sequence: &AtomicU32) -> &AtomicU8 {
+    // SAFETY: the byte lies in the word and `AtomicU8` needs no alignment.
+    // Byte and word accesses to a sequence happen under the session lock,
+    // so they never race.
+    unsafe { &*sequence.as_ptr().cast::<AtomicU8>() }
+}
 
 /// The session, when one was created.
 pub(super) fn session() -> Option<&'static PixSession> {
@@ -816,27 +866,30 @@ pub(super) fn session() -> Option<&'static PixSession> {
     if block == 0 {
         return None;
     }
+
     // SAFETY: `create` publishes a zeroed, initialized pool block of the
     // session's size and alignment that is never freed, and the session
     // is only reached through atomics and kernel objects.
     Some(unsafe { crate::kernel::object_at::<PixSession>(block) })
 }
 
-/// XAM builds with the feature query: `FEATURE_FIRST..FEATURE_END`, and
-/// from `FEATURE_CURRENT` on.
-const FEATURE_FIRST: u32 = 0x2029_dc00;
-const FEATURE_END: u32 = 0x202a_f701;
-const FEATURE_CURRENT: u32 = 0x202f_f100;
-
 /// Whether XAM feature `feature` is enabled (stock 0x91f521a8). Other XAM
 /// builds have every feature; these ask XAM export 0x200.
 pub(super) fn xam_feature_enabled(feature: u32) -> bool {
+    /// XAM builds with the feature query: `FEATURE_FIRST..FEATURE_END`,
+    /// and from `FEATURE_CURRENT` on.
+    const FEATURE_FIRST: u32 = 0x2029_dc00;
+    const FEATURE_END: u32 = 0x202a_f701;
+    const FEATURE_CURRENT: u32 = 0x202f_f100;
     const FEATURE_QUERY: Ordinal = Ordinal::new(0x200).unwrap();
+
     static QUERY: AtomicU32 = AtomicU32::new(0);
+
     let version = xam::XamGetSystemVersion();
     if !(FEATURE_FIRST..FEATURE_END).contains(&version) && version < FEATURE_CURRENT {
         return true;
     }
+
     let mut query = QUERY.load(core::sync::atomic::Ordering::Acquire);
     if query == 0 {
         let Ok(address) = SystemModule::Xam
@@ -848,6 +901,7 @@ pub(super) fn xam_feature_enabled(feature: u32) -> bool {
         query = address.raw();
         QUERY.store(query, core::sync::atomic::Ordering::Release);
     }
+
     // SAFETY: XAM export 0x200 takes one argument, a feature number.
     (unsafe { kernel::call_export(query, feature, 0, 0, 0) }) != 0
 }
@@ -862,12 +916,14 @@ pub(super) fn xam_build() -> u32 {
 /// 0x91f5c4e0); `pixcmd q` reports it.
 pub(super) fn capture_buffer_size() -> u32 {
     const FEATURE_QUERY_BUILD: u32 = 0x2f7d;
+
     let build = xam_build();
     // Stock queries the feature for these builds although every build
     // from 0x211f gets the same size.
     if build >= FEATURE_QUERY_BUILD {
         xam_feature_enabled(STREAMING_FEATURE);
     }
+
     if build >= 0x211f {
         0x6_0000
     } else if build >= 0x19fa {
@@ -879,28 +935,25 @@ pub(super) fn capture_buffer_size() -> u32 {
     }
 }
 
-const PIX_STREAM: &[u8] = b"\\Device\\Harddisk0\\PixStream";
-const PIX_DUMP: &[u8] = b"\\Device\\Harddisk0\\PixDump";
-/// Dump partitions are used in 128 KiB units.
-const DUMP_UNIT: i64 = 0x2_0000;
-/// Critical section spin count of the two locks.
-const LOCK_SPIN_COUNT: u32 = 10;
-/// Generation byte of the frame table sequences of an empty stream.
-pub(super) const EMPTY_GENERATION: u8 = 0xcc;
-/// XAM export of the capture size routine.
-const CAPTURE_SIZE_EXPORT: Ordinal = Ordinal::new(0x1f0).unwrap();
-/// Kernel export of the engine's kernel routine.
-const KERNEL_ROUTINE_EXPORT: Ordinal = Ordinal::new(0x2d4).unwrap();
-/// Protocol revisions with and without the kernel routine.
-const REVISION_KERNEL_ROUTINE: u32 = 0x5d;
-const REVISION: u32 = 0x55;
-
 /// Create the session (stock 0x91f5c560); `false` when streaming is
 /// disabled or the block cannot be allocated.
 pub(super) fn create() -> bool {
+    /// Dump partitions are used in 128 KiB units.
+    const DUMP_UNIT: i64 = 0x2_0000;
+    /// Critical section spin count of the two locks.
+    const LOCK_SPIN_COUNT: u32 = 10;
+    /// XAM export of the capture size routine.
+    const CAPTURE_SIZE_EXPORT: Ordinal = Ordinal::new(0x1f0).unwrap();
+    /// Kernel export of the engine's kernel routine.
+    const KERNEL_ROUTINE_EXPORT: Ordinal = Ordinal::new(0x2d4).unwrap();
+    /// Protocol revisions with and without the kernel routine.
+    const REVISION_KERNEL_ROUTINE: u32 = 0x5d;
+    const REVISION: u32 = 0x55;
+
     if !xam_feature_enabled(STREAMING_FEATURE) {
         return false;
     }
+
     // SAFETY: allocates from the system pool; no pointer arguments.
     let block = unsafe {
         xboxkrnl::ExAllocatePoolTypeWithTag(
@@ -912,6 +965,7 @@ pub(super) fn create() -> bool {
     if block == 0 {
         return false;
     }
+
     let pointer = core::ptr::with_exposed_provenance_mut::<PixSession>(block as usize);
     // SAFETY: a fresh pool block of the session's size, aligned for it
     // (pool blocks are 16-byte aligned), not yet shared; zero is a valid
@@ -920,6 +974,7 @@ pub(super) fn create() -> bool {
         pointer.write_bytes(0, 1);
         &*pointer
     };
+
     // SAFETY: both sections lie in the fresh, zeroed block, which is never
     // freed.
     unsafe {
@@ -929,12 +984,14 @@ pub(super) fn create() -> bool {
             LOCK_SPIN_COUNT,
         );
     }
+
     let mut path = PIX_STREAM;
     let mut device = reference_device(path);
     if device.is_none() {
         path = PIX_DUMP;
         device = reference_device(path);
     }
+
     if let Some(device) = device {
         /// Device flag the monitor sets on the device of the dump
         /// partition.
@@ -949,6 +1006,7 @@ pub(super) fn create() -> bool {
             xboxkrnl::ObDereferenceObject(device.addr() as u32);
         }
     }
+
     if let Some(handle) = open_device(path) {
         let stream = &session.streams[0];
         stream.handle.store(handle, Relaxed);
@@ -971,6 +1029,7 @@ pub(super) fn create() -> bool {
             .wrapping_mul(u64::from(size.bytes_per_sector)) as i64;
         stream.size.set((bytes / DUMP_UNIT * DUMP_UNIT) as u64);
     }
+
     session.message.code.store(0, Relaxed);
     session
         .render_client
@@ -980,9 +1039,11 @@ pub(super) fn create() -> bool {
     session.requested.turn_off();
     session.video.session.store(block, Relaxed);
     session.render_client.session.store(block, Relaxed);
+
     for entry in &session.streams[0].table {
         entry.generation().store(EMPTY_GENERATION, Relaxed);
     }
+
     if capture_buffer_size() != 0 {
         let routine = SystemModule::Xam
             .handle()
@@ -990,21 +1051,22 @@ pub(super) fn create() -> bool {
             .map_or(0, ExportAddress::raw);
         session.capture_size_routine.store(routine, Relaxed);
     }
+
     let routine = SystemModule::Kernel
         .handle()
         .and_then(|kernel| resolve_export(kernel, KERNEL_ROUTINE_EXPORT))
         .map_or(0, ExportAddress::raw);
     session.kernel_routine.store(routine, Relaxed);
-    session.revision.store(
-        if routine != 0 {
-            REVISION_KERNEL_ROUTINE
-        } else {
-            REVISION
-        },
-        Relaxed,
-    );
+    let revision = if routine != 0 {
+        REVISION_KERNEL_ROUTINE
+    } else {
+        REVISION
+    };
+    session.revision.store(revision, Relaxed);
+
     reset_budget(session);
     SESSION.store(block, core::sync::atomic::Ordering::Release);
+
     true
 }
 
@@ -1014,24 +1076,13 @@ pub(super) fn reset_budget(session: &PixSession) {
     session.budget.reset();
 }
 
-impl Budget {
-    #[inline(never)]
-    fn reset(&self) {
-        self.override_title.store(0, Relaxed);
-        self.enabled.store(1, Relaxed);
-        self.title_enabled.store(1, Relaxed);
-        self.title_size.store(0, Relaxed);
-        self.override_system.store(0, Relaxed);
-        self.system_size.store(0, Relaxed);
-    }
-}
-
 /// Reference the device object `path` names; `None` when the lookup
 /// fails.
 fn reference_device(path: &[u8]) -> Option<*mut DeviceObject> {
     let mut device = 0u32;
     // SAFETY: `data_imports_resolved` held at module load.
     let object_type = unsafe { xboxkrnl::IoDeviceObjectType.get_unchecked() };
+
     // SAFETY: the name string and `device` are live for the call.
     let status = unsafe {
         xboxkrnl::ObReferenceObjectByName(
@@ -1042,6 +1093,7 @@ fn reference_device(path: &[u8]) -> Option<*mut DeviceObject> {
             &mut device,
         )
     };
+
     status
         .is_success()
         .then(|| core::ptr::with_exposed_provenance_mut(device as usize))
@@ -1057,6 +1109,7 @@ fn open_device(path: &[u8]) -> Option<u32> {
     };
     let mut io_status = IoStatusBlock::default();
     let mut handle = Handle::NULL;
+
     // SAFETY: all pointers refer to live locals.
     let status: NtStatus = unsafe {
         xboxkrnl::NtCreateFile(
@@ -1071,6 +1124,7 @@ fn open_device(path: &[u8]) -> Option<u32> {
             CreateOptions::NO_INTERMEDIATE_BUFFERING,
         )
     };
+
     status.is_success().then(|| handle.raw())
 }
 
@@ -1079,14 +1133,6 @@ fn open_device(path: &[u8]) -> Option<u32> {
 pub(super) fn open_partition() -> Option<u32> {
     open_device(PIX_STREAM).or_else(|| open_device(PIX_DUMP))
 }
-
-/// Priority increment while holding a session lock.
-const LOCK_INCREMENT: u32 = 0xf;
-/// Priorities at which the lock leaves the thread's priority alone.
-const HIGH_PRIORITY: u8 = 0x12;
-const HIGH_BASE_PRIORITY: u8 = 0x11;
-/// Stored increment of a lock taken without a priority change.
-const PRIORITY_UNCHANGED: u32 = 0x8000_0000;
 
 /// Raised priority of a lock holder: the increment to restore, `None` when
 /// the lock left the priority alone. Stored in the lock's priority word.
@@ -1106,9 +1152,14 @@ fn thread_pointer(thread: &Kthread) -> *mut Kthread {
 /// enter `section` and store the increment to restore in `priority`
 /// (stock 0x91f5c2b0).
 fn enter(section: &RtlCriticalSection, priority: &AtomicU32) {
+    /// Priorities at which the lock leaves the thread's priority alone.
+    const HIGH_PRIORITY: u8 = 0x12;
+    const HIGH_BASE_PRIORITY: u8 = 0x11;
+
     let thread = current_object().kthread();
     // SAFETY: pairs with the `KeLeaveCriticalRegion` of `leave`.
     unsafe { xboxkrnl::KeEnterCriticalRegion() };
+
     let saved = (thread.priority.load(Relaxed) < HIGH_PRIORITY
         && thread.base_priority.load(Relaxed) < HIGH_BASE_PRIORITY
         && thread.saturation.load(Relaxed) == 0)
@@ -1116,6 +1167,7 @@ fn enter(section: &RtlCriticalSection, priority: &AtomicU32) {
             // SAFETY: the current thread object.
             unsafe { xboxkrnl::KeSetBasePriorityThread(thread_pointer(thread), LOCK_INCREMENT) }
         });
+
     // SAFETY: an initialized critical section of the session block.
     unsafe { xboxkrnl::RtlEnterCriticalSection(section.as_ptr()) };
     priority.store(encode_priority(saved), Relaxed);
@@ -1129,6 +1181,7 @@ fn leave(section: &RtlCriticalSection, priority: &AtomicU32) {
     let thread = current_object().kthread();
     // SAFETY: the session critical section [`enter`] took.
     unsafe { xboxkrnl::RtlLeaveCriticalSection(section.as_ptr()) };
+
     if let Some(saved) = saved {
         let base = u32::from(thread.process_priority.load(Relaxed));
         let expected = (base + LOCK_INCREMENT).min(u32::from(thread.priority_limit.load(Relaxed)));
@@ -1145,29 +1198,15 @@ fn leave(section: &RtlCriticalSection, priority: &AtomicU32) {
             }
         }
     }
+
     // SAFETY: pairs with the `KeEnterCriticalRegion` of [`enter`].
     unsafe { xboxkrnl::KeLeaveCriticalRegion() };
-}
-
-/// The locked session (stock 0x91f5a7f0); unlocks on drop (0x91f5c350).
-/// Only [`lock`] builds one.
-pub(super) struct Locked(&'static PixSession);
-
-impl Locked {
-    pub(super) fn session(&self) -> &'static PixSession {
-        self.0
-    }
-}
-
-impl Drop for Locked {
-    fn drop(&mut self) {
-        self.0.leave_lock();
-    }
 }
 
 pub(super) fn lock() -> Option<Locked> {
     let session = session()?;
     session.enter_lock();
+
     Some(Locked(session))
 }
 
@@ -1175,7 +1214,10 @@ pub(super) fn lock() -> Option<Locked> {
 /// frame range message replaces the payload of a queued one. `false`
 /// without a session or with a full queue.
 pub(super) fn post(code: u32, payload: &[u32]) -> bool {
-    let Some(locked) = lock() else { return false };
+    let Some(locked) = lock() else {
+        return false;
+    };
+
     let session = locked.0;
     let count = session.queue_count.load(Relaxed);
     let head = session.queue_head.load(Relaxed);
@@ -1185,6 +1227,7 @@ pub(super) fn post(code: u32, payload: &[u32]) -> bool {
             target.store(word, Relaxed);
         }
     };
+
     if code == EngineMessage::VideoOperation.raw()
         && let Some(queued) = (0..count)
             .map(entry)
@@ -1193,14 +1236,17 @@ pub(super) fn post(code: u32, payload: &[u32]) -> bool {
         write_payload(queued);
         return true;
     }
+
     if count >= QUEUE_ENTRIES {
         return false;
     }
+
     let free = entry(count);
     free.code.store(code, Relaxed);
     free.done.store(0, Relaxed);
     write_payload(free);
     session.queue_count.store(count + 1, Relaxed);
+
     true
 }
 
@@ -1210,16 +1256,16 @@ pub(super) fn next_message(session: &PixSession) -> Option<&QueueEntry> {
     if count == 0 {
         return None;
     }
+
     let head = session.queue_head.load(Relaxed);
+    let next = if head + 1 < QUEUE_ENTRIES {
+        head + 1
+    } else {
+        0
+    };
     session.queue_count.store(count - 1, Relaxed);
-    session.queue_head.store(
-        if head + 1 < QUEUE_ENTRIES {
-            head + 1
-        } else {
-            0
-        },
-        Relaxed,
-    );
+    session.queue_head.store(next, Relaxed);
+
     Some(&session.queue[head as usize % QUEUE_ENTRIES as usize])
 }
 
@@ -1229,29 +1275,30 @@ pub(super) fn requeue_message(session: &PixSession) {
     session
         .queue_count
         .store(session.queue_count.load(Relaxed) + 1, Relaxed);
-    let head = session.queue_head.load(Relaxed);
-    session.queue_head.store(
-        if head == 0 {
-            QUEUE_ENTRIES - 1
-        } else {
-            head - 1
-        },
-        Relaxed,
-    );
-}
 
-/// Status flags of `pixcmd q` that select the status words.
-const MIN_STATUS_FLAGS: u32 = 3;
+    let head = session.queue_head.load(Relaxed);
+    let previous = if head == 0 {
+        QUEUE_ENTRIES - 1
+    } else {
+        head - 1
+    };
+    session.queue_head.store(previous, Relaxed);
+}
 
 /// Engine status for `pixcmd q`/`p`/`u` (stock 0x91f5f130).
 pub(super) fn status(version: u32, flags: u32) -> Option<[u32; 12]> {
+    /// Status flags of `pixcmd q` that select the status words.
+    const MIN_STATUS_FLAGS: u32 = 3;
+
     if version == 0 || flags & MIN_STATUS_FLAGS == 0 {
         return None;
     }
+
     let locked = lock()?;
     let session = locked.0;
     let dump = session.streams[0].size.get() as i64;
     let record = &session.frame_record;
+
     Some([
         STATUS_VERSION,
         session.revision.load(Relaxed),
@@ -1278,21 +1325,25 @@ pub(super) fn frame_statistics(frame: u32) -> Option<[u32; 3]> {
     const RATE_SCALE: f32 = f32::from_bits(0x3c88_8889);
     const COUNT_SCALE: f32 = f32::from_bits(0x3655_5555);
     const PERCENT: f32 = 100.0;
+
+    #[inline(never)]
+    fn truncate(value: f32) -> u32 {
+        value as i64 as u32
+    }
+
     let locked = lock()?;
     let session = locked.0;
     let index = session.flags.load(Relaxed) >> EngineFlags::FRAME_SHIFT;
     let slot = |index: u32| session.frame_times[index as usize % FRAME_TIME_SLOTS].load(Relaxed);
     let ticks = slot(index.wrapping_sub(1)).wrapping_sub(slot(index));
     let rate = (MEASURED_FRAMES / (ticks as f32 * TICK_SECONDS)).min(MAX_RATE);
+
     let mut query = [frame, 0, 0, 0];
     events::notify_owner(
         CallbackOperation::FrameStatistics,
         query.as_mut_ptr() as usize as u32,
     );
-    #[inline(never)]
-    fn truncate(value: f32) -> u32 {
-        value as i64 as u32
-    }
+
     let mut out = [0u32; 3];
     if query[3] != 0 {
         let scale = rate * RATE_SCALE;
@@ -1300,30 +1351,15 @@ pub(super) fn frame_statistics(frame: u32) -> Option<[u32; 3]> {
         out[1] = truncate(scale * f32::from_bits(query[2]) * PERCENT);
         out[2] = truncate(query[3] as f32 * scale * COUNT_SCALE * PERCENT);
     }
-    Some(out)
-}
 
-xbox360_sys::flags! {
-    /// Capture state bits of monitor control code 0x44.
-    pub struct CaptureState(u32) {
-        /// Per-thread timing capture, or an event trace message.
-        TIMING = 0x1,
-        /// A capture to file message.
-        CAPTURE_TO_FILE = 0x2,
-        /// An instruction trace records.
-        INSTRUCTION_TRACE = 0x4,
-        /// The performance capture buffer is allocated.
-        CAPTURE_BUFFER = 0x8,
-        PROFILER = 0x10,
-        /// The stream ring is allocated.
-        STREAM = 0x20,
-        GPU = 0x40,
-        AUDIO = 0x80,
-    }
+    Some(out)
 }
 
 /// Monitor control code 0x44 (stock 0x91f5f3b8): capture state bits.
 pub(super) fn state_flags() -> CaptureState {
+    const TRACE_EVENT: u32 = EngineMessage::TraceEvent.raw();
+    const CAPTURE_TO_FILE: u32 = EngineMessage::CaptureToFile.raw();
+
     let mut flags = CaptureState::empty();
     if let Some(locked) = lock() {
         let configuration = &locked.0.configuration;
@@ -1336,14 +1372,15 @@ pub(super) fn state_flags() -> CaptureState {
         if !configuration.part(Part::Audio).is_off() {
             flags |= CaptureState::AUDIO;
         }
-        const TRACE_EVENT: u32 = EngineMessage::TraceEvent.raw();
-        const CAPTURE_TO_FILE: u32 = EngineMessage::CaptureToFile.raw();
+
         match locked.0.message.code.load(Relaxed) {
             TRACE_EVENT => flags |= CaptureState::TIMING,
             CAPTURE_TO_FILE => flags |= CaptureState::CAPTURE_TO_FILE,
+            // Other messages add no state bits.
             _ => {}
         }
     }
+
     if super::super::xtrace::is_recording() {
         flags |= CaptureState::INSTRUCTION_TRACE;
     }
@@ -1356,6 +1393,7 @@ pub(super) fn state_flags() -> CaptureState {
     if super::stream_active() {
         flags |= CaptureState::STREAM;
     }
+
     flags
 }
 
@@ -1373,6 +1411,7 @@ pub(super) fn set_discard(discard: bool) {
         .wrapping_add(2);
         first.sequence.store((value >> 32) as u32, Relaxed);
         first.sequence_low.store(value as u32, Relaxed);
+
         let generation = generation_byte(&locked.0.streams[1].sequence);
         generation.store(generation.load(Relaxed).wrapping_add(2), Relaxed);
     }

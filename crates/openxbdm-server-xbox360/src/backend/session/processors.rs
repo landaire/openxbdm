@@ -9,9 +9,8 @@
 //! is `handler(line, response, 0x1fb, context)` and a continuation
 //! `continuation(context, response, 0x100)`, with the context of stock
 //! connection +0x228. A call on another thread that does not end within
-//! `FAST_WAIT` continues in the background; the server's pass completes it
-//! once it has ended, so a handler can use services that need the server
-//! thread.
+//! 20 ms continues in the background; the server's pass completes it once
+//! it has ended, so a handler can use services that need the server thread.
 
 use core::cell::UnsafeCell;
 use core::fmt::Write as _;
@@ -52,11 +51,11 @@ use xbox360_sys::xboxkrnl::ThreadCreationFlags;
 use xbox360_sys::xboxkrnl::WaitReason;
 use xbox360_sys::xboxkrnl::WaitType;
 
-use super::super::Console;
-use super::CriticalSection;
 use super::until_nul;
+use crate::backend::Console;
 use crate::exports::export;
 use crate::kernel;
+use crate::kernel::CriticalSection;
 use crate::kernel::KernelEvent;
 use crate::net::XamNetwork;
 
@@ -68,29 +67,45 @@ const CONTINUATION_BUFFER_SIZE: u32 = 0x100;
 const LINE_SIZE: usize = 0x200;
 /// Scratch area a context points at (stock connection +0x240).
 const SCRATCH_SIZE: usize = 0x58;
-
-/// `ExCreateThread` flags of the title command thread and of dedicated
-/// threads (stock 0x91f50500, 0x91f51730); a thread of the system process
-/// adds [`ThreadCreationFlags::SYSTEM_PROCESS`]. Bit 0x4 has no name: no
-/// kernel code tests it, and it passes on as stock sets it.
-const THREAD_FLAGS: ThreadCreationFlags = ThreadCreationFlags::SUSPENDED
-    .union(ThreadCreationFlags::RETURN_THREAD_OBJECT)
-    .union(ThreadCreationFlags::EXEMPT_FROM_STOPS)
-    .union(ThreadCreationFlags::PROCESSOR2)
-    .union(ThreadCreationFlags::PRIORITY_CLASS_13)
-    .union(ThreadCreationFlags::from_bits_retain(0x4));
-const _: () = assert!(THREAD_FLAGS.bits() == 0x0400_02a5);
-const THREAD_STACK_SIZE: u32 = 0x8000;
 /// Executor context of the title command thread; dedicated threads get
 /// their connection index.
 const TITLE_EXECUTOR: u8 = MAX_CONNECTIONS as u8;
-/// The title command thread ends after this long without a title-owned
-/// connection (stock 0x91f42b98 waits 30 s).
-const TITLE_IDLE_MILLISECONDS: u32 = 30_000;
-/// How long the server thread waits for a call before it continues with
-/// other work; one pass of its loop.
-const FAST_WAIT: i64 = relative_interval(core::time::Duration::from_millis(20));
-const NO_WAIT: i64 = 0;
+
+static REGISTRY: Registry = Registry {
+    lock: CriticalSection::new(),
+    processors: UnsafeCell::new(Processors::new()),
+};
+
+static SLOTS: [Slot; MAX_CONNECTIONS] = [const {
+    Slot {
+        block: UnsafeCell::new(CallBlock {
+            context: Context {
+                continuation: 0,
+                count: 0,
+                buffer: 0,
+                size: 0,
+                scratch: 0,
+                remaining: Context::NOT_RECEIVING,
+            },
+            scratch: [0; SCRATCH_SIZE],
+            line: [0; LINE_SIZE],
+            response: [0; HANDLER_RESPONSE_SIZE as usize],
+        }),
+        state: SlotState::new(),
+        executor: AtomicU32::new(0),
+        routine: AtomicU32::new(0),
+        arguments: [const { AtomicU32::new(0) }; 4],
+        result: AtomicU32::new(0),
+        done: KernelEvent::new(),
+    }
+}; MAX_CONNECTIONS];
+
+static EXECUTORS: [Executor; MAX_CONNECTIONS + 1] = [const {
+    Executor {
+        work: KernelEvent::new(),
+        generation: AtomicU32::new(0),
+    }
+}; MAX_CONNECTIONS + 1];
 
 /// Registry entries (stock 0x91f9ff98, 16 pool records of 0x48 bytes).
 struct Registry {
@@ -107,70 +122,9 @@ impl Registry {
         // SAFETY: the critical section is held.
         let result = operation(unsafe { &mut *self.processors.get() });
         self.lock.leave();
+
         result
     }
-}
-
-static REGISTRY: Registry = Registry {
-    lock: CriticalSection::new(),
-    processors: UnsafeCell::new(Processors::new()),
-};
-
-/// Prepare the registry, the call slots, and the executors; called once at
-/// module start.
-pub(super) fn initialize() {
-    REGISTRY.lock.initialize();
-    for slot in &SLOTS {
-        slot.done.initialize();
-    }
-    for executor in &EXECUTORS {
-        executor.work.initialize();
-    }
-}
-
-export!(30, register_processor);
-export!(72, register_processor_ex);
-
-/// Export 30 (stock 0x91f51438): export 72 without a dedicated thread.
-extern "C" fn register_processor(name: u32, handler: u32) -> Hresult {
-    register_processor_ex(name, handler, 0)
-}
-
-/// Export 72 (stock 0x91f431e8): register `handler` under `name`, or
-/// unregister every processor named `name` when `handler` is null. A
-/// nonzero `dedicated` runs connections dedicated to the processor on
-/// their own thread.
-extern "C" fn register_processor_ex(name: u32, handler: u32, dedicated: u32) -> Hresult {
-    // One byte past the longest stored name tells an overlong name apart.
-    // SAFETY: callers pass 0 or a NUL-terminated name.
-    let Some(name) = (unsafe { kernel::bounded_c_string(name, PROCESSOR_NAME_CAPACITY + 1) })
-    else {
-        return Hresult::INVALID_ARGUMENT;
-    };
-    let mut flags = ProcessorFlags::empty();
-    if xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE {
-        flags = flags.union(ProcessorFlags::TITLE);
-    }
-    if dedicated != 0 {
-        flags = flags.union(ProcessorFlags::DEDICATED_THREAD);
-    }
-    // SAFETY: export callers pass 0 or a processor function that stays
-    // loaded while registered and while its calls run, the stock contract.
-    let handler = (handler != 0).then(|| unsafe { ProcessorHandle::from_raw(handler) });
-    crate::exports::export_result(
-        REGISTRY.with(|processors| processors.register(name, handler, flags)),
-    )
-}
-
-/// Monitor control code 0x1c (stock 0x91f3b6c0): register the `PIX`
-/// processor through export 30.
-///
-/// # Safety
-///
-/// `handler` must be 0 or a processor function that stays loaded while
-/// registered and while its calls run.
-pub(crate) unsafe fn service_register_pix_processor(handler: u32) -> u32 {
-    register_processor(c"PIX".as_ptr() as usize as u32, handler).0
 }
 
 /// Record of monitor control code 0x32.
@@ -178,21 +132,6 @@ pub(crate) unsafe fn service_register_pix_processor(handler: u32) -> u32 {
 struct ProcessorRegistration {
     name: u32,
     handler: u32,
-}
-
-/// Monitor control code 0x32 (stock 0x91f3b8a4): export 30 with a
-/// [`ProcessorRegistration`].
-///
-/// # Safety
-///
-/// `argument` must be the address of a [`ProcessorRegistration`] whose
-/// name is 0 or a NUL-terminated string and whose handler is 0 or a
-/// processor function that stays loaded while registered and while its
-/// calls run, unchanged for the call.
-pub(crate) unsafe fn service_register_processor(argument: u32) -> u32 {
-    // SAFETY: the caller's contract.
-    let registration = unsafe { kernel::object_at::<ProcessorRegistration>(argument) };
-    register_processor(registration.name, registration.handler).0
 }
 
 /// Context of a handler call (stock connection +0x228, handler argument 4).
@@ -210,15 +149,6 @@ struct Context {
     remaining: u32,
 }
 
-/// What a continuation left in its data buffer.
-#[derive(Clone, Copy)]
-enum ContinuationData {
-    /// One NUL-terminated line.
-    Line,
-    Bytes(u32),
-    Nothing,
-}
-
 impl Context {
     /// `count`: the data buffer holds one NUL-terminated line.
     const TEXT_LINE: u32 = u32::MAX;
@@ -233,6 +163,15 @@ impl Context {
             count => ContinuationData::Bytes(count),
         }
     }
+}
+
+/// What a continuation left in its data buffer.
+#[derive(Clone, Copy)]
+enum ContinuationData {
+    /// One NUL-terminated line.
+    Line,
+    Bytes(u32),
+    Nothing,
 }
 
 /// Memory a call reads and writes; handlers and continuations get
@@ -340,43 +279,12 @@ impl Slot {
     }
 }
 
-static SLOTS: [Slot; MAX_CONNECTIONS] = [const {
-    Slot {
-        block: UnsafeCell::new(CallBlock {
-            context: Context {
-                continuation: 0,
-                count: 0,
-                buffer: 0,
-                size: 0,
-                scratch: 0,
-                remaining: Context::NOT_RECEIVING,
-            },
-            scratch: [0; SCRATCH_SIZE],
-            line: [0; LINE_SIZE],
-            response: [0; HANDLER_RESPONSE_SIZE as usize],
-        }),
-        state: SlotState::new(),
-        executor: AtomicU32::new(0),
-        routine: AtomicU32::new(0),
-        arguments: [const { AtomicU32::new(0) }; 4],
-        result: AtomicU32::new(0),
-        done: KernelEvent::new(),
-    }
-}; MAX_CONNECTIONS];
-
 /// Wake-up event of an executor and the generation of its current thread;
 /// a thread whose generation is no longer current exits.
 struct Executor {
     work: KernelEvent,
     generation: AtomicU32,
 }
-
-static EXECUTORS: [Executor; MAX_CONNECTIONS + 1] = [const {
-    Executor {
-        work: KernelEvent::new(),
-        generation: AtomicU32::new(0),
-    }
-}; MAX_CONNECTIONS + 1];
 
 /// Context of an executor thread: the executor index in the low byte and
 /// the generation of the thread above it, modulo 2^24.
@@ -403,75 +311,6 @@ impl ThreadTag {
     }
 }
 
-/// Trace text of the title command thread, under trace mask bit 0x1 (stock
-/// 0x91f504d8, 0x91f42ae8, 0x91f43104): `text`, then `0x%08x` of `thread`
-/// and a line end when there is one.
-fn trace_title_thread(text: &str, thread: Option<u32>) {
-    if super::super::console::trace_mask().contains(TraceMask::REPLIES) {
-        let mut line = Text::<0x40>::new();
-        let _ = line.push_bytes(text.as_bytes());
-        if let Some(thread) = thread {
-            let _ = writeln!(line, "0x{thread:08x}");
-        }
-        kernel::debug_print_bytes(line.as_bytes());
-    }
-}
-
-/// Executor thread: run the calls posted to it, in connection order.
-extern "C" fn executor_thread(tag: u32) -> u32 {
-    // `ExecutorThread::start` passes the thread's tag as its context.
-    let tag = ThreadTag(tag);
-    let title = tag.context() == usize::from(TITLE_EXECUTOR);
-    if title {
-        trace_title_thread(
-            "XBDM: New title command processor thread = ",
-            Some(current_object().raw()),
-        );
-    }
-    let executor = &EXECUTORS[tag.context()];
-    let current = || tag.is_generation(executor.generation.load(Ordering::Acquire));
-    loop {
-        executor.work.wait();
-        while current()
-            && let Some(slot) = SLOTS.iter().find(|slot| {
-                slot.executor.load(Ordering::Acquire) == tag.0
-                    && slot.state.transition(
-                        CallSlotState::Posted,
-                        CallSlotState::Running,
-                        Ordering::AcqRel,
-                    )
-            })
-        {
-            let argument = |index: usize| slot.arguments[index].load(Ordering::Relaxed);
-            // SAFETY: the routine is a handler or continuation of a
-            // registered processor, called with the monitor's arguments.
-            let result = unsafe {
-                kernel::call_export(
-                    slot.routine.load(Ordering::Relaxed),
-                    argument(0),
-                    argument(1),
-                    argument(2),
-                    argument(3),
-                )
-            };
-            slot.result.store(result, Ordering::Relaxed);
-            slot.state.store(CallSlotState::Finished, Ordering::Release);
-            slot.done.set();
-        }
-        if !current() {
-            // The wake-up may have been meant for the executor's next thread.
-            executor.work.set();
-            if title {
-                trace_title_thread(
-                    "XBDM: Terminating title command processor thread=",
-                    Some(current_object().raw()),
-                );
-            }
-            return 0;
-        }
-    }
-}
-
 /// An executor thread: its referenced kernel thread object and its tag.
 #[derive(Debug, PartialEq, Eq)]
 struct ExecutorThread {
@@ -481,10 +320,25 @@ struct ExecutorThread {
 
 impl ExecutorThread {
     fn start(context: u8, title: bool) -> Option<Self> {
+        /// `ExCreateThread` flags of the title command thread and of
+        /// dedicated threads (stock 0x91f50500, 0x91f51730); a thread of
+        /// the system process adds [`ThreadCreationFlags::SYSTEM_PROCESS`].
+        /// Bit 0x4 has no name: no kernel code tests it, and it passes on
+        /// as stock sets it.
+        const THREAD_FLAGS: ThreadCreationFlags = ThreadCreationFlags::SUSPENDED
+            .union(ThreadCreationFlags::RETURN_THREAD_OBJECT)
+            .union(ThreadCreationFlags::EXEMPT_FROM_STOPS)
+            .union(ThreadCreationFlags::PROCESSOR2)
+            .union(ThreadCreationFlags::PRIORITY_CLASS_13)
+            .union(ThreadCreationFlags::from_bits_retain(0x4));
+        const _: () = assert!(THREAD_FLAGS.bits() == 0x0400_02a5);
+        const THREAD_STACK_SIZE: u32 = 0x8000;
+
         let executor = &EXECUTORS[usize::from(context)];
         let generation = executor.generation.load(Ordering::Acquire).wrapping_add(1);
         executor.generation.store(generation, Ordering::Release);
         let tag = ThreadTag::new(context, generation);
+
         let flags = if title {
             THREAD_FLAGS
         } else {
@@ -507,13 +361,17 @@ impl ExecutorThread {
         if !status.is_success() {
             return None;
         }
+
         let object = NonZeroU32::new(object)?;
         // SAFETY: `object` is the referenced, suspended thread created above.
         unsafe { KeResumeThread(object.get() as usize as *mut xboxkrnl::Kthread) };
+
         Some(Self { object, tag })
     }
 
     fn ended(&self) -> bool {
+        const NO_WAIT: i64 = 0;
+
         // SAFETY: `object` is the referenced thread object `self` owns.
         let status = unsafe {
             xboxkrnl::KeWaitForSingleObject(
@@ -524,6 +382,7 @@ impl ExecutorThread {
                 &NO_WAIT,
             )
         };
+
         status == NtStatus::WAIT_0
     }
 
@@ -567,14 +426,15 @@ impl ExecutorThread {
     /// Stop an idle thread; a busy one is asked to exit after its call and
     /// kept in `retired` until it does.
     fn release(self, retired: &mut [Option<ExecutorThread>; MAX_CONNECTIONS + 1]) {
-        if self.busy() {
-            self.retire();
-            let slot = &mut retired[self.tag.context()];
-            if let Some(older) = slot.replace(self) {
-                older.join();
-            }
-        } else {
+        if !self.busy() {
             self.stop();
+            return;
+        }
+
+        self.retire();
+        let slot = &mut retired[self.tag.context()];
+        if let Some(older) = slot.replace(self) {
+            older.join();
         }
     }
 
@@ -585,6 +445,7 @@ impl ExecutorThread {
                 slot.state.store(CallSlotState::Lost, Ordering::Release);
             }
         }
+
         // SAFETY: `self` owns the reference and is consumed here.
         unsafe { xboxkrnl::ObDereferenceObject(self.object.get()) };
     }
@@ -630,12 +491,15 @@ impl Output {
             written = count;
             self.passed += count as u32;
         }
+
         while written < binary.len() && self.passed < self.total {
             binary[written] = b"\r\n"[(self.passed - self.length) as usize];
             written += 1;
             self.passed += 1;
         }
+
         *binary_len = written;
+
         (self.passed < self.total).then_some(self)
     }
 }
@@ -675,36 +539,6 @@ pub struct Data {
     retired: [Option<ExecutorThread>; MAX_CONNECTIONS + 1],
 }
 
-/// How a call started.
-enum Started {
-    /// The routine's result.
-    Finished(Hresult),
-    Running,
-    /// No thread could run the call.
-    Unavailable,
-}
-
-/// Outcome of a background call.
-enum Taken {
-    Returned(Hresult),
-    Lost,
-}
-
-fn take_result(slot: &Slot) -> Option<Taken> {
-    match slot.state.load(Ordering::Acquire) {
-        CallSlotState::Finished => {
-            let result = Hresult(slot.result.load(Ordering::Relaxed));
-            slot.state.store(CallSlotState::Idle, Ordering::Release);
-            Some(Taken::Returned(result))
-        }
-        CallSlotState::Lost => {
-            slot.state.store(CallSlotState::Idle, Ordering::Release);
-            Some(Taken::Lost)
-        }
-        _ => None,
-    }
-}
-
 impl Data {
     pub const fn new() -> Self {
         Self {
@@ -729,10 +563,12 @@ impl Data {
                 if let Some(ended) = self.title.take_if(|thread| thread.ended()) {
                     ended.release_ended();
                 }
+
                 if self.title.is_none() {
                     trace_title_thread("XBDM: Creating new title command processor thread\n", None);
                     self.title = Some(ExecutorThread::start(TITLE_EXECUTOR, true)?);
                 }
+
                 self.title.as_ref()
             }
             ProcessorThread::Dedicated { title } => {
@@ -740,9 +576,11 @@ impl Data {
                 if let Some(ended) = dedicated.take_if(|dedicated| dedicated.thread.ended()) {
                     ended.thread.release_ended();
                 }
+
                 if let Some(other) = dedicated.take_if(|dedicated| dedicated.title != title) {
                     other.thread.stop();
                 }
+
                 if dedicated.is_none() {
                     let thread = ExecutorThread::start(slot as u8, title)?;
                     *dedicated = Some(DedicatedThread {
@@ -751,6 +589,7 @@ impl Data {
                         seen: None,
                     });
                 }
+
                 dedicated.as_ref().map(|dedicated| &dedicated.thread)
             }
         }
@@ -764,10 +603,15 @@ impl Data {
         routine: u32,
         arguments: [u32; 4],
     ) -> Started {
+        /// How long the server thread waits for a call before it continues
+        /// with other work; one pass of its loop.
+        const FAST_WAIT: i64 = relative_interval(core::time::Duration::from_millis(20));
+
         let Some(executor) = self.executor(slot, thread) else {
             if thread != ProcessorThread::Server {
                 return Started::Unavailable;
             }
+
             let [first, second, third, fourth] = arguments;
             // SAFETY: the routine is a handler or continuation of a
             // registered processor, called with the monitor's arguments.
@@ -775,16 +619,20 @@ impl Data {
                 kernel::call_export(routine, first, second, third, fourth)
             }));
         };
-        let (tag, object) = (executor.tag, executor.object.get());
+
+        let tag = executor.tag;
+        let object = executor.object.get();
         let call = &SLOTS[slot];
         call.executor.store(tag.0, Ordering::Relaxed);
         call.routine.store(routine, Ordering::Relaxed);
         for (stored, &argument) in call.arguments.iter().zip(&arguments) {
             stored.store(argument, Ordering::Relaxed);
         }
+
         call.done.reset();
         call.state.store(CallSlotState::Posted, Ordering::Release);
         EXECUTORS[tag.context()].work.set();
+
         let objects = [call.done.pointer() as usize as u32, object];
         let mut wait_blocks = [0u32; 0x10];
         loop {
@@ -802,6 +650,7 @@ impl Data {
                     wait_blocks.as_mut_ptr(),
                 )
             };
+
             return match take_result(call) {
                 Some(Taken::Returned(result)) => Started::Finished(result),
                 Some(Taken::Lost) => Started::Unavailable,
@@ -821,12 +670,16 @@ impl Data {
 
     /// Stop threads no connection needs: a dedicated thread whose
     /// connection closed or changed, and the title command thread after
-    /// `TITLE_IDLE_MILLISECONDS` without a title-owned connection.
+    /// 30 s without a title-owned connection.
     fn retain(&mut self, connections: &[Option<(SocketId, Owner)>; MAX_CONNECTIONS]) {
+        /// Stock 0x91f42b98 waits 30 s.
+        const TITLE_IDLE_MILLISECONDS: u32 = 30_000;
+
         for (connection, slot) in connections.iter().zip(&mut self.dedicated) {
             let Some(dedicated) = slot.as_mut() else {
                 continue;
             };
+
             let keep = match (connection, dedicated.seen) {
                 (Some((_, Owner::Processor(_))), None) => {
                     dedicated.seen = *connection;
@@ -839,12 +692,16 @@ impl Data {
                 unneeded.thread.stop();
             }
         }
+
         if connections
             .iter()
             .any(|connection| matches!(connection, Some((_, Owner::Title))))
         {
             self.title_idle_since = None;
-        } else if self.title.as_ref().is_some_and(|thread| !thread.busy()) {
+            return;
+        }
+
+        if self.title.as_ref().is_some_and(|thread| !thread.busy()) {
             let now = TickCount::now().milliseconds();
             let since = *self.title_idle_since.get_or_insert(now);
             if now.wrapping_sub(since) >= TITLE_IDLE_MILLISECONDS {
@@ -862,11 +719,13 @@ impl Data {
         if let Some(ended) = self.title.take_if(|thread| thread.ended()) {
             ended.release_ended();
         }
+
         for dedicated in &mut self.dedicated {
             if let Some(ended) = dedicated.take_if(|dedicated| dedicated.thread.ended()) {
                 ended.thread.release_ended();
             }
         }
+
         for retired in &mut self.retired {
             if let Some(ended) = retired.take_if(|thread| thread.ended()) {
                 ended.release_ended();
@@ -885,6 +744,7 @@ impl Data {
         if let Some(thread) = self.title.take() {
             thread.release(&mut self.retired);
         }
+
         for slot in &mut self.dedicated {
             if let Some(dedicated) = slot.take_if(|dedicated| dedicated.title) {
                 dedicated.thread.release(&mut self.retired);
@@ -897,11 +757,13 @@ impl Data {
         if let Some(thread) = self.title.take() {
             thread.stop();
         }
+
         for slot in &mut self.dedicated {
             if let Some(dedicated) = slot.take() {
                 dedicated.thread.stop();
             }
         }
+
         for slot in &mut self.retired {
             if let Some(thread) = slot.take() {
                 thread.join();
@@ -910,43 +772,19 @@ impl Data {
     }
 }
 
-/// Reset the context as the monitor does before a command (stock
-/// 0x91f50680) and after a transfer.
-fn reset_context(slot: &Slot) {
-    let context = slot.context();
-    // SAFETY: the slot is idle; only the server thread uses it.
-    unsafe {
-        (*context).buffer = 0;
-        (*context).remaining = Context::NOT_RECEIVING;
-        (*context).continuation = 0;
-        (*context).scratch = slot.scratch_address();
-    }
+/// How a call started.
+enum Started {
+    /// The routine's result.
+    Finished(Hresult),
+    Running,
+    /// No thread could run the call.
+    Unavailable,
 }
 
-/// Supply the default data buffer when the context has none (stock pump
-/// 0x91f423f8).
-fn supply_buffer(slot: &Slot) {
-    let context = slot.context();
-    // SAFETY: the slot is idle; only the server thread uses it.
-    unsafe {
-        if (*context).buffer == 0 {
-            (*context).buffer = slot.line_address();
-            (*context).size = CONTINUATION_BUFFER_SIZE;
-            (*slot.block()).line[0] = 0;
-        }
-    }
-}
-
-/// Drop the default data buffer after a call, as stock clears the stack
-/// buffer it supplied.
-fn withdraw_buffer(slot: &Slot) {
-    let context = slot.context();
-    // SAFETY: the slot is idle; only the server thread uses it.
-    unsafe {
-        if (*context).buffer == slot.line_address() {
-            (*context).buffer = 0;
-        }
-    }
+/// Outcome of a background call.
+enum Taken {
+    Returned(Hresult),
+    Lost,
 }
 
 impl Console {
@@ -963,6 +801,7 @@ impl Console {
         // SAFETY: the slot is idle; only the server thread uses it.
         let block = unsafe { &*slot.block() };
         text.set_bytes(until_nul(&block.response));
+
         let context = slot.context();
         let mode = if result == Hresult::MULTILINE {
             // SAFETY: the slot is idle; only the server thread uses it.
@@ -975,16 +814,19 @@ impl Console {
         } else {
             return result;
         };
+
         // SAFETY: the slot is idle; only the server thread uses it.
         let (routine, remaining) = unsafe { ((*context).continuation, (*context).remaining) };
         if routine == 0 {
             return result;
         }
+
         self.session.processors.connections[index].mode = mode;
         if mode == Mode::Upload {
             *receive_remaining = Some(remaining);
         }
         *continuation = Some(ExternalContinuation { call });
+
         result
     }
 
@@ -1013,6 +855,7 @@ impl Console {
             withdraw_buffer(slot);
             return result;
         }
+
         let context = slot.context();
         if calls.mode == Mode::Upload {
             withdraw_buffer(slot);
@@ -1022,10 +865,10 @@ impl Console {
                 *transfer.receive_remaining = Some(remaining);
                 return result;
             }
-            let mut result = result;
+
             // SAFETY: the slot is idle; only the server thread uses it.
             unsafe { (*context).remaining = Context::NOT_RECEIVING };
-            calls.mode = if result == Hresult::MULTILINE {
+            let mode = if result == Hresult::MULTILINE {
                 // SAFETY: as above.
                 unsafe { (*context).count = Context::TEXT_LINE };
                 Mode::Lines
@@ -1038,19 +881,23 @@ impl Console {
                 Mode::Idle
             };
             // SAFETY: as above.
-            if calls.mode != Mode::Idle && unsafe { (*context).continuation } == 0 {
+            let result = if mode != Mode::Idle && unsafe { (*context).continuation } == 0 {
                 calls.mode = Mode::Idle;
-                result = Hresult::UNEXPECTED;
+                Hresult::UNEXPECTED
             } else {
+                calls.mode = mode;
                 // SAFETY: as above.
                 let block = unsafe { &*slot.block() };
                 transfer.line.set_bytes(until_nul(
                     &block.response[..CONTINUATION_BUFFER_SIZE as usize],
                 ));
-            }
+                result
+            };
             *transfer.receive_remaining = Some(0);
+
             return result;
         }
+
         if result.is_failure() {
             withdraw_buffer(slot);
             if result == Hresult::END_OF_DATA {
@@ -1059,6 +906,7 @@ impl Console {
             }
             return result;
         }
+
         // SAFETY: the slot is idle; only the server thread uses it.
         let (data, buffer) = unsafe { ((*context).data(), (*context).buffer) };
         let output = match data {
@@ -1094,9 +942,12 @@ impl Console {
             Some(output) => {
                 calls.output = output.pass(transfer.binary, transfer.binary_len);
             }
-            None => *transfer.no_output = calls.mode == Mode::Lines,
+            None => {
+                *transfer.no_output = calls.mode == Mode::Lines;
+            }
         }
         withdraw_buffer(slot);
+
         result
     }
 }
@@ -1132,9 +983,11 @@ impl ProcessorBackend for Console {
                 if line.is_empty() {
                     return ProcessorProgress::Running;
                 }
+
                 // A call of a connection that closed still uses the slot.
                 return ProcessorProgress::Unavailable;
             };
+
             calls.in_flight = None;
             if line.is_empty() && in_flight == InFlight::Handler {
                 let result = match taken {
@@ -1150,6 +1003,7 @@ impl ProcessorBackend for Console {
                 ));
             }
         }
+
         calls.mode = Mode::Idle;
         calls.output = None;
         reset_context(slot);
@@ -1161,6 +1015,7 @@ impl ProcessorBackend for Console {
             block.line[length] = 0;
             block.response[0] = 0;
         }
+
         let arguments = [
             slot.line_address(),
             slot.response_address(),
@@ -1200,17 +1055,20 @@ impl ProcessorBackend for Console {
             let Some(taken) = take_result(slot) else {
                 return ProcessorProgress::Running;
             };
+
             calls.in_flight = None;
             return ProcessorProgress::Complete(
                 self.finish_continuation(index, aborted, taken, transfer),
             );
         }
+
         if !transfer.aborted
             && let Some(output) = calls.output.take()
         {
             calls.output = output.pass(transfer.binary, transfer.binary_len);
             return ProcessorProgress::Complete(Hresult::OK);
         }
+
         calls.output = None;
         supply_buffer(slot);
         let context = slot.context();
@@ -1230,6 +1088,7 @@ impl ProcessorBackend for Console {
             }
             (*slot.block()).response[0] = 0;
         }
+
         let aborted = transfer.aborted;
         // SAFETY: as above.
         let routine = unsafe { (*context).continuation };
@@ -1274,6 +1133,213 @@ impl ProcessorBackend for Console {
     }
 }
 
+/// Prepare the registry, the call slots, and the executors; called once at
+/// module start.
+pub(super) fn initialize() {
+    REGISTRY.lock.initialize();
+    for slot in &SLOTS {
+        slot.done.initialize();
+    }
+
+    for executor in &EXECUTORS {
+        executor.work.initialize();
+    }
+}
+
+export!(30, register_processor);
+export!(72, register_processor_ex);
+
+/// Export 30 (stock 0x91f51438): export 72 without a dedicated thread.
+extern "C" fn register_processor(name: u32, handler: u32) -> Hresult {
+    register_processor_ex(name, handler, 0)
+}
+
+/// Export 72 (stock 0x91f431e8): register `handler` under `name`, or
+/// unregister every processor named `name` when `handler` is null. A
+/// nonzero `dedicated` runs connections dedicated to the processor on
+/// their own thread.
+extern "C" fn register_processor_ex(name: u32, handler: u32, dedicated: u32) -> Hresult {
+    // One byte past the longest stored name tells an overlong name apart.
+    // SAFETY: callers pass 0 or a NUL-terminated name.
+    let Some(name) = (unsafe { kernel::bounded_c_string(name, PROCESSOR_NAME_CAPACITY + 1) })
+    else {
+        return Hresult::INVALID_ARGUMENT;
+    };
+
+    let mut flags = ProcessorFlags::empty();
+    if xboxkrnl::KeGetCurrentProcessType() == ProcessType::TITLE {
+        flags = flags.union(ProcessorFlags::TITLE);
+    }
+    if dedicated != 0 {
+        flags = flags.union(ProcessorFlags::DEDICATED_THREAD);
+    }
+
+    // SAFETY: export callers pass 0 or a processor function that stays
+    // loaded while registered and while its calls run, the stock contract.
+    let handler = (handler != 0).then(|| unsafe { ProcessorHandle::from_raw(handler) });
+
+    crate::exports::export_result(
+        REGISTRY.with(|processors| processors.register(name, handler, flags)),
+    )
+}
+
+/// Monitor control code 0x1c (stock 0x91f3b6c0): register the `PIX`
+/// processor through export 30.
+///
+/// # Safety
+///
+/// `handler` must be 0 or a processor function that stays loaded while
+/// registered and while its calls run.
+pub(crate) unsafe fn service_register_pix_processor(handler: u32) -> u32 {
+    register_processor(c"PIX".as_ptr() as usize as u32, handler).0
+}
+
+/// Monitor control code 0x32 (stock 0x91f3b8a4): export 30 with a
+/// [`ProcessorRegistration`].
+///
+/// # Safety
+///
+/// `argument` must be the address of a [`ProcessorRegistration`] whose
+/// name is 0 or a NUL-terminated string and whose handler is 0 or a
+/// processor function that stays loaded while registered and while its
+/// calls run, unchanged for the call.
+pub(crate) unsafe fn service_register_processor(argument: u32) -> u32 {
+    // SAFETY: the caller's contract.
+    let registration = unsafe { kernel::object_at::<ProcessorRegistration>(argument) };
+    register_processor(registration.name, registration.handler).0
+}
+
+/// Trace text of the title command thread, under trace mask bit 0x1 (stock
+/// 0x91f504d8, 0x91f42ae8, 0x91f43104): `text`, then `0x%08x` of `thread`
+/// and a line end when there is one.
+fn trace_title_thread(text: &str, thread: Option<u32>) {
+    if !crate::backend::console::trace_mask().contains(TraceMask::REPLIES) {
+        return;
+    }
+
+    let mut line = Text::<0x40>::new();
+    let _ = line.push_bytes(text.as_bytes());
+    if let Some(thread) = thread {
+        let _ = writeln!(line, "0x{thread:08x}");
+    }
+    kernel::debug_print_bytes(line.as_bytes());
+}
+
+/// Executor thread: run the calls posted to it, in connection order.
+extern "C" fn executor_thread(tag: u32) -> u32 {
+    // `ExecutorThread::start` passes the thread's tag as its context.
+    let tag = ThreadTag(tag);
+    let title = tag.context() == usize::from(TITLE_EXECUTOR);
+    if title {
+        trace_title_thread(
+            "XBDM: New title command processor thread = ",
+            Some(current_object().raw()),
+        );
+    }
+
+    let executor = &EXECUTORS[tag.context()];
+    let current = || tag.is_generation(executor.generation.load(Ordering::Acquire));
+
+    loop {
+        executor.work.wait();
+        while current()
+            && let Some(slot) = SLOTS.iter().find(|slot| {
+                slot.executor.load(Ordering::Acquire) == tag.0
+                    && slot.state.transition(
+                        CallSlotState::Posted,
+                        CallSlotState::Running,
+                        Ordering::AcqRel,
+                    )
+            })
+        {
+            let argument = |index: usize| slot.arguments[index].load(Ordering::Relaxed);
+            // SAFETY: the routine is a handler or continuation of a
+            // registered processor, called with the monitor's arguments.
+            let result = unsafe {
+                kernel::call_export(
+                    slot.routine.load(Ordering::Relaxed),
+                    argument(0),
+                    argument(1),
+                    argument(2),
+                    argument(3),
+                )
+            };
+            slot.result.store(result, Ordering::Relaxed);
+            slot.state.store(CallSlotState::Finished, Ordering::Release);
+            slot.done.set();
+        }
+
+        if current() {
+            continue;
+        }
+
+        // The wake-up may have been meant for the executor's next thread.
+        executor.work.set();
+        if title {
+            trace_title_thread(
+                "XBDM: Terminating title command processor thread=",
+                Some(current_object().raw()),
+            );
+        }
+
+        return 0;
+    }
+}
+
+fn take_result(slot: &Slot) -> Option<Taken> {
+    match slot.state.load(Ordering::Acquire) {
+        CallSlotState::Finished => {
+            let result = Hresult(slot.result.load(Ordering::Relaxed));
+            slot.state.store(CallSlotState::Idle, Ordering::Release);
+            Some(Taken::Returned(result))
+        }
+        CallSlotState::Lost => {
+            slot.state.store(CallSlotState::Idle, Ordering::Release);
+            Some(Taken::Lost)
+        }
+        _ => None,
+    }
+}
+
+/// Reset the context as the monitor does before a command (stock
+/// 0x91f50680) and after a transfer.
+fn reset_context(slot: &Slot) {
+    let context = slot.context();
+    // SAFETY: the slot is idle; only the server thread uses it.
+    unsafe {
+        (*context).buffer = 0;
+        (*context).remaining = Context::NOT_RECEIVING;
+        (*context).continuation = 0;
+        (*context).scratch = slot.scratch_address();
+    }
+}
+
+/// Supply the default data buffer when the context has none (stock pump
+/// 0x91f423f8).
+fn supply_buffer(slot: &Slot) {
+    let context = slot.context();
+    // SAFETY: the slot is idle; only the server thread uses it.
+    unsafe {
+        if (*context).buffer == 0 {
+            (*context).buffer = slot.line_address();
+            (*context).size = CONTINUATION_BUFFER_SIZE;
+            (*slot.block()).line[0] = 0;
+        }
+    }
+}
+
+/// Drop the default data buffer after a call, as stock clears the stack
+/// buffer it supplied.
+fn withdraw_buffer(slot: &Slot) {
+    let context = slot.context();
+    // SAFETY: the slot is idle; only the server thread uses it.
+    unsafe {
+        if (*context).buffer == slot.line_address() {
+            (*context).buffer = 0;
+        }
+    }
+}
+
 /// Server pass: end threads no connection needs, and finish the processor
 /// calls that ended on other threads.
 pub(crate) fn poll_processor_calls(
@@ -1285,9 +1351,11 @@ pub(crate) fn poll_processor_calls(
     for (index, socket, owner) in server.connections() {
         connections[index.0 as usize] = Some((socket, owner));
     }
+
     let data = &mut console.session.processors;
     data.find_lost_calls();
     data.retain(&connections);
+
     for (index, slot) in SLOTS.iter().enumerate() {
         if !matches!(
             slot.state.load(Ordering::Acquire),
@@ -1295,6 +1363,7 @@ pub(crate) fn poll_processor_calls(
         ) {
             continue;
         }
+
         let connection = ConnectionIndex(index as u8);
         server.complete_processor_call(connection, console, network);
         // Nothing collects the result of a connection that closed.

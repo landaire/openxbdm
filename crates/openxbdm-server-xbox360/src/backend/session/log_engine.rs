@@ -56,6 +56,7 @@ use xbox360_sys::xboxkrnl::ThreadCreationFlags;
 use xbox360_sys::xboxkrnl::WaitReason;
 use xbox360_sys::xboxkrnl::WaitType;
 
+use super::error::WorkerError;
 use crate::exports::export;
 use crate::kernel;
 use crate::lockfree;
@@ -120,109 +121,6 @@ const _: () = {
     assert!(offset_of!(LogEngine, free_routine) == 0x158);
     assert!(size_of::<LogEngine>() == 0x160);
 };
-
-/// Why the worker stopped early; its result word goes to the engine's
-/// status field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorkerError {
-    /// The quit or done event is missing.
-    MissingEvent,
-    /// The log file could not be created.
-    NoFile,
-    /// The callback failed with this result.
-    Callback(Hresult),
-    /// The file write failed; the thread's last error, if any.
-    Write(Option<Win32Error>),
-    /// An entry could not be returned to the free queue.
-    Requeue,
-}
-
-impl core::fmt::Display for WorkerError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::MissingEvent => f.write_str("quit or done event missing"),
-            Self::NoFile => f.write_str("log file not created"),
-            Self::Callback(result) => write!(f, "callback failed with {:#x}", result.0),
-            Self::Write(_) => f.write_str("log file write failed"),
-            Self::Requeue => f.write_str("entry not returned to the free queue"),
-        }
-    }
-}
-
-impl core::error::Error for WorkerError {}
-
-/// The engine status word of a worker failure.
-impl From<WorkerError> for Hresult {
-    fn from(error: WorkerError) -> Self {
-        match error {
-            WorkerError::MissingEvent => Self::INVALID_ARGUMENT,
-            // Stock stores the NTSTATUS itself in the status word.
-            WorkerError::NoFile => Self(KernelError::ObjectNameInvalid.status().0),
-            WorkerError::Callback(result) => result,
-            // Stock stores the conversion of a zero last error as is.
-            WorkerError::Write(error) => error.map_or(Self::SUCCESS, Self::from),
-            WorkerError::Requeue => Self::FAIL,
-        }
-    }
-}
-
-/// Exit code of the worker thread.
-#[derive(Clone, Copy)]
-#[repr(u32)]
-enum WorkerExit {
-    Finished = 0,
-    Failed = u32::MAX,
-}
-
-/// Pending-queue dequeue failure once the wait routine reports the quit
-/// event: the queue takes the routine's STATUS_WAIT_1 (wait index 1) as
-/// Win32 code 1.
-const QUIT_SIGNALED: lockfree::Error = lockfree::Error::Wait(Win32Error::INVALID_FUNCTION);
-
-/// An engine of this module.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) struct Engine(NonNull<LogEngine>);
-
-impl Engine {
-    /// The engine at `address`, none for 0.
-    ///
-    /// # Safety
-    ///
-    /// `address` is 0 or an engine of this module that is not destroyed
-    /// while the returned value or a copy of it is used.
-    pub(super) unsafe fn new(address: u32) -> Option<Self> {
-        NonNull::new(ptr::with_exposed_provenance_mut(address as usize)).map(Self)
-    }
-
-    pub(super) fn address(self) -> u32 {
-        self.0.as_ptr().expose_provenance() as u32
-    }
-
-    fn get(&self) -> &LogEngine {
-        // SAFETY: an `Engine` names a live engine (`Engine::new`, or a
-        // creation of this module) until `destroy` frees it.
-        unsafe { self.0.as_ref() }
-    }
-}
-
-/// An engine event, by the address its pointer word holds. It keeps no
-/// reference to the engine: once the done event is set, close may free the
-/// engine.
-#[derive(Clone, Copy)]
-struct Event(*mut Kevent);
-
-impl Event {
-    fn set(self) {
-        // SAFETY: the pointer came from a pointer word of an engine in use,
-        // which holds the engine's initialized event from creation until
-        // destroy (export contract).
-        unsafe { xboxkrnl::KeSetEvent(self.0, EVENT_INCREMENT, false) };
-    }
-
-    fn as_dispatcher(self) -> *mut DispatcherObject {
-        self.0.cast()
-    }
-}
 
 impl LogEngine {
     /// Record why the worker stopped in the caller-visible status field.
@@ -299,8 +197,9 @@ impl LogEngine {
 
     fn append(&self, entry: NonNull<u8>) {
         let entry = entry.as_ptr().expose_provenance() as u32;
+
         if self.enqueue(Cell::Pending, entry).is_err() {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+            self.dropped.fetch_add(1, Relaxed);
         }
     }
 }
@@ -310,6 +209,59 @@ impl LogEngine {
 enum Cell {
     Pending,
     Free,
+}
+
+/// An engine of this module.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct Engine(NonNull<LogEngine>);
+
+impl Engine {
+    /// The engine at `address`, none for 0.
+    ///
+    /// # Safety
+    ///
+    /// `address` is 0 or an engine of this module that is not destroyed
+    /// while the returned value or a copy of it is used.
+    pub(super) unsafe fn new(address: u32) -> Option<Self> {
+        NonNull::new(ptr::with_exposed_provenance_mut(address as usize)).map(Self)
+    }
+
+    pub(super) fn address(self) -> u32 {
+        self.0.as_ptr().expose_provenance() as u32
+    }
+
+    fn get(&self) -> &LogEngine {
+        // SAFETY: an `Engine` names a live engine (`Engine::new`, or a
+        // creation of this module) until `destroy` frees it.
+        unsafe { self.0.as_ref() }
+    }
+}
+
+/// An engine event, by the address its pointer word holds. It keeps no
+/// reference to the engine: once the done event is set, close may free the
+/// engine.
+#[derive(Clone, Copy)]
+struct Event(*mut Kevent);
+
+impl Event {
+    fn set(self) {
+        // SAFETY: the pointer came from a pointer word of an engine in use,
+        // which holds the engine's initialized event from creation until
+        // destroy (export contract).
+        unsafe { xboxkrnl::KeSetEvent(self.0, EVENT_INCREMENT, false) };
+    }
+
+    fn as_dispatcher(self) -> *mut DispatcherObject {
+        self.0.cast()
+    }
+}
+
+/// Exit code of the worker thread.
+#[derive(Clone, Copy)]
+#[repr(u32)]
+enum WorkerExit {
+    Finished = 0,
+    Failed = u32::MAX,
 }
 
 /// Allocator routines of the caller options.
@@ -323,18 +275,12 @@ struct CallerAllocator {
 impl CallerAllocator {
     fn of(options: Option<&CreationDescriptor>) -> Option<Self> {
         let options = options?;
+
         Some(Self {
             allocate: options.allocate?,
             free: options.free,
             context: options.context,
         })
-    }
-}
-
-fn allocate(allocator: Option<CallerAllocator>, size: u32) -> Option<NonZeroU32> {
-    match allocator {
-        Some(allocator) => NonZeroU32::new(allocator.allocate.call(allocator.context, size, 0, 0)),
-        None => lockfree::pool_allocate(size),
     }
 }
 
@@ -385,9 +331,17 @@ impl Request<'_> {
     const DEFAULT_NAME: &'static CStr = c"game:\\logfile.txt";
 }
 
+fn allocate(allocator: Option<CallerAllocator>, size: u32) -> Option<NonZeroU32> {
+    match allocator {
+        Some(allocator) => NonZeroU32::new(allocator.allocate.call(allocator.context, size, 0, 0)),
+        None => lockfree::pool_allocate(size),
+    }
+}
+
 /// Create an engine and store it through `output` (stock 0x91f79470).
 fn create(request: &Request<'_>, output: OutputWord<'_>) -> Hresult {
     output.store(0);
+
     match create_engine(request) {
         Ok(engine) => {
             output.store(engine.address());
@@ -403,6 +357,7 @@ fn create_engine(request: &Request<'_>) -> Result<Engine, LogEngineError> {
         NonZeroU32::new(request.entry_size).map_or(Request::DEFAULT_ENTRY_SIZE, NonZeroU32::get);
     let entries =
         NonZeroU32::new(request.entries).map_or(Request::DEFAULT_ENTRIES, NonZeroU32::get);
+
     // Stock sizes the object without an overflow check and then queues
     // entries beyond a wrapped allocation; an overflowing size is refused.
     let size = entry_size
@@ -412,6 +367,7 @@ fn create_engine(request: &Request<'_>) -> Result<Engine, LogEngineError> {
     let Some(address) = size.and_then(|size| allocate(allocator, size)) else {
         return Err(LogEngineError::OutOfMemory);
     };
+
     let object = ptr::with_exposed_provenance_mut::<LogEngine>(address.get() as usize);
     // SAFETY: the new allocation holds the header and the entries, aligned
     // for the header (4 bytes): pool blocks are, and the export 357 and 358
@@ -421,6 +377,7 @@ fn create_engine(request: &Request<'_>) -> Result<Engine, LogEngineError> {
         object.write_bytes(0, 1);
         Engine(NonNull::new_unchecked(object))
     };
+
     let fields = engine.get();
     if let Some(allocator) = allocator {
         fields
@@ -428,6 +385,7 @@ fn create_engine(request: &Request<'_>) -> Result<Engine, LogEngineError> {
             .store(allocator.free.map_or(0, Routine::raw), Relaxed);
         fields.free_context.store(allocator.context, Relaxed);
     }
+
     if request.callback.is_none() {
         let name = request.name.unwrap_or(Request::DEFAULT_NAME.to_bytes());
         // The zeroed header holds the NUL: names stop a byte short of the
@@ -436,6 +394,7 @@ fn create_engine(request: &Request<'_>) -> Result<Engine, LogEngineError> {
             slot.store(byte, Relaxed);
         }
     }
+
     fields.context.store(request.context, Relaxed);
     fields.entry_size.store(entry_size, Relaxed);
     fields.file.store(INVALID_HANDLE_VALUE.raw(), Relaxed);
@@ -448,11 +407,13 @@ fn create_engine(request: &Request<'_>) -> Result<Engine, LogEngineError> {
     fields
         .done_pointer
         .store(initialize_event(&fields.done_event), Relaxed);
+
     let built = build(engine, request, entry_size, entries, processor);
     if built.is_err() {
         // SAFETY: the engine is not returned.
         unsafe { destroy(engine) };
     }
+
     built.map(|()| engine)
 }
 
@@ -474,8 +435,10 @@ fn build(
     const UNTESTED_FLAG: ThreadCreationFlags = ThreadCreationFlags::from_bits_retain(0x4);
 
     let fields = engine.get();
+
     let capacity = entries.wrapping_add(1);
     let options = request.options;
+
     let mut pending = seed_descriptor(options, capacity);
     pending.options.flags |= OptionFlags::REMOVE_WAITS;
     if request.block {
@@ -487,6 +450,7 @@ fn build(
         wait_for_item_or_quit as extern "C" fn(u32, u32, u32, u32) -> NtStatus,
     ));
     create_queue(&fields.pending_cell, options, pending)?;
+
     let mut free = seed_descriptor(options, capacity);
     if request.block {
         free.options.remove_timeout = Timeout::INFINITE;
@@ -494,6 +458,7 @@ fn build(
         free.options.flags |= OptionFlags::INSERT_WAITS | OptionFlags::REMOVE_WAITS;
     }
     create_queue(&fields.free_cell, options, free)?;
+
     let mut entry = engine.address().wrapping_add(size_of::<LogEngine>() as u32);
     for _ in 0..(entries as i32).max(0) {
         fields
@@ -501,12 +466,16 @@ fn build(
             .map_err(|error| LogEngineError::Queue(error.insert_result()))?;
         entry = entry.wrapping_add(entry_size);
     }
+
     let system =
         request.callback.is_none() || thread::current_object().process_type() != ProcessType::TITLE;
-    let mut flags = ThreadCreationFlags::processors(1 << processor) | WORKER_FLAGS;
-    if system {
-        flags |= ThreadCreationFlags::SYSTEM_PROCESS;
-    }
+    let flags = ThreadCreationFlags::processors(1 << processor) | WORKER_FLAGS;
+    let flags = if system {
+        flags | ThreadCreationFlags::SYSTEM_PROCESS
+    } else {
+        flags
+    };
+
     // SAFETY: the handle and id outputs are words of the engine object;
     // `worker` takes the engine as its context.
     let status = unsafe {
@@ -520,6 +489,7 @@ fn build(
             flags,
         )
     };
+
     status.result().map_err(LogEngineError::Thread)
 }
 
@@ -531,6 +501,7 @@ fn seed_descriptor(options: Option<&CreationDescriptor>, capacity: u32) -> Creat
     let mut descriptor = options.copied().unwrap_or_default();
     descriptor.per_block = capacity;
     descriptor.node_limit = capacity;
+
     descriptor
 }
 
@@ -548,17 +519,21 @@ fn create_queue(
         // the engine header in `create_engine`).
         unsafe { LogEngine::cell(address) }.store(0, Relaxed);
     }
+
     cell.store(address.map_or(0, NonZeroU32::get), Relaxed);
     let Some(address) = address else {
         return Err(LogEngineError::OutOfMemory);
     };
+
     // SAFETY: as above.
     let queue_cell = unsafe { LogEngine::cell(address) };
     descriptor.size = CreationDescriptor::SIZE;
     let queue = Creation::new(Some(&descriptor))
         .and_then(|creation| Queue::create_with(&creation))
         .map_err(|error| LogEngineError::Queue(error.into()))?;
+
     queue_cell.store(queue.get(), Relaxed);
+
     Ok(())
 }
 
@@ -567,9 +542,11 @@ fn initialize_event(event: &Kevent) -> u32 {
     let address = event.as_ptr().expose_provenance() as u32;
     // The empty wait list links to itself.
     let list = address + 8;
+
     // SAFETY: the event lies in a new engine, which no other thread uses
     // yet.
     unsafe { event.as_ptr().cast::<[u32; 4]>().write([0, 0, list, list]) };
+
     address
 }
 
@@ -586,6 +563,7 @@ extern "C" fn wait_for_item_or_quit(
     if timeout == Timeout::IMMEDIATE {
         return NtStatus::TIMEOUT;
     }
+
     let interval = timeout.interval();
     let pointer = interval.as_ref().map_or(ptr::null(), ptr::from_ref);
     // SAFETY: the pending queue of an engine passes the address of the
@@ -596,6 +574,7 @@ extern "C" fn wait_for_item_or_quit(
         ptr::with_exposed_provenance_mut::<DispatcherObject>(semaphore as usize),
         ptr::with_exposed_provenance_mut::<DispatcherObject>(quit as usize),
     ];
+
     let mut wait_blocks = [0u32; 16];
     // SAFETY: both objects are dispatcher objects of the queue and engine;
     // `interval` and `wait_blocks` outlive the wait.
@@ -621,6 +600,7 @@ extern "C" fn worker(engine: u32) -> u32 {
         Some(engine) => run(engine),
         None => WorkerExit::Failed,
     };
+
     // SAFETY: the worker owns no resources once `run` returns.
     unsafe { xboxkrnl::ExTerminateThread(code as u32) }
 }
@@ -628,14 +608,22 @@ extern "C" fn worker(engine: u32) -> u32 {
 /// The worker's work. Close may free the engine once the done event is
 /// signaled, so only a local reference reaches it.
 fn run(engine: Engine) -> WorkerExit {
+    /// Pending-queue dequeue failure once the wait routine reports the quit
+    /// event: the queue takes the routine's STATUS_WAIT_1 (wait index 1) as
+    /// Win32 code 1.
+    const QUIT_SIGNALED: lockfree::Error = lockfree::Error::Wait(Win32Error::INVALID_FUNCTION);
+
     let engine = engine.get();
+
     if engine.pending_cell.load(Relaxed) == 0 {
         return WorkerExit::Failed;
     }
+
     if engine.quit_pointer.load(Relaxed) == 0 || engine.done_pointer.load(Relaxed) == 0 {
         engine.fail(WorkerError::MissingEvent);
         return WorkerExit::Failed;
     }
+
     if engine.callback.load(Relaxed) == 0 {
         // SAFETY: the name field holds a NUL-terminated name.
         let file = unsafe {
@@ -650,11 +638,13 @@ fn run(engine: Engine) -> WorkerExit {
             )
         };
         engine.file.store(file.raw(), Relaxed);
+
         if file == INVALID_HANDLE_VALUE {
             engine.fail(WorkerError::NoFile);
             return WorkerExit::Failed;
         }
     }
+
     // Until the quit event, a failed delivery ends the worker without
     // signaling the done event.
     loop {
@@ -666,16 +656,19 @@ fn run(engine: Engine) -> WorkerExit {
                 continue;
             }
         };
+
         if let Err(error) = deliver(engine, entry) {
             engine.fail(error);
             return WorkerExit::Failed;
         }
+
         if engine.enqueue(Cell::Free, entry).is_err() {
             engine.fail(WorkerError::Requeue);
             engine.done().set();
             return WorkerExit::Failed;
         }
     }
+
     loop {
         let Some(pending) = engine
             .queue(Cell::Pending)
@@ -685,15 +678,18 @@ fn run(engine: Engine) -> WorkerExit {
             engine.done().set();
             return WorkerExit::Finished;
         };
+
         let entry = match pending.dequeue() {
             Ok(entry) if entry != 0 => entry,
             _ => continue,
         };
+
         if let Err(error) = deliver(engine, entry) {
             engine.fail(error);
             engine.done().set();
             return WorkerExit::Failed;
         }
+
         if engine.enqueue(Cell::Free, entry).is_err() {
             engine.fail(WorkerError::Requeue);
             write_summary(engine);
@@ -707,6 +703,7 @@ fn run(engine: Engine) -> WorkerExit {
 fn deliver(engine: &LogEngine, entry: u32) -> Result<(), WorkerError> {
     let callback = engine.callback.load(Relaxed);
     let entry_size = engine.entry_size.load(Relaxed);
+
     // SAFETY: the callback word holds 0 or the callback the create export's
     // caller passed (export contract).
     if let Some(callback) = unsafe { Routine::new(callback) } {
@@ -717,6 +714,7 @@ fn deliver(engine: &LogEngine, entry: u32) -> Result<(), WorkerError> {
             Ok(())
         };
     }
+
     // Stock's strlen runs on into the following entries when the entry
     // holds no NUL; the text here ends with the entry.
     // SAFETY: a pending entry holds `entry_size` bytes after the engine
@@ -731,6 +729,7 @@ fn deliver(engine: &LogEngine, entry: u32) -> Result<(), WorkerError> {
         .iter()
         .position(|&byte| byte == 0)
         .unwrap_or(bytes.len());
+
     let file = Handle::from_raw(engine.file.load(Relaxed));
     write_file(file, &bytes[..length]).map_err(|_| WorkerError::Write(last_error()))
 }
@@ -741,6 +740,7 @@ fn write_summary(engine: &LogEngine) {
     let Some(file) = engine.file() else {
         return;
     };
+
     let mut text = Text::<0x60>::new();
     let _ = writeln!(
         text,
@@ -748,6 +748,7 @@ fn write_summary(engine: &LogEngine) {
         engine.dropped.load(Relaxed) as i32,
         engine.missed.load(Relaxed) as i32
     );
+
     // A failed write only records the thread's last error, as stock.
     let _ = write_file(file, text.as_bytes());
     close_handle(file);
@@ -772,6 +773,7 @@ fn write_file(file: Handle, bytes: &[u8]) -> Result<(), KernelError> {
             ptr::null(),
         )
     };
+
     if status == NtStatus::PENDING {
         // SAFETY: `file` is the engine's open log file.
         status = unsafe {
@@ -781,6 +783,7 @@ fn write_file(file: Handle, bytes: &[u8]) -> Result<(), KernelError> {
             status = io_status.status;
         }
     }
+
     status.result().inspect_err(|&error| set_last_error(error))
 }
 
@@ -807,10 +810,12 @@ unsafe fn destroy(engine: Engine) {
         routine: unsafe { Routine::new(fields.free_routine.load(Relaxed)) },
         context: fields.free_context.load(Relaxed),
     };
+
     for word in [&fields.pending_cell, &fields.free_cell] {
         let Some(address) = NonZeroU32::new(word.load(Relaxed)) else {
             continue;
         };
+
         // SAFETY: the engine allocated the cell.
         let cell = unsafe { LogEngine::cell(address) };
         let queue = cell.load(Relaxed);
@@ -819,18 +824,22 @@ unsafe fn destroy(engine: Engine) {
             unsafe { Queue::destroy(queue) };
             cell.store(0, Relaxed);
         }
+
         // SAFETY: the cell is not used after.
         unsafe { release.free(address) };
         word.store(0, Relaxed);
     }
+
     // The events need no cleanup.
     fields.quit_pointer.store(0, Relaxed);
     fields.done_pointer.store(0, Relaxed);
+
     let worker = fields.worker.load(Relaxed);
     if worker != 0 {
         close_handle(Handle::from_raw(worker));
         fields.worker.store(0, Relaxed);
     }
+
     let address = engine.0.as_ptr().expose_provenance() as u32;
     // SAFETY: the engine block is not used after; an engine is not at
     // address 0.
@@ -854,6 +863,7 @@ pub(super) fn create_for_callback(
         block: config.block,
         options: None,
     };
+
     create_engine(&request)
 }
 
@@ -867,6 +877,7 @@ pub(super) fn create_for_callback(
 pub(super) unsafe fn close_after_worker(engine: Engine) {
     let fields = engine.get();
     fields.quit().set();
+
     // SAFETY: the worker word holds the worker thread handle until
     // `destroy`.
     unsafe {
@@ -877,7 +888,9 @@ pub(super) unsafe fn close_after_worker(engine: Engine) {
             ptr::null(),
         )
     };
+
     sleep(Duration::from_millis(1));
+
     // SAFETY: the worker has ended; the caller guarantees the rest.
     unsafe { destroy(engine) };
 }
@@ -894,10 +907,12 @@ pub(super) fn write(engine: Engine, record: &[u8]) {
     if fields.worker_running() {
         return;
     }
+
     let Some(entry) = fields.take_free() else {
-        fields.dropped.fetch_add(1, Ordering::Relaxed);
+        fields.dropped.fetch_add(1, Relaxed);
         return;
     };
+
     let length = record.len().min(fields.entry_size.load(Relaxed) as usize);
     // SAFETY: a free entry holds `entry_size` bytes and belongs to this
     // producer until it is queued.
@@ -907,6 +922,7 @@ pub(super) fn write(engine: Engine, record: &[u8]) {
 
 pub(super) fn counters(engine: Engine) -> TellLogCounters {
     let fields = engine.get();
+
     TellLogCounters {
         dropped: fields.dropped.load(Relaxed),
         missed: fields.missed.load(Relaxed),
@@ -924,9 +940,10 @@ pub(super) fn counters(engine: Engine) -> TellLogCounters {
 /// arguments that match it.
 unsafe fn print(engine: &LogEngine, format: u32, arguments: u32) {
     let Some(entry) = engine.take_free() else {
-        engine.dropped.fetch_add(1, Ordering::Relaxed);
+        engine.dropped.fetch_add(1, Relaxed);
         return;
     };
+
     let entry_size = engine.entry_size.load(Relaxed);
     // SAFETY: the free entry holds `entry_size` bytes and belongs to this
     // producer; the caller guarantees the format and the va_list.
@@ -935,6 +952,7 @@ unsafe fn print(engine: &LogEngine, format: u32, arguments: u32) {
         // SAFETY: the last byte of the entry.
         unsafe { entry.add(entry_size as usize - 1).write(0) };
     }
+
     engine.append(entry);
 }
 
@@ -994,6 +1012,7 @@ extern "C" fn create_file_log_with_options(
     let Some(output_word) = (unsafe { OutputWord::new(output_word) }) else {
         return Hresult::INVALID_ARGUMENT;
     };
+
     // SAFETY: export 357 contract: `name` is 0 or a NUL-terminated file
     // name and `options` 0 or a creation descriptor whose allocator returns
     // 4-byte aligned blocks.
@@ -1003,6 +1022,7 @@ extern "C" fn create_file_log_with_options(
             caller_options(options),
         )
     };
+
     let request = Request {
         processor,
         name,
@@ -1013,6 +1033,7 @@ extern "C" fn create_file_log_with_options(
         block: block != 0,
         options,
     };
+
     create(&request, output_word)
 }
 export!(357, create_file_log_with_options);
@@ -1033,6 +1054,7 @@ extern "C" fn create_callback_log_with_options(
     let Some(output_word) = (unsafe { OutputWord::new(output_word) }) else {
         return Hresult::INVALID_ARGUMENT;
     };
+
     // SAFETY: export 358 contract: `callback` is 0 or a console routine and
     // `options` 0 or a creation descriptor whose allocator returns 4-byte
     // aligned blocks.
@@ -1047,6 +1069,7 @@ extern "C" fn create_callback_log_with_options(
         block: block != 0,
         options,
     };
+
     create(&request, output_word)
 }
 export!(358, create_callback_log_with_options);
@@ -1059,8 +1082,10 @@ extern "C" fn close(engine: u32) {
     let Some(engine) = (unsafe { Engine::new(engine) }) else {
         return;
     };
+
     let fields = engine.get();
     fields.quit().set();
+
     let done = fields.done();
     // SAFETY: the done pointer word held the engine's initialized event.
     let status = unsafe {
@@ -1072,10 +1097,13 @@ extern "C" fn close(engine: u32) {
             ptr::null(),
         )
     };
+
     if status != NtStatus::WAIT_0 {
         return;
     }
+
     sleep(Duration::from_millis(1));
+
     // SAFETY: the worker has signaled the done event; the export contract
     // covers the rest.
     unsafe { destroy(engine) };
@@ -1089,6 +1117,7 @@ extern "C" fn print_arguments(engine: u32, format: u32, arguments: u32) {
     let Some(engine) = (unsafe { Engine::new(engine) }) else {
         return;
     };
+
     // SAFETY: export 361 contract: `format` is a format string and the
     // arguments match it.
     unsafe { print(engine.get(), format, arguments) };
@@ -1121,12 +1150,15 @@ extern "C" fn print_list(engine: u32, format: u32, arguments: u32) {
     let Some(engine) = (unsafe { Engine::new(engine) }) else {
         return;
     };
+
     let fields = engine.get();
-    if !fields.worker_running() {
-        // SAFETY: export 362 contract: `format` is a format string and
-        // `arguments` a va_list that matches it.
-        unsafe { print(fields, format, arguments) };
+    if fields.worker_running() {
+        return;
     }
+
+    // SAFETY: export 362 contract: `format` is a format string and
+    // `arguments` a va_list that matches it.
+    unsafe { print(fields, format, arguments) };
 }
 export!(362, print_list);
 
@@ -1136,13 +1168,16 @@ extern "C" fn write_export(engine: u32, data: u32, length: u32) {
     let Some(engine) = (unsafe { Engine::new(engine) }) else {
         return;
     };
+
     let Some(data) = NonNull::new(ptr::with_exposed_provenance_mut::<u8>(data as usize)) else {
         return;
     };
+
     // Stock copies at most an entry.
     let length = length.min(engine.get().entry_size.load(Relaxed));
     // SAFETY: export 363 contract: `data` holds `length` bytes.
     let record = unsafe { slice::from_raw_parts(data.as_ptr(), length as usize) };
+
     write(engine, record);
 }
 export!(363, write_export);
@@ -1153,11 +1188,14 @@ extern "C" fn counters_export(engine: u32, dropped: u32, missed: u32) {
     let Some(engine) = (unsafe { Engine::new(engine) }) else {
         return;
     };
+
     let fields = engine.get();
+
     // SAFETY: export 364 contract: `dropped` is 0 or a writable word.
     if let Some(dropped) = unsafe { OutputWord::new(dropped) } {
         dropped.store(fields.dropped.load(Relaxed));
     }
+
     // SAFETY: export 364 contract: `missed` is 0 or a writable word.
     if let Some(missed) = unsafe { OutputWord::new(missed) } {
         missed.store(fields.missed.load(Relaxed));

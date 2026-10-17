@@ -8,6 +8,7 @@
 
 use core::ffi::CStr;
 use core::mem::offset_of;
+use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 use core::time::Duration;
@@ -23,7 +24,6 @@ use openxbdm_server::commands::performance::counters::CounterObject;
 use openxbdm_server::commands::performance::counters::CounterQuery;
 use openxbdm_server::commands::performance::counters::CounterRegistration;
 use openxbdm_server::commands::performance::counters::Evaluation;
-use openxbdm_server::reply::CommandError;
 use xbox360::module::Ordinal;
 use xbox360::module::SystemModule;
 use xbox360::module::resolve_export;
@@ -56,6 +56,8 @@ use xbox360_sys::xboxkrnl::ObjectAttributes;
 use xbox360_sys::xboxkrnl::ProcessType;
 use xbox360_sys::xboxkrnl::TimerType;
 
+use super::error::RegisterError;
+use super::error::StatisticsError;
 use super::load_pair;
 use super::store_pair;
 use crate::exports::bridged;
@@ -70,44 +72,77 @@ const HISTORY: usize = counters::HISTORY_LENGTH as usize;
 /// Length word of the monitor's memory statistics block.
 pub(crate) const MONITOR_STATISTICS_LENGTH: u32 = 0x30;
 
-/// A failed counter registration (stock export 33).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RegisterError {
-    /// The process has no counter directory.
-    NoDirectory,
-    /// The sampling period exceeds [`counters::MAX_PERIOD`].
-    PeriodTooLong,
-    Kernel(KernelError),
+/// Words of the monitor's memory statistics block (stock export 75).
+mod monitor_statistics {
+    pub(super) const LENGTH: usize = 0;
+    pub(super) const TOTAL_PAGES: usize = 1;
+    pub(super) const FREE_PAGES: usize = 2;
+    pub(super) const STACK_PAGES: usize = 3;
+    pub(super) const PAGE_TABLE_PAGES: usize = 4;
+    /// Stock stores 0.
+    pub(super) const RESERVED: usize = 5;
+    pub(super) const POOL_PAGES: usize = 6;
+    pub(super) const VM_PAGES: usize = 7;
+    pub(super) const IMAGE_PAGES: usize = 8;
+    pub(super) const CACHE_PAGES: usize = 9;
+    pub(super) const CONTIGUOUS_PAGES: usize = 10;
+    /// Stock stores 0.
+    pub(super) const DEBUGGER_PAGES: usize = 11;
 }
 
-impl From<RegisterError> for Hresult {
-    fn from(error: RegisterError) -> Self {
-        match error {
-            RegisterError::NoDirectory => Hresult::OUT_OF_MEMORY,
-            RegisterError::PeriodTooLong => CounterError::TypeInvalid.into(),
-            RegisterError::Kernel(error) => {
-                CommandError::from_kernel(error, CommandError::Fail).into()
-            }
-        }
-    }
-}
+static COUNTER_TYPE: ObjectType = ObjectType {
+    allocate: AtomicU32::new(0),
+    free: AtomicU32::new(0),
+    close: AtomicU32::new(0),
+    delete: AtomicU32::new(0),
+    parse: AtomicU32::new(0),
+    default_object: AtomicU32::new(0),
+    pool_tag: AtomicU32::new(u32::from_be_bytes(*b"cpmd")),
+};
 
-/// A failed memory statistics query (stock export 75).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StatisticsError {
-    /// The block's length word is not [`MONITOR_STATISTICS_LENGTH`].
-    BadLength,
-    Kernel(KernelError),
-}
+static DEFAULT_OBJECT: DefaultObject = DefaultObject {
+    _object_type: AtomicU32::new(EventType::Synchronization.raw() << 24),
+    _signal_state: AtomicU32::new(1),
+    wait_list: Link::new(),
+};
 
-impl From<StatisticsError> for Hresult {
-    fn from(error: StatisticsError) -> Self {
-        match error {
-            StatisticsError::BadLength => Hresult::INVALID_ARGUMENT,
-            StatisticsError::Kernel(error) => error.into(),
-        }
-    }
-}
+/// Directory handles per process type; a handle is never 0.
+static SYSTEM_DIRECTORY: AtomicU32 = AtomicU32::new(0);
+static TITLE_DIRECTORY: AtomicU32 = AtomicU32::new(0);
+/// The module is unloading: no directory is created or opened again.
+static CLOSED: AtomicBool = AtomicBool::new(false);
+
+static TITLE_INTERFACE: TitleInterface = TitleInterface {
+    size: AtomicU32::new(0),
+    capture_control: AtomicU32::new(0),
+    capture_result: AtomicU32::new(0),
+    capture_start: AtomicU32::new(0),
+    capture_stop: AtomicU32::new(0),
+    _reserved_14: AtomicU32::new(0),
+    frame_count: AtomicU32::new(0),
+    frame_ticks: AtomicU32::new(0),
+};
+
+/// Block published at debug monitor data +0x24 (stock 0x91fade30); the
+/// monitor never reads or writes it.
+static TITLE_RESERVED: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+
+static SOURCES: Sources = Sources {
+    pages: [const { AtomicU32::new(0) }; 8],
+    threads: [const { [const { SourcePair::new() }; 3] }; HARDWARE_THREAD_COUNT],
+};
+
+/// Sources of the GPU counters: value and rate words nothing updates.
+static GPU_SOURCES: [[u32; 2]; 4] = [[0; 2]; 4];
+
+static SAMPLER: Sampler = Sampler {
+    dpc: Kdpc::new(),
+    timer: Ktimer::new(),
+    buckets: [const { Link::new() }; BUCKETS],
+    current: AtomicU32::new(0),
+    processor_blocks: AtomicU32::new(0),
+    active: AtomicU32::new(0),
+};
 
 xbox360_sys::flags! {
     /// Flag bits of a registration word.
@@ -127,15 +162,6 @@ enum SourceKind {
     Words = 2,
 }
 
-/// Class bits of a counter type.
-#[derive(Clone, Copy)]
-#[repr(u32)]
-enum CounterClass {
-    Value = 0,
-    Rate = 0x10,
-    Ratio = 0x20,
-}
-
 impl SourceKind {
     /// Registration word of a built-in counter of `class`, sampled every
     /// tick.
@@ -143,6 +169,15 @@ impl SourceKind {
         const EVERY_TICK: u32 = 1;
         CounterRegistration(((self as u32) << 16) | class as u32 | EVERY_TICK)
     }
+}
+
+/// Class bits of a counter type.
+#[derive(Clone, Copy)]
+#[repr(u32)]
+enum CounterClass {
+    Value = 0,
+    Rate = 0x10,
+    Ratio = 0x20,
 }
 
 /// Console object type descriptor.
@@ -156,16 +191,6 @@ struct ObjectType {
     default_object: AtomicU32,
     pool_tag: AtomicU32,
 }
-
-static COUNTER_TYPE: ObjectType = ObjectType {
-    allocate: AtomicU32::new(0),
-    free: AtomicU32::new(0),
-    close: AtomicU32::new(0),
-    delete: AtomicU32::new(0),
-    parse: AtomicU32::new(0),
-    default_object: AtomicU32::new(0),
-    pool_tag: AtomicU32::new(u32::from_be_bytes(*b"cpmd")),
-};
 
 /// `{flink, blink}` link of a list the monitor keeps: a sampler bucket
 /// head, the first two words of a counter body, or the wait list of
@@ -213,16 +238,6 @@ struct DefaultObject {
 
 const _: () = assert!(size_of::<DefaultObject>() == size_of::<xboxkrnl::Kevent>());
 
-static DEFAULT_OBJECT: DefaultObject = DefaultObject {
-    _object_type: AtomicU32::new(EventType::Synchronization.raw() << 24),
-    _signal_state: AtomicU32::new(1),
-    wait_list: Link::new(),
-};
-
-fn counter_type() -> u32 {
-    core::ptr::from_ref(&COUNTER_TYPE) as u32
-}
-
 /// Body of a counter object, laid out as [`counters`] describes it.
 #[repr(C)]
 struct CounterBody {
@@ -250,57 +265,6 @@ const _: () = {
     assert!(offset_of!(CounterBody, _index) == 0xc0);
     assert!(size_of::<CounterBody>() == counters::OBJECT_SIZE);
 };
-
-/// Directory handles per process type; a handle is never 0.
-static SYSTEM_DIRECTORY: AtomicU32 = AtomicU32::new(0);
-static TITLE_DIRECTORY: AtomicU32 = AtomicU32::new(0);
-/// The module is unloading: no directory is created or opened again.
-static CLOSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-
-/// The counter directory of the calling process (stock 0x91f2a7a8): the
-/// system process creates it, a title opens it. Handles are kept.
-pub(super) fn directory() -> Option<u32> {
-    const COUNTER_DIRECTORY: &[u8] = b"\\DmCounters";
-    if CLOSED.load(Ordering::Acquire) {
-        return None;
-    }
-    let (slot, system) = match xboxkrnl::KeGetCurrentProcessType() {
-        ProcessType::SYSTEM => (&SYSTEM_DIRECTORY, true),
-        ProcessType::TITLE => (&TITLE_DIRECTORY, false),
-        _ => return None,
-    };
-    match slot.load(Ordering::Acquire) {
-        0 => {}
-        handle => return Some(handle),
-    }
-    let name = kernel::ansi_string(COUNTER_DIRECTORY);
-    let attributes = ObjectAttributes {
-        root_directory: Handle::NULL,
-        object_name: &name,
-        attributes: ObjectAttributeFlags::PERMANENT,
-    };
-    let mut handle = 0u32;
-    // SAFETY: `handle`, `attributes`, and the name it refers to are live
-    // for the call.
-    let status = unsafe {
-        if system {
-            xboxkrnl::NtCreateDirectoryObject((&raw mut handle).cast(), &attributes)
-        } else {
-            NtOpenDirectoryObject((&raw mut handle).cast(), &attributes)
-        }
-    };
-    if !status.is_success() {
-        kernel::debug_print(if system {
-            c"Failed to create system counter object directory.\n"
-        } else {
-            c"Failed to create Title counter object directory.\n"
-        });
-        slot.store(0, Ordering::Release);
-        return None;
-    }
-    slot.store(handle, Ordering::Release);
-    Some(handle)
-}
 
 /// `NtQueryDirectoryObject` buffer of the monitor: the counted entry name,
 /// the object type, then the name bytes.
@@ -349,6 +313,7 @@ impl DirectoryEntry {
             )
         };
         status.result()?;
+
         // SAFETY: on success the kernel has stored the name bytes in this
         // buffer, after the 0xc-byte header, and pointed `name` at them. An
         // entry whose name does not fit the 0x100 bytes after the header
@@ -372,86 +337,6 @@ impl CounterHandle {
         // SAFETY: the handle was opened by `open` and is closed once.
         unsafe { xboxkrnl::NtClose(Handle::from_raw(self.0)) };
     }
-}
-
-/// Open counter `name` (stock export 26, 0x91f2aa20).
-pub(super) fn open(name: &[u8]) -> Result<CounterHandle, CounterError> {
-    open_in(directory().ok_or(CounterError::NoDirectory)?, name)
-}
-
-fn open_in(directory: u32, name: &[u8]) -> Result<CounterHandle, CounterError> {
-    let name = kernel::ansi_string(name);
-    let attributes = ObjectAttributes {
-        root_directory: Handle::from_raw(directory),
-        object_name: &name,
-        attributes: ObjectAttributeFlags::CASE_INSENSITIVE,
-    };
-    let mut handle = 0u32;
-    // SAFETY: `attributes`, the name it refers to, and `handle` are live;
-    // the type is the registered counter object type.
-    let status = unsafe {
-        xboxkrnl::ObOpenObjectByName(&attributes, counter_type(), 0, (&raw mut handle).cast())
-    };
-    if !status.is_success() {
-        return Err(CounterError::NotFound);
-    }
-    Ok(CounterHandle(handle))
-}
-
-/// Referenced counter object of an open handle.
-pub(super) fn reference(handle: CounterHandle) -> Result<KernelCounter, KernelError> {
-    let mut object = 0u32;
-    // SAFETY: `object` is a live u32; the type is the registered counter
-    // object type.
-    let status = unsafe {
-        xboxkrnl::ObReferenceObjectByHandle(Handle::from_raw(handle.0), counter_type(), &mut object)
-    };
-    status.result()?;
-    // SAFETY: the kernel referenced an object of the counter type, which
-    // only `register` creates; the reference keeps it allocated until
-    // `KernelCounter::release`.
-    Ok(KernelCounter(unsafe { CounterView::new(object) }))
-}
-
-/// Evaluate a referenced counter (stock export 27, 0x91f2aab0).
-pub(super) fn query(
-    counter: &mut KernelCounter,
-    query: CounterQuery,
-    out: &mut CounterSample,
-) -> Result<Evaluation, CounterError> {
-    // SAFETY: only `register` creates counter objects, and it initializes
-    // each; only the sampler writes the history index after that.
-    unsafe { counters::query(&mut counter.0, query, out) }
-}
-
-/// One directory entry after `context` (0 restarts), its name copied into
-/// `name` (stock export 53, 0x91f2adf0).
-pub(super) fn next(context: &mut u32, name: &mut [u8]) -> Result<CounterEntry, CounterError> {
-    let directory = directory().ok_or(CounterError::End)?;
-    let mut record = DirectoryEntry::new();
-    let source = record
-        .query(directory, context)
-        .map_err(|error| match error {
-            KernelError::NoMoreEntries => CounterError::End,
-            KernelError::BufferTooSmall => CounterError::NameTooLong,
-            error => CounterError::Kernel(error),
-        })?;
-    // Stock copies the full entry name; the query buffer holds at most
-    // 0x100 name bytes, which can run past the caller's name field.
-    let length = source.len().min(name.len() - 1);
-    name[..length].copy_from_slice(&source[..length]);
-    name[length] = 0;
-    let handle = open(&name[..length]).map_err(|_| CounterError::Unexpected)?;
-    let entry = reference(handle).map(|counter| {
-        let counter_type = counter.0.registration().counter_type();
-        counter.release();
-        CounterEntry {
-            name_len: length,
-            counter_type,
-        }
-    });
-    handle.close();
-    entry.map_err(|_| CounterError::Unexpected)
 }
 
 /// A referenced counter object (see [`reference`]). The evaluation runs on
@@ -589,6 +474,7 @@ impl CounterObject for CounterView {
         let result = Hresult(unsafe {
             kernel::call_export(self.source(), value as *mut u64 as usize as u32, rate, 0, 0)
         });
+
         counters::routine_result(result).map(|_| ())
     }
 
@@ -603,6 +489,7 @@ impl CounterObject for CounterView {
         sample[2] = (out.rate >> 32) as u32;
         sample[3] = out.rate as u32;
         sample[4] = out.sample_type;
+
         // SAFETY: the caller checked the handler flag; handler counters
         // register a routine taking (query, object, sample).
         let result = Hresult(unsafe {
@@ -614,9 +501,11 @@ impl CounterObject for CounterView {
                 0,
             )
         });
+
         out.value = (u64::from(sample[0]) << 32) | u64::from(sample[1]);
         out.rate = (u64::from(sample[2]) << 32) | u64::from(sample[3]);
         out.sample_type = sample[4];
+
         counters::routine_result(result)
     }
 
@@ -662,91 +551,12 @@ const _: () = {
     assert!(size_of::<TitleInterface>() == 0x20);
 };
 
-static TITLE_INTERFACE: TitleInterface = TitleInterface {
-    size: AtomicU32::new(0),
-    capture_control: AtomicU32::new(0),
-    capture_result: AtomicU32::new(0),
-    capture_start: AtomicU32::new(0),
-    capture_stop: AtomicU32::new(0),
-    _reserved_14: AtomicU32::new(0),
-    frame_count: AtomicU32::new(0),
-    frame_ticks: AtomicU32::new(0),
-};
-/// Block published at debug monitor data +0x24 (stock 0x91fade30); the
-/// monitor never reads or writes it.
-static TITLE_RESERVED: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
-
-/// Store the capture entries titles call through the published block.
-pub(super) fn set_capture_entries(start: u32, stop: u32) {
-    TITLE_INTERFACE
-        .capture_start
-        .store(start, Ordering::Release);
-    TITLE_INTERFACE.capture_stop.store(stop, Ordering::Release);
-}
-
 /// Title capture dwords published through the block (stock 0x91fade44 and
 /// 0x91fade48).
 #[derive(Clone, Copy)]
 pub(super) struct TitleCaptureRequest {
     pub(super) control: Option<u32>,
     pub(super) result: Option<u32>,
-}
-
-pub(super) fn title_capture_request() -> TitleCaptureRequest {
-    let pointer = |field: &AtomicU32| match field.load(Ordering::Acquire) {
-        0 => None,
-        address => Some(address),
-    };
-    TitleCaptureRequest {
-        control: pointer(&TITLE_INTERFACE.capture_control),
-        result: pointer(&TITLE_INTERFACE.capture_result),
-    }
-}
-
-/// The title's frame counter, when the title published one.
-fn frame_number() -> u32 {
-    match TITLE_INTERFACE.frame_count.load(Ordering::Acquire) {
-        0 => 0,
-        // SAFETY: a title publishes the address of its frame count dword
-        // and keeps it until `title_terminated` withdraws it.
-        address => unsafe { kernel::object_at::<AtomicU32>(address) }.load(Ordering::Relaxed),
-    }
-}
-
-/// Reader of `Frames` (stock 0x91f2a510).
-extern "C" fn read_frames(value: *mut [AtomicU32; 2], _rate: *mut u32) -> Hresult {
-    let result = match TITLE_INTERFACE.frame_count.load(Ordering::Acquire) {
-        0 => Err(CounterError::DataNotAvailable),
-        address => {
-            // SAFETY: readers are called with the address of a u64
-            // (`CounterView::call_reader` passes its own).
-            let value = unsafe { &*value };
-            value[0].store(0, Ordering::Relaxed);
-            // SAFETY: as in `frame_number`.
-            let count = unsafe { kernel::object_at::<AtomicU32>(address) };
-            value[1].store(count.load(Ordering::Relaxed), Ordering::Relaxed);
-            Ok(())
-        }
-    };
-    export_result(result)
-}
-
-/// Reader of `Frame Ticks` (stock 0x91f2a550).
-extern "C" fn read_frame_ticks(value: *mut [AtomicU32; 2], _rate: *mut u32) -> Hresult {
-    let address = TITLE_INTERFACE.frame_ticks.load(Ordering::Acquire);
-    // A block that ends before the frame ticks field has none.
-    let size = TITLE_INTERFACE.size.load(Ordering::Acquire);
-    if size <= offset_of!(TitleInterface, frame_ticks) as u32 || address == 0 {
-        return export_result(Err(CounterError::DataNotAvailable));
-    }
-    // SAFETY: as in `read_frames`.
-    let value = unsafe { &*value };
-    value[0].store(0, Ordering::Relaxed);
-    // SAFETY: a title publishes the address of its frame ticks dword and
-    // keeps it until `title_terminated` withdraws it.
-    let ticks = unsafe { kernel::object_at::<AtomicU32>(address) };
-    value[1].store(ticks.load(Ordering::Relaxed), Ordering::Relaxed);
-    Hresult::OK
 }
 
 /// Value and rate words of a kind 2 counter source.
@@ -773,70 +583,6 @@ struct Sources {
     threads: [[SourcePair; 3]; HARDWARE_THREAD_COUNT],
 }
 
-static SOURCES: Sources = Sources {
-    pages: [const { AtomicU32::new(0) }; 8],
-    threads: [const { [const { SourcePair::new() }; 3] }; HARDWARE_THREAD_COUNT],
-};
-
-/// Sources of the GPU counters: value and rate words nothing updates.
-static GPU_SOURCES: [[u32; 2]; 4] = [[0; 2]; 4];
-
-const PAGE_COUNTERS: [&CStr; 8] = [
-    c"Free Pages",
-    c"Cache Pages",
-    c"Image Pages",
-    c"Pool Pages",
-    c"Stack Pages",
-    c"VM Pages",
-    c"Contiguous Pages",
-    c"Debugger Pages",
-];
-const THREAD_COUNTERS: [[&CStr; 3]; HARDWARE_THREAD_COUNT] = [
-    [c"%Thread0 Idle", c"%Thread0 DPC", c"%Thread0 ISR"],
-    [c"%Thread1 Idle", c"%Thread1 DPC", c"%Thread1 ISR"],
-    [c"%Thread2 Idle", c"%Thread2 DPC", c"%Thread2 ISR"],
-    [c"%Thread3 Idle", c"%Thread3 DPC", c"%Thread3 ISR"],
-    [c"%Thread4 Idle", c"%Thread4 DPC", c"%Thread4 ISR"],
-    [c"%Thread5 Idle", c"%Thread5 DPC", c"%Thread5 ISR"],
-];
-const GPU_COUNTERS: [&CStr; 4] = [
-    c"% GPU",
-    c"% GPU Frontend",
-    c"% GPU Backend",
-    c"% GPU Swap Stall",
-];
-
-/// Words of the monitor's memory statistics block (stock export 75).
-mod monitor_statistics {
-    pub(super) const LENGTH: usize = 0;
-    pub(super) const TOTAL_PAGES: usize = 1;
-    pub(super) const FREE_PAGES: usize = 2;
-    pub(super) const STACK_PAGES: usize = 3;
-    pub(super) const PAGE_TABLE_PAGES: usize = 4;
-    /// Stock stores 0.
-    pub(super) const RESERVED: usize = 5;
-    pub(super) const POOL_PAGES: usize = 6;
-    pub(super) const VM_PAGES: usize = 7;
-    pub(super) const IMAGE_PAGES: usize = 8;
-    pub(super) const CACHE_PAGES: usize = 9;
-    pub(super) const CONTIGUOUS_PAGES: usize = 10;
-    /// Stock stores 0.
-    pub(super) const DEBUGGER_PAGES: usize = 11;
-}
-
-/// Output words of the monitor's memory statistics that feed the page
-/// counters, in counter order.
-const PAGE_STATISTICS: [usize; 8] = [
-    monitor_statistics::FREE_PAGES,
-    monitor_statistics::CACHE_PAGES,
-    monitor_statistics::IMAGE_PAGES,
-    monitor_statistics::POOL_PAGES,
-    monitor_statistics::STACK_PAGES,
-    monitor_statistics::VM_PAGES,
-    monitor_statistics::CONTIGUOUS_PAGES,
-    monitor_statistics::DEBUGGER_PAGES,
-];
-
 /// Sampler state; modified at `SAMPLER_IRQL` or in the sampler DPC, as stock.
 struct Sampler {
     dpc: Kdpc,
@@ -851,137 +597,6 @@ struct Sampler {
     /// DPC bodies in progress, waited for at unload.
     active: AtomicU32,
 }
-
-static SAMPLER: Sampler = Sampler {
-    dpc: Kdpc::new(),
-    timer: Ktimer::new(),
-    buckets: [const { Link::new() }; BUCKETS],
-    current: AtomicU32::new(0),
-    processor_blocks: AtomicU32::new(0),
-    active: AtomicU32::new(0),
-};
-
-/// Append `object` to the bucket `period` ticks ahead of the current one.
-///
-/// # Safety
-///
-/// `period` is at most `counters::MAX_PERIOD`.
-unsafe fn schedule(object: &Link, period: u32) {
-    let mut index = SAMPLER.current.load(Ordering::Relaxed) + period;
-    if index >= BUCKETS as u32 {
-        index -= BUCKETS as u32;
-    }
-    // SAFETY: `current` is below BUCKETS and `period` at most BUCKETS, so
-    // the index is below BUCKETS.
-    let head = unsafe { SAMPLER.buckets.get_unchecked(index as usize) };
-    let tail = head.blink.load(Ordering::Relaxed);
-    object.flink.store(head.address(), Ordering::Relaxed);
-    object.blink.store(tail, Ordering::Relaxed);
-    // SAFETY: the tail of a bucket is its head or a listed counter.
-    unsafe { Link::at(tail) }
-        .flink
-        .store(object.address(), Ordering::Relaxed);
-    head.blink.store(object.address(), Ordering::Relaxed);
-}
-
-/// Register counter `name` (stock export 33) with the source it reads.
-fn register(
-    name: &[u8],
-    registration: CounterRegistration,
-    source: u32,
-) -> Result<(), RegisterError> {
-    let directory = directory().ok_or(RegisterError::NoDirectory)?;
-    let period = registration.period();
-    if period > counters::MAX_PERIOD {
-        return Err(RegisterError::PeriodTooLong);
-    }
-    let name = kernel::ansi_string(name);
-    let attributes = ObjectAttributes {
-        root_directory: Handle::from_raw(directory),
-        object_name: &name,
-        attributes: ObjectAttributeFlags::PERMANENT | ObjectAttributeFlags::CASE_INSENSITIVE,
-    };
-    let mut object = 0u32;
-    // SAFETY: `attributes`, the name it refers to, and `object` are live;
-    // the type is the registered counter object type.
-    let status = unsafe {
-        ObCreateObject(
-            counter_type(),
-            &attributes,
-            size_of::<CounterBody>() as u32,
-            &mut object,
-        )
-    };
-    status.result().map_err(RegisterError::Kernel)?;
-    // SAFETY: `ObCreateObject` returned a fresh body of `CounterBody` size,
-    // word aligned, that nothing else uses before `ObInsertObject`; zero is
-    // a valid `CounterBody`.
-    unsafe { core::ptr::write_bytes(object as usize as *mut CounterBody, 0, 1) };
-    let mut handle = 0u32;
-    // SAFETY: `object` was created above; `attributes` and `handle` are live.
-    let status = unsafe { ObInsertObject(object, &attributes, 0, (&raw mut handle).cast()) };
-    status.result().map_err(RegisterError::Kernel)?;
-    // SAFETY: `object` is the counter body initialized above; its permanent
-    // directory entry keeps it allocated.
-    let mut counter = unsafe { CounterView::new(object) };
-    counter.body().source.store(source, Ordering::Relaxed);
-    counters::initialize(&mut counter, registration);
-    if period != 0 {
-        // SAFETY: the IRQL is restored below.
-        let irql = unsafe { xboxkrnl::KfRaiseIrql(SAMPLER_IRQL) };
-        // SAFETY: `period` was checked above.
-        unsafe { schedule(&counter.body().link, period) };
-        // SAFETY: returns to the IRQL raised from above.
-        unsafe { xboxkrnl::KfLowerIrql(irql) };
-    }
-    // SAFETY: `handle` was opened by `ObInsertObject` and is closed once.
-    unsafe { xboxkrnl::NtClose(Handle::from_raw(handle)) };
-    Ok(())
-}
-
-/// Stock export 33: `(name, word, source) -> HRESULT`.
-extern "C" fn register_counter(name: *const u8, word: u32, source: u32) -> Hresult {
-    if name.is_null() {
-        // Stock tests the directory before the name.
-        return match directory() {
-            Some(_) => Hresult::INVALID_ARGUMENT,
-            None => RegisterError::NoDirectory.into(),
-        };
-    }
-    // SAFETY: the caller passes a NUL-terminated name.
-    let name = unsafe { CStr::from_ptr(name.cast()) };
-    export_result(register(name.to_bytes(), CounterRegistration(word), source))
-}
-export!(33, register_counter);
-
-/// Stock export 26: `(name, handle out) -> HRESULT`.
-extern "C" fn open_counter(name: *const u8, handle: *mut u32) -> Hresult {
-    let Some(directory) = directory() else {
-        return export_result(Err(CounterError::NoDirectory));
-    };
-    if name.is_null() {
-        return export_result(Err(CounterError::NoDirectory));
-    }
-    // SAFETY: the caller passes a NUL-terminated name.
-    let name = kernel::ansi_string(unsafe { CStr::from_ptr(name.cast()) }.to_bytes());
-    let attributes = ObjectAttributes {
-        root_directory: Handle::from_raw(directory),
-        object_name: &name,
-        attributes: ObjectAttributeFlags::CASE_INSENSITIVE,
-    };
-    // The kernel stores the handle through the caller's pointer.
-    // SAFETY: `attributes` and the name it refers to are live; the caller
-    // passes a writable handle dword.
-    let status =
-        unsafe { xboxkrnl::ObOpenObjectByName(&attributes, counter_type(), 0, handle.cast()) };
-    let result = if status.is_success() {
-        Ok(())
-    } else {
-        Err(CounterError::NotFound)
-    };
-    export_result(result)
-}
-export!(26, open_counter);
 
 /// Sample of stock export 27: `{u64 value, u64 rate, u32 type}`, high words
 /// first.
@@ -1014,29 +629,6 @@ impl SampleRecord {
     }
 }
 
-/// Stock export 27: `(handle, query, sample) -> HRESULT`; the sample keeps
-/// the fields the query does not produce.
-extern "C" fn query_counter(handle: u32, query_type: u32, sample: *const SampleRecord) -> Hresult {
-    if sample.is_null() {
-        return Hresult::INVALID_ARGUMENT;
-    }
-    let mut counter = match reference(CounterHandle(handle)) {
-        Ok(counter) => counter,
-        Err(error) => return export_result(Err(CounterError::Kernel(error))),
-    };
-    // SAFETY: the caller passes a writable sample, live for the call.
-    let record = unsafe { &*sample };
-    let mut out = record.load();
-    let result = query(&mut counter, CounterQuery(query_type), &mut out);
-    counter.release();
-    record.store(&out);
-    match result {
-        Ok(evaluation) => evaluation.into(),
-        Err(error) => error.into(),
-    }
-}
-export!(27, query_counter);
-
 /// Entry of stock export 53: `{char name[0x100], u32 type}`.
 #[repr(C)]
 struct WalkEntry {
@@ -1046,21 +638,399 @@ struct WalkEntry {
 
 const _: () = assert!(offset_of!(WalkEntry, counter_type) == 0x100);
 
+fn counter_type() -> u32 {
+    core::ptr::from_ref(&COUNTER_TYPE) as u32
+}
+
+/// The counter directory of the calling process (stock 0x91f2a7a8): the
+/// system process creates it, a title opens it. Handles are kept.
+pub(super) fn directory() -> Option<u32> {
+    const COUNTER_DIRECTORY: &[u8] = b"\\DmCounters";
+
+    if CLOSED.load(Ordering::Acquire) {
+        return None;
+    }
+
+    let (slot, system) = match xboxkrnl::KeGetCurrentProcessType() {
+        ProcessType::SYSTEM => (&SYSTEM_DIRECTORY, true),
+        ProcessType::TITLE => (&TITLE_DIRECTORY, false),
+        _ => return None,
+    };
+    let cached = slot.load(Ordering::Acquire);
+    if cached != 0 {
+        return Some(cached);
+    }
+
+    let name = kernel::ansi_string(COUNTER_DIRECTORY);
+    let attributes = ObjectAttributes {
+        root_directory: Handle::NULL,
+        object_name: &name,
+        attributes: ObjectAttributeFlags::PERMANENT,
+    };
+    let mut handle = 0u32;
+    // SAFETY: `handle`, `attributes`, and the name it refers to are live
+    // for the call.
+    let status = unsafe {
+        if system {
+            xboxkrnl::NtCreateDirectoryObject((&raw mut handle).cast(), &attributes)
+        } else {
+            NtOpenDirectoryObject((&raw mut handle).cast(), &attributes)
+        }
+    };
+
+    if !status.is_success() {
+        kernel::debug_print(if system {
+            c"Failed to create system counter object directory.\n"
+        } else {
+            c"Failed to create Title counter object directory.\n"
+        });
+        slot.store(0, Ordering::Release);
+        return None;
+    }
+
+    slot.store(handle, Ordering::Release);
+
+    Some(handle)
+}
+
+/// Open counter `name` (stock export 26, 0x91f2aa20).
+pub(super) fn open(name: &[u8]) -> Result<CounterHandle, CounterError> {
+    open_in(directory().ok_or(CounterError::NoDirectory)?, name)
+}
+
+fn open_in(directory: u32, name: &[u8]) -> Result<CounterHandle, CounterError> {
+    let name = kernel::ansi_string(name);
+    let attributes = ObjectAttributes {
+        root_directory: Handle::from_raw(directory),
+        object_name: &name,
+        attributes: ObjectAttributeFlags::CASE_INSENSITIVE,
+    };
+    let mut handle = 0u32;
+    // SAFETY: `attributes`, the name it refers to, and `handle` are live;
+    // the type is the registered counter object type.
+    let status = unsafe {
+        xboxkrnl::ObOpenObjectByName(&attributes, counter_type(), 0, (&raw mut handle).cast())
+    };
+
+    if !status.is_success() {
+        return Err(CounterError::NotFound);
+    }
+
+    Ok(CounterHandle(handle))
+}
+
+/// Referenced counter object of an open handle.
+pub(super) fn reference(handle: CounterHandle) -> Result<KernelCounter, KernelError> {
+    let mut object = 0u32;
+    // SAFETY: `object` is a live u32; the type is the registered counter
+    // object type.
+    let status = unsafe {
+        xboxkrnl::ObReferenceObjectByHandle(Handle::from_raw(handle.0), counter_type(), &mut object)
+    };
+    status.result()?;
+
+    // SAFETY: the kernel referenced an object of the counter type, which
+    // only `register` creates; the reference keeps it allocated until
+    // `KernelCounter::release`.
+    Ok(KernelCounter(unsafe { CounterView::new(object) }))
+}
+
+/// Evaluate a referenced counter (stock export 27, 0x91f2aab0).
+pub(super) fn query(
+    counter: &mut KernelCounter,
+    query: CounterQuery,
+    out: &mut CounterSample,
+) -> Result<Evaluation, CounterError> {
+    // SAFETY: only `register` creates counter objects, and it initializes
+    // each; only the sampler writes the history index after that.
+    unsafe { counters::query(&mut counter.0, query, out) }
+}
+
+/// One directory entry after `context` (0 restarts), its name copied into
+/// `name` (stock export 53, 0x91f2adf0).
+pub(super) fn next(context: &mut u32, name: &mut [u8]) -> Result<CounterEntry, CounterError> {
+    let directory = directory().ok_or(CounterError::End)?;
+    let mut record = DirectoryEntry::new();
+    let source = record
+        .query(directory, context)
+        .map_err(|error| match error {
+            KernelError::NoMoreEntries => CounterError::End,
+            KernelError::BufferTooSmall => CounterError::NameTooLong,
+            error => CounterError::Kernel(error),
+        })?;
+
+    // Stock copies the full entry name; the query buffer holds at most
+    // 0x100 name bytes, which can run past the caller's name field.
+    let length = source.len().min(name.len() - 1);
+    name[..length].copy_from_slice(&source[..length]);
+    name[length] = 0;
+
+    let handle = open(&name[..length]).map_err(|_| CounterError::Unexpected)?;
+    let entry = reference(handle).map(|counter| {
+        let counter_type = counter.0.registration().counter_type();
+        counter.release();
+        CounterEntry {
+            name_len: length,
+            counter_type,
+        }
+    });
+
+    handle.close();
+
+    entry.map_err(|_| CounterError::Unexpected)
+}
+
+/// Store the capture entries titles call through the published block.
+pub(super) fn set_capture_entries(start: u32, stop: u32) {
+    TITLE_INTERFACE
+        .capture_start
+        .store(start, Ordering::Release);
+    TITLE_INTERFACE.capture_stop.store(stop, Ordering::Release);
+}
+
+pub(super) fn title_capture_request() -> TitleCaptureRequest {
+    let pointer = |field: &AtomicU32| match field.load(Ordering::Acquire) {
+        0 => None,
+        address => Some(address),
+    };
+
+    TitleCaptureRequest {
+        control: pointer(&TITLE_INTERFACE.capture_control),
+        result: pointer(&TITLE_INTERFACE.capture_result),
+    }
+}
+
+/// The title's frame counter, when the title published one.
+fn frame_number() -> u32 {
+    match TITLE_INTERFACE.frame_count.load(Ordering::Acquire) {
+        0 => 0,
+        // SAFETY: a title publishes the address of its frame count dword
+        // and keeps it until `title_terminated` withdraws it.
+        address => unsafe { kernel::object_at::<AtomicU32>(address) }.load(Ordering::Relaxed),
+    }
+}
+
+/// Reader of `Frames` (stock 0x91f2a510).
+extern "C" fn read_frames(value: *mut [AtomicU32; 2], _rate: *mut u32) -> Hresult {
+    let result = match TITLE_INTERFACE.frame_count.load(Ordering::Acquire) {
+        0 => Err(CounterError::DataNotAvailable),
+        address => {
+            // SAFETY: readers are called with the address of a u64
+            // (`CounterView::call_reader` passes its own).
+            let value = unsafe { &*value };
+            value[0].store(0, Ordering::Relaxed);
+            // SAFETY: as in `frame_number`.
+            let count = unsafe { kernel::object_at::<AtomicU32>(address) };
+            value[1].store(count.load(Ordering::Relaxed), Ordering::Relaxed);
+
+            Ok(())
+        }
+    };
+
+    export_result(result)
+}
+
+/// Reader of `Frame Ticks` (stock 0x91f2a550).
+extern "C" fn read_frame_ticks(value: *mut [AtomicU32; 2], _rate: *mut u32) -> Hresult {
+    let address = TITLE_INTERFACE.frame_ticks.load(Ordering::Acquire);
+    // A block that ends before the frame ticks field has none.
+    let size = TITLE_INTERFACE.size.load(Ordering::Acquire);
+    if size <= offset_of!(TitleInterface, frame_ticks) as u32 || address == 0 {
+        return export_result(Err(CounterError::DataNotAvailable));
+    }
+
+    // SAFETY: as in `read_frames`.
+    let value = unsafe { &*value };
+    value[0].store(0, Ordering::Relaxed);
+    // SAFETY: a title publishes the address of its frame ticks dword and
+    // keeps it until `title_terminated` withdraws it.
+    let ticks = unsafe { kernel::object_at::<AtomicU32>(address) };
+    value[1].store(ticks.load(Ordering::Relaxed), Ordering::Relaxed);
+
+    Hresult::OK
+}
+
+/// Append `object` to the bucket `period` ticks ahead of the current one.
+///
+/// # Safety
+///
+/// `period` is at most `counters::MAX_PERIOD`.
+unsafe fn schedule(object: &Link, period: u32) {
+    let mut index = SAMPLER.current.load(Ordering::Relaxed) + period;
+    if index >= BUCKETS as u32 {
+        index -= BUCKETS as u32;
+    }
+
+    // SAFETY: `current` is below BUCKETS and `period` at most BUCKETS, so
+    // the index is below BUCKETS.
+    let head = unsafe { SAMPLER.buckets.get_unchecked(index as usize) };
+    let tail = head.blink.load(Ordering::Relaxed);
+    object.flink.store(head.address(), Ordering::Relaxed);
+    object.blink.store(tail, Ordering::Relaxed);
+
+    // SAFETY: the tail of a bucket is its head or a listed counter.
+    unsafe { Link::at(tail) }
+        .flink
+        .store(object.address(), Ordering::Relaxed);
+    head.blink.store(object.address(), Ordering::Relaxed);
+}
+
+/// Register counter `name` (stock export 33) with the source it reads.
+fn register(
+    name: &[u8],
+    registration: CounterRegistration,
+    source: u32,
+) -> Result<(), RegisterError> {
+    let directory = directory().ok_or(RegisterError::NoDirectory)?;
+
+    let period = registration.period();
+    if period > counters::MAX_PERIOD {
+        return Err(RegisterError::PeriodTooLong);
+    }
+
+    let name = kernel::ansi_string(name);
+    let attributes = ObjectAttributes {
+        root_directory: Handle::from_raw(directory),
+        object_name: &name,
+        attributes: ObjectAttributeFlags::PERMANENT | ObjectAttributeFlags::CASE_INSENSITIVE,
+    };
+    let mut object = 0u32;
+    // SAFETY: `attributes`, the name it refers to, and `object` are live;
+    // the type is the registered counter object type.
+    let status = unsafe {
+        ObCreateObject(
+            counter_type(),
+            &attributes,
+            size_of::<CounterBody>() as u32,
+            &mut object,
+        )
+    };
+    status.result().map_err(RegisterError::Kernel)?;
+
+    // SAFETY: `ObCreateObject` returned a fresh body of `CounterBody` size,
+    // word aligned, that nothing else uses before `ObInsertObject`; zero is
+    // a valid `CounterBody`.
+    unsafe { core::ptr::write_bytes(object as usize as *mut CounterBody, 0, 1) };
+
+    let mut handle = 0u32;
+    // SAFETY: `object` was created above; `attributes` and `handle` are live.
+    let status = unsafe { ObInsertObject(object, &attributes, 0, (&raw mut handle).cast()) };
+    status.result().map_err(RegisterError::Kernel)?;
+
+    // SAFETY: `object` is the counter body initialized above; its permanent
+    // directory entry keeps it allocated.
+    let mut counter = unsafe { CounterView::new(object) };
+    counter.body().source.store(source, Ordering::Relaxed);
+    counters::initialize(&mut counter, registration);
+
+    if period != 0 {
+        // SAFETY: the IRQL is restored below.
+        let irql = unsafe { xboxkrnl::KfRaiseIrql(SAMPLER_IRQL) };
+        // SAFETY: `period` was checked above.
+        unsafe { schedule(&counter.body().link, period) };
+        // SAFETY: returns to the IRQL raised from above.
+        unsafe { xboxkrnl::KfLowerIrql(irql) };
+    }
+
+    // SAFETY: `handle` was opened by `ObInsertObject` and is closed once.
+    unsafe { xboxkrnl::NtClose(Handle::from_raw(handle)) };
+
+    Ok(())
+}
+
+/// Stock export 33: `(name, word, source) -> HRESULT`.
+extern "C" fn register_counter(name: *const u8, word: u32, source: u32) -> Hresult {
+    if name.is_null() {
+        // Stock tests the directory before the name.
+        return match directory() {
+            Some(_) => Hresult::INVALID_ARGUMENT,
+            None => RegisterError::NoDirectory.into(),
+        };
+    }
+
+    // SAFETY: the caller passes a NUL-terminated name.
+    let name = unsafe { CStr::from_ptr(name.cast()) };
+
+    export_result(register(name.to_bytes(), CounterRegistration(word), source))
+}
+export!(33, register_counter);
+
+/// Stock export 26: `(name, handle out) -> HRESULT`.
+extern "C" fn open_counter(name: *const u8, handle: *mut u32) -> Hresult {
+    let Some(directory) = directory() else {
+        return export_result(Err(CounterError::NoDirectory));
+    };
+
+    if name.is_null() {
+        return export_result(Err(CounterError::NoDirectory));
+    }
+
+    // SAFETY: the caller passes a NUL-terminated name.
+    let name = kernel::ansi_string(unsafe { CStr::from_ptr(name.cast()) }.to_bytes());
+    let attributes = ObjectAttributes {
+        root_directory: Handle::from_raw(directory),
+        object_name: &name,
+        attributes: ObjectAttributeFlags::CASE_INSENSITIVE,
+    };
+    // The kernel stores the handle through the caller's pointer.
+    // SAFETY: `attributes` and the name it refers to are live; the caller
+    // passes a writable handle dword.
+    let status =
+        unsafe { xboxkrnl::ObOpenObjectByName(&attributes, counter_type(), 0, handle.cast()) };
+    let result = if status.is_success() {
+        Ok(())
+    } else {
+        Err(CounterError::NotFound)
+    };
+
+    export_result(result)
+}
+export!(26, open_counter);
+
+/// Stock export 27: `(handle, query, sample) -> HRESULT`; the sample keeps
+/// the fields the query does not produce.
+extern "C" fn query_counter(handle: u32, query_type: u32, sample: *const SampleRecord) -> Hresult {
+    if sample.is_null() {
+        return Hresult::INVALID_ARGUMENT;
+    }
+
+    let mut counter = match reference(CounterHandle(handle)) {
+        Ok(counter) => counter,
+        Err(error) => return export_result(Err(CounterError::Kernel(error))),
+    };
+
+    // SAFETY: the caller passes a writable sample, live for the call.
+    let record = unsafe { &*sample };
+    let mut out = record.load();
+    let result = query(&mut counter, CounterQuery(query_type), &mut out);
+    counter.release();
+    record.store(&out);
+
+    match result {
+        Ok(evaluation) => evaluation.into(),
+        Err(error) => error.into(),
+    }
+}
+export!(27, query_counter);
+
 /// Stock export 53: `(context in/out, entry) -> HRESULT`.
 extern "C" fn walk_counters(context: *mut u32, entry: *mut WalkEntry) -> Hresult {
     let directory = directory();
     if context.is_null() || entry.is_null() {
         return Hresult::INVALID_ARGUMENT;
     }
+
     if directory.is_none() {
         return export_result(Err(CounterError::End));
     }
+
     // SAFETY: the caller passes a context dword and an entry, both
     // writable and unaliased for the call.
     let (context, entry) = unsafe { (&mut *context, &mut *entry) };
     let result = next(context, &mut entry.name).map(|counter| {
         entry.counter_type = u32::from(counter.counter_type);
     });
+
     export_result(result)
 }
 export!(53, walk_counters);
@@ -1070,10 +1040,23 @@ export!(53, walk_counters);
 pub(crate) fn memory_statistics(
     out: &mut [u32; MONITOR_STATISTICS_LENGTH as usize / 4],
 ) -> Result<(), StatisticsError> {
-    use monitor_statistics::*;
+    use monitor_statistics::CACHE_PAGES;
+    use monitor_statistics::CONTIGUOUS_PAGES;
+    use monitor_statistics::DEBUGGER_PAGES;
+    use monitor_statistics::FREE_PAGES;
+    use monitor_statistics::IMAGE_PAGES;
+    use monitor_statistics::LENGTH;
+    use monitor_statistics::PAGE_TABLE_PAGES;
+    use monitor_statistics::POOL_PAGES;
+    use monitor_statistics::RESERVED;
+    use monitor_statistics::STACK_PAGES;
+    use monitor_statistics::TOTAL_PAGES;
+    use monitor_statistics::VM_PAGES;
+
     if out[LENGTH] != MONITOR_STATISTICS_LENGTH {
         return Err(StatisticsError::BadLength);
     }
+
     let mut reply = DebugMemoryStatistics::new();
     let mut statistics: MmStatistics;
     // SAFETY: `reply` is a live block whose first words give its length.
@@ -1085,7 +1068,8 @@ pub(crate) fn memory_statistics(
             0,
         )
     };
-    let s = if status.is_success() && reply.is_complete() {
+
+    let block = if status.is_success() && reply.is_complete() {
         &reply.statistics
     } else {
         statistics = MmStatistics::new();
@@ -1094,8 +1078,9 @@ pub(crate) fn memory_statistics(
         &statistics
     };
     status.result().map_err(StatisticsError::Kernel)?;
-    let (title, system) = (&s.title, &s.system);
-    out[TOTAL_PAGES] = s.total_physical_pages;
+
+    let (title, system) = (&block.title, &block.system);
+    out[TOTAL_PAGES] = block.total_physical_pages;
     out[FREE_PAGES] = system.available_pages.wrapping_add(title.available_pages);
     out[STACK_PAGES] = system.stack_pages.wrapping_add(title.stack_pages);
     out[PAGE_TABLE_PAGES] = system.page_table_pages.wrapping_add(title.page_table_pages);
@@ -1111,8 +1096,9 @@ pub(crate) fn memory_statistics(
     out[CONTIGUOUS_PAGES] = system
         .physical_pages
         .wrapping_add(title.physical_pages)
-        .wrapping_add(s.kernel_pages);
+        .wrapping_add(block.kernel_pages);
     out[DEBUGGER_PAGES] = 0;
+
     Ok(())
 }
 
@@ -1122,17 +1108,21 @@ fn sample_processors() {
     if blocks == 0 {
         return;
     }
+
     // SAFETY: the debug monitor data gives the kernel's processor block
     // array, one entry per hardware thread, which the kernel never frees.
     let blocks = unsafe { crate::kernel::object_at::<[KernelU32; HARDWARE_THREAD_COUNT]>(blocks) };
+
     for (block, sources) in blocks.iter().zip(&SOURCES.threads) {
         let block = block.load(Ordering::Relaxed);
         if block == 0 {
             continue;
         }
+
         // SAFETY: a nonzero entry is the processor control block of a
         // started hardware thread, which stays mapped.
         let block = unsafe { crate::kernel::object_at::<Kprcb>(block) };
+
         // SAFETY: the IRQL is restored before the loop body ends.
         let irql = unsafe { xboxkrnl::KfRaiseIrql(SAMPLER_IRQL) };
         let interrupt = block.interrupt_time.load(Ordering::Relaxed);
@@ -1145,6 +1135,7 @@ fn sample_processors() {
         let tick = TickCount::now().milliseconds();
         // SAFETY: returns to the IRQL raised from above.
         unsafe { xboxkrnl::KfLowerIrql(irql) };
+
         let [idle_pair, dpc_pair, interrupt_pair] = sources;
         idle_pair.value.store(idle, Ordering::Relaxed);
         idle_pair.rate.store(tick, Ordering::Relaxed);
@@ -1156,11 +1147,25 @@ fn sample_processors() {
 }
 
 fn sample_pages() {
+    /// Output words of the monitor's memory statistics that feed the page
+    /// counters, in counter order.
+    const PAGE_STATISTICS: [usize; 8] = [
+        monitor_statistics::FREE_PAGES,
+        monitor_statistics::CACHE_PAGES,
+        monitor_statistics::IMAGE_PAGES,
+        monitor_statistics::POOL_PAGES,
+        monitor_statistics::STACK_PAGES,
+        monitor_statistics::VM_PAGES,
+        monitor_statistics::CONTIGUOUS_PAGES,
+        monitor_statistics::DEBUGGER_PAGES,
+    ];
+
     let mut statistics = [0u32; MONITOR_STATISTICS_LENGTH as usize / 4];
     statistics[monitor_statistics::LENGTH] = MONITOR_STATISTICS_LENGTH;
     // Stock copies its uninitialized stack block when the query fails;
     // zeros are copied instead.
     let _ = memory_statistics(&mut statistics);
+
     for (word, &index) in SOURCES.pages.iter().zip(&PAGE_STATISTICS) {
         word.store(statistics[index], Ordering::Relaxed);
     }
@@ -1171,10 +1176,12 @@ extern "C" fn sampler_dpc(_dpc: usize, _context: usize, _argument1: usize, _argu
     SAMPLER.active.fetch_add(1, Ordering::AcqRel);
     sample_processors();
     sample_pages();
+
     let current = SAMPLER.current.load(Ordering::Relaxed);
     // SAFETY: `current` stays below BUCKETS (see `Sampler`).
     let head = unsafe { SAMPLER.buckets.get_unchecked(current as usize) };
     let mut entry = head.flink.load(Ordering::Relaxed);
+
     if entry != head.address() {
         // SAFETY: the bucket is not empty, so its tail is a listed counter.
         unsafe { Link::at(head.blink.load(Ordering::Relaxed)) }
@@ -1182,15 +1189,21 @@ extern "C" fn sampler_dpc(_dpc: usize, _context: usize, _argument1: usize, _argu
             .store(0, Ordering::Relaxed);
         head.flink.store(head.address(), Ordering::Relaxed);
         head.blink.store(head.address(), Ordering::Relaxed);
+
         while entry != 0 {
             // SAFETY: buckets list the bodies of permanent counter objects
             // that `register` initialized.
             let mut counter = unsafe { CounterView::new(entry) };
             let next = counter.body().link.flink.load(Ordering::Relaxed);
             let registration = counter.registration();
-            if !RegistrationFlags::from_bits_retain(registration.0)
+            if RegistrationFlags::from_bits_retain(registration.0)
                 .contains(RegistrationFlags::HAS_HANDLER)
             {
+                let routine = counter.source();
+                // SAFETY: handler counters register a routine taking
+                // (query, object, sample).
+                unsafe { kernel::call_export(routine, 0, entry, 0, 0) };
+            } else {
                 // SAFETY: the IRQL is restored after the sample.
                 let irql = unsafe { xboxkrnl::KfRaiseIrql(SAMPLER_IRQL) };
                 let tick = TickCount::now().milliseconds();
@@ -1201,23 +1214,21 @@ extern "C" fn sampler_dpc(_dpc: usize, _context: usize, _argument1: usize, _argu
                 unsafe { counters::sample(&mut counter, tick, frame) };
                 // SAFETY: returns to the IRQL raised from above.
                 unsafe { xboxkrnl::KfLowerIrql(irql) };
-            } else {
-                let routine = counter.source();
-                // SAFETY: handler counters register a routine taking
-                // (query, object, sample).
-                unsafe { kernel::call_export(routine, 0, entry, 0, 0) };
             }
+
             // SAFETY: `register` checked the period, which the registration
             // word keeps (see `CounterView`).
             unsafe { schedule(&counter.body().link, registration.period()) };
             entry = next;
         }
     }
+
     let next = if current + 1 == BUCKETS as u32 {
         0
     } else {
         current + 1
     };
+
     SAMPLER.current.store(next, Ordering::Relaxed);
     SAMPLER.active.fetch_sub(1, Ordering::AcqRel);
 }
@@ -1237,18 +1248,43 @@ pub(super) fn initialize() {
     const FRAME_TICKS: CounterRegistration = SourceKind::Reader.registration(CounterClass::Value);
     const PERCENT: CounterRegistration = SourceKind::Words.registration(CounterClass::Ratio);
     const PAGES: CounterRegistration = SourceKind::Words.registration(CounterClass::Value);
+    const PAGE_COUNTERS: [&CStr; 8] = [
+        c"Free Pages",
+        c"Cache Pages",
+        c"Image Pages",
+        c"Pool Pages",
+        c"Stack Pages",
+        c"VM Pages",
+        c"Contiguous Pages",
+        c"Debugger Pages",
+    ];
+    const THREAD_COUNTERS: [[&CStr; 3]; HARDWARE_THREAD_COUNT] = [
+        [c"%Thread0 Idle", c"%Thread0 DPC", c"%Thread0 ISR"],
+        [c"%Thread1 Idle", c"%Thread1 DPC", c"%Thread1 ISR"],
+        [c"%Thread2 Idle", c"%Thread2 DPC", c"%Thread2 ISR"],
+        [c"%Thread3 Idle", c"%Thread3 DPC", c"%Thread3 ISR"],
+        [c"%Thread4 Idle", c"%Thread4 DPC", c"%Thread4 ISR"],
+        [c"%Thread5 Idle", c"%Thread5 DPC", c"%Thread5 ISR"],
+    ];
+    const GPU_COUNTERS: [&CStr; 4] = [
+        c"% GPU",
+        c"% GPU Frontend",
+        c"% GPU Backend",
+        c"% GPU Swap Stall",
+    ];
 
-    if let Ok(module) = SystemModule::Kernel.handle() {
-        if let (Ok(allocate), Ok(free)) = (
+    if let Ok(module) = SystemModule::Kernel.handle()
+        && let (Ok(allocate), Ok(free)) = (
             resolve_export(module, EX_ALLOCATE_POOL_TYPE_WITH_TAG),
             resolve_export(module, EX_FREE_POOL),
-        ) {
-            COUNTER_TYPE
-                .allocate
-                .store(allocate.raw(), Ordering::Relaxed);
-            COUNTER_TYPE.free.store(free.raw(), Ordering::Relaxed);
-        }
+        )
+    {
+        COUNTER_TYPE
+            .allocate
+            .store(allocate.raw(), Ordering::Relaxed);
+        COUNTER_TYPE.free.store(free.raw(), Ordering::Relaxed);
     }
+
     let wait_list = &DEFAULT_OBJECT.wait_list;
     wait_list
         .flink
@@ -1264,6 +1300,7 @@ pub(super) fn initialize() {
     TITLE_INTERFACE
         .size
         .store(size_of::<TitleInterface>() as u32, Ordering::Relaxed);
+
     let data = kernel::debug_monitor_data();
     data.title_interface
         .store(kernel::address_of(&TITLE_INTERFACE), Ordering::Release);
@@ -1275,10 +1312,12 @@ pub(super) fn initialize() {
     );
 
     let directory = directory();
+
     for head in &SAMPLER.buckets {
         head.flink.store(head.address(), Ordering::Relaxed);
         head.blink.store(head.address(), Ordering::Relaxed);
     }
+
     // SAFETY: the static sampler storage is zeroed, sized for a KDPC and a
     // KTIMER, and stays in place until `shut_down` cancels both.
     unsafe {
@@ -1304,20 +1343,24 @@ pub(super) fn initialize() {
     if directory.is_none() {
         return;
     }
+
     register_c(c"Frames", FRAMES, read_frames as *const () as usize as u32);
     register_c(
         c"Frame Ticks",
         FRAME_TICKS,
         read_frame_ticks as *const () as usize as u32,
     );
+
     for (names, sources) in THREAD_COUNTERS.iter().zip(&SOURCES.threads) {
         for (name, pair) in names.iter().zip(sources) {
             register_c(name, PERCENT, core::ptr::from_ref(pair) as usize as u32);
         }
     }
+
     for (name, word) in PAGE_COUNTERS.iter().zip(&SOURCES.pages) {
         register_c(name, PAGES, word.as_ptr() as usize as u32);
     }
+
     for (name, source) in GPU_COUNTERS.iter().zip(&GPU_SOURCES) {
         register_c(name, PERCENT, source.as_ptr() as usize as u32);
     }
@@ -1329,24 +1372,29 @@ pub(super) fn initialize() {
 /// handles but leave the directory.
 pub(super) fn shut_down() {
     CLOSED.store(true, Ordering::Release);
+
     // SAFETY: the sampler timer and DPC were initialized by `initialize`.
     unsafe {
         KeCancelTimer(SAMPLER.timer.as_ptr());
         KeRemoveQueueDpc(SAMPLER.dpc.as_ptr());
     }
+
     // A DPC the kernel dequeued just before the cancel may not have entered
     // the sampler yet; it runs at dispatch level, so it starts well within
     // one period.
     sleep(Duration::from_millis(u64::from(
         counters::SAMPLER_INTERVAL_MS,
     )));
+
     while SAMPLER.active.load(Ordering::Acquire) != 0 {
         core::hint::spin_loop();
     }
+
     let directory = SYSTEM_DIRECTORY.swap(0, Ordering::AcqRel);
     if directory == 0 {
         return;
     }
+
     // Objects leave the directory as their last handle closes, which moves
     // the enumeration; passes repeat until one finds no fewer entries.
     let mut previous = usize::MAX;
@@ -1357,6 +1405,7 @@ pub(super) fn shut_down() {
         }
         previous = remaining;
     }
+
     let mut object = 0u32;
     // SAFETY: `directory` is the owned system directory handle and `object`
     // a live u32.
@@ -1369,6 +1418,7 @@ pub(super) fn shut_down() {
             xboxkrnl::ObDereferenceObject(object);
         }
     }
+
     // SAFETY: the directory handle was taken out of SYSTEM_DIRECTORY and is
     // closed once.
     unsafe { xboxkrnl::NtClose(Handle::from_raw(directory)) };
@@ -1379,6 +1429,7 @@ pub(super) fn shut_down() {
 fn retire_counters(directory: u32) -> usize {
     let mut context = 0u32;
     let mut seen = 0usize;
+
     loop {
         let mut record = DirectoryEntry::new();
         // The pass ends with `KernelError::NoMoreEntries` or any failure.
@@ -1386,14 +1437,17 @@ fn retire_counters(directory: u32) -> usize {
             return seen;
         };
         seen += 1;
+
         let Ok(handle) = open_in(directory, name) else {
             continue;
         };
+
         if let Ok(counter) = reference(handle) {
             // SAFETY: `counter` holds a reference to the object.
             unsafe { ObMakeTemporaryObject(counter.0.object) };
             counter.release();
         }
+
         handle.close();
     }
 }

@@ -21,6 +21,52 @@ const TIMEBASE_FREQUENCY: u64 = 49_875_000;
 /// Time base ticks per millisecond, for latencies.
 const TICKS_PER_MILLISECOND: u64 = TIMEBASE_FREQUENCY / 1000;
 
+/// Random-number source of the stages (instance method 0,
+/// `XeCryptRandom`).
+pub(super) trait Random {
+    fn fill(&mut self, buffer: &mut [u8]);
+
+    /// Uniform in `low..=high` (0x91f94140).
+    fn range64(&mut self, low: u64, high: u64) -> u64 {
+        let span = high.wrapping_sub(low);
+        if span == 0 {
+            return low;
+        }
+
+        let mut bytes = [0u8; 8];
+        self.fill(&mut bytes);
+
+        let value = u64::from_be_bytes(bytes);
+        let value = if span == u64::MAX {
+            value
+        } else {
+            value % (span + 1)
+        };
+
+        value.wrapping_add(low)
+    }
+
+    /// Uniform in `low..=high` (0x91f940b8).
+    fn range32(&mut self, low: u32, high: u32) -> u32 {
+        let span = high.wrapping_sub(low);
+        if span == 0 {
+            return low;
+        }
+
+        let mut bytes = [0u8; 4];
+        self.fill(&mut bytes);
+
+        let value = u32::from_be_bytes(bytes);
+        let value = if span == u32::MAX {
+            value
+        } else {
+            value % (span + 1)
+        };
+
+        value.wrapping_add(low)
+    }
+}
+
 /// A release time other than never: time base ticks below u64::MAX. It
 /// holds the complement of the ticks, so `Option<ReleaseTime>` is one u64
 /// whose `None` is the complement of stock's u64::MAX.
@@ -42,37 +88,6 @@ impl ReleaseTime {
         !self.0.get()
     }
 }
-
-/// Stored form of a release time: never is u64::MAX, which stock compares
-/// as a time.
-#[inline]
-const fn to_stored(time: Option<ReleaseTime>) -> u64 {
-    match time {
-        Some(time) => time.ticks(),
-        None => u64::MAX,
-    }
-}
-
-#[inline]
-const fn from_stored(stored: u64) -> Option<ReleaseTime> {
-    ReleaseTime::at(stored)
-}
-
-/// The earlier of two release times.
-#[inline]
-pub(super) fn earliest(a: Option<ReleaseTime>, b: Option<ReleaseTime>) -> Option<ReleaseTime> {
-    from_stored(to_stored(a).min(to_stored(b)))
-}
-
-/// Whether `time` comes before release time `bound`.
-#[inline]
-pub(super) fn is_before(time: ReleaseTime, bound: Option<ReleaseTime>) -> bool {
-    time.ticks() < to_stored(bound)
-}
-
-/// Default limits of the first stage: 200 frames, 128 KiB.
-const DEFAULT_PACKET_LIMIT: u32 = 200;
-const DEFAULT_BYTE_LIMIT: u64 = 0x2_0000;
 
 /// A copied frame (stock 0x1c-byte header before the frame).
 #[repr(C)]
@@ -113,6 +128,7 @@ impl OwnedPacket {
         let header = core::mem::size_of::<Packet>();
         let block = memory::allocate(header + frame.len())?;
         let packet = block.cast::<Packet>();
+
         // SAFETY: the block holds the header and the frame bytes, and pool
         // blocks are 8-aligned.
         unsafe {
@@ -127,10 +143,10 @@ impl OwnedPacket {
             });
             core::ptr::copy_nonoverlapping(frame.as_ptr(), block.as_ptr().add(header), frame.len());
         }
+
         Some(Self(packet))
     }
 
-    /// The frame bytes.
     pub(super) fn frame(&mut self) -> &mut [u8] {
         // SAFETY: an owned packet is live, and its frame bytes follow the
         // header.
@@ -200,6 +216,7 @@ impl Batch {
 
     pub(super) fn push(&mut self, packet: OwnedPacket) {
         let packet = packet.0.as_ptr();
+
         // SAFETY: an owned packet is live and in no list.
         unsafe { (*packet).next = self.packets };
         self.packets = packet;
@@ -207,17 +224,21 @@ impl Batch {
 
     pub(super) fn pop(&mut self) -> Option<OwnedPacket> {
         let packet = NonNull::new(self.packets)?;
+
         // SAFETY: members are live; the popped packet leaves the batch.
         self.packets = unsafe { packet.as_ref().next };
+
         Some(OwnedPacket(packet))
     }
 
     /// Frames leave in release order.
     pub(super) fn reverse(&mut self) {
         let mut reversed = Batch::new();
+
         while let Some(packet) = self.pop() {
             reversed.push(packet);
         }
+
         *self = reversed;
     }
 }
@@ -227,6 +248,7 @@ impl Batch {
 pub(super) struct PacketList {
     head: *mut Packet,
     tail: *mut Packet,
+
     bytes: u64,
     count: u32,
 }
@@ -251,17 +273,21 @@ impl PacketList {
     fn insert(&mut self, packet: OwnedPacket, time: Option<ReleaseTime>, size: u32) {
         let packet = packet.0.as_ptr();
         let stored = to_stored(time);
+
         // SAFETY: list members and the owned `packet` are live packets.
         unsafe {
             (*packet).time = stored;
             (*packet).size = size;
             (*packet).dropped = false;
+
             let mut after = self.tail;
             while !after.is_null() && (*after).time > stored {
                 after = (*after).prev;
             }
+
             self.link_after(packet, after);
         }
+
         self.bytes = self.bytes.wrapping_add(u64::from(size));
         self.count = self.count.wrapping_add(1);
     }
@@ -276,13 +302,16 @@ impl PacketList {
             } else {
                 (*after).next
             };
+
             (*packet).prev = after;
             (*packet).next = next;
+
             if after.is_null() {
                 self.head = packet;
             } else {
                 (*after).next = packet;
             }
+
             if next.is_null() {
                 self.tail = packet;
             } else {
@@ -296,17 +325,21 @@ impl PacketList {
     unsafe fn unlink(&mut self, packet: *mut Packet) {
         // SAFETY: guaranteed by the caller.
         unsafe {
-            let (prev, next) = ((*packet).prev, (*packet).next);
+            let prev = (*packet).prev;
+            let next = (*packet).next;
+
             if prev.is_null() {
                 self.head = next;
             } else {
                 (*prev).next = next;
             }
+
             if next.is_null() {
                 self.tail = prev;
             } else {
                 (*next).prev = prev;
             }
+
             (*packet).prev = null_mut();
             (*packet).next = null_mut();
         }
@@ -317,21 +350,23 @@ impl PacketList {
     fn last_live_time(&self, now: u64) -> Option<ReleaseTime> {
         let packet = self.last_live();
         if packet.is_null() {
-            ReleaseTime::at(now)
-        } else {
-            // SAFETY: a non-null result of `last_live` is a member.
-            unsafe { (*packet).release_time() }
+            return ReleaseTime::at(now);
         }
+
+        // SAFETY: a non-null result of `last_live` is a member.
+        unsafe { (*packet).release_time() }
     }
 
     fn last_live(&self) -> *mut Packet {
         let mut packet = self.tail;
+
         // SAFETY: members are live packets.
         unsafe {
             while !packet.is_null() && (*packet).dropped {
                 packet = (*packet).prev;
             }
         }
+
         packet
     }
 
@@ -346,16 +381,19 @@ impl PacketList {
             if (*packet).dropped {
                 return;
             }
+
             (*packet).dropped = true;
             self.bytes = self.bytes.wrapping_sub(u64::from((*packet).size));
             self.count = self.count.wrapping_sub(1);
             (*packet).set_release_time(ReleaseTime::at(0));
+
             let mut before = (*packet).prev;
             let mut skipped = false;
             while !before.is_null() && !(*before).dropped {
                 before = (*before).prev;
                 skipped = true;
             }
+
             if skipped {
                 self.unlink(packet);
                 self.link_after(packet, before);
@@ -373,17 +411,21 @@ impl PacketList {
             if packet.is_null() {
                 break;
             }
+
             // SAFETY: a non-null result of `last_live` is a member.
             unsafe { self.drop_packet(packet) };
         }
+
         let Some(limit) = packet_limit else {
             return;
         };
+
         while self.count > limit {
             let packet = self.last_live();
             if packet.is_null() {
                 break;
             }
+
             // SAFETY: as above.
             unsafe { self.drop_packet(packet) };
         }
@@ -394,6 +436,7 @@ impl PacketList {
     unsafe fn pop(&mut self) -> Released {
         // SAFETY: guaranteed by the caller.
         let packet = unsafe { NonNull::new_unchecked(self.head) };
+
         // SAFETY: the head is a live member; unlinking passes its ownership
         // to the result.
         let dropped = unsafe {
@@ -401,10 +444,12 @@ impl PacketList {
             packet.as_ref().dropped
         };
         let packet = OwnedPacket(packet);
+
         if !dropped {
             self.bytes = self.bytes.wrapping_sub(u64::from(packet.size()));
             self.count = self.count.wrapping_sub(1);
         }
+
         Released { packet, dropped }
     }
 
@@ -421,8 +466,10 @@ impl PacketList {
         if self.is_empty() {
             return None;
         }
+
         // SAFETY: the head is a live packet.
         let (time, dropped) = unsafe { ((*self.head).time, (*self.head).dropped) };
+
         // SAFETY: checked not empty.
         (time <= now || dropped).then(|| unsafe { self.pop() })
     }
@@ -434,6 +481,7 @@ impl PacketList {
         if self.is_empty() {
             return None;
         }
+
         // SAFETY: the head is a live packet.
         from_stored(unsafe { (*self.head).time }.max(now))
     }
@@ -456,22 +504,6 @@ impl PacketList {
             // SAFETY: checked not empty.
             unsafe { self.pop() }.packet.free();
         }
-    }
-}
-
-/// `start + delta` clamped to the time range (0x91f93a60).
-fn saturating_add(start: u64, delta: i64) -> u64 {
-    start
-        .checked_add_signed(delta)
-        .unwrap_or(if delta < 0 { 0 } else { u64::MAX })
-}
-
-/// `end - start` clamped to the signed range (0x91f93aa0).
-fn saturating_difference(start: u64, end: u64) -> i64 {
-    if end >= start {
-        i64::try_from(end - start).unwrap_or(i64::MAX)
-    } else {
-        i64::try_from(start - end).map_or(i64::MIN, |difference| -difference)
     }
 }
 
@@ -499,50 +531,11 @@ impl Rate {
     fn release_time(self, list: &PacketList, now: u64, bytes: u32) -> Option<ReleaseTime> {
         let start = to_stored(list.last_live_time(now));
         let ticks = self.ticks(bytes)?;
+
         from_stored(saturating_add(
             start,
             i64::try_from(ticks).unwrap_or(i64::MAX),
         ))
-    }
-}
-
-/// Random-number source of the stages (instance method 0,
-/// `XeCryptRandom`).
-pub(super) trait Random {
-    fn fill(&mut self, buffer: &mut [u8]);
-
-    /// Uniform in `low..=high` (0x91f94140).
-    fn range64(&mut self, low: u64, high: u64) -> u64 {
-        let span = high.wrapping_sub(low);
-        if span == 0 {
-            return low;
-        }
-        let mut bytes = [0u8; 8];
-        self.fill(&mut bytes);
-        let value = u64::from_be_bytes(bytes);
-        let value = if span == u64::MAX {
-            value
-        } else {
-            value % (span + 1)
-        };
-        value.wrapping_add(low)
-    }
-
-    /// Uniform in `low..=high` (0x91f940b8).
-    fn range32(&mut self, low: u32, high: u32) -> u32 {
-        let span = high.wrapping_sub(low);
-        if span == 0 {
-            return low;
-        }
-        let mut bytes = [0u8; 4];
-        self.fill(&mut bytes);
-        let value = u32::from_be_bytes(bytes);
-        let value = if span == u32::MAX {
-            value
-        } else {
-            value % (span + 1)
-        };
-        value.wrapping_add(low)
     }
 }
 
@@ -552,6 +545,7 @@ pub(super) trait Random {
 pub(super) struct LinkRate {
     list: PacketList,
     rate: Rate,
+
     byte_limit: u64,
     packet_limit: Option<u32>,
 }
@@ -561,6 +555,7 @@ impl LinkRate {
         const FRAME_CHECK_SEQUENCE: u32 = 4;
         const MINIMUM_FRAME: u32 = 0x40;
         const PREAMBLE: u32 = 8;
+
         let wire = length.wrapping_add(FRAME_CHECK_SEQUENCE).max(MINIMUM_FRAME) + PREAMBLE;
         let time = self.rate.release_time(&self.list, now, wire);
         self.list.insert(packet, time, wire);
@@ -571,6 +566,7 @@ impl LinkRate {
 /// Random latency stage (vtable 0x91f0f568).
 pub(super) struct Latency {
     list: PacketList,
+
     minimum: u64,
     maximum: u64,
     reorder: bool,
@@ -579,12 +575,16 @@ pub(super) struct Latency {
 impl Latency {
     fn enqueue(&mut self, packet: OwnedPacket, size: u32, now: u64, random: &mut dyn Random) {
         let delay = random.range64(self.minimum, self.maximum);
-        let mut time = saturating_add(now, i64::try_from(delay).unwrap_or(i64::MAX));
-        // `time` is not before `now`, so the fallback to `now` leaves it
+        let delayed = saturating_add(now, i64::try_from(delay).unwrap_or(i64::MAX));
+
+        // `delayed` is not before `now`, so the fallback to `now` leaves it
         // unchanged when every frame is dropped.
-        if !self.reorder {
-            time = time.max(to_stored(self.list.last_live_time(now)));
-        }
+        let time = if self.reorder {
+            delayed
+        } else {
+            delayed.max(to_stored(self.list.last_live_time(now)))
+        };
+
         self.list.insert(packet, from_stored(time), size);
     }
 }
@@ -603,11 +603,13 @@ impl Loss {
         if self.loss == 0 {
             return;
         }
+
         let draw = if self.loss >= LOSS_SCALE {
             0
         } else {
             random.range32(0, LOSS_SCALE)
         };
+
         if draw <= self.loss {
             // SAFETY: `member` was just inserted and nothing removed it.
             unsafe { self.list.drop_packet(member) };
@@ -619,11 +621,13 @@ impl Loss {
 /// ticks adds `step` bytes up to `depth`.
 pub(super) struct Bucket {
     list: PacketList,
+
     period: i64,
     step: u64,
     depth: u64,
     last: u64,
     tokens: u64,
+
     byte_limit: u64,
     packet_limit: Option<u32>,
 }
@@ -635,6 +639,7 @@ impl Bucket {
         if periods <= 0 {
             return;
         }
+
         let added = self.step.wrapping_mul(periods as u64);
         self.tokens = if self.depth.wrapping_sub(self.tokens) > added {
             self.tokens.wrapping_add(added)
@@ -653,11 +658,14 @@ impl Bucket {
     fn dequeue(&mut self, now: u64) -> Option<Released> {
         self.list.head_cost()?;
         self.refill(now);
+
         let cost = self.list.head_cost()?;
         if self.tokens < cost {
             return None;
         }
+
         self.tokens -= cost;
+
         self.list.pop_now()
     }
 
@@ -667,10 +675,13 @@ impl Bucket {
         if self.tokens >= cost {
             return ReleaseTime::at(now);
         }
+
         if self.step == 0 {
             return None;
         }
+
         let periods = (cost - self.tokens).div_ceil(self.step);
+
         from_stored(saturating_add(self.last, self.period.wrapping_mul(periods as i64)).max(now))
     }
 
@@ -682,7 +693,9 @@ impl Bucket {
             self.step = 0;
             return;
         }
+
         let bytes_per_tick = f64::from(rate) / TIMEBASE_FREQUENCY as f64 * 1.0 * 0.125;
+
         // SAFETY (both conversions): a nonzero u32 rate puts
         // `bytes_per_tick` in (0, 11) and its reciprocal below 4e8, finite
         // and within the i64 range.
@@ -694,6 +707,12 @@ impl Bucket {
             self.step = 1;
         }
     }
+}
+
+/// Plain rate stage (vtable 0x91f0f540).
+pub(super) struct PacketListRate {
+    list: PacketList,
+    rate: Rate,
 }
 
 /// Frames of a queue (stock queue processor at queue +0x58).
@@ -715,15 +734,13 @@ pub(super) enum Pipeline {
     },
 }
 
-/// Plain rate stage (vtable 0x91f0f540).
-pub(super) struct PacketListRate {
-    list: PacketList,
-    rate: Rate,
-}
-
 impl Pipeline {
     /// A new queue of `kind` with stock defaults (0x91f8cbc0).
     pub(super) fn new(kind: QueueKind) -> Self {
+        /// Default limits of the first stage: 200 frames, 128 KiB.
+        const DEFAULT_PACKET_LIMIT: u32 = 200;
+        const DEFAULT_BYTE_LIMIT: u64 = 0x2_0000;
+
         match kind {
             QueueKind::Unshaped => Self::Unshaped(PacketList::new()),
             QueueKind::Link => Self::Link {
@@ -768,7 +785,9 @@ impl Pipeline {
     pub(super) fn configure(&mut self, update: &QueueConfig, now: u64) {
         let mask = update.mask;
         let packet_limit = (update.packet_limit != u32::MAX).then_some(update.packet_limit);
+
         match self {
+            // An unshaped queue has no settings.
             Self::Unshaped(_) => {}
             Self::Link {
                 rate,
@@ -780,12 +799,15 @@ impl Pipeline {
                     rate.packet_limit = packet_limit;
                     rate.list.enforce(rate.byte_limit, rate.packet_limit);
                 }
+
                 if mask.contains(ConfigMask::RATE) {
                     rate.rate = Rate::from_setting(update.rate);
                 }
+
                 if mask.contains(ConfigMask::LOSS) {
                     loss.loss = update.loss;
                 }
+
                 if mask.contains(ConfigMask::LATENCY) {
                     latency.minimum = u64::from(update.latency_min) * TICKS_PER_MILLISECOND;
                     latency.maximum = u64::from(update.latency_max) * TICKS_PER_MILLISECOND;
@@ -798,15 +820,19 @@ impl Pipeline {
                     bucket.packet_limit = packet_limit;
                     bucket.list.enforce(bucket.byte_limit, bucket.packet_limit);
                 }
+
                 if mask.contains(ConfigMask::RATE) {
                     rate.rate = Rate::from_setting(update.rate);
                 }
+
                 if mask.contains(ConfigMask::TOKEN_RATE) {
                     bucket.set_token_rate(update.token_rate);
                 }
+
                 if mask.contains(ConfigMask::BUCKET) {
                     bucket.depth = u64::from(update.bucket_depth);
                     bucket.tokens = bucket.tokens.min(bucket.depth);
+
                     if mask.contains(ConfigMask::START_FULL) {
                         bucket.tokens = bucket.depth;
                         bucket.last = now;
@@ -843,26 +869,32 @@ impl Pipeline {
                     if released.dropped {
                         return Some(released);
                     }
+
                     let size = released.packet.size();
                     latency.enqueue(released.packet, size, now, random);
                 }
+
                 if let Some(released) = latency.list.pop_due(now) {
                     if released.dropped {
                         return Some(released);
                     }
+
                     let size = released.packet.size();
                     loss.enqueue(released.packet, size, now, random);
                 }
+
                 loss.list.pop_now()
             }
             Self::TokenBucket { bucket, rate } => loop {
                 if let Some(released) = rate.list.pop_due(now) {
                     return Some(released);
                 }
+
                 let released = bucket.dequeue(now)?;
                 if released.dropped {
                     return Some(released);
                 }
+
                 let size = released.packet.size();
                 let time = rate.rate.release_time(&rate.list, now, size);
                 rate.list.insert(released.packet, time, size);
@@ -884,10 +916,10 @@ impl Pipeline {
                 loss.list.next_time(now),
             ),
             Self::TokenBucket { bucket, rate } => {
-                if !rate.list.is_empty() {
-                    rate.list.next_time(now)
-                } else {
+                if rate.list.is_empty() {
                     bucket.next_time(now)
+                } else {
+                    rate.list.next_time(now)
                 }
             }
         }
@@ -911,5 +943,48 @@ impl Pipeline {
                 rate.list.free_all();
             }
         }
+    }
+}
+
+/// The earlier of two release times.
+#[inline]
+pub(super) fn earliest(a: Option<ReleaseTime>, b: Option<ReleaseTime>) -> Option<ReleaseTime> {
+    from_stored(to_stored(a).min(to_stored(b)))
+}
+
+/// Whether `time` comes before release time `bound`.
+#[inline]
+pub(super) fn is_before(time: ReleaseTime, bound: Option<ReleaseTime>) -> bool {
+    time.ticks() < to_stored(bound)
+}
+
+/// Stored form of a release time: never is u64::MAX, which stock compares
+/// as a time.
+#[inline]
+const fn to_stored(time: Option<ReleaseTime>) -> u64 {
+    match time {
+        Some(time) => time.ticks(),
+        None => u64::MAX,
+    }
+}
+
+#[inline]
+const fn from_stored(stored: u64) -> Option<ReleaseTime> {
+    ReleaseTime::at(stored)
+}
+
+/// `start + delta` clamped to the time range (0x91f93a60).
+fn saturating_add(start: u64, delta: i64) -> u64 {
+    start
+        .checked_add_signed(delta)
+        .unwrap_or(if delta < 0 { 0 } else { u64::MAX })
+}
+
+/// `end - start` clamped to the signed range (0x91f93aa0).
+fn saturating_difference(start: u64, end: u64) -> i64 {
+    if end >= start {
+        i64::try_from(end - start).unwrap_or(i64::MAX)
+    } else {
+        i64::try_from(start - end).map_or(i64::MIN, |difference| -difference)
     }
 }

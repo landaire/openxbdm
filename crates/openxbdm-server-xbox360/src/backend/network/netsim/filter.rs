@@ -2,6 +2,8 @@
 //! program's expression over the fields of one parsed frame. Any failure
 //! makes the frame pass the simulator untouched.
 
+mod error;
+
 use openxbdm_server::commands::network::netsim::classifier::Node;
 use openxbdm_server::commands::network::netsim::classifier::Operator;
 use openxbdm_server::commands::network::netsim::classifier::Program;
@@ -22,174 +24,9 @@ use super::frame::info;
 use super::frame::ipv4;
 use super::frame::udp;
 
-/// Evaluation failed; the frame bypasses the simulator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct EvaluationFailed;
+pub(super) use self::error::EvaluationFailed;
 
 type Result<T, E = EvaluationFailed> = core::result::Result<T, E>;
-
-fn truth(value: &Variant) -> Result<bool> {
-    variant::to_bool(value).map_err(|_| EvaluationFailed)
-}
-
-/// How a field reads its value (getters of the table at 0x91f0ca48).
-#[derive(Clone, Copy)]
-enum Getter {
-    /// Presence only: true.
-    Present,
-    /// Bytes at a frame offset (0x91f8c7c0).
-    Frame(u8, u8),
-    /// Bytes at a parse information offset (0x91f8c8b0).
-    Info(u8, u8),
-    /// A bit of a parse information byte (0x91f8c940).
-    Bit(u8, TcpFlags),
-    /// An address at a frame offset (0x91f8c850).
-    Address(u8),
-    /// A masked DNS flag field, shifted down by the mask's trailing zeros
-    /// (0x91f8dc88).
-    DnsFlags(DnsFlags),
-    /// A DNS header count (0x91f8dd48).
-    DnsCount(u8),
-    /// The first DNS question name (0x91f8de00).
-    DnsName,
-}
-
-xbox360_sys::flags! {
-    /// TCP header flags (information byte [`info::TCP_FLAGS`]).
-    pub struct TcpFlags(u8) {
-        FINISH = 0x1,
-        SYNCHRONIZE = 0x2,
-        RESET = 0x4,
-        PUSH = 0x8,
-        ACKNOWLEDGE = 0x10,
-        URGENT = 0x20,
-    }
-}
-
-xbox360_sys::flags! {
-    /// DNS header flag word; `OPCODE` and `RESPONSE_CODE` are fields.
-    pub struct DnsFlags(u16) {
-        RESPONSE = 0x8000,
-        OPCODE = 0x7800,
-        AUTHORITATIVE = 0x400,
-        TRUNCATED = 0x200,
-        RECURSION_DESIRED = 0x100,
-        RECURSION_AVAILABLE = 0x80,
-        AUTHENTIC_DATA = 0x20,
-        CHECKING_DISABLED = 0x10,
-        RESPONSE_CODE = 0xf,
-    }
-}
-
-/// DNS header fields.
-mod dns {
-    pub(super) const FLAGS: usize = 2;
-    pub(super) const QUESTIONS: u8 = 4;
-    pub(super) const ANSWERS: u8 = 6;
-    pub(super) const AUTHORITIES: u8 = 8;
-    pub(super) const ADDITIONAL: u8 = 0xa;
-    pub(super) const HEADER: usize = 0xc;
-    /// Marks a compression pointer in a name; the other bits are the
-    /// high bits of the offset.
-    pub(super) const POINTER: u8 = 0xc0;
-    /// Type and class after a question name.
-    pub(super) const QUESTION_TRAILER: usize = 4;
-}
-
-/// Frame offsets of the fields the table reads.
-mod offset {
-    use super::ETHERNET_HEADER;
-    use super::arp;
-    use super::ipv4;
-
-    /// Offset of a field of the packet after the Ethernet header.
-    const fn ip(field: usize) -> u8 {
-        (ETHERNET_HEADER + field) as u8
-    }
-
-    pub(super) const ETHERNET_DESTINATION: u8 = 0x0;
-    pub(super) const ETHERNET_SOURCE: u8 = 0x6;
-    pub(super) const ETHERNET_TYPE: u8 = 0xc;
-    pub(super) const IPV4_TOTAL_LENGTH: u8 = ip(ipv4::TOTAL_LENGTH);
-    pub(super) const IPV4_IDENTIFICATION: u8 = ip(ipv4::IDENTIFICATION);
-    pub(super) const IPV4_FRAGMENT: u8 = ip(ipv4::FRAGMENT);
-    pub(super) const IPV4_TIME_TO_LIVE: u8 = ip(ipv4::TIME_TO_LIVE);
-    pub(super) const IPV4_PROTOCOL: u8 = ip(ipv4::PROTOCOL);
-    pub(super) const IPV4_SOURCE: u8 = ip(ipv4::SOURCE);
-    pub(super) const IPV4_DESTINATION: u8 = ip(ipv4::DESTINATION);
-    pub(super) const ARP_OPERATION: u8 = ip(arp::OPERATION);
-    pub(super) const ARP_SENDER_HARDWARE: u8 = ip(arp::SENDER_HARDWARE);
-    pub(super) const ARP_SENDER_PROTOCOL: u8 = ip(arp::SENDER_PROTOCOL);
-    pub(super) const ARP_TARGET_HARDWARE: u8 = ip(arp::TARGET_HARDWARE);
-    pub(super) const ARP_TARGET_PROTOCOL: u8 = ip(arp::TARGET_PROTOCOL);
-}
-
-/// Value type of a field (variant type numbers).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    Bool,
-    U8,
-    U16,
-    U32,
-    Mac,
-    Ipv4,
-    Str,
-}
-
-/// Parse flags a field needs: one flag bit (`BIT` plus its number), one
-/// XSP subtype (its value), or any XSP subtype (zero, which no subtype
-/// has).
-#[derive(Clone, Copy)]
-struct Presence(u8);
-
-impl Presence {
-    const BIT: u8 = 0x20;
-    const ANY_XSP: Self = Self(0);
-
-    const fn flag(flag: FrameFlags) -> Self {
-        assert!(flag.bits().is_power_of_two());
-        Self(Self::BIT | flag.bits().trailing_zeros() as u8)
-    }
-
-    const fn xsp(subtype: XspSubtype) -> Self {
-        Self(subtype.get())
-    }
-
-    fn test(self, flags: FrameFlags) -> bool {
-        // Zero for no subtype, which matches only `ANY_XSP` below.
-        let subtype = flags.xsp_subtype().map_or(0, XspSubtype::get);
-        if self.0 & Self::BIT != 0 {
-            (flags.bits() >> (self.0 & !Self::BIT)) & 1 != 0
-        } else if self.0 == Self::ANY_XSP.0 {
-            subtype != 0
-        } else {
-            subtype == self.0
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct Field {
-    presence: Presence,
-    getter: Getter,
-    kind: Kind,
-}
-
-const fn field(presence: Presence, getter: Getter, kind: Kind) -> Field {
-    Field {
-        presence,
-        getter,
-        kind,
-    }
-}
-
-const fn present(presence: Presence) -> Field {
-    field(presence, Getter::Present, Kind::Bool)
-}
-
-const fn xsp(subtype: XspSubtype) -> Field {
-    present(Presence::xsp(subtype))
-}
 
 const ETHERNET: Presence = Presence::flag(FrameFlags::ETHERNET);
 const IPV4: Presence = Presence::flag(FrameFlags::IPV4);
@@ -353,6 +190,149 @@ const NAME_CAPACITY: usize = 0x100;
 /// text, so that every string is a range of one buffer.
 const NAME_START: usize = TEXT_CAPACITY;
 
+/// How a field reads its value (getters of the table at 0x91f0ca48).
+#[derive(Clone, Copy)]
+enum Getter {
+    /// Presence only: true.
+    Present,
+    /// Bytes at a frame offset (0x91f8c7c0).
+    Frame(u8, u8),
+    /// Bytes at a parse information offset (0x91f8c8b0).
+    Info(u8, u8),
+    /// A bit of a parse information byte (0x91f8c940).
+    Bit(u8, TcpFlags),
+    /// An address at a frame offset (0x91f8c850).
+    Address(u8),
+    /// A masked DNS flag field, shifted down by the mask's trailing zeros
+    /// (0x91f8dc88).
+    DnsFlags(DnsFlags),
+    /// A DNS header count (0x91f8dd48).
+    DnsCount(u8),
+    /// The first DNS question name (0x91f8de00).
+    DnsName,
+}
+
+xbox360_sys::flags! {
+    /// TCP header flags (information byte [`info::TCP_FLAGS`]).
+    pub struct TcpFlags(u8) {
+        FINISH = 0x1,
+        SYNCHRONIZE = 0x2,
+        RESET = 0x4,
+        PUSH = 0x8,
+        ACKNOWLEDGE = 0x10,
+        URGENT = 0x20,
+    }
+}
+
+xbox360_sys::flags! {
+    /// DNS header flag word; `OPCODE` and `RESPONSE_CODE` are fields.
+    pub struct DnsFlags(u16) {
+        RESPONSE = 0x8000,
+        OPCODE = 0x7800,
+        AUTHORITATIVE = 0x400,
+        TRUNCATED = 0x200,
+        RECURSION_DESIRED = 0x100,
+        RECURSION_AVAILABLE = 0x80,
+        AUTHENTIC_DATA = 0x20,
+        CHECKING_DISABLED = 0x10,
+        RESPONSE_CODE = 0xf,
+    }
+}
+
+/// DNS header fields.
+mod dns {
+    pub(super) const FLAGS: usize = 2;
+    pub(super) const QUESTIONS: u8 = 4;
+    pub(super) const ANSWERS: u8 = 6;
+    pub(super) const AUTHORITIES: u8 = 8;
+    pub(super) const ADDITIONAL: u8 = 0xa;
+    pub(super) const HEADER: usize = 0xc;
+    /// Marks a compression pointer in a name; the other bits are the
+    /// high bits of the offset.
+    pub(super) const POINTER: u8 = 0xc0;
+    /// Type and class after a question name.
+    pub(super) const QUESTION_TRAILER: usize = 4;
+}
+
+/// Frame offsets of the fields the table reads.
+mod offset {
+    use super::ETHERNET_HEADER;
+    use super::arp;
+    use super::ipv4;
+
+    /// Offset of a field of the packet after the Ethernet header.
+    const fn ip(field: usize) -> u8 {
+        (ETHERNET_HEADER + field) as u8
+    }
+
+    pub(super) const ETHERNET_DESTINATION: u8 = 0x0;
+    pub(super) const ETHERNET_SOURCE: u8 = 0x6;
+    pub(super) const ETHERNET_TYPE: u8 = 0xc;
+    pub(super) const IPV4_TOTAL_LENGTH: u8 = ip(ipv4::TOTAL_LENGTH);
+    pub(super) const IPV4_IDENTIFICATION: u8 = ip(ipv4::IDENTIFICATION);
+    pub(super) const IPV4_FRAGMENT: u8 = ip(ipv4::FRAGMENT);
+    pub(super) const IPV4_TIME_TO_LIVE: u8 = ip(ipv4::TIME_TO_LIVE);
+    pub(super) const IPV4_PROTOCOL: u8 = ip(ipv4::PROTOCOL);
+    pub(super) const IPV4_SOURCE: u8 = ip(ipv4::SOURCE);
+    pub(super) const IPV4_DESTINATION: u8 = ip(ipv4::DESTINATION);
+    pub(super) const ARP_OPERATION: u8 = ip(arp::OPERATION);
+    pub(super) const ARP_SENDER_HARDWARE: u8 = ip(arp::SENDER_HARDWARE);
+    pub(super) const ARP_SENDER_PROTOCOL: u8 = ip(arp::SENDER_PROTOCOL);
+    pub(super) const ARP_TARGET_HARDWARE: u8 = ip(arp::TARGET_HARDWARE);
+    pub(super) const ARP_TARGET_PROTOCOL: u8 = ip(arp::TARGET_PROTOCOL);
+}
+
+/// Value type of a field (variant type numbers).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Bool,
+    U8,
+    U16,
+    U32,
+    Mac,
+    Ipv4,
+    Str,
+}
+
+/// Parse flags a field needs: one flag bit (`BIT` plus its number), one
+/// XSP subtype (its value), or any XSP subtype (zero, which no subtype
+/// has).
+#[derive(Clone, Copy)]
+struct Presence(u8);
+
+impl Presence {
+    const BIT: u8 = 0x20;
+    const ANY_XSP: Self = Self(0);
+
+    const fn flag(flag: FrameFlags) -> Self {
+        assert!(flag.bits().is_power_of_two());
+        Self(Self::BIT | flag.bits().trailing_zeros() as u8)
+    }
+
+    const fn xsp(subtype: XspSubtype) -> Self {
+        Self(subtype.get())
+    }
+
+    fn test(self, flags: FrameFlags) -> bool {
+        // Zero for no subtype, which matches only `ANY_XSP` below.
+        let subtype = flags.xsp_subtype().map_or(0, XspSubtype::get);
+        if self.0 & Self::BIT != 0 {
+            (flags.bits() >> (self.0 & !Self::BIT)) & 1 != 0
+        } else if self.0 == Self::ANY_XSP.0 {
+            subtype != 0
+        } else {
+            subtype == self.0
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Field {
+    presence: Presence,
+    getter: Getter,
+    kind: Kind,
+}
+
 /// One evaluation of a program against a frame.
 pub(super) struct Evaluation<'a> {
     program: &'a Program,
@@ -365,41 +345,6 @@ pub(super) struct Evaluation<'a> {
     /// The program text, then the question name.
     text: [u8; NAME_START + NAME_CAPACITY],
     name_len: Option<usize>,
-}
-
-/// Whether the frame passes `program` (0x91f8c988).
-pub(super) fn matches(
-    program: &Program,
-    frame: &[u8],
-    parsed: &Parsed,
-) -> core::result::Result<bool, EvaluationFailed> {
-    let mut evaluation = Evaluation {
-        program,
-        frame,
-        parsed,
-        items: [None; 0x10],
-        operands: [[0; 5]; 0x20],
-        text: [0; NAME_START + NAME_CAPACITY],
-        name_len: None,
-    };
-    let program_text = program.text();
-    evaluation.text[..program_text.len()].copy_from_slice(program_text);
-    let nodes = program.nodes();
-    let mut stack = [0u8; 0x20];
-    let mut depth = 0;
-    for (index, node) in nodes.iter().enumerate() {
-        let count = match *node {
-            Node::Operator { operands, .. } => usize::from(operands),
-            _ => 0,
-        };
-        depth -= count;
-        evaluation.operands[index][..count].copy_from_slice(&stack[depth..depth + count]);
-        stack[depth] = index as u8;
-        depth += 1;
-    }
-    let root = evaluation.evaluate(nodes.len() - 1)?;
-    // 0x91f84768: the result as a truth value.
-    truth(&root)
 }
 
 impl Evaluation<'_> {
@@ -430,6 +375,7 @@ impl Evaluation<'_> {
         /// Functions from `Operator::STRING_LENGTH` on.
         const FIRST_FUNCTION: u8 = Operator::STRING_LENGTH.0;
         const LAST_FUNCTION: u8 = 0x24;
+
         match operator {
             AND | OR => self.logical(node, operator == AND),
             Operator::CONDITIONAL => {
@@ -446,6 +392,7 @@ impl Evaluation<'_> {
                 for (index, argument) in arguments.iter_mut().enumerate().take(count) {
                     *argument = self.operand(node, index)?;
                 }
+
                 variant::apply(&self.text, operator, &arguments[..count])
                     .map_err(|_| EvaluationFailed)
             }
@@ -459,6 +406,7 @@ impl Evaluation<'_> {
     fn logical(&mut self, node: usize, and: bool) -> Result<Variant> {
         let left = truth(&self.operand(node, 0)?);
         let right_node = usize::from(self.operands[node][1]);
+
         if let Node::Constant(value) = self.program.nodes()[right_node] {
             let (left, right) = (left?, truth(&self.program.variant(value))?);
             return Ok(Variant::Bool(if and {
@@ -467,10 +415,12 @@ impl Evaluation<'_> {
                 left || right
             }));
         }
+
         let decided = left?;
         if decided != and {
             return Ok(Variant::Bool(decided));
         }
+
         Ok(Variant::Bool(truth(&self.evaluate(right_node)?)?))
     }
 
@@ -478,12 +428,15 @@ impl Evaluation<'_> {
         if let Some(value) = self.items[index] {
             return Ok(value);
         }
+
         let item = self.program.items()[index];
         let value = match item.value {
             Value::Null => self.read_field(usize::from(item.field.0) - 1)?,
             declared => self.program.variant(declared),
         };
+
         self.items[index] = Some(value);
+
         Ok(value)
     }
 
@@ -506,6 +459,7 @@ impl Evaluation<'_> {
                 }),
             });
         }
+
         let number = |bytes: &[u8], kind: Kind| -> Variant {
             let value = bytes
                 .iter()
@@ -516,6 +470,7 @@ impl Evaluation<'_> {
                 _ => Variant::U32(value),
             }
         };
+
         Ok(match field.getter {
             Getter::Present => Variant::Bool(true),
             // 0x91f8c7c0 copies `size` frame bytes in order and reads the
@@ -580,7 +535,9 @@ impl Evaluation<'_> {
         {
             return None;
         }
+
         let header = header_length(self.frame.get(ETHERNET_HEADER).copied().unwrap_or(0));
+
         Some(ETHERNET_HEADER + header + UDP_HEADER)
     }
 
@@ -590,6 +547,7 @@ impl Evaluation<'_> {
         if let Some(length) = self.name_len {
             return length;
         }
+
         let length = self
             .dns()
             .and_then(|dns| {
@@ -604,20 +562,65 @@ impl Evaluation<'_> {
                         .try_into()
                         .ok()?,
                 );
+
                 if questions == 0 {
                     return None;
                 }
+
                 let area_start = dns + dns::HEADER;
                 let area_len = usize::from(udp_length).checked_sub(UDP_HEADER + dns::HEADER)?;
                 let area = self
                     .frame
                     .get(area_start..(area_start + area_len).min(self.frame.len()))?;
+
                 decode_question(area, area_len, &mut self.text[NAME_START..])
             })
             .unwrap_or(0);
+
         self.name_len = Some(length);
+
         length
     }
+}
+
+/// Whether the frame passes `program` (0x91f8c988).
+pub(super) fn matches(
+    program: &Program,
+    frame: &[u8],
+    parsed: &Parsed,
+) -> core::result::Result<bool, EvaluationFailed> {
+    let mut evaluation = Evaluation {
+        program,
+        frame,
+        parsed,
+        items: [None; 0x10],
+        operands: [[0; 5]; 0x20],
+        text: [0; NAME_START + NAME_CAPACITY],
+        name_len: None,
+    };
+
+    let program_text = program.text();
+    evaluation.text[..program_text.len()].copy_from_slice(program_text);
+
+    let nodes = program.nodes();
+    let mut stack = [0u8; 0x20];
+    let mut depth = 0;
+
+    for (index, node) in nodes.iter().enumerate() {
+        let count = match *node {
+            Node::Operator { operands, .. } => usize::from(operands),
+            _ => 0,
+        };
+        depth -= count;
+        evaluation.operands[index][..count].copy_from_slice(&stack[depth..depth + count]);
+        stack[depth] = index as u8;
+        depth += 1;
+    }
+
+    let root = evaluation.evaluate(nodes.len() - 1)?;
+
+    // 0x91f84768: the result as a truth value.
+    truth(&root)
 }
 
 /// Decode a question name into `output`; returns its length without the
@@ -627,54 +630,88 @@ fn decode_question(area: &[u8], declared: usize, output: &mut [u8]) -> Option<us
     let mut position = 0usize;
     let mut limit = declared.min(area.len());
     let mut written = 0usize;
+
     loop {
         let byte = *area.get(position).filter(|_| position < limit)?;
         position += 1;
+
         if byte & dns::POINTER == dns::POINTER {
             let low = *area.get(position).filter(|_| position < limit)?;
             position += 1;
+
             let offset = (usize::from(byte & !dns::POINTER) << 8 | usize::from(low)) & 0x3fff;
+
             // Pointers count from the DNS header; `area` starts after it.
             if offset < dns::HEADER {
                 return None;
             }
+
             let current = position - 2;
             let target = (offset - dns::HEADER) & 0xffff;
             if target + 1 >= current {
                 return None;
             }
+
             limit = limit.min(current);
             position = target;
             continue;
         }
+
         if byte == 0 {
             if position + dns::QUESTION_TRAILER > limit {
                 return None;
             }
+
             return written.checked_sub(1);
         }
+
         let label = usize::from(byte);
         let end = position + label;
         if end > limit {
             return None;
         }
+
         if written + label < capacity {
             output[written..written + label].copy_from_slice(&area[position..end]);
             output[written + label] = b'.';
         }
+
         written += label + 1;
         position = end;
+
         if written > capacity {
             return None;
         }
     }
 }
 
+fn truth(value: &Variant) -> Result<bool> {
+    variant::to_bool(value).map_err(|_| EvaluationFailed)
+}
+
 /// Up to eight frame bytes; bytes past the frame read as zero.
 fn bytes_at(frame: &[u8], offset: usize, size: usize) -> [u8; 8] {
     let mut bytes = [0u8; 8];
+
     for (index, byte) in bytes.iter_mut().enumerate().take(size) {
         *byte = frame.get(offset + index).copied().unwrap_or(0);
     }
+
     bytes
+}
+
+const fn field(presence: Presence, getter: Getter, kind: Kind) -> Field {
+    Field {
+        presence,
+        getter,
+        kind,
+    }
+}
+
+const fn present(presence: Presence) -> Field {
+    field(presence, Getter::Present, Kind::Bool)
+}
+
+const fn xsp(subtype: XspSubtype) -> Field {
+    present(Presence::xsp(subtype))
 }

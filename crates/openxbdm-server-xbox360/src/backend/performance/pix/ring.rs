@@ -33,20 +33,90 @@ use super::status;
 use crate::backend::dispatcher;
 use crate::backend::dispatcher::ControlCode;
 
-/// Ring size and pool tag `PIXs`.
+/// Ring size.
 const RING_BYTES: u32 = 0x1_0000;
 const RING_WORDS: usize = (RING_BYTES / 4) as usize;
-const RING_TAG: PoolTag = PoolTag::new(*b"PIXs");
 /// Queued bytes that make the ring report `CounterDataAvailable`.
 const NOTIFY_BYTES: u32 = 0x8000;
-/// Dropped tags kept for the drop record; the last slot becomes `....`
-/// when more tags are dropped.
+/// Dropped tags kept for the drop record.
 const DROPPED_TAGS: usize = 16;
-const DROPPED_OVERFLOW: RecordTag = RecordTag::new(*b"....");
 /// Dwords a capture record collects.
 const CAPTURED_DWORDS: usize = 8;
 /// Stream consumers (stock 0x91fa2b20).
 const CONSUMERS: usize = 5;
+/// Groups 0 to 4; 0 and 1 hold no values (group 0 index 0 starts a
+/// capture record instead).
+const GROUPS: [Option<Group>; 5] = [
+    None,
+    None,
+    Some(Group {
+        tag: RecordTag::new(*b"D3d_"),
+        count: 0x13,
+        first: 0,
+    }),
+    Some(Group {
+        tag: RecordTag::new(*b"XAM_"),
+        count: 7,
+        first: 0x13,
+    }),
+    Some(Group {
+        tag: RecordTag::new(*b"XAu_"),
+        count: 7,
+        first: 0x1a,
+    }),
+];
+
+/// Values of every group.
+const GROUP_VALUES: usize = 0x21;
+
+/// Header, tag, and length of a tagged record.
+const TAGGED_HEADER_DWORDS: usize = 3;
+/// Most payload dwords a tagged record carries; stock asserts below 0x7d.
+const TAGGED_PAYLOAD_DWORDS: usize = 0x7c;
+
+type TaggedRecord = [u32; TAGGED_HEADER_DWORDS + TAGGED_PAYLOAD_DWORDS];
+
+static RING: Locked = Locked {
+    lock: KspinLock::new(),
+    irql: UnsafeCell::new(Irql::PASSIVE),
+    dpc: Dpc(UnsafeCell::new([0; 0x20])),
+    dword_owner: AtomicU32::new(0),
+    ring: UnsafeCell::new(Ring {
+        buffer: None,
+        last: 0,
+        read: 0,
+        write: 0,
+        committed: 0,
+        snapshot: 0,
+        snapshot_end: 0,
+        consumers: [Consumer {
+            callback: None,
+            context: 0,
+            persistent: false,
+        }; CONSUMERS],
+        notified: false,
+        dpc_fired: false,
+        dpc_queued: false,
+        dropped: [0; DROPPED_TAGS],
+        dropped_count: 0,
+        first_drop_time: 0,
+        accepting: false,
+        capture_start: None,
+        capture_end: None,
+        capture_frames: 0,
+        value_target: None,
+        group_values: [0; GROUP_VALUES],
+        capturing: false,
+        packet_left: 0,
+        captured_value: 0,
+        captured_index: None,
+        captured: [0; CAPTURED_DWORDS],
+        flush_capture: false,
+        legacy: false,
+        dword_left: 0,
+        dword_ok: false,
+    }),
+};
 
 xbox360_sys::value_enum! {
     /// Packet kinds in the low bits of a packet header.
@@ -141,36 +211,6 @@ struct Group {
     first: usize,
 }
 
-/// Groups 0 to 4; 0 and 1 hold no values (group 0 index 0 starts a
-/// capture record instead).
-const GROUPS: [Option<Group>; 5] = [
-    None,
-    None,
-    Some(Group {
-        tag: RecordTag::new(*b"D3d_"),
-        count: 0x13,
-        first: 0,
-    }),
-    Some(Group {
-        tag: RecordTag::new(*b"XAM_"),
-        count: 7,
-        first: 0x13,
-    }),
-    Some(Group {
-        tag: RecordTag::new(*b"XAu_"),
-        count: 7,
-        first: 0x1a,
-    }),
-];
-/// Values of every group.
-const GROUP_VALUES: usize = 0x21;
-/// Group the frame boundary writes after storing the frame number.
-const FRAME_GROUP: usize = 2;
-/// Group 2 value index that the frame boundary sets to the frame number.
-const FRAME_VALUE: usize = 2;
-/// Group of the XAM counters an old-protocol consumer block carries.
-const XAM_GROUP: u32 = 3;
-
 /// Where the next dword of a packet is stored.
 #[derive(Clone, Copy)]
 enum ValueTarget {
@@ -241,6 +281,409 @@ struct Ring {
     dword_ok: bool,
 }
 
+impl Ring {
+    /// Address of the block; 0 without one, when every position is 0 too.
+    fn base(&self) -> u32 {
+        self.buffer.map_or(0, address)
+    }
+
+    /// Copy `bytes` to the write position without committing (stock
+    /// 0x91f62668); the write position after their whole dwords. The ring
+    /// never fills completely.
+    fn place_bytes(&self, bytes: &[u8]) -> Option<u32> {
+        let block = self.buffer?;
+        if !self.accepting {
+            return None;
+        }
+
+        let base = address(block);
+        let dwords = (bytes.len() >> 2) as u32;
+        let to_end = (self.last.wrapping_sub(self.write).wrapping_add(4) as i32 >> 2) as u32;
+        let offset = self.write.wrapping_sub(base);
+
+        if to_end > dwords {
+            if self.read > self.write && self.read <= self.write.wrapping_add(dwords << 2) {
+                return None;
+            }
+
+            // Stock copies the trailing partial dword too, past the new
+            // write position.
+            // SAFETY: `write` is a dword position in the block and `last`
+            // its last dword (`Ring::buffer`), so `to_end` dwords are left;
+            // `bytes` is shorter than `dwords + 1 <= to_end` dwords.
+            unsafe { copy_to(block, offset, bytes) };
+
+            Some(self.write.wrapping_add(dwords << 2))
+        } else {
+            if self.read > self.write {
+                return None;
+            }
+
+            let rest = (dwords - to_end) << 2;
+            // `read` stays in the block, so the first test bounds `rest`;
+            // the second keeps the copy below inside the block on its own,
+            // as the unchecked split relies on it.
+            if self.read <= base.wrapping_add(rest) || rest > RING_BYTES - 4 {
+                return None;
+            }
+
+            // Across the end stock copies whole dwords only.
+            let split = (to_end << 2) as usize;
+            // SAFETY: `bytes` holds `to_end` dwords and then `rest` bytes of
+            // its remaining `dwords - to_end` dwords.
+            let (head, tail) = unsafe {
+                (
+                    bytes.get_unchecked(..split),
+                    bytes.get_unchecked(split..split + rest as usize),
+                )
+            };
+            // SAFETY: `head` is the `to_end` dwords from `write` to the end
+            // of the block (`Ring::buffer`); `tail`, `rest` bytes, fits in
+            // the `RING_BYTES` block as tested above.
+            unsafe {
+                copy_to(block, offset, head);
+                copy_to(block, 0, tail);
+            }
+
+            Some(base.wrapping_add(rest))
+        }
+    }
+
+    /// [`Self::place_bytes`] for words.
+    fn place(&self, words: &[u32]) -> Option<u32> {
+        self.place_bytes(word_bytes(words))
+    }
+
+    fn advance(&mut self, placed: Option<u32>) -> bool {
+        if let Some(write) = placed {
+            self.write = write;
+        }
+
+        placed.is_some()
+    }
+
+    fn put_bytes(&mut self, bytes: &[u8]) -> bool {
+        let placed = self.place_bytes(bytes);
+        self.advance(placed)
+    }
+
+    fn put(&mut self, words: &[u32]) -> bool {
+        self.put_bytes(word_bytes(words))
+    }
+
+    fn commit(&mut self) {
+        self.committed = self.write;
+    }
+
+    fn discard(&mut self) {
+        self.write = self.committed;
+    }
+
+    /// Remember a dropped record's tag (stock 0x91f627a0); the first drop
+    /// stops further writes.
+    fn drop_tag(&mut self, tag: u32) {
+        /// Last tag slot once more tags are dropped than fit.
+        const DROPPED_OVERFLOW: RecordTag = RecordTag::new(*b"....");
+
+        if self.dropped[..self.dropped_count].contains(&tag) {
+            return;
+        }
+
+        if self.dropped_count == 0 {
+            self.first_drop_time = Timebase::now().ticks();
+            self.accepting = false;
+        }
+
+        if self.dropped_count < DROPPED_TAGS {
+            self.dropped[self.dropped_count] = tag;
+            self.dropped_count += 1;
+        } else {
+            self.dropped[DROPPED_TAGS - 1] = DROPPED_OVERFLOW.raw();
+        }
+    }
+
+    /// Bytes from ring position `start` to `end`, across the end of the
+    /// block when `end` is before `start`.
+    #[inline(always)]
+    fn span(&self, start: u32, end: u32) -> u32 {
+        if end < start {
+            ((self.last.wrapping_sub(start).wrapping_add(4) as i32 >> 2) << 2) as u32 - self.base()
+                + end
+        } else {
+            end - start
+        }
+    }
+
+    /// Bytes between the read position and the last complete record.
+    fn queued(&self) -> u32 {
+        ((self.span(self.read, self.committed) as i32 >> 2) << 2) as u32
+    }
+
+    /// Queue the DPC that reports `CounterDataAvailable` once enough data
+    /// is queued (stock 0x91f62870).
+    fn kick(&mut self) {
+        if self.notified || self.dpc_fired || self.dpc_queued || self.queued() < NOTIFY_BYTES {
+            return;
+        }
+
+        self.dpc_queued = true;
+        // SAFETY: the static DPC object `initialize` set up.
+        unsafe { KeInsertQueueDpc(RING.dpc.0.get().cast(), 0, 0) };
+    }
+
+    /// Feed one dword of a packet to the value and capture state (stock
+    /// 0x91f62c90).
+    fn parse(&mut self, word: u32) {
+        if let Some(target) = self.value_target.take() {
+            match target {
+                ValueTarget::Captured => self.captured_value = word,
+                ValueTarget::Group(slot) => self.group_values[slot] = word,
+            }
+        }
+
+        if self.capturing
+            && let Some(index) = self.captured_index
+        {
+            // Stock keeps storing past the eighth dword into the fields
+            // after the array; the extra dwords are not stored.
+            if let Some(slot) = self.captured.get_mut(index) {
+                *slot = word;
+            }
+            self.captured_index = Some(index + 1);
+            if index + 1 >= CAPTURED_DWORDS || self.packet_left == 1 {
+                self.flush_capture = true;
+            }
+        }
+
+        if self.packet_left != 0 {
+            self.packet_left -= 1;
+            return;
+        }
+
+        let header = PacketHeader(word);
+        self.packet_left = header.dwords().wrapping_sub(1);
+        if header.starts_capture() && self.capturing {
+            self.captured_index = Some(0);
+        }
+
+        if !header.assigns_value() {
+            return;
+        }
+
+        let group = header.group();
+        let index = header.index();
+        if group == 0 && index == 0 {
+            self.capturing = true;
+            self.value_target = Some(ValueTarget::Captured);
+            self.captured_index = None;
+            return;
+        }
+
+        if let Some(&Some(Group { count, first, .. })) = GROUPS.get(group)
+            && index < count
+        {
+            self.value_target = Some(ValueTarget::Group(first + index));
+        }
+    }
+
+    /// Write the capture record and end the capture (stock 0x91f63718).
+    fn write_capture(&mut self) {
+        /// Header, time base, and the captured value.
+        const FIXED_DWORDS: u32 = 4;
+
+        let time = Timebase::now().ticks();
+        let count = self.captured_index.map_or(u32::MAX, |index| index as u32);
+        let header = PacketHeader::new(PacketKind::Capture, count.wrapping_add(FIXED_DWORDS));
+        let stored = self.captured_index.unwrap_or(0).min(CAPTURED_DWORDS);
+        let written = self.put(&[
+            header.raw(),
+            (time >> 32) as u32,
+            time as u32,
+            self.captured_value,
+        ]) && {
+            let placed = self.place(&self.captured[..stored]);
+            self.advance(placed)
+        };
+        if written {
+            self.commit()
+        } else {
+            self.discard()
+        }
+
+        self.flush_capture = false;
+        self.capturing = false;
+        self.captured_index = None;
+    }
+
+    /// Write the timing and drop records that end an `r` transfer and
+    /// accept writes again (stock 0x91f62ee0).
+    fn write_drop_record(&mut self) {
+        /// Header and two time base values.
+        const FIXED_DWORDS: u32 = 5;
+
+        let time = Timebase::now().ticks();
+        if self.capture_start.is_some() && self.capture_end.is_none() {
+            return;
+        }
+
+        self.accepting = true;
+        if self.dropped_count == 0 {
+            self.first_drop_time = time;
+        }
+
+        let written = match (self.capture_start, self.capture_end) {
+            (Some(start), Some(end)) => {
+                let start = start.get();
+                let end = end.get();
+                self.put(&[
+                    PacketHeader::new(PacketKind::CaptureTiming, 4).raw(),
+                    CapturePhase::Start.raw(),
+                    (start >> 32) as u32,
+                    start as u32,
+                ]) && self.put(&[
+                    PacketHeader::new(PacketKind::CaptureTiming, 5).raw(),
+                    CapturePhase::End.raw(),
+                    (end >> 32) as u32,
+                    end as u32,
+                    self.capture_frames,
+                ])
+            }
+            _ => true,
+        };
+
+        let header = PacketHeader::new(PacketKind::Drops, self.dropped_count as u32 + FIXED_DWORDS);
+        let first = self.first_drop_time;
+        if written
+            && self.put(&[
+                header.raw(),
+                (first >> 32) as u32,
+                first as u32,
+                (time >> 32) as u32,
+                time as u32,
+            ])
+            && {
+                let placed = self.place(&self.dropped[..self.dropped_count]);
+                self.advance(placed)
+            }
+        {
+            self.dropped_count = 0;
+            self.capture_start = None;
+            self.capture_end = None;
+            self.capture_frames = 0;
+            self.commit();
+        } else {
+            self.accepting = false;
+            self.discard();
+        }
+    }
+
+    /// Append a record and commit it (stock 0x91f63808 after locking).
+    fn write_block(&mut self, words: &[u32]) {
+        if self.put(words) {
+            self.commit();
+        } else {
+            if let [header, tag, ..] = *words
+                && PacketHeader(header).is_tagged()
+            {
+                self.drop_tag(tag);
+            }
+            self.discard();
+        }
+
+        if let Some(&header) = words.first()
+            && PacketHeader(header).assigns_value()
+        {
+            for &word in words {
+                self.parse(word);
+            }
+            if self.flush_capture {
+                self.write_capture();
+            }
+        }
+
+        self.kick();
+    }
+
+    /// A consumer block record carrying `data` (stock 0x91f630a0).
+    fn write_consumer_block(&mut self, tag: u32, data: &[u8], extra: u32) {
+        /// Header, `extra`, tag, and length.
+        const FIXED_DWORDS: u32 = 4;
+
+        let length = data.len() as u32;
+        let header = PacketHeader::new(
+            PacketKind::ConsumerBlock,
+            (length.wrapping_add(3) >> 2) + FIXED_DWORDS,
+        );
+
+        if self.put(&[header.raw(), extra, tag, length]) && self.put_bytes(data) {
+            self.commit();
+        } else {
+            self.drop_tag(tag);
+            self.discard();
+        }
+    }
+
+    /// Write value group `group` as a tagged record (stock 0x91f63570).
+    fn write_group(&mut self, group: usize) {
+        /// Header, tag, length, and the time base.
+        const FIXED_DWORDS: u32 = 5;
+
+        let Some(&Some(Group { tag, count, first })) = GROUPS.get(group) else {
+            return;
+        };
+
+        if self.legacy {
+            return;
+        }
+
+        let time = Timebase::now().ticks();
+        let header = PacketHeader::new(PacketKind::Tagged, count as u32 + FIXED_DWORDS);
+
+        if self.put(&[
+            header.raw(),
+            tag.raw(),
+            (count as u32 + 2) << 2,
+            (time >> 32) as u32,
+            time as u32,
+        ]) && {
+            let placed = self.place(&self.group_values[first..first + count]);
+            self.advance(placed)
+        } {
+            self.commit();
+        } else {
+            self.drop_tag(tag.raw());
+            self.discard();
+        }
+    }
+
+    /// Store one dword of a code 0x27 packet in `block`, the ring block,
+    /// unless the ring is full.
+    fn put_dword(&mut self, block: &[AtomicU32], word: u32) -> bool {
+        let base = address(block);
+        let next = if self.write == self.last {
+            base
+        } else {
+            self.write + 4
+        };
+
+        let full = self.read.wrapping_sub(self.write) & !3 == 4
+            || (self.read == base && self.write == self.last);
+        if !full {
+            // SAFETY: `write` is a dword position in the block
+            // (`Ring::buffer`).
+            unsafe {
+                &*block
+                    .as_ptr()
+                    .byte_add(self.write.wrapping_sub(base) as usize)
+            }
+            .store(word, Relaxed);
+            self.write = next;
+        }
+
+        !full
+    }
+}
+
 #[repr(C, align(8))]
 struct Dpc(UnsafeCell<[u8; 0x20]>);
 
@@ -258,46 +701,91 @@ struct Locked {
 // object is used through kernel calls.
 unsafe impl Sync for Locked {}
 
-static RING: Locked = Locked {
-    lock: KspinLock::new(),
-    irql: UnsafeCell::new(Irql::PASSIVE),
-    dpc: Dpc(UnsafeCell::new([0; 0x20])),
-    dword_owner: AtomicU32::new(0),
-    ring: UnsafeCell::new(Ring {
-        buffer: None,
-        last: 0,
-        read: 0,
-        write: 0,
-        committed: 0,
-        snapshot: 0,
-        snapshot_end: 0,
-        consumers: [Consumer {
-            callback: None,
-            context: 0,
-            persistent: false,
-        }; CONSUMERS],
-        notified: false,
-        dpc_fired: false,
-        dpc_queued: false,
-        dropped: [0; DROPPED_TAGS],
-        dropped_count: 0,
-        first_drop_time: 0,
-        accepting: false,
-        capture_start: None,
-        capture_end: None,
-        capture_frames: 0,
-        value_target: None,
-        group_values: [0; GROUP_VALUES],
-        capturing: false,
-        packet_left: 0,
-        captured_value: 0,
-        captured_index: None,
-        captured: [0; CAPTURED_DWORDS],
-        flush_capture: false,
-        legacy: false,
-        dword_left: 0,
-        dword_ok: false,
-    }),
+/// A block of a code 0x43 argument and of a code 0x5e list.
+#[repr(C)]
+struct BlockEntry {
+    address: AtomicU32,
+    dwords: AtomicU32,
+}
+
+/// Records of a code 0x5e block list, up to its null address.
+#[derive(Clone)]
+struct BlockList<'a> {
+    entry: u32,
+    records: PhantomData<&'a [u8]>,
+}
+
+impl BlockList<'_> {
+    /// # Safety
+    /// `list` holds 4-byte aligned [`BlockEntry`] values up to a null
+    /// address word, each naming `dwords` readable words of any alignment,
+    /// all kept for the lifetime of the list.
+    unsafe fn new(list: u32) -> Self {
+        Self {
+            entry: list,
+            records: PhantomData,
+        }
+    }
+}
+
+impl<'a> Iterator for BlockList<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        // SAFETY: the entry address lies in the list up to and including
+        // its null address word (`BlockList::new`).
+        let address = unsafe { crate::kernel::object_at::<AtomicU32>(self.entry) }.load(Relaxed);
+        if address == 0 {
+            return None;
+        }
+
+        // SAFETY: a full entry precedes the null address word, and it names
+        // a record of `dwords` words (`BlockList::new`) at the nonzero
+        // `address`, a valid pointer for an empty record too. The byte count
+        // wraps as in stock.
+        let record = unsafe {
+            let entry = crate::kernel::object_at::<BlockEntry>(self.entry);
+            core::slice::from_raw_parts(
+                core::ptr::with_exposed_provenance(address as usize),
+                (entry.dwords.load(Relaxed) << 2) as usize,
+            )
+        };
+        self.entry += size_of::<BlockEntry>() as u32;
+
+        Some(record)
+    }
+}
+
+/// Code 0x41, 0x42, and 0x58 argument.
+#[repr(C)]
+struct ConsumerArgument {
+    callback: AtomicU32,
+    context: AtomicU32,
+}
+
+/// Transfer context of a title's `pixcmd r` run through code 0x45.
+#[repr(C)]
+struct TitleTransfer {
+    /// Routine the title calls for each run.
+    continuation: AtomicU32,
+    /// Bytes of the current run.
+    length: AtomicU32,
+    /// Address of the current run.
+    data: AtomicU32,
+    /// Snapshot size.
+    size: AtomicU32,
+    reserved: AtomicU32,
+    /// Snapshot size, then the bytes after the end of the block.
+    wrapped: AtomicU32,
+}
+
+const _: () = {
+    use core::mem::offset_of;
+    assert!(offset_of!(TitleTransfer, length) == 4);
+    assert!(offset_of!(TitleTransfer, data) == 8);
+    assert!(offset_of!(TitleTransfer, size) == 0xc);
+    assert!(offset_of!(TitleTransfer, reserved) == 0x10);
+    assert!(offset_of!(TitleTransfer, wrapped) == 0x14);
 };
 
 /// Raise to DISPATCH and take the ring lock (stock 0x91f625c8).
@@ -309,6 +797,7 @@ fn acquire() {
         KeAcquireSpinLockAtRaisedIrql(RING.lock.as_ptr());
         irql
     };
+
     // SAFETY: the lock is held.
     unsafe { *RING.irql.get() = irql };
 }
@@ -323,8 +812,10 @@ fn try_acquire() -> bool {
         unsafe { xboxkrnl::KfLowerIrql(irql) };
         return false;
     }
+
     // SAFETY: the lock is held.
     unsafe { *RING.irql.get() = irql };
+
     true
 }
 
@@ -354,6 +845,7 @@ fn with<R>(f: impl FnOnce(&mut Ring) -> R) -> R {
     // SAFETY: the lock is held for the call.
     let result = f(unsafe { ring() });
     release();
+
     result
 }
 
@@ -367,6 +859,7 @@ unsafe fn caller_words<'a>(address: u32, dwords: u32) -> &'a [u32] {
     if dwords == 0 {
         return &[];
     }
+
     // SAFETY: guaranteed by the caller.
     unsafe {
         core::slice::from_raw_parts(
@@ -386,6 +879,7 @@ unsafe fn caller_bytes<'a>(address: u32, length: usize) -> &'a [u8] {
     if length == 0 {
         return &[];
     }
+
     // SAFETY: guaranteed by the caller.
     unsafe {
         core::slice::from_raw_parts(core::ptr::with_exposed_provenance(address as usize), length)
@@ -426,381 +920,10 @@ unsafe fn copy_to(block: &[AtomicU32], offset: u32, source: &[u8]) {
     };
 }
 
-impl Ring {
-    /// Address of the block; 0 without one, when every position is 0 too.
-    fn base(&self) -> u32 {
-        self.buffer.map_or(0, address)
-    }
-
-    /// Copy `bytes` to the write position without committing (stock
-    /// 0x91f62668); the write position after their whole dwords. The ring
-    /// never fills completely.
-    fn place_bytes(&self, bytes: &[u8]) -> Option<u32> {
-        let block = self.buffer?;
-        if !self.accepting {
-            return None;
-        }
-        let base = address(block);
-        let dwords = (bytes.len() >> 2) as u32;
-        let to_end = (self.last.wrapping_sub(self.write).wrapping_add(4) as i32 >> 2) as u32;
-        let offset = self.write.wrapping_sub(base);
-        if to_end > dwords {
-            if self.read > self.write && self.read <= self.write.wrapping_add(dwords << 2) {
-                return None;
-            }
-            // Stock copies the trailing partial dword too, past the new
-            // write position.
-            // SAFETY: `write` is a dword position in the block and `last`
-            // its last dword (`Ring::buffer`), so `to_end` dwords are left;
-            // `bytes` is shorter than `dwords + 1 <= to_end` dwords.
-            unsafe { copy_to(block, offset, bytes) };
-            Some(self.write.wrapping_add(dwords << 2))
-        } else {
-            if self.read > self.write {
-                return None;
-            }
-            let rest = (dwords - to_end) << 2;
-            // `read` stays in the block, so the first test bounds `rest`;
-            // the second keeps the copy below inside the block on its own,
-            // as the unchecked split relies on it.
-            if self.read <= base.wrapping_add(rest) || rest > RING_BYTES - 4 {
-                return None;
-            }
-            // Across the end stock copies whole dwords only.
-            let split = (to_end << 2) as usize;
-            // SAFETY: `bytes` holds `to_end` dwords and then `rest` bytes of
-            // its remaining `dwords - to_end` dwords.
-            let (head, tail) = unsafe {
-                (
-                    bytes.get_unchecked(..split),
-                    bytes.get_unchecked(split..split + rest as usize),
-                )
-            };
-            // SAFETY: `head` is the `to_end` dwords from `write` to the end
-            // of the block (`Ring::buffer`); `tail`, `rest` bytes, fits in
-            // the `RING_BYTES` block as tested above.
-            unsafe {
-                copy_to(block, offset, head);
-                copy_to(block, 0, tail);
-            }
-            Some(base.wrapping_add(rest))
-        }
-    }
-
-    /// [`Self::place_bytes`] for words.
-    fn place(&self, words: &[u32]) -> Option<u32> {
-        self.place_bytes(word_bytes(words))
-    }
-
-    fn advance(&mut self, placed: Option<u32>) -> bool {
-        if let Some(write) = placed {
-            self.write = write;
-        }
-        placed.is_some()
-    }
-
-    fn put_bytes(&mut self, bytes: &[u8]) -> bool {
-        let placed = self.place_bytes(bytes);
-        self.advance(placed)
-    }
-
-    fn put(&mut self, words: &[u32]) -> bool {
-        self.put_bytes(word_bytes(words))
-    }
-
-    fn commit(&mut self) {
-        self.committed = self.write;
-    }
-
-    fn discard(&mut self) {
-        self.write = self.committed;
-    }
-
-    /// Remember a dropped record's tag (stock 0x91f627a0); the first drop
-    /// stops further writes.
-    fn drop_tag(&mut self, tag: u32) {
-        if self.dropped[..self.dropped_count].contains(&tag) {
-            return;
-        }
-        if self.dropped_count == 0 {
-            self.first_drop_time = Timebase::now().ticks();
-            self.accepting = false;
-        }
-        if self.dropped_count < DROPPED_TAGS {
-            self.dropped[self.dropped_count] = tag;
-            self.dropped_count += 1;
-        } else {
-            self.dropped[DROPPED_TAGS - 1] = DROPPED_OVERFLOW.raw();
-        }
-    }
-
-    /// Bytes from ring position `start` to `end`, across the end of the
-    /// block when `end` is before `start`.
-    #[inline(always)]
-    fn span(&self, start: u32, end: u32) -> u32 {
-        if end < start {
-            ((self.last.wrapping_sub(start).wrapping_add(4) as i32 >> 2) << 2) as u32 - self.base()
-                + end
-        } else {
-            end - start
-        }
-    }
-
-    /// Bytes between the read position and the last complete record.
-    fn queued(&self) -> u32 {
-        ((self.span(self.read, self.committed) as i32 >> 2) << 2) as u32
-    }
-
-    /// Queue the DPC that reports `CounterDataAvailable` once enough data
-    /// is queued (stock 0x91f62870).
-    fn kick(&mut self) {
-        if self.notified || self.dpc_fired || self.dpc_queued || self.queued() < NOTIFY_BYTES {
-            return;
-        }
-        self.dpc_queued = true;
-        // SAFETY: the static DPC object `initialize` set up.
-        unsafe { KeInsertQueueDpc(RING.dpc.0.get().cast(), 0, 0) };
-    }
-
-    /// Feed one dword of a packet to the value and capture state (stock
-    /// 0x91f62c90).
-    fn parse(&mut self, word: u32) {
-        if let Some(target) = self.value_target.take() {
-            match target {
-                ValueTarget::Captured => self.captured_value = word,
-                ValueTarget::Group(slot) => self.group_values[slot] = word,
-            }
-        }
-        if self.capturing
-            && let Some(index) = self.captured_index
-        {
-            // Stock keeps storing past the eighth dword into the fields
-            // after the array; the extra dwords are not stored.
-            if let Some(slot) = self.captured.get_mut(index) {
-                *slot = word;
-            }
-            self.captured_index = Some(index + 1);
-            if index + 1 >= CAPTURED_DWORDS || self.packet_left == 1 {
-                self.flush_capture = true;
-            }
-        }
-        if self.packet_left != 0 {
-            self.packet_left -= 1;
-            return;
-        }
-        let header = PacketHeader(word);
-        self.packet_left = header.dwords().wrapping_sub(1);
-        if header.starts_capture() && self.capturing {
-            self.captured_index = Some(0);
-        }
-        if !header.assigns_value() {
-            return;
-        }
-        let group = header.group();
-        let index = header.index();
-        if group == 0 && index == 0 {
-            self.capturing = true;
-            self.value_target = Some(ValueTarget::Captured);
-            self.captured_index = None;
-            return;
-        }
-        if let Some(&Some(Group { count, first, .. })) = GROUPS.get(group)
-            && index < count
-        {
-            self.value_target = Some(ValueTarget::Group(first + index));
-        }
-    }
-
-    /// Write the capture record and end the capture (stock 0x91f63718).
-    fn write_capture(&mut self) {
-        /// Header, time base, and the captured value.
-        const FIXED_DWORDS: u32 = 4;
-        let time = Timebase::now().ticks();
-        let count = self.captured_index.map_or(u32::MAX, |index| index as u32);
-        let header = PacketHeader::new(PacketKind::Capture, count.wrapping_add(FIXED_DWORDS));
-        let stored = self.captured_index.unwrap_or(0).min(CAPTURED_DWORDS);
-        let written = self.put(&[
-            header.raw(),
-            (time >> 32) as u32,
-            time as u32,
-            self.captured_value,
-        ]) && {
-            let placed = self.place(&self.captured[..stored]);
-            self.advance(placed)
-        };
-        if written {
-            self.commit()
-        } else {
-            self.discard()
-        }
-        self.flush_capture = false;
-        self.capturing = false;
-        self.captured_index = None;
-    }
-
-    /// Write the timing and drop records that end an `r` transfer and
-    /// accept writes again (stock 0x91f62ee0).
-    fn write_drop_record(&mut self) {
-        /// Header and two time base values.
-        const FIXED_DWORDS: u32 = 5;
-        let time = Timebase::now().ticks();
-        if self.capture_start.is_some() && self.capture_end.is_none() {
-            return;
-        }
-        self.accepting = true;
-        if self.dropped_count == 0 {
-            self.first_drop_time = time;
-        }
-        let mut written = true;
-        if let (Some(start), Some(end)) = (self.capture_start, self.capture_end) {
-            let (start, end) = (start.get(), end.get());
-            written = self.put(&[
-                PacketHeader::new(PacketKind::CaptureTiming, 4).raw(),
-                CapturePhase::Start.raw(),
-                (start >> 32) as u32,
-                start as u32,
-            ]) && self.put(&[
-                PacketHeader::new(PacketKind::CaptureTiming, 5).raw(),
-                CapturePhase::End.raw(),
-                (end >> 32) as u32,
-                end as u32,
-                self.capture_frames,
-            ]);
-        }
-        let header = PacketHeader::new(PacketKind::Drops, self.dropped_count as u32 + FIXED_DWORDS);
-        let first = self.first_drop_time;
-        if written
-            && self.put(&[
-                header.raw(),
-                (first >> 32) as u32,
-                first as u32,
-                (time >> 32) as u32,
-                time as u32,
-            ])
-            && {
-                let placed = self.place(&self.dropped[..self.dropped_count]);
-                self.advance(placed)
-            }
-        {
-            self.dropped_count = 0;
-            self.capture_start = None;
-            self.capture_end = None;
-            self.capture_frames = 0;
-            self.commit();
-        } else {
-            self.accepting = false;
-            self.discard();
-        }
-    }
-
-    /// Append a record and commit it (stock 0x91f63808 after locking).
-    fn write_block(&mut self, words: &[u32]) {
-        if self.put(words) {
-            self.commit();
-        } else {
-            if let [header, tag, ..] = *words
-                && PacketHeader(header).is_tagged()
-            {
-                self.drop_tag(tag);
-            }
-            self.discard();
-        }
-        if let Some(&header) = words.first()
-            && PacketHeader(header).assigns_value()
-        {
-            for &word in words {
-                self.parse(word);
-            }
-            if self.flush_capture {
-                self.write_capture();
-            }
-        }
-        self.kick();
-    }
-
-    /// A consumer block record carrying `data` (stock 0x91f630a0).
-    fn write_consumer_block(&mut self, tag: u32, data: &[u8], extra: u32) {
-        /// Header, `extra`, tag, and length.
-        const FIXED_DWORDS: u32 = 4;
-        let length = data.len() as u32;
-        let header = PacketHeader::new(
-            PacketKind::ConsumerBlock,
-            (length.wrapping_add(3) >> 2) + FIXED_DWORDS,
-        );
-        if self.put(&[header.raw(), extra, tag, length]) && self.put_bytes(data) {
-            self.commit();
-        } else {
-            self.drop_tag(tag);
-            self.discard();
-        }
-    }
-
-    /// Write value group `group` as a tagged record (stock 0x91f63570).
-    fn write_group(&mut self, group: usize) {
-        /// Header, tag, length, and the time base.
-        const FIXED_DWORDS: u32 = 5;
-        let Some(&Some(Group { tag, count, first })) = GROUPS.get(group) else {
-            return;
-        };
-        if self.legacy {
-            return;
-        }
-        let time = Timebase::now().ticks();
-        let header = PacketHeader::new(PacketKind::Tagged, count as u32 + FIXED_DWORDS);
-        if self.put(&[
-            header.raw(),
-            tag.raw(),
-            (count as u32 + 2) << 2,
-            (time >> 32) as u32,
-            time as u32,
-        ]) && {
-            let placed = self.place(&self.group_values[first..first + count]);
-            self.advance(placed)
-        } {
-            self.commit();
-        } else {
-            self.drop_tag(tag.raw());
-            self.discard();
-        }
-    }
-
-    /// Store one dword of a code 0x27 packet in `block`, the ring block,
-    /// unless the ring is full.
-    fn put_dword(&mut self, block: &[AtomicU32], word: u32) -> bool {
-        let base = address(block);
-        let next = if self.write == self.last {
-            base
-        } else {
-            self.write + 4
-        };
-        let full = self.read.wrapping_sub(self.write) & !3 == 4
-            || (self.read == base && self.write == self.last);
-        if !full {
-            // SAFETY: `write` is a dword position in the block
-            // (`Ring::buffer`).
-            unsafe {
-                &*block
-                    .as_ptr()
-                    .byte_add(self.write.wrapping_sub(base) as usize)
-            }
-            .store(word, Relaxed);
-            self.write = next;
-        }
-        !full
-    }
-}
-
 /// Whether the ring exists, i.e. tracing is on (stock 0x91f62758).
 pub(crate) fn stream_active() -> bool {
     with(|ring| ring.buffer.is_some())
 }
-
-/// Header, tag, and length of a tagged record.
-const TAGGED_HEADER_DWORDS: usize = 3;
-/// Most payload dwords a tagged record carries; stock asserts below 0x7d.
-const TAGGED_PAYLOAD_DWORDS: usize = 0x7c;
-
-type TaggedRecord = [u32; TAGGED_HEADER_DWORDS + TAGGED_PAYLOAD_DWORDS];
 
 /// Write a tagged record `{header, tag, length, payload}` through the
 /// monitor control codes so a debugger extension sees it: code 0x5e with a
@@ -811,6 +934,7 @@ pub(crate) fn write_tagged_record(tag: u32, payload: &[u8]) -> bool {
     if payload.len().div_ceil(4) > TAGGED_PAYLOAD_DWORDS {
         return false;
     }
+
     let mut record: TaggedRecord = [0; TAGGED_HEADER_DWORDS + TAGGED_PAYLOAD_DWORDS];
     for (word, chunk) in record[TAGGED_HEADER_DWORDS..]
         .iter_mut()
@@ -820,6 +944,7 @@ pub(crate) fn write_tagged_record(tag: u32, payload: &[u8]) -> bool {
         bytes[..chunk.len()].copy_from_slice(chunk);
         *word = u32::from_be_bytes(bytes);
     }
+
     send_tagged_record(&mut record, tag, payload.len() as u32)
 }
 
@@ -828,6 +953,7 @@ pub(crate) fn write_tagged_words(tag: u32, words: &[u32]) -> bool {
     if words.len() > TAGGED_PAYLOAD_DWORDS {
         return false;
     }
+
     let mut record: TaggedRecord = [0; TAGGED_HEADER_DWORDS + TAGGED_PAYLOAD_DWORDS];
     record[TAGGED_HEADER_DWORDS..TAGGED_HEADER_DWORDS + words.len()].copy_from_slice(words);
     send_tagged_record(&mut record, tag, (words.len() * 4) as u32)
@@ -841,6 +967,7 @@ fn send_tagged_record(record: &mut TaggedRecord, tag: u32, length: u32) -> bool 
     record[0] = PacketHeader::new(PacketKind::Tagged, dwords + header_dwords).raw();
     record[1] = tag;
     record[2] = length;
+
     let address = record.as_ptr() as usize as u32;
     // Header and payload entries, then the null address that ends the list.
     let list = [
@@ -858,6 +985,7 @@ fn send_tagged_record(record: &mut TaggedRecord, tag: u32, length: u32) -> bool 
             list.as_ptr() as usize as u32,
         )
     };
+
     match listed as i32 {
         0 => {
             let block = [address, dwords + header_dwords];
@@ -875,7 +1003,11 @@ fn send_tagged_record(record: &mut TaggedRecord, tag: u32, length: u32) -> bool 
 /// Allocate the ring and register the context switch record routine
 /// (stock 0x91f63ba8, `pixcmd b`).
 pub(super) fn start() {
+    /// Pool tag `PIXs` of the ring block.
+    const RING_TAG: PoolTag = PoolTag::new(*b"PIXs");
+
     acquire();
+
     // SAFETY: the lock is held.
     let ring = unsafe { ring() };
     let fresh = ring.buffer.is_none();
@@ -888,6 +1020,7 @@ pub(super) fn start() {
         // takes it out of `buffer` and frees it.
         ring.buffer = (block != 0).then(|| unsafe { super::words_at(block, RING_WORDS) });
     }
+
     if let Some(block) = ring.buffer {
         let base = address(block);
         ring.read = base;
@@ -914,6 +1047,7 @@ pub(super) fn start() {
             crate::backend::session::register_swap_routine(context_switch, true);
         }
     }
+
     release();
 }
 
@@ -921,6 +1055,7 @@ pub(super) fn start() {
 /// `pixcmd e`).
 pub(super) fn stop() {
     acquire();
+
     // SAFETY: the lock is held.
     let ring = unsafe { ring() };
     let block = ring.buffer.take().map(address);
@@ -931,7 +1066,9 @@ pub(super) fn stop() {
     if block.is_some() {
         crate::backend::session::unregister_swap_routine(context_switch);
     }
+
     release();
+
     if let Some(block) = block {
         // SAFETY: the ring block from `start`, detached from the ring under
         // the lock.
@@ -963,6 +1100,7 @@ pub(super) fn write_block(record: &[u32], wait: bool) {
     } else if !try_acquire() {
         return;
     }
+
     // SAFETY: the lock is held.
     unsafe { ring() }.write_block(record);
     release();
@@ -988,6 +1126,11 @@ pub(super) fn write_group(group: usize) {
 /// Store the frame number in group 2 and write the group (stock
 /// 0x91f636c8).
 pub(super) fn write_frame_group(frame: u32) {
+    /// Group the frame boundary writes after storing the frame number.
+    const FRAME_GROUP: usize = 2;
+    /// Group 2 value index that the frame boundary sets to the frame number.
+    const FRAME_VALUE: usize = 2;
+
     with(|ring| {
         if let Some(group) = GROUPS[FRAME_GROUP] {
             ring.group_values[group.first + FRAME_VALUE] = frame;
@@ -1003,6 +1146,7 @@ pub(super) fn call_consumers(frame: u32) {
     // SAFETY: the lock is held; consumers write through `consumer_write`,
     // which relies on this lock.
     let consumers = unsafe { ring() }.consumers;
+
     for consumer in &consumers {
         let Some(callback) = consumer.callback else {
             continue;
@@ -1019,6 +1163,7 @@ pub(super) fn call_consumers(frame: u32) {
             )
         };
     }
+
     release();
 }
 
@@ -1043,6 +1188,9 @@ unsafe extern "C" fn consumer_write(tag: u32, data: u32, length: u32, extra: u32
     const VERSION_1: u32 = 0x10;
     /// Dword of an XAM counter block holding the first XAM group value.
     const XAM_FIRST_VALUE: usize = 3;
+    /// Group of the XAM counters an old-protocol consumer block carries.
+    const XAM_GROUP: u32 = 3;
+
     /// The counter block as words, as stock reads it.
     ///
     /// # Safety
@@ -1051,6 +1199,7 @@ unsafe extern "C" fn consumer_write(tag: u32, data: u32, length: u32, extra: u32
         // SAFETY: guaranteed by the caller.
         unsafe { caller_words(data, COUNTER_BLOCK >> 2) }
     }
+
     // SAFETY: the caller's contract: `call_consumers` holds the lock.
     let ring = unsafe { ring() };
     if !ring.legacy {
@@ -1072,11 +1221,14 @@ unsafe extern "C" fn consumer_write(tag: u32, data: u32, length: u32, extra: u32
             // bytewise.
             ring.write_consumer_block(tag, unsafe { caller_bytes(data, length as usize) }, extra);
         }
+
         return;
     }
+
     if length != COUNTER_BLOCK {
         return;
     }
+
     if tag == XAM_COUNTERS.raw() {
         // SAFETY: an XAM counter block, read by words as in stock.
         let data = unsafe { counters(data) };
@@ -1089,6 +1241,7 @@ unsafe extern "C" fn consumer_write(tag: u32, data: u32, length: u32, extra: u32
             pair[0] = PacketHeader::assignment(XAM_GROUP, index as u32).raw();
             pair[1] = (value as f32).to_bits();
         }
+
         if ring.put(&record) {
             ring.commit()
         } else {
@@ -1116,6 +1269,7 @@ pub(crate) fn service_write_dword(word: u32) -> u32 {
         ring.dword_left = word >> PacketHeader::DWORDS_SHIFT;
         ring.dword_ok = true;
     }
+
     // SAFETY: this processor holds the lock until the packet ends.
     let ring = unsafe { ring() };
     ring.parse(word);
@@ -1125,6 +1279,7 @@ pub(crate) fn service_write_dword(word: u32) -> u32 {
     };
     ring.dword_ok = stored;
     ring.dword_left = ring.dword_left.wrapping_sub(1);
+
     if ring.dword_left == 0 {
         if stored {
             ring.commit()
@@ -1137,14 +1292,8 @@ pub(crate) fn service_write_dword(word: u32) -> u32 {
         }
         release();
     }
-    u32::from(stored)
-}
 
-/// A block of a code 0x43 argument and of a code 0x5e list.
-#[repr(C)]
-struct BlockEntry {
-    address: AtomicU32,
-    dwords: AtomicU32,
+    u32::from(stored)
 }
 
 /// Monitor control code 0x43 (stock 0x91f63808 with `{+0 address, +4
@@ -1162,53 +1311,8 @@ pub(crate) unsafe fn service_write_block(argument: u32) -> u32 {
         caller_words(entry.address.load(Relaxed), entry.dwords.load(Relaxed))
     };
     write_block(record, true);
+
     0
-}
-
-/// Records of a code 0x5e block list, up to its null address.
-#[derive(Clone)]
-struct BlockList<'a> {
-    entry: u32,
-    records: PhantomData<&'a [u8]>,
-}
-
-impl BlockList<'_> {
-    /// # Safety
-    /// `list` holds 4-byte aligned [`BlockEntry`] values up to a null
-    /// address word, each naming `dwords` readable words of any alignment,
-    /// all kept for the lifetime of the list.
-    unsafe fn new(list: u32) -> Self {
-        Self {
-            entry: list,
-            records: PhantomData,
-        }
-    }
-}
-
-impl<'a> Iterator for BlockList<'a> {
-    type Item = &'a [u8];
-
-    fn next(&mut self) -> Option<&'a [u8]> {
-        // SAFETY: the entry address lies in the list up to and including
-        // its null address word (`BlockList::new`).
-        let address = unsafe { crate::kernel::object_at::<AtomicU32>(self.entry) }.load(Relaxed);
-        if address == 0 {
-            return None;
-        }
-        // SAFETY: a full entry precedes the null address word, and it names
-        // a record of `dwords` words (`BlockList::new`) at the nonzero
-        // `address`, a valid pointer for an empty record too. The byte count
-        // wraps as in stock.
-        let record = unsafe {
-            let entry = crate::kernel::object_at::<BlockEntry>(self.entry);
-            core::slice::from_raw_parts(
-                core::ptr::with_exposed_provenance(address as usize),
-                (entry.dwords.load(Relaxed) << 2) as usize,
-            )
-        };
-        self.entry += size_of::<BlockEntry>() as u32;
-        Some(record)
-    }
 }
 
 /// Monitor control code 0x5e (stock 0x91f62998): a list of `{address,
@@ -1222,6 +1326,7 @@ impl<'a> Iterator for BlockList<'a> {
 pub(crate) unsafe fn service_write_block_list(argument: u32) -> u32 {
     // SAFETY: the caller's contract.
     let blocks = unsafe { BlockList::new(argument) };
+
     with(|ring| {
         let written = blocks.clone().all(|record| ring.put_bytes(record));
         if written {
@@ -1242,16 +1347,11 @@ pub(crate) unsafe fn service_write_block_list(argument: u32) -> u32 {
             }
             ring.discard();
         }
+
         ring.kick();
+
         if written { 1 } else { u32::MAX }
     })
-}
-
-/// Code 0x41, 0x42, and 0x58 argument.
-#[repr(C)]
-struct ConsumerArgument {
-    callback: AtomicU32,
-    context: AtomicU32,
 }
 
 /// Monitor control codes 0x42 (`persistent` false) and 0x58: register a
@@ -1268,6 +1368,7 @@ pub(crate) unsafe fn register_consumer(argument: u32, persistent: bool) -> u32 {
     let argument = unsafe { crate::kernel::object_at::<ConsumerArgument>(argument) };
     let callback = argument.callback.load(Relaxed);
     let context = argument.context.load(Relaxed);
+
     with(|ring| {
         if let Some(slot) = ring
             .consumers
@@ -1282,6 +1383,7 @@ pub(crate) unsafe fn register_consumer(argument: u32, persistent: bool) -> u32 {
             };
         }
     });
+
     0
 }
 
@@ -1309,6 +1411,7 @@ pub(crate) unsafe fn service_unregister_consumer(argument: u32) -> u32 {
     let argument = unsafe { crate::kernel::object_at::<ConsumerArgument>(argument) };
     let callback = argument.callback.load(Relaxed);
     let context = argument.context.load(Relaxed);
+
     with(|ring| {
         if let Some(slot) = ring.consumers.iter_mut().find(|slot| {
             // A free slot matches a null callback, as in stock; freeing it
@@ -1318,6 +1421,7 @@ pub(crate) unsafe fn service_unregister_consumer(argument: u32) -> u32 {
             slot.callback = None;
         }
     });
+
     1
 }
 
@@ -1332,17 +1436,22 @@ pub(super) unsafe fn replay_group(group: usize, callback: u32) {
     if callback == 0 {
         return;
     }
+
     let Some(group) = GROUPS.get(group) else {
         return;
     };
+
     let count = group.map_or(0, |group| group.count);
+
     acquire();
+
     // SAFETY: the caller's contract.
     unsafe { super::events::call(callback, CallbackOperation::ReplayStart, 0) };
     for index in 0..count as u32 {
         // SAFETY: the caller's contract.
         unsafe { super::events::call(callback, CallbackOperation::CounterEnabled, index) };
     }
+
     release();
 }
 
@@ -1396,12 +1505,14 @@ pub(super) fn read_snapshot(output: &mut [u8]) -> usize {
             ring.write_drop_record();
             return 0;
         }
+
         let end = if ring.snapshot_end > ring.snapshot {
             ring.snapshot_end
         } else {
             ring.last + 4
         };
         let count = ((end - ring.snapshot) as usize).min(output.len());
+
         // SAFETY: the bytes lie in the block between the snapshot position
         // and the snapshot end or the end of the block; every ring write
         // holds the lock held here.
@@ -1415,38 +1526,15 @@ pub(super) fn read_snapshot(output: &mut [u8]) -> usize {
             )
         };
         output[..count].copy_from_slice(source);
+
         ring.snapshot += count as u32;
         if ring.snapshot > ring.last {
             ring.snapshot = base;
         }
+
         count
     })
 }
-
-/// Transfer context of a title's `pixcmd r` run through code 0x45.
-#[repr(C)]
-struct TitleTransfer {
-    /// Routine the title calls for each run.
-    continuation: AtomicU32,
-    /// Bytes of the current run.
-    length: AtomicU32,
-    /// Address of the current run.
-    data: AtomicU32,
-    /// Snapshot size.
-    size: AtomicU32,
-    reserved: AtomicU32,
-    /// Snapshot size, then the bytes after the end of the block.
-    wrapped: AtomicU32,
-}
-
-const _: () = {
-    use core::mem::offset_of;
-    assert!(offset_of!(TitleTransfer, length) == 4);
-    assert!(offset_of!(TitleTransfer, data) == 8);
-    assert!(offset_of!(TitleTransfer, size) == 0xc);
-    assert!(offset_of!(TitleTransfer, reserved) == 0x10);
-    assert!(offset_of!(TitleTransfer, wrapped) == 0x14);
-};
 
 /// Fill a title's transfer context for `pixcmd r` run through code 0x45
 /// (stock 0x91f63248): the continuation, the snapshot size, and cleared
@@ -1458,6 +1546,7 @@ const _: () = {
 /// for the transfer.
 pub(super) unsafe fn begin_title_transfer(context: u32) {
     let size = with(|ring| ring.span(ring.snapshot, ring.snapshot_end));
+
     // SAFETY: the caller's contract.
     let transfer = unsafe { crate::kernel::object_at::<TitleTransfer>(context) };
     transfer
@@ -1481,10 +1570,12 @@ crate::exports::bridged!(title_transfer_entry, title_transfer);
 unsafe extern "C" fn title_transfer(context: u32) -> u32 {
     // SAFETY: the caller's contract.
     let transfer = unsafe { crate::kernel::object_at::<TitleTransfer>(context) };
+
     with(|ring| {
         let Some(block) = ring.buffer else {
             return Hresult::END_OF_DATA.0;
         };
+
         let base = address(block);
         ring.read = ring.snapshot;
         if ring.snapshot == ring.snapshot_end {
@@ -1492,6 +1583,7 @@ unsafe extern "C" fn title_transfer(context: u32) -> u32 {
             ring.write_drop_record();
             return Hresult::END_OF_DATA.0;
         }
+
         transfer.data.store(ring.snapshot, Relaxed);
         if ring.snapshot_end > ring.snapshot {
             transfer.wrapped.store(0, Relaxed);
@@ -1511,6 +1603,7 @@ unsafe extern "C" fn title_transfer(context: u32) -> u32 {
             );
             ring.snapshot = base;
         }
+
         Hresult::OK.0
     })
 }
@@ -1532,13 +1625,16 @@ pub(super) fn poll() {
     if !with(|ring| core::mem::take(&mut ring.dpc_fired)) {
         return;
     }
+
     let notify = with(|ring| {
         if ring.notified || ring.queued() < NOTIFY_BYTES {
             return false;
         }
+
         ring.notified = true;
         true
     });
+
     if notify {
         status::post_without_text(status::Status::CounterDataAvailable);
     }
@@ -1548,6 +1644,7 @@ pub(super) fn poll() {
 pub(super) fn initialize() {
     // SAFETY: runs before any other ring user.
     unsafe { RING.lock.as_ptr().cast::<u32>().write(0) };
+
     // SAFETY: the static DPC storage, 0x20 bytes, not yet queued.
     unsafe {
         xboxkrnl::KeInitializeDpc(
@@ -1562,5 +1659,6 @@ pub(super) fn initialize() {
 pub(super) fn shut_down() {
     // SAFETY: the static DPC object `initialize` set up.
     unsafe { xboxkrnl::KeRemoveQueueDpc(RING.dpc.0.get().cast()) };
+
     stop();
 }

@@ -19,12 +19,23 @@ use crate::net;
 use crate::net::FdSetExt as _;
 use crate::net::XamNetwork;
 
-const SMB_PORT: u16 = 445;
-const LISTEN_BACKLOG: i32 = 4;
 /// Each connection holds two pool blocks of `smb::BUFFER_SIZE` bytes.
 const CONNECTIONS: usize = 2;
-/// Delay before a failed listen is tried again (5 s).
-const LISTEN_RETRY: u64 = 5 * FileTime::INTERVALS_PER_SECOND;
+
+static LOCAL: LocalCell = LocalCell(UnsafeCell::new(Local {
+    service: SmbService::new(),
+    listen_at: None,
+}));
+/// The listener, [`Socket::INVALID`] while there is none; unload closes it
+/// from another thread.
+static LISTENER: AtomicU32 = AtomicU32::new(Socket::INVALID.raw());
+
+/// Sockets of one select pass: the listener and each connection with
+/// whether it waits to send.
+pub(crate) struct Sockets {
+    listener: Option<Socket>,
+    connections: [Option<(SocketId, bool)>; CONNECTIONS],
+}
 
 /// Service state used by the server thread only.
 struct Local {
@@ -40,14 +51,6 @@ struct LocalCell(UnsafeCell<Local>);
 // SAFETY: only the server thread uses the state.
 unsafe impl Sync for LocalCell {}
 
-static LOCAL: LocalCell = LocalCell(UnsafeCell::new(Local {
-    service: SmbService::new(),
-    listen_at: None,
-}));
-/// The listener, [`Socket::INVALID`] while there is none; unload closes it
-/// from another thread.
-static LISTENER: AtomicU32 = AtomicU32::new(Socket::INVALID.raw());
-
 /// The service state.
 ///
 /// # Safety
@@ -61,14 +64,10 @@ unsafe fn local() -> &'static mut Local {
 
 /// When a failed listen is tried again.
 fn retry_time(console: &mut Console) -> FileTime {
-    FileTime::from_intervals(console.system_time().wrapping_add(LISTEN_RETRY))
-}
+    /// Delay before a failed listen is tried again (5 s).
+    const LISTEN_RETRY: u64 = 5 * FileTime::INTERVALS_PER_SECOND;
 
-/// Sockets of one select pass: the listener and each connection with
-/// whether it waits to send.
-pub(crate) struct Sockets {
-    listener: Option<Socket>,
-    connections: [Option<(SocketId, bool)>; CONNECTIONS],
+    FileTime::from_intervals(console.system_time().wrapping_add(LISTEN_RETRY))
 }
 
 /// Start the service and listen on its port. Without a listener the
@@ -78,10 +77,14 @@ pub(crate) fn open(console: &mut Console) {
     // SAFETY: called on the server thread.
     let local = unsafe { local() };
     local.service.start(console);
+
     listen(local, console);
 }
 
 fn listen(local: &mut Local, console: &mut Console) {
+    const SMB_PORT: u16 = 445;
+    const LISTEN_BACKLOG: i32 = 4;
+
     match net::listen(SMB_PORT, LISTEN_BACKLOG) {
         Ok(listener) => {
             LISTENER.store(listener.raw(), Ordering::SeqCst);
@@ -107,6 +110,7 @@ pub(crate) fn close_listener() {
 #[inline(never)]
 pub(crate) fn shut_down(server: &Server, console: &mut Console, network: &mut XamNetwork) {
     close_listener();
+
     // SAFETY: called on the server thread.
     let local = unsafe { local() };
     local.listen_at = None;
@@ -120,8 +124,9 @@ pub(crate) fn poll(server: &Server, console: &mut Console, network: &mut XamNetw
     // SAFETY: called on the server thread.
     let local = unsafe { local() };
     local.service.poll_timers(&server.state, console, network);
-    if let Some(at) = local.listen_at
-        && FileTime::from_intervals(console.system_time()) >= at
+
+    if let Some(listen_at) = local.listen_at
+        && FileTime::from_intervals(console.system_time()) >= listen_at
     {
         listen(local, console);
     }
@@ -135,6 +140,7 @@ pub(crate) fn select_sockets(read: &mut FdSet, write: &mut FdSet) -> Sockets {
     if let Some(listener) = listener {
         read.insert(listener);
     }
+
     let mut connections = [None; CONNECTIONS];
     // SAFETY: called on the server thread.
     let service = &unsafe { local() }.service;
@@ -146,6 +152,7 @@ pub(crate) fn select_sockets(read: &mut FdSet, write: &mut FdSet) -> Sockets {
             read.insert(net::socket_of(socket));
         }
     }
+
     Sockets {
         listener,
         connections,
@@ -153,7 +160,7 @@ pub(crate) fn select_sockets(read: &mut FdSet, write: &mut FdSet) -> Sockets {
 }
 
 /// Report the ready sockets of `sockets` to the service. A failed accept
-/// closes the listener, which is opened again after `LISTEN_RETRY`, so a
+/// closes the listener, which is opened again after the retry delay, so a
 /// broken listener does not keep select returning.
 #[inline(never)]
 pub(crate) fn dispatch(
@@ -177,12 +184,14 @@ pub(crate) fn dispatch(
                 .on_readable(socket, &server.state, console, network);
         }
     }
+
     let Some(listener) = sockets.listener else {
         return;
     };
     if !read.contains(listener) {
         return;
     }
+
     match net::accept(listener) {
         Some(socket) => {
             local

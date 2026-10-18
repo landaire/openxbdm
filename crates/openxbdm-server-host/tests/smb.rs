@@ -340,18 +340,28 @@ impl Peer {
         Reply(reply)
     }
 
-    /// Whether the server closed the connection.
+    /// Whether the server closes the connection within the read timeout.
+    /// Loopback delivers the close asynchronously on some hosts.
     fn closed(&mut self) -> bool {
-        self.stream.set_nonblocking(true).unwrap();
         let mut byte = [0u8; 1];
-        let closed = match self.stream.read(&mut byte) {
+        match self.stream.read(&mut byte) {
             Ok(0) => true,
             Ok(_) => false,
-            Err(error) => error.kind() != ErrorKind::WouldBlock,
-        };
+            Err(error) => !matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
+        }
+    }
+
+    /// Whether the connection has neither data nor a close waiting.
+    fn open(&mut self) -> bool {
+        self.stream.set_nonblocking(true).unwrap();
+        let mut byte = [0u8; 1];
+        let open = matches!(
+            self.stream.peek(&mut byte),
+            Err(error) if error.kind() == ErrorKind::WouldBlock
+        );
         self.stream.set_nonblocking(false).unwrap();
 
-        closed
+        open
     }
 }
 
@@ -502,7 +512,7 @@ fn a_full_table_evicts_the_oldest_connection_without_a_session() {
     assert_eq!(bench.log_on(&mut third), STATUS_SUCCESS);
     let mut refused = bench.connect();
     assert!(refused.closed());
-    assert!(!second.closed() && !third.closed());
+    assert!(second.open() && third.open());
 }
 
 #[test]

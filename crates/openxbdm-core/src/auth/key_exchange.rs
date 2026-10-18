@@ -5,14 +5,17 @@ pub const DH_LENGTH: usize = 0x60;
 
 const LIMBS: usize = DH_LENGTH / 4;
 
-/// Group modulus in wire layout (little-endian 768-bit number).
+/// Group modulus in wire layout (little-endian 768-bit number). Stock
+/// passes its group table (0x91f06098) to the kernel without the per-qword
+/// byte swap it applies to client values, so each table qword appears
+/// byte reversed here.
 const MODULUS: [u8; DH_LENGTH] = [
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x34, 0xc2, 0x68, 0x21, 0xa2, 0xda, 0x0f, 0xc9,
-    0xd1, 0x1c, 0xdc, 0x80, 0x8b, 0x62, 0xc6, 0xc4, 0x74, 0xcc, 0x67, 0x8a, 0x08, 0x4e, 0x02, 0x29,
-    0x22, 0x9b, 0x13, 0x3b, 0xa6, 0xbe, 0x0b, 0x02, 0xdd, 0x04, 0x34, 0x8e, 0x79, 0x08, 0x4a, 0x51,
-    0x1b, 0x43, 0x3a, 0xcd, 0xb3, 0x19, 0x95, 0xef, 0x37, 0x14, 0x5f, 0xf2, 0x6d, 0x0a, 0x2b, 0x30,
-    0x45, 0xc2, 0x51, 0x6d, 0x6d, 0x35, 0xe1, 0x4f, 0xc6, 0x7e, 0x5e, 0x62, 0x76, 0xb5, 0x85, 0xe4,
-    0x20, 0x36, 0x3a, 0xa6, 0xe9, 0x42, 0x4c, 0xf4, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc9, 0x0f, 0xda, 0xa2, 0x21, 0x68, 0xc2, 0x34,
+    0xc4, 0xc6, 0x62, 0x8b, 0x80, 0xdc, 0x1c, 0xd1, 0x29, 0x02, 0x4e, 0x08, 0x8a, 0x67, 0xcc, 0x74,
+    0x02, 0x0b, 0xbe, 0xa6, 0x3b, 0x13, 0x9b, 0x22, 0x51, 0x4a, 0x08, 0x79, 0x8e, 0x34, 0x04, 0xdd,
+    0xef, 0x95, 0x19, 0xb3, 0xcd, 0x3a, 0x43, 0x1b, 0x30, 0x2b, 0x0a, 0x6d, 0xf2, 0x5f, 0x14, 0x37,
+    0x4f, 0xe1, 0x35, 0x6d, 0x6d, 0x51, 0xc2, 0x45, 0xe4, 0x85, 0xb5, 0x76, 0x62, 0x5e, 0x7e, 0xc6,
+    0xf4, 0x4c, 0x42, 0xe9, 0xa6, 0x3a, 0x36, 0x20, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 ];
 
 /// A group element or exponent of the key exchange, in wire layout.
@@ -22,8 +25,9 @@ pub struct DhValue(pub [u8; DH_LENGTH]);
 impl DhValue {
     /// The group generator.
     pub const fn generator() -> Self {
-        /// Offset of the only nonzero generator byte (value 2) in wire layout.
-        const GENERATOR_BYTE: usize = 0x58;
+        /// Offset of the only nonzero generator byte (value 2) in wire
+        /// layout: the table byte 0x91f06150, swapped like the modulus.
+        const GENERATOR_BYTE: usize = 0x5f;
 
         let mut bytes = [0; DH_LENGTH];
         bytes[GENERATOR_BYTE] = 2;
@@ -224,12 +228,12 @@ mod tests {
         assert_eq!(dh_mod_exp(None, &DhValue([0; DH_LENGTH])), DhValue(one));
         assert_eq!(dh_mod_exp(None, &DhValue(one)), generator);
 
-        // The generator is 2^705; its square is 2^705 doubled 705 times.
+        // The generator is 2^761; its square is 2^761 doubled 761 times.
         let squared = dh_mod_exp(None, &DhValue(two));
         let mut expected = limbs(&generator.0);
         let modulus = limbs(&MODULUS);
 
-        for _ in 0..705 {
+        for _ in 0..761 {
             let carry = shift_left(&mut expected);
             if carry || !less_than(&expected, &modulus) {
                 subtract(&mut expected, &modulus);
@@ -246,6 +250,38 @@ mod tests {
 
         assert_eq!(
             dh_mod_exp(Some(&DhValue::modulus()), &DhValue(one)),
+            DhValue([0; DH_LENGTH])
+        );
+    }
+
+    /// Client values that stock XBDM turned into a shared value of 1 and 0
+    /// on a devkit, checked through `adminpw passwd=` and `authuser`.
+    #[test]
+    fn stock_group_reduces_the_modulus_and_its_successor() {
+        let wire = |hex: &str| {
+            let mut bytes = [0u8; DH_LENGTH];
+            for (byte, pair) in bytes.iter_mut().zip(hex.as_bytes().chunks(2)) {
+                *byte = u8::from_str_radix(core::str::from_utf8(pair).unwrap(), 16).unwrap();
+            }
+
+            DhValue(bytes)
+        };
+        let successor = wire(
+            "0000000000000000ca0fdaa22168c234c4c6628b80dc1cd129024e088a67cc74\
+             020bbea63b139b22514a08798e3404ddef9519b3cd3a431b302b0a6df25f1437\
+             4fe1356d6d51c245e485b576625e7ec6f44c42e9a63a3620ffffffffffffffff",
+        );
+        let modulus = wire(
+            "ffffffffffffffffc90fdaa22168c234c4c6628b80dc1cd129024e088a67cc74\
+             020bbea63b139b22514a08798e3404ddef9519b3cd3a431b302b0a6df25f1437\
+             4fe1356d6d51c245e485b576625e7ec6f44c42e9a63a3620ffffffffffffffff",
+        );
+        let mut one = [0u8; DH_LENGTH];
+        one[0] = 1;
+
+        assert_eq!(dh_mod_exp(Some(&successor), &value(3)), DhValue(one));
+        assert_eq!(
+            dh_mod_exp(Some(&modulus), &value(3)),
             DhValue([0; DH_LENGTH])
         );
     }

@@ -110,6 +110,13 @@ fn big(bytes: &[u8; 96]) -> Big {
     std::array::from_fn(|i| u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap()))
 }
 
+/// A group table of 0x91f06090 as the kernel reads it: least significant
+/// qword first, each qword big-endian (the table skips the byte swap that
+/// client values get).
+fn table(bytes: &[u8; 96]) -> Big {
+    std::array::from_fn(|i| u64::from_be_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap()))
+}
+
 fn wire(value: &Big) -> [u8; 96] {
     let mut bytes = [0u8; 96];
 
@@ -199,7 +206,7 @@ fn generator() -> Big {
     let mut bytes = [0u8; 96];
     bytes[0x58] = 2;
 
-    big(&bytes)
+    table(&bytes)
 }
 
 /// A short private exponent keeps the test-side arithmetic fast.
@@ -223,7 +230,7 @@ fn exchange_keys(session: &mut RawSession) -> u64 {
         0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
     ];
 
-    let modulus = big(&MODULUS);
+    let modulus = table(&MODULUS);
     let public = pow_mod(&generator(), &exponent(), &modulus);
 
     assert_eq!(session.command("keyxchg"), "204- send binary data");

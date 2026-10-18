@@ -47,7 +47,7 @@ Enable kdnet with stock XBDM (`kdnet set IP=<host> Port=50000`, `kdnet enable`, 
     openxbdm-kd listen [--passive] [--log-file kd.log]
     openxbdm-kd [--target 169.254.59.14] break
     openxbdm-kd mem 0x80040000 64
-    openxbdm-kd gdbserver --listen 127.0.0.1:2159
+    openxbdm-kd gdbserver [--listen 127.0.0.1:2159] [--registers 64|32] [--stop-on-load IMAGE]
     openxbdm-kd host [--file CONSOLE_PATH=LOCAL_PATH] [--stop-on-load IMAGE]
     openxbdm-kd reboot
 
@@ -63,17 +63,31 @@ To boot XBDM from a local image:
 
 `--stop-on-load xbdm.xex` keeps the console stopped at that image's load, after it is mapped and before its entry point runs, and reads commands from standard input: `mem ADDRESS [LENGTH]`, `write ADDRESS HEXBYTES` and `continue` (end of input also continues). `--log-file` appends every received datagram in the `listen --log-file` format.
 
-### GDB
+### GDB and LLDB
 
-GDB can be used with `openxbdm-kd` (any build of GDB with PowerPC support):
+`gdbserver` serves one debugger (any GDB or LLDB with PowerPC support), then lets the console run.
 
-    gdb -ex 'set architecture powerpc:common64' -ex 'set endian big' \
+- Every processor (hardware thread) is a thread of the debugger. A stop freezes all of them.
+- Debug output and module loads appear in the debugger console while the console runs.
+- `--stop-on-load debugprobe.xex` stops the console when that image loads, after it is mapped and before its entry point runs, so you can set breakpoints first. Launch the title after `gdbserver` starts.
+- The registers are 64-bit, as on the processor. Titles compiled as 32-bit PowerPC, such as those built with [rust-xbox360](rust-xbox360), need `--registers 32`: GDB loads a 32-bit ELF only then, and both debuggers unwind 32-bit stack frames with it. A register write in that mode keeps the high word.
+
+Load the title's ELF before you connect so the debugger has its symbols and source. rust-xbox360 titles have `[gdb]` and `[lldb]` subtargets that do this, including the standard library source. Run the debugger from that project's root, since the source paths are relative to it:
+
+    openxbdm-kd gdbserver --registers 32 --stop-on-load stdhello.xex
+    gdb -x "$(buck2 build //examples/stdhello:stdhello[gdb] --show-simple-output)" \
         -ex 'target remote 127.0.0.1:2159'
+    lldb -s "$(buck2 build //examples/stdhello:stdhello[lldb] --show-simple-output)" \
+        -o 'gdb-remote 127.0.0.1:2159'
 
-- Registers, memory, software breakpoints, `stepi` (software single step), interrupt and detach are supported.
+Without a symbol file, start GDB with `-ex 'set endian big'`.
+
+- Registers, memory, software breakpoints, single step, `next`, `finish`, interrupt and detach are supported.
+- A step runs every processor, as the kernel resumes them all, so another thread can pass a breakpoint the debugger lifted for the step.
 - Detaching removes breakpoints and resumes the console.
 - Do not set breakpoints in the kernel debugger's own code paths, such as the kd poll path at `0x801b4990`.
 - Single step through MSR.SE stops the console with bug check 0x2b.
+- LLDB releases (21 and earlier) have three defects with 32-bit PowerPC titles: they cannot unwind out of a function that saves no registers, they show values held in several registers with their bytes reversed, and with `--registers 64` they cannot unwind 32-bit frames. GDB has none of them. An LLDB with fixes for all three works with both register widths.
 
 ## Client
 

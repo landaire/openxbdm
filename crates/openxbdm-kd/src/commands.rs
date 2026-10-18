@@ -14,6 +14,7 @@ use crate::print::hexdump;
 use crate::print::print_stop;
 use crate::transport::UdpTransport;
 
+pub use self::gdb_server::RegisterWidth;
 pub use self::gdb_server::gdb_server;
 pub use self::host::check_host_files;
 pub use self::host::host;

@@ -428,7 +428,7 @@ with XBDM served from the host, then check XBDM on port 730 and the
 
 GDB:
 
-    openxbdm-kd break
-    gdb -batch -ex 'set architecture powerpc:common64' -ex 'set endian big' \
+    openxbdm-kd gdbserver
+    gdb -batch -ex 'set endian big' \
         -ex 'target remote 127.0.0.1:2159' -ex 'info registers pc' \
         -ex 'x/2c 0x80040000' -ex detach

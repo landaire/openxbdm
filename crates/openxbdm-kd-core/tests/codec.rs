@@ -166,6 +166,10 @@ fn request_encodings() {
             disposition: ContinueDisposition::Handled,
         },
         Request::GetVersion,
+        // The header names the target processor, not the sender.
+        Request::SwitchProcessor {
+            processor: Processor(3),
+        },
     ];
 
     let mut out = String::new();

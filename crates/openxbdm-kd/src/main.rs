@@ -64,10 +64,21 @@ enum Command {
         length: u64,
     },
     /// Serve one GDB or LLDB client over the GDB remote serial protocol.
+    /// Every processor is a thread; debug output and module loads go to
+    /// the debugger console.
     Gdbserver {
         /// TCP address to accept the debugger on.
         #[arg(long, default_value = "127.0.0.1:2159")]
         listen: SocketAddr,
+        /// Register width to describe. Use `32` with GDB and an ELF
+        /// compiled as 32-bit PowerPC, such as a rust-xbox360 title.
+        #[arg(long, value_enum, default_value = "64")]
+        registers: commands::RegisterWidth,
+        /// Stop the console at the load of this image (for example
+        /// `debugprobe.xex`), after it is mapped and before its entry point
+        /// runs. The stop waits for the debugger if none is attached.
+        #[arg(long, value_name = "IMAGE_NAME")]
+        stop_on_load: Vec<String>,
     },
     /// Act as the console's debugger host: acknowledge and continue every
     /// event, print debug output and module loads, and answer the kernel's
@@ -115,9 +126,13 @@ fn run(cli: Cli) -> Result<(), Report<CliError>> {
             let mut client = connect(cli.target, cli.local)?;
             commands::memory(&mut client, address, length)
         }
-        Command::Gdbserver { listen } => {
+        Command::Gdbserver {
+            listen,
+            registers,
+            stop_on_load,
+        } => {
             let client = connect(cli.target, cli.local)?;
-            commands::gdb_server(client, listen)
+            commands::gdb_server(client, listen, registers, stop_on_load)
         }
         Command::Host {
             files,

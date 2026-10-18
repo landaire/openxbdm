@@ -41,6 +41,14 @@ pub enum KdError {
     UnalignedBreakpoint { address: u64 },
     #[error("the kernel rejected a breakpoint at {address:#x}")]
     BreakpointRejected { address: u64 },
+    #[error(
+        "the kernel did not switch to processor {requested}; processor {stopped} reported the stop"
+    )]
+    SwitchRejected { requested: u16, stopped: u16 },
+    #[error("the debugger named thread {thread}, which is no processor")]
+    NoSuchProcessor { thread: usize },
+    #[error("the kernel reports {reported} processors, outside 1 to 6")]
+    ProcessorCount { reported: u32 },
 }
 
 /// A command-line or interactive command value that does not parse.

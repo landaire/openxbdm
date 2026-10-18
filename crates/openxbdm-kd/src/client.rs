@@ -311,6 +311,7 @@ where
     /// Ends the stop and lets the kernel run.
     pub fn resume(&mut self, disposition: ContinueDisposition) -> Result<(), KdError> {
         let stop = self.link.stop.take().ok_or(KdError::NotStopped)?;
+        self.link.held_reports.clear();
 
         let mut outbox = Outbox::default();
         self.link.send_request(
@@ -353,8 +354,47 @@ where
         self.resume(disposition)
     }
 
+    /// Makes `processor` the processor that serves requests. The current
+    /// processor waits in the kernel until a later switch returns to it.
+    pub fn switch_processor(&mut self, processor: Processor) -> Result<(), KdError> {
+        /// Time for the target processor to leave its freeze loop and report.
+        const SWITCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+        let stop = self.link.stop.take().ok_or(KdError::NotStopped)?;
+
+        let mut outbox = Outbox::default();
+        self.link.send_request(
+            stop.processor,
+            Request::SwitchProcessor { processor },
+            &[],
+            &mut outbox,
+        )?;
+        self.flush(outbox)?;
+        self.await_acknowledge("switch acknowledgement")?;
+
+        if !self.wait_for_stop(SWITCH_TIMEOUT)? {
+            return Err(KdError::Timeout {
+                waiting_for: "stop of the switched-to processor",
+                seconds: SWITCH_TIMEOUT.as_secs(),
+            });
+        }
+
+        // A refused switch (0x801b43e8 returns 2) repeats the stop of the
+        // current processor.
+        let stopped = self.link.stop.as_ref().map(|stop| stop.processor);
+        match stopped {
+            Some(stopped) if stopped == processor => Ok(()),
+            Some(stopped) => Err(KdError::SwitchRejected {
+                requested: processor.0,
+                stopped: stopped.0,
+            }),
+            None => Err(KdError::NotStopped),
+        }
+    }
+
     pub fn reboot(&mut self) -> Result<(), KdError> {
         let stop = self.link.stop.take().ok_or(KdError::NotStopped)?;
+        self.link.held_reports.clear();
 
         let mut outbox = Outbox::default();
         self.link

@@ -139,7 +139,7 @@ by the byte table at 0x8006b308.
 | 0x3146 | 0x801b6890 | Version: 0x10c, build, protocol 6, flags 0xb, machine 0x1f2, +0x1a 0xc, +0x20 kernel base, +0x28 0x801c07cc, +0x30 0x801cdb10 | |
 | 0x3147 / 0x3148 | 0x801b6990 / 0x801b6ac8 | Breakpoint lists | |
 | 0x3149 | | | Bug check 0xe2. |
-| 0x3150 | 0x801b43e8 | Processor in header | Switch processor. |
+| 0x3150 | 0x801b43e8 | Processor in header (the target) | Switch processor; no reply. See Processor switch. |
 | 0x3151 | 0x801b6940 | | Always 0xc0000001. |
 | 0x3156 | 0x801b6b78 | +0x10 start, +0x18 length, +0x20 pattern length | Search memory. |
 | 0x3159 | 0x801b6fd0 | | Calls 0x801b6e30 when 0x802196b8 is set; not analyzed. |
@@ -153,6 +153,33 @@ point, 4 integer, 0x10 vector), +4 MSR, +8 IAR, +0xc LR, +0x10 CTR (u64),
 +0x18 GPR0-31 (u64), +0x118 CR, +0x11c XER, +0x120 FPSCR (u64), +0x128
 FPR0-31, +0x228 trap frame +0x1bc (not analyzed), +0x230 0x810 bytes of
 vector state (layout not analyzed).
+
+## Processor switch
+
+The stop loop (0x801b7138) hands api 0x3150 to 0x801b43e8 with the header
+processor (sp+0x76) and returns that routine's result to its caller
+(0x801b7408), which sends a new state change and serves again when the
+result is 2.
+
+0x801b43e8(target), verified on hardware (build 16547, 6 processors):
+
+- `target >= 6`, or no processor block in the table at 0x801fb4c0: returns
+  2, so the current processor reports its stop again.
+- Otherwise it clears bit 0x20 of the current processor's debugger word
+  (r13 + 0x120) and sets bit 0x20 in the target's (block + 0x20). The low
+  nibble of the current word then decides: 2 returns 3; 4 waits until bit
+  0x20 of its own word is set again (`mr 31, 31` spin) and returns 2;
+  other values return 0. Purpose of states 2 and 4 is not analyzed.
+- The target processor leaves its freeze and sends its own state change:
+  exception 0x80000007 with the program counter and context of the code it
+  was running (idle processors report 0x8009b404..0x8009b410, lr into
+  0x8009b448..0x8009b4e4). Context and memory requests then act on it.
+- Switching back to the processor that reported the original stop repeats
+  that stop report (same code and program counter). A continue sent from
+  that processor resumes all processors. Continuing from a switched-to
+  processor was not tried; the host always switches back first.
+- Each state change rebuilds the report and so removes breakpoints inside
+  the 16 reported instruction bytes of that processor (0x801bb658).
 
 ## Single step
 

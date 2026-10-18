@@ -26,6 +26,7 @@ use openxbdm_kd_core::state_change::StateChange;
 
 use crate::error::KdError;
 use crate::host_files::HostFiles;
+use crate::stop::StopImage;
 use crate::stop::StopReport;
 
 pub type NotifyFn = Box<dyn FnMut(Notification<'_>) + Send>;
@@ -117,6 +118,12 @@ pub(crate) struct Link {
     /// Image names whose load-symbols stop is reported as a stop instead
     /// of being continued. Compared case-insensitively.
     pub(crate) hold_loads: Vec<String>,
+    /// Held load stops reported since the last continue. The kernel
+    /// repeats a stop after the reset that synchronizes a session and when a
+    /// processor switch returns to the reporting processor; a repeat is not
+    /// a new load. The repeat carries the registers of that moment, so only
+    /// the processor, program counter and image identify it.
+    pub(crate) held_reports: Vec<HeldLoad>,
     file_data: Box<[u8; MAX_READ_LEN]>,
 }
 
@@ -129,6 +136,7 @@ impl Link {
             notify: None,
             files: HostFiles::default(),
             hold_loads: Vec::new(),
+            held_reports: Vec::new(),
             file_data: Box::new([0; MAX_READ_LEN]),
         }
     }
@@ -273,9 +281,11 @@ impl Link {
         let held = !symbols.unload && self.holds(change.path);
         let report = held.then(|| StopReport::from_state_change(&change));
 
-        // The kernel repeats its stop after the reset that synchronizes
-        // a session; the repeat is not a new load.
-        if report.is_none() || self.stop != report {
+        let held_load = report.as_ref().map(HeldLoad::of);
+        let repeat = held_load
+            .as_ref()
+            .is_some_and(|held_load| self.held_reports.contains(held_load));
+        if !repeat {
             self.notify(Notification::LoadSymbols {
                 path: change.path,
                 base: symbols.base,
@@ -285,6 +295,11 @@ impl Link {
         }
 
         if let Some(report) = report {
+            if let Some(held_load) = held_load
+                && !repeat
+            {
+                self.held_reports.push(held_load);
+            }
             self.stop = Some(report);
             return Ok(Some(Incoming::Stopped));
         }
@@ -389,5 +404,23 @@ impl Link {
 fn emit(notify: &mut Option<NotifyFn>, notification: Notification<'_>) {
     if let Some(notify) = notify.as_mut() {
         notify(notification);
+    }
+}
+
+/// Identity of a held load stop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HeldLoad {
+    processor: Processor,
+    program_counter: u64,
+    image: Option<StopImage>,
+}
+
+impl HeldLoad {
+    fn of(report: &StopReport) -> Self {
+        Self {
+            processor: report.processor,
+            program_counter: report.program_counter,
+            image: report.image.clone(),
+        }
     }
 }

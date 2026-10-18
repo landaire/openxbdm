@@ -109,6 +109,9 @@ impl core::fmt::Debug for ApiNumber {
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
 pub struct Processor(pub u16);
 
+/// Processors the kernel can switch to (0x801b43e8 refuses higher numbers).
+pub const MAX_PROCESSORS: u16 = 6;
+
 /// Kernel breakpoint table index plus one (table at 0x802244d0, 32 slots).
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct BreakpointHandle(pub NonZeroU32);
@@ -173,6 +176,12 @@ pub enum Request {
     },
     GetVersion,
     Reboot,
+    /// Makes `processor` the processor that serves the debugger (0x801b43e8).
+    /// No reply: that processor sends its own state change. Processors are
+    /// numbered below the reported processor count (at most 6).
+    SwitchProcessor {
+        processor: Processor,
+    },
 }
 
 impl Request {
@@ -189,18 +198,28 @@ impl Request {
             Self::Continue { .. } => ApiNumber::CONTINUE,
             Self::GetVersion => ApiNumber::GET_VERSION,
             Self::Reboot => ApiNumber::REBOOT,
+            Self::SwitchProcessor { .. } => ApiNumber::SWITCH_PROCESSOR,
         }
     }
 
     /// Whether the kernel answers this request with a reply.
     pub const fn expects_reply(&self) -> bool {
-        !matches!(self, Self::Continue { .. } | Self::Reboot)
+        !matches!(
+            self,
+            Self::Continue { .. } | Self::Reboot | Self::SwitchProcessor { .. }
+        )
     }
 
+    /// `processor` is the stopped processor the request is addressed to,
+    /// except for [`Self::SwitchProcessor`], which names its target there.
     pub fn encode(&self, processor: Processor) -> [u8; HEADER_LEN] {
+        let target = match *self {
+            Self::SwitchProcessor { processor } => processor,
+            _ => processor,
+        };
         let mut header = [0u8; HEADER_LEN];
         wire::put_le32(&mut header, 0, self.api().0);
-        wire::put_le16(&mut header, 6, processor.0);
+        wire::put_le16(&mut header, 6, target.0);
 
         match *self {
             Self::ReadVirtualMemory { address, length }
@@ -224,7 +243,7 @@ impl Request {
                 wire::put_le32(&mut header, 0x10, disposition.status().0)
             }
             // These requests carry no fields.
-            Self::GetVersion | Self::Reboot => {}
+            Self::GetVersion | Self::Reboot | Self::SwitchProcessor { .. } => {}
         }
 
         header

@@ -4,6 +4,7 @@ use openxbdm_server::network::Endpoint;
 use openxbdm_server::network::Ipv4Address;
 use openxbdm_server::network::NetError;
 use openxbdm_server::network::Network;
+use openxbdm_server::network::SendBufferSize;
 use openxbdm_server::network::SocketId;
 use xbox360::status::KernelError;
 use xbox360::status::Win32Error;
@@ -21,6 +22,7 @@ use xbox360_sys::xam::NetDll_bind;
 use xbox360_sys::xam::NetDll_closesocket;
 use xbox360_sys::xam::NetDll_connect;
 use xbox360_sys::xam::NetDll_getpeername;
+use xbox360_sys::xam::NetDll_getsockopt;
 use xbox360_sys::xam::NetDll_ioctlsocket;
 use xbox360_sys::xam::NetDll_listen;
 use xbox360_sys::xam::NetDll_recv;
@@ -243,6 +245,47 @@ impl Network for XamNetwork {
             )
         } {
             0 => Ok(pending as usize),
+            _ => Err(last_error()),
+        }
+    }
+
+    fn send_buffer_size(&mut self, socket: SocketId) -> Result<SendBufferSize, NetError> {
+        let mut size = 0u32;
+        let mut length = size_of::<u32>() as i32;
+        // SAFETY: `size` and `length` are live locals; `length` holds the
+        // size of `size`.
+        match unsafe {
+            NetDll_getsockopt(
+                XnCaller::DebugMonitor,
+                socket_of(socket),
+                SocketLevel::Socket,
+                SocketOption::SO_SNDBUF,
+                (&raw mut size).cast(),
+                &mut length,
+            )
+        } {
+            0 => Ok(SendBufferSize(size)),
+            _ => Err(last_error()),
+        }
+    }
+
+    fn set_send_buffer_size(
+        &mut self,
+        socket: SocketId,
+        size: SendBufferSize,
+    ) -> Result<(), NetError> {
+        // SAFETY: `size.0` is a live 4-byte local.
+        match unsafe {
+            NetDll_setsockopt(
+                XnCaller::DebugMonitor,
+                socket_of(socket),
+                SocketLevel::Socket,
+                SocketOption::SO_SNDBUF,
+                (&raw const size.0).cast(),
+                size_of::<u32>() as i32,
+            )
+        } {
+            0 => Ok(()),
             _ => Err(last_error()),
         }
     }

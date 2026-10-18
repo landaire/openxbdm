@@ -12,7 +12,6 @@ use xbox360_sys::processor::Kpcr;
 use xbox360_sys::xam::GetCurrentThreadId;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::Boolean8;
-use xbox360_sys::xboxkrnl::Irql;
 use xbox360_sys::xboxkrnl::KtrapFrame;
 
 use super::super::pmc;
@@ -238,9 +237,15 @@ unsafe fn sample(frame: &KtrapFrame, processor: usize) {
 }
 
 /// Profile interrupt routine (stock 0x91f90528): the last sampled
-/// processor reloads the interval; samples are skipped above dispatch level
-/// and in an idle thread without pending DPCs.
-extern "C" fn profile_interrupt(frame: *const KtrapFrame, irql: Irql) {
+/// processor reloads the interval; samples are skipped in an idle thread
+/// without pending DPCs.
+///
+/// The kernel's vector 0x60 routine (K16547 0x8009ed40) calls it at IRQL
+/// 0x60 with external interrupts enabled. r3 is the trap frame of the
+/// interrupted thread; r4 the address of this processor's interrupt
+/// controller (`0x7fff0000` plus the low half of the PCR address) and r5 1
+/// for an interrupt nested in another are unused.
+extern "C" fn profile_interrupt(frame: *const KtrapFrame) {
     // SAFETY: the kernel passes the trap frame of the thread it interrupted
     // on this processor, unchanged until the routine returns.
     let frame = unsafe { &*frame };
@@ -266,9 +271,10 @@ extern "C" fn profile_interrupt(frame: *const KtrapFrame, irql: Irql) {
 
     count(Counter::Interrupts, processor);
     let prcb = &pcr.prcb;
-    if irql > Irql::DISPATCH
-        || (prcb.idle_thread.load(Ordering::Relaxed) == prcb.current_thread.load(Ordering::Relaxed)
-            && prcb.dpc_active.load(Ordering::Relaxed) == 0)
+    // Stock also skips when the low byte of r4, which it tests as an IRQL,
+    // is above 2; the controller address has a zero low byte.
+    if prcb.idle_thread.load(Ordering::Relaxed) == prcb.current_thread.load(Ordering::Relaxed)
+        && prcb.dpc_active.load(Ordering::Relaxed) == 0
     {
         count(Counter::Skipped, processor);
         return;
@@ -294,8 +300,12 @@ extern "C" fn profile_interrupt(frame: *const KtrapFrame, irql: Irql) {
 crate::exports::bridged!(pub(super) profile_interrupt_entry, profile_interrupt);
 
 /// Call profile interrupt export `ordinal` of the kernel (stock
-/// 0x91f8eeb0, 0x91f8ef48, 0x91f8efd0): 669 enables it on a processor
-/// mask, 670 disables it and 671 sets the routine.
+/// 0x91f8eeb0, 0x91f8ef48, 0x91f8efd0). In K16547: 669 (0x80097250)
+/// returns false for a mask of 0 or above 63, else saves SOC register
+/// 0x56020 and writes `mask << 16 | 0x460` to it (0x60 is the vector of the
+/// profile interrupt); 670 (0x800972c0) restores the saved register for
+/// argument 1 and writes 0 otherwise; 671 (0x80096d20) stores the routine
+/// the vector 0x60 routine calls when it is not null.
 fn call_kernel(ordinal: Ordinal, argument: u32) -> Result<u32, ProfilerError> {
     let kernel = SystemModule::Kernel
         .handle()

@@ -5,8 +5,6 @@
 pub(crate) mod nuicam;
 pub(super) mod pgo;
 
-use core::cell::UnsafeCell;
-use core::fmt::Write as _;
 use core::num::NonZeroU32;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicU32;
@@ -19,7 +17,6 @@ use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::Win32Error;
 use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::ConnectionIndex;
-use openxbdm_server::Server;
 use openxbdm_server::commands;
 use openxbdm_server::commands::filesystem::CreateRequest;
 use openxbdm_server::commands::filesystem::FileHandle;
@@ -54,14 +51,18 @@ use openxbdm_server::commands::hardware::automation::Poll;
 use openxbdm_server::commands::hardware::automation::QueueEntry;
 use openxbdm_server::commands::hardware::automation::QueueStatus;
 use openxbdm_server::commands::hardware::automation::UploadLayout;
-use openxbdm_server::text::Text;
+use openxbdm_server::commands::hardware::odd::MountRequest;
+use openxbdm_server::commands::hardware::odd::OddLog;
+use openxbdm_server::commands::hardware::odd::OddLogReservation;
+use openxbdm_server::commands::hardware::odd::OddPlatform;
+use openxbdm_server::commands::hardware::odd::ReadRequest;
+use openxbdm_server::commands::hardware::odd::SpeedChangeRequest;
 use xbox360::module::Ordinal;
 use xbox360::module::SystemModule;
 use xbox360::module::resolve_export;
 use xbox360::sync::SpinLock;
 use xbox360::time::TickCount;
 use xbox360::time::Timebase;
-use xbox360_sys::status::Severity;
 use xbox360_sys::status::Win32ErrorCode;
 use xbox360_sys::xam;
 use xbox360_sys::xam::XnAddr;
@@ -82,14 +83,14 @@ use xbox360_sys::xboxkrnl::ThreadCreationFlags;
 use xbox360_sys::xboxkrnl::XInputdSetRFPowerMode;
 
 use super::Console;
-use super::dispatcher;
+use super::filesystem;
+use super::filesystem::CallerPaths;
 use super::network::xam_procedure;
 use super::performance::pix;
 use crate::exports::export;
 use crate::exports::export_result;
 use crate::kernel;
 use crate::kernel::KernelEvent;
-use crate::net::XamNetwork;
 
 /// XAM ordinal: heap information `(id, class, buffer) -> HRESULT`.
 const XAM_HEAP_INFO: Ordinal = Ordinal::new(0x827).unwrap();
@@ -100,7 +101,6 @@ const KERNEL_USB_PORT_POWER: Ordinal = Ordinal::new(825).unwrap();
 const MAX_CONNECTIONS: usize = 8;
 /// Status word of controls 0x7b and 0x7c for a slot without a controller.
 const NOT_CONNECTED: Win32ErrorCode = Win32ErrorCode(Win32Error::DEVICE_NOT_CONNECTED.code());
-const ODD_RING: usize = 64;
 
 /// The input system polls the controllers from other threads.
 static AUTOMATION: SpinLock<Automation<PoolEntries>> = SpinLock::new(Automation::new());
@@ -112,22 +112,8 @@ static INPUT_FOCUS: AtomicU32 = AtomicU32::new(0);
 static HEAP_COUNT: CachedExport = CachedExport::new();
 static HEAP_INFO: CachedExport = CachedExport::new();
 static USB_PORT_POWER: CachedExport = CachedExport::new();
-static ODD_LOG: OddLog = OddLog {
-    stopped: AtomicU32::new(1),
-    busy: AtomicU32::new(0),
-    allocate: AtomicU32::new(ODD_RING as u32 - 1),
-    drops: AtomicU32::new(0),
-    read: AtomicU32::new(0),
-    slots: [const {
-        OddSlot {
-            state: AtomicU32::new(OddSlotState::Free.raw()),
-            words: UnsafeCell::new([0; 7]),
-        }
-    }; ODD_RING],
-    pending_start: AtomicU32::new(0),
-    pending_count: AtomicU32::new(0),
-    pending_time_high: AtomicU32::new(0),
-    pending_time_low: AtomicU32::new(0),
+static ODD_LOG: OddLog = OddLog::new();
+static ODD_WRITER: OddWriter = OddWriter {
     work: KernelEvent::new(),
     finished: KernelEvent::new(),
     thread: AtomicU32::new(0),
@@ -392,12 +378,20 @@ impl commands::hardware::Backend for Console {
         }
     }
 
-    fn odd_log_start(&mut self, path: Result<&[u8], KernelError>) -> Result<(), OddLogStartError> {
-        odd_log_start(path)
+    fn odd_log_reserve(&mut self) -> Result<OddLogReservation, OddLogStartError> {
+        ODD_LOG.reserve(&mut OddServices)
+    }
+
+    fn odd_log_start(
+        &mut self,
+        reservation: OddLogReservation,
+        path: Result<&[u8], KernelError>,
+    ) -> Result<(), OddLogStartError> {
+        ODD_LOG.start(&mut OddServices, reservation, path)
     }
 
     fn odd_log_stop(&mut self) -> Result<(), OddLogNotRunning> {
-        odd_log_stop()
+        ODD_LOG.stop(&mut OddServices)
     }
 
     fn pgo_start(&mut self, module: PgoModule) -> Result<(), PgoError> {
@@ -650,155 +644,124 @@ struct AutomationState {
 
 const _: () = assert!(size_of::<AutomationState>() == size_of::<xam::InputState>());
 
-/// Record words of a slot, laid out per record kind; a timebase value
-/// takes two words, high word first.
-type OddWords = [u32; 7];
-
-/// Kind of an optical disc log record. The value is the slot state of a
-/// ready record.
-#[repr(u32)]
-#[derive(Clone, Copy)]
-enum OddRecordKind {
-    /// `{start, count, requested, completed, status}`.
-    Read = 2,
-    /// `{sector, size, time}`.
-    Mount = 3,
-    /// `{current, target, status, time}`.
-    SpeedChange = 4,
-}
-
-#[derive(Clone, Copy)]
-enum OddSlotState {
-    Free,
-    /// A drive event owns the slot.
-    Writing,
-    /// The writer thread owns the slot.
-    Ready(OddRecordKind),
-}
-
-impl OddSlotState {
-    const fn raw(self) -> u32 {
-        match self {
-            Self::Free => 0,
-            Self::Writing => 1,
-            Self::Ready(kind) => kind as u32,
-        }
-    }
-
-    /// Slots hold only values of [`Self::raw`].
-    const fn from_raw(raw: u32) -> Self {
-        match raw {
-            0 => Self::Free,
-            1 => Self::Writing,
-            2 => Self::Ready(OddRecordKind::Read),
-            3 => Self::Ready(OddRecordKind::Mount),
-            _ => Self::Ready(OddRecordKind::SpeedChange),
-        }
-    }
-}
-
-struct OddSlot {
-    state: AtomicU32,
-    words: UnsafeCell<OddWords>,
-}
-
-/// Optical disc log: a ring filled by drive events and drained by the
-/// writer thread.
-struct OddLog {
-    /// Nonzero when no log is being written; drive events are dropped.
-    stopped: AtomicU32,
-    /// A start owns the writer.
-    busy: AtomicU32,
-
-    allocate: AtomicU32,
-    drops: AtomicU32,
-    read: AtomicU32,
-    slots: [OddSlot; ODD_RING],
-
-    /// Read started by the drive and not yet completed.
-    pending_start: AtomicU32,
-    pending_count: AtomicU32,
-    pending_time_high: AtomicU32,
-    pending_time_low: AtomicU32,
-
+/// Writer thread of the optical disc log.
+struct OddWriter {
     work: KernelEvent,
     /// Notification event: no writer runs.
     finished: KernelEvent,
+    /// Referenced thread object of the last writer started.
     thread: AtomicU32,
 }
 
-// SAFETY: a slot's record is accessed only by the owner of its state.
-unsafe impl Sync for OddLog {}
+/// Kernel services of the optical disc log.
+struct OddServices;
 
-impl OddLog {
-    fn publish(&self, kind: OddRecordKind, words: OddWords) {
-        if self.stopped.load(Ordering::Acquire) == 1 {
-            return;
-        }
+impl OddPlatform for OddServices {
+    type File = Handle;
 
-        let next = self.allocate.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
-        let index = if next >= ODD_RING as u32 {
-            let wrapped = next % ODD_RING as u32;
-            let _ =
-                self.allocate
-                    .compare_exchange(next, wrapped, Ordering::AcqRel, Ordering::Relaxed);
-            wrapped
-        } else {
-            next
+    fn timebase(&mut self) -> u64 {
+        Timebase::now().ticks()
+    }
+
+    fn create_file(&mut self, path: &[u8]) -> Result<Handle, KernelError> {
+        /// `FILE_SHARE_READ | FILE_SHARE_DELETE`.
+        const SHARE_READ_DELETE: ShareAccess = ShareAccess::from_bits_retain(5);
+
+        let request = CreateRequest {
+            access: AccessMask::GENERIC_WRITE,
+            allocation_size: None,
+            attributes: FileAttributes::NORMAL,
+            share: SHARE_READ_DELETE,
+            disposition: CreateDisposition::OverwriteIf,
+            options: CreateOptions::SYNCHRONOUS_IO_NONALERT,
+        };
+        let FileHandle(handle) = super::filesystem::create_file(path, &request)?;
+
+        Ok(Handle::from_raw(handle))
+    }
+
+    fn write_file(&mut self, file: Handle, text: &[u8]) -> NtStatus {
+        let mut io_status = xboxkrnl::IoStatusBlock {
+            status: NtStatus::SUCCESS,
+            information: 0,
         };
 
-        let slot = &self.slots[index as usize];
-        if slot
-            .state
-            .compare_exchange(
-                OddSlotState::Free.raw(),
-                OddSlotState::Writing.raw(),
-                Ordering::AcqRel,
-                Ordering::Relaxed,
+        // SAFETY: `file` is the open log file and `text` is valid for its length.
+        unsafe {
+            xboxkrnl::NtWriteFile(
+                file,
+                Handle::NULL,
+                0,
+                0,
+                &mut io_status,
+                text.as_ptr(),
+                text.len() as u32,
+                core::ptr::null(),
             )
-            .is_err()
-        {
-            self.drops.fetch_add(1, Ordering::AcqRel);
-            return;
+        }
+    }
+
+    fn close_file(&mut self, file: Handle) {
+        // SAFETY: the log owns `file` and closes it once.
+        unsafe { xboxkrnl::NtClose(file) };
+    }
+
+    fn writer_starting(&mut self) {
+        ODD_WRITER.finished.reset();
+    }
+
+    fn start_writer(&mut self, file: Handle) -> NtStatus {
+        const WRITER_STACK: u32 = 0x8000;
+        const WRITER_FLAGS: ThreadCreationFlags =
+            kernel::SYSTEM_THREAD_FLAGS.union(ThreadCreationFlags::EXEMPT_FROM_STOPS);
+
+        let mut thread = 0u32;
+        // SAFETY: `thread` is a local word; `odd_writer` takes the handle as
+        // its context.
+        let created = unsafe {
+            xboxkrnl::ExCreateThread(
+                &mut thread,
+                WRITER_STACK,
+                core::ptr::null_mut(),
+                0,
+                odd_writer as *const () as usize as u32,
+                file.raw(),
+                WRITER_FLAGS,
+            )
+        };
+
+        // A stop that ran before this store left the previous object behind.
+        if thread != 0 {
+            let previous = ODD_WRITER.thread.swap(thread, Ordering::AcqRel);
+            if previous != 0 {
+                // SAFETY: `previous` is a referenced thread object from an
+                // earlier start.
+                unsafe { xboxkrnl::ObDereferenceObject(previous) };
+            }
         }
 
-        // SAFETY: the slot is owned by this writer while its state is Writing.
-        unsafe { *slot.words.get() = words };
-        slot.state
-            .store(OddSlotState::Ready(kind).raw(), Ordering::Release);
-        self.work.set();
+        created
     }
-}
 
-/// Request of monitor control 0x46.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct OddReadRequest {
-    sector: u32,
-    count: u32,
-}
+    fn writer_absent(&mut self) {
+        ODD_WRITER.finished.set();
+    }
 
-/// First words of the volume descriptor control 0x48 passes.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct OddMountRequest {
-    root_sector: u32,
-    root_size: u32,
-}
+    fn wake_writer(&mut self, _log: &OddLog) {
+        ODD_WRITER.work.set();
+    }
 
-/// Request of monitor control 0x49.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct OddSpeedChangeRequest {
-    current: u32,
-    target: u32,
-    status: NtStatus,
-}
+    fn join_writer(&mut self) {
+        ODD_WRITER.finished.wait();
 
-/// Request of [`translate_on_server`].
-struct Translation<'a> {
-    name: &'a [u8],
-    path: Option<ObjectPath>,
+        // Creation flag 0x80 returns a referenced thread object rather than
+        // a handle.
+        let thread = ODD_WRITER.thread.swap(0, Ordering::AcqRel);
+        if thread != 0 {
+            // SAFETY: `thread` is the referenced object ExCreateThread returned.
+            unsafe { xboxkrnl::ObDereferenceObject(thread) };
+        }
+    }
 }
 
 /// Optical disc records of the trace stream.
@@ -974,45 +937,35 @@ pub(crate) fn service_ignore_gdf_attributes(_argument: u32) -> u32 {
     u32::from(IGNORE_GDF_ATTRIBUTES.load(Ordering::Relaxed))
 }
 
-/// Monitor control 0x46: the drive started a read.
+/// Monitor control 0x46 (0x91f3d210): the drive started a read.
 ///
 /// # Safety
 ///
-/// `argument` must be the address of an `OddReadRequest` the caller keeps
+/// `argument` must be the address of a `ReadRequest` the caller keeps
 /// valid and unchanged for the call.
 pub(crate) unsafe fn service_odd_read_start(argument: u32) -> u32 {
     // SAFETY: the caller's contract.
-    let OddReadRequest {
-        sector: start,
-        count,
-    } = *unsafe { kernel::object_at::<OddReadRequest>(argument) };
+    let request = *unsafe { kernel::object_at::<ReadRequest>(argument) };
     let time = Timebase::now().ticks();
 
     if pix::stream_active() {
         let words = [
             (time >> 32) as u32,
             time as u32 & !odd_trace::COMPLETION,
-            start,
-            count,
+            request.sector,
+            request.count,
             ODD_AUTH_STATE.load(Ordering::Relaxed),
         ];
         pix::write_tagged_record(odd_trace::TAG, odd_trace::payload(words).as_flattened());
     }
 
-    let log = &ODD_LOG;
-    if log.stopped.load(Ordering::Acquire) != 1 {
-        log.pending_start.store(start, Ordering::Relaxed);
-        log.pending_count.store(count, Ordering::Relaxed);
-        log.pending_time_high
-            .store((time >> 32) as u32, Ordering::Relaxed);
-        log.pending_time_low.store(time as u32, Ordering::Release);
-    }
+    ODD_LOG.read_start(request, time);
 
     0
 }
 
-/// Monitor control 0x47: the pending read completed; the argument is the
-/// completion status itself.
+/// Monitor control 0x47 (0x91f3d6e0): the pending read completed; the
+/// argument is the completion status itself.
 pub(crate) fn service_odd_read_complete(argument: u32) -> u32 {
     let status = NtStatus(argument);
     let completed = Timebase::now().ticks();
@@ -1026,85 +979,38 @@ pub(crate) fn service_odd_read_complete(argument: u32) -> u32 {
         pix::write_tagged_record(odd_trace::TAG, odd_trace::payload(words).as_flattened());
     }
 
-    let log = &ODD_LOG;
-    let low = log.pending_time_low.load(Ordering::Acquire);
-    let high = log.pending_time_high.load(Ordering::Relaxed);
-    if high != 0 || low != 0 {
-        log.publish(
-            OddRecordKind::Read,
-            [
-                log.pending_start.load(Ordering::Relaxed),
-                log.pending_count.load(Ordering::Relaxed),
-                high,
-                low,
-                (completed >> 32) as u32,
-                completed as u32,
-                status.0,
-            ],
-        );
-    }
+    ODD_LOG.read_complete(&mut OddServices, status, completed);
 
     0
 }
 
-/// Monitor control 0x48: a GDFX volume was mounted.
+/// Monitor control 0x48 (0x91f3d7a0): a GDFX volume was mounted.
 ///
 /// # Safety
 ///
 /// `argument` must be the address of the mounted volume's descriptor,
-/// starting with an `OddMountRequest`, which the caller keeps valid and
+/// starting with a `MountRequest`, which the caller keeps valid and
 /// unchanged for the call.
 pub(crate) unsafe fn service_odd_mount(argument: u32) -> u32 {
     // SAFETY: the caller's contract.
-    let OddMountRequest {
-        root_sector,
-        root_size,
-    } = *unsafe { kernel::object_at::<OddMountRequest>(argument) };
-    let time = Timebase::now().ticks();
+    let request = *unsafe { kernel::object_at::<MountRequest>(argument) };
 
-    ODD_LOG.publish(
-        OddRecordKind::Mount,
-        [
-            root_sector,
-            root_size,
-            (time >> 32) as u32,
-            time as u32,
-            0,
-            0,
-            0,
-        ],
-    );
+    ODD_LOG.mount(&mut OddServices, request);
 
     0
 }
 
-/// Monitor control 0x49: the spindle speed changed.
+/// Monitor control 0x49 (0x91f3d808): the spindle speed changed.
 ///
 /// # Safety
 ///
-/// `argument` must be the address of an `OddSpeedChangeRequest` the caller
+/// `argument` must be the address of a `SpeedChangeRequest` the caller
 /// keeps valid and unchanged for the call.
 pub(crate) unsafe fn service_odd_speed_change(argument: u32) -> u32 {
     // SAFETY: the caller's contract.
-    let OddSpeedChangeRequest {
-        current,
-        target,
-        status,
-    } = *unsafe { kernel::object_at::<OddSpeedChangeRequest>(argument) };
-    let time = Timebase::now().ticks();
+    let request = *unsafe { kernel::object_at::<SpeedChangeRequest>(argument) };
 
-    ODD_LOG.publish(
-        OddRecordKind::SpeedChange,
-        [
-            current,
-            target,
-            status.0,
-            (time >> 32) as u32,
-            time as u32,
-            0,
-            0,
-        ],
-    );
+    ODD_LOG.speed_change(&mut OddServices, request);
 
     0
 }
@@ -1129,46 +1035,6 @@ fn odd_auth_state(state: u32) -> u32 {
     if (1..=4).contains(&state) { state } else { 0 }
 }
 
-fn hundred_ns(high: u32, low: u32) -> u64 {
-    /// Timebase ticks per 100 ns unit.
-    const TIMEBASE_PER_100NS: i64 = 5;
-
-    let timebase = u64::from(high) << 32 | u64::from(low);
-
-    (timebase as i64 / TIMEBASE_PER_100NS) as u64
-}
-
-fn speed_name(code: u32) -> &'static str {
-    match code {
-        1 => "2.4x",
-        2 => "5x",
-        3 => "8x",
-        4 => "12x",
-        _ => "Unknown",
-    }
-}
-
-fn write_text(handle: Handle, text: &[u8]) {
-    let mut io_status = xboxkrnl::IoStatusBlock {
-        status: NtStatus::SUCCESS,
-        information: 0,
-    };
-
-    // SAFETY: `handle` is the open log file and `text` is valid for its length.
-    unsafe {
-        xboxkrnl::NtWriteFile(
-            handle,
-            Handle::NULL,
-            0,
-            0,
-            &mut io_status,
-            text.as_ptr(),
-            text.len() as u32,
-            core::ptr::null(),
-        )
-    };
-}
-
 /// Startup (0x91f3d558): the log's events, then the drive's current
 /// authentication state.
 fn odd_initialize() {
@@ -1177,8 +1043,8 @@ fn odd_initialize() {
     const OPTICAL_DRIVE_ATTRIBUTES: ObjectAttributeFlags =
         ObjectAttributeFlags::PERMANENT.union(ObjectAttributeFlags::CASE_INSENSITIVE);
 
-    ODD_LOG.work.initialize();
-    ODD_LOG.finished.initialize_notification(true);
+    ODD_WRITER.work.initialize();
+    ODD_WRITER.finished.initialize_notification(true);
 
     let name = kernel::ansi_string(OPTICAL_DRIVE);
     let attributes = xboxkrnl::ObjectAttributes {
@@ -1231,255 +1097,19 @@ fn odd_initialize() {
     unsafe { xboxkrnl::NtClose(Handle::from_raw(handle)) };
 }
 
-fn odd_write_record(handle: Handle, kind: OddRecordKind, words: OddWords) {
-    let mut line = Text::<0x100>::new();
-    let _ = match kind {
-        OddRecordKind::Mount => {
-            let [sector, size, high, low, ..] = words;
-            let size = u64::from(size);
-            let time = hundred_ns(high, low);
-            write!(line, "GMNT,0x{sector:08x},0x{size:016x},0x{time:016x}\r\n")
-        }
-        OddRecordKind::Read => {
-            let [
-                start,
-                count,
-                requested_high,
-                requested_low,
-                high,
-                low,
-                status,
-            ] = words;
-            let requested = hundred_ns(requested_high, requested_low);
-            let completed = hundred_ns(high, low);
-            write!(
-                line,
-                "READ,0x{start:08x},0x{count:08x},0x{requested:016x},0x{completed:016x},0x{status:08x}\r\n"
-            )
-        }
-        OddRecordKind::SpeedChange => {
-            let [current, target, status, high, low, ..] = words;
-            let current = speed_name(current);
-            let target = speed_name(target);
-            let time = hundred_ns(high, low);
-            write!(
-                line,
-                "SSC ,{current},{target},0x{status:08X},0x{time:016x}\r\n"
-            )
-        }
-    };
-
-    write_text(handle, line.as_bytes());
-}
-
-fn odd_drain(handle: Handle) {
-    let log = &ODD_LOG;
-
-    loop {
-        let index = log.read.load(Ordering::Relaxed);
-        let slot = &log.slots[index as usize];
-        let OddSlotState::Ready(kind) = OddSlotState::from_raw(slot.state.load(Ordering::Acquire))
-        else {
-            break;
-        };
-
-        // SAFETY: a ready slot is owned by the writer thread.
-        let words = unsafe { *slot.words.get() };
-        odd_write_record(handle, kind, words);
-
-        slot.state
-            .store(OddSlotState::Free.raw(), Ordering::Release);
-        log.read
-            .store((index + 1) % ODD_RING as u32, Ordering::Relaxed);
-    }
-
-    let drops = log.drops.swap(0, Ordering::AcqRel);
-    if drops != 0 {
-        let mut line = Text::<0x20>::new();
-        let _ = write!(line, "DROP,0x{drops:08x}\r\n");
-        write_text(handle, line.as_bytes());
-    }
-}
-
-/// Writer thread; the context is the log file handle.
+/// Writer thread (0x91f3d878); the context is the log file handle.
 extern "C" fn odd_writer(context: u32) -> u32 {
-    let handle = Handle::from_raw(context);
-    let log = &ODD_LOG;
+    let file = Handle::from_raw(context);
 
-    while log.stopped.load(Ordering::Acquire) == 0 {
-        log.work.wait();
-        odd_drain(handle);
+    while !ODD_LOG.is_stopped() {
+        ODD_WRITER.work.wait();
+        ODD_LOG.drain(&mut OddServices, file);
     }
 
-    // SAFETY: the writer thread owns the log file handle passed at creation.
-    unsafe { xboxkrnl::NtClose(handle) };
-    log.finished.set();
+    OddServices.close_file(file);
+    ODD_WRITER.finished.set();
 
     0
-}
-
-/// The failure of a status with error severity. Warnings do not fail the
-/// optical disc log.
-fn failure(status: NtStatus) -> Result<(), KernelError> {
-    if status.severity() == Severity::Error {
-        status.result()
-    } else {
-        Ok(())
-    }
-}
-
-/// Start the optical disc log (stock export 147 0x91f3dad0).
-fn odd_log_start(path: Result<&[u8], KernelError>) -> Result<(), OddLogStartError> {
-    const HEADER: &[u8] = b"# Optical Disc Log Created on Console\r\n\
-# Log Format Information:\r\n\
-# READ,<StartSector>,<SectorCount>,<RequestTime_100ns>,<CompleteTime_100ns>,<NTSTATUS>,;for each read operation\r\n\
-# GMNT,<RootDirStartSector>,<RootDirSize_bytes>,<Time_100ns>,;when GDFX filesystem is mounted\r\n\
-# SSC ,<CurrentSpeed>,<TargetSpeed>,<NTSTATUS>,<Time_100ns>,;for each spindle speed change\r\n\
-# DROP,<DropCount>,;indicates dropped log entries\r\n";
-    /// `FILE_SHARE_READ | FILE_SHARE_DELETE`.
-    const SHARE_READ_DELETE: ShareAccess = ShareAccess::from_bits_retain(5);
-    const WRITER_STACK: u32 = 0x8000;
-    const WRITER_FLAGS: ThreadCreationFlags =
-        kernel::SYSTEM_THREAD_FLAGS.union(ThreadCreationFlags::EXEMPT_FROM_STOPS);
-
-    let log = &ODD_LOG;
-    if log
-        .busy
-        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
-        .is_err()
-    {
-        return Err(OddLogStartError::Busy);
-    }
-
-    for slot in &log.slots {
-        slot.state
-            .store(OddSlotState::Free.raw(), Ordering::Relaxed);
-    }
-
-    log.read.store(0, Ordering::Relaxed);
-    log.drops.store(0, Ordering::Relaxed);
-    log.allocate.store(ODD_RING as u32 - 1, Ordering::Relaxed);
-    log.pending_time_low.store(0, Ordering::Relaxed);
-    log.pending_time_high.store(0, Ordering::Relaxed);
-    log.finished.reset();
-    log.stopped.store(0, Ordering::Release);
-
-    let request = CreateRequest {
-        access: AccessMask::GENERIC_WRITE,
-        allocation_size: None,
-        attributes: FileAttributes::NORMAL,
-        share: SHARE_READ_DELETE,
-        disposition: CreateDisposition::OverwriteIf,
-        options: CreateOptions::SYNCHRONOUS_IO_NONALERT,
-    };
-    let opened = path.and_then(|path| super::filesystem::create_file(path, &request));
-    let failed = match opened {
-        Ok(FileHandle(handle)) => {
-            let handle = Handle::from_raw(handle);
-            let mut io_status = xboxkrnl::IoStatusBlock {
-                status: NtStatus::SUCCESS,
-                information: 0,
-            };
-            // SAFETY: `handle` was opened above; the header is static.
-            let written = unsafe {
-                xboxkrnl::NtWriteFile(
-                    handle,
-                    Handle::NULL,
-                    0,
-                    0,
-                    &mut io_status,
-                    HEADER.as_ptr(),
-                    HEADER.len() as u32,
-                    core::ptr::null(),
-                )
-            };
-
-            match failure(written) {
-                Err(error) => {
-                    // SAFETY: `handle` was opened above and no writer owns it.
-                    unsafe { xboxkrnl::NtClose(handle) };
-                    Some(error)
-                }
-                Ok(()) => {
-                    let mut thread = 0u32;
-                    // SAFETY: `thread` is a local word; `odd_writer` takes the
-                    // handle as its context.
-                    let created = unsafe {
-                        xboxkrnl::ExCreateThread(
-                            &mut thread,
-                            WRITER_STACK,
-                            core::ptr::null_mut(),
-                            0,
-                            odd_writer as *const () as usize as u32,
-                            handle.raw(),
-                            WRITER_FLAGS,
-                        )
-                    };
-                    if let Err(error) = failure(created) {
-                        // Stock leaves the finished event clear here, so its
-                        // next stop waits forever; no writer runs, so mark it
-                        // finished.
-                        // SAFETY: no writer started, so `handle` is still owned here.
-                        unsafe { xboxkrnl::NtClose(handle) };
-                        log.finished.set();
-                        log.busy.store(0, Ordering::Release);
-                        return Err(OddLogStartError::Failed(error));
-                    }
-
-                    // A stop that ran before this store left the previous
-                    // object behind.
-                    let previous = log.thread.swap(thread, Ordering::AcqRel);
-                    if previous != 0 {
-                        // SAFETY: `previous` is a referenced thread object from
-                        // an earlier start.
-                        unsafe { xboxkrnl::ObDereferenceObject(previous) };
-                    }
-
-                    return Ok(());
-                }
-            }
-        }
-        Err(error) => failure(error.status()).err(),
-    };
-
-    // Stock's writer reports the open or header status and exits, setting
-    // the finished event; only statuses with error severity fail the start.
-    // The stop flag stays clear, so a later stop succeeds.
-    log.finished.set();
-    if let Some(error) = failed {
-        log.busy.store(0, Ordering::Release);
-        return Err(OddLogStartError::Failed(error));
-    }
-
-    Ok(())
-}
-
-/// Stop the optical disc log and wait for its writer (stock export 148
-/// 0x91f3d140).
-fn odd_log_stop() -> Result<(), OddLogNotRunning> {
-    let log = &ODD_LOG;
-    if log
-        .stopped
-        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
-        .is_err()
-    {
-        return Err(OddLogNotRunning);
-    }
-
-    log.work.set();
-    log.finished.wait();
-
-    // Creation flag 0x80 returns a referenced thread object rather than a
-    // handle.
-    let thread = log.thread.swap(0, Ordering::AcqRel);
-    if thread != 0 {
-        // SAFETY: `thread` is the referenced object ExCreateThread returned.
-        unsafe { xboxkrnl::ObDereferenceObject(thread) };
-    }
-
-    log.busy.store(0, Ordering::Release);
-
-    Ok(())
 }
 
 /// The XAM input focus query for `user`; nonzero when the system has
@@ -1510,21 +1140,6 @@ fn clear_queue(user: u32) -> Result<(), AutomationError> {
 #[inline(never)]
 fn query_queue(user: u32) -> Result<QueueStatus, AutomationError> {
     AUTOMATION.lock().query(user, &mut Input)
-}
-
-fn translate_on_server(
-    server: &mut Server,
-    console: &mut Console,
-    _network: &mut XamNetwork,
-    request: &mut Translation<'_>,
-) -> u32 {
-    request.path = server
-        .state
-        .filesystem
-        .drives
-        .translate(console, request.name);
-
-    0
 }
 
 /// The avatar hook lookup; resolved on every use, as the monitor does.
@@ -1689,26 +1304,32 @@ extern "C" fn export_automation_query_queue(
 }
 
 /// Export 147 (stock 0x91f3dad0): start the optical disc log at the drive
-/// path `path`. Stock's writer translates it through the drive table
-/// (0x91f2eb68); the table is server state, so it is translated on the
-/// server thread, and a name that does not translate fails with
-/// STATUS_NO_SUCH_FILE as stock's open does.
+/// path `path`. Stock checks the busy writer first; its writer then
+/// translates the name through the drive table (0x91f2eb68). Here the
+/// caller translates it with the published table after the busy check,
+/// and a name that does not translate fails with STATUS_NO_SUCH_FILE as
+/// stock's open does.
 extern "C" fn export_odd_log_start(path: *const core::ffi::c_char) -> Hresult {
     // SAFETY: the caller passes a NUL-terminated name.
     let name = unsafe { core::ffi::CStr::from_ptr(path) }.to_bytes();
 
-    let mut translation = Translation { name, path: None };
-    let translated = dispatcher::call_on_server_with(&mut translation, translate_on_server)
-        .and(translation.path.as_ref())
+    let reservation = match ODD_LOG.reserve(&mut OddServices) {
+        Ok(reservation) => reservation,
+        Err(error) => return Hresult::from(error),
+    };
+
+    let translated = filesystem::published_drives().translate(&mut CallerPaths::new(), name);
+    let translated = translated
+        .as_ref()
         .map(ObjectPath::as_bytes)
         .ok_or(KernelError::NoSuchFile);
 
-    export_result(odd_log_start(translated))
+    export_result(ODD_LOG.start(&mut OddServices, reservation, translated))
 }
 
 /// Export 148 (stock 0x91f3d140): stop the optical disc log.
 extern "C" fn export_odd_log_stop() -> Hresult {
-    export_result(odd_log_stop())
+    export_result(ODD_LOG.stop(&mut OddServices))
 }
 
 export!(147, export_odd_log_start);

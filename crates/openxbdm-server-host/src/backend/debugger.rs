@@ -10,6 +10,8 @@ use std::collections::VecDeque;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
 use openxbdm_server::commands::debugger;
+use openxbdm_server::commands::debugger::BreakpointState;
+use openxbdm_server::commands::debugger::CodeWords;
 use openxbdm_server::commands::debugger::Context;
 use openxbdm_server::commands::debugger::ContextFlags;
 use openxbdm_server::commands::debugger::DebugEvent;
@@ -20,7 +22,6 @@ use openxbdm_server::commands::debugger::DirectNotification;
 use openxbdm_server::commands::debugger::DirectOutcome;
 use openxbdm_server::commands::debugger::DirectPolicy;
 use openxbdm_server::commands::debugger::DirectRegisters;
-use openxbdm_server::commands::debugger::DirectStep;
 use openxbdm_server::commands::debugger::Disposition;
 use openxbdm_server::commands::debugger::ExceptionRecord;
 use openxbdm_server::commands::debugger::ExitStatus;
@@ -30,6 +31,8 @@ use openxbdm_server::commands::debugger::Msr;
 use openxbdm_server::commands::debugger::NOTICE_TEXT_CAPACITY;
 use openxbdm_server::commands::debugger::NoSuchThread;
 use openxbdm_server::commands::debugger::ProcessKind;
+use openxbdm_server::commands::debugger::SetError;
+use openxbdm_server::commands::debugger::SpareBlock;
 use openxbdm_server::commands::debugger::StoppedThreadError;
 use openxbdm_server::commands::debugger::ThreadId;
 use openxbdm_server::commands::debugger::ThreadInfo;
@@ -39,11 +42,12 @@ use openxbdm_server::commands::services::ThreadHandle;
 use openxbdm_server::notify::ExecutionState;
 
 use super::MockBackend;
+use super::memory::Region;
 
 /// Thread that runs commands; `break now` traps on it.
 pub const COMMAND_THREAD: u32 = 0xf900_0004;
-/// Address of the `break now` trap instruction.
-pub const BREAK_NOW_TRAP: u32 = 0x91f4_8a60;
+/// Address of the `break now` trap instruction (stock 0x91f48a6c).
+pub const BREAK_NOW_TRAP: u32 = 0x91f4_8a6c;
 
 /// Simulated state of this domain.
 #[derive(Debug)]
@@ -72,9 +76,13 @@ pub struct Mock {
 
     /// State the server last published for direct exceptions.
     pub policy: DirectPolicy,
-    pub direct_step: Option<DirectStep>,
+    /// The breakpoint table and in-place step state. Every backend call
+    /// runs under the host lock, which stands in for the table lock.
+    pub breakpoints: BreakpointState,
     /// Notifications queued by direct exceptions, with captured text.
     pub direct: VecDeque<(DirectNotification, Vec<u8>)>,
+    /// Outcome and registers of the last `break now` trap.
+    pub break_now: Option<(DirectOutcome, Context)>,
 }
 
 impl Default for Mock {
@@ -97,8 +105,9 @@ impl Default for Mock {
             loaded_extensions: Vec::new(),
             unloaded_extensions: Vec::new(),
             policy: DirectPolicy::default(),
-            direct_step: None,
+            breakpoints: BreakpointState::new(),
             direct: VecDeque::new(),
+            break_now: None,
         }
     }
 }
@@ -229,6 +238,8 @@ pub struct MockThread {
     pub debuggable: bool,
     /// Exempt from suspension when execution stops.
     pub exempt: bool,
+    /// Monitor record marked by a stack overflow notification.
+    pub stack_overflowed: bool,
 
     pub info: ThreadInfo,
     pub monitor_suspended: bool,
@@ -258,6 +269,7 @@ impl MockThread {
             has_record: true,
             debuggable: true,
             exempt: false,
+            stack_overflowed: false,
             info: ThreadInfo {
                 suspend_count: 0,
                 monitor_suspended: false,
@@ -284,6 +296,23 @@ struct RegionOffset {
     offset: usize,
 }
 
+/// Code memory of the simulated regions.
+struct RegionCode<'a>(&'a mut [Region]);
+
+impl CodeWords for RegionCode<'_> {
+    fn replace_code_word(&mut self, address: u32, value: u32) -> Option<u32> {
+        let bytes = self.0.iter_mut().find_map(|region| {
+            let offset = address.checked_sub(region.base)? as usize;
+            region.bytes.get_mut(offset..offset + 4)
+        })?;
+
+        let previous = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        bytes.copy_from_slice(&value.to_be_bytes());
+
+        Some(previous)
+    }
+}
+
 impl MockBackend {
     fn region_offset(&self, address: u32, length: usize) -> Option<RegionOffset> {
         self.memory
@@ -308,9 +337,10 @@ impl MockBackend {
 
     /// Raise an exception on a thread that cannot wait for the server and
     /// dispatch it on the raising thread with the published policy, as
-    /// the console does above passive level and on its server thread.
-    /// `context` is updated in place; a notification is queued for the
-    /// server.
+    /// the console does above passive level, on its server thread, for a
+    /// thread that overflowed its stack, and for a thread already inside
+    /// the monitor. `context` is updated in place; a notification is queued
+    /// for the server.
     pub fn raise_direct_exception(
         &mut self,
         thread: u32,
@@ -320,15 +350,15 @@ impl MockBackend {
     ) -> DirectOutcome {
         use openxbdm_server::commands::system::Backend as _;
 
-        let has_record = self
-            .debugger
-            .thread(ThreadId(thread))
-            .is_some_and(|found| found.has_record);
+        let found = self.debugger.thread(ThreadId(thread));
         let event = DirectException {
             thread: ThreadId(thread),
             record,
             second_chance: false,
-            has_record,
+            has_record: found.is_some_and(|found| found.has_record),
+            debuggable: found.is_some_and(|found| found.has_record && found.debuggable),
+            stack_overflowed: found.is_some_and(|found| found.stack_overflowed),
+            nested: self.debugger.in_monitor.contains_key(&thread),
             hardware_flags: self.hardware_flags(),
             delivery,
         };
@@ -353,7 +383,8 @@ impl MockBackend {
             &event,
             &mut registers,
             instruction,
-            &mut self.debugger.direct_step,
+            &mut self.debugger.breakpoints,
+            &mut RegionCode(&mut self.memory.regions),
         );
 
         context.msr = registers.msr;
@@ -362,6 +393,17 @@ impl MockBackend {
         context.gpr[4] = registers.gpr4;
         if let Some(value) = outcome.data_breakpoint_register {
             self.debugger.data_breakpoint_register = value;
+        }
+        if let Some(DirectNotice::ModuleUnload {
+            name_string, entry, ..
+        }) = outcome.notice
+            && let Some(module) = self.debugger.modules.get(&(name_string, entry))
+        {
+            self.debugger.breakpoints.remove_module(
+                module.base,
+                module.size,
+                &mut RegionCode(&mut self.memory.regions),
+            );
         }
 
         let Some(notice) = outcome.notice else {
@@ -597,6 +639,14 @@ impl debugger::Backend for MockBackend {
     }
 
     fn thread_exit_status(&mut self, handle: ThreadHandle) -> Result<ExitStatus, KernelError> {
+        /// `NtCurrentThread()`: ObReferenceObjectByHandle returns the calling
+        /// thread, the running server thread, without a table lookup.
+        const CURRENT_THREAD: ThreadHandle = ThreadHandle(0xffff_fffe);
+
+        if handle == CURRENT_THREAD {
+            return Ok(ExitStatus::STILL_ACTIVE);
+        }
+
         // Handles the simulated table lacks are invalid, as for the kernel.
         self.debugger
             .thread_handles
@@ -605,14 +655,31 @@ impl debugger::Backend for MockBackend {
             .unwrap_or(Err(KernelError::InvalidHandle))
     }
 
-    fn replace_code_word(&mut self, address: u32, value: u32) -> Option<u32> {
-        let RegionOffset { region, offset } = self.region_offset(address, 4)?;
-        let bytes = &mut self.memory.regions[region].bytes[offset..offset + 4];
+    fn lock_breakpoints(
+        &mut self,
+        access: &mut dyn FnMut(&mut BreakpointState, &mut dyn CodeWords),
+    ) {
+        access(
+            &mut self.debugger.breakpoints,
+            &mut RegionCode(&mut self.memory.regions),
+        );
+    }
 
-        let previous = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        bytes.copy_from_slice(&value.to_be_bytes());
+    fn set_breakpoint(&mut self, address: u32) -> Result<(), SetError> {
+        use openxbdm_server::commands::filesystem::Backend as _;
 
-        Some(previous)
+        // Every call runs under the host lock, which serializes sets.
+        if self.debugger.breakpoints.needs_spare()
+            && let Some(spare) = self
+                .allocate_scratch(SpareBlock::SIZE)
+                .and_then(|block| SpareBlock::from_pool(block.into_raw()))
+        {
+            self.debugger.breakpoints.provide_spare(spare);
+        }
+
+        self.debugger
+            .breakpoints
+            .set(address, &mut RegionCode(&mut self.memory.regions))
     }
 
     fn target_bytes(&mut self, address: u32, length: usize) -> Option<&[u8]> {
@@ -660,19 +727,18 @@ impl debugger::Backend for MockBackend {
         Some(notification)
     }
 
-    fn break_now(&mut self) -> Option<DebugEvent> {
+    fn break_now(&mut self) {
         let id = ThreadId(COMMAND_THREAD);
         if self.debugger.thread(id).is_none() {
+            // Stock's command thread record is not debuggable (0x91f50cf0).
             let mut thread = MockThread::new(COMMAND_THREAD, ProcessKind::System);
             thread.debuggable = false;
             self.debugger.threads.push(thread);
         }
 
-        let context = self
+        let mut context = self
             .debugger
             .exception_context(COMMAND_THREAD, BREAK_NOW_TRAP);
-        self.debugger.in_monitor.insert(COMMAND_THREAD, context);
-
         let record = ExceptionRecord {
             code: NtStatus::BREAKPOINT,
             address: BREAK_NOW_TRAP,
@@ -682,14 +748,9 @@ impl debugger::Backend for MockBackend {
             ..ExceptionRecord::default()
         };
 
-        Some(DebugEvent::Exception {
-            thread: id,
-            process: ProcessKind::System,
-            record,
-            second_chance: false,
-            has_record: true,
-            debuggable: false,
-        })
+        let outcome =
+            self.raise_direct_exception(COMMAND_THREAD, record, &mut context, Delivery::Inline);
+        self.debugger.break_now = Some((outcome, context));
     }
 
     fn crash_dump(&mut self) {

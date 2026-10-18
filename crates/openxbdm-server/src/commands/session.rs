@@ -29,7 +29,6 @@ use crate::invocation::DedicateTarget;
 use crate::invocation::Invocation;
 use crate::invocation::SessionRequest;
 use crate::notify::Event;
-use crate::notify::POSTED_TEXT_CAPACITY;
 use crate::registry::CommandEntry;
 use crate::registry::DispatchFlags;
 use crate::reply::CommandError;
@@ -37,7 +36,8 @@ use crate::reply::CommandResult;
 use crate::reply::Reply;
 
 pub use capture::DEBUG_CAPTURE_SIZE;
-pub use capture::debug_capture_print;
+pub use capture::DebugCaptureRing;
+pub use capture::ReservationEvent;
 pub use discovery::DISCOVERY_PACKET_CAPACITY;
 pub use discovery::DiscoveryDestination;
 pub use discovery::DiscoveryFlags;
@@ -59,10 +59,13 @@ pub use fileevent::FileEventBegin;
 pub use fileevent::FileEventFlags;
 pub use fileevent::FileEventId;
 pub use fileevent::FileEventText;
+pub use fileevent::FileEventTitles;
+pub use fileevent::FileOperationClass;
 pub use fileevent::PseudoBegin;
 pub use fileevent::PseudoBeginIo;
 pub use fileevent::PseudoOptions;
 pub use fileevent::file_event_kind;
+pub use fileevent::file_mode_flags;
 pub use fileevent::format_file_event_begin;
 pub use fileevent::format_file_event_end;
 pub use fileevent::format_file_event_switch;
@@ -217,11 +220,15 @@ pub enum Continuation {
 
 /// Platform services this domain needs.
 pub trait Backend: RpcBackend + FastPipeBackend + TellLogBackend {
-    /// Allocate the debug capture ring; `false` when memory is exhausted.
+    /// Allocate the debug capture ring with its first byte and write offset
+    /// cleared, then publish it to the producers; `false` when memory is
+    /// exhausted.
     fn allocate_debug_capture(&mut self) -> bool;
+    /// Withdraw the ring from the producers, wait for those still writing,
+    /// free it and clear the write offset.
     fn free_debug_capture(&mut self);
     /// The debug capture ring while it is allocated.
-    fn debug_capture(&mut self) -> Option<&mut [u8; DEBUG_CAPTURE_SIZE]>;
+    fn debug_capture(&mut self) -> Option<DebugCaptureRing<'_>>;
     /// Processor executing the server thread.
     fn current_processor(&mut self) -> ProcessorNumber;
     /// Restrict the server thread to `processor`.
@@ -231,8 +238,9 @@ pub trait Backend: RpcBackend + FastPipeBackend + TellLogBackend {
     /// Switch file I/O event notifications and take the next event
     /// identifier, which the I/O events share.
     fn switch_file_events(&mut self, enable: bool) -> FileEventId;
-    /// Take the oldest notification text another thread posted.
-    fn next_posted_notification(&mut self, text: &mut [u8; POSTED_TEXT_CAPACITY]) -> Option<usize>;
+    /// Take the oldest notification text another thread posted and pass it
+    /// to `send`; `false` when none is queued.
+    fn send_next_posted_notification(&mut self, send: &mut dyn FnMut(&[u8])) -> bool;
     /// Run the in-process notification session handlers registered for
     /// `event` (stock 0x91f395c0), before its line goes to the channels.
     fn notify_sessions(&mut self, event: &Event<'_>);

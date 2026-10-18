@@ -129,7 +129,7 @@ specified in `framework.md`. Points relied on in this file:
   5. Length phase: when 4 bytes have arrived, ctx[5] := L, phase := name.
      L = 0 leaves ctx[5] = 0 with result 0x02da0000, so the pump sends
      `200- OK` and resets the context; following upload bytes are parsed as
-     commands.
+     commands. The pool block is not freed (0x91f45f34..0x91f45f54).
   6. Name phase, when ctx[5] reaches 0: record index i = scratch+8 (then
      incremented); record zeroed (0x1c bytes). If the name begins with
      `\Device\` (case-insensitive), it is copied (max 0x140 bytes) as the
@@ -144,9 +144,12 @@ specified in `framework.md`. Points relied on in this file:
      (`203- binary response follows`). First send call (ctx[5] = 0xffffffff):
      ctx[2] := records, ctx[1] := count * 0x1c, ctx[5] := 0; the pump sends
      all records at once. Next call: pool freed, 0x82da0104.
-  8. count = 0: the first 4 received bytes cause the pool to be freed and
-     0x82da0104 returned while ctx[5] stays 4; the pump keeps receiving into
-     the freed block and frees it again. Defective in the stock image.
+  8. count = 0: the first 4 received bytes cause the pool to be freed
+     (0x91f45ec4 index == count, 0x91f45efc export 9) and 0x82da0104
+     returned while ctx[5] stays 4; the receive pump ignores results while
+     ctx[5] != 0 (0x91f426b0), so it keeps receiving into the freed block
+     and the continuation frees it again on every piece. Defective in the
+     stock image.
 - Backend requirement: query file attributes (creation time, last write time,
   size, attribute bits) by drive path or device path.
 - Status: spec complete.
@@ -644,9 +647,12 @@ specified in `framework.md`. Points relied on in this file:
   0x80000012 (32-bit wrap), i.e. code 0x15. The dispatcher raises ntassert
   as 0xc0000420, so a thread stopped at an ntassert reports type 9
   (`exception code=0xc0000420 ...`).
-- Type 0xd reads its kind from a stack word the builder never writes; the
-  value cannot be reproduced. The reimplementation reports `stopped` (the
-  text for kinds outside 1..3).
-- Status: spec complete except the indeterminate type 0xd kind.
+- Type 0xd reads its kind from a stack word the builder never writes
+  (export 22 writes only the type, context +8 and the thread for it,
+  0x91f2618c..0x91f261b0; the handler's buffer at sp+0x60 is not
+  initialized, 0x91f48dd0; the formatter reads buffer +0xc, 0x91f392c8).
+  This is a stock uninitialized read; the reimplementation reports
+  `stopped` (the text for kinds outside 1..3) and lists it as a deviation.
+- Status: spec complete; the type 0xd kind is a stock defect.
   Cross-check: capture `isstopped_running.capture` shows `408- not stopped`,
   matching.

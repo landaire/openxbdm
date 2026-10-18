@@ -16,10 +16,13 @@ use openxbdm_server::commands::session::FileEventBegin;
 use openxbdm_server::commands::session::FileEventFlags;
 use openxbdm_server::commands::session::FileEventId;
 use openxbdm_server::commands::session::FileEventText;
+use openxbdm_server::commands::session::FileEventTitles;
+use openxbdm_server::commands::session::FileOperationClass;
 use openxbdm_server::commands::session::PseudoBegin;
 use openxbdm_server::commands::session::PseudoBeginIo;
 use openxbdm_server::commands::session::PseudoOptions;
 use openxbdm_server::commands::session::file_event_kind;
+use openxbdm_server::commands::session::file_mode_flags;
 use openxbdm_server::commands::session::format_file_event_begin;
 use openxbdm_server::commands::session::format_file_event_end;
 use openxbdm_server::commands::session::format_file_event_switch;
@@ -51,7 +54,7 @@ const BAD_PARAMETER: Hresult = ErrorCode::BadParameter.hresult();
 
 static FILE_EVENTS: SpinLock<FileEvents> = SpinLock::new(FileEvents {
     last_id: FileEventId(0),
-    suppressed: None,
+    titles: FileEventTitles::new(),
 });
 /// Enable flag (stock 0x91f9f628): set under the lock, read without it, as
 /// stock does.
@@ -68,38 +71,21 @@ export!(159, mark_thread);
 export!(160, unmark_thread);
 
 /// Identifier and title state under the monitor's critical section
-/// 0x91fae520 (stock 0x91f9735c identifier, 0x91f9f62c/0x91f9f630
-/// suppressed title).
+/// 0x91fae520 (stock 0x91f9735c identifier).
 struct FileEvents {
     last_id: FileEventId,
-    /// Title whose events are suppressed after it terminated.
-    suppressed: Option<u32>,
+    titles: FileEventTitles,
 }
 
 impl FileEvents {
-    /// The dashboard and this system title never report.
-    const DASHBOARD_TITLE: u32 = 0xfffe_07d1;
-    const SYSTEM_TITLE: u32 = 0xfffe_07ff;
-
     fn next_id(&mut self) -> FileEventId {
         self.last_id = self.last_id.next();
         self.last_id
     }
 
-    /// Whether the running title reports events; a different title ends
-    /// the suppression.
+    /// Whether the running title reports events.
     fn reports(&mut self) -> bool {
-        let title = current_title_id();
-        if title == Self::DASHBOARD_TITLE
-            || title == Self::SYSTEM_TITLE
-            || self.suppressed == Some(title)
-        {
-            return false;
-        }
-
-        self.suppressed = None;
-
-        true
+        self.titles.reports(current_title_id())
     }
 }
 
@@ -134,35 +120,6 @@ const _: () = {
     assert!(core::mem::size_of::<FileEventRecord>() == 0x28);
 };
 
-/// What a record's operation number tells the begin event.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum OperationClass {
-    /// Operations 0 and 1 open a file by path, with create options.
-    Open,
-    /// Operations 3 to 6 transfer data at a byte offset; 5 and 6 are
-    /// scatter/gather transfers.
-    Transfer {
-        scatter_gather: bool,
-    },
-    Other,
-}
-
-impl OperationClass {
-    #[inline(always)]
-    const fn of(operation: u32) -> Self {
-        match operation {
-            0 | 1 => Self::Open,
-            3 | 4 => Self::Transfer {
-                scatter_gather: false,
-            },
-            5 | 6 => Self::Transfer {
-                scatter_gather: true,
-            },
-            _ => Self::Other,
-        }
-    }
-}
-
 fn enabled() -> bool {
     ENABLED.load(Ordering::Acquire)
 }
@@ -178,7 +135,7 @@ pub(super) fn switch(enable: bool) -> FileEventId {
 
 /// The title-terminate routine suppresses the ending title's events.
 pub(super) fn suppress_title(title: u32) {
-    FILE_EVENTS.lock().suppressed = Some(title);
+    FILE_EVENTS.lock().titles.suppress(title);
 }
 
 /// Take the next identifier and store it in `output` under the lock.
@@ -450,10 +407,10 @@ pub(crate) unsafe fn service_file_event_begin(record: u32) -> u32 {
     };
 
     let operation = record.operation;
-    let class = OperationClass::of(operation);
+    let class = FileOperationClass::of(operation);
     let handle = record.handle;
     let (offset, flags) = match class {
-        OperationClass::Transfer { scatter_gather } => {
+        FileOperationClass::Transfer { scatter_gather } => {
             let requested = if record.offset == 0 {
                 0
             } else {
@@ -496,7 +453,7 @@ pub(crate) unsafe fn service_file_event_begin(record: u32) -> u32 {
                 )
             };
             let mut flags = if status.is_success() {
-                mode_flags(mode)
+                file_mode_flags(mode)
             } else {
                 FileEventFlags::empty()
             };
@@ -506,13 +463,13 @@ pub(crate) unsafe fn service_file_event_begin(record: u32) -> u32 {
 
             (offset, flags)
         }
-        OperationClass::Open => (0, mode_flags(record.options)),
-        OperationClass::Other => (0, FileEventFlags::empty()),
+        FileOperationClass::Open => (0, file_mode_flags(record.options)),
+        FileOperationClass::Other => (0, FileEventFlags::empty()),
     };
 
     let thread_id = current_thread_id();
     let time_base = event_time();
-    let path = if class == OperationClass::Open {
+    let path = if class == FileOperationClass::Open {
         // SAFETY: an open record holds 0 or the address of the caller's
         // object attributes, whose name is 0 or an ANSI_STRING.
         unsafe {
@@ -537,21 +494,6 @@ pub(crate) unsafe fn service_file_event_begin(record: u32) -> u32 {
     send(&format_file_event_begin(&event));
 
     0
-}
-
-/// Begin flags from file mode or create option bits.
-fn mode_flags(mode: CreateOptions) -> FileEventFlags {
-    let mut flags = FileEventFlags::empty();
-
-    if mode.contains(CreateOptions::SYNCHRONOUS_IO_NONALERT) {
-        flags |= FileEventFlags::SYNCHRONOUS;
-    }
-
-    if !mode.contains(CreateOptions::NO_INTERMEDIATE_BUFFERING) {
-        flags |= FileEventFlags::BUFFERED;
-    }
-
-    flags
 }
 
 /// Monitor control code 0x65 (stock 0x91f2f930): a file service finished;

@@ -13,6 +13,7 @@ use core::sync::atomic::Ordering;
 use core::time::Duration;
 
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::Server;
 use openxbdm_server::commands::debugger;
 use xbox360::console::hardware_flags;
@@ -21,6 +22,7 @@ use xbox360::time::sleep;
 use xbox360_sys::processor;
 use xbox360_sys::processor::current_thread;
 use xbox360_sys::xboxkrnl;
+use xbox360_sys::xboxkrnl::HalOpenCloseODDTray;
 use xbox360_sys::xboxkrnl::HardwareFlags;
 use xbox360_sys::xboxkrnl::Irql;
 use xbox360_sys::xboxkrnl::ProcessorMode;
@@ -75,6 +77,8 @@ static SERVER_THREAD: AtomicU32 = AtomicU32::new(0);
 static STOPPED: AtomicBool = AtomicBool::new(false);
 /// Threads inside `call_on_server`; unload waits for them to leave.
 static CALLERS: AtomicU32 = AtomicU32::new(0);
+/// The server thread waits for the thread of a dispatch flag 0x4 command.
+static POSTS_BLOCKED: AtomicBool = AtomicBool::new(false);
 
 static STARTUP_HOST: StartupHost = StartupHost {
     created: UnsafeCell::new(false),
@@ -183,6 +187,8 @@ impl ControlCode {
     /// Whether a debug break may stop the caller: at passive level, or
     /// with the kernel debugger enabled.
     pub(crate) const BREAK_ALLOWED: Self = Self(0x19);
+    /// Opens the optical drive tray.
+    pub(crate) const OPEN_TRAY: Self = Self(0x1a);
     pub(crate) const REGISTER_PIX_PROCESSOR: Self = Self(0x1c);
     pub(crate) const WRITE_SETTINGS_COPY: Self = Self(0x1d);
     pub(crate) const SET_SYSTEM_SETTINGS: Self = Self(0x1e);
@@ -441,6 +447,17 @@ fn call_on_server(service: ErasedService, argument: NonNull<()>) -> Option<u32> 
     result
 }
 
+/// Whether the calling thread is the server thread. The debugger backend
+/// records the server thread before startup work (settings, extension
+/// loads) that may call in; this module's copy is set only at the first
+/// pass.
+pub(crate) fn on_server_thread() -> bool {
+    let thread = current_thread();
+
+    thread == SERVER_THREAD.load(Ordering::Acquire)
+        || monitor::server_thread().is_some_and(|recorded| recorded.get() == thread)
+}
+
 fn call_on_server_counted(service: ErasedService, argument: NonNull<()>) -> Option<u32> {
     /// Longest wait of a caller for the startup lock, and its poll interval.
     const STARTUP_WAIT_MS: u32 = 5000;
@@ -448,13 +465,7 @@ fn call_on_server_counted(service: ErasedService, argument: NonNull<()>) -> Opti
     /// Interval at which a waiting caller checks whether the server stopped.
     const STOP_CHECK_INTERVAL: i64 = relative_interval(Duration::from_millis(100));
 
-    // The debugger backend records the server thread before startup work
-    // (settings, extension loads) that may call in; this module's copy is
-    // set only at the first pass.
-    let thread = current_thread();
-    let on_server_thread = thread == SERVER_THREAD.load(Ordering::Acquire)
-        || monitor::server_thread().is_some_and(|recorded| recorded.get() == thread);
-    if !passive() || on_server_thread || STOPPED.load(Ordering::Acquire) {
+    if !passive() || on_server_thread() || posts_blocked() || STOPPED.load(Ordering::Acquire) {
         return None;
     }
 
@@ -499,7 +510,7 @@ fn call_on_server_counted(service: ErasedService, argument: NonNull<()>) -> Opti
     }
 
     let request = loop {
-        if STOPPED.load(Ordering::Acquire) {
+        if STOPPED.load(Ordering::Acquire) || posts_blocked() {
             return None;
         }
 
@@ -531,8 +542,8 @@ fn call_on_server_counted(service: ErasedService, argument: NonNull<()>) -> Opti
             )
         };
 
-        let stopped = STOPPED.load(Ordering::Acquire);
-        if stopped
+        let refused = STOPPED.load(Ordering::Acquire) || posts_blocked();
+        if refused
             && request
                 .state
                 .transition(HandoffState::Posted, HandoffState::Free, Ordering::AcqRel)
@@ -550,6 +561,35 @@ fn call_on_server_counted(service: ErasedService, argument: NonNull<()>) -> Opti
 /// The server thread is about to exit; later requests fail.
 pub(crate) fn stop_serving() {
     STOPPED.store(true, Ordering::Release);
+}
+
+/// Whether [`stop_serving`] ran.
+pub(crate) fn stopped() -> bool {
+    STOPPED.load(Ordering::Acquire)
+}
+
+/// The server thread no longer takes posts until the guard drops: posts
+/// that would wait for it take their non-waiting path, and requests not
+/// taken yet fail. Stock's server thread runs a dispatch flag 0x4 command
+/// the same way, but stock's posters do not wait for it.
+pub(crate) fn block_posts() -> PostBlock {
+    POSTS_BLOCKED.store(true, Ordering::Release);
+
+    PostBlock(())
+}
+
+/// Whether [`block_posts`] is in effect.
+pub(crate) fn posts_blocked() -> bool {
+    POSTS_BLOCKED.load(Ordering::Acquire)
+}
+
+/// Guard of [`block_posts`].
+pub(crate) struct PostBlock(());
+
+impl Drop for PostBlock {
+    fn drop(&mut self) {
+        POSTS_BLOCKED.store(false, Ordering::Release);
+    }
 }
 
 /// Wait until no thread runs in `call_on_server`; call after
@@ -665,6 +705,11 @@ unsafe extern "C" fn dispatch_with_stack(code: u32, argument: u32, entry_stack: 
             let kernel_debugger = KERNEL_DEBUGGER.load(Ordering::Relaxed)
                 && hardware_flags().contains(HardwareFlags::KERNEL_DEBUGGER);
             u32::from(passive() || kernel_debugger)
+        }
+        C::OPEN_TRAY => {
+            // SAFETY: the request takes no pointers.
+            unsafe { HalOpenCloseODDTray(1) };
+            Hresult::OK.0
         }
         C::REGISTER_PIX_PROCESSOR => unsafe { session::service_register_pix_processor(argument) },
         C::WRITE_SETTINGS_COPY => unsafe { system::service_write_settings_copy(argument) },
@@ -809,7 +854,7 @@ pub(crate) fn drain(server: &mut Server, console: &mut Console, network: &mut Xa
     server.drain_posted_notifications(console, network);
     monitor::apply_pending_stop_on(&mut server.state);
     serve_requests(server, console, network);
-    super::dvd_hotplug::drain(server, console);
+    super::dvd_hotplug::drain(console);
 
     let state = &server.state.debugger;
     // Without a persisted setting the boot-time kernel debugger flag

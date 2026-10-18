@@ -17,7 +17,7 @@ monitor data block (`ExDebugMonitorService` 1, copied at startup by
 | Command | Wire | Host mock | Xbox backend |
 | --- | --- | --- | --- |
 | addtitlemem | matches | title module field 0x40801, console memory statistics | export 403 module, `RtlImageXexHeaderField` |
-| advmem | matches | flash bytes, read/write failure injection | `\Device\Flash` read; block read-modify-write (IOCTL 0x3c0028) |
+| advmem | matches; flash word 6 bit 0x100 makes the hypervisor drop the devkit's extra memory (512 MB instead of 1 GB) at the next boot | flash bytes, read/write failure injection | `\Device\Flash` read; block read-modify-write (IOCTL 0x3c0028) |
 | detour | matches; records, file, and completions host-tested | engine in the server crate; trampolines mapped at 0x91f13230; writer and completion worker run synchronously; `MockBackend::detour_call` simulates title calls | stubs and trampolines in `.text` (`backend/memory/detour.rs`), logger on title threads, writer and completion threads |
 | getmem | matches, including the stale-buffer quirk and breakpoint shadows | regions; device ranges fail reads | `MmIsAddressValid`, `MmDbgReadCheck` + device ranges |
 | getmemex | matches; breakpoint bytes restored from any table entry; missing texts `missing ADDR` and `missing LENGTH` | regions | `MmDbgReadCheck` per page, direct copy |
@@ -28,7 +28,7 @@ monitor data block (`ExDebugMonitorService` 1, copied at startup by
 | setmem | matches, writes under breakpoints update the saved instruction | regions | `MmDbgWriteCheck`, `KeSweepIcacheRange` |
 | traceimports | matches, including both DbgPrint lines | accepted names, request log | kernel export 719 |
 | walkmem | matches | regions incl. a device-range overlap | `MmIsAddressValid` page walk |
-| xbeinfo | matches; `ondiskonly` opens the file and leaves it open | executable object path | export 431 string, drive-table reverse mapping |
+| xbeinfo | matches; `ondiskonly` opens the file and leaves it open; reverse mapping takes the first drive row whose target is a prefix (0x91f2e750) | executable object path; first-match order, disabled rows, prefix without separator, untranslated path | export 431 string, drive-table reverse mapping |
 | xexfield | matches | inline and data fields | `RtlImageXexHeaderField` |
 
 Debug monitor control codes owned here (Xbox, `backend/memory.rs`): 0x08
@@ -65,10 +65,12 @@ Settings file: `memory::memtrack_settings_lines` writes
   thread at start.
 - Export 78 keeps up to 0x100 registered type names; stock stores them
   through an unallocated table and faults.
-- Exports 10, 16, 40, and 212 run their server part through the
-  dispatcher's server requests (breakpoint and drive tables, console
-  memory); on the server thread or above passive level they return
-  0x80004005.
+- Export 212 runs its server part through the dispatcher's server
+  requests (console memory); on the server thread, above passive level, or
+  while a dispatch flag 0x4 command runs it returns 0x80004005. Exports 10
+  and 40 run on the calling thread and take the breakpoint table lock for
+  each byte (stock 0x91f33730, 0x91f337f8), and export 16 translates the
+  drive path on the calling thread, as stock does.
 
 ## Detour engine
 

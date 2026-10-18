@@ -6,6 +6,7 @@ use std::io::Write;
 
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::KernelError;
+use openxbdm_core::status::NtStatus;
 use openxbdm_server::commands::console::ConfigSetting;
 use openxbdm_server::commands::hardware::AvatarError;
 use openxbdm_server::commands::hardware::AvatarHook;
@@ -18,11 +19,23 @@ use openxbdm_server::commands::hardware::XamError;
 use openxbdm_server::commands::hardware::automation::DebuggerMessage;
 use openxbdm_server::commands::hardware::automation::Gamepad;
 use openxbdm_server::commands::hardware::automation::Poll;
+use openxbdm_server::commands::hardware::odd::MountRequest;
+use openxbdm_server::commands::hardware::odd::ReadRequest;
+use openxbdm_server::commands::hardware::odd::SpeedChangeRequest;
+use openxbdm_server::commands::hardware::odd::SpindleSpeed;
+use openxbdm_server_host::backend::hardware::LogFile;
 use openxbdm_server_host::backend::hardware::PgoRecord;
 use openxbdm_server_host::backend::hardware::UsbPortRequest;
 
 use common::RawSession;
 use common::TestServer;
+
+const ODD_LOG_HEADER: &str = "# Optical Disc Log Created on Console\r\n\
+# Log Format Information:\r\n\
+# READ,<StartSector>,<SectorCount>,<RequestTime_100ns>,<CompleteTime_100ns>,<NTSTATUS>,;for each read operation\r\n\
+# GMNT,<RootDirStartSector>,<RootDirSize_bytes>,<Time_100ns>,;when GDFX filesystem is mounted\r\n\
+# SSC ,<CurrentSpeed>,<TargetSpeed>,<NTSTATUS>,<Time_100ns>,;for each spindle speed change\r\n\
+# DROP,<DropCount>,;indicates dropped log entries\r\n";
 
 fn session(server: &TestServer) -> RawSession {
     let mut session = server.raw();
@@ -86,6 +99,17 @@ fn pgo_record(address: u32) -> PgoRecord {
         snapshots: Vec::new(),
         resets: 0,
     }
+}
+
+fn log_files(server: &TestServer) -> Vec<LogFile> {
+    server
+        .host
+        .lock()
+        .backend
+        .hardware
+        .optical_drive
+        .files
+        .clone()
 }
 
 #[test]
@@ -228,6 +252,26 @@ fn autoinput_setpacket_presents_a_fixed_state() {
         .debugger_messages
         .len();
     assert_eq!(messages, 3);
+}
+
+#[test]
+fn autoinput_connection_status_follows_the_controller() {
+    let server = TestServer::start();
+    let mut session = session(&server);
+    let connected = |user| server.host.lock().backend.hardware.is_connected(user);
+    assert_eq!(connected(1), None);
+    assert_eq!(
+        session.command("autoinput user=1 bind queuelen=0"),
+        "200- OK"
+    );
+    assert_eq!(connected(1), Some(true));
+    assert_eq!(session.command("autoinput user=1 disconnect"), "200- OK");
+    assert_eq!(connected(1), Some(false));
+    assert_eq!(session.command("autoinput user=1 connect"), "200- OK");
+    assert_eq!(connected(1), Some(true));
+    assert_eq!(session.command("autoinput user=1 unbind"), "200- OK");
+    assert_eq!(connected(1), None);
+    assert_eq!(connected(4), None);
 }
 
 #[test]
@@ -656,7 +700,148 @@ fn oddlog_starts_and_stops_the_writer() {
         "200- Logging to 'devkit:\\OpticalDiscLog_1.txt'"
     );
     assert_eq!(session.command("oddlog stop"), "200- stopped logging");
-    assert_eq!(server.host.lock().backend.hardware.odd_log.files.len(), 2);
+
+    let files = log_files(&server);
+    let paths: Vec<&[u8]> = files.iter().map(|file| file.path.as_slice()).collect();
+    assert_eq!(
+        paths,
+        [
+            b"\\Device\\Harddisk0\\Partition1\\DEVKIT\\OpticalDiscLog_0.txt".as_slice(),
+            b"\\Device\\Harddisk0\\Partition1\\DEVKIT\\OpticalDiscLog_1.txt".as_slice(),
+        ]
+    );
+    for file in &files {
+        assert!(!file.open);
+        assert_eq!(file.content, ODD_LOG_HEADER.as_bytes());
+    }
+}
+
+#[test]
+fn oddlog_writes_drive_events_in_stock_record_layout() {
+    let server = TestServer::start();
+    let mut session = session(&server);
+    assert_eq!(
+        session.command("oddlog file=e:\\odd.txt"),
+        "200- Logging to 'e:\\odd.txt'"
+    );
+
+    {
+        let mut host = server.host.lock();
+        let hardware = &mut host.backend.hardware;
+        hardware.optical_drive.timebase = 0x32;
+        hardware.odd_read_start(ReadRequest {
+            sector: 0x1234,
+            count: 0x20,
+        });
+        hardware.optical_drive.timebase = 0x64;
+        hardware.odd_read_complete(NtStatus::SUCCESS);
+        // The latched start is kept, so a second completion repeats it.
+        hardware.optical_drive.timebase = 0x1_0000_0005;
+        hardware.odd_read_complete(NtStatus(0xc000_0185));
+        hardware.optical_drive.timebase = 0x96;
+        hardware.odd_mount(MountRequest {
+            root_sector: 0x30,
+            root_size: 0x1000,
+        });
+        hardware.odd_speed_change(SpeedChangeRequest {
+            current: SpindleSpeed(3),
+            target: SpindleSpeed(1),
+            status: NtStatus(0xc000_00b5),
+        });
+        hardware.odd_speed_change(SpeedChangeRequest {
+            current: SpindleSpeed(2),
+            target: SpindleSpeed(0),
+            status: NtStatus::SUCCESS,
+        });
+
+        let file = &hardware.optical_drive.files[0];
+        assert!(file.open);
+    }
+
+    assert_eq!(session.command("oddlog stop"), "200- stopped logging");
+
+    let files = log_files(&server);
+    assert_eq!(files.len(), 1);
+    assert!(!files[0].open);
+    assert_eq!(
+        String::from_utf8(files[0].content.clone()).unwrap(),
+        format!(
+            "{ODD_LOG_HEADER}\
+READ,0x00001234,0x00000020,0x000000000000000a,0x0000000000000014,0x00000000\r\n\
+READ,0x00001234,0x00000020,0x000000000000000a,0x0000000033333334,0xc0000185\r\n\
+GMNT,0x00000030,0x0000000000001000,0x000000000000001e\r\n\
+SSC ,8x,2.4x,0xC00000B5,0x000000000000001e\r\n\
+SSC ,5x,Unknown,0x00000000,0x000000000000001e\r\n"
+        )
+    );
+}
+
+#[test]
+fn oddlog_ignores_drive_events_while_not_logging() {
+    let server = TestServer::start();
+    let mut session = session(&server);
+    let read = ReadRequest {
+        sector: 0x10,
+        count: 1,
+    };
+    let mount = MountRequest {
+        root_sector: 0x20,
+        root_size: 0x800,
+    };
+
+    {
+        let mut host = server.host.lock();
+        let hardware = &mut host.backend.hardware;
+        hardware.optical_drive.timebase = 5;
+        hardware.odd_read_start(read);
+        hardware.odd_mount(mount);
+        assert!(hardware.optical_drive.files.is_empty());
+    }
+
+    // A start clears the latched read, so a completion without a read
+    // started in this log has no record.
+    assert_eq!(
+        session.command("oddlog file=e:\\first.txt"),
+        "200- Logging to 'e:\\first.txt'"
+    );
+    server
+        .host
+        .lock()
+        .backend
+        .hardware
+        .odd_read_complete(NtStatus::SUCCESS);
+    server.host.lock().backend.hardware.odd_read_start(read);
+    assert_eq!(session.command("oddlog stop"), "200- stopped logging");
+
+    {
+        let mut host = server.host.lock();
+        let hardware = &mut host.backend.hardware;
+        hardware.odd_read_complete(NtStatus::SUCCESS);
+        hardware.odd_mount(mount);
+        hardware.odd_speed_change(SpeedChangeRequest {
+            current: SpindleSpeed(1),
+            target: SpindleSpeed(2),
+            status: NtStatus::SUCCESS,
+        });
+    }
+
+    assert_eq!(
+        session.command("oddlog file=e:\\second.txt"),
+        "200- Logging to 'e:\\second.txt'"
+    );
+    server
+        .host
+        .lock()
+        .backend
+        .hardware
+        .odd_read_complete(NtStatus::SUCCESS);
+    assert_eq!(session.command("oddlog stop"), "200- stopped logging");
+
+    let files = log_files(&server);
+    assert_eq!(files.len(), 2);
+    for file in &files {
+        assert_eq!(file.content, ODD_LOG_HEADER.as_bytes());
+    }
 }
 
 #[test]
@@ -668,9 +853,41 @@ fn oddlog_file_failure_leaves_the_writer_stoppable() {
         "413- file cannot be created"
     );
     assert_eq!(session.command("oddlog stop"), "200- stopped logging");
-    server.host.lock().backend.hardware.odd_log.file_result = Err(KernelError::ObjectPathNotFound);
+    server
+        .host
+        .lock()
+        .backend
+        .hardware
+        .optical_drive
+        .file_result = Err(KernelError::ObjectPathNotFound);
     assert_eq!(session.command("oddlog"), "430- path not found");
     assert_eq!(session.command("oddlog stop"), "200- stopped logging");
+    assert!(log_files(&server).is_empty());
+}
+
+#[test]
+fn oddlog_warning_file_status_starts_without_a_file() {
+    let server = TestServer::start();
+    let mut session = session(&server);
+    server
+        .host
+        .lock()
+        .backend
+        .hardware
+        .optical_drive
+        .file_result = Err(KernelError::NoMoreFiles);
+    assert_eq!(
+        session.command("oddlog"),
+        "200- Logging to 'devkit:\\OpticalDiscLog_0.txt'"
+    );
+    assert_eq!(session.command("oddlog"), "425- ");
+    server.host.lock().backend.hardware.odd_mount(MountRequest {
+        root_sector: 0x20,
+        root_size: 0x800,
+    });
+    assert_eq!(session.command("oddlog stop"), "200- stopped logging");
+    assert_eq!(session.command("oddlog stop"), "424- ");
+    assert!(log_files(&server).is_empty());
 }
 
 #[test]

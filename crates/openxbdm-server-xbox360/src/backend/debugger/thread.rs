@@ -41,6 +41,9 @@ static SERVER_THREAD: AtomicU32 = AtomicU32::new(0);
 xbox360_sys::flags! {
     /// Flags of a monitor thread record.
     pub struct MonitorRecordFlags(u32) {
+        /// The thread overflowed its stack (stock 0x91f3abb0); its later
+        /// exceptions end unresolved (0x91f3a0d8).
+        STACK_OVERFLOW = 0x40,
         /// Set with [`Self::EXEMPT`] by the PIX capture pause, as stock sets
         /// it there. No monitor code tests it; its stock meaning is
         /// unknown.
@@ -93,6 +96,17 @@ impl MonitorRecord {
     #[inline(always)]
     pub(super) fn is_monitor_suspended(&self) -> bool {
         self.monitor_suspended.load(Ordering::Relaxed) != 0
+    }
+
+    #[inline(always)]
+    pub(super) fn has_overflowed(&self) -> bool {
+        self.flags().contains(MonitorRecordFlags::STACK_OVERFLOW)
+    }
+
+    /// Stock stores the flag without a lock, as here.
+    #[inline(always)]
+    pub(super) fn mark_stack_overflow(&self) {
+        self.set_flags(self.flags() | MonitorRecordFlags::STACK_OVERFLOW);
     }
 
     #[inline(always)]

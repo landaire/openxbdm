@@ -91,7 +91,7 @@ impl Server {
                     && invocation.backend.is_test_kit())
             {
                 // Settings lines send no reply.
-                let _ = (entry.handler)(&mut invocation);
+                let _ = call_handler(entry, &mut invocation);
             }
         }
 
@@ -247,7 +247,7 @@ impl Server {
                         network,
                     };
 
-                    (entry.handler)(&mut invocation)
+                    call_handler(entry, &mut invocation)
                 }
             }
         };
@@ -492,5 +492,43 @@ fn processor_result(
         Ok(Reply::Sent)
     } else {
         reply::from_processor(result)
+    }
+}
+
+/// Call the handler of `entry`. A handler with dispatch flag 0x4 runs on a
+/// thread of its own (stock 0x91f421c8). Stock zeroes the result slot
+/// before it creates the thread, so a thread that ends without returning
+/// from the handler gives result 0, which sends no status line.
+fn call_handler(entry: &registry::CommandEntry, invocation: &mut Invocation<'_>) -> CommandResult {
+    if !entry.flags().contains(DispatchFlags::OWN_THREAD) {
+        return (entry.handler)(invocation);
+    }
+
+    let Invocation {
+        line,
+        buffer,
+        text,
+        session,
+        state,
+        backend,
+        network,
+    } = invocation;
+    let mut result = None;
+    let ran = backend.run_command_thread(&mut |backend| {
+        let mut invocation = Invocation {
+            line: *line,
+            buffer,
+            text,
+            session: session.as_deref_mut(),
+            state,
+            backend,
+            network: &mut **network,
+        };
+        result = Some((entry.handler)(&mut invocation));
+    });
+
+    match ran {
+        Ok(()) => result.unwrap_or(Ok(Reply::Sent)),
+        Err(status) => Err(CommandError::CommandThread(status)),
     }
 }

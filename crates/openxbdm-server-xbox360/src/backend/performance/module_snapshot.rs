@@ -7,7 +7,6 @@ use core::mem::size_of;
 use core::ptr::NonNull;
 use core::sync::atomic::Ordering;
 
-use openxbdm_server::Server;
 use openxbdm_server::commands::memory::PAGE_SIZE;
 use openxbdm_server::commands::performance::capture;
 use openxbdm_server::commands::performance::capture::MAX_PROCESSORS;
@@ -23,14 +22,12 @@ use xbox360_sys::xboxkrnl::MemoryRegion;
 use xbox360_sys::xboxkrnl::PageProtection;
 use xbox360_sys::xboxkrnl::RtlImageDirectoryEntryToData;
 
-use crate::backend::Console;
 use crate::backend::console;
-use crate::backend::dispatcher;
+use crate::backend::filesystem;
 use crate::exports::export;
 use crate::kernel;
 use crate::kernel::LoaderLock;
 use crate::kernel::ModuleList;
-use crate::net::XamNetwork;
 
 /// Bytes of the block.
 pub(crate) const SIZE: u32 = 0xc000;
@@ -171,13 +168,6 @@ impl ExecutableObjectPath {
     pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.bytes[..self.length]
     }
-}
-
-/// Request of [`drive_path_on_server`].
-struct DrivePath<'a> {
-    object: &'a [u8],
-    output: &'a mut [u8],
-    length: usize,
 }
 
 fn contains(lock: &LoaderLock, list: ModuleList, base: u32) -> bool {
@@ -387,42 +377,10 @@ pub(crate) fn copy_executable_object_path(output: &mut [u8]) -> usize {
     unsafe { ExLoadedImageName.get_unchecked() }.copy_to(output)
 }
 
-fn drive_path_on_server(
-    server: &mut Server,
-    console: &mut Console,
-    _network: &mut XamNetwork,
-    request: &mut DrivePath<'_>,
-) -> u32 {
-    request.length = server.state.filesystem.drives.object_path_to_drive_path(
-        console,
-        request.object,
-        request.output,
-    );
-
-    0
-}
-
-/// Drive path of the running executable from a thread other than the
-/// server's. Off the server, where the drive table cannot be read, the
-/// object path is kept, which is what the conversion yields for a path
-/// outside every drive.
+/// Drive path of the running executable, translated on the caller's
+/// thread (stock 0x91f33c38).
 pub(crate) fn executable_drive_path(output: &mut [u8; PATH_LIMIT + 2]) -> usize {
-    let object = ExecutableObjectPath::read();
-    let mut request = DrivePath {
-        object: object.as_bytes(),
-        output,
-        length: 0,
-    };
-
-    if dispatcher::call_on_server_with(&mut request, drive_path_on_server).is_some() {
-        return request.length;
-    }
-
-    let object = object.as_bytes();
-    let length = object.len().min(PATH_LIMIT + 1);
-    request.output[..length].copy_from_slice(&object[..length]);
-
-    length
+    filesystem::drive_path(ExecutableObjectPath::read().as_bytes(), output)
 }
 
 /// Export 131: a snapshot block, or null when it cannot be allocated.

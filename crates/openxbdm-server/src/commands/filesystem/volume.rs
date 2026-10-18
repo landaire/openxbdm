@@ -241,6 +241,7 @@ pub(super) fn drive_list_line(
                 if let Some(entry) = cx.state.filesystem.drives.entries[row].as_mut() {
                     entry.enabled = false;
                 }
+                super::publish_drives(cx.state, cx.backend);
             }
             // Other drives that fail to open are skipped.
             Err(_) => {}

@@ -13,12 +13,46 @@ use crate::reply::CommandError;
 use crate::reply::CommandResult;
 use crate::reply::Reply;
 
-/// A `flash` image being received.
+/// A `flash` image being received into its own buffer, so concurrent
+/// uploads on several connections stay separate as in stock (connection
+/// context +8).
 #[derive(Debug, Clone, Copy)]
 pub struct FlashUpload {
+    buffer: FlashBuffer,
     /// Bytes received so far.
     received: u32,
     options: FlashOptions,
+}
+
+/// Image buffer of a `flash` upload, from [`Backend::flash_begin`] until it
+/// is passed to [`Backend::flash_commit`] or [`Backend::flash_abort`]. Only
+/// the backend makes one.
+///
+/// [`Backend::flash_begin`]: super::Backend::flash_begin
+/// [`Backend::flash_commit`]: super::Backend::flash_commit
+/// [`Backend::flash_abort`]: super::Backend::flash_abort
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlashBuffer {
+    address: u32,
+    size: u32,
+}
+
+impl FlashBuffer {
+    /// # Safety
+    ///
+    /// `address` names a block of `size` bytes that the backend's flash
+    /// calls accept, which stays allocated until it is released.
+    pub const unsafe fn from_raw(address: u32, size: u32) -> Self {
+        Self { address, size }
+    }
+
+    pub const fn address(self) -> u32 {
+        self.address
+    }
+
+    pub const fn size(self) -> u32 {
+        self.size
+    }
 }
 
 /// Options of a flash write.
@@ -96,10 +130,10 @@ pub(super) fn flash(invocation: &mut Invocation<'_>) -> CommandResult {
     };
 
     let rounded = size.wrapping_add(FLASH_BLOCK - 1) & !(FLASH_BLOCK - 1);
-    if !invocation.backend.flash_begin(rounded) {
+    let Some(buffer) = invocation.backend.flash_begin(rounded) else {
         invocation.set_text(format_args!("Not enough memory"));
         return Err(ErrorCode::Undefined.into());
-    }
+    };
 
     invocation.text.clear();
     let _ = invocation.text.push_bytes(b"send=");
@@ -109,6 +143,7 @@ pub(super) fn flash(invocation: &mut Invocation<'_>) -> CommandResult {
         session.receive_remaining = Some(size);
         session.continuation =
             crate::continuation::Continuation::System(Continuation::Flash(FlashUpload {
+                buffer,
                 received: 0,
                 options,
             }));
@@ -122,11 +157,15 @@ pub(super) fn resume_flash(
     cx: &mut ContinuationContext<'_>,
 ) -> CommandResult {
     if cx.received.is_empty() {
-        cx.backend.flash_abort();
+        // SAFETY: the connection closed or the upload is complete, so the
+        // server drops the continuation, the only other holder, after this
+        // result.
+        unsafe { cx.backend.flash_abort(upload.buffer) };
         return Err(CommandError::Unexpected);
     }
 
-    cx.backend.flash_write(upload.received, cx.received);
+    cx.backend
+        .flash_write(upload.buffer, upload.received, cx.received);
     let count = cx.received.len() as u32;
     upload.received += count;
 
@@ -140,7 +179,12 @@ pub(super) fn resume_flash(
         return Ok(Reply::Ok);
     }
 
-    match cx.backend.flash_commit(upload.received, upload.options) {
+    // SAFETY: `receive_remaining` is 0, so the server drops the continuation,
+    // the only other holder, after this result.
+    match unsafe {
+        cx.backend
+            .flash_commit(upload.buffer, upload.received, upload.options)
+    } {
         Ok(()) => {
             let _ = cx.line.write_str("Done, new image flashed");
             Ok(Reply::Ok)

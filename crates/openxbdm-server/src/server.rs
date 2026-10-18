@@ -214,7 +214,6 @@ impl Server {
             .and_then(Option::take)
         {
             let socket = connection.session.socket;
-            crate::commands::debugger::connection_closed(&mut self.state, socket);
 
             // SAFETY: the connection, with its continuation, was taken out
             // of its slot above and is dropped here.
@@ -235,12 +234,19 @@ impl Server {
         crate::commands::debugger::process_events(&mut self.state, backend, network);
     }
 
-    /// Periodic work: end the wait for reverse persistent notification
-    /// targets and drive the lab server registration. The platform calls
-    /// this on every pass of its loop and at least once per second; the
-    /// result is the milliseconds until a timer needs it again.
+    /// Periodic work: discard notification channel input every 120 seconds,
+    /// end the wait for reverse persistent notification targets and drive
+    /// the lab server registration. The platform calls this on every pass
+    /// of its loop and at least once per second; the result is the
+    /// milliseconds until a timer needs it again.
     #[inline(never)]
-    pub fn poll_timers(&mut self, backend: &mut dyn Backend) -> Option<u32> {
+    pub fn poll_timers(
+        &mut self,
+        backend: &mut dyn Backend,
+        network: &mut dyn Network,
+    ) -> Option<u32> {
+        let now = crate::commands::console::Backend::tick_milliseconds(backend);
+        self.state.notifications.drain_input(now, network);
         crate::commands::session::expire_reverse_targets(&mut self.state, backend);
         let registration = crate::commands::console::poll_registration(&mut self.state, backend);
         self.save_settings_if_dirty(backend);

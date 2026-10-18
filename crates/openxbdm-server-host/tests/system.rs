@@ -609,6 +609,34 @@ fn flash_with_a_wrapped_size_releases_the_connection() {
 }
 
 #[test]
+fn concurrent_flash_uploads_program_their_own_images() {
+    let server = TestServer::start();
+    let mut first = server.raw();
+    first.line();
+    let mut second = server.raw();
+    second.line();
+
+    assert_eq!(first.command("flash size_t=0x4000"), "204- send=t");
+    first.stream.write_all(&[0x11; 0x2000]).unwrap();
+    assert_eq!(
+        second.command("flash size_t=0x4000 stockimage"),
+        "204- send=t"
+    );
+    second.stream.write_all(&[0x22; 0x4000]).unwrap();
+    assert_eq!(second.line(), "200- Done, new image flashed");
+    first.stream.write_all(&[0x11; 0x2000]).unwrap();
+    assert_eq!(first.line(), "200- Done, new image flashed");
+
+    let host = server.host.lock();
+    let writes = &host.backend.system.flash_writes;
+    assert_eq!(writes.len(), 2);
+    assert!(writes[0].options.stock_image);
+    assert!(writes[0].image.iter().all(|&byte| byte == 0x22));
+    assert!(!writes[1].options.stock_image);
+    assert!(writes[1].image.iter().all(|&byte| byte == 0x11));
+}
+
+#[test]
 fn settings_copies_append_sysset_and_recovery() {
     let server = TestServer::start();
     let mut session = server.raw();

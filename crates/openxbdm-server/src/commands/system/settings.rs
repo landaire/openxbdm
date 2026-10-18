@@ -350,6 +350,8 @@ pub fn load_settings(server: &mut Server, backend: &mut dyn AnyBackend, network:
         commands::console::check_settings_block(&mut server.state, backend);
     }
 
+    commands::filesystem::publish_drives(&server.state, backend);
+
     commands::session::connect_persistent_targets(&mut server.state, backend, network);
 
     let system = &mut server.state.system;

@@ -1,5 +1,7 @@
 //! System control commands: time, reboot, titles, flash, and the settings
 //! file.
+// The `flash` image buffer of `Backend` is released by unsafe methods.
+#![allow(unsafe_code)]
 
 mod default_title;
 mod error;
@@ -41,6 +43,7 @@ use crate::server::Server;
 
 pub use self::error::CreateSettingsError;
 pub use self::error::FlashFailed;
+pub use self::flash::FlashBuffer;
 pub use self::flash::FlashOptions;
 pub use self::flash::FlashUpload;
 pub use self::settings::SettingsCopy;
@@ -239,15 +242,28 @@ pub trait Backend {
     fn title_launch_registered(&mut self) -> bool;
     /// Call the registered title launch routine.
     fn launch_title(&mut self);
-    /// Allocate the buffer of a `flash` image; false when out of memory.
-    fn flash_begin(&mut self, rounded_size: u32) -> bool;
-    /// Store received image bytes at `offset`.
-    fn flash_write(&mut self, offset: u32, bytes: &[u8]);
-    /// Zero the buffer from `length` to its end, program the flash with the
+    /// Allocate the buffer of a `flash` image; None when out of memory.
+    fn flash_begin(&mut self, rounded_size: u32) -> Option<FlashBuffer>;
+    /// Store received image bytes at `offset` of `buffer`.
+    fn flash_write(&mut self, buffer: FlashBuffer, offset: u32, bytes: &[u8]);
+    /// Zero `buffer` from `length` to its end, program the flash with the
     /// whole buffer, and release it.
-    fn flash_commit(&mut self, length: u32, options: FlashOptions) -> Result<(), Win32Error>;
-    /// Release the image buffer without programming.
-    fn flash_abort(&mut self);
+    ///
+    /// # Safety
+    ///
+    /// No copy of `buffer` is used afterwards.
+    unsafe fn flash_commit(
+        &mut self,
+        buffer: FlashBuffer,
+        length: u32,
+        options: FlashOptions,
+    ) -> Result<(), Win32Error>;
+    /// Release `buffer` without programming.
+    ///
+    /// # Safety
+    ///
+    /// No copy of `buffer` is used afterwards.
+    unsafe fn flash_abort(&mut self, buffer: FlashBuffer);
 }
 
 const fn entry(

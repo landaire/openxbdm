@@ -1,11 +1,13 @@
 //! Simulated console identity and configuration.
 
+mod feature;
 mod http;
 
 use std::collections::BTreeMap;
 use std::time::Instant;
 
 use openxbdm_core::status::KernelError;
+use openxbdm_server::Platform;
 use openxbdm_server::commands::console;
 use openxbdm_server::commands::console::ConfigSetting;
 use openxbdm_server::commands::console::ConsoleId;
@@ -24,10 +26,12 @@ use openxbdm_server::commands::console::SETTINGS_BLOCK_SIZE;
 use openxbdm_server::commands::console::SystemInformation;
 use openxbdm_server::commands::console::SystemSettings;
 use openxbdm_server::commands::console::Version;
+use openxbdm_server::commands::filesystem::DriveTable;
 use xbox360_sys::xboxkrnl::HardwareFlags;
 
 use super::MockBackend;
 
+pub use self::feature::XamFeatures;
 pub use self::http::HttpClient;
 
 /// Kernel address of the simulated server thread object.
@@ -53,8 +57,9 @@ pub struct Mock {
     /// Times the inactivity configuration was applied.
     pub inactivity_updates: u32,
     pub network_ra: NetworkRaService,
-    /// Calls of the system UI feature switch; `None` when the export is absent.
-    pub feature_calls: Option<Vec<(u32, u32)>>,
+    /// XAM state of the feature switch (ordinal 515); `None` when the
+    /// export is absent.
+    pub xam_features: Option<XamFeatures>,
     /// Failure of loading the network file system client; `None` loads it.
     pub network_client_failure: Option<KernelError>,
 
@@ -119,7 +124,7 @@ impl Default for Mock {
             },
             inactivity_updates: 0,
             network_ra: NetworkRaService::default(),
-            feature_calls: Some(Vec::new()),
+            xam_features: Some(XamFeatures::default()),
             network_client_failure: None,
             system_version: 0x2045_5400,
             boot: Instant::now(),
@@ -202,6 +207,8 @@ pub struct PublishedState {
     pub trace_mask: u32,
     /// Export 194 view of the lab server registration.
     pub registration: console::RegistrationResult,
+    /// Drive table of the monitor exports.
+    pub drives: DriveTable,
 }
 
 impl Default for PublishedState {
@@ -216,6 +223,7 @@ impl Default for PublishedState {
             event_defer: state.event_defer.bits(),
             trace_mask: state.trace_mask.bits(),
             registration: console::RegistrationResult::EMPTY,
+            drives: DriveTable::new(),
         }
     }
 }
@@ -330,12 +338,25 @@ impl console::Backend for MockBackend {
     }
 
     fn feature_switch_present(&mut self) -> bool {
-        self.console.feature_calls.is_some()
+        self.console.xam_features.is_some()
     }
 
     fn set_feature(&mut self, enable: u32, feature: u32) {
-        if let Some(calls) = &mut self.console.feature_calls {
-            calls.push((enable, feature));
+        let Some(features) = self.console.xam_features else {
+            return;
+        };
+
+        let mut texts = Vec::new();
+        // The command ignores the result.
+        feature::switch(
+            &features,
+            &mut self.console.xconfig,
+            enable,
+            feature,
+            &mut |text| texts.push(text),
+        );
+        for text in texts {
+            self.debug_print(text.as_bytes());
         }
     }
 
@@ -376,6 +397,7 @@ impl console::Backend for MockBackend {
             }
             Published::EventDefer(mask) => published.event_defer = mask.bits(),
             Published::TraceMask(mask) => published.trace_mask = mask.bits(),
+            Published::Drives(drives) => published.drives.clone_from(drives),
             Published::Registration(registration) => {
                 published.registration = console::RegistrationResult::new(registration, body)
             }

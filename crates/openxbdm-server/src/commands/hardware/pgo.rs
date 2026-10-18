@@ -3,23 +3,22 @@
 //! runtime's text conversions, and `pogo.ini` handling. The Xbox backend
 //! applies the results to the instrumented modules; see
 //! `docs/re-notes/pgo.md`.
-// Pool blocks are freed through the unsafe `Backend::free_pool`.
-#![allow(unsafe_code)]
 
 mod error;
 
+use openxbdm_core::status::KernelError;
 use xbox360_sys::xboxkrnl::AccessMask;
 use xbox360_sys::xboxkrnl::CreateDisposition;
 use xbox360_sys::xboxkrnl::CreateOptions;
 use xbox360_sys::xboxkrnl::FileAttributes;
 use xbox360_sys::xboxkrnl::ShareAccess;
 
-use crate::backend::Backend as AnyBackend;
-use crate::commands::filesystem;
 use crate::commands::filesystem::CreateRequest;
-use crate::commands::filesystem::PoolRange;
+use crate::commands::filesystem::DriveTable;
+use crate::commands::filesystem::FileHandle;
+use crate::commands::filesystem::PathServices;
+use crate::commands::filesystem::ScratchBlock;
 use crate::commands::memory::PAGE_SIZE;
-use crate::state::ServerState;
 
 pub use self::error::BadModulePath;
 pub use self::error::BufferTooSmall;
@@ -1095,15 +1094,29 @@ pub fn ini_line<'a>(
     }
 }
 
+/// Services export 107 reads `pogo.ini` with on the caller's thread.
+pub trait IniFiles: PathServices {
+    fn create_file(
+        &mut self,
+        path: &[u8],
+        request: &CreateRequest,
+    ) -> Result<FileHandle, KernelError>;
+    /// Read at the current position into `buffer`; returns the bytes read.
+    fn read_file(&mut self, handle: FileHandle, buffer: &mut [u8]) -> Result<u32, KernelError>;
+    fn close_file(&mut self, handle: FileHandle);
+    fn allocate_scratch(&mut self, size: u32) -> Option<ScratchBlock>;
+    fn free_scratch(&mut self, block: ScratchBlock);
+}
+
 /// Load `pogo.ini` for a module (export 107, 0x91f3e038): from the
 /// directory of `module_path` (an object path) as a drive path, else
 /// `xe:\pogo.ini`, passing each setting of the module's section to
 /// `apply`. The stop-on-`pogomodstart` event is the caller's.
 pub fn load_ini(
-    state: &ServerState,
-    backend: &mut dyn AnyBackend,
+    drives: &DriveTable,
+    files: &mut dyn IniFiles,
     module_path: &[u8],
-    apply: &mut dyn FnMut(&ServerState, &mut dyn AnyBackend, IniDirective<'_>),
+    apply: &mut dyn FnMut(IniDirective<'_>),
 ) -> Result<(), BadModulePath> {
     /// Bytes of the `pogo.ini` read buffer.
     const INI_BUFFER_SIZE: usize = 0x1000;
@@ -1120,11 +1133,7 @@ pub fn load_ini(
     }
 
     let mut drive_path = [0u8; INI_PATH_CAPACITY];
-    let drive_length =
-        state
-            .filesystem
-            .drives
-            .object_path_to_drive_path(backend, module_path, &mut drive_path);
+    let drive_length = drives.object_path_to_drive_path(files, module_path, &mut drive_path);
     let drive_path = &drive_path[..drive_length];
     let Some(separator) = drive_path.iter().rposition(|&byte| byte == b'\\') else {
         return Err(BadModulePath);
@@ -1138,6 +1147,79 @@ pub fn load_ini(
     ini_path[separator + 1..separator + 9].copy_from_slice(b"pogo.ini");
     let ini_path = &ini_path[..separator + 9];
 
+    let Some(handle) = open_ini(drives, files, ini_path)
+        .or_else(|_| open_ini(drives, files, b"xe:\\pogo.ini"))
+        .ok()
+    else {
+        return Ok(());
+    };
+
+    if let Some(mut block) = files.allocate_scratch(INI_BUFFER_SIZE as u32) {
+        let buffer = &mut block[..INI_BUFFER_SIZE];
+        let mut in_section = false;
+        let mut run = |files: &mut dyn IniFiles, line: &[u8]| {
+            let Some(directive) = ini_line(line, &mut in_section, module_path, drive_path) else {
+                return;
+            };
+
+            match directive {
+                IniDirective::OutputPath(value) => match drives.translate(files, value) {
+                    Some(object) => apply(IniDirective::OutputPath(object.as_bytes())),
+                    None => apply(directive),
+                },
+                directive => apply(directive),
+            }
+        };
+
+        // Lines end at `\n` or `\r`; stock writes a terminator over the end
+        // in place.
+        let mut count = 0usize;
+        loop {
+            if count != 0 {
+                let mut start = 0;
+                for position in 0..count {
+                    if matches!(buffer[position], b'\n' | b'\r') {
+                        run(files, &buffer[start..position]);
+                        start = position + 1;
+                    }
+                }
+
+                // The byte past the data is taken as nonzero.
+                if start < count && buffer[start] == 0 {
+                    break;
+                }
+
+                if start != 0 {
+                    buffer.copy_within(start..count, 0);
+                    count -= start;
+                } else {
+                    run(files, &buffer[..count - 1]);
+                    count = 0;
+                }
+            }
+
+            if let Ok(read) = files.read_file(handle, &mut buffer[count..]) {
+                count += read as usize;
+            }
+            if count == 0 {
+                break;
+            }
+        }
+
+        files.free_scratch(block);
+    }
+
+    files.close_file(handle);
+
+    Ok(())
+}
+
+/// Open `pogo.ini` at drive path `path` for reading (0x91f2eb68).
+fn open_ini(
+    drives: &DriveTable,
+    files: &mut dyn IniFiles,
+    path: &[u8],
+) -> Result<FileHandle, KernelError> {
     let request = CreateRequest {
         access: AccessMask::GENERIC_READ.union(AccessMask::SYNCHRONIZE),
         allocation_size: None,
@@ -1146,87 +1228,11 @@ pub fn load_ini(
         disposition: CreateDisposition::Open,
         options: CreateOptions::SYNCHRONOUS_IO_NONALERT,
     };
-    let handle = match filesystem::open_translated(state, backend, ini_path, &request) {
-        Ok(handle) => Some(handle),
-        Err(_) => filesystem::open_translated(state, backend, b"xe:\\pogo.ini", &request).ok(),
-    };
-    let Some(handle) = handle else {
-        return Ok(());
-    };
+    let object = drives
+        .translate(files, path)
+        .ok_or(KernelError::NoSuchFile)?;
 
-    if let Some(buffer) = backend.allocate_pool(INI_BUFFER_SIZE as u32) {
-        let mut in_section = false;
-        let mut line = [0u8; INI_BUFFER_SIZE];
-        let mut run = |state: &ServerState, backend: &mut dyn AnyBackend, bytes: &[u8]| {
-            let Some(directive) = ini_line(bytes, &mut in_section, module_path, drive_path) else {
-                return;
-            };
-
-            match directive {
-                IniDirective::OutputPath(value) => {
-                    match state.filesystem.drives.translate(backend, value) {
-                        Some(object) => {
-                            apply(state, backend, IniDirective::OutputPath(object.as_bytes()))
-                        }
-                        None => apply(state, backend, directive),
-                    }
-                }
-                directive => apply(state, backend, directive),
-            }
-        };
-
-        let mut count = 0usize;
-        loop {
-            if count != 0 {
-                let mut start = 0;
-                let mut position = 0;
-                while position < count {
-                    if matches!(backend.pool(buffer)[position], b'\n' | b'\r') {
-                        let length = position - start;
-                        line[..length].copy_from_slice(&backend.pool(buffer)[start..position]);
-                        run(state, backend, &line[..length]);
-                        start = position + 1;
-                    }
-                    position += 1;
-                }
-
-                // The byte past the data is taken as nonzero.
-                if start < count && backend.pool(buffer)[start] == 0 {
-                    break;
-                }
-
-                if start != 0 {
-                    backend.pool(buffer).copy_within(start..count, 0);
-                    count -= start;
-                } else {
-                    let length = count - 1;
-                    line[..length].copy_from_slice(&backend.pool(buffer)[..length]);
-                    run(state, backend, &line[..length]);
-                    count = 0;
-                }
-            }
-
-            let target = PoolRange {
-                buffer,
-                offset: count as u32,
-                length: (INI_BUFFER_SIZE - count) as u32,
-            };
-            if let Ok(read) = backend.read_file(handle, None, filesystem::ReadTarget::Pool(target))
-            {
-                count += read as usize;
-            }
-            if count == 0 {
-                break;
-            }
-        }
-
-        // SAFETY: the block is local to this command and not used after.
-        unsafe { backend.free_pool(buffer) };
-    }
-
-    backend.close_file(handle);
-
-    Ok(())
+    files.create_file(object.as_bytes(), &request)
 }
 
 /// Trailing byte count of a UTF-8 lead byte (0x91f99508).

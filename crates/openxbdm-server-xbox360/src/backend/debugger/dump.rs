@@ -13,15 +13,22 @@ use super::context::ContextStorage;
 use crate::kernel;
 use crate::kernel::address_of;
 
-/// `DumpWriteDump` dump kinds.
+/// `DumpWriteDump` flags (K16547 0x801af818). Without
+/// [`DumpKind::Return`] the kernel restarts the console after writing
+/// (`HalReturnToFirmware(2)`, 0x801afad8); the call returns only when a dump
+/// was already written or is in progress (0x116) or the dump disk cannot be
+/// opened (its status).
 #[repr(u32)]
 #[derive(Clone, Copy)]
 pub(crate) enum DumpKind {
     Default = 0,
     /// The kind stock passes for an exception once the kernel's bug check
-    /// flag ([`DebugMonitorFlags::BUG_CHECK`]) is set.
+    /// flag ([`DebugMonitorFlags::BUG_CHECK`]) is set: the dump header
+    /// records `KiBugCheckData` (K15574 0x801ad748).
     BugCheck = 1,
-    Full = 2,
+    /// Return to the caller after writing instead of restarting
+    /// (0x801afa88).
+    Return = 2,
 }
 
 /// Mark the data block as writing a crash dump, as stock does before each

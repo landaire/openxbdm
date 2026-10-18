@@ -18,9 +18,9 @@ this group.
      `414- access denied`. Privilege bits (from 0x91f40878): 0x1 read,
      0x2 write, 0x4 control, 0x8 config, 0x10 manage. The connection privilege
      mask is connection slot +0xc (set by `authuser`).
-  3. Extra bit 0x4: the handler runs on a newly created system thread
-     (ExCreateThread flags 0x20); the dispatcher waits for it and uses its
-     return value.
+  3. Extra bit 0x4: the handler runs on a newly created title-process thread
+     (ExCreateThread flags 0x20, priority class 13, no SYSTEM_PROCESS); the
+     dispatcher waits for it and uses its return value (`framework.md`).
   4. Otherwise, if a server thread is registered (0x91fab984) and the current
      thread is not it, the command is rejected with
      `422- dedicated connection required` unless extra bit 0x1 is set.
@@ -162,7 +162,31 @@ this group.
     `400- improper command`.
 - Backend requirement: read and write a 16-bit flag word at byte offset 6 of
   the console's raw flash.
-- Status: partial: the platform meaning of flash word 6 bit 0x100 is unknown.
+- Meaning of flash word 6 bit 0x100: it withholds the development kit's
+  additional memory, so the console runs with 512 MB instead of 1 GB from
+  the next boot. `advmem on` (bit clear) gives 1 GB. Evidence from the
+  devkit hypervisor image (HV 2.0.16547, `deanxbox-hv-16547.bin`,
+  addresses are image offsets):
+  - Startup routine 0x1cd8 (first call of the initialization sequence
+    0x3040) copies the first 0x10 bytes of the flash header from
+    0x80000200_c8000000 (0x68c) to the stack. When the boot flag halfword
+    at hypervisor header +6 has bit 0x80, it sets bit 0x1 of the
+    hypervisor word at r2 + 0x10000 + 0x69c8. When flash header +6 has bit
+    0x100 (0x1d2c), it clears bit 0x80 of the boot flags (0x1d3c..0x1d48).
+    The physical memory size word (r2 + 0x10000 + 0x69e0) becomes
+    0x40000000 when bit 0x80 remains and 0x20000000 otherwise (0x1d4c..0x1d68).
+    The hypervisor checks physical addresses against that word (for
+    example 0x2838).
+  - The kernel entry hands the boot flags over in r3 (`lhz r3, 6(0)`,
+    0x1b6c; r4 = the hypervisor magic 0x5e4e). KiInitializeKernel stores
+    them at XboxHardwareInfo +0xe (K15574 0x801a5cdc).
+    MmInitializeSystemPhase0 (K15574 0x800ae5b0, K16547 0x800ae908) copies
+    bit 0x80 to MmDevkitMemoryPresent and sets MmHighestPhysicalPage to
+    0x3ffff (1 GB of 4 KB pages) when it is set, else 0x1ffff (512 MB).
+  - No other test of the flash bit was found in the hypervisor, the
+    kernels, xam or xbdm. The devkit's running boot flags are 0x009e: bit
+    0x80 is set, so it currently runs with `advmem` enabled.
+- Status: spec complete.
 
 ## altaddr
 - Handler: 0x91f49a08. Access: 0x4. Extra: 0x0.
@@ -389,7 +413,14 @@ this group.
   console configuration.
 - Both paths are exports 175 and 176 (0x91f24820, 0x91f248b0); the flag
   check is inside them.
-- Status: partial: meaning of hardware-info flag 0x10 is unknown.
+- Hardware-info flag 0x10 marks development hardware. K16547 0x80168de8
+  (K15574 OmniUsbDetectTopologyProblems 0x80165ed8) tests it before it
+  accepts an internal wireless network adapter: with the bit set the
+  adapter is allowed (trace text `[omni]: Allowing internal adapter
+  (DEVKIT).`, K16547 0x80060244); with it clear the adapter is refused
+  with 0xc0051012 (`[omni]: Ignoring internal adapter`). The devkit runs
+  with hardware flags 0x400102b7, which has the bit set.
+- Status: spec complete.
 
 ## autoshutoff
 - Handler: 0x91f4f540. Access: 0x4. Extra: 0x2 (absent on test kits).
@@ -489,7 +520,11 @@ this group.
      (`size` not required with `clear`).
 - Behavior:
   - `now`: sleep 250 ms (KeDelayExecutionThread), execute a debug trap
-    (trap code 0x16), then `200- OK`.
+    (trap code 0x16, 0x91f48a6c), then `200- OK` without testing the other
+    keys (0x91f48a74). The command thread's record is not debuggable
+    (0x91f50cf0 clears 0x2000), so the debug routine cannot stop it: the
+    trap ends unresolved (crash dump unless disabled or the kernel debugger
+    flag is set, then the `kd lite` chain, else r3 = 0 and Iar + 4).
   - `start`: if the execution state (0x91fae664) is 3 (`pending`) or 5
     (`pending_title`), set bit 0x2 in 0x91fade6c (break at title entry) and
     reply `200- OK`. Else text `execution not pending`, 0x80004005,
@@ -498,10 +533,11 @@ this group.
   - `clearall`: remove every software breakpoint and the data breakpoint,
     reprogram all processors (KeIpiGenericCall). `200- OK`.
   - `addr` present: without `clear`, set an execution breakpoint
-    (0x91f26fc8): address not 4-byte aligned, or no breakpoint list
-    available, gives 0x80004005 (`400- `); an existing breakpoint is
-    re-armed; up to 0x80 entries per list block. With `clear`, remove it
-    (0x91f27178); not found gives `400- `. Success `200- OK`.
+    (0x91f26fc8): address not 4-byte aligned, or no block obtainable from
+    pool memory, gives 0x80004005 (`400- `); an existing breakpoint is
+    re-armed; up to 0x80 entries per block, a full block splits. With
+    `clear`, remove it (0x91f27178); not found gives `400- `. Success
+    `200- OK`.
   - `addr` absent: the text `missing addr` is formatted, then the data
     keywords are tested: `read` -> type 5, `write` -> 1, `readwrite` -> 2,
     `execute` -> 3. None present: reply `400- missing addr`.
@@ -701,10 +737,14 @@ this group.
   back (0 during a DPC). Module and export resolution failures set it.
   0x91f729d8 treats an export whose address equals the module entry point
   (handle+0x18) as absent with status 0xc0000263.
-- Backend requirement: trigger a content-integrity failure, optionally
-  followed by a hard reboot.
-- Status: wire behavior complete. XAM ordinal 0x9c0 semantics unknown
-  (xam.xex image not available for analysis).
+- XAM 0x9c0 is `XamShowBadDiscErrorUI` (xam.xex 0x81787750): it ignores
+  its argument and shows the bad disc message box for any user, returning
+  when the box is dismissed, so the reboot follows the dismissal. With
+  XAM's flag 0x8e03860a bit 0x4 set it returns 5 without a box. Details:
+  `parity/services.md`.
+- Backend requirement: show the bad disc message box, then optionally
+  reboot hard.
+- Status: spec complete.
 
 ## civinject
 - Handler: 0x91f2a040. Access: 0x4. Extra: 0x4 (runs on its own thread).
@@ -717,10 +757,15 @@ this group.
   - Calls XAM ordinal 0x9bf(hasherrors, readerrors) (0x91f77a98) when
     resolvable; the result is ignored.
   - Reply `200- OK` when both are present.
+- XAM 0x9bf is `XamMediaVerificationInject` (0x8175ff68): two zero counts
+  open a verification session on processor 5 (as `civstart threadid=5`);
+  otherwise each nonzero count is stored only when no error of that kind
+  is pending. The next startup consumes one of each kind and fails; each
+  block read and hash check of a pass consumes one. Details:
+  `parity/services.md`.
 - Backend requirement: inject read and hash errors into content
   verification.
-- Status: wire behavior complete. XAM ordinal 0x9bf semantics unknown
-  (xam.xex image not available).
+- Status: spec complete.
 
 ## civsetbits
 - Handler: 0x91f2a1e8. Access: 0x4. Extra: 0x2 (absent on test kits).
@@ -761,9 +806,14 @@ this group.
   (0x91f77818). Value X = its return; if xam.xex is absent, the last-error
   value; if the ordinal is absent, the last-error value or 0 when it is
   0x7f. Reply `200- XSecurityCreateProcess 0x%x` (X).
-- Backend requirement: start content verification for a process slot.
-- Status: wire behavior complete. XAM ordinal 0x9bb semantics unknown
-  (xam.xex image not available).
+- XAM 0x9bb is `XamMediaVerificationCreate` (0x81a16110): returns 5 when a
+  session is open (also after a failed startup until `civstop`), else
+  starts the verification worker on processor n and waits for its startup:
+  0 when it is ready, 0x571 when the startup failed (an injected error, or
+  the CD-ROM device not opening). Without a disc the worker reads in a
+  no-media mode and starts. Details: `parity/services.md`.
+- Backend requirement: start content verification on a processor.
+- Status: spec complete.
 
 ## civstatus
 - Handler: 0x91f2a0c0. Access: 0x4. Extra: 0x0.
@@ -777,6 +827,14 @@ this group.
   - Else `200- Blocks Checked %d, Failed Reads %d, Failed Hashes %d, Total Blocks %d, %hs.`
     with +0xc, +4, +8, +0x10, and `Completed` if +0x14 is nonzero else
     `In Progress`.
+- XAM 0x9be is `XamMediaVerificationFailedBlocks` (0x81a15a48): it copies
+  the session's record and returns 0x570 after a startup that failed an
+  injected check (until `civstop`); a successful startup clears the
+  checked count, total and completion flag (the total reads 0 until a
+  pass checks a block); every checked block updates the record, and the
+  checked count accumulates over the passes of a session. With no disc
+  the total is 264354 and the verification never completes (devkit with
+  an empty tray: confirmed).
 - Backend requirement: report content verification progress counters.
 - Status: spec complete.
 
@@ -785,6 +843,10 @@ this group.
 - Syntax: `civstop`.
 - Behavior: calls XAM ordinal 0x9bc() (0x91f778a0) when resolvable (result
   ignored). Reply `200- XSecurityCloseProcess`.
+- XAM 0x9bc is `XamMediaVerificationClose` (0x81a15998): without a session
+  it does nothing; else it stops the worker and resets the session
+  (checked count, completion flag, failure flag); the record's failure
+  counters and total stay.
 - Backend requirement: stop content verification.
 - Status: spec complete.
 
@@ -797,6 +859,17 @@ this group.
   Calls XAM ordinal 0x9bd(m, 0, 0) (0x91f778f0). Value X = its return;
   xam.xex absent: last error; ordinal absent: last error, or 0 when it is
   0x7f. Reply `200- XSecurityVerify 0x%x` (X).
+- XAM 0x9bd is `XamMediaVerificationVerify` (0x81a15fd0): 0x21 unless a
+  session is ready (none, a failed startup, or a pass still running);
+  else it hands the budget to the worker and returns 0 at once. The
+  worker checks blocks until m milliseconds have passed since the pass
+  started (at least one block). Without a disc each block takes 100 ms,
+  200 ms when it also reads a new hash index block (the first block and
+  every 2048th). m = -1 runs until `civstop`, waiting 200 ms after each
+  block (300 ms per block); with detection bit 12 set at `civstart` every
+  pass runs until `civstop`, waiting 200 ms whenever more than 300 ms
+  have passed since the last wait. `civstop` ends a pass after its
+  current block.
+  Details: `parity/services.md`.
 - Backend requirement: run content verification for a time budget.
-- Status: wire behavior complete. XAM ordinal 0x9bd semantics unknown
-  (xam.xex image not available).
+- Status: spec complete.

@@ -18,7 +18,7 @@ an `Engine` trait, unit-tested).
 
 | Command | Server | Host test |
 | --- | --- | --- |
-| autoprof | as stock exports 175/176 (hardware flag 0x10, XConfig 3/8) | read, write, malformed `xuid`, flag clear |
+| autoprof | as stock exports 175/176 (hardware flag 0x10, development hardware; XConfig 3/8) | read, write, malformed `xuid`, flag clear |
 | capctrl | subcommand order, `HRESULT 0x%08x` text, start validates the file through the drive table (0x91f2eb68); start/stop/abort run `capture::{start, stop, abort}` | every subcommand, missing name, not instrumented, running start, stop and file name, call-cap service calls, full buffer on stop and abort, title hand-off |
 | gpucount | as stock | enable, disable, neither |
 | lopctrl | `profiler::Control` (0x91f32c90/0x91f33010/0x91f32e30/0x91f33090) shared by the command and exports 149-151; the backend translates the name | sequence, double start, flush failure, init failure and retry, translated path and directories, name without a drive |
@@ -239,8 +239,23 @@ Gaps (Xbox):
   applying memory past the table; export 211 waits with a wrapping tick
   difference; null function table copies are not passed to
   `MmFreePhysicalMemory`. The random interval generator stock seeds but
-  never uses is omitted. Not verified on hardware: kernel exports 669-671
-  semantics (routine arguments: trap frame, previous IRQL).
+  never uses is omitted. Kernel exports 669-671 (K16547 0x80097250,
+  0x800972c0, 0x80096d20; same code in K15574 as `KeEnablePFMInterrupt`,
+  `KeDisablePFMInterrupt`, `KeSetProfilerISR`): 669 returns false for a
+  mask of 0 or above 63, else saves SOC register 0x56020 and writes `mask
+  << 16 | 0x460`; 670 restores the saved value for argument 1 and writes 0
+  otherwise; 671 stores the routine. The external interrupt dispatcher
+  (K16547 0x8009bc0c, K15574 `KiHandleExternalInterrupt`) calls vector 0x60
+  (K16547 0x8009ed40, K15574 `KiProfilerInterrupt`) with r3 = trap frame,
+  r4 = previous IRQL (raised to 2 when it was below 2 at the first level),
+  r5 = interrupt controller address; that routine raises the IRQL to 0x60,
+  enables external interrupts, and calls the routine (when not null) with
+  r3 = trap frame, r4 = interrupt controller address (`0x7fff0000` plus the
+  low half of the PCR address 0x8023n000), r5 = 1 when nested in another
+  interrupt, else 0. No previous IRQL reaches the routine: stock's test of
+  the low byte of r4 above 2 (0x91f905e0) reads the controller address,
+  whose low byte is 0, and never skips a sample. openxbdm takes only the
+  trap frame and omits that test.
 - PIX (`backend/performance/pix.rs` and `pix/`): stream ring 0x91fa2af0
   (`b`/`e` with IPI 0x91f56670 and the `CxSw` swap routine, `r` snapshot,
   codes 0x27/0x41/0x42/0x43/0x58/0x5e, DPC and server pass for

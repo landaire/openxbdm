@@ -22,8 +22,8 @@ Status labels:
 | Command engine | `openxbdm-server` | implemented | `no_std`, allocation-free; 177 of 177 stock commands in 11 domains |
 | Host server and simulated console | `openxbdm-server-host` | implemented | One simulated console shared by all connections; every command exercised over TCP by `tests/` |
 | SMB file sharing | `openxbdm-server` (`smb`), `smb2-server` | implemented | SMB 2.0.2 and 2.1 shares of every drive whose device exists; host listener on `--smb-listen`, console listener on TCP port 445 |
-| Xbox 360 module | `openxbdm-server-xbox360` | verified | Backends for every domain, 253 of 253 exports, 102 of 103 non-default control codes; boots on a devkit as `xbdm.xex` and xshell loads against its exports |
-| Command specifications | `docs/re-notes/commands/` | specified | 165 complete, 4 wire complete, 8 partial |
+| Xbox 360 module | `openxbdm-server-xbox360` | verified | Backends for every domain, 253 of 253 exports, 103 of 103 non-default control codes; boots on a devkit as `xbdm.xex` and xshell loads against its exports |
+| Command specifications | `docs/re-notes/commands/` | specified | 177 of 177 complete |
 | Export table | `docs/re-notes/exports.md` | specified | 253 populated ordinals of 373 |
 | Control dispatcher | `docs/re-notes/dispatcher.md` | specified | Codes 0x01 to 0xa9 |
 | PGO runtime | `docs/re-notes/pgo.md` | implemented | Exports and `pogoctrl` |
@@ -39,10 +39,12 @@ deliberate deviations: `parity.md`.
 
 openxbdm boots on a devkit in place of stock XBDM and serves the
 protocol; xshell loads against its exports. Differential run of
-`parity/hardware-commands.txt` (399 lines, 134 of 177 commands): 378
-exchanges equal, 21 equal outside environment-dependent fields, 0 differ.
-The other 43 commands are not run on hardware (persistent state, flash or
-disk writes, console faults); see `parity/hardware.md`.
+`parity/hardware-commands.txt` (1060 exchanges, 138 of 177 commands):
+1042 exchanges equal, 18 equal outside environment-dependent fields, 0
+differ. The other 39 commands are not run on hardware (persistent state,
+flash or disk writes, user interface, console restarts); see
+`parity/hardware.md`, which also lists the checks run outside the
+command list.
 
 Image requirements found on hardware:
 

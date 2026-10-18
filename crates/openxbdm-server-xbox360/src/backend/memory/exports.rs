@@ -56,6 +56,8 @@ use super::tracking_type_name_bytes;
 use super::untrack_allocation;
 use super::write_debug_byte;
 use crate::backend::dispatcher;
+use crate::backend::filesystem;
+use crate::backend::performance::module_snapshot;
 use crate::exports::export;
 use crate::exports::export_result;
 use crate::kernel;
@@ -84,13 +86,10 @@ xbox360_sys::flags! {
     }
 }
 
-/// A memory copy of exports 10 and 40, passed to the server thread by
-/// address. Built only by those exports from their arguments.
+/// The range and count dword of a memory copy of exports 10 and 40.
 struct Transfer {
     address: u32,
     length: u32,
-    /// The caller's buffer of `length` bytes.
-    buffer: NonNull<u8>,
     /// The caller's count dword, at any alignment, or null.
     count: *mut u32,
 }
@@ -353,7 +352,7 @@ fn copy_bytes(request: &mut Transfer, mut step: impl FnMut(u32, u32) -> bool) ->
 
 /// Stock export 10 (0x91f33730): `(address, length, buffer, count) ->
 /// HRESULT`; read through the debugger with breakpoint bytes shown as
-/// their saved originals.
+/// their saved originals, on the calling thread.
 extern "C" fn get_memory(
     address: u32,
     length: u32,
@@ -367,41 +366,26 @@ extern "C" fn get_memory(
     let mut request = Transfer {
         address,
         length,
-        buffer,
         count,
     };
 
-    dispatcher::call_on_server_with(
-        &mut request,
-        |server, _console, _network, request: &mut Transfer| {
-            let buffer = request.buffer;
-
-            reply::hresult(copy_bytes(request, |current, index| {
-                match server
-                    .state
-                    .debugger
-                    .shadow_read(current)
-                    .or_else(|| read_debug_byte(current))
-                {
-                    Some(byte) => {
-                        // SAFETY: export 10 takes a writable buffer of
-                        // `length` bytes, and `index` is below `length`.
-                        unsafe { buffer.add(index as usize).write(byte) };
-                        true
-                    }
-                    None => false,
-                }
-            }))
-            .0
-        },
-    )
-    .map_or(SERVER_UNAVAILABLE, Hresult)
+    reply::hresult(copy_bytes(&mut request, |current, index| {
+        match crate::backend::debugger::shadow_read(current).or_else(|| read_debug_byte(current)) {
+            Some(byte) => {
+                // SAFETY: export 10 takes a writable buffer of `length`
+                // bytes, and `index` is below `length`.
+                unsafe { buffer.add(index as usize).write(byte) };
+                true
+            }
+            None => false,
+        }
+    }))
 }
 export!(10, get_memory);
 
 /// Stock export 40 (0x91f337f8): `(address, length, buffer, count) ->
 /// HRESULT`; write through the debugger, updating the saved original of a
-/// byte under a breakpoint.
+/// byte under a breakpoint, on the calling thread.
 extern "C" fn set_memory(
     address: u32,
     length: u32,
@@ -415,25 +399,15 @@ extern "C" fn set_memory(
     let mut request = Transfer {
         address,
         length,
-        buffer,
         count,
     };
 
-    dispatcher::call_on_server_with(
-        &mut request,
-        |server, _console, _network, request: &mut Transfer| {
-            let buffer = request.buffer;
-
-            reply::hresult(copy_bytes(request, |current, index| {
-                // SAFETY: export 40 takes a readable buffer of `length`
-                // bytes, and `index` is below `length`.
-                let byte = unsafe { buffer.add(index as usize).read() };
-                server.state.debugger.shadow_write(current, byte) || write_debug_byte(current, byte)
-            }))
-            .0
-        },
-    )
-    .map_or(SERVER_UNAVAILABLE, Hresult)
+    reply::hresult(copy_bytes(&mut request, |current, index| {
+        // SAFETY: export 40 takes a readable buffer of `length` bytes, and
+        // `index` is below `length`.
+        let byte = unsafe { buffer.add(index as usize).read() };
+        crate::backend::debugger::shadow_write(current, byte) || write_debug_byte(current, byte)
+    }))
 }
 export!(40, set_memory);
 
@@ -456,45 +430,34 @@ export!(12, get_proc_address);
 
 /// Stock export 16 (0x91f34448 -> 0x91f33c38 with flags 0): `(name, info)
 /// -> HRESULT`; the running executable's drive path, whatever the name,
-/// with zero timestamp, checksum, and stack size.
-extern "C" fn get_xbe_info(_name: u32, mut info: *mut XbeInfo) -> Hresult {
+/// with zero timestamp, checksum, and stack size. The path translates on
+/// the caller's thread.
+extern "C" fn get_xbe_info(_name: u32, info: *mut XbeInfo) -> Hresult {
     if info.is_null() {
         return Hresult::INVALID_ARGUMENT;
     }
 
-    dispatcher::call_on_server_with(
-        &mut info,
-        |server, console, _network, info: &mut *mut XbeInfo| {
-            let info = *info;
+    let mut object = [0u8; memory::EXECUTABLE_PATH_CAPACITY];
+    let length = module_snapshot::copy_executable_object_path(&mut object);
 
-            let mut object = [0u8; memory::EXECUTABLE_PATH_CAPACITY];
-            let length = console.running_executable_path(&mut object);
+    let mut path = [0u8; XBE_PATH_CAPACITY];
+    let length = filesystem::drive_path(&object[..length], &mut path);
 
-            let mut path = [0u8; XBE_PATH_CAPACITY];
-            let length = server.state.filesystem.drives.object_path_to_drive_path(
-                console,
-                &object[..length],
-                &mut path,
-            );
+    // SAFETY: export 16 takes a writable DM_XBE, checked non-null above,
+    // which stock does not align; the path is a byte array.
+    unsafe {
+        let slots = &mut *(&raw mut (*info).path);
+        // The conversion leaves at least one zero after the path, which
+        // terminates the copy.
+        for (slot, &byte) in slots.iter_mut().zip(&path[..=length]) {
+            *slot = byte;
+        }
+        (&raw mut (*info).time_stamp).write_unaligned(0);
+        (&raw mut (*info).checksum).write_unaligned(0);
+        (&raw mut (*info).stack_size).write_unaligned(0);
+    }
 
-            // SAFETY: export 16 takes a writable DM_XBE, checked non-null
-            // above, which stock does not align; the path is a byte array.
-            unsafe {
-                let slots = &mut *(&raw mut (*info).path);
-                // The conversion leaves at least one zero after the path,
-                // which terminates the copy.
-                for (slot, &byte) in slots.iter_mut().zip(&path[..=length]) {
-                    *slot = byte;
-                }
-                (&raw mut (*info).time_stamp).write_unaligned(0);
-                (&raw mut (*info).checksum).write_unaligned(0);
-                (&raw mut (*info).stack_size).write_unaligned(0);
-            }
-
-            Hresult::OK.0
-        },
-    )
-    .map_or(SERVER_UNAVAILABLE, Hresult)
+    Hresult::OK
 }
 export!(16, get_xbe_info);
 

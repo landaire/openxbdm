@@ -19,13 +19,17 @@ mod memory;
 mod module;
 mod policy;
 mod slot;
+mod table;
 mod thread;
+mod wake;
 
 use core::sync::atomic::Ordering;
 use core::time::Duration;
 
 use openxbdm_core::status::KernelError;
 use openxbdm_server::commands::debugger;
+use openxbdm_server::commands::debugger::BreakpointState;
+use openxbdm_server::commands::debugger::CodeWords;
 use openxbdm_server::commands::debugger::Context;
 use openxbdm_server::commands::debugger::DebugEvent;
 use openxbdm_server::commands::debugger::DirectNotification;
@@ -37,6 +41,7 @@ use openxbdm_server::commands::debugger::ModuleEvent;
 use openxbdm_server::commands::debugger::NOTICE_TEXT_CAPACITY;
 use openxbdm_server::commands::debugger::NoSuchThread;
 use openxbdm_server::commands::debugger::ProcessKind;
+use openxbdm_server::commands::debugger::SetError;
 use openxbdm_server::commands::debugger::StoppedThreadError;
 use openxbdm_server::commands::debugger::ThreadId;
 use openxbdm_server::commands::debugger::ThreadInfo;
@@ -75,6 +80,8 @@ pub(crate) use self::module::ansi_string_length;
 pub(crate) use self::slot::begin_event_service;
 pub(crate) use self::slot::end_event_service;
 pub(crate) use self::slot::wait_for_event_waiters;
+pub(crate) use self::table::shadow_read;
+pub(crate) use self::table::shadow_write;
 pub(crate) use self::thread::MonitorRecordFlags;
 pub(crate) use self::thread::collect_thread_ids;
 pub(crate) use self::thread::current_debug_data;
@@ -87,6 +94,9 @@ pub(crate) use self::thread::set_server_thread;
 pub(crate) use self::thread::suspend;
 pub(crate) use self::thread::thread_information;
 pub(crate) use self::thread::thread_name;
+pub(crate) use self::wake::close_wake;
+pub(crate) use self::wake::drain_wake;
+pub(crate) use self::wake::open_wake;
 
 /// Platform state of this domain.
 pub struct Data {
@@ -173,25 +183,22 @@ impl debugger::Backend for Console {
         })
     }
 
-    fn replace_code_word(&mut self, address: u32, value: u32) -> Option<u32> {
-        memory::replace_code_word(address, value)
+    fn lock_breakpoints(
+        &mut self,
+        access: &mut dyn FnMut(&mut BreakpointState, &mut dyn CodeWords),
+    ) {
+        table::with_breakpoints(|state, code| access(state, code));
+    }
+
+    fn set_breakpoint(&mut self, address: u32) -> Result<(), SetError> {
+        table::set_breakpoint(address)
     }
 
     fn target_bytes(&mut self, address: u32, length: usize) -> Option<&[u8]> {
         let length = length.min(self.debugger.scratch.len());
+        let bytes = &mut self.debugger.scratch[..length];
 
-        for (offset, byte) in self.debugger.scratch[..length].iter_mut().enumerate() {
-            let source = address.wrapping_add(offset as u32);
-            if offset == 0 || source & 0xfff == 0 {
-                if !readable(source) {
-                    return None;
-                }
-            }
-            // SAFETY: `readable` checked the page of `source` above.
-            *byte = unsafe { target_u8(source) };
-        }
-
-        Some(&self.debugger.scratch[..length])
+        copy_target(address, bytes).then_some(&*bytes)
     }
 
     fn set_data_breakpoint_register(&mut self, value: u32) {
@@ -234,8 +241,8 @@ impl debugger::Backend for Console {
         direct::next_direct_notification(text)
     }
 
-    fn break_now(&mut self) -> Option<DebugEvent> {
-        hook::break_now()
+    fn break_now(&mut self) {
+        hook::break_now();
     }
 
     fn crash_dump(&mut self) {
@@ -254,4 +261,19 @@ impl debugger::Backend for Console {
     fn unload_extension(&mut self, handle: ExtensionHandle) -> Result<(), KernelError> {
         extension::unload_extension(handle)
     }
+}
+
+/// Copy target memory at `address` into `output`; false when part of the
+/// range is not readable.
+pub(crate) fn copy_target(address: u32, output: &mut [u8]) -> bool {
+    for (offset, byte) in output.iter_mut().enumerate() {
+        let source = address.wrapping_add(offset as u32);
+        if (offset == 0 || source & 0xfff == 0) && !readable(source) {
+            return false;
+        }
+        // SAFETY: `readable` checked the page of `source` above.
+        *byte = unsafe { target_u8(source) };
+    }
+
+    true
 }

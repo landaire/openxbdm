@@ -101,7 +101,7 @@ impl SharedHost {
                     network,
                 } = &mut *guard;
                 server.drain_posted_notifications(backend, network);
-                server.poll_timers(backend)
+                server.poll_timers(backend, network)
             };
 
             #[cfg(feature = "smb")]

@@ -2,6 +2,7 @@
 
 mod exports;
 mod format;
+mod paths;
 mod pool;
 
 use core::cell::UnsafeCell;
@@ -66,6 +67,13 @@ use self::pool::PoolBlock;
 use self::pool::pool_range;
 use super::Console;
 use crate::kernel;
+
+pub(crate) use self::paths::CallerPaths;
+pub(crate) use self::paths::drive_path;
+pub(crate) use self::paths::open_translated;
+pub(crate) use self::paths::publish_drives;
+pub(crate) use self::paths::published_drives;
+pub(crate) use self::paths::translate;
 
 /// Size of the optical drive trace buffer.
 const DVD_TRACE_SIZE: u32 = 0x20_0000;
@@ -145,8 +153,7 @@ impl commands::filesystem::Backend for Console {
     }
 
     fn close_file(&mut self, handle: FileHandle) {
-        // SAFETY: the protocol layer passes an open handle and drops it after.
-        unsafe { xboxkrnl::NtClose(Handle::from_raw(handle.0)) };
+        close_file(handle);
     }
 
     fn count_file_change(&mut self) {
@@ -166,26 +173,8 @@ impl commands::filesystem::Backend for Console {
             // `pool` during the call.
             ReadTarget::Pool(range) => unsafe { pool_range(range) },
         };
-        let io_status = PendingStatus::new();
-        let offset_pointer = offset
-            .as_ref()
-            .map_or(core::ptr::null(), |offset| offset as *const u64);
-        // SAFETY: `buffer` is a live mutable slice; `io_status` and the offset
-        // stay live until `complete` returns.
-        let raw = unsafe {
-            xboxkrnl::NtReadFile(
-                Handle::from_raw(handle.0),
-                Handle::NULL,
-                0,
-                0,
-                io_status.as_ptr(),
-                buffer.as_mut_ptr(),
-                buffer.len() as u32,
-                offset_pointer,
-            )
-        };
 
-        io_status.complete(handle, raw)
+        read_file(handle, offset, buffer)
     }
 
     fn write_file(
@@ -463,18 +452,7 @@ impl commands::filesystem::Backend for Console {
         link: &[u8],
         target: &mut [u8],
     ) -> Result<usize, KernelError> {
-        let name = ansi(link);
-        let object = attributes(0, &name);
-        let mut output = AnsiString {
-            length: 0,
-            maximum_length: target.len() as u16,
-            buffer: target.as_mut_ptr(),
-        };
-        // SAFETY: `output` describes the live `target` slice; `object` refers to `name`.
-        let raw = unsafe { ObTranslateSymbolicLink(&object, &mut output) };
-        raw.result()?;
-
-        Ok(usize::from(output.length))
+        translate_symbolic_link(link, target)
     }
 
     fn open_object_directory(&mut self, path: &[u8]) -> Result<ObjectDirectory, KernelError> {
@@ -615,14 +593,11 @@ impl commands::filesystem::Backend for Console {
     }
 
     fn allocate_scratch(&mut self, size: u32) -> Option<ScratchBlock> {
-        PoolBlock::allocate(size).map(PoolBlock::into_scratch)
+        allocate_scratch(size)
     }
 
     fn free_scratch(&mut self, block: ScratchBlock) {
-        let data = block.into_raw();
-        // SAFETY: a `ScratchBlock` holds the data of a block of
-        // `into_scratch` and is consumed here.
-        drop(unsafe { PoolBlock::from_data(data.as_mut_ptr().expose_provenance()) });
+        free_scratch(block);
     }
 
     fn open_close_tray(&mut self, value: u32) {
@@ -657,8 +632,8 @@ impl commands::filesystem::Backend for Console {
             return;
         };
 
-        /// Byte of the trace buffer whose bit 0 stock clears before the
-        /// driver records; its meaning is unknown.
+        /// Byte of the trace buffer whose bit 0 stock clears before
+        /// recording starts; no producer in the system images reads it.
         const TRACE_FLAGS_OFFSET: usize = 8;
         const TRACE_FLAG_0: u8 = 0x1;
 
@@ -680,7 +655,7 @@ impl commands::filesystem::Backend for Console {
     fn stop_dvd_trace(&mut self) -> Option<DvdTrace> {
         let end = match kernel::published_debug_monitor_data() {
             Some(block) => {
-                // The driver updates the write pointer atomically.
+                // Stock exchanges the write pointer atomically.
                 // SAFETY: 0 stops the recording before the buffer is freed.
                 let end = unsafe { block.dvd_trace_pointer.swap(0, Ordering::SeqCst) };
                 let flags = &block.flags;
@@ -780,6 +755,68 @@ pub(crate) fn create_file(path: &[u8], request: &CreateRequest) -> Result<FileHa
     raw.result()?;
 
     Ok(FileHandle(handle))
+}
+
+fn close_file(handle: FileHandle) {
+    // SAFETY: callers pass an open handle and drop it after.
+    unsafe { xboxkrnl::NtClose(Handle::from_raw(handle.0)) };
+}
+
+/// Read into `buffer` at `offset`, or at the current position when `None`;
+/// returns the bytes read.
+fn read_file(
+    handle: FileHandle,
+    offset: Option<u64>,
+    buffer: &mut [u8],
+) -> Result<u32, KernelError> {
+    let io_status = PendingStatus::new();
+    let offset_pointer = offset
+        .as_ref()
+        .map_or(core::ptr::null(), |offset| offset as *const u64);
+    // SAFETY: `buffer` is a live mutable slice; `io_status` and the offset
+    // stay live until `complete` returns.
+    let raw = unsafe {
+        xboxkrnl::NtReadFile(
+            Handle::from_raw(handle.0),
+            Handle::NULL,
+            0,
+            0,
+            io_status.as_ptr(),
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            offset_pointer,
+        )
+    };
+
+    io_status.complete(handle, raw)
+}
+
+/// Resolve the symbolic link object `link` into `target`; returns the
+/// target length.
+fn translate_symbolic_link(link: &[u8], target: &mut [u8]) -> Result<usize, KernelError> {
+    let name = ansi(link);
+    let object = attributes(0, &name);
+    let mut output = AnsiString {
+        length: 0,
+        maximum_length: target.len() as u16,
+        buffer: target.as_mut_ptr(),
+    };
+    // SAFETY: `output` describes the live `target` slice; `object` refers to `name`.
+    let raw = unsafe { ObTranslateSymbolicLink(&object, &mut output) };
+    raw.result()?;
+
+    Ok(usize::from(output.length))
+}
+
+fn allocate_scratch(size: u32) -> Option<ScratchBlock> {
+    PoolBlock::allocate(size).map(PoolBlock::into_scratch)
+}
+
+fn free_scratch(block: ScratchBlock) {
+    let data = block.into_raw();
+    // SAFETY: a `ScratchBlock` holds the data of a block of
+    // `into_scratch` and is consumed here.
+    drop(unsafe { PoolBlock::from_data(data.as_mut_ptr().expose_provenance()) });
 }
 
 fn set_information(

@@ -1,24 +1,22 @@
 //! Kernel debug routine, stack overflow, and thread notification hooks.
 
-use core::cell::UnsafeCell;
-use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 use core::time::Duration;
 
 use openxbdm_core::status::NtStatus;
 use openxbdm_server::commands::console::DumpMode;
-use openxbdm_server::commands::debugger::DebugEvent;
 use openxbdm_server::commands::debugger::Delivery;
 use openxbdm_server::commands::debugger::DirectException;
+use openxbdm_server::commands::debugger::DirectNotice;
 use openxbdm_server::commands::debugger::DirectRegisters;
 use openxbdm_server::commands::debugger::Disposition;
 use openxbdm_server::commands::debugger::ExceptionFlags;
 use openxbdm_server::commands::debugger::ExceptionRecord;
-use openxbdm_server::commands::debugger::ProcessKind;
 use openxbdm_server::commands::debugger::StopOn;
 use openxbdm_server::commands::debugger::ThreadId;
 use openxbdm_server::commands::debugger::dispatch_direct;
+use openxbdm_server::commands::debugger::exception_stops;
 use xbox360::console::hardware_flags;
 use xbox360::time::sleep;
 use xbox360_sys::processor;
@@ -36,7 +34,6 @@ use xbox360_sys::xboxkrnl::KeContextFromKframes;
 use xbox360_sys::xboxkrnl::KeIpiGenericCall;
 use xbox360_sys::xboxkrnl::KeResumeThread;
 use xbox360_sys::xboxkrnl::KeSetSpecialPurposeRegister;
-use xbox360_sys::xboxkrnl::Kthread;
 use xbox360_sys::xboxkrnl::KtrapFrame;
 use xbox360_sys::xboxkrnl::NotificationRegistration;
 use xbox360_sys::xboxkrnl::SpecialPurposeRegister;
@@ -47,23 +44,22 @@ use super::direct::queue_direct;
 use super::dump::DumpKind;
 use super::dump::mark_dump;
 use super::dump::write_dump;
-use super::memory::INSTRUCTION_SIZE;
 use super::memory::readable;
-use super::policy::DIRECT_STEP;
-use super::policy::StepWord;
+use super::module::describe_module;
 use super::policy::load_policy;
 use super::slot::SlotDisposition;
 use super::slot::SlotEventKind;
 use super::slot::post_and_wait;
+use super::slot::post_and_wait_stopping;
 use super::slot::post_detached;
+use super::table::with_breakpoints;
 use super::thread::MonitorRecord;
 use super::thread::OwnThread;
 use super::thread::ThreadListLock;
-use super::thread::current;
-use super::thread::has_record;
 use super::thread::is_server;
 use super::thread::name_thread;
 use super::thread::owning_process;
+use super::thread::process_kind_of;
 use super::thread::thread_pointer;
 use crate::kernel;
 use crate::kernel::RoutineVariable;
@@ -78,38 +74,12 @@ static PREVIOUS_DEBUG_ROUTINE: AtomicU32 = AtomicU32::new(0);
 /// bytes of the record.
 static THREAD_NOTIFICATION: NotificationRegistration = NotificationRegistration::new();
 
-pub(super) static BREAK_NOW: BreakNowCapture = BreakNowCapture {
-    context: UnsafeCell::new(KernelContext::new(KernelContextFlags::empty())),
-    record: UnsafeCell::new(KernelExceptionRecord {
-        code: NtStatus::SUCCESS,
-        flags: KernelExceptionFlags::empty(),
-        next_record: 0,
-        address: 0,
-        parameter_count: 0,
-        parameters: [0; 15],
-    }),
-};
-
-static BREAK_NOW_ARMED: AtomicBool = AtomicBool::new(false);
-
-pub(super) static BREAK_NOW_STOPPED: AtomicBool = AtomicBool::new(false);
-
-/// Exception record and context of the command thread stopped by
-/// `break now`.
-pub(super) struct BreakNowCapture {
-    pub(super) context: UnsafeCell<KernelContext>,
-    pub(super) record: UnsafeCell<KernelExceptionRecord>,
-}
-
-// SAFETY: the server thread writes the capture while `BREAK_NOW_STOPPED` is
-// clear and only the server thread reads or writes it while it is set.
-unsafe impl Sync for BreakNowCapture {}
-
 crate::exports::bridged!(pub(super) debug_routine_entry, debug_routine);
 
 /// Replacement kernel debug routine (stock 0x91f3a980). Threads that can
-/// wait are handed to the server; threads above passive level and the
-/// server thread are dispatched in place, as is every thread while the
+/// wait are handed to the server; threads above passive level, the server
+/// thread, threads that overflowed their stack, and threads that already
+/// wait at an event are dispatched in place, as is every thread while the
 /// server does not take events.
 extern "C" fn debug_routine(trap_frame: u32, record: u32, context: u32, second_chance: u32) -> u32 {
     let previous = PREVIOUS_DEBUG_ROUTINE.load(Ordering::Acquire);
@@ -130,32 +100,26 @@ extern "C" fn debug_routine(trap_frame: u32, record: u32, context: u32, second_c
     // borrowed only around each use below, never across those.
     let registers = core::ptr::with_exposed_provenance_mut::<KernelContext>(context as usize);
     let own = OwnThread::current();
-    let thread = own.kthread();
     let irql = current_irql();
-    let server = is_server(thread);
-    if server
-        && irql == Irql::PASSIVE
-        && exception.code == NtStatus::BREAKPOINT
-        && BREAK_NOW_ARMED.swap(false, Ordering::AcqRel)
-    {
-        // SAFETY: the kernel's context of the calling thread, live for the
-        // call; neither a slot nor `chain` reaches it on this path.
-        capture_break_now(exception, unsafe { &mut *registers });
-        return 1;
-    }
-    if irql != Irql::PASSIVE || server {
-        let delivery = if irql == Irql::PASSIVE {
+    let server = is_server(own.kthread());
+    let marked = own
+        .record()
+        .is_some_and(|record| record.has_overflowed() || record.waits_in_slot());
+    if irql != Irql::PASSIVE || server || marked {
+        let delivery = if irql == Irql::PASSIVE && server {
             Delivery::Inline
-        } else if irql == Irql::APC || irql == Irql::DISPATCH {
+        } else if irql == Irql::PASSIVE || irql == Irql::APC || irql == Irql::DISPATCH {
             Delivery::Deferred
         } else {
             Delivery::Discarded
         };
         // SAFETY: the kernel's record and context of the calling thread,
-        // live for the call; no slot holds them on this path.
+        // live for the call; no slot holds them on this path (a thread
+        // waiting in its slot raises this exception with its own record
+        // and context).
         return unsafe {
             dispatch_in_place(
-                thread,
+                own,
                 exception,
                 registers,
                 second_chance != 0,
@@ -164,26 +128,39 @@ extern "C" fn debug_routine(trap_frame: u32, record: u32, context: u32, second_c
             )
         };
     }
-    if own.record().is_some_and(MonitorRecord::waits_in_slot) {
-        // A nested exception while the thread waits in a slot.
-        return chain();
-    }
 
-    let Some(disposition) = post_and_wait(
+    // Read before posting: the server writes the context once it takes the
+    // slot.
+    // SAFETY: the kernel's context of the calling thread; nothing else
+    // writes it before the post.
+    let raised = direct_registers(unsafe { &*registers });
+    // While the server waits for a dispatch flag 0x4 command thread, an
+    // exception that stops this thread still waits for the server, as
+    // stock's thread stays stopped; any other is dispatched in place.
+    let stops = || exception_stops_thread(own, exception, &raised, second_chance != 0);
+    let Some(disposition) = post_and_wait_stopping(
         SlotEventKind::Exception,
         own,
         record,
         context,
         second_chance,
+        &stops,
     ) else {
+        // While the server waits for a command thread every notification
+        // is queued for it, as stock's raising thread sends them itself.
+        let delivery = if crate::backend::dispatcher::posts_blocked() {
+            Delivery::Inline
+        } else {
+            Delivery::Deferred
+        };
         // SAFETY: as above; the thread did not post to a slot.
         return unsafe {
             dispatch_in_place(
-                thread,
+                own,
                 exception,
                 registers,
                 second_chance != 0,
-                Delivery::Deferred,
+                delivery,
                 &chain,
             )
         };
@@ -252,7 +229,10 @@ extern "C" fn stack_overflow(frame_address: u32) -> u32 {
     if !can_stop && policy.dump_mode == DumpMode::Disabled {
         return address;
     }
-
+    // Stock stores the flag through the record pointer without a check.
+    if let Some(record) = own.record() {
+        record.mark_stack_overflow();
+    }
     let mut context = ContextStorage::new(KernelContextFlags::FULL);
     // SAFETY: `frame_address` is the trap frame the kernel passed;
     // `context` is a live local of the size the kernel writes.
@@ -273,12 +253,15 @@ extern "C" fn stack_overflow(frame_address: u32) -> u32 {
         unsafe { processor::enable_interrupts() };
 
         loop {
-            let Some(disposition) = post_and_wait(
+            // The thread stops, so it waits even while the server waits for
+            // a command thread.
+            let Some(disposition) = post_and_wait_stopping(
                 SlotEventKind::StackOverflow,
                 own,
                 record_address,
                 context_address,
                 0,
+                &|| true,
             ) else {
                 // As for a thread that cannot stop.
                 break policy.dump_mode != DumpMode::Disabled;
@@ -321,7 +304,7 @@ pub(super) fn exception_record(record: &KernelExceptionRecord) -> ExceptionRecor
 /// of the calling thread, which nothing else accesses during the call
 /// except `chain`.
 unsafe fn dispatch_in_place(
-    thread: &Kthread,
+    own: OwnThread,
     record: *const KernelExceptionRecord,
     context: *mut KernelContext,
     second_chance: bool,
@@ -332,7 +315,7 @@ unsafe fn dispatch_in_place(
     // context to the previous debug routine.
     // SAFETY: the caller guarantees both objects.
     let disposition =
-        unsafe { direct_dispatch(thread, &*record, &mut *context, delivery, second_chance) };
+        unsafe { direct_dispatch(own, &*record, &mut *context, delivery, second_chance) };
     let mut handled = disposition.handled;
     if disposition.chain_kernel_debugger {
         handled = chain() & 0xff != 0;
@@ -341,40 +324,87 @@ unsafe fn dispatch_in_place(
     u32::from(handled)
 }
 
+/// The registers the in-place dispatch reads and changes.
+fn direct_registers(context: &KernelContext) -> DirectRegisters {
+    DirectRegisters {
+        msr: context.msr,
+        iar: context.iar,
+        gpr3: context.gpr[3],
+        gpr4: context.gpr[4],
+    }
+}
+
+/// The calling thread's exception as the in-place dispatch takes it.
+fn direct_event(
+    own: OwnThread,
+    record: &KernelExceptionRecord,
+    delivery: Delivery,
+    second_chance: bool,
+) -> DirectException {
+    let monitor_record = own.record();
+    DirectException {
+        thread: ThreadId(own.kthread().id),
+        record: exception_record(record),
+        second_chance,
+        has_record: monitor_record.is_some(),
+        debuggable: monitor_record.is_some_and(MonitorRecord::is_debuggable),
+        stack_overflowed: monitor_record.is_some_and(MonitorRecord::has_overflowed),
+        nested: monitor_record.is_some_and(MonitorRecord::waits_in_slot),
+        hardware_flags: hardware_flags(),
+        delivery,
+    }
+}
+
+/// The instruction word at `iar`, when mapped.
+fn instruction_at(iar: u32) -> Option<u32> {
+    // SAFETY: `readable` found the instruction word mapped; instruction
+    // addresses are word-aligned.
+    readable(iar).then(|| {
+        unsafe { AtomicU32::from_ptr(core::ptr::with_exposed_provenance_mut(iar as usize)) }
+            .load(Ordering::Relaxed)
+    })
+}
+
+/// Whether the monitor's dispatch stops the calling thread at this
+/// exception, from the registers it raised it with.
+fn exception_stops_thread(
+    own: OwnThread,
+    record: &KernelExceptionRecord,
+    registers: &DirectRegisters,
+    second_chance: bool,
+) -> bool {
+    exception_stops(
+        &load_policy(),
+        &direct_event(own, record, Delivery::Inline, second_chance),
+        process_kind_of(own.kthread()),
+        registers,
+        instruction_at(registers.iar),
+        &mut |address| with_breakpoints(|shared, _| shared.contains(address)),
+        &mut |name_string, entry| {
+            // SAFETY: the calling thread raised the module load trap with
+            // these r3 and r4 and stays at it for the call.
+            unsafe { describe_module(name_string, entry) }.is_some_and(|module| module.has_header)
+        },
+    )
+}
+
 /// Dispatch an exception in place, without the kernel debugger chain.
 fn direct_dispatch(
-    thread: &Kthread,
+    own: OwnThread,
     record: &KernelExceptionRecord,
     context: &mut KernelContext,
     delivery: Delivery,
     second_chance: bool,
 ) -> Disposition {
     let policy = load_policy();
-    let mut registers = DirectRegisters {
-        msr: context.msr,
-        iar: context.iar,
-        gpr3: context.gpr[3],
-        gpr4: context.gpr[4],
-    };
+    let mut registers = direct_registers(context);
     let iar = registers.iar;
-    let thread_id = ThreadId(thread.id);
-    let event = DirectException {
-        thread: thread_id,
-        record: exception_record(record),
-        second_chance,
-        has_record: has_record(thread),
-        hardware_flags: hardware_flags(),
-        delivery,
-    };
-    // SAFETY: `readable` found the instruction word mapped; instruction
-    // addresses are word-aligned.
-    let instruction = readable(iar).then(|| {
-        unsafe { AtomicU32::from_ptr(core::ptr::with_exposed_provenance_mut(iar as usize)) }
-            .load(Ordering::Relaxed)
+    let thread_id = ThreadId(own.kthread().id);
+    let event = direct_event(own, record, delivery, second_chance);
+    let instruction = instruction_at(iar);
+    let outcome = with_breakpoints(|shared, code| {
+        dispatch_direct(&policy, &event, &mut registers, instruction, shared, code)
     });
-    let mut step = StepWord::decode(DIRECT_STEP.swap(StepWord::Idle as u32, Ordering::AcqRel));
-    let outcome = dispatch_direct(&policy, &event, &mut registers, instruction, &mut step);
-    DIRECT_STEP.store(StepWord::encode(step), Ordering::Release);
     context.msr = registers.msr;
     context.iar = registers.iar;
     context.gpr[3] = registers.gpr3;
@@ -396,6 +426,15 @@ fn direct_dispatch(
         // names it without the process lock and the monitor keeps that
         // race.
         unsafe { name_thread(Some(request.thread), request.address) };
+    }
+    if let Some(DirectNotice::ModuleUnload {
+        name_string, entry, ..
+    }) = outcome.notice
+        // SAFETY: the calling thread raised the module unload trap with
+        // these r3 and r4, and stays at it for the call.
+        && let Some(module) = unsafe { describe_module(name_string, entry) }
+    {
+        with_breakpoints(|shared, code| shared.remove_module(module.base, module.size, code));
     }
     if let Some(notice) = outcome.notice
         && delivery != Delivery::Discarded
@@ -473,11 +512,15 @@ extern "C" fn thread_notification(_registration: u32, thread_object: u32, create
     match own.create_record() {
         Some(record) if record.is_debuggable() => {
             // Stock waits only when the thread may stop (0x91f39b30): with
-            // `stopon createthread`, or a title entry that may break.
+            // `stopon createthread`, or a title entry that may break. While
+            // the server waits for a command thread the event is posted
+            // without waiting, so the thread cannot stop.
             let title_entry = thread
                 .creation_flags
                 .contains(ThreadCreationFlags::TITLE_ENTRY);
-            if !title_entry && !load_policy().stop_on.contains(StopOn::CREATE_THREAD) {
+            if (!title_entry && !load_policy().stop_on.contains(StopOn::CREATE_THREAD))
+                || crate::backend::dispatcher::posts_blocked()
+            {
                 post_detached(SlotEventKind::Create, thread);
                 return 0;
             }
@@ -501,6 +544,7 @@ extern "C" fn thread_notification(_registration: u32, thread_object: u32, create
 /// notification registration in 0x91f32628). Call once after the debug
 /// monitor data is available.
 pub(crate) fn install() {
+    super::table::initialize();
     if let Some(variable) = kernel::routine_variable(RoutineVariable::Debug)
         && PREVIOUS_DEBUG_ROUTINE.load(Ordering::Relaxed) == 0
     {
@@ -514,15 +558,17 @@ pub(crate) fn install() {
             );
         }
     }
-    if let Some(variable) = kernel::routine_variable(RoutineVariable::StackOverflow) {
-        // SAFETY: the entry is a stack overflow notification of the
-        // kernel's form.
-        unsafe {
-            variable.store(
+    // The query service always stores the variable's address (K16547
+    // 0x800894d4), and stock stores through it without a check (0x91f3bdec).
+    // SAFETY: `register_debug_monitor` succeeded before this call; the
+    // entry is a stack overflow notification of the kernel's form.
+    unsafe {
+        kernel::routine_variable(RoutineVariable::StackOverflow)
+            .unwrap_unchecked()
+            .store(
                 stack_overflow_entry as *const () as usize as u32,
                 Ordering::Relaxed,
             );
-        }
     }
     // SAFETY: the record is not registered yet; the routine is the bridged
     // entry of `thread_notification`, which takes the arguments of a thread
@@ -571,19 +617,6 @@ pub(crate) fn uninstall() {
     }
 }
 
-/// The command thread hit the `break now` trap: keep its exception record
-/// and context for the monitor and let the thread run on past the trap.
-fn capture_break_now(record: &KernelExceptionRecord, context: &mut KernelContext) {
-    // SAFETY: the server thread runs this while `BREAK_NOW_STOPPED` is
-    // clear, so nothing else accesses the capture.
-    unsafe {
-        *BREAK_NOW.context.get() = *context;
-        *BREAK_NOW.record.get() = *record;
-    }
-    context.iar = context.iar.wrapping_add(INSTRUCTION_SIZE);
-    BREAK_NOW_STOPPED.store(true, Ordering::Release);
-}
-
 crate::exports::bridged!(pub(super) set_data_breakpoint_entry, set_data_breakpoint_on_processor);
 
 extern "C" fn set_data_breakpoint_on_processor(value: u32) -> u32 {
@@ -593,26 +626,11 @@ extern "C" fn set_data_breakpoint_on_processor(value: u32) -> u32 {
     value
 }
 
-pub(super) fn break_now() -> Option<DebugEvent> {
+/// `break now` (stock 0x91f48a64): the server thread traps, and the debug
+/// routine dispatches the trap in place.
+pub(super) fn break_now() {
     sleep(Duration::from_millis(250));
-    BREAK_NOW_ARMED.store(true, Ordering::Release);
-    // SAFETY: executes the breakpoint trap; the debug routine records it
-    // and resumes after it.
+    // SAFETY: executes the breakpoint trap, which the debug routine
+    // resolves on this thread before execution continues.
     unsafe { core::arch::asm!("twi 31, 0, 0x16") };
-    BREAK_NOW_ARMED.store(false, Ordering::Release);
-    if !BREAK_NOW_STOPPED.load(Ordering::Acquire) {
-        return None;
-    }
-
-    let thread = current();
-    // SAFETY: the capture is set and only the server thread reads it.
-    let record = exception_record(unsafe { &*BREAK_NOW.record.get() });
-    Some(DebugEvent::Exception {
-        thread: ThreadId(thread.id),
-        process: ProcessKind::System,
-        record,
-        second_chance: false,
-        has_record: has_record(thread),
-        debuggable: false,
-    })
 }

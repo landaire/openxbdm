@@ -21,6 +21,7 @@ use core::sync::atomic::Ordering;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::XbdmHresult;
+use openxbdm_server::Backend;
 use openxbdm_server::ConnectionIndex;
 use openxbdm_server::Server;
 use openxbdm_server::SocketId;
@@ -53,6 +54,7 @@ use xbox360_sys::xboxkrnl::WaitType;
 
 use super::until_nul;
 use crate::backend::Console;
+use crate::backend::dispatcher;
 use crate::exports::export;
 use crate::kernel;
 use crate::kernel::CriticalSection;
@@ -1131,6 +1133,86 @@ impl ProcessorBackend for Console {
             (_, size) => size as usize,
         }
     }
+
+    /// Stock 0x91f421c8: `ExCreateThread(&handle, 0, &id, 0, start, &args,
+    /// 0x20)`, then a wait without limit and `NtClose`. Creation flag 0x20
+    /// (priority class 13) without SYSTEM_PROCESS puts the thread in the
+    /// title process. Meanwhile posts to the server thread do not wait
+    /// ([`dispatcher::block_posts`]): the handler or a thread it waits for
+    /// would otherwise wait for this thread.
+    fn run_command_thread(
+        &mut self,
+        run: &mut dyn FnMut(&mut dyn Backend),
+    ) -> Result<(), NtStatus> {
+        let mut request = CommandThread { console: self, run };
+        let _blocked = dispatcher::block_posts();
+        let mut handle = xboxkrnl::Handle::NULL;
+        let mut thread_id = 0u32;
+        // SAFETY: `handle` and `thread_id` are live locals; `command_thread`
+        // takes the address of `request`, which outlives the thread.
+        let status = unsafe {
+            xboxkrnl::ExCreateThread(
+                (&raw mut handle).cast(),
+                0,
+                &mut thread_id,
+                0,
+                command_thread_entry as *const () as usize as u32,
+                (&raw mut request) as usize as u32,
+                ThreadCreationFlags::PRIORITY_CLASS_13,
+            )
+        };
+        if !status.is_success() {
+            return Err(status);
+        }
+
+        // `request` and the handler's borrows live in this frame, so the
+        // thread must end before it returns. Stock returns a failed wait at
+        // once and leaves the thread using its frame; here a failed wait is
+        // repeated and the first failure is the result.
+        let mut result = Ok(());
+        loop {
+            // SAFETY: `handle` is the thread handle created above.
+            let waited = unsafe {
+                xboxkrnl::NtWaitForSingleObjectEx(
+                    handle,
+                    ProcessorMode::Kernel,
+                    false,
+                    core::ptr::null(),
+                )
+            };
+            if waited.is_success() {
+                break;
+            }
+
+            result = result.and(Err(waited));
+        }
+
+        // SAFETY: the handle is owned here and closed once.
+        unsafe { xboxkrnl::NtClose(handle) };
+
+        result
+    }
+}
+
+/// What a dispatch flag 0x4 thread runs: the handler with the server's
+/// console, which the server thread leaves alone while it waits.
+struct CommandThread<'a> {
+    console: &'a mut Console,
+    run: &'a mut dyn FnMut(&mut dyn Backend),
+}
+
+crate::exports::bridged!(command_thread_entry, command_thread);
+
+/// Start routine of a dispatch flag 0x4 thread (stock 0x91f42178).
+extern "C" fn command_thread(context: u32) -> u32 {
+    // SAFETY: `run_command_thread` passes the address of its request and
+    // waits for this thread before the request goes away.
+    let request = unsafe {
+        &mut *core::ptr::with_exposed_provenance_mut::<CommandThread<'_>>(context as usize)
+    };
+    (request.run)(request.console);
+
+    0
 }
 
 /// Prepare the registry, the call slots, and the executors; called once at

@@ -1,13 +1,12 @@
 //! PIX capture file (stock 0x91f98ef0) and resource capture file (stock
-//! 0x91f98ef4): opened through the drive table on the server thread,
-//! written with records `{type | 0x80000000, dwords + 2}` and their data.
+//! 0x91f98ef4): opened through the published drive table on the caller's
+//! thread, written with records `{type | 0x80000000, dwords + 2}` and
+//! their data.
 
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
-use openxbdm_server::Server;
-use openxbdm_server::commands::filesystem;
 use openxbdm_server::commands::filesystem::CreateRequest;
 use xbox360_sys::status::NtStatus;
 use xbox360_sys::xam;
@@ -24,10 +23,8 @@ use super::session;
 use super::session::EngineMessage;
 use super::status;
 use super::status::Status;
-use crate::backend::Console;
-use crate::backend::dispatcher;
+use crate::backend::filesystem;
 use crate::kernel;
-use crate::net::XamNetwork;
 
 /// Stock keeps -1 in the handle words while no file is open.
 const NO_FILE: u32 = u32::MAX;
@@ -81,13 +78,6 @@ struct ResourceBegin {
 #[repr(C)]
 struct ResourceEnd {
     notify: AtomicU32,
-}
-
-/// Request of [`open`] on the server thread.
-struct OpenRequest {
-    name: u32,
-    in_pix_directory: bool,
-    handle: u32,
 }
 
 pub(super) fn capture_file() -> Option<CaptureFile> {
@@ -159,38 +149,19 @@ pub(super) unsafe extern "C" fn plugin_write(data: u32, length: u32) {
     }
 }
 
-/// Open capture file `name` (stock 0x91f55180). A name without a drive
-/// goes to `E:\pix` when `in_pix_directory` is set or for
-/// `crashdump.pix2`, else to `D:`. `None` when it cannot be created.
+/// Open capture file `name` (stock 0x91f55180) on the caller's thread. A
+/// name without a drive goes to `E:\pix` when `in_pix_directory` is set or
+/// for `crashdump.pix2`, else to `D:`. `None` when it cannot be created.
 ///
 /// # Safety
 ///
 /// `name` must be a NUL-terminated string, not 0 (stock reads it without a
 /// check), that stays unchanged for the call.
 pub(super) unsafe fn open(name: u32, in_pix_directory: bool) -> Option<CaptureFile> {
-    let mut request = OpenRequest {
-        name,
-        in_pix_directory,
-        handle: NO_FILE,
-    };
-    dispatcher::call_on_server_with(&mut request, open_on_server)?;
-
-    Some(request.handle)
-        .filter(|&handle| handle != NO_FILE)
-        .map(CaptureFile)
-}
-
-fn open_on_server(
-    server: &mut Server,
-    console: &mut Console,
-    _network: &mut XamNetwork,
-    request: &mut OpenRequest,
-) -> u32 {
     const PATH_CAPACITY: usize = 0x104;
 
-    // SAFETY: `open` callers pass a NUL-terminated name, not 0 (stock reads
-    // it without a check), that outlives the synchronous server call.
-    let name = unsafe { kernel::c_string(request.name).unwrap_unchecked() };
+    // SAFETY: the caller's contract.
+    let name = unsafe { kernel::c_string(name).unwrap_unchecked() };
 
     let mut path = [0u8; PATH_CAPACITY];
     let mut length = 0;
@@ -204,12 +175,12 @@ fn open_on_server(
     if name.contains(&b':') {
         push(name);
     } else {
-        let directory: &[u8] =
-            if !request.in_pix_directory && !name.eq_ignore_ascii_case(b"crashdump.pix2") {
-                b"D:"
-            } else {
-                b"E:\\pix"
-            };
+        let directory: &[u8] = if !in_pix_directory && !name.eq_ignore_ascii_case(b"crashdump.pix2")
+        {
+            b"D:"
+        } else {
+            b"E:\\pix"
+        };
         let create = CreateRequest {
             access: AccessMask::SYNCHRONIZE.union(AccessMask::LIST_DIRECTORY),
             allocation_size: None,
@@ -219,8 +190,7 @@ fn open_on_server(
             options: CreateOptions::DIRECTORY_FILE.union(CreateOptions::SYNCHRONOUS_IO_NONALERT),
         };
         // The directory is created when missing; the open result is otherwise unused.
-        if let Ok(handle) = filesystem::open_translated(&server.state, console, directory, &create)
-        {
+        if let Ok(handle) = filesystem::open_translated(directory, &create) {
             // SAFETY: the handle was just opened and is not used again.
             unsafe { xboxkrnl::NtClose(Handle::from_raw(handle.0)) };
         }
@@ -243,8 +213,8 @@ fn open_on_server(
             .union(CreateOptions::SEQUENTIAL_ONLY),
     };
 
-    match filesystem::open_translated(&server.state, console, &path[..length], &create) {
-        Ok(handle) => request.handle = handle.0,
+    match filesystem::open_translated(&path[..length], &create) {
+        Ok(handle) => Some(CaptureFile(handle.0)),
         Err(_) => {
             let mut message = [0u8; 0x140];
             let prefix = b"Unable to open PIX capture file: \"";
@@ -256,10 +226,10 @@ fn open_on_server(
             }
             message[end..end + 2].copy_from_slice(b"\"\n");
             kernel::debug_print_bytes(&message[..end + 2]);
+
+            None
         }
     }
-
-    0
 }
 
 /// Monitor control code 0x53 (stock 0x91f56130): open the capture file and

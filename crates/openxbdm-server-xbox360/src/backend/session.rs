@@ -6,20 +6,22 @@
 //! the state they share with the commands is static and lock-protected.
 
 use core::sync::atomic::AtomicBool;
+use core::sync::atomic::AtomicU8;
+use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
+use core::time::Duration;
 
 use openxbdm_core::status::KernelError;
 use openxbdm_server::Server;
 use openxbdm_server::commands;
 use openxbdm_server::commands::filesystem::FileHandle;
 use openxbdm_server::commands::session::DEBUG_CAPTURE_SIZE;
+use openxbdm_server::commands::session::DebugCaptureRing;
 use openxbdm_server::commands::session::FastPipeBackend;
 use openxbdm_server::commands::session::FileEventId;
 use openxbdm_server::commands::session::ProcessorNumber;
-use openxbdm_server::notify::POSTED_TEXT_CAPACITY;
-use openxbdm_server::notify::PostedTexts;
-use xbox360::sync::SpinLock;
-use xbox360::thread::current_object;
+use openxbdm_server::text::Text;
+use xbox360::time::sleep;
 use xbox360_sys::image::XexExecutionInfo;
 use xbox360_sys::image::XexHeaderKey;
 use xbox360_sys::processor;
@@ -39,6 +41,7 @@ use xbox360_sys::xboxkrnl::XexExecutableModuleHandle;
 
 use self::notifications::send_notification;
 use self::notifications::unlink_title_notification_sessions;
+use self::posted::post_notification;
 use super::Console;
 use super::dispatcher;
 use crate::net::XamNetwork;
@@ -64,6 +67,7 @@ mod error;
 mod file_events;
 mod log_engine;
 mod notifications;
+mod posted;
 mod processors;
 mod rpc;
 mod swap;
@@ -79,23 +83,60 @@ static TITLE_TERMINATE: NotificationRegistration = NotificationRegistration::new
 /// runs it at its next pass.
 static TITLE_TERMINATED: AtomicBool = AtomicBool::new(false);
 
-/// Notification texts queued for the server thread.
-static POSTED: SpinLock<PostedTexts> = SpinLock::new(PostedTexts::new());
+/// The debug capture ring as the producers find it (stock 0x91f9fdb0 and
+/// 0x91f9fdb4).
+static DEBUG_CAPTURE: DebugCaptureSlot = DebugCaptureSlot {
+    address: AtomicU32::new(0),
+    write: AtomicU32::new(0),
+    producers: AtomicU32::new(0),
+};
+
+struct DebugCaptureSlot {
+    /// Pool block of the ring; 0 while capture is off.
+    address: AtomicU32,
+    write: AtomicU32,
+    /// Producers that may hold `address`. Stock keeps no count, and its
+    /// producer can write into a block `dbgprint stop` freed.
+    producers: AtomicU32,
+}
 
 /// Platform state of this domain owned by the server thread.
 pub struct Data {
-    /// Address of the debug capture ring.
-    debug_capture: Option<u32>,
     processors: processors::Data,
 }
 
 impl Data {
     pub const fn new() -> Self {
         Self {
-            debug_capture: None,
             processors: processors::Data::new(),
         }
     }
+}
+
+/// Stock producer 0x91f3ebb0: append `message` to the debug capture ring
+/// from any thread at any IRQL; nothing while capture is off. Reservation
+/// failures go to DbgPrint.
+pub(crate) fn debug_capture_print(message: &[u8]) {
+    let slot = &DEBUG_CAPTURE;
+    slot.producers.fetch_add(1, Ordering::SeqCst);
+
+    let address = slot.address.load(Ordering::SeqCst);
+    if address != 0 {
+        // SAFETY: the block is DEBUG_CAPTURE_SIZE bytes, and
+        // `free_debug_capture` frees it only after this producer leaves.
+        let bytes = unsafe { &*(address as usize as *const [AtomicU8; DEBUG_CAPTURE_SIZE]) };
+        let ring = DebugCaptureRing {
+            bytes,
+            write: &slot.write,
+        };
+        ring.print(message, &mut |event| {
+            let mut text = Text::<0x50>::new();
+            let _ = event.write_text(&mut text);
+            crate::kernel::debug_print_bytes(text.as_bytes());
+        });
+    }
+
+    slot.producers.fetch_sub(1, Ordering::SeqCst);
 }
 
 impl commands::session::Backend for Console {
@@ -104,34 +145,58 @@ impl commands::session::Backend for Console {
         const DEBUG_CAPTURE_POOL: PoolType = PoolType::System;
 
         // SAFETY: the allocation takes only a size, tag and pool type.
-        match unsafe {
+        let address = unsafe {
             xboxkrnl::ExAllocatePoolTypeWithTag(
                 DEBUG_CAPTURE_SIZE as u32,
                 crate::kernel::pool_tag::BUFFER,
                 DEBUG_CAPTURE_POOL,
             )
-        } {
-            0 => false,
-            address => {
-                self.session.debug_capture = Some(address);
-                true
-            }
+        };
+        if address == 0 {
+            return false;
         }
+
+        // SAFETY: the block is DEBUG_CAPTURE_SIZE bytes and not yet
+        // published.
+        unsafe { *(address as usize as *mut u8) = 0 };
+        DEBUG_CAPTURE.write.store(0, Ordering::SeqCst);
+        DEBUG_CAPTURE.address.store(address, Ordering::SeqCst);
+
+        true
     }
 
     fn free_debug_capture(&mut self) {
-        if let Some(address) = self.session.debug_capture.take() {
-            // SAFETY: `address` is the ring allocated by `allocate_debug_capture`.
+        /// Wait between checks for producers still writing; a producer
+        /// at passive level may need this processor to finish.
+        const PRODUCER_WAIT: Duration = Duration::from_millis(1);
+
+        let address = DEBUG_CAPTURE.address.swap(0, Ordering::SeqCst);
+        if address != 0 {
+            while DEBUG_CAPTURE.producers.load(Ordering::SeqCst) != 0 {
+                sleep(PRODUCER_WAIT);
+            }
+
+            // SAFETY: `address` is the ring allocated by
+            // `allocate_debug_capture`; no producer holds it.
             unsafe { xboxkrnl::ExFreePool(address) };
         }
+        DEBUG_CAPTURE.write.store(0, Ordering::SeqCst);
     }
 
-    fn debug_capture(&mut self) -> Option<&mut [u8; DEBUG_CAPTURE_SIZE]> {
-        let address = self.session.debug_capture?;
+    fn debug_capture(&mut self) -> Option<DebugCaptureRing<'_>> {
+        let address = DEBUG_CAPTURE.address.load(Ordering::SeqCst);
+        if address == 0 {
+            return None;
+        }
 
-        // SAFETY: the pool block is DEBUG_CAPTURE_SIZE bytes, owned by this
-        // backend until freed, and borrowed through `&mut self`.
-        Some(unsafe { &mut *(address as usize as *mut [u8; DEBUG_CAPTURE_SIZE]) })
+        // SAFETY: the block is DEBUG_CAPTURE_SIZE bytes; only
+        // `free_debug_capture`, which takes `&mut self`, frees it.
+        let bytes = unsafe { &*(address as usize as *const [AtomicU8; DEBUG_CAPTURE_SIZE]) };
+
+        Some(DebugCaptureRing {
+            bytes,
+            write: &DEBUG_CAPTURE.write,
+        })
     }
 
     fn current_processor(&mut self) -> ProcessorNumber {
@@ -179,8 +244,8 @@ impl commands::session::Backend for Console {
         file_events::switch(enable)
     }
 
-    fn next_posted_notification(&mut self, text: &mut [u8; POSTED_TEXT_CAPACITY]) -> Option<usize> {
-        POSTED.lock().pop(text)
+    fn send_next_posted_notification(&mut self, send: &mut dyn FnMut(&[u8])) -> bool {
+        posted::send_next(send)
     }
 
     fn notify_sessions(&mut self, event: &openxbdm_server::notify::Event<'_>) {
@@ -198,12 +263,6 @@ impl FastPipeBackend for Console {
         // SAFETY: the call takes only a cache number and count.
         unsafe { FscSetCacheElementCount(PIPE_CACHE, count) };
     }
-}
-
-/// A text whose poster waits for the server thread to send it.
-struct WaitingText {
-    address: u32,
-    length: u32,
 }
 
 fn passive() -> bool {
@@ -243,12 +302,14 @@ pub(crate) fn initialize() {
     }
 }
 
-/// Undo the registration of [`initialize`] before the image unloads.
+/// Undo the registration of [`initialize`] and free the kept notification
+/// texts before the image unloads; the server has stopped.
 pub(crate) fn uninstall() {
     if TITLE_TERMINATE.routine.load(Ordering::Relaxed) != 0 {
         // SAFETY: the static record registered by `initialize`.
         unsafe { ExRegisterTitleTerminateNotification(TITLE_TERMINATE.as_ptr(), false) };
     }
+    posted::discard_kept();
 }
 
 // The kernel calls the routine with the console ABI.
@@ -308,51 +369,6 @@ fn current_title_id() -> u32 {
         None => 0,
         Some(info) => info.title_id,
     }
-}
-
-/// Send a notification text to every notification channel. The server
-/// thread sends it on its next pass; a text longer than a queue slot, or
-/// one that finds the queue full, is sent by the server thread while the
-/// caller waits. The server thread itself and the log worker (which the
-/// server may be waiting for) cannot wait and lose such a text. Returns
-/// whether the text was queued or sent.
-pub(crate) fn post_notification(text: &[u8]) -> bool {
-    if POSTED.lock().push(text) {
-        return true;
-    }
-
-    if tell_log::worker().is_some_and(|worker| worker.get() == current_object().id().raw()) {
-        return false;
-    }
-
-    let mut request = WaitingText {
-        address: text.as_ptr() as usize as u32,
-        length: text.len() as u32,
-    };
-
-    dispatcher::call_on_server_with(&mut request, send_waiting_text).is_some()
-}
-
-/// Server-thread part of [`post_notification`]; queued texts go first.
-fn send_waiting_text(
-    server: &mut Server,
-    console: &mut Console,
-    network: &mut XamNetwork,
-    request: &mut WaitingText,
-) -> u32 {
-    server.drain_posted_notifications(console, network);
-
-    // SAFETY: the poster waits in `call_on_server_with` while its text is
-    // alive.
-    let text = unsafe {
-        core::slice::from_raw_parts(
-            request.address as usize as *const u8,
-            request.length as usize,
-        )
-    };
-    server.state.notifications.send_text(text, network);
-
-    0
 }
 
 /// Monitor control code 0xa9 (stock case 0x91f3bb08): export 36 with the

@@ -2,9 +2,7 @@ use core::mem::size_of;
 use core::sync::atomic::AtomicU8;
 use core::sync::atomic::Ordering;
 
-use openxbdm_server::Server;
 use openxbdm_server::commands::filesystem::CreateRequest;
-use openxbdm_server::commands::filesystem::ObjectPath;
 use xbox360::status::set_last_error;
 use xbox360_sys::status::NtStatus;
 use xbox360_sys::status::Severity;
@@ -19,18 +17,9 @@ use xbox360_sys::xboxkrnl::IoStatusBlock;
 use xbox360_sys::xboxkrnl::ProcessorMode;
 use xbox360_sys::xboxkrnl::ShareAccess;
 
-use crate::backend::Console;
-use crate::backend::dispatcher;
 use crate::backend::filesystem;
-use crate::net::XamNetwork;
 
 const FILE_NAME_SIZE: usize = 0x100;
-
-/// Request of [`translate_on_server`].
-struct Translation<'a> {
-    name: &'a [u8],
-    path: Option<ObjectPath>,
-}
 
 /// The session file name, NUL-padded.
 static FILE_NAME: [AtomicU8; FILE_NAME_SIZE] = [const { AtomicU8::new(0) }; FILE_NAME_SIZE];
@@ -66,28 +55,11 @@ pub(super) fn set_file_name(name: &[u8]) {
     }
 }
 
-fn translate_on_server(
-    server: &mut Server,
-    console: &mut Console,
-    _network: &mut XamNetwork,
-    request: &mut Translation<'_>,
-) -> u32 {
-    request.path = server
-        .state
-        .filesystem
-        .drives
-        .translate(console, request.name);
-
-    0
-}
-
-/// Open a drive path (stock 0x91f2eb68). The drive table is server state,
-/// so the name is translated on the server thread; a name that does not
-/// translate fails, where stock would use an uninitialized handle.
+/// Open a drive path (stock 0x91f2eb68), translated on the caller's
+/// thread; a name that does not translate fails, where stock would use an
+/// uninitialized handle.
 pub(super) fn open(name: &[u8], request: &CreateRequest) -> Option<u32> {
-    let mut translation = Translation { name, path: None };
-    dispatcher::call_on_server_with(&mut translation, translate_on_server)?;
-    filesystem::create_file(translation.path?.as_bytes(), request)
+    filesystem::open_translated(name, request)
         .ok()
         .map(|handle| handle.0)
 }

@@ -19,10 +19,8 @@ use core::time::Duration;
 
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
-use openxbdm_server::Server;
 use openxbdm_server::commands::console::TraceMask;
 use openxbdm_server::commands::filesystem::Backend as _;
-use openxbdm_server::commands::session::debug_capture_print;
 use openxbdm_server::text::Text;
 use xbox360::console::hardware_flags;
 use xbox360::console::kernel_version;
@@ -79,12 +77,9 @@ const HOTPLUG_INSERTED: SataHotplug = SataHotplug::from_bits_retain(0x20);
 const REINIT_DELAY_TICKS: u8 = 3;
 const TICK_MILLISECONDS: u32 = 100;
 
-/// Longest text of the stock trace producer (0x91f3ebb0).
+/// Longest text of the stock trace producer (0x91f3ebb0), which formats
+/// into a 0x230-byte buffer.
 const TRACE_TEXT_CAPACITY: usize = 0x1ff;
-
-/// Trace texts that can wait for the server thread; a text is dropped
-/// while every slot is taken.
-const TRACE_SLOTS: usize = 16;
 
 /// Hot-plug DPC (stock 0x91f9fdc4).
 static HOTPLUG_DPC: Kdpc = Kdpc::new();
@@ -122,14 +117,6 @@ static DVD_EMULATOR_STATE: AtomicU32 = AtomicU32::new(0);
 static DRIVE_REINITIALIZED: AtomicBool = AtomicBool::new(false);
 /// SMC notification registration (stock 0x91f97454).
 static TRAY_REGISTRATION: NotificationRegistration = NotificationRegistration::new();
-static TRACE: TraceQueue = TraceQueue {
-    lock: KspinLock::new(),
-    ring: UnsafeCell::new(TraceRing {
-        traces: [Trace::UpdatingDriver; TRACE_SLOTS],
-        first: 0,
-        count: 0,
-    }),
-};
 
 /// The kernel's channel extension of the CD-ROM SATA channel. The kernel's
 /// interrupt routine, DPCs and timer use it concurrently, so every field is
@@ -204,6 +191,14 @@ impl ChannelExtension {
         Irql::new(self.irql.load(Ordering::Relaxed))
     }
 
+    /// The channel's SATA registers, at the address the extension holds;
+    /// read on every use, as stock reads it.
+    fn sata_registers(&self) -> &'static SataRegisters {
+        // SAFETY: the kernel keeps the address of the channel's mapped
+        // registers in the extension while the system runs.
+        unsafe { sata_registers(self.registers.load(Ordering::Relaxed)) }
+    }
+
     /// Take the channel lock at the channel IRQL from `expected` IRQL.
     fn lock(&self, expected: Irql) -> ChannelLock<'_> {
         check(current_irql() == expected);
@@ -217,6 +212,15 @@ impl ChannelExtension {
 
         ChannelLock(self)
     }
+}
+
+/// # Safety
+///
+/// `address` must be the mapped register block of a SATA channel, which the
+/// kernel keeps mapped while the system runs.
+unsafe fn sata_registers(address: u32) -> &'static SataRegisters {
+    // SAFETY: guaranteed by the caller.
+    unsafe { &*core::ptr::with_exposed_provenance(address as usize) }
 }
 
 /// The `KDPC` of the channel. Word 4, the deferred context in Xenia's
@@ -370,8 +374,7 @@ struct Inquiry {
 }
 
 /// A text of the stock trace producer (0x91f3ebb0) with the values it
-/// prints. The server thread formats it, so the producer, which may run
-/// above dispatch level, stores only the values.
+/// prints.
 #[derive(Clone, Copy)]
 enum Trace {
     UpdatingDriver,
@@ -550,83 +553,6 @@ impl Trace {
     }
 }
 
-/// Traces waiting for the server thread, which appends their texts to the
-/// debug capture ring.
-struct TraceQueue {
-    lock: KspinLock,
-    ring: UnsafeCell<TraceRing>,
-}
-
-// SAFETY: every access to `ring` holds the spin lock.
-unsafe impl Sync for TraceQueue {}
-
-impl TraceQueue {
-    /// Queue `trace`; it is dropped when the queue is full. Above dispatch
-    /// level the producer may have interrupted the lock holder, so it only
-    /// tries the lock.
-    fn push(&self, trace: Trace) {
-        let lock = self.lock.as_ptr();
-        let irql = current_irql();
-
-        // SAFETY: `lock` is the queue's spin lock, which starts released.
-        let previous = unsafe {
-            if irql < Irql::DISPATCH {
-                Some(xboxkrnl::KfAcquireSpinLock(lock))
-            } else if irql == Irql::DISPATCH {
-                xboxkrnl::KeAcquireSpinLockAtRaisedIrql(lock);
-                None
-            } else if xboxkrnl::KeTryToAcquireSpinLockAtRaisedIrql(lock).get() {
-                None
-            } else {
-                return;
-            }
-        };
-
-        // SAFETY: the spin lock is held.
-        let ring = unsafe { &mut *self.ring.get() };
-        if ring.count < TRACE_SLOTS {
-            ring.traces[(ring.first + ring.count) % TRACE_SLOTS] = trace;
-            ring.count += 1;
-        }
-
-        // SAFETY: this thread holds `lock`, taken above in the mode `previous` records.
-        unsafe {
-            match previous {
-                Some(previous) => xboxkrnl::KfReleaseSpinLock(lock, previous),
-                None => xboxkrnl::KeReleaseSpinLockFromRaisedIrql(lock),
-            }
-        };
-    }
-
-    /// Take the oldest trace; called on the server thread.
-    fn pop(&self) -> Option<Trace> {
-        let lock = self.lock.as_ptr();
-
-        // SAFETY: `lock` is the queue's spin lock.
-        let previous = unsafe { xboxkrnl::KfAcquireSpinLock(lock) };
-
-        // SAFETY: the spin lock is held.
-        let ring = unsafe { &mut *self.ring.get() };
-        let trace = (ring.count != 0).then(|| {
-            let trace = ring.traces[ring.first];
-            ring.first = (ring.first + 1) % TRACE_SLOTS;
-            ring.count -= 1;
-            trace
-        });
-
-        // SAFETY: this thread acquired `lock` above.
-        unsafe { xboxkrnl::KfReleaseSpinLock(lock, previous) };
-
-        trace
-    }
-}
-
-struct TraceRing {
-    traces: [Trace; TRACE_SLOTS],
-    first: usize,
-    count: usize,
-}
-
 /// A kernel device object that stays allocated while the system runs.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Device(u32);
@@ -692,7 +618,9 @@ impl Irp {
 
 /// Stock trace producer 0x91f3ebb0.
 fn trace(trace: Trace) {
-    TRACE.push(trace);
+    let mut text = Text::<TRACE_TEXT_CAPACITY>::new();
+    trace.write(&mut text);
+    super::session::debug_capture_print(text.as_bytes());
 }
 
 fn processor() -> u8 {
@@ -1001,7 +929,9 @@ extern "C" fn interrupt_hook(interrupt: u32, registers: u32) -> u32 {
         unsafe { ChannelExtension::at(interrupt - offset_of!(ChannelExtension, interrupt) as u32) };
     check(registers as usize == SataRegisters::CDROM_ADDRESS);
 
-    let sata = SataRegisters::cdrom();
+    // SAFETY: the kernel passes the registers of the hooked channel; the
+    // check above traps on any other address.
+    let sata = unsafe { sata_registers(registers) };
     let device_status = sata.status();
     let hotplug = sata.hotplug();
     if hotplug.contains(SataHotplug::INTERRUPT)
@@ -1043,6 +973,7 @@ extern "C" fn hotplug_dpc(_dpc: u32, device: u32, channel: u32, hotplug: u32) {
     // and `initialize` gave it the channel's device as its context.
     let (channel, device) =
         unsafe { (ChannelExtension::at(channel), Device::from_address(device)) };
+    let registers = channel.sata_registers();
 
     let hotplug = SataHotplug::from_bits_retain(hotplug);
     let acknowledge = hotplug.difference(HOTPLUG_REMOVED.union(HOTPLUG_INSERTED));
@@ -1056,11 +987,8 @@ extern "C" fn hotplug_dpc(_dpc: u32, device: u32, channel: u32, hotplug: u32) {
         acknowledge.union(HOTPLUG_INSERTED)
     };
 
-    // Deviation: stock reloads the register address from the channel
-    // extension (`registers`). `find_channel` checked that it is
-    // `SataRegisters::CDROM_ADDRESS`, so the constant replaces the load.
     // SAFETY: the hot-plug register makes the device write no memory.
-    unsafe { SataRegisters::cdrom().write_hotplug(acknowledge) };
+    unsafe { registers.write_hotplug(acknowledge) };
 }
 
 fn queue_reinitialize(device: Device, channel: &ChannelExtension) {
@@ -1252,9 +1180,7 @@ extern "C" fn start_reinitialize(channel: u32) {
     // SAFETY: the channel timer passes its channel extension.
     let channel = unsafe { ChannelExtension::at(channel) };
     let device = channel.device();
-    // Deviation: stock loads the register address from the channel
-    // extension; the constant replaces the load, as in `hotplug_dpc`.
-    let registers = SataRegisters::cdrom();
+    let registers = channel.sata_registers();
 
     trace(Trace::StartReinitialize {
         processor: processor(),
@@ -1556,19 +1482,12 @@ extern "C" fn tray_notification(_registration: u32, message: *const SmcMessage) 
     }
 }
 
-/// Server-thread part, run on every pass: append the queued trace texts to
-/// the debug capture ring (dropped while capture is off), then complete a
-/// finished reinitialization as the stock server loop does (0x91f510c4).
-pub(crate) fn drain(server: &mut Server, console: &mut Console) {
+/// Server-thread part, run on every pass: complete a finished
+/// reinitialization as the stock server loop does (0x91f510c4).
+pub(crate) fn drain(console: &mut Console) {
     /// SMC message the server thread sends after a reinitialization; its
     /// meaning is unknown.
     const SMC_REINITIALIZED: [u8; 2] = [0x8b, 0x66];
-
-    while let Some(trace) = TRACE.pop() {
-        let mut text = Text::<TRACE_TEXT_CAPACITY>::new();
-        trace.write(&mut text);
-        debug_capture_print(&mut server.state, console, text.as_bytes());
-    }
 
     if DRIVE_REINITIALIZED.swap(false, Ordering::AcqRel) {
         let mut message = SmcMessage::default();

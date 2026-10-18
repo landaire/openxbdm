@@ -7,10 +7,10 @@ Stock XBDM 2.0.21256.0. Server: `crates/openxbdm-server/src/commands/session.rs`
 | Command | Handler | Status |
 | --- | --- | --- |
 | bye | 0x91f43450 | done |
-| dbgprint | 0x91f3eee8, continuation 0x91f3ee18, reader 0x91f3ed28, producer 0x91f3ebb0 | done; no producer texts (see gaps) |
+| dbgprint | 0x91f3eee8, continuation 0x91f3ee18, reader 0x91f3ed28, producer 0x91f3ebb0 | done; producer texts written directly by the DMSATA routines (dvd_hotplug.rs) |
 | dedicate | 0x91f51838, routine 0x91f51640 | done |
 | dmtelllog | 0x91f4e870, start 0x91f51b30, stop 0x91f51c60, writer 0x91f51938, producer 0x91f51d58; log engine exports 355..364 | done |
-| fastpipe | 0x91f44038, 0x91f540c0, slots 0x91f53f70, data plane 0x91f52720..0x91f54134 | done; stock defects not reproduced |
+| fastpipe | 0x91f44038, 0x91f540c0, slots 0x91f53f70, data plane 0x91f52720..0x91f54134 | done; stock defects are deviations |
 | fileevent | 0x91f4e7f8, exports 152 (0x91f2f428) and 153 (0x91f2f4c0) | done |
 | notify | 0x91f44268, registration 0x91f3cfe0 | done |
 | notifyat | 0x91f441e8, worker 0x91f3c308, address parser 0x91f41b80 | done |
@@ -25,7 +25,10 @@ Stock XBDM 2.0.21256.0. Server: `crates/openxbdm-server/src/commands/session.rs`
 - Add target 0x91f3c0d8 `(addr, port, flags, reverse, socket)`: binds to an existing entry with the same address and port and no socket only when port != 0 and a socket is given. A new entry that is neither reverse nor given a socket connects blocking (0x91f3bed8) and sends the execution line. Failure clears the entry, closes the created socket and drops (addr, port). Debugger globals (0x91f9fef8, read by control code 0x0a) are set only on success.
 - Add socket 0x91f3be18: when all 16 slots are full, a `null` line (type 0) goes to every channel through 0x91f39688, failing channels are pruned, and the allocation is retried once. With 16 live channels the 17th request fails with `400- notification limit exceeded` after the `null` lines.
 - Per-socket send 0x91f389e0: FIONREAD drain (0x91f388a8), select writable for 60 s, send the line. Failure closes the socket and frees targets bound to its slot.
-- Drop 0x91f38b60: matches entries by (addr, port), including freed entries that keep stale port and slot fields.
+- Debug strings 0x91f38ce8 (`debugstr`, `assert`; skipped above passive level, PCR +0x18): no input drain. Each piece is one `WSASend` of four buffers (prefix, `<eol>string=`, piece, CR LF) under the channel lock. Before every send call `select` waits up to 3 s for the socket to become writable; a timeout ends the string for that channel, which stays open and may hold a partial line; a `select` error still sends. A partial send consumes the buffers and waits again. A failed send closes the socket and frees the targets bound to its slot. openxbdm: `deliver_string`/`send_gathered` in `notify.rs`.
+- Input drain 0x91f38940, called after every successful `select` of the server loop (0x91f5106c): when the tick count (`KeTimeStampBundle` +0x10) is at least 120000 ms (signed difference) past the last drain, or on the first pass, 0x91f388a8 runs for every channel. openxbdm: `Notifications::drain_input` from `Server::poll_timers`.
+- Target table 0x91fadb00 (16 entries `{addr, port, flags, slot}`, zero at load): an entry is free when its address is 0. Freeing (send failure, drop, add failure, persistent connect failure) clears only the address; port and slot stay. Close all 0x91f3b208 closes the sockets and leaves the slots of the targets.
+- Drop 0x91f38b60 `(addr, port)`: every entry with that address and port is freed, and when its slot is not negative the socket in that slot is closed and the slot emptied; other targets bound to the slot keep it. An invalid `addr=` parses as 0 (0x91f41b80), so `notifyat port=P addr=x drop` takes free entries whose kept port is P and closes whatever socket now holds their kept slot; P = 0 takes the entries never used (slot 0). openxbdm keeps free entries as `TargetEntry::Free { port, socket_slot }`.
 - Settings line 0x91f38ac8: `notifyat addr=%d.%d.%d.%d port=%d%s` with address bytes 3, 2, 1, 0 and suffix ` reverse` for flag 0x40000. The parser 0x91f41b80 also stores octets reversed, so a saved line restores the same target. From the settings file 0x91f311b8 calls 0x91f3c308(-1, line, 1): the target is stored as reverse and not connected.
 - Persistent targets 0x91f3c440 (called from dminit 0x91f32628): non-reverse targets get a non-blocking connect; within a 30 s total wait a writable socket is set blocking, sent `hello` and registered. Timeout or `hello` failure drops the target. Reverse targets wait for `notify reconnectport=` within the same window and are dropped afterwards. The settings file is rewritten. openxbdm: `connect_persistent_targets` and `expire_reverse_targets`.
 
@@ -33,10 +36,10 @@ Stock XBDM 2.0.21256.0. Server: `crates/openxbdm-server/src/commands/session.rs`
 
 - UDP port 730.
 - Request type 3 (identify): always answered.
-- Request type 1 (lookup): byte 1 is the name length, followed by the name. Answered only when the name equals the debug name, compared case-insensitively.
+- Request type 1 (lookup): byte 1 is the name length L, followed by the name; the datagram must be exactly L + 2 bytes and L nonzero. The name is terminated at L and compared with 0x91f41148 (case-insensitive, L characters), then byte L of the name buffer 0x91fab9c0 must be 0. A name with an embedded NUL therefore matches by its text before the NUL.
 - Reply: `02 len name` with the console's own spelling of the name.
 - Request bit 0x80: the reply goes to the broadcast address instead of the sender.
-- openxbdm: `answer_discovery`/`discovery_reply`; host `SharedHost::serve_discovery`. The client accepts a reply whose name matches ignoring ASCII case.
+- openxbdm: `answer_discovery`/`discovery_reply`; host `SharedHost::serve_discovery`. Bytes of the name buffer past the name read as 0 (see Deviations). The client accepts a reply whose name matches ignoring ASCII case.
 
 ## Monitor control codes
 
@@ -58,10 +61,10 @@ The critical section trace line format is `%c:%c 0x%016I64x 0x%08x 0x%08x 0x%08x
 
 ## Posted notification queue
 
-- `notify::PostedTexts`: 16 slots of 0x200 bytes, FIFO; texts longer than 0x200 bytes are cut.
-- Producers: control codes 0x64, 0x65 and 0xa9 and exports 152..160 on the Xbox (`backend::session::post_notification`); `MockBackend::post_notification` on the host.
+- `notify::PostedTexts`: 16 slots of 0x200 bytes, FIFO.
+- Producers: control codes 0x64, 0x65 and 0xa9 and exports 152..160 on the Xbox (`backend/session/posted.rs`); `MockBackend::post_notification` on the host.
 - Consumer: the server thread drains the queue on every pass of its select loop (at most 20 ms per pass) and before `fileevent` sends Start/Stop. Host: the timer thread, every 50 ms.
-- Full queue: a passive-level thread other than the server thread sleeps 10 ms and retries; the server thread or a caller above passive level loses the text.
+- A text that does not fit (queue full or longer than 0x200 bytes): a passive-level thread other than the server thread has the server thread send it while it waits (`dispatcher::call_on_server`), after the waiting texts. A poster that cannot wait copies the text into a pool block (tag `xbdm`) kept after the queue: the server thread, the log worker, any thread while the server thread waits for a dispatch flag 0x4 command thread (`parity/debugger.md`), and a poster whose request the server refused while it still serves. While any is kept new texts are kept too, so the order holds. Stock export 36 sends in the posting thread and loses no text; openxbdm loses one only when that pool allocation fails or the server stopped. The texts of a flag 0x4 command window reach the channels after its reply. The host keeps such texts in `posted_kept`.
 - Ordering: stock sends in the producing thread before the file operation proceeds. openxbdm sends later on the server thread, so a notification can follow command replies and other channel traffic produced in the meantime.
 
 ## Xbox imports added
@@ -94,10 +97,12 @@ Reused from other domains: KeResumeThread, RtlImageXexHeaderField, NtQueryInform
 - Exports 76 (stores 0x91fadd20, never read), 370 (loads 0x91fa3afc), 371 (exchanges it), 372 (control code 0xa8).
 - Title termination (0x91f3c9b0, from 0x91f32398) unlinks title sessions without freeing them and refreshes the hooks of kinds 2..=0x17.
 - Deviations: export 24 with kind 0 and a handler loops forever in stock with the lock held at IRQL 2; openxbdm removes the handler from the kind-1 list once and returns. The kind-6 record fields that stock leaves uninitialized are zero. Session handlers run on the server thread when the debugger delivers the event, not on the thread that raised it.
+- Host: `Mock::session_handlers` are closures run newest first for every event before its line goes out (`MockBackend::notify_sessions`).
 
 ## File event exports (152..160)
 
-- Xbox: `backend/session/file_events.rs` (with control codes 0x64/0x65); texts in `commands/session/fileevent.rs`. State: `FILE_EVENTS` (sequence 0x91f9735c, suppressed title 0x91f9f62c/0x91f9f630) under a spin lock in place of critical section 0x91fae520, enable flag 0x91f9f628 as an atomic read without the lock.
+- Xbox: `backend/session/file_events.rs` (with control codes 0x64/0x65); texts in `commands/session/fileevent.rs`, with the operation classes (`FileOperationClass`), mode flags (`file_mode_flags`) and title rules (`FileEventTitles`) both backends use. State: `FILE_EVENTS` (sequence 0x91f9735c, suppressed title 0x91f9f62c/0x91f9f630) under a spin lock in place of critical section 0x91fae520, enable flag 0x91f9f628 as an atomic read without the lock.
+- Host: `MockBackend::file_operation` runs codes 0x64 and 0x65 around a `MockFileOperation` (title, thread, operation, handle, path, offset, position, length, options, status) and posts the texts.
 - `fileevent` and exports 152/153 share `file_events::switch` (Xbox) and `format_file_event_switch`; the command sends its text directly on the server thread, the exports through export 36.
 - Sequence: stock's skip of 0 never fires (64-bit `addic.` compare), so the sequence wraps from 0xffffffff to 0; openxbdm (`FileEventId::next`) does the same.
 - Stock sends Start/Stop while holding the critical section; openxbdm sends after releasing the spin lock (export 36 cannot run at the raised IRQL). Start/Stop from concurrent exports can reach the channels in the opposite order of their sequence numbers.
@@ -127,13 +132,19 @@ Reused from other domains: KeResumeThread, RtlImageXexHeaderField, NtQueryInform
 - Differences in thread structure: the server thread does the socket I/O of every connection; the other threads run only the handler and continuation calls. A call that has not ended after 20 ms continues in the background; the server keeps servicing other connections and requests (so handlers can use exports that need the server thread) and finishes the connection's step when the call ends. Handlers of system processors run on the server thread as in stock; exports that need the server thread are unavailable to them.
 - The title command thread exits after 30 s without a title-owned connection; a dedicated thread exits when its connection closes or changes owner. A call still running for a connection that closed keeps its slot until it ends; a new connection in that slot gets `422- dedicated connection required` for processor commands meanwhile.
 
+## Deviations
+
+Stock behavior that faults, hangs or uses freed memory; openxbdm does not reproduce it.
+
+- dbgprint reader 0x91f3ed28: the restart flag is toggled at 0x91f3edd0 and tested at 0x91f3ede4. After a restart, a scan from the ring start that meets a NUL at or before the write offset (normally the end of the newest message) with no LF and fewer than 0x100 bytes keeps the flag set and loops back to the same NUL: the server thread spins until a producer writes a byte there, and hangs when no more output comes. openxbdm ends the stream and leaves the read cursor at the ring start, so the next `dbgprint` returns the record from the ring start, as stock does once released.
+- dbgprint: `dbgprint stop` waits for producers still writing before it frees the ring; the stock producer can write into the freed block (0x91f3ecf0 reloads the address).
+- rpc argument copies (0x91f3e708, 0x91f3e724): `memcpy` of n integer and m double qwords to 8-slot arrays at +0xa0 and +0xe0 of the 0x140-byte frame of 0x91f3e630. Integers 9..16 land in the double slots, which openxbdm keeps; a 17th integer or a 9th double overwrites the saved r29..r31 and LR at +0x120..+0x13f and further ones the caller's frame. openxbdm copies at most 16 integers and 8 doubles.
+- rpc call block: the runner 0x91f3e630 sets the done flag (+0x60) before it stores the result (+0x68), 0x91f3e7b0..0x91f3e7bc, and the stream 0x91f3e460 frees the block when it ends (0x91f3e4f4..0x91f3e518) without waiting for the runner, so for a named thread the result store can land in freed pool. openxbdm frees the block when the last of the runner and the stream releases it and keeps the store order.
+- fastpipe slot -1: 0x91f53f70 starts the free index at -1 and stores socket and group through it (0x91f5404c..0x91f5405c) when all six slots hold the requesting group, that is 0x3c bytes before the table 0x91fab800. openxbdm replies `400- fastpipe limit exceeded`.
+- fastpipe first read: when 0x91f537c0 cannot allocate the read buffer (0x91f52810, 0x8007000e) or `WSARecv` fails other than pending, 0x91f53f70 returns 0 (0x91f54098..0x91f540a0) and the handler replies `400- fastpipe limit exceeded` on a connection that keeps the socket. After an allocation failure the slot keeps the same socket (two owners; a group close later closes it under the connection), after a `WSARecv` failure 0x91f535d0 has already closed it. openxbdm allocates the buffer before it takes a slot and fails without a slot.
+- fastpipe later reads: the worker re-posts the read after each packet (0x91f53dc8..0x91f53de0). When the buffer allocation fails nothing posts it again (the slot +0x20 flag and the counter 0x91fab7f0 set at 0x91f53808..0x91f53834 are never read), so the pipe neither reads nor closes until another pipe of its group closes. openxbdm closes the pipe.
+- Discovery lookup: byte L of the name buffer is tested after the compare. For an embedded NUL it lies past the name: up to offset 0x14 it holds what `dbgname` copied from its uninitialized stack buffer (`memcpy` of 0x15 bytes, 0x91f514fc; `DmSetXboxName` 0x91f513f4 pads with zeros), from 0x15 on bytes after the buffer (the connection table starts at 0x91fab9e0). openxbdm treats every byte past the name as 0.
+
 ## Remaining gaps
 
-- Posted notification texts: texts up to 0x200 bytes are queued; longer texts, or texts finding the queue full, are sent by the server thread while the poster waits (`dispatcher::call_on_server`). The server thread and the log worker lose a text that does not fit. Queued texts are sent after the producing operation; ordering against debug events and server requests of the same thread is kept by draining the queue first.
-- dbgprint: the reader's endless loop after a ring restart is not reproduced. No code emits the producer texts (CD-ROM / SATA patch routines 0x91f40088, 0x91f3f518, 0x91f3f180, 0x91f3f2d0, 0x91f3f6f0, 0x91f3fcd0, 0x91f3fd34, 0x91f3fe50, 0x91f3ffc4 are not implemented).
-- `notifyat drop` with an invalid address does not match stale freed entries.
-- Debug string delivery (0x91f38ce8) uses a 3 s writable wait that skips (not closes) a slow channel, and drains input of all channels every 120 s (0x91f38940); notify.rs `deliver_string` keeps the 60 s wait.
-- rpc: argument copies are limited to the 16 register slots (stock overruns its frame). The call block is freed by the last of the runner and the stream.
-- fastpipe: the slot[-1] write, double socket ownership, and the stalled pipe after a read buffer allocation failure (openxbdm closes the pipe) are not reproduced.
-- A discovery lookup name with an embedded NUL is not matched.
-- The host mock generates no 0x64/0x65 file events and runs no notification session handlers.
+None.

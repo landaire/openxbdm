@@ -5,6 +5,8 @@ use openxbdm_core::status::KernelError;
 use super::CreateRequest;
 use super::FileHandle;
 use crate::commands::console;
+use crate::commands::console::MessageText;
+use crate::commands::console::Published;
 use crate::commands::console::TraceMask;
 use crate::commands::memory::PAGE_SIZE;
 use crate::state::ServerState;
@@ -161,6 +163,46 @@ const INTERNAL_DRIVES: &[(&[u8], &[u8], bool)] = &[
     ),
 ];
 
+/// Services drive path translation uses (0x91f2e888, 0x91f2e750). They hold
+/// no server state, so a published drive table translates on any thread at
+/// passive level.
+pub trait PathServices {
+    /// `length` bytes of target memory at `address`, or `None` when part of
+    /// the range is not readable.
+    fn read_target(&mut self, address: u32, length: usize) -> Option<&[u8]>;
+    /// Resolve the symbolic link object `link` into `target`; returns the
+    /// target length.
+    fn resolve_link(&mut self, link: &[u8], target: &mut [u8]) -> Result<usize, KernelError>;
+    /// The published trace mask.
+    fn published_trace_mask(&mut self) -> TraceMask;
+    /// Write a trace text to the debug output.
+    fn print_trace(&mut self, text: &[u8]);
+}
+
+impl<T> PathServices for T
+where
+    T: crate::backend::Platform
+        + super::Backend
+        + crate::commands::debugger::Backend
+        + console::Backend,
+{
+    fn read_target(&mut self, address: u32, length: usize) -> Option<&[u8]> {
+        crate::commands::debugger::Backend::target_bytes(self, address, length)
+    }
+
+    fn resolve_link(&mut self, link: &[u8], target: &mut [u8]) -> Result<usize, KernelError> {
+        super::Backend::translate_symbolic_link(self, link, target)
+    }
+
+    fn published_trace_mask(&mut self) -> TraceMask {
+        console::Backend::trace_mask(self)
+    }
+
+    fn print_trace(&mut self, text: &[u8]) {
+        crate::backend::Platform::debug_print(self, text);
+    }
+}
+
 /// Where a drive name points.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriveTarget {
@@ -251,7 +293,7 @@ impl DriveTable {
     /// Mapped strings are read only up to `limit` bytes.
     pub(crate) fn target_bytes<'a>(
         &'a self,
-        backend: &'a mut dyn crate::backend::Backend,
+        services: &'a mut dyn PathServices,
         target: DriveTarget,
         limit: usize,
     ) -> Option<&'a [u8]> {
@@ -259,7 +301,7 @@ impl DriveTable {
             DriveTarget::Object(bytes) => Some(bytes),
             DriveTarget::NetworkShare => Some(&self.network_share[..self.network_share_len]),
             DriveTarget::Mapped { address, length } => {
-                backend.target_bytes(address, (length as usize).min(limit))
+                services.read_target(address, (length as usize).min(limit))
             }
         }
     }
@@ -348,23 +390,19 @@ impl DriveTable {
     /// (0x91f2e888). A leading `x` or `X` before a one-character drive is
     /// dropped. Drives missing from the table resolve through the `\??`
     /// symbolic link of the path, and to `\??\<path>` when that fails.
-    pub fn translate(
-        &self,
-        backend: &mut dyn crate::backend::Backend,
-        path: &[u8],
-    ) -> Option<ObjectPath> {
+    pub fn translate(&self, services: &mut dyn PathServices, path: &[u8]) -> Option<ObjectPath> {
         trace_path(
-            backend,
+            services,
             &[
                 b"[xbdm] FFileNameToObName(sz='",
                 console::c_string(path),
                 b"',...)\n",
             ],
         );
-        let translated = self.object_name(backend, path);
+        let translated = self.object_name(services, path);
         match &translated {
             Some(output) => trace_path(
-                backend,
+                services,
                 &[
                     b"[xbdm] FFileNameToObName succeeded, osz='",
                     console::c_string(output.as_bytes()),
@@ -372,7 +410,7 @@ impl DriveTable {
                 ],
             ),
             None => trace_path(
-                backend,
+                services,
                 &[b"[xbdm] FFileNameToObName - not a drive path - failing\n"],
             ),
         }
@@ -380,11 +418,7 @@ impl DriveTable {
         translated
     }
 
-    fn object_name(
-        &self,
-        backend: &mut dyn crate::backend::Backend,
-        path: &[u8],
-    ) -> Option<ObjectPath> {
+    fn object_name(&self, services: &mut dyn PathServices, path: &[u8]) -> Option<ObjectPath> {
         let input = match path {
             [b'x' | b'X', drive, b':', ..] if !matches!(drive, b':' | 0) => &path[1..],
             _ => path,
@@ -399,7 +433,7 @@ impl DriveTable {
         let mut output = ObjectPath::new();
         if let Some(entry) = self.find(drive) {
             trace_path(
-                backend,
+                services,
                 &[b"[xbdm] FFileNameToObName - drive name in conversion table\n"],
             );
             match entry.target {
@@ -412,7 +446,7 @@ impl DriveTable {
                     while output.len < OBJECT_PATH_LIMIT {
                         let room = (PAGE_SIZE - (at & (PAGE_SIZE - 1))) as usize;
                         let Some(bytes) =
-                            backend.target_bytes(at, room.min(OBJECT_PATH_LIMIT - output.len))
+                            services.read_target(at, room.min(OBJECT_PATH_LIMIT - output.len))
                         else {
                             break;
                         };
@@ -427,7 +461,7 @@ impl DriveTable {
                     }
                 }
                 target => {
-                    if let Some(target) = self.target_bytes(backend, target, OBJECT_PATH_LIMIT) {
+                    if let Some(target) = self.target_bytes(services, target, OBJECT_PATH_LIMIT) {
                         output.push(target);
                     }
                 }
@@ -443,7 +477,7 @@ impl DriveTable {
         let count = input.len().min(link.len() - 4);
         link[4..4 + count].copy_from_slice(&input[..count]);
         let link = &link[..4 + count];
-        match backend.translate_symbolic_link(link, &mut output.bytes) {
+        match services.resolve_link(link, &mut output.bytes) {
             Ok(length) => {
                 let mut length = length.min(OBJECT_PATH_LIMIT);
                 if link.last() == Some(&b'\\')
@@ -476,7 +510,7 @@ impl DriveTable {
     /// length.
     pub fn object_path_to_drive_path(
         &self,
-        backend: &mut dyn crate::backend::Backend,
+        services: &mut dyn PathServices,
         object_path: &[u8],
         output: &mut [u8],
     ) -> usize {
@@ -493,7 +527,7 @@ impl DriveTable {
                 continue;
             }
 
-            let Some(target) = self.target_bytes(backend, entry.target, length) else {
+            let Some(target) = self.target_bytes(services, entry.target, length) else {
                 continue;
             };
 
@@ -584,13 +618,21 @@ pub(crate) fn internal_drives() -> impl Iterator<Item = (&'static [u8], &'static
 /// A FFileNameToObName trace text of `parts`. The translation holds no
 /// server state; the published mask follows every change of the server's.
 #[inline(never)]
-fn trace_path(backend: &mut dyn crate::backend::Backend, parts: &[&[u8]]) {
-    let mask = console::Backend::trace_mask(backend);
-    console::trace_text(mask, backend, TraceMask::PATHS, |message| {
-        for part in parts {
-            let _ = message.push_bytes(part);
-        }
-    });
+fn trace_path(services: &mut dyn PathServices, parts: &[&[u8]]) {
+    if !services.published_trace_mask().intersects(TraceMask::PATHS) {
+        return;
+    }
+
+    let mut message = MessageText::new();
+    for part in parts {
+        let _ = message.push_bytes(part);
+    }
+    services.print_trace(message.as_bytes());
+}
+
+/// Make the drive table readable by threads other than the server's.
+pub(crate) fn publish_drives(state: &ServerState, backend: &mut dyn crate::backend::Backend) {
+    console::Backend::publish(backend, Published::Drives(&state.filesystem.drives));
 }
 
 /// Control code 0x03 (0x91f2ef60, enabled): map the drive named by a title
@@ -633,6 +675,7 @@ pub fn map_title_drive(
     };
 
     state.filesystem.drives.map(name, target, true);
+    publish_drives(state, backend);
 }
 
 /// Length of the title string at `address`. Strings longer than any object

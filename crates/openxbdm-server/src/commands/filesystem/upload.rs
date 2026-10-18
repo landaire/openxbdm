@@ -372,7 +372,10 @@ impl MultiUpload {
             return self.next_file(remaining);
         }
 
-        self.open(cx, buffer, remaining)
+        // No name bytes are expected, so the image's receive pump ends the
+        // upload here with `200- OK` (0x91f44fb4, 0x91f426ac): the block
+        // stays allocated and the file data is read as command lines.
+        Ok(Reply::Ok)
     }
 
     pub(super) fn resume(&mut self, cx: &mut ContinuationContext<'_>) -> CommandResult {

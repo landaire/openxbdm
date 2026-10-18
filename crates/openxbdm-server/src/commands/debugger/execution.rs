@@ -113,7 +113,7 @@ pub(super) fn transition(
 
     for (index, &process) in PROCESS_ORDER.iter().enumerate() {
         if actions.release[index] {
-            events::release_stopped(state, backend, network, process);
+            events::release_stopped(state, backend, process);
         }
         if actions.suspend[index] {
             backend.suspend_threads(process);

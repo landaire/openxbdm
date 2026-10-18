@@ -25,6 +25,7 @@ use openxbdm_server::commands::filesystem::ReadTarget;
 use openxbdm_server::commands::filesystem::ScratchBlock;
 use openxbdm_server::commands::filesystem::TransferDirection;
 use openxbdm_server::commands::filesystem::VolumeSize;
+use openxbdm_server::commands::hardware::pgo;
 use xbox360_sys::xboxkrnl::AccessMask;
 use xbox360_sys::xboxkrnl::CreateDisposition;
 use xbox360_sys::xboxkrnl::CreateOptions;
@@ -229,8 +230,8 @@ impl Mock {
         self.pools.len()
     }
 
-    /// Append one optical drive request to the active trace, as the
-    /// optical driver does.
+    /// Append one record to the active trace in the layout `dvdperf report`
+    /// reads. The console system software holds no producer of records.
     pub fn record_dvd_request(
         &mut self,
         time: u64,
@@ -1061,6 +1062,33 @@ impl filesystem::Backend for MockBackend {
 
     fn dvd_trace_active(&mut self) -> bool {
         self.filesystem.dvd_trace.is_some()
+    }
+}
+
+/// The file services of export 107 on the simulated console.
+impl pgo::IniFiles for MockBackend {
+    fn create_file(
+        &mut self,
+        path: &[u8],
+        request: &CreateRequest,
+    ) -> Result<FileHandle, KernelError> {
+        filesystem::Backend::create_file(self, path, request)
+    }
+
+    fn read_file(&mut self, handle: FileHandle, buffer: &mut [u8]) -> Result<u32, KernelError> {
+        filesystem::Backend::read_file(self, handle, None, ReadTarget::Bytes(buffer))
+    }
+
+    fn close_file(&mut self, handle: FileHandle) {
+        filesystem::Backend::close_file(self, handle);
+    }
+
+    fn allocate_scratch(&mut self, size: u32) -> Option<ScratchBlock> {
+        filesystem::Backend::allocate_scratch(self, size)
+    }
+
+    fn free_scratch(&mut self, block: ScratchBlock) {
+        filesystem::Backend::free_scratch(self, block);
     }
 }
 

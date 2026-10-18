@@ -132,3 +132,91 @@ pub(super) fn reserve_send_space(stream: &TcpStream) {
 
 #[cfg(not(target_os = "macos"))]
 pub(super) fn reserve_send_space(_stream: &TcpStream) {}
+
+#[cfg(unix)]
+mod send_buffer {
+    use std::net::TcpStream;
+    use std::os::fd::AsRawFd;
+
+    unsafe extern "C" {
+        fn getsockopt(
+            socket: std::ffi::c_int,
+            level: std::ffi::c_int,
+            name: std::ffi::c_int,
+            value: *mut std::ffi::c_void,
+            length: *mut u32,
+        ) -> std::ffi::c_int;
+    }
+
+    /// 0 on success, -1 on failure.
+    pub fn query(stream: &TcpStream, size: &mut std::ffi::c_int) -> std::ffi::c_int {
+        #[cfg(target_os = "linux")]
+        const SOL_SOCKET: std::ffi::c_int = 1;
+        #[cfg(target_os = "linux")]
+        const SO_SNDBUF: std::ffi::c_int = 7;
+        #[cfg(not(target_os = "linux"))]
+        const SOL_SOCKET: std::ffi::c_int = 0xffff;
+        #[cfg(not(target_os = "linux"))]
+        const SO_SNDBUF: std::ffi::c_int = 0x1001;
+
+        let mut length = size_of::<std::ffi::c_int>() as u32;
+
+        // SAFETY: `size` and `length` outlive the call; `length` holds the
+        // size of `size`.
+        unsafe {
+            getsockopt(
+                stream.as_raw_fd(),
+                SOL_SOCKET,
+                SO_SNDBUF,
+                (size as *mut std::ffi::c_int).cast(),
+                &mut length,
+            )
+        }
+    }
+}
+
+#[cfg(windows)]
+mod send_buffer {
+    use std::net::TcpStream;
+    use std::os::windows::io::AsRawSocket;
+
+    #[link(name = "ws2_32")]
+    unsafe extern "system" {
+        fn getsockopt(
+            socket: usize,
+            level: std::ffi::c_int,
+            name: std::ffi::c_int,
+            value: *mut std::ffi::c_char,
+            length: *mut std::ffi::c_int,
+        ) -> std::ffi::c_int;
+    }
+
+    /// 0 on success, SOCKET_ERROR (-1) on failure.
+    pub fn query(stream: &TcpStream, size: &mut std::ffi::c_int) -> std::ffi::c_int {
+        const SOL_SOCKET: std::ffi::c_int = 0xffff;
+        const SO_SNDBUF: std::ffi::c_int = 0x1001;
+
+        let mut length = size_of::<std::ffi::c_int>() as std::ffi::c_int;
+
+        // SAFETY: `size` and `length` outlive the call; `length` holds the
+        // size of `size`.
+        unsafe {
+            getsockopt(
+                stream.as_raw_socket() as usize,
+                SOL_SOCKET,
+                SO_SNDBUF,
+                (size as *mut std::ffi::c_int).cast(),
+                &mut length,
+            )
+        }
+    }
+}
+
+/// The platform send buffer size of `stream` (SO_SNDBUF).
+pub(super) fn send_buffer_size(stream: &TcpStream) -> io::Result<u32> {
+    let mut size: std::ffi::c_int = 0;
+    match send_buffer::query(stream, &mut size) {
+        0 => u32::try_from(size).map_err(|_| io::Error::from(io::ErrorKind::InvalidData)),
+        _ => Err(io::Error::last_os_error()),
+    }
+}

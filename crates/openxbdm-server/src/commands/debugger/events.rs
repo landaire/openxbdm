@@ -339,7 +339,7 @@ impl StopReason {
     }
 }
 
-const fn process_index(process: ProcessKind) -> usize {
+pub(super) const fn process_index(process: ProcessKind) -> usize {
     match process {
         ProcessKind::Title => 0,
         ProcessKind::System => 1,
@@ -368,8 +368,6 @@ pub fn process_events(
         handle(state, backend, network, event);
     }
 
-    super::send_held_reply(state, backend, network);
-
     let policy = direct_policy(state, backend);
     backend.publish_direct_policy(&policy);
 }
@@ -386,11 +384,16 @@ fn direct_policy(state: &mut ServerState, backend: &mut dyn AnyBackend) -> Direc
         attached: state.debugger.debugger.attached,
         defer_mask: state.console.event_defer,
         data_breakpoint: state.debugger.data_breakpoint,
+        quiet_step: state
+            .debugger
+            .events
+            .steps
+            .map(|step| step.is_some_and(|step| !step.saved_trace)),
     }
 }
 
-/// Send a notification a direct exception queued. A module unload removes
-/// the module's breakpoints whether or not its line is sent.
+/// Send a notification a direct exception queued. The platform removed an
+/// unloaded module's breakpoints during the dispatch.
 fn deliver_direct(
     state: &mut ServerState,
     backend: &mut dyn AnyBackend,
@@ -399,27 +402,16 @@ fn deliver_direct(
     text: &[u8],
 ) {
     let notice = match notification.notice {
+        DirectNotice::Break => Notice::Break,
         DirectNotice::DebugString { address, length } => Notice::DebugString { address, length },
         DirectNotice::ModuleLoad { .. } => match &notification.module {
             Some(module) if module.has_header => Notice::ModuleLoad(module),
             _ => return,
         },
-        DirectNotice::ModuleUnload { line, .. } => {
-            let Some(module) = &notification.module else {
-                return;
-            };
-
-            state
-                .debugger
-                .breakpoints
-                .remove_range(module.base, module.size, backend);
-
-            if !line {
-                return;
-            }
-
-            Notice::ModuleUnload(module)
-        }
+        DirectNotice::ModuleUnload { line, .. } => match &notification.module {
+            Some(module) if line => Notice::ModuleUnload(module),
+            _ => return,
+        },
         DirectNotice::Assert { address, length } => Notice::Assert { address, length },
         DirectNotice::Rip { address, length } => Notice::Rip { address, length },
         DirectNotice::SingleStep => Notice::SingleStep,
@@ -910,7 +902,7 @@ fn exception(
             record: Some(record),
             ..Pending::new(thread, process, Resolution::Final)
         };
-        finish(state, backend, network, entry, false);
+        finish(state, backend, entry, false);
         return;
     }
 
@@ -972,11 +964,7 @@ fn exception(
                         unsafe { backend.module_event(gpr3 as u32, context.gpr4 as u32, thread) };
                     match &module {
                         Some(module) => {
-                            state.debugger.breakpoints.remove_range(
-                                module.base,
-                                module.size,
-                                backend,
-                            );
+                            super::remove_breakpoints(backend, module.base, module.size);
                             crate::commands::memory::module_unloaded(
                                 backend,
                                 module.base,
@@ -1009,11 +997,24 @@ fn exception(
                 Plan::silent(Resolution::Final)
             }
             _ => {
-                let table = state.debugger.breakpoints.contains(iar);
+                let table = super::has_breakpoint(backend, iar);
                 if table {
                     dump = false;
                 }
-                Plan::notify(Notice::Break, true, Resolution::Break { table })
+
+                // Stock 0x91f3a22c..0x91f3a2f0: a thread that cannot stop
+                // reports a table breakpoint without a stop (debuggable
+                // records only) and steps over it; any other breakpoint
+                // ends unresolved without a line. The kernel debugger keeps
+                // only table breakpoints stopping.
+                if can_stop && (table || !kd) {
+                    Plan::notify(Notice::Break, true, Resolution::Break { table })
+                } else if table {
+                    Plan::notify(Notice::Break, false, Resolution::Break { table })
+                        .only_if(debuggable)
+                } else {
+                    Plan::silent(Resolution::Final)
+                }
             }
         },
         NtStatus::ASSERTION_FAILURE => {
@@ -1043,7 +1044,8 @@ fn exception(
             if let Some(step) = state.debugger.events.steps[process_index(process)].take() {
                 match step.target {
                     StepTarget::Breakpoint(slot) => {
-                        state.debugger.breakpoints.rearm(slot, backend);
+                        backend
+                            .lock_breakpoints(&mut |shared, code| shared.table.rearm(slot, code));
                     }
                     // The data breakpoint register is reprogrammed when the
                     // event ends.
@@ -1107,12 +1109,12 @@ fn exception(
     };
 
     if plan.handled {
-        finish(state, backend, network, pending, true);
+        finish(state, backend, pending, true);
         return;
     }
 
     let Some(notice) = plan.notice else {
-        finish(state, backend, network, pending, false);
+        finish(state, backend, pending, false);
         return;
     };
 
@@ -1127,7 +1129,7 @@ fn exception(
     );
 
     if !plan.stop {
-        finish(state, backend, network, pending, false);
+        finish(state, backend, pending, false);
         return;
     }
 
@@ -1138,7 +1140,7 @@ fn exception(
             state.debugger.events.pending[index] = None;
         }
         let _ = change_execution(state, backend, network, ExecutionState::Started);
-        finish(state, backend, network, pending, false);
+        finish(state, backend, pending, false);
     }
 }
 
@@ -1381,7 +1383,11 @@ fn step_over(
 ) -> bool {
     let mut lifted = false;
     edit_registers(backend, thread, &mut |backend, context| {
-        if let Some(slot) = state.debugger.breakpoints.lift(context.iar, backend) {
+        let mut lifted_slot = None;
+        backend.lock_breakpoints(&mut |shared, code| {
+            lifted_slot = shared.table.lift(context.iar, code);
+        });
+        if let Some(slot) = lifted_slot {
             state.debugger.events.steps[process_index(process)] = Some(Step {
                 target: StepTarget::Breakpoint(slot),
                 saved_trace: context.msr.contains(Msr::SINGLE_STEP),
@@ -1409,13 +1415,7 @@ fn step_over(
 /// End an event: apply what the monitor does after its notification and
 /// release the thread. `continued` is true when a debugger released a
 /// stopped thread (or the event was handled outright).
-fn finish(
-    state: &mut ServerState,
-    backend: &mut dyn AnyBackend,
-    network: &mut dyn Network,
-    entry: Pending,
-    continued: bool,
-) {
+fn finish(state: &mut ServerState, backend: &mut dyn AnyBackend, entry: Pending, continued: bool) {
     let thread = entry.thread;
     let process = entry.process;
     let mut handled = true;
@@ -1466,7 +1466,7 @@ fn finish(
         Resolution::SingleStep => {
             if resolved {
                 let context = registers(backend, thread);
-                if state.debugger.breakpoints.contains(context.iar) {
+                if super::has_breakpoint(backend, context.iar) {
                     step_over(state, backend, thread, process);
                 }
             } else {
@@ -1556,14 +1556,12 @@ fn finish(
     reprogram_data_breakpoint(state, backend);
     disposition.handled = handled;
     backend.complete_event(thread, disposition);
-    super::send_held_reply(state, backend, network);
 }
 
 /// `continue thread= [exception]` (stock 0x91f25c60).
 pub(super) fn continue_thread(
     state: &mut ServerState,
     backend: &mut dyn AnyBackend,
-    network: &mut dyn Network,
     thread: ThreadId,
     pass_exception: bool,
 ) -> Result<(), StoppedThreadError> {
@@ -1592,7 +1590,7 @@ pub(super) fn continue_thread(
     }
 
     entry.pass_exception = pass_exception;
-    finish(state, backend, network, entry, true);
+    finish(state, backend, entry, true);
 
     Ok(())
 }
@@ -1602,7 +1600,6 @@ pub(super) fn continue_thread(
 pub(super) fn release_stopped(
     state: &mut ServerState,
     backend: &mut dyn AnyBackend,
-    network: &mut dyn Network,
     process: ProcessKind,
 ) {
     for index in 0..MAX_PENDING {
@@ -1615,7 +1612,7 @@ pub(super) fn release_stopped(
         }
 
         state.debugger.events.pending[index] = None;
-        finish(state, backend, network, entry, true);
+        finish(state, backend, entry, true);
     }
 }
 
@@ -1639,7 +1636,7 @@ pub(super) fn release_all(
 
             state.debugger.events.pending[index] = None;
             entry.released = true;
-            finish(state, backend, network, entry, true);
+            finish(state, backend, entry, true);
         }
 
         backend.resume_threads(process);
@@ -1653,17 +1650,6 @@ pub(super) fn release_all(
         &Event::Execution(ExecutionState::Started),
     );
     process_deferred(state, backend, network);
-}
-
-/// Whether `thread` waits at an event, stopped or deferred.
-pub(super) fn is_waiting(state: &ServerState, thread: ThreadId) -> bool {
-    let events = &state.debugger.events;
-    events.pending_index(thread).is_some()
-        || events
-            .deferred
-            .iter()
-            .flatten()
-            .any(|event| event.thread() == thread)
 }
 
 /// Whether a thread stopped at an exception keeps the title from being
@@ -1681,7 +1667,7 @@ pub(super) fn relaunch_blocked(state: &ServerState, backend: &mut dyn AnyBackend
         {
             let Some(record) = entry.record else { continue };
 
-            if blocks_relaunch(state, backend, entry, &record) {
+            if blocks_relaunch(backend, entry, &record) {
                 return true;
             }
         }
@@ -1691,7 +1677,6 @@ pub(super) fn relaunch_blocked(state: &ServerState, backend: &mut dyn AnyBackend
 }
 
 fn blocks_relaunch(
-    state: &ServerState,
     backend: &mut dyn AnyBackend,
     entry: &Pending,
     record: &ExceptionRecord,
@@ -1706,7 +1691,7 @@ fn blocks_relaunch(
         NtStatus::BREAKPOINT => match record.trap_code() {
             trap::DEBUG_STRING | trap::MODULE_LOAD => false,
             trap::BREAKPOINT => {
-                if state.debugger.breakpoints.contains(iar) {
+                if super::has_breakpoint(backend, iar) {
                     return false;
                 }
 

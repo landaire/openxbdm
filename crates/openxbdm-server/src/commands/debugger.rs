@@ -20,9 +20,6 @@ mod threads;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
 
-use self::break_command::HeldReply;
-// `events` reaches these through `super::`.
-use self::break_command::send_held_reply;
 use self::execution::transition;
 use crate::access::Access;
 use crate::backend::Backend as AnyBackend;
@@ -45,13 +42,13 @@ pub use self::break_command::DataTarget;
 pub use self::break_command::break_at_title_start;
 pub use self::break_command::breakpoint_kind;
 pub use self::break_command::clear_software_breakpoint;
-pub(crate) use self::break_command::connection_closed;
 pub use self::break_command::set_data_breakpoint;
 pub use self::break_command::set_software_breakpoint;
-pub use self::breakpoints::BREAKPOINT_BLOCKS;
-pub use self::breakpoints::Breakpoints;
+pub use self::breakpoints::BreakpointState;
+pub use self::breakpoints::CodeWords;
 pub use self::breakpoints::DataBreakpoint;
 pub use self::breakpoints::DataKind;
+pub use self::breakpoints::SpareBlock;
 pub use self::breakpoints::TRAP_INSTRUCTION;
 pub use self::context::Context;
 pub use self::context::ContextFlags;
@@ -61,9 +58,9 @@ pub use self::direct::DirectNotice;
 pub use self::direct::DirectOutcome;
 pub use self::direct::DirectPolicy;
 pub use self::direct::DirectRegisters;
-pub use self::direct::DirectStep;
 pub use self::direct::ThreadNameRequest;
 pub use self::direct::dispatch_direct;
+pub use self::direct::exception_stops;
 pub use self::error::DataBreakpointError;
 pub use self::error::ExecutionError;
 pub use self::error::ExtensionError;
@@ -507,10 +504,18 @@ pub trait Backend {
     /// Exit status of the thread behind a handle of the monitor process:
     /// [`ExitStatus::STILL_ACTIVE`] while it runs.
     fn thread_exit_status(&mut self, handle: ThreadHandle) -> Result<ExitStatus, KernelError>;
-    /// Replace the instruction word at `address` through a writable
-    /// mapping, synchronizing the instruction cache. Returns the previous
-    /// word, or `None` when the address cannot be mapped.
-    fn replace_code_word(&mut self, address: u32, value: u32) -> Option<u32>;
+    /// Run `access` on the breakpoint state, with code memory, while the
+    /// table lock is held (stock spin lock 0x91fae9c0, taken at IRQL 0x7c,
+    /// which threads dispatched in place take too). `access` must not
+    /// allocate or wait.
+    fn lock_breakpoints(
+        &mut self,
+        access: &mut dyn FnMut(&mut BreakpointState, &mut dyn CodeWords),
+    );
+    /// Set a software breakpoint (stock 0x91f26fc8): obtain a spare block
+    /// from pool memory when the table holds none, before taking the table
+    /// lock, then [`BreakpointState::set`] under it. Sets are serialized.
+    fn set_breakpoint(&mut self, address: u32) -> Result<(), SetError>;
     /// `length` bytes of target memory at `address`, or `None` when part
     /// of the range is not readable.
     fn target_bytes(&mut self, address: u32, length: usize) -> Option<&[u8]>;
@@ -545,12 +550,10 @@ pub trait Backend {
         &mut self,
         text: &mut [u8; NOTICE_TEXT_CAPACITY],
     ) -> Option<DirectNotification>;
-    /// Wait 250 ms, then execute a breakpoint trap on the calling thread.
-    /// Returns the trap as an exception event that is processed like a
-    /// reported one: the thread's context at the trap stays readable and
-    /// writable until the event is completed. `None` when the trap did not
-    /// reach the monitor.
-    fn break_now(&mut self) -> Option<DebugEvent>;
+    /// Wait 250 ms, then execute a breakpoint trap on the calling thread,
+    /// which the platform dispatches in place as any exception of that
+    /// thread (stock 0x91f48a64).
+    fn break_now(&mut self);
     /// Wait 200 ms, then write a crash dump of the calling thread.
     fn crash_dump(&mut self);
     /// Kernel build number.
@@ -584,7 +587,6 @@ pub struct State {
     /// Per-boot process identifier, generated on first use.
     pub process_id: Option<u32>,
 
-    pub breakpoints: Breakpoints,
     pub data_breakpoint: Option<DataBreakpoint>,
 
     pub stop_on: StopOn,
@@ -604,8 +606,6 @@ pub struct State {
     /// the debugger (control code 0xa4).
     pub trap_passthrough: bool,
 
-    /// Reply of a `break now` held until its thread is continued.
-    held_reply: Option<HeldReply>,
     events: events::Events,
 }
 
@@ -613,7 +613,6 @@ impl State {
     pub const fn new() -> Self {
         Self {
             process_id: None,
-            breakpoints: Breakpoints::new(),
             data_breakpoint: None,
             stop_on: StopOn::empty(),
             break_at_title_entry: false,
@@ -623,27 +622,47 @@ impl State {
             debugger: DebuggerRecord::EMPTY,
             extension: None,
             trap_passthrough: false,
-            held_reply: None,
             events: events::Events::new(),
         }
     }
+}
 
-    /// Original byte under an armed software breakpoint.
-    pub fn shadow_read(&self, address: u32) -> Option<u8> {
-        self.breakpoints.shadow_read(address)
-    }
+/// Original byte under an armed software breakpoint.
+pub fn shadow_read(backend: &mut dyn AnyBackend, address: u32) -> Option<u8> {
+    let mut byte = None;
+    backend.lock_breakpoints(&mut |shared, _| byte = shared.table.shadow_read(address));
 
-    /// Store a byte into the saved instruction of an armed breakpoint;
-    /// true when the address is under one.
-    pub fn shadow_write(&mut self, address: u32, value: u8) -> bool {
-        self.breakpoints.shadow_write(address, value)
-    }
+    byte
+}
 
-    /// Copy the saved instruction bytes of every software breakpoint
-    /// overlapping `data`, read from `start`, over it.
-    pub fn restore_saved(&self, start: u32, data: &mut [u8]) {
-        self.breakpoints.restore_saved(start, data);
-    }
+/// Store a byte into the saved instruction of an armed breakpoint; true
+/// when the address is under one.
+pub fn shadow_write(backend: &mut dyn AnyBackend, address: u32, value: u8) -> bool {
+    let mut covered = false;
+    backend.lock_breakpoints(&mut |shared, _| {
+        covered = shared.table.shadow_write(address, value);
+    });
+
+    covered
+}
+
+/// Copy the saved instruction bytes of every software breakpoint
+/// overlapping `data`, read from `start`, over it.
+pub fn restore_saved(backend: &mut dyn AnyBackend, start: u32, data: &mut [u8]) {
+    backend.lock_breakpoints(&mut |shared, _| shared.table.restore_saved(start, data));
+}
+
+/// Whether a software breakpoint is set at `address`.
+pub(crate) fn has_breakpoint(backend: &mut dyn AnyBackend, address: u32) -> bool {
+    let mut found = false;
+    backend.lock_breakpoints(&mut |shared, _| found = shared.table.contains(address));
+
+    found
+}
+
+/// Remove the breakpoints in `[base, base + size)` (module unload).
+pub(crate) fn remove_breakpoints(backend: &mut dyn AnyBackend, base: u32, size: u32) {
+    backend.lock_breakpoints(&mut |shared, code| shared.table.remove_range(base, size, code));
 }
 
 /// Transfers started by this domain.

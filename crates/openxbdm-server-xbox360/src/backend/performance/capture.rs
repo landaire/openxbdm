@@ -21,7 +21,6 @@ use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::Win32Error;
 use openxbdm_core::status::XbdmHresult;
-use openxbdm_server::Server;
 use openxbdm_server::commands::filesystem::DriveTable;
 use openxbdm_server::commands::filesystem::ObjectPath;
 use openxbdm_server::commands::memory::PAGE_SIZE;
@@ -72,14 +71,13 @@ use super::pmc;
 use super::pmc::Owner;
 use super::store_pair;
 use crate::backend::Console;
-use crate::backend::dispatcher;
+use crate::backend::filesystem;
 use crate::exports::bridged;
 use crate::exports::export;
 use crate::kernel;
 use crate::kernel::LoaderLock;
 use crate::kernel::ModuleList;
 use crate::kernel::RoutineVariable;
-use crate::net::XamNetwork;
 
 /// Capture file name buffer (stock 0x91fae820).
 const NAME_CAPACITY: usize = 0x104;
@@ -680,26 +678,20 @@ impl capture::Engine for Engine {
     }
 }
 
-/// [`Paths`] where the server's drive table cannot be read: no name
-/// translates, and the executable keeps its object path, as for a path
-/// outside every drive.
-struct NoDriveTable;
+/// [`Paths`] of the calling thread, through the published drive table.
+struct PublishedPaths;
 
-impl Paths for NoDriveTable {
-    fn object_path(&mut self, _name: &[u8]) -> Option<ObjectPath> {
-        None
+impl Paths for PublishedPaths {
+    fn object_path(&mut self, name: &[u8]) -> Option<ObjectPath> {
+        filesystem::translate(name)
     }
 
     fn executable_drive_path(&mut self, output: &mut [u8]) -> usize {
-        let limit = output.len().saturating_sub(1);
-        module_snapshot::copy_executable_object_path(&mut output[..limit])
+        filesystem::drive_path(
+            module_snapshot::ExecutableObjectPath::read().as_bytes(),
+            output,
+        )
     }
-}
-
-/// Export 73 request posted to the server thread.
-struct TitleStart<'a> {
-    name: &'a [u8],
-    buffer: BufferRequest,
 }
 
 /// The word at `address` of the record buffer, the chunk list, or a
@@ -1276,22 +1268,8 @@ fn start_for_title(
     capture::start(&mut Engine, name, buffer, false)
 }
 
-fn start_on_server(
-    server: &mut Server,
-    console: &mut Console,
-    _network: &mut XamNetwork,
-    request: &mut TitleStart<'_>,
-) -> u32 {
-    let mut paths = DrivePaths {
-        drives: &server.state.filesystem.drives,
-        backend: console,
-    };
-
-    reply_word(start_for_title(&mut paths, request.name, request.buffer).map(Reply::from))
-}
-
-/// Export 73: start a capture into the drive path `name`. The drive table
-/// is read on the server thread; the title waits for it.
+/// Export 73: start a capture into the drive path `name`, translated on
+/// the caller's thread.
 extern "C" fn title_start(name: *const u8, buffer_size: u32) -> u32 {
     /// Longest name read from the title.
     const NAME_LIMIT: usize = 0x140;
@@ -1303,12 +1281,10 @@ extern "C" fn title_start(name: *const u8, buffer_size: u32) -> u32 {
     // keeps unchanged for the call.
     let name =
         unsafe { kernel::bounded_c_string(name as usize as u32, NAME_LIMIT).unwrap_unchecked() };
-    let buffer = BufferRequest(buffer_size);
-    let mut request = TitleStart { name, buffer };
 
-    dispatcher::call_on_server_with(&mut request, start_on_server).unwrap_or_else(|| {
-        reply_word(start_for_title(&mut NoDriveTable, name, buffer).map(Reply::from))
-    })
+    reply_word(
+        start_for_title(&mut PublishedPaths, name, BufferRequest(buffer_size)).map(Reply::from),
+    )
 }
 bridged!(title_start_entry, title_start);
 export_raw!(73, title_start_entry);
@@ -1324,21 +1300,10 @@ pub(super) fn stop(console: &mut Console, drives: &DriveTable) -> Result<(), Cap
     )
 }
 
-fn stop_on_server(
-    server: &mut Server,
-    console: &mut Console,
-    _network: &mut XamNetwork,
-    _request: &mut (),
-) -> u32 {
-    reply_word(stop(console, &server.state.filesystem.drives).map(|()| Reply::Ok))
-}
-
-/// Export 74: stop and write the capture file; the drive table is read on
-/// the server thread.
+/// Export 74: stop and write the capture file, translating its name on
+/// the caller's thread.
 extern "C" fn title_stop() -> u32 {
-    dispatcher::call_on_server_with(&mut (), stop_on_server).unwrap_or_else(|| {
-        reply_word(capture::stop(&mut Engine, &mut NoDriveTable).map(|()| Reply::Ok))
-    })
+    reply_word(capture::stop(&mut Engine, &mut PublishedPaths).map(|()| Reply::Ok))
 }
 bridged!(title_stop_entry, title_stop);
 export_raw!(74, title_stop_entry);

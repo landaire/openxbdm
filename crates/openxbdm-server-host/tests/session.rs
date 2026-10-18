@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::net::UdpSocket;
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -19,16 +20,19 @@ use openxbdm_client::discovery::DiscoveryConfig;
 use openxbdm_client::discovery::discover_all;
 use openxbdm_client::discovery::find_by_name;
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::XbdmHresult;
 use openxbdm_core::status::xbdm_error;
 use openxbdm_core::status::xbdm_success;
 use openxbdm_server::ConnectionIndex;
 use openxbdm_server::commands::session::FileEventId;
 use openxbdm_server::commands::session::TellLogAreas;
-use openxbdm_server::commands::session::debug_capture_print;
+use openxbdm_server::notify::Event;
 use openxbdm_server::processors::ProcessorFlags;
 use openxbdm_server_host::Host;
+use openxbdm_server_host::backend::session::MockFileOperation;
 use openxbdm_server_host::backend::session::RpcRegisters;
+use xbox360_sys::xboxkrnl::CreateOptions;
 
 use common::RawSession;
 use common::TestServer;
@@ -249,6 +253,56 @@ fn notifyat_requires_a_port() {
     let mut session = session(&server);
 
     assert_eq!(session.command("notifyat addr=1.0.0.127"), "400- ");
+}
+
+/// Read to the end of `session`'s stream; the peer has closed it when this
+/// returns nothing.
+fn remaining(session: &mut RawSession) -> Vec<u8> {
+    let mut rest = Vec::new();
+    session.reader.read_to_end(&mut rest).unwrap();
+    rest
+}
+
+#[test]
+fn notifyat_drop_of_an_invalid_address_closes_slots_of_free_targets() {
+    let server = TestServer::start();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut session = session(&server);
+
+    // An invalid address parses as 0. Target entries never used hold port 0
+    // and socket slot 0, the slot of the first channel.
+    let mut first = channel(&server);
+    assert_eq!(session.command("notifyat port=0 addr=none drop"), "200- OK");
+    assert!(remaining(&mut first).is_empty());
+
+    // A dropped target keeps its port and slot.
+    assert_eq!(
+        session.command(&format!("notifyat port={port} addr=1.0.0.127")),
+        "200- OK"
+    );
+    let (mut target, _) = listener.accept().unwrap();
+    target
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    assert_eq!(
+        session.command(&format!("notifyat port={port} addr=1.0.0.127 drop")),
+        "200- OK"
+    );
+    let mut rest = Vec::new();
+    target.read_to_end(&mut rest).unwrap();
+    assert_eq!(rest, b"execution started\r\n");
+
+    let mut second = channel(&server);
+    assert_eq!(
+        session.command(&format!("notifyat port={} addr=none drop", port ^ 1)),
+        "200- OK"
+    );
+    assert_eq!(
+        session.command(&format!("notifyat port={port} addr=none drop")),
+        "200- OK"
+    );
+    assert!(remaining(&mut second).is_empty());
 }
 
 #[test]
@@ -512,16 +566,9 @@ fn dbgprint_streams_captured_records() {
     );
 
     {
-        let mut host = server.host.lock();
-        let Host {
-            server, backend, ..
-        } = &mut *host;
-        debug_capture_print(
-            &mut server.state,
-            backend,
-            b"XBDM: Updating CD-ROM driver.\n",
-        );
-        debug_capture_print(&mut server.state, backend, b"XBDM: Updated Channel ISR.\n");
+        let backend = &mut server.host.lock().backend;
+        backend.debug_capture_print(b"XBDM: Updating CD-ROM driver.\n");
+        backend.debug_capture_print(b"XBDM: Updated Channel ISR.\n");
     }
 
     assert_eq!(
@@ -546,6 +593,19 @@ fn dbgprint_streams_captured_records() {
     );
     assert_eq!(session.multiline().len(), 2);
     assert_eq!(session.command("dbgprint stop=1"), "200- OK");
+    // Producers store nothing while capture is off.
+    server
+        .host
+        .lock()
+        .backend
+        .debug_capture_print(b"XBDM: Updated Channel ISR.\n");
+    assert_eq!(session.command("dbgprint start="), "200- OK");
+    assert_eq!(
+        session.command("dbgprint"),
+        "202- Debug print strings follow"
+    );
+    assert!(session.multiline().is_empty());
+    assert_eq!(session.command("dbgprint stop=1"), "200- OK");
     assert_eq!(
         session.command("dbgprint"),
         "400- Debug capture not started (use 'start' option to start capture)"
@@ -555,28 +615,156 @@ fn dbgprint_streams_captured_records() {
     assert_eq!(session.command("dbgprint start="), "428- out of memory");
 }
 
+/// `line` with the 16 time base digits of its `Perf=` field replaced by `T`.
+fn without_perf(line: &str) -> String {
+    const PERF: &str = "\"Perf=0x";
+
+    let start = line.find(PERF).expect("Perf field") + PERF.len();
+    format!("{}T{}", &line[..start], &line[start + 16..])
+}
+
+fn open_operation() -> MockFileOperation<'static> {
+    MockFileOperation {
+        title: 0x4d53_07e6,
+        thread_id: 0xf900_0010,
+        operation: 0,
+        handle: 0x8000_0044,
+        path: Some(b"\\Device\\Harddisk0\\Partition1\\file.bin"),
+        offset: 0,
+        position: 0,
+        length: 0,
+        options: CreateOptions::SYNCHRONOUS_IO_NONALERT,
+        status: NtStatus::SUCCESS,
+    }
+}
+
 #[test]
-fn fileevent_announces_start_and_stop_after_posted_texts() {
+fn fileevent_reports_file_services_between_start_and_stop() {
+    const DASHBOARD: u32 = 0xfffe_07d1;
+
+    let server = TestServer::start();
+    let mut channel = channel(&server);
+    let mut session = session(&server);
+    let open = open_operation();
+    let read = MockFileOperation {
+        operation: 3,
+        path: None,
+        position: 0x2000,
+        length: 0x100,
+        options: CreateOptions::SYNCHRONOUS_IO_NONALERT | CreateOptions::NO_INTERMEDIATE_BUFFERING,
+        status: NtStatus(0xc000_0011),
+        ..open
+    };
+
+    assert_eq!(session.command("fileevent"), "400- ");
+    // Disabled file services report nothing and take no identifier.
+    server.host.lock().backend.file_operation(&open);
+    assert_eq!(session.command("fileevent advise"), "200- OK");
+    assert_eq!(channel.line(), "XBDMFE!Start 0x00000001");
+
+    {
+        let mut host = server.host.lock();
+        host.backend.file_operation(&open);
+        host.backend.file_operation(&read);
+        // The dashboard never reports, nor a title after its termination.
+        host.backend.file_operation(&MockFileOperation {
+            title: DASHBOARD,
+            ..open
+        });
+        host.backend.session.file_event_titles.suppress(open.title);
+        host.backend.file_operation(&open);
+    }
+
+    assert_eq!(session.command("fileevent unadvise"), "200- OK");
+    assert_eq!(
+        without_perf(&channel.line()),
+        "XBDMFE!Begin 0x00000002 \"Perf=0xT\" \"Type=0x00000000\" \"ThreadId=0xf9000010\" \
+         \"Handle=0x80000044\" \"Offset=0x0000000000000000\" \"Bytes=0x00000000\" \
+         \"Flags=0xa0000000\" \"Path=\\Device\\Harddisk0\\Partition1\\file.bin\""
+    );
+    assert_eq!(
+        without_perf(&channel.line()),
+        "XBDMFE!End 0x00000002 \"Perf=0xT\" \"Handle=0x80000044\" \"Result=0x00000000\""
+    );
+    assert_eq!(
+        without_perf(&channel.line()),
+        "XBDMFE!Begin 0x00000003 \"Perf=0xT\" \"Type=0x00000001\" \"ThreadId=0xf9000010\" \
+         \"Handle=0x80000044\" \"Offset=0x0000000000002000\" \"Bytes=0x00000100\" \
+         \"Flags=0x80000000\""
+    );
+    assert_eq!(
+        without_perf(&channel.line()),
+        "XBDMFE!End 0x00000003 \"Perf=0xT\" \"Handle=0x80000044\" \"Result=0xc0000011\""
+    );
+    assert_eq!(channel.line(), "XBDMFE!Stop 0x00000004");
+    assert!(!server.host.lock().backend.session.file_events);
+}
+
+#[test]
+fn a_file_event_numbered_zero_has_no_end() {
     let server = TestServer::start();
     let mut channel = channel(&server);
     let mut session = session(&server);
 
-    assert_eq!(session.command("fileevent"), "400- ");
+    server.host.lock().backend.session.file_event_id = FileEventId(0xffff_fffe);
     assert_eq!(session.command("fileevent advise"), "200- OK");
-    assert_eq!(channel.line(), "XBDMFE!Start 0x00000001");
-    assert!(server.host.lock().backend.session.file_events);
+    assert_eq!(channel.line(), "XBDMFE!Start 0xffffffff");
+    server.host.lock().backend.file_operation(&open_operation());
+    assert_eq!(session.command("fileevent unadvise"), "200- OK");
+    assert!(channel.line().starts_with("XBDMFE!Begin 0x00000000 "));
+    assert_eq!(channel.line(), "XBDMFE!Stop 0x00000001");
+}
+
+#[test]
+fn posted_texts_beyond_the_queue_keep_their_order() {
+    let server = TestServer::start();
+    let mut channel = channel(&server);
+    let long = format!("PIX!{}", "x".repeat(0x300));
 
     {
         let mut host = server.host.lock();
-        host.backend.post_notification(b"XBDMFE!Begin 0x00000002");
-        host.backend.post_notification(b"XBDMFE!End 0x00000002");
+        for index in 0..20 {
+            host.backend
+                .post_notification(format!("PIX!text {index}").as_bytes());
+        }
+        host.backend.post_notification(long.as_bytes());
+        host.backend.post_notification(b"PIX!last");
     }
 
-    assert_eq!(session.command("fileevent unadvise"), "200- OK");
-    assert_eq!(channel.line(), "XBDMFE!Begin 0x00000002");
-    assert_eq!(channel.line(), "XBDMFE!End 0x00000002");
-    assert_eq!(channel.line(), "XBDMFE!Stop 0x00000002");
-    assert!(!server.host.lock().backend.session.file_events);
+    for index in 0..20 {
+        assert_eq!(channel.line(), format!("PIX!text {index}"));
+    }
+    assert_eq!(channel.line(), long);
+    assert_eq!(channel.line(), "PIX!last");
+}
+
+#[test]
+fn session_handlers_run_newest_first_for_each_event() {
+    let server = TestServer::start();
+    let (seen, events) = mpsc::channel();
+    for name in ["first", "second"] {
+        let seen = seen.clone();
+        server
+            .host
+            .lock()
+            .backend
+            .session
+            .session_handlers
+            .push(Box::new(move |event| {
+                if let Event::Execution(state) = *event {
+                    let _ = seen.send((name, state.name()));
+                }
+            }));
+    }
+
+    let mut channel = channel(&server);
+    let mut session = session(&server);
+    assert_eq!(session.command("stop"), "200- OK");
+    assert_eq!(channel.line(), "execution stopped");
+    assert_eq!(
+        events.try_iter().collect::<Vec<_>>(),
+        [("second", "stopped"), ("first", "stopped")]
+    );
 }
 
 #[test]

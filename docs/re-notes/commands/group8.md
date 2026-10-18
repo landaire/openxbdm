@@ -82,11 +82,30 @@ Settings persistence: 0x91f31e48 schedules a rewrite of `\SystemRoot\xbdm.ini`
      Response `200- Exit Code 0x%x`.
   Format strings `Exit Code 0x%x` and `Error 0x%x` are written with
   _snprintf(arg2, arg3, ...). Always returns 0x02da0000 after a token is found.
-- Backend requirement: resolve a thread handle in the debug monitor's handle
-  table and report whether the thread has terminated and its exit status.
-- Status: partial: which process handle table the lookup uses (system versus
-  title) is not determined from this handler; resolve by inspecting the
-  ObReferenceObjectByHandle implementation in xboxkrnl.
+- Handle resolution (K15574 ObReferenceObjectByHandle 0x800b5a48, K16547
+  0x800b5dd8):
+  - 0xfffffffe (`NtCurrentThread`) with a thread or NULL object type
+    references the calling thread without a table lookup: `200- Exit Code
+    0x103`.
+  - Other handles are looked up in the table ObpGetCurrentObjectHandleTable
+    selects (K15574 0x800b5e70, K16547 0x800b6200): the title table
+    (ObTitleObjectHandleTable, K15574 0x801fe1a0, K16547 0x801fdd20) when
+    KeGetCurrentProcessType returns 1, else the system table
+    (ObSystemObjectHandleTable, K15574 0x801fe160, K16547 0x801fdce0). The
+    process type is the byte at process +0x2f, copied to thread +0x73
+    (KeInitializeProcess stores 1 for KeTitleProcess and 2 for
+    KeSystemProcess). The handler runs on the server thread, which
+    ExCreateThread flags 0x040004a6 place in KeSystemProcess (flag 0x2,
+    K15574 0x80088ca8), so the lookup uses the system handle table; a
+    title's handles do not resolve.
+  - An unknown handle calls RtlRip(`Invalid handle specified`) and returns
+    0xc0000008; a handle of another object type calls
+    RtlRip(`Invalid handle type specified`) and returns 0xc0000024. Both
+    become Win32 error 6.
+- Backend requirement: resolve a thread handle in the system process
+  handle table and report whether the thread has terminated and its exit
+  status.
+- Status: spec complete.
 
 ## title
 - Handler: 0x91f47210. Access: 0x4. Extra: 0x0.
@@ -229,7 +248,8 @@ Settings persistence: 0x91f31e48 schedules a rewrite of `\SystemRoot\xbdm.ini`
   lock state query.
 - Name rules (xboxkrnl K15574 ObpLookupElementNameInDirectory,
   ObpComputeHashIndex, ObCreateObject, ObInsertObject,
-  NtQueryDirectoryObject, RtlUpperChar):
+  NtQueryDirectoryObject, RtlUpperChar; K16547, the console's kernel, has
+  the same code, see `parity/security.md` "User directory"):
   - Lookup is case-insensitive (RtlCompareString with case folding):
     a-z and 0xe0-0xfe except 0xf7 fold to upper case; 0xff folds to `?`.
   - The directory has 13 buckets; bucket = h % 13 with h = (c | 0x20) +
@@ -449,22 +469,38 @@ Settings persistence: 0x91f31e48 schedules a rewrite of `\SystemRoot\xbdm.ini`
        unconditionally.
      - otherwise (`running`, or `name` without `ondiskonly`, regardless of
        the name): takes the running executable object path from the xboxkrnl
-       data export ordinal 431 (NUL-terminated string), converts it with
-       0x91f2e750 (if a drive mapping in table 0x91f96bf8 matches the prefix
-       case-insensitively the output is `DRIVE:` + remainder, else the raw
-       path; max 0x104 chars), and sets timestamp = 0, checksum = 0.
+       data export ordinal 431 (`RtlInitAnsiString` of the NUL-terminated
+       string), converts it with 0x91f2e750 into the 0x105-byte path buffer
+       (below), and sets timestamp = 0, checksum = 0.
   5. Continuation 0x91f48fc8; `202- multiline response follows`, lines:
      `timestamp=0x%08x checksum=0x%08x` (both 0 in this build), then
      `name="<path>"` (no escaping), then `.`.
+- Reverse translation 0x91f2e750(ANSI string, out, size); xbeinfo passes
+  size 0x105, export 107 passes 0x104 (0x91f3e09c):
+  - Rows of the drive table 0x91f96bf8 (+0 target pointer, +4 target
+    length, +8 name) are scanned in table order until a row with a null
+    target. A row matches when its target length L is at most the input
+    length and `_strnicmp` (0x91f75508, ASCII case folding in the C locale)
+    finds the first L characters equal. The enabled flag (+0x28) is not
+    tested, and nothing has to follow the prefix: target `\Device\Mu0`
+    matches `\Device\Mu0x\a.xex`.
+  - First match: output = row name (all of it, unchecked) + `:` + the input
+    after the first L characters, the remainder cut to size - 2 - name
+    length characters, then NUL. No match: the input cut to size - 1
+    characters, then NUL.
+  - With the image table the first rows decide common paths:
+    `\Device\Cdrom0\...` gives `A:\...` (row `A`, disabled, precedes
+    `DVD`), `\Device\Harddisk0\Partition1\DEVKIT\...` gives `E:\...`, and
+    `\Device\Harddisk0\Partition1\...` gives `HDD:\...`. No row has the
+    target `\Device\Flash`, so `\Device\Flash\xshell.xex` is returned
+    unchanged.
 - Backend requirement: report the object path of the running title
   executable.
 - Client cross-check: `xbeinfo_running.capture`:
   `timestamp=0x00000000 checksum=0x00000000`, `name="\Device\Flash\xshell.xex"`.
   Consistent. `XbeInfo::Named` will receive the running title's data, not the
   named file's.
-- Status: partial: the drive-prefix translation 0x91f2e750 and table
-  0x91f96bf8 are described only at the level used here; full specs belong to
-  the file and module command groups.
+- Status: spec complete.
 
 ## xexfield
 - Handler: 0x91f492e8. Access: 0x4. Extra: 0x0.

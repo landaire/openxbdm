@@ -20,11 +20,13 @@
 
 mod error;
 
+use core::mem::ManuallyDrop;
 use core::num::NonZeroU32;
 use core::ptr::NonNull;
 
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::Win32Error;
+use openxbdm_server::commands::system::FlashBuffer;
 use xbox360::console::hardware_flags;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::AccessMask;
@@ -182,6 +184,49 @@ impl FlashImage {
             base,
             size: rounded_size,
         })
+    }
+
+    /// Hand the block to the server, which returns it through
+    /// [`FlashImage::from_buffer`].
+    pub fn into_buffer(self) -> FlashBuffer {
+        let image = ManuallyDrop::new(self);
+        // SAFETY: the block stays allocated until `from_buffer` takes it
+        // back and drops it.
+        unsafe { FlashBuffer::from_raw(image.base.as_ptr().expose_provenance() as u32, image.size) }
+    }
+
+    /// Take back the block a buffer carries.
+    ///
+    /// # Safety
+    ///
+    /// `buffer` comes from [`FlashImage::into_buffer`], and no copy of it
+    /// is used afterwards.
+    pub unsafe fn from_buffer(buffer: FlashBuffer) -> Self {
+        Self {
+            // SAFETY: `into_buffer` made the address from a nonnull block.
+            base: unsafe {
+                NonNull::new_unchecked(core::ptr::with_exposed_provenance_mut(
+                    buffer.address() as usize
+                ))
+            },
+            size: buffer.size(),
+        }
+    }
+
+    /// The bytes of a block the server holds.
+    ///
+    /// # Safety
+    ///
+    /// `buffer` comes from [`FlashImage::into_buffer`] and is not released,
+    /// and no other reference to its bytes exists for `'a`.
+    pub unsafe fn bytes_of<'a>(buffer: FlashBuffer) -> &'a mut [u8] {
+        // SAFETY: the block holds `size` bytes (the caller's contract).
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                core::ptr::with_exposed_provenance_mut(buffer.address() as usize),
+                buffer.size() as usize,
+            )
+        }
     }
 
     pub fn bytes_mut(&mut self) -> &mut [u8] {

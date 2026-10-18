@@ -76,11 +76,13 @@ pub use self::drive::DriveTable;
 pub use self::drive::DriveTarget;
 pub use self::drive::OBJECT_PATH_LIMIT;
 pub use self::drive::ObjectPath;
+pub use self::drive::PathServices;
 #[cfg(feature = "smb")]
 pub(crate) use self::drive::internal_drives;
 pub use self::drive::map_title_drive;
 pub use self::drive::open_path;
 pub use self::drive::open_translated;
+pub(crate) use self::drive::publish_drives;
 pub use self::dvd::DvdReport;
 pub(crate) use self::dvd::dvdperf_settings_lines;
 pub use self::sysfile::SystemFileUpdate;

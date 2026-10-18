@@ -450,6 +450,36 @@ fn xbeinfo_reports_the_running_executable_for_every_name() {
 }
 
 #[test]
+fn xbeinfo_names_the_path_through_the_first_matching_drive() {
+    let server = TestServer::start();
+    let mut session = session(&server);
+    for (path, name) in [
+        // `A` precedes `DVD` and matches although it is disabled.
+        (&b"\\Device\\Cdrom0\\default.xex"[..], "A:\\default.xex"),
+        (b"\\DEVICE\\HARDDISK0\\PARTITION1\\x.xex", "HDD:\\x.xex"),
+        // The target is a plain prefix; no separator has to follow it.
+        (b"\\Device\\Mu0x\\a.xex", "MU0:x\\a.xex"),
+        (
+            b"\\Device\\Flash\\xshell.xex",
+            "\\Device\\Flash\\xshell.xex",
+        ),
+    ] {
+        server.host.lock().backend.memory.executable_path = path.to_vec();
+        assert_eq!(
+            session.command("xbeinfo running"),
+            "202- multiline response follows"
+        );
+        assert_eq!(
+            session.multiline(),
+            [
+                "timestamp=0x00000000 checksum=0x00000000".to_owned(),
+                format!("name=\"{name}\"")
+            ]
+        );
+    }
+}
+
+#[test]
 fn addtitlemem_reads_the_title_field_in_extended_memory() {
     let server = TestServer::start();
     let mut session = session(&server);

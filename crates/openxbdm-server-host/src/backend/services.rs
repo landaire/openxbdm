@@ -1,9 +1,12 @@
 //! Simulated CIV services. IPTV settings live in the console configuration
 //! store of the console domain.
 
+mod verification;
+
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
+use openxbdm_core::status::Win32Error;
 use openxbdm_server::commands::services;
 use openxbdm_server::commands::services::CivProgress;
 use openxbdm_server::commands::services::CivResult;
@@ -13,14 +16,20 @@ use openxbdm_server::commands::services::DetectionRoutineMissing;
 use openxbdm_server::commands::services::DetectionUpdate;
 use openxbdm_server::commands::services::LastError;
 use openxbdm_server::commands::services::ThreadHandle;
+use xbox360_sys::status::Win32ErrorCode;
 
 use super::MockBackend;
+
+pub use self::verification::MediaVerification;
+pub use self::verification::SessionState;
 
 /// A request made to the XAM content verification services.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CivCall {
-    /// The failure thread ran XAM 0x9c0(0xff), then restarted the console
-    /// when `reboot` is set.
+    /// The failure thread called `XamShowBadDiscErrorUI`, which ignores its
+    /// argument, shows the bad disc message box and returns when it is
+    /// dismissed; the thread then restarted the console when `reboot` is
+    /// set.
     Failure {
         reboot: bool,
     },
@@ -53,12 +62,10 @@ pub struct Mock {
     /// A detection export the simulated kernel lacks.
     pub missing_detection_routine: Option<DetectionRoutineMissing>,
 
-    /// Return value of XAM 0x9bb.
-    pub create_result: CivResult,
-    /// Return value of XAM 0x9bd.
-    pub verify_result: CivResult,
-    /// What XAM 0x9be reports.
-    pub progress: Result<CivProgress, CivResult>,
+    /// Millisecond clock of the verification worker; the embedder advances
+    /// it.
+    pub now: u64,
+    pub verification: MediaVerification,
 }
 
 impl Default for Mock {
@@ -73,9 +80,8 @@ impl Default for Mock {
             // A booted console has loaded its security settings.
             detection_mask: Some(0),
             missing_detection_routine: None,
-            create_result: CivResult::Returned(Hresult(0)),
-            verify_result: CivResult::Returned(Hresult(0)),
-            progress: Ok(CivProgress::default()),
+            now: 0,
+            verification: MediaVerification::default(),
         }
     }
 }
@@ -118,10 +124,15 @@ impl services::Backend for MockBackend {
     }
 
     fn inject_civ_errors(&mut self, hash_errors: u32, read_errors: u32) {
-        self.services.calls.push(CivCall::Inject {
+        let mock = &mut self.services;
+        mock.calls.push(CivCall::Inject {
             hash_errors,
             read_errors,
         });
+
+        let detected = mock.detected();
+        mock.verification
+            .inject(mock.now, detected, hash_errors, read_errors);
     }
 
     fn update_civ_detection(
@@ -145,24 +156,37 @@ impl services::Backend for MockBackend {
     }
 
     fn create_civ_process(&mut self, thread_id: u32) -> CivResult {
-        self.services
-            .calls
-            .push(CivCall::CreateProcess { thread_id });
+        let mock = &mut self.services;
+        mock.calls.push(CivCall::CreateProcess { thread_id });
 
-        self.services.create_result
+        let detected = mock.detected();
+        returned(mock.verification.create(mock.now, detected))
     }
 
     fn close_civ_process(&mut self) {
-        self.services.calls.push(CivCall::CloseProcess);
+        let mock = &mut self.services;
+        mock.calls.push(CivCall::CloseProcess);
+
+        mock.verification.close(mock.now);
     }
 
     fn verify_civ(&mut self, milliseconds: u32) -> CivResult {
-        self.services.calls.push(CivCall::Verify { milliseconds });
+        let mock = &mut self.services;
+        mock.calls.push(CivCall::Verify { milliseconds });
 
-        self.services.verify_result
+        returned(mock.verification.verify(mock.now, milliseconds))
     }
 
     fn civ_progress(&mut self) -> Result<CivProgress, CivResult> {
-        self.services.progress
+        let mock = &mut self.services;
+        mock.verification
+            .failed_blocks(mock.now)
+            .map_err(|error| CivResult::Returned(Hresult(error.code())))
     }
+}
+
+/// The XAM service's return value: `ERROR_SUCCESS` or the Win32 error,
+/// reported unchanged.
+fn returned(result: Result<(), Win32Error>) -> CivResult {
+    CivResult::Returned(Hresult(Win32ErrorCode::from(result.err()).0))
 }

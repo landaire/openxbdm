@@ -12,7 +12,6 @@ use crate::network::Endpoint;
 use crate::network::NetError;
 use crate::network::Network;
 use crate::network::SocketId;
-use crate::network::send_all;
 use crate::network::send_line;
 use crate::text::Text;
 
@@ -26,8 +25,13 @@ pub use self::posted::PostedTexts;
 
 pub const MAX_NOTIFICATION_SOCKETS: usize = 16;
 pub const MAX_NOTIFICATION_TARGETS: usize = 16;
-/// Wait for a notification socket to become writable.
+/// Wait for a notification socket to become writable before an event line.
 const SEND_TIMEOUT_MS: u32 = 60_000;
+/// Wait for a notification socket to become writable before each send of a
+/// debug string piece.
+const STRING_SEND_TIMEOUT_MS: u32 = 3_000;
+/// Interval at which the input of every notification socket is discarded.
+const INPUT_DRAIN_INTERVAL_MS: i32 = 120_000;
 
 xbox360_sys::flags! {
     /// Target flags.
@@ -48,6 +52,54 @@ pub struct Target {
     pub socket_slot: Option<u8>,
 }
 
+/// A target table entry (stock table 0x91fadb00). Freeing an entry clears
+/// only its address word, so a free entry keeps the port and socket slot of
+/// its last use. The table starts zeroed: port 0, socket slot 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetEntry {
+    Used(Target),
+    Free { port: u16, socket_slot: Option<u8> },
+}
+
+impl TargetEntry {
+    const ZEROED: Self = Self::Free {
+        port: 0,
+        socket_slot: Some(0),
+    };
+
+    const fn used(&self) -> Option<&Target> {
+        match self {
+            Self::Used(target) => Some(target),
+            Self::Free { .. } => None,
+        }
+    }
+
+    fn free(&mut self) {
+        if let Self::Used(target) = *self {
+            *self = Self::Free {
+                port: target.endpoint.port,
+                socket_slot: target.socket_slot,
+            };
+        }
+    }
+
+    const fn socket_slot(&self) -> Option<u8> {
+        match *self {
+            Self::Used(target) => target.socket_slot,
+            Self::Free { socket_slot, .. } => socket_slot,
+        }
+    }
+
+    /// Whether a drop of `endpoint` takes this entry (stock 0x91f38b60);
+    /// a free entry has address 0.
+    fn matches(&self, endpoint: Endpoint) -> bool {
+        match *self {
+            Self::Used(target) => target.endpoint == endpoint,
+            Self::Free { port, .. } => endpoint.address.is_unspecified() && port == endpoint.port,
+        }
+    }
+}
+
 /// Debugger attachment recorded when a `debug` target is registered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DebuggerTarget {
@@ -58,21 +110,24 @@ pub struct DebuggerTarget {
 #[derive(Debug)]
 pub struct Notifications {
     sockets: [Option<SocketId>; MAX_NOTIFICATION_SOCKETS],
-    targets: [Option<Target>; MAX_NOTIFICATION_TARGETS],
+    targets: [TargetEntry; MAX_NOTIFICATION_TARGETS],
     debugger: Option<DebuggerTarget>,
+    /// Tick count of the last input drain.
+    last_input_drain: Option<u32>,
 }
 
 impl Notifications {
     pub const fn new() -> Self {
         Self {
             sockets: [None; MAX_NOTIFICATION_SOCKETS],
-            targets: [None; MAX_NOTIFICATION_TARGETS],
+            targets: [TargetEntry::ZEROED; MAX_NOTIFICATION_TARGETS],
             debugger: None,
+            last_input_drain: None,
         }
     }
 
     pub fn targets(&self) -> impl Iterator<Item = &Target> {
-        self.targets.iter().flatten()
+        self.targets.iter().filter_map(TargetEntry::used)
     }
 
     pub fn debugger(&self) -> Option<DebuggerTarget> {
@@ -81,7 +136,7 @@ impl Notifications {
 
     /// The target at `index`.
     pub fn target(&self, index: usize) -> Option<Target> {
-        self.targets.get(index).copied().flatten()
+        self.targets.get(index).and_then(TargetEntry::used).copied()
     }
 
     /// Place `socket` in a free notification slot.
@@ -110,7 +165,8 @@ impl Notifications {
             }
         };
 
-        if let Some(Some(entry)) = target.and_then(|index| self.targets.get_mut(index)) {
+        if let Some(TargetEntry::Used(entry)) = target.and_then(|index| self.targets.get_mut(index))
+        {
             entry.socket_slot = Some(slot);
         }
 
@@ -118,11 +174,11 @@ impl Notifications {
     }
 
     /// Register a target. A `socket` for a nonzero port binds to an existing
-    /// target with the same endpoint that has no socket. Otherwise a new
-    /// target is created; unless `reverse`, it is bound to `socket` or, without
-    /// one, connected now and sent the `execution` line. A target that cannot
-    /// be connected or attached is removed along with every target of its
-    /// endpoint. Returns whether the target was registered.
+    /// target with the same endpoint that has no socket. Otherwise the first
+    /// free entry becomes the target; unless `reverse`, it is bound to
+    /// `socket` or, without one, connected now and sent the `execution`
+    /// line. A target that cannot be connected or attached is freed and its
+    /// endpoint dropped. Returns whether the target was registered.
     pub fn register_target(
         &mut self,
         endpoint: Endpoint,
@@ -138,11 +194,10 @@ impl Notifications {
 
         if endpoint.port != 0
             && let Some(socket) = socket
-            && let Some(index) = self.targets.iter().position(|target| {
-                matches!(
-                    target,
-                    Some(target) if target.endpoint == endpoint && target.socket_slot.is_none()
-                )
+            && let Some(index) = self.targets.iter().position(|entry| {
+                entry.used().is_some_and(|target| {
+                    target.endpoint == endpoint && target.socket_slot.is_none()
+                })
             })
         {
             let attached = self.attach_socket(socket, Some(index), network).is_some();
@@ -153,11 +208,11 @@ impl Notifications {
             return attached;
         }
 
-        let Some(index) = self.targets.iter().position(Option::is_none) else {
+        let Some(index) = self.targets.iter().position(|entry| entry.used().is_none()) else {
             return false;
         };
 
-        self.targets[index] = Some(Target {
+        self.targets[index] = TargetEntry::Used(Target {
             endpoint,
             flags,
             socket_slot: None,
@@ -174,7 +229,7 @@ impl Notifications {
         let attached =
             connected.and_then(|connected| self.attach_socket(connected, Some(index), network));
         if attached.is_none() {
-            self.targets[index] = None;
+            self.targets[index].free();
             if socket.is_none()
                 && let Some(connected) = connected
             {
@@ -193,51 +248,65 @@ impl Notifications {
     }
 
     /// Detach `socket` from its slot without closing it; targets bound to
-    /// the slot are removed.
+    /// the slot are freed.
     pub fn detach_socket(&mut self, socket: SocketId) {
         let Some(slot) = self.sockets.iter().position(|entry| *entry == Some(socket)) else {
             return;
         };
 
         self.sockets[slot] = None;
-        for target in &mut self.targets {
-            if matches!(target, Some(entry) if entry.socket_slot == Some(slot as u8)) {
-                *target = None;
-            }
-        }
+        self.free_slot_targets(slot);
     }
 
-    /// Remove every target with `endpoint`, closing its socket.
+    /// `notifyat drop` (stock 0x91f38b60): free every entry of `endpoint`
+    /// and close the socket of its slot. Address 0 also takes free entries
+    /// by the port and slot they kept. Other targets bound to a closed slot
+    /// keep it.
     pub fn drop_targets(&mut self, endpoint: Endpoint, network: &mut dyn Network) {
         for index in 0..MAX_NOTIFICATION_TARGETS {
-            if let Some(target) = self.targets[index]
-                && target.endpoint == endpoint
-            {
-                self.targets[index] = None;
+            let entry = &mut self.targets[index];
+            if !entry.matches(endpoint) {
+                continue;
+            }
 
-                if let Some(slot) = target.socket_slot {
-                    self.close_slot(slot as usize, network);
-                }
+            entry.free();
+            if let Some(socket) = entry
+                .socket_slot()
+                .and_then(|slot| self.sockets[slot as usize].take())
+            {
+                network.close(socket);
             }
         }
     }
 
-    /// Remove the target at `index` without touching its socket.
+    /// Free the target at `index` without touching its socket.
     pub fn remove_target(&mut self, index: usize) {
-        if let Some(target) = self.targets.get_mut(index) {
-            *target = None;
+        if let Some(entry) = self.targets.get_mut(index) {
+            entry.free();
         }
     }
 
-    /// Close every notification socket. Targets stay registered and are
-    /// unbound from their sockets.
+    /// Close every notification socket (stock 0x91f3b208). Targets stay
+    /// registered and keep their socket slots.
     pub fn close_all(&mut self, network: &mut dyn Network) {
         for socket in self.sockets.iter_mut().filter_map(Option::take) {
             network.close(socket);
         }
+    }
 
-        for target in self.targets.iter_mut().flatten() {
-            target.socket_slot = None;
+    /// Discard the input of every notification socket when 120 seconds
+    /// have passed since the last time (stock 0x91f38940, run on every pass
+    /// of the server loop). `now` is the millisecond tick count.
+    pub fn drain_input(&mut self, now: u32, network: &mut dyn Network) {
+        if let Some(last) = self.last_input_drain
+            && (now.wrapping_sub(last) as i32) < INPUT_DRAIN_INTERVAL_MS
+        {
+            return;
+        }
+
+        self.last_input_drain = Some(now);
+        for &socket in self.sockets.iter().flatten() {
+            let _ = discard_input(network, socket);
         }
     }
 
@@ -246,9 +315,16 @@ impl Notifications {
             network.close(socket);
         }
 
-        for target in &mut self.targets {
-            if matches!(target, Some(entry) if entry.socket_slot == Some(slot as u8)) {
-                *target = None;
+        self.free_slot_targets(slot);
+    }
+
+    fn free_slot_targets(&mut self, slot: usize) {
+        for entry in &mut self.targets {
+            if entry
+                .used()
+                .is_some_and(|target| target.socket_slot == Some(slot as u8))
+            {
+                entry.free();
             }
         }
     }
@@ -311,10 +387,10 @@ impl Notifications {
         accepted
     }
 
-    /// Debug strings are split at CR, LF, LF CR, and every 0x800 bytes. Each
-    /// piece is sent as `<kind> [stop ]thread=0x%08x <eol>string=<piece>`,
-    /// where `<eol>` is `cr `, `lf `, `crlf `, or empty, naming the line end
-    /// that ended the piece.
+    /// Debug strings (stock 0x91f38ce8) are split at CR, LF, LF CR, and every
+    /// 0x800 bytes. Each piece is sent as `<kind> [stop ]thread=0x%08x
+    /// <eol>string=<piece>`, where `<eol>` is `cr `, `lf `, `crlf `, or
+    /// empty, naming the line end that ended the piece.
     fn deliver_string(
         &mut self,
         kind: &str,
@@ -362,6 +438,8 @@ fn connect_target(
     Some(socket)
 }
 
+/// Send the pieces of a debug string to one socket. A socket that is not
+/// writable in time gets no more of the string but stays open.
 fn send_string_pieces(
     network: &mut dyn Network,
     socket: SocketId,
@@ -388,15 +466,55 @@ fn send_string_pieces(
             (b"lf ", 1)
         };
 
-        network.wait_writable(socket, SEND_TIMEOUT_MS)?;
-        send_all(network, socket, prefix)?;
-        send_all(network, socket, eol)?;
-        send_all(network, socket, b"string=")?;
-        send_line(network, socket, &text[offset..end])?;
+        let parts = [prefix, eol, b"string=", &text[offset..end], b"\r\n"];
+        if send_gathered(network, socket, &parts)? == GatheredSend::TimedOut {
+            return Ok(());
+        }
+
         offset = end + skip;
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatheredSend {
+    Sent,
+    TimedOut,
+}
+
+/// Send `parts` back to back as the monitor's gathered send does. Each send
+/// call is preceded by a wait of up to 3 seconds for the socket to become
+/// writable and continues through the parts until one is accepted in part.
+/// Only a wait that runs out ends the send; a failed wait still sends.
+fn send_gathered(
+    network: &mut dyn Network,
+    socket: SocketId,
+    parts: &[&[u8]],
+) -> Result<GatheredSend, NetError> {
+    let mut parts = parts.iter().copied().filter(|part| !part.is_empty());
+    let Some(mut part) = parts.next() else {
+        return Ok(GatheredSend::Sent);
+    };
+
+    loop {
+        if network.wait_writable(socket, STRING_SEND_TIMEOUT_MS) == Err(NetError::WouldBlock) {
+            return Ok(GatheredSend::TimedOut);
+        }
+
+        loop {
+            let sent = network.send(socket, part)?;
+            part = &part[sent.min(part.len())..];
+            if !part.is_empty() {
+                break;
+            }
+
+            match parts.next() {
+                Some(next) => part = next,
+                None => return Ok(GatheredSend::Sent),
+            }
+        }
+    }
 }
 
 /// Read and drop the input waiting on a notification socket (stock
@@ -419,4 +537,188 @@ fn discard_input(network: &mut dyn Network, socket: SocketId) -> Result<(), NetE
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use std::vec::Vec;
+
+    use super::*;
+    use crate::network::Ipv4Address;
+    use crate::network::SendBufferSize;
+
+    const SOCKETS: usize = 4;
+
+    /// Sockets that accept bytes while they have room and report input that
+    /// receives consume.
+    #[derive(Default)]
+    struct ScriptedNetwork {
+        sent: [Vec<u8>; SOCKETS],
+        /// Bytes a socket still accepts; `None` accepts any amount.
+        room: [Option<usize>; SOCKETS],
+        pending: [usize; SOCKETS],
+        closed: Vec<SocketId>,
+        waits: Vec<(SocketId, u32)>,
+    }
+
+    impl Network for ScriptedNetwork {
+        fn receive(&mut self, socket: SocketId, buffer: &mut [u8]) -> Result<usize, NetError> {
+            let pending = &mut self.pending[socket.0 as usize];
+            let count = buffer.len().min(*pending);
+            *pending -= count;
+
+            Ok(count)
+        }
+
+        fn send(&mut self, socket: SocketId, data: &[u8]) -> Result<usize, NetError> {
+            let index = socket.0 as usize;
+            let count = self.room[index].map_or(data.len(), |room| room.min(data.len()));
+            if let Some(room) = &mut self.room[index] {
+                *room -= count;
+            }
+            self.sent[index].extend_from_slice(&data[..count]);
+
+            Ok(count)
+        }
+
+        fn close(&mut self, socket: SocketId) {
+            self.closed.push(socket);
+        }
+
+        fn peer(&mut self, _socket: SocketId) -> Result<Endpoint, NetError> {
+            Err(NetError::Closed)
+        }
+
+        fn connect(&mut self, _endpoint: Endpoint, _blocking: bool) -> Result<SocketId, NetError> {
+            Err(NetError::Exhausted)
+        }
+
+        fn wait_writable(&mut self, socket: SocketId, timeout_ms: u32) -> Result<(), NetError> {
+            self.waits.push((socket, timeout_ms));
+            match self.room[socket.0 as usize] {
+                Some(0) => Err(NetError::WouldBlock),
+                _ => Ok(()),
+            }
+        }
+
+        fn set_blocking(&mut self, _socket: SocketId, _blocking: bool) -> Result<(), NetError> {
+            Ok(())
+        }
+
+        fn pending_input(&mut self, socket: SocketId) -> Result<usize, NetError> {
+            Ok(self.pending[socket.0 as usize])
+        }
+
+        fn send_buffer_size(&mut self, _socket: SocketId) -> Result<SendBufferSize, NetError> {
+            Ok(SendBufferSize(0x2000))
+        }
+
+        fn set_send_buffer_size(
+            &mut self,
+            _socket: SocketId,
+            _size: SendBufferSize,
+        ) -> Result<(), NetError> {
+            Ok(())
+        }
+    }
+
+    fn endpoint(address: Ipv4Address, port: u16) -> Endpoint {
+        Endpoint { address, port }
+    }
+
+    #[test]
+    fn a_debug_string_skips_a_full_channel_and_an_event_line_closes_it() {
+        const FIRST: &[u8] = b"debugstr thread=0x00000007 lf string=one\r\n";
+        const SECOND: &[u8] = b"debugstr thread=0x00000007 string=two\r\n";
+
+        let mut network = ScriptedNetwork::default();
+        let mut notifications = Notifications::new();
+        notifications.add_socket(SocketId(0));
+        notifications.add_socket(SocketId(1));
+        network.room[0] = Some(FIRST.len() + 5);
+
+        let string = Event::DebugString {
+            thread: 7,
+            text: b"one\ntwo",
+            stopped: false,
+        };
+        assert!(notifications.deliver(&string, &mut network));
+
+        // The full channel got the first piece and part of the second; it
+        // stays open.
+        assert_eq!(network.sent[0], [FIRST, &SECOND[..5]].concat());
+        assert_eq!(network.sent[1], [FIRST, SECOND].concat());
+        assert!(network.closed.is_empty());
+        assert!(
+            network
+                .waits
+                .iter()
+                .all(|&(_, timeout)| timeout == STRING_SEND_TIMEOUT_MS)
+        );
+
+        // An event line waits 60 seconds and closes the channel that is
+        // still full.
+        let execution = Event::Execution(ExecutionState::Stopped);
+        assert!(notifications.deliver(&execution, &mut network));
+        assert_eq!(network.closed, [SocketId(0)]);
+        assert_eq!(network.waits.last(), Some(&(SocketId(1), SEND_TIMEOUT_MS)));
+        assert!(network.sent[1].ends_with(b"execution stopped\r\n"));
+    }
+
+    #[test]
+    fn a_drop_of_address_zero_takes_free_entries_by_their_kept_port_and_slot() {
+        const TARGET: Endpoint = Endpoint {
+            address: Ipv4Address([1, 0, 0, 127]),
+            port: 731,
+        };
+
+        let mut network = ScriptedNetwork::default();
+        let mut notifications = Notifications::new();
+
+        // Entries never used hold port 0 and socket slot 0.
+        assert_eq!(notifications.add_socket(SocketId(0)), Some(0));
+        notifications.drop_targets(endpoint(Ipv4Address::UNSPECIFIED, 0), &mut network);
+        assert_eq!(network.closed, [SocketId(0)]);
+
+        // A dropped target keeps its port and slot; the slot's next socket
+        // goes with the next drop of address 0 and that port.
+        assert!(notifications.register_target(
+            TARGET,
+            TargetFlags::empty(),
+            false,
+            Some(SocketId(1)),
+            ExecutionState::Started,
+            &mut network,
+        ));
+        notifications.drop_targets(TARGET, &mut network);
+        assert_eq!(network.closed, [SocketId(0), SocketId(1)]);
+        assert_eq!(notifications.targets().count(), 0);
+
+        assert_eq!(notifications.add_socket(SocketId(2)), Some(0));
+        notifications.drop_targets(endpoint(Ipv4Address::UNSPECIFIED, 732), &mut network);
+        assert_eq!(network.closed, [SocketId(0), SocketId(1)]);
+        notifications.drop_targets(endpoint(Ipv4Address::UNSPECIFIED, 731), &mut network);
+        assert_eq!(network.closed, [SocketId(0), SocketId(1), SocketId(2)]);
+    }
+
+    #[test]
+    fn channel_input_is_discarded_every_120_seconds() {
+        const START: u32 = 0xffff_0000;
+
+        let mut network = ScriptedNetwork::default();
+        let mut notifications = Notifications::new();
+        notifications.add_socket(SocketId(0));
+
+        network.pending[0] = 0x50;
+        notifications.drain_input(START, &mut network);
+        assert_eq!(network.pending[0], 0);
+
+        network.pending[0] = 0x50;
+        notifications.drain_input(START.wrapping_add(119_999), &mut network);
+        assert_eq!(network.pending[0], 0x50);
+        notifications.drain_input(START.wrapping_add(120_000), &mut network);
+        assert_eq!(network.pending[0], 0);
+    }
 }

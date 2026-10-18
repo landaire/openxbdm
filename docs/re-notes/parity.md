@@ -33,17 +33,17 @@ Columns:
 | --- | --- | --- | --- | --- |
 | session | 12 | 12 | 29 | [parity/session.md](parity/session.md) |
 | security | 9 | 9 | 7 | [parity/security.md](parity/security.md) |
-| console | 29 | 28 | 18 | [parity/console.md](parity/console.md) |
-| system | 10 | 9 | 4 | [parity/system.md](parity/system.md) |
-| filesystem | 24 | 23 | 4 | [parity/filesystem.md](parity/filesystem.md) |
-| memory | 14 | 12 | 17 | [parity/memory.md](parity/memory.md) |
-| debugger | 24 | 22 | 25 | [parity/debugger.md](parity/debugger.md) |
+| console | 29 | 29 | 18 | [parity/console.md](parity/console.md) |
+| system | 10 | 10 | 4 | [parity/system.md](parity/system.md) |
+| filesystem | 24 | 24 | 4 | [parity/filesystem.md](parity/filesystem.md) |
+| memory | 14 | 14 | 17 | [parity/memory.md](parity/memory.md) |
+| debugger | 24 | 24 | 25 | [parity/debugger.md](parity/debugger.md) |
 | network | 10 | 10 | 13 | [parity/network.md](parity/network.md) |
-| performance | 12 | 11 | 41 | [parity/performance.md](parity/performance.md) |
+| performance | 12 | 12 | 41 | [parity/performance.md](parity/performance.md) |
 | hardware | 19 | 19 | 34 | [parity/hardware.md](parity/hardware.md) |
-| services | 14 | 10 | 0 | [parity/services.md](parity/services.md) |
+| services | 14 | 14 | 0 | [parity/services.md](parity/services.md) |
 | generic | 0 | - | 61 | [exports.md](exports.md) |
-| Total | 177 | 165 | 253 | |
+| Total | 177 | 177 | 253 | |
 
 All 177 stock command table entries are registered, and each has a host
 test. All 253 populated export ordinals of the stock table are declared
@@ -54,18 +54,22 @@ under debugger there.
 
 ## Hardware results
 
-`xeedee parity record` sent the 399 lines of
-`parity/hardware-commands.txt` to stock XBDM 2.0.21256.0 and to openxbdm
-on the same devkit; `xeedee parity compare` with
+`xeedee parity record` sent `parity/hardware-commands.txt` to stock XBDM
+2.0.21256.0 and to openxbdm on the same devkit, each from a fresh boot
+with the kd host attached; `xeedee parity compare` with
 `parity/hardware-variances.txt` reports:
 
 | Exchanges | Equal | Equal outside varying fields | Differ |
 | --- | --- | --- | --- |
-| 399 | 378 | 21 | 0 |
+| 1060 | 1042 | 18 | 0 |
 
-The lines cover 134 of the 177 commands; the other 43 are excluded. On
-the same console xshell loads against the openxbdm exports. Method,
-exclusions, and varying fields:
+The lines cover 138 of the 177 commands; the other 39 are excluded. On
+the same console xshell loads against the openxbdm exports. Further
+checks run outside the command list (key exchange group, breakpoints of
+threads that cannot stop, `break now`, `civ*` pass timing, the CPU
+profiler, `notifyat drop`, the debug event wake socket) are listed in
+[parity/hardware.md](parity/hardware.md#checks-outside-the-command-list).
+Method, exclusions, and varying fields:
 [parity/hardware.md](parity/hardware.md#hardware-differential-results).
 
 ## Control dispatcher codes
@@ -83,10 +87,10 @@ openxbdm.
 | Memory | 4 | 4 | 0x08 0x09 0x18 0x86 |
 | Session | 6 | 6 | 0x0a 0x32 0x88 0x89 0x8a 0xa9 |
 | Network | 15 | 15 | 0x0b..0x16 0xa5 0xa6 0xa7 |
-| Hardware | 13 | 12 | 0x1a (missing) 0x46..0x4a 0x7a 0x7b 0x7c 0x96 0x97 0x98 0xa1 |
+| Hardware | 13 | 13 | 0x1a 0x46..0x4a 0x7a 0x7b 0x7c 0x96 0x97 0x98 0xa1 |
 | Performance and PIX | 44 | 44 | 0x1b 0x1c 0x27 0x2e 0x2f 0x30 0x38..0x3c 0x3f 0x41..0x45 0x50..0x5e 0x7f 0x80..0x85 0x87 0x8d 0x8e 0x99 0x9f |
 | Console | 3 | 3 | 0x1e 0x1f 0x33 |
-| Total | 103 | 102 | |
+| Total | 103 | 103 | |
 
 ## Commands
 
@@ -94,11 +98,11 @@ openxbdm.
 | --- | --- | --- | --- | --- | --- | --- |
 | addtitlemem | [memory](parity/memory.md) | [complete](commands/group1.md#addtitlemem) | yes | `memory.rs` | yes | yes |
 | adminpw | [security](parity/security.md) | [complete](commands/group1.md#adminpw) | yes | `security.rs` | yes | yes |
-| advmem | [memory](parity/memory.md) | [partial](commands/group1.md#advmem) | yes | `memory.rs` | yes | yes |
+| advmem | [memory](parity/memory.md) | [complete](commands/group1.md#advmem) | yes | `memory.rs` | yes | yes |
 | altaddr | [console](parity/console.md) | [complete](commands/group1.md#altaddr) | yes | `console.rs` | yes | yes |
 | authuser | [security](parity/security.md) | [complete](commands/group1.md#authuser) | yes | `security.rs` | yes | yes |
 | autoinput | [hardware](parity/hardware.md) | [complete](commands/group1.md#autoinput) | yes | `hardware.rs` | yes | yes |
-| autoprof | [performance](parity/performance.md) | [partial](commands/group1.md#autoprof) | yes | `performance.rs` | yes | yes |
+| autoprof | [performance](parity/performance.md) | [complete](commands/group1.md#autoprof) | yes | `performance.rs` | yes | yes |
 | autoshutoff | [console](parity/console.md) | [complete](commands/group1.md#autoshutoff) | yes | `console.rs` | yes | yes |
 | avatar | [hardware](parity/hardware.md) | [complete](commands/group1.md#avatar) | yes | `hardware.rs` | yes | yes |
 | bkgdmodetest | [hardware](parity/hardware.md) | [complete](commands/group1.md#bkgdmodetest) | yes | `hardware.rs` | yes | yes |
@@ -108,19 +112,19 @@ openxbdm.
 | builtinmu | [hardware](parity/hardware.md) | [complete](commands/group1.md#builtinmu) | yes | `hardware.rs` | yes | yes |
 | bye | [session](parity/session.md) | [complete](commands/group1.md#bye) | yes | `framework.rs`, `security.rs` | yes | yes |
 | capctrl | [performance](parity/performance.md) | [complete](commands/group1.md#capctrl) | yes | `performance.rs` | yes | yes |
-| civfail | [services](parity/services.md) | [wire complete](commands/group1.md#civfail) | yes | `services.rs` | yes | excluded |
-| civinject | [services](parity/services.md) | [wire complete](commands/group1.md#civinject) | yes | `services.rs` | yes | excluded |
+| civfail | [services](parity/services.md) | [complete](commands/group1.md#civfail) | yes | `services.rs` | yes | excluded |
+| civinject | [services](parity/services.md) | [complete](commands/group1.md#civinject) | yes | `services.rs` | yes | yes |
 | civsetbits | [services](parity/services.md) | [complete](commands/group1.md#civsetbits) | yes | `services.rs` | yes | excluded |
-| civstart | [services](parity/services.md) | [wire complete](commands/group1.md#civstart) | yes | `services.rs` | yes | excluded |
+| civstart | [services](parity/services.md) | [complete](commands/group1.md#civstart) | yes | `services.rs` | yes | yes |
 | civstatus | [services](parity/services.md) | [complete](commands/group1.md#civstatus) | yes | `services.rs` | yes | yes |
-| civstop | [services](parity/services.md) | [complete](commands/group1.md#civstop) | yes | `services.rs` | yes | excluded |
-| civverify | [services](parity/services.md) | [wire complete](commands/group1.md#civverify) | yes | `services.rs` | yes | excluded |
+| civstop | [services](parity/services.md) | [complete](commands/group1.md#civstop) | yes | `services.rs` | yes | yes |
+| civverify | [services](parity/services.md) | [complete](commands/group1.md#civverify) | yes | `services.rs` | yes | yes |
 | confignetra | [console](parity/console.md) | [complete](commands/group2.md#confignetra) | yes | `console.rs` | yes | yes |
 | consolefeatures | [console](parity/console.md) | [complete](commands/group2.md#consolefeatures) | yes | `console.rs` | yes | yes |
 | consolemem | [console](parity/console.md) | [complete](commands/group2.md#consolemem) | yes | `console.rs` | yes | yes |
 | consoletype | [console](parity/console.md) | [complete](commands/group2.md#consoletype) | yes | `console.rs` | yes | yes |
 | continue | [debugger](parity/debugger.md) | [complete](commands/group2.md#continue) | yes | `debugger.rs` | yes | yes |
-| crashdump | [debugger](parity/debugger.md) | [partial](commands/group2.md#crashdump) | yes | `debugger.rs` | yes | excluded |
+| crashdump | [debugger](parity/debugger.md) | [complete](commands/group2.md#crashdump) | yes | `debugger.rs` | yes | excluded |
 | datacentermode | [console](parity/console.md) | [complete](commands/group2.md#datacentermode) | yes | `console.rs` | yes | excluded |
 | dbgextld | [debugger](parity/debugger.md) | [complete](commands/group2.md#dbgextld) | yes | `debugger.rs` | yes | yes |
 | dbgname | [console](parity/console.md) | [complete](commands/group2.md#dbgname) | yes | `console.rs`, `session.rs`, `system.rs`, `trace.rs` | yes | yes |
@@ -142,14 +146,14 @@ openxbdm.
 | dumpsettings | [console](parity/console.md) | [complete](commands/group3.md#dumpsettings) | yes | `console.rs`, `system.rs` | yes | yes |
 | dvdblk | [filesystem](parity/filesystem.md) | [complete](commands/group3.md#dvdblk) | yes | `filesystem.rs` | yes | yes |
 | dvdeject | [filesystem](parity/filesystem.md) | [complete](commands/group3.md#dvdeject) | yes | `filesystem.rs` | yes | excluded |
-| dvdperf | [filesystem](parity/filesystem.md) | [partial](commands/group3.md#dvdperf) | yes | `filesystem.rs` | yes | yes |
+| dvdperf | [filesystem](parity/filesystem.md) | [complete](commands/group3.md#dvdperf) | yes | `filesystem.rs` | yes | yes |
 | enablewirelesscontrollers | [hardware](parity/hardware.md) | [complete](commands/group3.md#enablewirelesscontrollers) | yes | `hardware.rs` | yes | yes |
 | eventdefer | [console](parity/console.md) | [complete](commands/group3.md#eventdefer) | yes | `console.rs`, `debugger.rs`, `trace.rs` | yes | yes |
 | fastpipe | [session](parity/session.md) | [complete](commands/group3.md#fastpipe) | yes | `session.rs` | yes | excluded |
-| feature | [console](parity/console.md) | [partial](commands/group3.md#feature) | yes | `console.rs` | yes | yes |
+| feature | [console](parity/console.md) | [complete](commands/group3.md#feature) | yes | `console.rs` | yes | yes |
 | fileeof | [filesystem](parity/filesystem.md) | [complete](commands/group3.md#fileeof) | yes | `filesystem.rs` | yes | yes |
 | fileevent | [session](parity/session.md) | [complete](commands/group3.md#fileevent) | yes | `session.rs` | yes | yes |
-| flash | [system](parity/system.md) | [partial](commands/group3.md#flash) | yes | `system.rs` | yes | excluded |
+| flash | [system](parity/system.md) | [complete](commands/group3.md#flash) | yes | `system.rs` | yes | excluded |
 | fmtfat | [filesystem](parity/filesystem.md) | [complete](commands/group3.md#fmtfat) | yes | `filesystem.rs` | yes | excluded |
 | getconsoleid | [console](parity/console.md) | [complete](commands/group3.md#getconsoleid) | yes | `console.rs` | yes | yes |
 | getcontext | [debugger](parity/debugger.md) | [complete](commands/group3.md#getcontext) | yes | `debugger.rs` | yes | yes |
@@ -253,7 +257,7 @@ openxbdm.
 | tdecomp | [hardware](parity/hardware.md) | [complete](commands/group7.md#tdecomp) | yes | `hardware.rs` | yes | yes |
 | threadinfo | [debugger](parity/debugger.md) | [complete](commands/group7.md#threadinfo) | yes | `debugger.rs` | yes | yes |
 | threads | [debugger](parity/debugger.md) | [complete](commands/group7.md#threads) | yes | `debugger.rs` | yes | yes |
-| threadstat | [debugger](parity/debugger.md) | [partial](commands/group8.md#threadstat) | yes | `debugger.rs` | yes | yes |
+| threadstat | [debugger](parity/debugger.md) | [complete](commands/group8.md#threadstat) | yes | `debugger.rs` | yes | yes |
 | title | [system](parity/system.md) | [complete](commands/group8.md#title) | yes | `system.rs` | yes | excluded |
 | traceimports | [memory](parity/memory.md) | [complete](commands/group8.md#traceimports) | yes | `memory.rs` | yes | yes |
 | usbportctrl | [hardware](parity/hardware.md) | [complete](commands/group8.md#usbportctrl) | yes | `hardware.rs` | yes | yes |
@@ -265,62 +269,39 @@ openxbdm.
 | welcomedefault | [console](parity/console.md) | [complete](commands/group8.md#welcomedefault) | yes | `console.rs` | yes | excluded |
 | welcomehide | [console](parity/console.md) | [complete](commands/group8.md#welcomehide) | yes | `console.rs` | yes | excluded |
 | writefile | [filesystem](parity/filesystem.md) | [complete](commands/group8.md#writefile) | yes | `filesystem.rs` | yes | yes |
-| xbeinfo | [memory](parity/memory.md) | [partial](commands/group8.md#xbeinfo) | yes | `memory.rs` | yes | yes |
+| xbeinfo | [memory](parity/memory.md) | [complete](commands/group8.md#xbeinfo) | yes | `memory.rs` | yes | yes |
 | xexfield | [memory](parity/memory.md) | [complete](commands/group8.md#xexfield) | yes | `memory.rs` | yes | yes |
 | xhttpproxy | [network](parity/network.md) | [complete](commands/group8.md#xhttpproxy) | yes | `network.rs` | yes | yes |
 | xstudio | [performance](parity/performance.md) | [complete](commands/group8.md#xstudio) | yes | `performance.rs` | yes | yes |
 
 ## Remaining gaps
 
-Open specification questions:
-
-- `advmem`: platform meaning of flash word 6 bit 0x100
-  ([group1](commands/group1.md#advmem)).
-- `autoprof`: meaning of hardware flag 0x10
-  ([group1](commands/group1.md#autoprof)).
-- `civfail`, `civinject`, `civstart`, `civverify`: XAM ordinals 0x9bb to
-  0x9c0 (no xam.xex image); the host mock logs requests
-  ([services](parity/services.md#remaining-differences)).
-- `crashdump`: whether `DumpWriteDump` returns is decided in the kernel
-  ([group2](commands/group2.md#crashdump)).
-- `dvdperf`: unit of the `time` and timestamp ticks
-  ([group3](commands/group3.md#dvdperf)).
-- `feature`: XAM ordinal 515 semantics; XHttp request headers beyond
-  `User-Agent` and `Host` ([console](parity/console.md#remaining-differences)).
-- `flash`: image validation rules of 0x91f73260/0x91f732a8/0x91f734a0
-  ([group3](commands/group3.md#flash)); `flash_commit` treats a missing
-  image buffer as success ([system](parity/system.md#remaining-gaps)).
-- `threadstat`: system or title handle table
-  ([group8](commands/group8.md#threadstat)).
-- `xbeinfo`: drive-prefix translation described only as far as used
-  ([group8](commands/group8.md#xbeinfo)).
+Open specification questions: none. Every command section is `spec
+complete`; the answers that closed the last questions are in the command
+sections (XAM ordinals from the devkit's xam.xex memory image, kernel
+routines from K16547, the hypervisor flash header reader for `advmem`).
 
 Implementation gaps:
 
-- Control code 0x1a (`HalOpenCloseODDTray(1)`, result `0x02da0000`) has
-  no case in the Xbox dispatcher; it returns 0 and does not open the tray.
-- Session: no code emits the `dbgprint` producer texts of the CD-ROM and
-  SATA patch routines; the reader's endless loop after a ring restart,
-  stale `notifyat drop` matches, and the 3 s / 120 s debug string
-  delivery timing are not reproduced; the host mock generates no
-  0x64/0x65 file events ([session](parity/session.md#remaining-gaps)).
-- Debugger: posted events wait for the next server pass (20 ms); stack
-  overflow marking, direct exceptions above passive level, the 8-block
-  breakpoint arena, and record flag 0x100
+- Debugger: stock does an event's dispatch, execution change, thread
+  suspension and notification sends on the faulting thread; openxbdm's
+  server thread does them. A posting thread wakes the server through its
+  wake socket, so the event is taken at once rather than at the next
+  20 ms pass (on the devkit a datagram to 127.0.0.1 and to the debug
+  address both woke a waiting select)
   ([debugger](parity/debugger.md#remaining-gaps-precise)).
-- Hardware: PGO export 107 cannot read `pogo.ini` when called on the
-  server thread, above passive level, or after the server stopped; the
-  host has no optical drive events
-  ([hardware](parity/hardware.md#gaps)).
-- Performance: PIX and CPU profiler deviations
-  ([performance](parity/performance.md#xbox-backend)); kernel exports
-  669-671 semantics unverified.
-- Security: directory rules come from the K15574 debug kernel, and DH
-  inputs at or above the modulus were not traced in the kernel
-  ([security](parity/security.md#unverified-on-hardware)).
-- File system: no SO_SNDBUF change for `getfile`; `count=0` and overlong
-  name cases of `getvfattr`/`sendvfile`
-  ([filesystem](parity/filesystem.md#divergences-and-gaps)).
+- Dispatch flag 0x4 commands (`civinject`, `civstart`, `civstop`,
+  `civverify`) run on a title-process thread while the server thread
+  waits, as stock does. In that window a thread whose event stops it
+  waits for the server as stock's stays stopped, and the server takes the
+  event after the reply; events that do not stop are dispatched on their
+  thread, so their notification texts reach the channels after the
+  reply, and execution changes requested from other threads are dropped;
+  stock's printing or faulting thread does that work itself
+  ([debugger](parity/debugger.md#events-during-a-dispatch-flag-0x4-command)).
+- Exports and control codes that change server state fail when they are
+  called on the server thread, above passive level, or after the server
+  stopped (next section); stock runs them inline.
 
 ## Server-thread requests
 
@@ -331,7 +312,11 @@ afterwards they are posted to the server thread and the caller waits for
 its next pass (at most about 20 ms). They fail without running when
 called on the server thread, above passive level, before the server
 state exists, or after control code 0x02 stopped the server. The
-domain records list the result each export returns in that case.
+domain records list the result each export returns in that case. Exports
+that only translate drive paths do not need the server thread: they copy
+the drive table the server publishes after each change and translate on
+the caller's thread
+([hardware](parity/hardware.md#drive-table-off-the-server-thread)).
 
 ## Deliberate deviations
 
@@ -345,14 +330,16 @@ record:
 - [system](parity/system.md#deviations): `setreset` stale bytes, `title
   nopersist` assertion, `magicboot` from the settings file, control codes
   0x1d and 0x22.
-- [filesystem](parity/filesystem.md#divergences-and-gaps): unchecked pool
-  allocations, double free on `count=0`, unreadable title memory in
-  control code 0x03.
+- [filesystem](parity/filesystem.md#deviations): unchecked pool
+  allocations, double free on `count=0`, the name length 0 leak, the
+  spinning receive window for names over 0x4000 bytes, unreadable title
+  memory in control code 0x03, and the ring freed under a DMSATA
+  producer.
 - [memory](parity/memory.md#deviations): per-line loader walks,
   `traceimports` without export 719, `detour` table and pool cases,
   export 78 type names.
-- [debugger](parity/debugger.md#remaining-gaps-precise): `isstopped` type
-  0xd kind, breakpoint split slots.
+- [debugger](parity/debugger.md#deviations): `isstopped` type 0xd kind,
+  breakpoint split slots, the stack overflow mark through a null record.
 - [network](parity/network.md#remaining-differences): snapshot leaks,
   `nicstats` stale stack, `xhttpproxy` null context, classifier compiler
   faults, `netsim` limit loops ([group5](commands/group5.md#netsim)).
@@ -362,10 +349,12 @@ record:
   `autoinput`, `pogoctrl`, `setpacket`, `playto`, optical disc log, PGO
   runtime faults.
 - [security](parity/security.md#deliberate-difference): `ObInsertObject`
-  double release, export 61 overlong names.
+  double release, export 61 overlong names, the uninitialized `user`
+  password field.
 - [services](parity/services.md#remaining-differences): `civsetbits` and
   `civverify` uninitialized arguments, cleared connection buffers.
-- [session](parity/session.md#remaining-gaps): `rpc` argument copies,
-  `fastpipe` defects.
+- [session](parity/session.md#deviations): the `dbgprint` reader's loop
+  after a ring restart, `rpc` argument copies and call block lifetime,
+  `fastpipe` defects, and the discovery name buffer byte.
 
 Further single-behavior entries are in `nuances.md`.

@@ -19,12 +19,16 @@ use super::send_pool_piece;
 use crate::commands::util;
 use crate::continuation::ContinuationContext;
 use crate::invocation::Invocation;
+use crate::network::SendBufferSize;
 use crate::reply::CommandError;
 use crate::reply::CommandResult;
 use crate::reply::Reply;
 
 /// `getfile` reads this many bytes per chunk.
 const GETFILE_CHUNK: u32 = 0x3000;
+
+/// SO_SNDBUF for the duration of a `getfile` transfer.
+const TRANSFER_SEND_BUFFER: u32 = 0x10000;
 
 /// `getfile` transfer: a 4-byte little-endian length, then the data in
 /// 0x3000-byte reads.
@@ -37,6 +41,8 @@ pub struct GetFile {
     header_sent: bool,
     chunk_sent: u32,
     chunk_length: u32,
+    /// SO_SNDBUF before the transfer, restored when it ends.
+    saved_send_buffer: Option<SendBufferSize>,
 }
 
 impl GetFile {
@@ -47,6 +53,16 @@ impl GetFile {
             cx.binary[..4].copy_from_slice(&self.length.to_le_bytes());
             cx.binary_len = 4;
 
+            // A failed query leaves the size unchanged; a saved size of 0
+            // is not restored. A failed set is ignored.
+            let socket = cx.session.socket;
+            if let Ok(size) = cx.network.send_buffer_size(socket) {
+                self.saved_send_buffer = Some(size).filter(|size| size.0 != 0);
+                let _ = cx
+                    .network
+                    .set_send_buffer_size(socket, SendBufferSize(TRANSFER_SEND_BUFFER));
+            }
+
             return Ok(Reply::Ok);
         }
 
@@ -56,6 +72,12 @@ impl GetFile {
             // SAFETY: the transfer ends with this result, so the server drops
             // the continuation, the only other holder.
             unsafe { cx.backend.free_pool(self.buffer) };
+
+            // A failed restore is ignored.
+            if let Some(size) = self.saved_send_buffer {
+                let _ = cx.network.set_send_buffer_size(cx.session.socket, size);
+            }
+
             return Err(CommandError::EndOfData);
         }
 
@@ -167,6 +189,7 @@ pub(super) fn get_file(invocation: &mut Invocation<'_>) -> CommandResult {
         header_sent: false,
         chunk_sent: 0,
         chunk_length: 0,
+        saved_send_buffer: None,
     };
 
     begin(invocation, Continuation::GetFile(transfer), None);

@@ -18,9 +18,11 @@ use openxbdm_server::network::Endpoint;
 use openxbdm_server::network::Ipv4Address;
 use openxbdm_server::network::NetError;
 use openxbdm_server::network::Network;
+use openxbdm_server::network::SendBufferSize;
 use openxbdm_server::network::SocketId;
 
 use self::socket_option::reserve_send_space;
+use self::socket_option::send_buffer_size;
 
 pub use self::socket_option::set_keepalive;
 pub use self::wait::wait_readable;
@@ -32,6 +34,9 @@ pub struct SocketTable {
     sockets: HashMap<u32, TcpStream>,
     /// Sockets switched to non-blocking mode.
     non_blocking: HashSet<u32>,
+    /// Send buffer sizes set through `set_send_buffer_size`. The platform
+    /// buffer is left unchanged, as Linux doubles the value it is given.
+    send_buffers: HashMap<u32, SendBufferSize>,
 
     next: u32,
 }
@@ -62,6 +67,16 @@ impl SocketTable {
         self.get(socket).and_then(|stream| stream.try_clone().ok())
     }
 
+    /// Identifiers of the open sockets.
+    pub fn sockets(&self) -> impl Iterator<Item = SocketId> + '_ {
+        self.sockets.keys().map(|&socket| SocketId(socket))
+    }
+
+    /// The send buffer size last set on `socket`, if any.
+    pub fn recorded_send_buffer_size(&self, socket: SocketId) -> Option<SendBufferSize> {
+        self.send_buffers.get(&socket.0).copied()
+    }
+
     fn stream(&mut self, socket: SocketId) -> Result<&mut TcpStream, NetError> {
         self.sockets.get_mut(&socket.0).ok_or(NetError::Closed)
     }
@@ -86,6 +101,7 @@ impl Network for SocketTable {
 
     fn close(&mut self, socket: SocketId) {
         self.non_blocking.remove(&socket.0);
+        self.send_buffers.remove(&socket.0);
 
         if let Some(stream) = self.sockets.remove(&socket.0) {
             let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -127,7 +143,8 @@ impl Network for SocketTable {
             Duration::from_millis(u64::from(timeout_ms)),
         ) {
             Ok(true) => Ok(()),
-            Ok(false) | Err(_) => Err(NetError::Closed),
+            Ok(false) => Err(NetError::WouldBlock),
+            Err(_) => Err(NetError::Closed),
         }
     }
 
@@ -164,6 +181,27 @@ impl Network for SocketTable {
         }
 
         pending
+    }
+
+    fn send_buffer_size(&mut self, socket: SocketId) -> Result<SendBufferSize, NetError> {
+        if let Some(size) = self.recorded_send_buffer_size(socket) {
+            return Ok(size);
+        }
+
+        send_buffer_size(self.stream(socket)?)
+            .map(SendBufferSize)
+            .map_err(map_error)
+    }
+
+    fn set_send_buffer_size(
+        &mut self,
+        socket: SocketId,
+        size: SendBufferSize,
+    ) -> Result<(), NetError> {
+        self.stream(socket)?;
+        self.send_buffers.insert(socket.0, size);
+
+        Ok(())
     }
 }
 

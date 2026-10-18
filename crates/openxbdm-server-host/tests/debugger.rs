@@ -13,7 +13,7 @@ use std::time::Duration;
 use openxbdm_core::status::KernelError;
 use openxbdm_core::status::NtStatus;
 use openxbdm_server::commands::console::ConfigSetting;
-use openxbdm_server::commands::debugger::BREAKPOINT_BLOCKS;
+use openxbdm_server::commands::debugger;
 use openxbdm_server::commands::debugger::ContextFlags;
 use openxbdm_server::commands::debugger::ExceptionRecord;
 use openxbdm_server::commands::debugger::ExitStatus;
@@ -28,6 +28,7 @@ use openxbdm_server_host::backend::debugger::MockThread;
 use openxbdm_server_host::backend::memory::MEMORY_BASE;
 use xbox360_sys::xboxkrnl::HardwareFlags;
 
+use common::RawSession;
 use common::TestServer;
 
 const TITLE_THREAD: u32 = 0xfb00_0058;
@@ -119,13 +120,7 @@ fn software_breakpoints_are_set_queried_and_cleared() {
     );
     assert_eq!(code_word(&server, CODE), TRAP_INSTRUCTION);
     assert_eq!(
-        server
-            .host
-            .lock()
-            .server
-            .state
-            .debugger
-            .shadow_read(CODE + 1),
+        debugger::shadow_read(&mut server.host.lock().backend, CODE + 1),
         Some(original.to_be_bytes()[1])
     );
     assert_eq!(
@@ -174,32 +169,49 @@ fn software_breakpoints_are_set_queried_and_cleared() {
 }
 
 #[test]
-fn break_fails_once_no_spare_block_can_be_obtained() {
+fn break_fails_only_when_pool_memory_runs_out() {
     let server = TestServer::start();
     let mut session = server.raw();
     session.line();
 
+    server.host.lock().backend.filesystem.pool_exhausted = true;
+    assert_eq!(
+        session.command(&format!("break addr=0x{CODE:08x}")),
+        "400- "
+    );
+    server.host.lock().backend.filesystem.pool_exhausted = false;
+
     // Ascending sets split each full 0x80-entry block in half: every block
-    // but the last keeps 0x40 entries.
-    let capacity = (BREAKPOINT_BLOCKS as u32 - 1) * 0x40 + 0x80;
+    // but the last keeps 0x40 entries. This chain has 9 blocks, the last
+    // holding 0x41 entries, and no spare.
+    let chained = 9 * 0x40 + 1;
 
     // One write per command, sent at once, keeps the run from waiting for
     // delayed acknowledgments.
     session.stream.set_nodelay(true).unwrap();
-    for index in 0..capacity {
+    let set = |session: &mut RawSession, index: u32| {
         session
             .stream
             .write_all(format!("break addr=0x{:08x}\r\n", CODE + index * 8).as_bytes())
             .unwrap();
         assert_eq!(session.line(), "200- OK");
+    };
+    for index in 0..chained {
+        set(&mut session, index);
     }
 
+    // Without pool memory the last block still fills up.
+    server.host.lock().backend.filesystem.pool_exhausted = true;
+    let full = chained + 0x3f;
+    for index in chained..full {
+        set(&mut session, index);
+    }
     assert_eq!(
-        session.command(&format!("break addr=0x{:08x}", CODE + capacity * 8)),
+        session.command(&format!("break addr=0x{:08x}", CODE + full * 8)),
         "400- "
     );
     assert_eq!(
-        session.command(&format!("isbreak addr=0x{:08x}", CODE + capacity * 8)),
+        session.command(&format!("isbreak addr=0x{:08x}", CODE + full * 8)),
         "200- type=0"
     );
 
@@ -212,6 +224,12 @@ fn break_fails_once_no_spare_block_can_be_obtained() {
     // The first block has room.
     assert_eq!(
         session.command(&format!("break addr=0x{:08x}", CODE + 4)),
+        "200- OK"
+    );
+
+    server.host.lock().backend.filesystem.pool_exhausted = false;
+    assert_eq!(
+        session.command(&format!("break addr=0x{:08x}", CODE + full * 8)),
         "200- OK"
     );
 }
@@ -897,6 +915,11 @@ fn threadstat_reports_exit_code_or_error() {
         "200- Exit Code 0x103"
     );
     assert_eq!(session.command("threadstat handle=0x20"), "200- Error 0x6");
+    // The current-thread pseudo-handle names the server thread itself.
+    assert_eq!(
+        session.command("threadstat handle=0xfffffffe"),
+        "200- Exit Code 0x103"
+    );
     assert_eq!(session.command("threadstat"), "423- bad parameter");
 }
 
@@ -1078,35 +1101,61 @@ fn extension_loads_once_and_counts_references() {
 }
 
 #[test]
-fn break_now_replies_after_the_command_thread_is_continued() {
+fn break_now_ends_unresolved_on_the_command_thread() {
+    use openxbdm_server::commands::console::DumpMode;
     use openxbdm_server_host::backend::debugger::BREAK_NOW_TRAP;
-    use openxbdm_server_host::backend::debugger::COMMAND_THREAD;
 
     let server = TestServer::start();
-    let mut channel = Channel::attach(&server);
-    let mut breaking = server.raw();
-    breaking.line();
     let mut session = server.raw();
     session.line();
-    breaking.send("break now");
+    poll(&server);
     assert_eq!(
-        channel.lines(2),
-        [
-            "execution stopped".to_owned(),
-            format!("break addr=0x{BREAK_NOW_TRAP:08x} thread=0x{COMMAND_THREAD:08x} stop")
-        ]
-    );
-    assert_eq!(
-        session.command(&format!("isstopped thread=0x{COMMAND_THREAD:08x}")),
-        format!("200- break addr=0x{BREAK_NOW_TRAP:08x} thread=0x{COMMAND_THREAD:08x}")
-    );
-    assert_eq!(
-        session.command(&format!("continue thread=0x{COMMAND_THREAD:08x}")),
+        session.command(&format!("break addr=0x{CODE:08x}")),
         "200- OK"
     );
-    assert_eq!(breaking.line(), "200- OK");
-    assert_eq!(session.command("go"), "200- OK");
-    assert_eq!(channel.line(), "execution started");
+
+    // The other keys are not looked at.
+    assert_eq!(session.command("break now clearall"), "200- OK");
+    assert_eq!(
+        session.command(&format!("isbreak addr=0x{CODE:08x}")),
+        "200- type=4"
+    );
+
+    // The command thread's record is not debuggable, so it cannot stop: no
+    // line, a crash dump, and the kd lite chain.
+    let (outcome, context) = server
+        .host
+        .lock()
+        .backend
+        .debugger
+        .break_now
+        .take()
+        .unwrap();
+    assert!(outcome.notice.is_none());
+    assert!(outcome.disposition.write_dump && outcome.disposition.chain_kernel_debugger);
+    assert_eq!(context.iar, BREAK_NOW_TRAP);
+
+    // Without kd lite and dumps the trap is stepped past.
+    {
+        let mut host = server.host.lock();
+        host.server.state.debugger.kd_lite = false;
+        host.server.state.console.dump_mode = DumpMode::Disabled;
+    }
+    poll(&server);
+    assert_eq!(session.command("break now"), "200- OK");
+    let (outcome, context) = server
+        .host
+        .lock()
+        .backend
+        .debugger
+        .break_now
+        .take()
+        .unwrap();
+    assert!(!outcome.disposition.write_dump && outcome.disposition.handled);
+    assert_eq!((context.iar, context.gpr[3]), (BREAK_NOW_TRAP + 4, 0));
+
+    // Nothing was queued for the notification channels.
+    assert!(server.host.lock().backend.debugger.direct.is_empty());
 }
 
 #[test]
@@ -1157,6 +1206,390 @@ fn debug_string_above_passive_level_is_deferred_only_when_selected() {
     poll(&server);
     let (outcome, _) = raise(&server);
     assert!(outcome.notice.is_none());
+}
+
+#[test]
+fn exceptions_after_a_stack_overflow_end_unresolved() {
+    use openxbdm_server::commands::debugger::Delivery;
+
+    let server = TestServer::start();
+    let mut session = server.raw();
+    session.line();
+    assert_eq!(session.command("debugger connect"), "200- OK");
+    write_memory(&server, MEMORY_BASE + 0x2000, b"hi\n");
+    {
+        let mut host = server.host.lock();
+        host.server.state.debugger.kd_lite = false;
+        host.backend
+            .debugger
+            .threads
+            .iter_mut()
+            .find(|thread| thread.id.0 == SYSTEM_THREAD)
+            .unwrap()
+            .stack_overflowed = true;
+    }
+    poll(&server);
+
+    let raise = |server: &TestServer| {
+        let mut host = server.host.lock();
+        let mut context = host.backend.debugger.exception_context(SYSTEM_THREAD, CODE);
+        context.gpr[3] = u64::from(MEMORY_BASE + 0x2000);
+        context.gpr[4] = 3;
+        let record = ExceptionRecord {
+            code: NtStatus::BREAKPOINT,
+            parameter_count: 1,
+            parameters: [u32::from(trap::DEBUG_STRING), 0, 0, 0],
+            ..ExceptionRecord::default()
+        };
+        let outcome = host.backend.raise_direct_exception(
+            SYSTEM_THREAD,
+            record,
+            &mut context,
+            Delivery::Deferred,
+        );
+        (outcome, context)
+    };
+
+    // The debug string is not queued; the exception ends unresolved with a
+    // crash dump and continues past the trap.
+    let (outcome, context) = raise(&server);
+    assert!(outcome.notice.is_none());
+    assert!(outcome.disposition.write_dump && outcome.disposition.handled);
+    assert!(!outcome.disposition.chain_kernel_debugger);
+    assert_eq!((context.iar, context.gpr[3]), (CODE + 4, 0));
+
+    // With kd lite the kernel debugger takes it instead of the advance.
+    server.host.lock().server.state.debugger.kd_lite = true;
+    poll(&server);
+    let (outcome, context) = raise(&server);
+    assert!(outcome.disposition.write_dump && outcome.disposition.chain_kernel_debugger);
+    assert_eq!(context.iar, CODE);
+}
+
+fn breakpoint_record(address: u32) -> ExceptionRecord {
+    ExceptionRecord {
+        code: NtStatus::BREAKPOINT,
+        address,
+        parameter_count: 1,
+        parameters: [u32::from(trap::BREAKPOINT), 0, 0, 0],
+        ..ExceptionRecord::default()
+    }
+}
+
+fn single_step_record(address: u32) -> ExceptionRecord {
+    ExceptionRecord {
+        code: NtStatus::SINGLE_STEP,
+        address,
+        parameter_count: 1,
+        parameters: [1, 0, 0, 0],
+        ..ExceptionRecord::default()
+    }
+}
+
+/// Raise `record` at its address on `thread`, dispatched in place up to
+/// dispatch level; `trace` sets the trace bit of the context.
+fn raise_in_place(
+    server: &TestServer,
+    thread: u32,
+    record: ExceptionRecord,
+    trace: bool,
+) -> (
+    openxbdm_server::commands::debugger::DirectOutcome,
+    openxbdm_server::commands::debugger::Context,
+) {
+    use openxbdm_server::commands::debugger::Delivery;
+
+    let mut host = server.host.lock();
+    let mut context = host
+        .backend
+        .debugger
+        .exception_context(thread, record.address);
+    if trace {
+        context.msr.insert(Msr::SINGLE_STEP);
+    } else {
+        context.msr.remove(Msr::SINGLE_STEP);
+    }
+    let outcome =
+        host.backend
+            .raise_direct_exception(thread, record, &mut context, Delivery::Deferred);
+
+    (outcome, context)
+}
+
+#[test]
+fn breakpoints_in_place_follow_the_table() {
+    use openxbdm_server::commands::debugger::DirectNotice;
+
+    let server = TestServer::start();
+    let mut channel = Channel::attach(&server);
+    let mut session = server.raw();
+    session.line();
+    let original = code_word(&server, CODE);
+    assert_eq!(
+        session.command(&format!("break addr=0x{CODE:08x}")),
+        "200- OK"
+    );
+    assert_eq!(session.command("debugger connect"), "200- OK");
+    assert_eq!(session.command("eventdefer set break"), "200-  break");
+    server.host.lock().server.state.debugger.kd_lite = false;
+    poll(&server);
+
+    // A table breakpoint is reported without a stop, lifted for a trace
+    // step, and handled.
+    let (outcome, context) = raise_in_place(&server, SYSTEM_THREAD, breakpoint_record(CODE), false);
+    assert_eq!(outcome.notice, Some(DirectNotice::Break));
+    assert!(outcome.disposition.handled && !outcome.disposition.write_dump);
+    assert!(!outcome.disposition.chain_kernel_debugger);
+    assert_eq!(context.iar, CODE);
+    assert!(context.msr.contains(Msr::SINGLE_STEP));
+    assert_eq!(code_word(&server, CODE), original);
+    poll(&server);
+    assert_eq!(
+        channel.line(),
+        format!("break addr=0x{CODE:08x} thread=0x{SYSTEM_THREAD:08x}")
+    );
+
+    // The trace step re-arms it and clears the trace bit it set.
+    let (outcome, context) =
+        raise_in_place(&server, SYSTEM_THREAD, single_step_record(CODE + 4), true);
+    assert!(outcome.notice.is_none() && outcome.disposition.handled);
+    assert!(!context.msr.contains(Msr::SINGLE_STEP));
+    assert_eq!(code_word(&server, CODE), TRAP_INSTRUCTION);
+
+    // Any other breakpoint ends unresolved: no line, a crash dump, and Iar
+    // past the trap.
+    let (outcome, context) =
+        raise_in_place(&server, SYSTEM_THREAD, breakpoint_record(CODE + 8), false);
+    assert!(outcome.notice.is_none());
+    assert!(outcome.disposition.handled && outcome.disposition.write_dump);
+    assert_eq!((context.iar, context.gpr[3]), (CODE + 12, 0));
+}
+
+#[test]
+fn queued_single_step_steps_over_a_table_breakpoint() {
+    use openxbdm_server::commands::debugger::DirectNotice;
+
+    let server = TestServer::start();
+    let mut session = server.raw();
+    session.line();
+    let original = code_word(&server, CODE);
+    assert_eq!(
+        session.command(&format!("break addr=0x{CODE:08x}")),
+        "200- OK"
+    );
+    assert_eq!(session.command("debugger connect"), "200- OK");
+    assert!(
+        session
+            .command("eventdefer set singlestep")
+            .starts_with("200-")
+    );
+    poll(&server);
+
+    let (outcome, context) = raise_in_place(&server, SYSTEM_THREAD, single_step_record(CODE), true);
+    assert_eq!(outcome.notice, Some(DirectNotice::SingleStep));
+    assert!(outcome.disposition.handled);
+    assert_eq!(context.iar, CODE);
+    assert!(context.msr.contains(Msr::SINGLE_STEP));
+    assert_eq!(code_word(&server, CODE), original);
+
+    // The step over the breakpoint ends at the next trace exception, which
+    // re-arms it.
+    let (outcome, context) =
+        raise_in_place(&server, SYSTEM_THREAD, single_step_record(CODE + 4), true);
+    assert!(outcome.notice.is_none() && outcome.disposition.handled);
+    assert!(!context.msr.contains(Msr::SINGLE_STEP));
+    assert_eq!(code_word(&server, CODE), TRAP_INSTRUCTION);
+}
+
+#[test]
+fn nested_exception_disarms_a_table_breakpoint_or_ends_unresolved() {
+    let server = TestServer::start();
+    let mut session = server.raw();
+    session.line();
+    let original = code_word(&server, CODE);
+    assert_eq!(
+        session.command(&format!("break addr=0x{CODE:08x}")),
+        "200- OK"
+    );
+    server.host.lock().server.state.debugger.kd_lite = false;
+    poll(&server);
+
+    // The thread stops at a first breakpoint and waits in its slot.
+    server
+        .host
+        .lock()
+        .backend
+        .debugger
+        .raise_breakpoint(TITLE_THREAD, CODE + 0x20);
+    poll(&server);
+    assert_eq!(
+        session.command(&format!("isstopped thread=0x{TITLE_THREAD:08x}")),
+        format!(
+            "200- break addr=0x{:08x} thread=0x{TITLE_THREAD:08x}",
+            CODE + 0x20
+        )
+    );
+
+    // A nested trap at a table breakpoint gets its instruction back; the
+    // entry stays.
+    let (outcome, context) = raise_in_place(&server, TITLE_THREAD, breakpoint_record(CODE), false);
+    assert!(outcome.notice.is_none() && outcome.disposition.handled);
+    assert!(!outcome.disposition.write_dump);
+    assert_eq!(context.iar, CODE);
+    assert_eq!(code_word(&server, CODE), original);
+    assert_eq!(
+        session.command(&format!("isbreak addr=0x{CODE:08x}")),
+        "200- type=4"
+    );
+
+    // Any other nested exception ends unresolved.
+    let (outcome, context) =
+        raise_in_place(&server, TITLE_THREAD, breakpoint_record(CODE + 8), false);
+    assert!(outcome.notice.is_none());
+    assert!(outcome.disposition.handled && outcome.disposition.write_dump);
+    assert_eq!(context.iar, CODE + 12);
+}
+
+#[test]
+fn module_unload_in_place_removes_its_breakpoints_during_the_dispatch() {
+    use openxbdm_server::commands::debugger::Delivery;
+    use openxbdm_server::commands::debugger::ModuleEvent;
+
+    const NAME_STRING: u32 = 0x7000_1000;
+    const ENTRY: u32 = 0x7000_2000;
+
+    let server = TestServer::start();
+    let mut session = server.raw();
+    session.line();
+    let original = code_word(&server, CODE);
+    assert_eq!(
+        session.command(&format!("break addr=0x{CODE:08x}")),
+        "200- OK"
+    );
+    poll(&server);
+
+    let mut host = server.host.lock();
+    host.backend.debugger.modules.insert(
+        (NAME_STRING, ENTRY),
+        ModuleEvent {
+            base: CODE,
+            size: 0x100,
+            ..ModuleEvent::default()
+        },
+    );
+    let mut context = host
+        .backend
+        .debugger
+        .exception_context(SYSTEM_THREAD, CODE + 0x800);
+    context.gpr[3] = u64::from(NAME_STRING);
+    context.gpr[4] = u64::from(ENTRY);
+    let record = ExceptionRecord {
+        code: NtStatus::BREAKPOINT,
+        address: CODE + 0x800,
+        parameter_count: 1,
+        parameters: [u32::from(trap::MODULE_UNLOAD), 0, 0, 0],
+        ..ExceptionRecord::default()
+    };
+    host.backend
+        .raise_direct_exception(SYSTEM_THREAD, record, &mut context, Delivery::Deferred);
+    drop(host);
+
+    // The instruction is back before the server takes any notice.
+    assert_eq!(code_word(&server, CODE), original);
+    assert_eq!(
+        session.command(&format!("isbreak addr=0x{CODE:08x}")),
+        "200- type=0"
+    );
+}
+
+#[test]
+fn posted_breakpoints_stop_only_threads_that_can_stop() {
+    let server = TestServer::start();
+    let mut channel = Channel::attach(&server);
+    let mut session = server.raw();
+    session.line();
+    let original = code_word(&server, CODE);
+    assert_eq!(
+        session.command(&format!("break addr=0x{CODE:08x}")),
+        "200- OK"
+    );
+    {
+        let mut host = server.host.lock();
+        host.server.state.debugger.kd_lite = false;
+        host.backend
+            .debugger
+            .threads
+            .iter_mut()
+            .find(|thread| thread.id.0 == OTHER_THREAD)
+            .unwrap()
+            .debuggable = false;
+    }
+
+    // Not debuggable: the table breakpoint is stepped over without a line.
+    server
+        .host
+        .lock()
+        .backend
+        .debugger
+        .raise_breakpoint(OTHER_THREAD, CODE);
+    poll(&server);
+    let disposition = server
+        .host
+        .lock()
+        .backend
+        .debugger
+        .disposition(OTHER_THREAD)
+        .unwrap();
+    assert!(disposition.handled && !disposition.write_dump);
+    assert_eq!(code_word(&server, CODE), original);
+
+    // Debuggable with interrupts off: reported without a stop.
+    let raise = |address: u32| {
+        let mut host = server.host.lock();
+        let mut context = host
+            .backend
+            .debugger
+            .exception_context(TITLE_THREAD, address);
+        context.msr.remove(Msr::EXTERNAL_INTERRUPT);
+        host.backend.debugger.raise_exception(
+            TITLE_THREAD,
+            breakpoint_record(address),
+            context,
+            false,
+        );
+    };
+    raise(CODE);
+    poll(&server);
+    assert_eq!(
+        channel.line(),
+        format!("break addr=0x{CODE:08x} thread=0x{TITLE_THREAD:08x}")
+    );
+    assert!(
+        server
+            .host
+            .lock()
+            .backend
+            .debugger
+            .disposition(TITLE_THREAD)
+            .unwrap()
+            .handled
+    );
+
+    // Not a table breakpoint: no line, unresolved with a crash dump.
+    raise(CODE + 8);
+    poll(&server);
+    let disposition = server
+        .host
+        .lock()
+        .backend
+        .debugger
+        .disposition(TITLE_THREAD)
+        .unwrap();
+    assert!(disposition.handled && disposition.write_dump);
+    assert_eq!(
+        session.command(&format!("isstopped thread=0x{TITLE_THREAD:08x}")),
+        "408- not stopped"
+    );
 }
 
 #[test]

@@ -88,9 +88,17 @@ fn serve(
     listener: Socket,
     discovery: Option<Socket>,
 ) {
+    let wake = crate::backend::debugger::open_wake();
+    if wake.is_none() {
+        kernel::debug_print(c"openxbdm: no wake socket; debug events wait up to 20 ms\n");
+    }
+
     crate::backend::debugger::begin_event_service();
-    serve_passes(server, console, network, listener, discovery);
+    serve_passes(server, console, network, listener, discovery, wake);
     crate::backend::debugger::end_event_service();
+    if let Some(wake) = wake {
+        crate::backend::debugger::close_wake(wake);
+    }
 }
 
 #[inline(never)]
@@ -100,12 +108,15 @@ fn serve_passes(
     network: &mut XamNetwork,
     listener: Socket,
     discovery: Option<Socket>,
+    wake: Option<Socket>,
 ) {
     /// Select timeout, which bounds the delay before a shutdown request is
     /// seen.
     const POLL_INTERVAL_MS: u32 = 1000;
-    /// Longest wait before a thread posted at a debug event is processed.
-    const DEBUG_EVENT_POLL_MS: u32 = 20;
+    /// Longest wait before work other threads queue for the server thread
+    /// is seen (dispatcher requests, posted notifications, processor calls,
+    /// and debug events when no wake socket is available).
+    const PASS_INTERVAL_MS: u32 = 20;
 
     let mut timer_ms = POLL_INTERVAL_MS;
     while !shutting_down() {
@@ -125,6 +136,9 @@ fn serve_passes(
         read.insert(listener);
         if let Some(discovery) = discovery {
             read.insert(discovery);
+        }
+        if let Some(wake) = wake {
+            read.insert(wake);
         }
 
         for &ActiveConnection {
@@ -149,9 +163,9 @@ fn serve_passes(
         #[cfg(feature = "smb")]
         let smb_sockets = crate::smb::select_sockets(&mut read, &mut write);
 
-        // Threads waiting at debug events are seen at the next pass.
+        // A thread posting a debug event makes the wake socket readable.
         let timeout =
-            TimeVal::from_milliseconds(timer_ms.min(POLL_INTERVAL_MS).min(DEBUG_EVENT_POLL_MS));
+            TimeVal::from_milliseconds(timer_ms.min(POLL_INTERVAL_MS).min(PASS_INTERVAL_MS));
         if net::select(&mut read, &mut write, Some(&timeout)).is_err() {
             return;
         }
@@ -182,8 +196,15 @@ fn serve_passes(
         {
             answer_discovery(server, discovery);
         }
+        if let Some(wake) = wake
+            && read.contains(wake)
+        {
+            crate::backend::debugger::drain_wake(wake);
+        }
 
-        timer_ms = server.poll_timers(console).unwrap_or(POLL_INTERVAL_MS);
+        timer_ms = server
+            .poll_timers(console, network)
+            .unwrap_or(POLL_INTERVAL_MS);
         #[cfg(feature = "smb")]
         crate::smb::poll(server, console, network);
         crate::backend::dispatcher::drain(server, console, network);

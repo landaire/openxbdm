@@ -185,8 +185,7 @@ fn call_reporting(ordinal: Ordinal, a0: u32, a1: u32, a2: u32) -> CivResult {
 extern "C" fn failure_thread(context: u32) -> u32 {
     match xam_export(xam::ordinal::SHOW_BAD_DISC_ERROR_UI) {
         Err(Unresolved::Module) => return 0,
-        // The meaning of the argument is unknown; stock passes the
-        // any-user index, as to `XamShowDirtyDiscErrorUI`.
+        // XAM ignores the argument; stock passes the any-user index.
         // SAFETY: the export takes one dword argument.
         Ok(function) => unsafe {
             kernel::call_export(function, UserIndex::Any.raw(), 0, 0, 0);

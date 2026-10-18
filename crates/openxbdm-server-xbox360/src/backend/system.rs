@@ -14,6 +14,7 @@ use openxbdm_core::status::Win32Error;
 use openxbdm_server::Server;
 use openxbdm_server::commands;
 use openxbdm_server::commands::system::CreateSettingsError;
+use openxbdm_server::commands::system::FlashBuffer;
 use openxbdm_server::commands::system::FlashOptions;
 use openxbdm_server::commands::system::RebootKind;
 use openxbdm_server::commands::system::SettingsCopy;
@@ -62,7 +63,6 @@ const SAVED_SETTINGS_PATH: &[u8] = b"\\SystemRoot\\MobileJ.dat";
 /// Platform state of this domain.
 pub struct Data {
     write: Option<WriteBuffer>,
-    flash: Option<FlashImage>,
     /// The server request being served came from a thread of the title
     /// process.
     title_caller: bool,
@@ -75,7 +75,6 @@ impl Data {
     pub const fn new() -> Self {
         Self {
             write: None,
-            flash: None,
             title_caller: false,
             relaunched: false,
         }
@@ -299,31 +298,34 @@ impl commands::system::Backend for Console {
         unsafe { kernel::call_export(routine, 0, 0, 0, 0) };
     }
 
-    fn flash_begin(&mut self, rounded_size: u32) -> bool {
-        self.system.flash = FlashImage::allocate(rounded_size);
-
-        self.system.flash.is_some()
+    fn flash_begin(&mut self, rounded_size: u32) -> Option<FlashBuffer> {
+        FlashImage::allocate(rounded_size).map(FlashImage::into_buffer)
     }
 
-    fn flash_write(&mut self, offset: u32, bytes: &[u8]) {
-        if let Some(image) = self.system.flash.as_mut() {
-            let start = offset as usize;
-            image.bytes_mut()[start..start + bytes.len()].copy_from_slice(bytes);
-        }
+    fn flash_write(&mut self, buffer: FlashBuffer, offset: u32, bytes: &[u8]) {
+        // SAFETY: the server holds `buffer` until commit or abort; the slice
+        // ends before either.
+        let image = unsafe { FlashImage::bytes_of(buffer) };
+        let start = offset as usize;
+        image[start..start + bytes.len()].copy_from_slice(bytes);
     }
 
-    fn flash_commit(&mut self, length: u32, options: FlashOptions) -> Result<(), Win32Error> {
-        let Some(mut image) = self.system.flash.take() else {
-            return Ok(());
-        };
-
+    unsafe fn flash_commit(
+        &mut self,
+        buffer: FlashBuffer,
+        length: u32,
+        options: FlashOptions,
+    ) -> Result<(), Win32Error> {
+        // SAFETY: the caller passes the only copy of a live buffer.
+        let mut image = unsafe { FlashImage::from_buffer(buffer) };
         image.bytes_mut()[length as usize..].fill(0);
 
         image.program(options.ignore_version_checking, options.stock_image)
     }
 
-    fn flash_abort(&mut self) {
-        self.system.flash = None;
+    unsafe fn flash_abort(&mut self, buffer: FlashBuffer) {
+        // SAFETY: the caller passes the only copy of a live buffer.
+        drop(unsafe { FlashImage::from_buffer(buffer) });
     }
 }
 

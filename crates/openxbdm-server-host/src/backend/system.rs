@@ -6,6 +6,7 @@ use openxbdm_core::status::KernelError;
 use openxbdm_core::status::Win32Error;
 use openxbdm_server::commands::system;
 use openxbdm_server::commands::system::CreateSettingsError;
+use openxbdm_server::commands::system::FlashBuffer;
 use openxbdm_server::commands::system::FlashOptions;
 use openxbdm_server::commands::system::RebootKind;
 use openxbdm_server::commands::system::SettingsCopy;
@@ -77,7 +78,9 @@ pub struct Mock {
     /// Images programmed, in order. The simulation stores them instead of
     /// writing a flash device.
     pub flash_writes: Vec<FlashWrite>,
-    flash_buffer: Option<Vec<u8>>,
+    /// Image buffers of `flash` uploads in progress, indexed by the address
+    /// of their [`FlashBuffer`].
+    flash_buffers: Vec<Option<Vec<u8>>>,
 
     open: Vec<Option<OpenFile>>,
 }
@@ -108,7 +111,7 @@ impl Default for Mock {
             flash_memory: FLASH_MEMORY,
             flash_result: Ok(()),
             flash_writes: Vec::new(),
-            flash_buffer: None,
+            flash_buffers: Vec::new(),
             open: Vec::new(),
         }
     }
@@ -279,22 +282,30 @@ impl system::Backend for MockBackend {
         self.system.relaunches += 1;
     }
 
-    fn flash_begin(&mut self, rounded_size: u32) -> bool {
+    fn flash_begin(&mut self, rounded_size: u32) -> Option<FlashBuffer> {
         if rounded_size > self.system.flash_memory {
-            return false;
+            return None;
         }
 
-        self.system.flash_buffer = Some(vec![0xcd; rounded_size as usize]);
+        let buffers = &mut self.system.flash_buffers;
+        let index = match buffers.iter().position(Option::is_none) {
+            Some(index) => index,
+            None => {
+                buffers.push(None);
+                buffers.len() - 1
+            }
+        };
+        buffers[index] = Some(vec![0xcd; rounded_size as usize]);
 
-        true
+        // SAFETY: slot `index` holds the buffer until it is committed or
+        // aborted.
+        Some(unsafe { FlashBuffer::from_raw(index as u32, rounded_size) })
     }
 
     /// Bytes past the rounded buffer, possible when the rounding wrapped,
     /// are not simulated.
-    fn flash_write(&mut self, offset: u32, bytes: &[u8]) {
-        let Some(tail) = self
-            .system
-            .flash_buffer
+    fn flash_write(&mut self, buffer: FlashBuffer, offset: u32, bytes: &[u8]) {
+        let Some(tail) = self.system.flash_buffers[buffer.address() as usize]
             .as_mut()
             .and_then(|buffer| buffer.get_mut(offset as usize..))
         else {
@@ -305,10 +316,15 @@ impl system::Backend for MockBackend {
         tail[..count].copy_from_slice(&bytes[..count]);
     }
 
-    fn flash_commit(&mut self, length: u32, options: FlashOptions) -> Result<(), Win32Error> {
-        let Some(mut image) = self.system.flash_buffer.take() else {
-            return self.system.flash_result;
-        };
+    unsafe fn flash_commit(
+        &mut self,
+        buffer: FlashBuffer,
+        length: u32,
+        options: FlashOptions,
+    ) -> Result<(), Win32Error> {
+        let mut image = self.system.flash_buffers[buffer.address() as usize]
+            .take()
+            .expect("a flash buffer is live until it is released");
 
         let length = (length as usize).min(image.len());
         image[length..].fill(0);
@@ -320,8 +336,8 @@ impl system::Backend for MockBackend {
         self.system.flash_result
     }
 
-    fn flash_abort(&mut self) {
-        self.system.flash_buffer = None;
+    unsafe fn flash_abort(&mut self, buffer: FlashBuffer) {
+        self.system.flash_buffers[buffer.address() as usize] = None;
     }
 }
 

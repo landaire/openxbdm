@@ -62,7 +62,8 @@ Conventions used below:
 ## dvdperf
 - Handler: 0x91f4c208. Access: 0x4. Extra: 0x0.
 - Syntax: `dvdperf start` | `dvdperf stop [report]`. Flags; `stop` is tested first.
-- State: global trace buffer pointer 0x91fab980; shared debug-monitor block 0x91fade60: +0xc flag bit 0x20 = DVD trace enabled, +0x3c = current write pointer. [INFERENCE] records are written by the kernel optical driver through this block; no writer exists in XBDM.
+- State: global trace buffer pointer 0x91fab980; shared debug-monitor block 0x91fade60: +0xc flag bit 0x20 = DVD trace enabled, +0x3c = current write pointer.
+- Producer: none in the system software these images hold. Of the 54 `KeDebugMonitorData` load sites in K15574 and in K16547, none reads block +0x3c or tests +0xc bit 0x20; the optical read path reports only control codes 0x46 and 0x47 (K15574 `SataCdRomStartRead` 0x800c77a4, `SataCdRomFinishRead` 0x800c73f8), whose xbdm handlers (0x91f3d210, 0x91f3d6e0) write the ODD log and PIX stream, not this buffer. xam's 42 load sites do not touch these fields, and the only xbdm accesses are this handler's. A started trace therefore stays empty: `stop report` sends `202- multiline response follows` and `.` with no lines (end = buffer start). The tick units of `time` and of the record timestamp belong to a producer outside these images; xbdm prints them without conversion except the division of the timestamp delta by 1000.
 - start: write pointer := 0; free the old buffer; allocate 0x200000 bytes; allocation failure returns `200- OK` silently. Else clear bit 0 of the first record's flag word (buf+8), set enable bit 0x20, write pointer := buffer start. `200- OK`.
 - stop: ctx NULL -> 0x80004005. Atomically swap write pointer with 0 (old value = end), clear enable bit, take buffer from 0x91fab980 (global := 0). Scratch: +0x10 end, +0xc cursor = buffer, +8 buffer.
   - Without `report`: free buffer, `200- OK`.
@@ -71,8 +72,8 @@ Conventions used below:
 - Record (16 bytes, big-endian): +0 u64 time, +8 u32 W, +0xc u32 elapsed. W bit 0 = record valid; lba = (W >> 1) & 0xffffff; cblk = W >> 25.
 - Continuation 0x91f4c138: while cursor < end: time := (time - base) / 1000 (written back), format `timestamp=%lu time=%d lba=%d cblk=%d` with timestamp = low 32 bits of the scaled time, time = elapsed; advance 16; if the record's valid bit is set, send the line (line mode) and return. Records with bit 0 clear are skipped. At end: free buffer, return end -> `.`.
 - Backend requirement: optical-drive request tracing with timestamps, sector and block counts.
-- Xbox: the monitor block is the debug monitor data copy at 0x91fade60 whose address dminit stores into kernel variable ordinal 89 (`KeDebugMonitorData`); flags at +0xc, write pointer at +0x3c. The optical driver writes the records.
-- Status: partial: unit of `time`/timestamp ticks unknown (resolve in the kernel optical driver).
+- Xbox: the monitor block is the debug monitor data copy at 0x91fade60 whose address dminit stores into kernel variable ordinal 89 (`KeDebugMonitorData`); flags at +0xc, write pointer at +0x3c.
+- Status: spec complete.
 
 ## enablewirelesscontrollers
 - Handler: 0x91f4c398. Access: 0x4. Extra: 0x2 (development-kit only; test kit returns `407- unknown command`).
@@ -103,8 +104,7 @@ Conventions used below:
   1. ctx NULL (settings file): 0x80004005, no line. Hardware flag word (kernel data ordinal 342, first dword) lacks bit 0x00010000: `400- `. The bit is the 1 GB RAM feature (` 1GB_RAM` in `consolefeatures`); fastpipe is available only on such consoles.
   2. group = value (strtol base 0) or 0 when absent or malformed. 0x91f540c0(socket, group):
      - First use starts the subsystem (0x91f53e18): one writer thread at 0x91f52ab8 (hardware thread 3) and three worker threads at 0x91f53ad0 (hardware thread 2); the threads run for the life of XBDM. Failure -> limit message.
-     - Slot allocation 0x91f53f70: group 0 is replaced by an auto-incremented nonzero id (0x91fa2644, first id 1; the counter advances even when allocation fails). Six slots (0x91fab800, stride 0x3c, +0 socket, +0x24 group). Any occupied slot with a different group fails, so only one group exists at a time and group 0 succeeds only when no pipe is open. First pipe: saves `FscGetCacheElementCount(2)` and calls `FscSetCacheElementCount(2, 0x400)`. The first 0x5b4-byte read is posted before the 209 line. Defect: with all six slots used by the same group the free index stays -1 and slot -1 is written (not reproduced; limit exceeded).
-     - On success sends `209- result code <group>` (signed decimal) directly on the socket, one send of text + CR LF; not the 0x02da0009 framework path.
+     - Slot allocation 0x91f53f70: group 0 is replaced by an auto-incremented nonzero id (0x91fa2644, first id 1; the counter advances even when allocation fails). Six slots (0x91fab800, stride 0x3c, +0 socket, +0x24 group). Any occupied slot with a different group fails, so only one group exists at a time and group 0 succeeds only when no pipe is open. First pipe: saves `FscGetCacheElementCount(2)` and calls `FscSetCacheElementCount(2, 0x400)`. The first 0x5b4-byte read is posted (0x91f537c0) before the 209 line; when its buffer allocation fails or `WSARecv` fails other than pending, the allocation returns 0 with the slot still holding the socket (closed already after a `WSARecv` failure). Defects (not reproduced, `parity/session.md`): with all six slots used by the same group the free index stays -1 and slot -1 is written; after a failed first read the slot and the connection both hold the socket.
   3. Failure: `400- fastpipe limit exceeded`; the connection stays a command connection.
   4. Success: connection socket field := -1 (socket now owned by the pipe), connection released via 0x91f41460, handler returns 0 (no further status line).
 - Data plane (dmfastpipe.c, 0x91f52720..0x91f54134). The pipe carries only binary packets after the 209 line; the console sends only 12-byte replies. All fields big-endian.
@@ -127,8 +127,14 @@ Conventions used below:
   2. `XexGetProcedureAddress(xam.xex, ordinal 515)`; failure returns `200- OK` with no action.
   3. `enable` absent: `423- 'enable' not specified`. `feature` absent: `423- 'feature' not specified`.
   4. Calls XAM ordinal 515 `(enable, feature)`; result ignored; `200- OK`.
+- XAM ordinal 515 (xam.xex 0x81748138) `(enable, feature)` edits the XAM feature mask that the next cold boot loads (0x81747ef0 into 0x81d3fee0). The mask is stored in XConfig category 11, setting 2 (16 bytes): word 0 holds mask bits 32..63, word 1 the cleared bits among bits 0..6, the rest is zero; no stored value means mask 0x7f. Bit `id - 1` belongs to feature `id` of the table at 0x815f9490 (13 entries of 0x20 bytes: devkit flag, name, id, heap, image, pool, stack and total sizes): console features 1 PRELOADED_HUD, 2 MESSENGER, 3 XMP, 4 COMMUNITY, 5 XIME, 6 XSTUDIO, 7 WIRELESS_WAVEA; development kit features 0x21 DEVKIT_HEAP, 0x22 PIX_STREAM, 0x23 ETX_BOOST, 0x24 XS_LOGS, 0x26 TESTXEX, 0x27 XAMUIAUTOMATION.
+  1. feature 0: DbgPrint the table (`XAM FEATURE LIST`, 0x81747d80) with the mask in effect since boot; 0.
+  2. feature > 64: 0x80070057. Not in the table: DbgPrint `Unknown XAM feature %d\n`; 0x80004005.
+  3. Read the setting (ExGetXConfigSetting); failure: DbgPrint `Reading feature mask returned 0x%08X\n`, 0x80004005. Bits outside the table are cleared with DbgPrint `Excluding unknown features in mask: 0x%016XI64\n` (0x81747d00); `%016X` prints the low word of the mask, which holds no unknown bits, so the line is always `0x0000000000000000I64` (`parity/console.md`).
+  4. DbgPrint `XAM FEATURE SELECTION` between separator lines, then `Enabling %s\n` and set the bit, or (enable 0) `Disabling %s\n` and clear it.
+  5. Write the setting (ExSetXConfigSetting); failure: DbgPrint `Failed to write feature mask to flash (err: 0x%08X)\n`, 0x80004005. Success: DbgPrint `Printing pending settings for next cold reboot...\n` and the budget (0x81747818): budget 0x518000 for the console features plus 0x3800000 when `XboxHardwareInfo.BldrFlags` has 0x80 (`1GB devkit - budgeting additional 0%08X bytes`); disabled console features free their size; each enabled development kit feature is listed as fitting (`+`) or not (`-`, `only 0x%08X available`); four total lines. Returns 0.
 - Backend requirement: forward a feature toggle to the system UI library.
-- Status: partial: semantics of XAM ordinal 515 unknown.
+- Status: spec complete.
 
 ## fileeof
 - Handler: 0x91f45b10. Access: 0x0, all_of 0x3 (read and write). Extra: 0x0.
@@ -190,9 +196,21 @@ Conventions used below:
   4. Allocate rounded size (tag 'Xbdm'); failure `400- Not enough memory` (0x82da0000).
   5. ctx+0x14 = size, ctx+8 = buffer, ctx+0xc = size, continuation 0x91f4a628; `204- send=<suffix>`.
   - Receive continuation: 0 bytes received (connection closed) -> free, 0x8000ffff. Accumulates until ctx+0x14 = 0, zero-pads to the rounded size, calls flash writer 0x91f735d0(buffer, rounded size, ignore flag, stockimage, 0). A positive Win32 error e becomes 0x80070000|e. Success `200- Done, new image flashed`; failure `<4xx>- Flash failed with HRESULT 0x%x`. Buffer freed.
-  - Writer 0x91f735d0: requires size multiple of 0x4000 (else 0xc000000d); validates the image unless ignore flag set; programs flash; re-encrypts the boot loader with `XeKeysSaveBootLoader` (`XapiFlashKernelImage(): unable to reencrypt boot loader`); errors returned via `RtlNtStatusToDosError`.
+  - Writer 0x91f735d0(image, size, ignore, stockimage, progress): every failure is returned as a Win32 code; NTSTATUS values go through `RtlNtStatusToDosError`, and the buffers below are released on every exit.
+    1. size & 0x3fff != 0: `STATUS_INVALID_PARAMETER` (87).
+    2. ignore == 0: revision check 0x91f73260 fails -> 1306 (`ERROR_REVISION_MISMATCH`).
+    3. Write-unit alignment 0x91f732a8; its failure status is returned.
+    4. Patch buffer: `NtAllocateVirtualMemory(MEM_COMMIT, PAGE_READWRITE)` of header +0x60 bytes (0 means 0x4000); the kernel rounds the size up, and the rounded size is used from here on.
+    5. Patch block 0x91f733b8; failure with ignore == 0 -> 11 (`ERROR_BAD_FORMAT`); with ignore != 0 the writer continues with no patch block. When the block moved, the patch buffer is written to flash at the new offset first.
+    6. Range writer 0x91f734a0(image, size, patch offset, patch size, progress, 0, 1).
+    7. stockimage: done. Else `MmAllocatePhysicalMemory(0, header +0xc, PAGE_READWRITE | 0x20000000)` (failure `STATUS_NO_MEMORY`), `XeKeysSaveBootLoader(&flags, &length, buffer)` with length = header +0xc; a failure or nonzero flags prints the warning `XapiFlashKernelImage(): unable to reencrypt boot loader` (component `XAPI`, 0x91f745a8), calls progress(size) when present, and returns success. Else 0x91f734a0(loader, length, patch offset, patch size, progress, size, 1).
+  - Image header (big-endian, image offset 0): +0x08 offset of the 16-bit hardware identifier; +0x0c boot loader length; +0x60 patch block size (0 means 0x4000); +0x64 loader extent; +0x6a patch block version (u16); +0x6c flash offset of the patch block (0 = none); +0x70 a word rounded with +0x64. Bytes 0x80..0x100 of flash are never written.
+  - Revision check 0x91f73260: identifier = u16 at image + header[+0x08]. When hardware flags & 3 == 3, identifier & 0xfff must be 0x342; otherwise the identifier must be 0.
+  - Alignment 0x91f732a8: `NtOpenFile(\Device\Flash, GENERIC_READ | SYNCHRONIZE, share 0, options 0x20)`, IOCTL 0x3c0028 (0x14-byte geometry; write unit U = dword +8 * dword +0), close. When U > 0x4000 and header +0x70 != 0: +0x64 and +0x70 are rounded up to U, and +0x0c := the new +0x64. Open and IOCTL failures are returned.
+  - Patch block 0x91f733b8(image, buffer, buffer size, &offset, &moved): both outputs cleared first. Image +0x6c == 0: success, no block. Else read 0x80 bytes of flash at 0 (the current header); it fails when the read fails, current +0x6c is 0, current +0x6a differs from image +0x6a, or the current block size (+0x60, 0 means 0x4000) differs from the buffer size. Then the current block (buffer size bytes at current +0x6c) is read into the buffer (failure fails); offset := image +0x6c, moved := (current +0x6c != image +0x6c).
+  - Range writer 0x91f734a0(buffer, size, offset, patch size, progress, base, shift): offset != 0 and below 0x100: trap, `STATUS_INVALID_PARAMETER`. offset + patch size above 0x20000: trap, then continue (a patch-less image adds the size to offset 0). Writes, through the flash writer 0x91f72c78, stop at the first failure: bytes 0..0x80 at 0; with a patch block, [0x100, offset) at 0x100 and resume := offset + patch size, else resume := 0x100; without progress, [resume, size) at resume. With progress, the rest goes in pieces ending at the next 0x20000 boundary (or size), each followed by progress(base + (piece end >> shift)). The `flash` command passes no progress routine.
 - Backend requirement: receive and program a system flash image for the detected hardware revision.
-- Status: partial: image validation rules inside 0x91f73260/0x91f732a8/0x91f734a0 not reconstructed.
+- Status: spec complete.
 
 ## fmtfat
 - Handler: 0x91f46eb0. Access: 0x8. Extra: 0x0.
@@ -245,7 +263,7 @@ Conventions used below:
   4. Length = EOF. offset > EOF: length 0 (no error). 0 < offset <= EOF: seek (FilePositionInformation; failure mapped, fallback 414), length = EOF - offset. size != 0 and size < length: length = size.
   5. 0x3000-byte buffer (allocation not checked), continuation 0x91f456f0, ctx+0x14 = 1.
   6. Status `203- partial send` if offset != 0 or size != 0, else `203- binary response follows`.
-  - Continuation: first call writes u32 little-endian length (4 bytes); saves SO_SNDBUF and sets it to 0x10000. Then reads min(remaining, 0x3000) bytes per call; a read failure sends zeros for that chunk. At end: close, free, restore SO_SNDBUF.
+  - Continuation: first call writes u32 little-endian length (4 bytes); reads SO_SNDBUF (getsockopt wrapper 0x91f71a20, call 0x91f457f4, level 0xffff, option 0x1001, caller 3) into the saved slot, zeroed when the read fails; after a successful read sets it to 0x10000 (setsockopt wrapper 0x91f71990, call 0x91f45824, result ignored). Then reads min(remaining, 0x3000) bytes per call; a read failure sends zeros for that chunk. At end (remaining 0, also after a send failure, which zeroes remaining): close, free, and restore SO_SNDBUF when the saved value is nonzero (0x91f45764, result ignored).
 - Backend requirement: open and read files with offset; file size query.
 - Status: spec complete.
 - Client disagreement: openxbdm-client rejects a ranged reply whose advertised length differs from SIZE; the server clamps to the bytes available, treats SIZE=0 as "to end of file" and returns 0 bytes when OFFSET > EOF.

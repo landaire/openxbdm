@@ -40,10 +40,45 @@ body: password qword, privilege dword, password-set dword) in an unnamed
 object directory (handle 0x91f9fecc). The Xbox backend does the same with
 its own object type whose allocate and free procedures are the kernel's
 `ExAllocatePoolTypeWithTag` and `ExFreePool` exports. The host mock
-reproduces the directory rules taken from the K15574 kernel image: 13
-buckets, `h = (c | 0x20) + (h >> 1) + 3h` over bytes below 0x80, newest
-entry first in a bucket, global-index enumeration, `RtlUpperChar` case
-folding, and relative path resolution of names with backslashes.
+reproduces the kernel's directory rules: 13 buckets, `h = (c | 0x20) +
+(h >> 1) + 3h` over bytes below 0x80, newest entry first in a bucket,
+global-index enumeration, `RtlUpperChar` case folding, and relative path
+resolution of names with backslashes. The rules were read from K15574
+(PDB symbols); K16547, the kernel the console runs, has the same code: its
+object manager 0x800b3990..0x800b6790 and string routines
+0x800afad0..0x800aff90 match K15574 0x800b3600..0x800b6400 and
+0x800af740..0x800afc00 instruction for instruction except for global data
+addresses and call targets of the same routines, and its `RtlUpperChar`
+table (0x800429c0) equals K15574's (0x80042988).
+
+## Key exchange
+
+`XeCryptBnDwLeDhModExp` (K16547 0x801508f8) does not validate or reduce
+the base. `XeCryptBnQwNeModExp` (0x801511a0) copies it raw into its power
+table and multiplies with full products reduced by
+`XeCryptBnQwNe_BenalohMod` (0x80150f88), which keeps every 1536-bit
+product congruent modulo the group modulus and within 768 bits; the result
+is reduced with `XeCryptBnQwNeMod` (0x80156620) at the end. These routines
+and their helpers match K15574 (0x8014e908..0x8014fdb0,
+0x801547f0..0x80155060) instruction for instruction except for call
+targets and the default group address. A client value at or above the
+modulus therefore yields (value mod modulus) ^ x mod modulus, which
+`dh_mod_exp` computes by subtracting the modulus first. An emulation of the
+reduction routine over products with bases in [modulus, 2^768) kept
+congruence and ended within two correction additions.
+
+The group table at 0x91f06090 reaches the kernel without the per-qword
+byte swap applied to client values (0x80150970..0x80150988), so the
+kernel reads each table qword big-endian: the generator is 2^761 and, in
+wire layout, each modulus qword is the table qword byte reversed.
+
+On the devkit, stock XBDM confirmed both results. A client value of
+2^761 made the shared value equal to the server's public value, and 2^705
+did not. The modulus plus 1 gave a shared value of 1 and the modulus gave
+0. Each case was checked by setting `adminpw passwd=` with the key that
+the expected shared value derives and then authenticating with `authuser
+admin` on a new unlocked connection. Test:
+`stock_group_reduces_the_modulus_and_its_successor` (`openxbdm-core`).
 
 ## Exports
 
@@ -88,14 +123,10 @@ passive level its critical section and object manager calls are invalid).
   that many bytes from its stack buffer into the 0x104-byte record,
   reading past the buffer and, beyond 0x104 bytes, writing past the
   record. openxbdm ends the walk (and `userlist`) at such an entry.
-
-## Unverified on hardware
-
-- The directory rules come from the K15574 debug kernel, not the kernel
-  the target console runs.
-- The DH base is not validated by the kernel. A client value at or above
-  the modulus is reduced before exponentiation here; the kernel's
-  Montgomery routines were not traced for that input.
-- Network `user` requests leave the stock password field uninitialized
-  with the password-set flag clear; the value is never read, so the Xbox
-  backend stores zero.
+- Network `user` requests: stock copies an uninitialized stack qword into
+  the password field (0x91f40770) with the password-set flag clear. Every
+  reader of the field (the response check 0x91f405d0, the settings line
+  0x91f40a40) runs only while the flag is set, and each store that sets
+  the flag writes the password with it (`authuser` 0x91f40610/0x91f40614;
+  the add copy 0x91f40778/0x91f40780 for a settings line with `passwd=`),
+  so the value is never observable. The Xbox backend stores zero.

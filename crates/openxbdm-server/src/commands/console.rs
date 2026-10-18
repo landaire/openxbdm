@@ -34,6 +34,7 @@ use self::system_info::system_info_line;
 use self::trace::verbose;
 use crate::access::Access;
 use crate::backend::Backend as AnyBackend;
+use crate::commands::filesystem::DriveTable;
 use crate::commands::system::RebootKind;
 use crate::commands::system::SettingsFile;
 use crate::commands::system::end_line;
@@ -514,6 +515,8 @@ pub enum Published<'a> {
     DumpSettings(&'a DumpSettings),
     EventDefer(EventDeferMask),
     TraceMask(TraceMask),
+    /// Monitor exports translate drive paths on the caller's thread.
+    Drives(&'a DriveTable),
     /// Export 194 reads the state, transaction and response.
     Registration(&'a HttpRegistration),
 }

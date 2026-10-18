@@ -46,6 +46,12 @@ impl Mock {
     pub fn poll(&mut self, user: u32) -> Option<Poll> {
         self.automation.poll(user, &mut self.input)
     }
+
+    /// Connection status the input system reads (monitor controls 0x7b
+    /// and 0x7c); `None` for a slot without a controller.
+    pub fn is_connected(&self, user: u32) -> Option<bool> {
+        self.automation.is_connected(user)
+    }
 }
 
 impl Controllers for Mock {

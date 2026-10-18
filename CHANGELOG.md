@@ -22,10 +22,11 @@
 - Add integration tests per domain that send every command to the host server over TCP.
 - Run on Windows (writability through `WSAPoll`) and macOS, where a socket is reported writable only with a full transfer block of send space free, so a stalled reader does not block other connections.
 - Serve SMB on `--smb-listen` (default `127.0.0.1:1445`) over the simulated volumes.
+- Simulate XAM's media verification service for the `civ*` commands (session states, injected errors, and timed passes over an empty drive on a settable millisecond clock) and XAM's feature switch for `feature` (stored mask and DbgPrint texts); the `httpreg` request carries the `Connection: Close` and `Host` lines XAM writes and follows redirects as XAM does.
 
 ### Xbox 360 module
 
-- Add console backends for every domain, the debug monitor control dispatcher (102 of 103 stock handler codes), and all 253 stock exports through `export!`/`export_raw!` and xex-link.
+- Add console backends for every domain, the debug monitor control dispatcher (all 103 stock handler codes), and all 253 stock exports through `export!`/`export_raw!` and xex-link.
 - Run server services inline under a startup lock until the command loop starts, so exports called during boot do not wait for the server thread.
 - Threads wait for the server thread only while it runs its pass loop: debug events, thread notifications, and queued services take their default disposition before the first pass and after the loop stops, and thread notifications are posted without waiting unless the thread may stop.
 - Enter the module entry point, the kernel debug routine, the thread notification, the control dispatcher, and the remaining kernel callbacks through the export bridge, and call console routines through frames that reserve the console argument area.
@@ -35,7 +36,11 @@
 - Deploy the module as `DEVKIT:\FlashEx\xbdm.xex` with a matching bounding path; it removes that file at startup.
 - Pack the image on 4 KB pages (`.text` at `0x91f01000`; xex-link derives section alignment from the small-pages flag), so the image ends below xshell at `0x92000000`.
 - Replace inline callee-saved register saves and restores with shared helpers (`xbox360-asm-rewrite` of rust-xbox360 on the module's LTO assembly; `//xbox360:openxbdm-no-rewrite` builds without it), and fail the build on reservation instructions the kernel loader reports as unprotected.
-- Shrink static data to stock's layouts: 0x298-class connection slots, one static 0x488 breakpoint block with pool blocks after it, a static transfer block with pool fallback for `threads`, `getcontext`, and similar replies, and detour records from the pool at the first `detour start`.
+- Shrink static data to stock's layouts: 0x298-class connection slots, 0x488-byte breakpoint blocks taken from the pool as stock does (a set fails only when the pool is exhausted), a static transfer block with pool fallback for `threads`, `getcontext`, and similar replies, and detour records from the pool at the first `detour start`.
+- Keep the breakpoint table under a spin lock taken at IRQL 0x7c, as stock does, so that exceptions dispatched in place (above passive level, on the server thread, after a stack overflow, or nested in a waiting thread) step over table breakpoints, report them without a stop, and remove an unloaded module's breakpoints. Breakpoints stop only threads that can stop; `break now` ends unresolved on the command thread as in stock. A stack overflow marks the thread so its later exceptions end unresolved.
+- Wake the server thread through a self-addressed datagram when a thread posts a debug event, so the event is taken at once rather than at the next 20 ms pass; without delivery the 20 ms pass remains.
+- Run `civinject`, `civstart`, `civstop` and `civverify` (dispatch flag 0x4) on a new title-process thread that the server thread waits for, as stock does, so XAM's media verification uses the title's handles; meanwhile an exception that stops its thread still waits for the server, and other posts that would wait take their non-waiting path.
+- Exports that translate drive paths (PGO export 107, the optical disc log, captures, traces) copy the drive table the server publishes and translate on the caller's thread, so they work wherever stock's do.
 - Loaded footprint: image 0xbb000 bytes (stock 0xaf000); with xshell idle the console reports 22 more free pages than with stock XBDM.
 - Place the export table in an executable section (`.xexp`); the loader hypercall reads it only from protected code pages.
 - `threads` reads the process objects at debug monitor data +0x50 and +0x54; the listener sets SO_REUSEADDR before bind; `getmemex` missing texts are `missing ADDR` and `missing LENGTH`.
@@ -67,6 +72,7 @@
 - Add client commands for `getcontext`, `setcontext`, `isdebugger`, `debugger`, `kd`, `kdlite`, `kdnet`, `threadstat`, `crashdump`, `break now`, lock mode, users, privileges, `authuser`, `adminpw`, and `keyxchg`.
 - Add `xeedee parity record` and `xeedee parity compare`: record the replies to a command list and compare two recordings outside listed varying fields.
 - Report 4xx replies outside the result table as remote errors with their code (`RemoteStatus`); parse stop exception codes as `NtStatus`, thread last errors as `Win32Error`, and the PIX capture file result as a hexadecimal HRESULT, failing on malformed text.
+- Compute the key exchange in the group stock XBDM uses on the console, for both the client and the server: the group table reaches the kernel without the byte swap that client values get, so the generator is 2^761 and each modulus qword is byte reversed in wire layout. A session key from `keyxchg` matches stock XBDM's, so `adminpw passwd=` and `authuser passwd=` store the intended passwords.
 - The command-line client is `xeedee`.
 
 ### Build
@@ -92,5 +98,5 @@
 ### Documentation
 
 - Add command specifications, the export table, the control dispatcher, the PGO runtime, per-domain parity records, and the parity summary under `docs/re-notes`.
-- Add the hardware differential results (`parity/hardware-commands.txt`, `parity/hardware-variances.txt`): 399 exchanges, 378 equal, 21 equal outside varying fields, 0 differ.
+- Add the hardware differential results (`parity/hardware-commands.txt`, `parity/hardware-variances.txt`): 1060 exchanges over 138 commands, 1042 equal, 18 equal outside varying fields, 0 differ; and the checks run outside the command list.
 - Document the kd host deployment loop, kdnet setup, and differential testing in `DEVELOPING.md`.

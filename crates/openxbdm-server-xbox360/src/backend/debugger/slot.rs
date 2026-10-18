@@ -22,7 +22,6 @@ use xbox360_sys::xboxkrnl::ThreadCreationFlags;
 use xbox360_sys::xboxkrnl::WaitReason;
 
 use super::execution::execution_from_code;
-use super::hook::BREAK_NOW_STOPPED;
 use super::hook::exception_record;
 use super::thread::MonitorRecord;
 use super::thread::OwnThread;
@@ -31,9 +30,10 @@ use super::thread::has_record;
 use super::thread::owning_process;
 use super::thread::process_kind_of;
 use super::thread::record_of;
-use super::thread::server_thread;
+use super::wake::wake_server;
 use crate::backend::dispatcher::Handoff;
 use crate::backend::dispatcher::HandoffState;
+use crate::backend::dispatcher::posts_blocked;
 use crate::kernel::address_of;
 use crate::kernel::object_at;
 use crate::kernel::thread_at;
@@ -182,7 +182,9 @@ pub(crate) fn wait_for_event_waiters() {
 /// Post an event for the calling thread and wait for its disposition;
 /// `None` when the server does not take events, which the caller resolves
 /// with the monitor's default disposition. `record` and `context` are
-/// addresses the server reads and writes while the thread waits.
+/// addresses the server reads and writes while the thread waits. While the
+/// server waits for a dispatch flag 0x4 command thread the event is not
+/// posted and `None` is returned.
 pub(super) fn post_and_wait(
     kind: SlotEventKind,
     own: OwnThread,
@@ -190,8 +192,24 @@ pub(super) fn post_and_wait(
     context: u32,
     argument: u32,
 ) -> Option<SlotDisposition> {
+    post_and_wait_stopping(kind, own, record, context, argument, &|| false)
+}
+
+/// [`post_and_wait`] for an event that may stop its thread: when `stops`
+/// answers true, the thread waits for the server even while it waits for a
+/// dispatch flag 0x4 command thread, as stock's thread stays stopped
+/// whatever its server thread does (0x91f3a980). `stops` is asked at most
+/// once, and only while posts are blocked.
+pub(super) fn post_and_wait_stopping(
+    kind: SlotEventKind,
+    own: OwnThread,
+    record: u32,
+    context: u32,
+    argument: u32,
+    stops: &dyn Fn() -> bool,
+) -> Option<SlotDisposition> {
     WAITERS.fetch_add(1, Ordering::AcqRel);
-    let disposition = post_and_wait_served(kind, own, record, context, argument);
+    let disposition = post_and_wait_served(kind, own, record, context, argument, stops);
     WAITERS.fetch_sub(1, Ordering::AcqRel);
 
     disposition
@@ -203,12 +221,16 @@ fn post_and_wait_served(
     record: u32,
     context: u32,
     argument: u32,
+    stops: &dyn Fn() -> bool,
 ) -> Option<SlotDisposition> {
     /// Interval at which a waiting thread checks whether the server stopped.
     const STOP_CHECK_INTERVAL: i64 = relative_interval(Duration::from_millis(100));
 
+    let mut stopping = None;
+    let mut stays = || *stopping.get_or_insert_with(stops);
+
     let thread = own.kthread();
-    let (slot_index, slot) = claim_slot()?;
+    let (slot_index, slot) = claim_slot(Claim::Wait, &mut stays)?;
     let thread_record = own.record();
     slot.event.reset();
     slot.kind.store(kind.raw(), Ordering::Relaxed);
@@ -224,6 +246,7 @@ fn post_and_wait_served(
             .store(slot_index as u32 + 1, Ordering::Relaxed);
     }
     slot.state.store(HandoffState::Posted, Ordering::Release);
+    wake_server();
     let disposition = loop {
         if slot.state.is(HandoffState::Completed, Ordering::Acquire) {
             break Some(SlotDisposition::from_bits_retain(
@@ -231,17 +254,22 @@ fn post_and_wait_served(
             ));
         }
         // A slot the server has not completed is reclaimed once it stops;
-        // completion claims the slot first, so exactly one side wins.
-        if !EVENTS_SERVED.load(Ordering::Acquire)
+        // completion claims the slot first, so exactly one side wins. While
+        // the server waits for a command thread, a slot it has not taken is
+        // reclaimed too unless the event stops its thread: the command may
+        // wait for this thread. A taken slot (a stopped thread) stays.
+        let served = EVENTS_SERVED.load(Ordering::Acquire);
+        if (!served || (posts_blocked() && !stays()))
             && (slot.state.transition(
                 HandoffState::Posted,
                 HandoffState::Filling,
                 Ordering::AcqRel,
-            ) || slot.state.transition(
-                HandoffState::Taken,
-                HandoffState::Filling,
-                Ordering::AcqRel,
-            ))
+            ) || (!served
+                && slot.state.transition(
+                    HandoffState::Taken,
+                    HandoffState::Filling,
+                    Ordering::AcqRel,
+                )))
         {
             break None;
         }
@@ -268,10 +296,25 @@ fn post_and_wait_served(
     disposition
 }
 
-/// Take a free slot while the server takes events.
-fn claim_slot() -> Option<(usize, &'static Slot)> {
+/// Whether a poster waits for the server to complete its slot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Claim {
+    Wait,
+    Detached,
+}
+
+/// Take a free slot while the server takes events. While the server waits
+/// for a command thread, a waiting poster gets one only when `stays`
+/// answers that its event stops it (it then waits for a free slot as
+/// usual), and a detached one none when all slots are in use.
+fn claim_slot(claim: Claim, stays: &mut dyn FnMut() -> bool) -> Option<(usize, &'static Slot)> {
     loop {
         if !EVENTS_SERVED.load(Ordering::Acquire) {
+            return None;
+        }
+
+        let blocked = posts_blocked() && !(claim == Claim::Wait && stays());
+        if blocked && claim == Claim::Wait {
             return None;
         }
 
@@ -281,6 +324,10 @@ fn claim_slot() -> Option<(usize, &'static Slot)> {
         }) {
             return Some((index, &SLOTS[index]));
         }
+        if blocked {
+            return None;
+        }
+
         sleep(Duration::from_millis(1));
     }
 }
@@ -292,7 +339,7 @@ fn claim_slot() -> Option<(usize, &'static Slot)> {
 /// `context` the title entry flag, `argument` the title process flag.
 pub(super) fn post_detached(kind: SlotEventKind, thread: &Kthread) {
     WAITERS.fetch_add(1, Ordering::AcqRel);
-    if let Some((_, slot)) = claim_slot() {
+    if let Some((_, slot)) = claim_slot(Claim::Detached, &mut || false) {
         slot.kind.store(kind.raw(), Ordering::Relaxed);
         slot.thread_object.store(0, Ordering::Relaxed);
         slot.thread_id.store(thread.id, Ordering::Relaxed);
@@ -307,6 +354,7 @@ pub(super) fn post_detached(kind: SlotEventKind, thread: &Kthread) {
             Ordering::Relaxed,
         );
         slot.state.store(HandoffState::Posted, Ordering::Release);
+        wake_server();
     }
     WAITERS.fetch_sub(1, Ordering::AcqRel);
 }
@@ -431,14 +479,6 @@ pub(super) fn next_event() -> Option<DebugEvent> {
 }
 
 pub(super) fn complete_event(thread: ThreadId, disposition: Disposition) {
-    // SAFETY: the server thread object stays allocated while the server
-    // runs, and the server calls this on its own thread.
-    if let Some(server) = server_thread()
-        && unsafe { thread_at(server.get()) }.id == thread.0
-    {
-        BREAK_NOW_STOPPED.store(false, Ordering::Release);
-        return;
-    }
     // Claimed before the disposition is written: a waiter released by
     // a stop reclaims its taken slot with the same exchange.
     let Some(slot) = SLOTS.iter().find(|slot| {

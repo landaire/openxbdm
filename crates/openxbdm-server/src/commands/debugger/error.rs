@@ -52,8 +52,8 @@ impl From<NotPending> for CommandError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetError {
     Misaligned,
-    /// The entry needed a block split and no spare block could be obtained.
-    NoSpareBlock,
+    /// A block the entry needs could not be obtained from pool memory.
+    NoBlock,
 }
 
 impl From<SetError> for CommandError {

@@ -1,24 +1,15 @@
 //! Software execution breakpoints and the hardware data breakpoint.
+// Pool memory is reinterpreted as a block.
+#![allow(unsafe_code)]
 
-use super::Backend;
 use super::SetError;
-use crate::commands::filesystem::ScratchBlock;
+use super::direct::DirectStep;
 
 /// `twi 31, r0, 0x16`, the instruction written over a breakpoint.
 pub const TRAP_INSTRUCTION: u32 = 0x0fe0_0016;
-/// Blocks the table can obtain: the static first block, then pool blocks.
-pub const BREAKPOINT_BLOCKS: usize = 8;
 /// Entries per block.
 const BLOCK_ENTRIES: usize = 0x80;
 
-/// Stock block layout: count, addresses, saved instruction words, flag
-/// bytes, next link.
-const BLOCK_SIZE: usize = 0x488;
-const ADDRESSES: usize = 4;
-const SAVED: usize = ADDRESSES + 4 * BLOCK_ENTRIES;
-const FLAGS: usize = SAVED + 4 * BLOCK_ENTRIES;
-const NEXT: usize = FLAGS + BLOCK_ENTRIES;
-const _: () = assert!(NEXT + 4 == BLOCK_SIZE);
 xbox360_sys::flags! {
     /// Flags byte of a breakpoint slot. Stock also refuses to arm on bit 1,
     /// which has no writer.
@@ -28,55 +19,58 @@ xbox360_sys::flags! {
     }
 }
 
-type Block = [u8; BLOCK_SIZE];
-
-/// Block index: 0 is the static block, n is pool block n - 1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BlockId(u8);
-
-trait BlockFields {
-    fn word(&self, offset: usize) -> u32;
-    fn set_word(&mut self, offset: usize, value: u32);
-    fn count(&self) -> usize;
-    fn address(&self, index: usize) -> u32;
-    fn saved(&self, index: usize) -> u32;
-    fn armed(&self, index: usize) -> bool;
-    fn next(&self) -> Option<BlockId>;
-    fn search(&self, address: u32) -> Result<usize, usize>;
-    fn shift(&mut self, from: usize, to: usize);
+/// Stock block layout: count, sorted addresses, saved instruction words,
+/// flag bytes, next link (0x488 bytes, pool tag `Xbdm`, type 2).
+#[derive(Debug)]
+#[repr(C)]
+struct Block {
+    count: u32,
+    addresses: [u32; BLOCK_ENTRIES],
+    saved: [u32; BLOCK_ENTRIES],
+    flags: [u8; BLOCK_ENTRIES],
+    next: Option<&'static mut Block>,
 }
 
-impl BlockFields for Block {
-    fn word(&self, offset: usize) -> u32 {
-        let mut bytes = [0; 4];
-        bytes.copy_from_slice(&self[offset..offset + 4]);
-        u32::from_ne_bytes(bytes)
-    }
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(core::mem::size_of::<Block>() == 0x488);
 
-    fn set_word(&mut self, offset: usize, value: u32) {
-        self[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+impl Block {
+    /// Zero `memory` and use it as a block. Stock leaves a block's unused
+    /// slots as the pool returned them.
+    fn from_pool(memory: &'static mut [u8]) -> Option<&'static mut Self> {
+        if memory.len() < core::mem::size_of::<Self>()
+            || !memory.as_ptr().cast::<Self>().is_aligned()
+        {
+            return None;
+        }
+
+        memory.fill(0);
+
+        // SAFETY: the memory is held for the life of the program by nothing
+        // else, large enough and aligned, and zero bytes are a valid block
+        // (zero words, no next link).
+        Some(unsafe { &mut *memory.as_mut_ptr().cast::<Self>() })
     }
 
     fn count(&self) -> usize {
-        self.word(0) as usize
+        self.count as usize
     }
 
-    fn address(&self, index: usize) -> u32 {
-        self.word(ADDRESSES + 4 * index)
-    }
-
-    fn saved(&self, index: usize) -> u32 {
-        self.word(SAVED + 4 * index)
+    fn identity(&self) -> BlockIdentity {
+        BlockIdentity(core::ptr::from_ref(self).addr())
     }
 
     fn armed(&self, index: usize) -> bool {
-        BreakpointFlags::from_bits_retain(self[FLAGS + index]).intersects(BreakpointFlags::ARMED)
+        BreakpointFlags::from_bits_retain(self.flags[index]).intersects(BreakpointFlags::ARMED)
     }
 
-    fn next(&self) -> Option<BlockId> {
-        match self.word(NEXT) {
-            0 => None,
-            link => Some(BlockId(link as u8 - 1)),
+    /// Whether the walk of stock 0x91f25480 stops here: this is the last
+    /// block, or the address lies between this block's first address and
+    /// the next one's. Stale first addresses of emptied blocks count.
+    fn covers(&self, address: u32) -> bool {
+        match self.next.as_deref() {
+            None => true,
+            Some(next) => address >= self.addresses[0] && address < next.addresses[0],
         }
     }
 
@@ -85,7 +79,7 @@ impl BlockFields for Block {
 
         while low < high {
             let middle = (low + high) / 2;
-            match self.address(middle).cmp(&address) {
+            match self.addresses[middle].cmp(&address) {
                 core::cmp::Ordering::Less => low = middle + 1,
                 core::cmp::Ordering::Equal => return Ok(middle),
                 core::cmp::Ordering::Greater => high = middle,
@@ -98,226 +92,268 @@ impl BlockFields for Block {
     /// Move the entries from index `from` to the end to index `to`.
     fn shift(&mut self, from: usize, to: usize) {
         let count = self.count();
-        self.copy_within(
-            ADDRESSES + 4 * from..ADDRESSES + 4 * count,
-            ADDRESSES + 4 * to,
-        );
-        self.copy_within(SAVED + 4 * from..SAVED + 4 * count, SAVED + 4 * to);
-        self.copy_within(FLAGS + from..FLAGS + count, FLAGS + to);
+        self.addresses.copy_within(from..count, to);
+        self.saved.copy_within(from..count, to);
+        self.flags.copy_within(from..count, to);
+    }
+
+    /// Move the upper half of this full block into `upper`, link it after
+    /// this one, and return the half that covers `address`.
+    fn split(&mut self, upper: &'static mut Self, address: u32) -> &mut Self {
+        let count = self.count();
+        let moved = count / 2;
+        let kept = count - moved;
+
+        upper.addresses[..moved].copy_from_slice(&self.addresses[kept..count]);
+        upper.saved[..moved].copy_from_slice(&self.saved[kept..count]);
+        upper.flags[..moved].copy_from_slice(&self.flags[kept..count]);
+        upper.count = moved as u32;
+        upper.next = self.next.take();
+        self.count = kept as u32;
+
+        if address >= upper.addresses[0] {
+            self.next.insert(upper)
+        } else {
+            self.next = Some(upper);
+            self
+        }
+    }
+
+    fn insert(&mut self, index: usize, address: u32) {
+        // The saved word at the new index keeps its previous value until
+        // the trap is written.
+        self.shift(index, index + 1);
+        self.count += 1;
+        self.addresses[index] = address;
+        self.flags[index] = 0;
+    }
+
+    fn remove(&mut self, index: usize) {
+        self.shift(index + 1, index);
+        self.count -= 1;
+    }
+
+    /// Stock 0x91f269f0.
+    fn arm<C>(&mut self, index: usize, code: &mut C)
+    where
+        C: CodeWords + ?Sized,
+    {
+        if self.armed(index) {
+            return;
+        }
+
+        if let Some(original) = code.replace_code_word(self.addresses[index], TRAP_INSTRUCTION) {
+            self.saved[index] = original;
+            self.flags[index] = BreakpointFlags::ARMED.bits();
+        }
+    }
+
+    /// Stock 0x91f26ac0.
+    fn disarm<C>(&mut self, index: usize, code: &mut C)
+    where
+        C: CodeWords + ?Sized,
+    {
+        if self.armed(index) {
+            code.replace_code_word(self.addresses[index], self.saved[index]);
+        }
+
+        self.flags[index] = 0;
     }
 }
+
+/// Address of a block, which never moves or is freed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockIdentity(usize);
 
 /// Position of an entry. A step over a breakpoint records this rather than
 /// the address, and re-arms whatever entry occupies it afterwards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Slot {
-    block: BlockId,
+    block: BlockIdentity,
     index: usize,
 }
 
-/// Code memory the table patches and the pool its blocks come from.
-pub(crate) trait CodeWords {
-    /// Store `value` and return the previous word, or `None` when the
+/// Code memory the table patches.
+pub trait CodeWords {
+    /// Store `value` through a writable mapping, synchronizing the
+    /// instruction cache, and return the previous word; `None` when the
     /// address cannot be mapped.
     fn replace_code_word(&mut self, address: u32, value: u32) -> Option<u32>;
-    /// Pool memory for a block, held for the life of the table.
-    fn allocate_block(&mut self) -> Option<&'static mut [u8]>;
 }
 
-impl<T> CodeWords for T
-where
-    T: crate::backend::Backend + ?Sized,
-{
-    fn replace_code_word(&mut self, address: u32, value: u32) -> Option<u32> {
-        Backend::replace_code_word(self, address, value)
-    }
-
-    fn allocate_block(&mut self) -> Option<&'static mut [u8]> {
-        // Blocks are never freed.
-        self.allocate_scratch(BLOCK_SIZE as u32)
-            .map(ScratchBlock::into_raw)
-    }
-}
-
-/// Execution breakpoints: a chain of sorted blocks that split in half when
-/// full, plus one spare block. Stock takes every block from pool memory;
-/// the first one is static so the table works without pool memory until
-/// it splits. Blocks are never freed.
+/// A zeroed pool block for the table. The platform obtains it before it
+/// takes the table lock, as stock allocates the spare before raising IRQL
+/// (0x91f27018).
 #[derive(Debug)]
-pub struct Breakpoints {
-    first: Block,
-    pool: [Option<&'static mut Block>; BREAKPOINT_BLOCKS - 1],
-    /// Blocks handed out so far.
-    allocated: u8,
-    head: Option<BlockId>,
-    spare: Option<BlockId>,
+pub struct SpareBlock(&'static mut Block);
+
+impl SpareBlock {
+    /// Bytes of pool memory a block needs.
+    pub const SIZE: u32 = core::mem::size_of::<Block>() as u32;
+
+    /// `memory` is held for the life of the program, as blocks are never
+    /// freed.
+    pub fn from_pool(memory: &'static mut [u8]) -> Option<Self> {
+        Block::from_pool(memory).map(Self)
+    }
+}
+
+/// The breakpoint table and the step state of exceptions dispatched in
+/// place. The platform keeps both under its table lock (stock spin lock
+/// 0x91fae9c0, taken at IRQL 0x7c), so that threads that cannot wait for
+/// the server reach them.
+#[derive(Debug)]
+pub struct BreakpointState {
+    pub(crate) table: Breakpoints,
+    /// Step over a breakpoint or the data breakpoint begun in place (stock
+    /// keeps it in the context of the deferred dispatch, 0x91fae9b0).
+    pub(crate) direct_step: Option<DirectStep>,
+}
+
+impl BreakpointState {
+    pub const fn new() -> Self {
+        Self {
+            table: Breakpoints::new(),
+            direct_step: None,
+        }
+    }
+
+    /// Whether the table holds no spare block, which a set may need.
+    pub fn needs_spare(&self) -> bool {
+        self.table.needs_spare()
+    }
+
+    pub fn provide_spare(&mut self, spare: SpareBlock) {
+        self.table.provide_spare(spare);
+    }
+
+    /// Add or re-arm a breakpoint (stock 0x91f26fc8 under the table lock);
+    /// a split fails when no spare block is held.
+    pub fn set(&mut self, address: u32, code: &mut dyn CodeWords) -> Result<(), SetError> {
+        if address & 3 != 0 {
+            return Err(SetError::Misaligned);
+        }
+
+        self.table.set(address, code)
+    }
+
+    /// Remove a breakpoint (stock 0x91f27178); whether it existed.
+    pub fn clear(&mut self, address: u32, code: &mut dyn CodeWords) -> bool {
+        self.table.clear(address, code)
+    }
+
+    /// Original byte under an armed breakpoint (stock 0x91f26bc8).
+    pub fn shadow_read(&self, address: u32) -> Option<u8> {
+        self.table.shadow_read(address)
+    }
+
+    /// Store a byte into the saved instruction of an armed breakpoint
+    /// (stock 0x91f26cb8); whether the address is covered.
+    pub fn shadow_write(&mut self, address: u32, value: u8) -> bool {
+        self.table.shadow_write(address, value)
+    }
+
+    /// Whether a software breakpoint is set at `address`.
+    pub fn contains(&self, address: u32) -> bool {
+        self.table.contains(address)
+    }
+
+    /// Forget the breakpoints of an unloaded module after restoring their
+    /// instructions (stock 0x91f26e90), as the dispatch of its unload trap
+    /// does in place (0x91f3a3dc).
+    pub fn remove_module(&mut self, base: u32, size: u32, code: &mut dyn CodeWords) {
+        self.table.remove_range(base, size, code);
+    }
+}
+
+/// Execution breakpoints (stock head 0x91fae980, spare 0x91fae97c): a
+/// chain of sorted pool blocks that split in half when full, plus one
+/// spare block. Blocks are never freed.
+#[derive(Debug)]
+pub(crate) struct Breakpoints {
+    head: Option<&'static mut Block>,
+    spare: Option<&'static mut Block>,
 }
 
 impl Breakpoints {
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
-            first: [0; BLOCK_SIZE],
-            pool: [const { None }; BREAKPOINT_BLOCKS - 1],
-            allocated: 0,
             head: None,
             spare: None,
         }
     }
 
-    fn block(&self, id: BlockId) -> &Block {
-        match id.0.checked_sub(1) {
-            None => &self.first,
-            Some(index) => match &self.pool[usize::from(index)] {
-                Some(block) => block,
-                None => unreachable!(),
-            },
-        }
+    pub(crate) fn needs_spare(&self) -> bool {
+        self.spare.is_none()
     }
 
-    fn block_mut(&mut self, id: BlockId) -> &mut Block {
-        match id.0.checked_sub(1) {
-            None => &mut self.first,
-            Some(index) => match &mut self.pool[usize::from(index)] {
-                Some(block) => block,
-                None => unreachable!(),
-            },
-        }
+    pub(crate) fn provide_spare(&mut self, spare: SpareBlock) {
+        self.spare = Some(spare.0);
     }
 
-    /// A zeroed block: the static one first, then pool memory.
-    fn allocate<C>(&mut self, code: &mut C) -> Option<BlockId>
-    where
-        C: CodeWords + ?Sized,
-    {
-        let id = BlockId(self.allocated);
+    fn blocks(&self) -> impl Iterator<Item = &Block> + '_ {
+        core::iter::successors(self.head.as_deref(), |block| block.next.as_deref())
+    }
 
-        if let Some(index) = self.allocated.checked_sub(1) {
-            let slot = self.pool.get_mut(usize::from(index))?;
-            let block: &'static mut Block = code.allocate_block()?.try_into().ok()?;
-            block.fill(0);
-            *slot = Some(block);
+    /// Block an address belongs to (stock 0x91f25480). An address below
+    /// the head's first entry falls through to the last block.
+    fn walk(&self, address: u32) -> Option<&Block> {
+        let mut current = self.head.as_deref()?;
+
+        while !current.covers(address) {
+            current = current.next.as_deref()?;
         }
 
-        self.allocated += 1;
-
-        Some(id)
+        Some(current)
     }
 
-    /// Block an address belongs to (stock 0x91f25480). The test reads the
-    /// first address of every block, including stale ones of emptied
-    /// blocks, and an address below the head's first entry falls through
-    /// to the last block.
-    fn walk(&self, head: BlockId, address: u32) -> BlockId {
-        let mut current = head;
+    fn find(&self, address: u32) -> Option<(&Block, usize)> {
+        let block = self.walk(address)?;
+        let index = block.search(address).ok()?;
 
-        while let Some(next) = self.block(current).next() {
-            if address >= self.block(current).address(0) && address < self.block(next).address(0) {
-                break;
-            }
-            current = next;
+        Some((block, index))
+    }
+
+    fn find_mut(&mut self, address: u32) -> Option<(&mut Block, usize)> {
+        let mut current = self.head.as_deref_mut()?;
+
+        while !current.covers(address) {
+            current = current.next.as_deref_mut()?;
         }
 
-        current
+        let index = current.search(address).ok()?;
+
+        Some((current, index))
     }
 
-    fn find(&self, address: u32) -> Option<Slot> {
-        let block = self.walk(self.head?, address);
-
-        self.block(block)
-            .search(address)
-            .ok()
-            .map(|index| Slot { block, index })
-    }
-
-    /// Lookup with insertion: `Ok` for an existing entry, `Err` for the
-    /// position a new entry takes, `None` when a needed block is missing.
-    fn locate_for_insert(&mut self, address: u32) -> Option<Result<Slot, Slot>> {
-        let head = match self.head {
-            Some(head) => head,
-            None => {
-                let head = self.spare.take()?;
-                self.block_mut(head).fill(0);
-                self.head = Some(head);
-                head
-            }
-        };
-
-        let mut block = self.walk(head, address);
-
-        loop {
-            let index = match self.block(block).search(address) {
-                Ok(index) => return Some(Ok(Slot { block, index })),
-                Err(index) => index,
-            };
-
-            if self.block(block).count() != BLOCK_ENTRIES {
-                return Some(Err(Slot { block, index }));
-            }
-
-            let upper = self.spare.take()?;
-            self.split(block, upper);
-            if address >= self.block(upper).address(0) {
-                block = upper;
-            }
-        }
-    }
-
-    /// Move the upper half of the full block `lower` into `upper` and link
-    /// it after `lower`.
-    fn split(&mut self, lower: BlockId, upper: BlockId) {
-        let source = self.block(lower);
-        let count = source.count();
-        let moved = count / 2;
-        let kept = count - moved;
-        let next = source.word(NEXT);
-
-        for (field, width) in [(ADDRESSES, 4), (SAVED, 4), (FLAGS, 1)] {
-            let mut part = [0u8; 4 * BLOCK_ENTRIES / 2];
-            let part = &mut part[..width * moved];
-            part.copy_from_slice(&self.block(lower)[field + width * kept..field + width * count]);
-            self.block_mut(upper)[field..field + width * moved].copy_from_slice(part);
-        }
-
-        let target = self.block_mut(upper);
-        target.set_word(0, moved as u32);
-        target.set_word(NEXT, next);
-
-        let source = self.block_mut(lower);
-        source.set_word(NEXT, u32::from(upper.0) + 1);
-        source.set_word(0, kept as u32);
-    }
-
-    fn blocks_in_chain(&self) -> impl Iterator<Item = BlockId> + '_ {
-        core::iter::successors(self.head, |&id| self.block(id).next())
-    }
-
-    pub fn contains(&self, address: u32) -> bool {
+    pub(crate) fn contains(&self, address: u32) -> bool {
         self.find(address).is_some()
     }
 
-    fn armed_entry(&self, address: u32) -> Option<Slot> {
-        self.find(address & !3)
-            .filter(|slot| self.block(slot.block).armed(slot.index))
-    }
-
     /// Original byte under an armed breakpoint (stock 0x91f26bc8).
-    pub fn shadow_read(&self, address: u32) -> Option<u8> {
-        let slot = self.armed_entry(address)?;
+    pub(crate) fn shadow_read(&self, address: u32) -> Option<u8> {
+        let (block, index) = self.find(address & !3)?;
+        if !block.armed(index) {
+            return None;
+        }
 
-        Some(self.block(slot.block).saved(slot.index).to_be_bytes()[(address & 3) as usize])
+        Some(block.saved[index].to_be_bytes()[(address & 3) as usize])
     }
 
     /// Store a byte into the saved instruction of an armed breakpoint
     /// (stock 0x91f26cb8). Returns whether the address is covered.
     pub fn shadow_write(&mut self, address: u32, value: u8) -> bool {
-        let Some(slot) = self.armed_entry(address) else {
+        let Some((block, index)) = self.find_mut(address & !3) else {
             return false;
         };
 
-        let block = self.block_mut(slot.block);
-        let mut bytes = block.saved(slot.index).to_be_bytes();
+        if !block.armed(index) {
+            return false;
+        }
+
+        let mut bytes = block.saved[index].to_be_bytes();
         bytes[(address & 3) as usize] = value;
-        block.set_word(SAVED + 4 * slot.index, u32::from_be_bytes(bytes));
+        block.saved[index] = u32::from_be_bytes(bytes);
 
         true
     }
@@ -329,23 +365,21 @@ impl Breakpoints {
         let length = data.len() as u32;
         let end = start.wrapping_add(length);
 
-        for id in self.blocks_in_chain() {
-            let block = self.block(id);
+        for block in self.blocks() {
             let count = block.count();
             if count == 0 {
                 continue;
             }
 
-            if end <= block.address(0) {
+            if end <= block.addresses[0] {
                 break;
             }
 
-            if start > block.address(count - 1).wrapping_add(4) {
+            if start > block.addresses[count - 1].wrapping_add(4) {
                 continue;
             }
 
-            for index in 0..count {
-                let address = block.address(index);
+            for (&address, &saved) in block.addresses[..count].iter().zip(&block.saved) {
                 if end <= address {
                     break;
                 }
@@ -354,7 +388,7 @@ impl Breakpoints {
                     continue;
                 }
 
-                for (byte_offset, byte) in (0u32..).zip(block.saved(index).to_be_bytes()) {
+                for (byte_offset, byte) in (0u32..).zip(saved.to_be_bytes()) {
                     let offset = address.wrapping_add(byte_offset).wrapping_sub(start);
                     if offset < length {
                         data[offset as usize] = byte;
@@ -364,39 +398,38 @@ impl Breakpoints {
         }
     }
 
-    /// Add or re-arm a breakpoint (stock 0x91f26fc8). A new entry counts as
-    /// set even when its address cannot be mapped for the trap.
+    /// Add or re-arm a breakpoint (stock 0x91f26fc8) at an aligned address.
+    /// A new entry counts as set even when its address cannot be mapped for
+    /// the trap. Fails only when a block is needed and no spare is held.
     pub(crate) fn set<C>(&mut self, address: u32, code: &mut C) -> Result<(), SetError>
     where
         C: CodeWords + ?Sized,
     {
-        if address & 3 != 0 {
-            return Err(SetError::Misaligned);
-        }
-
-        if self.spare.is_none() {
-            self.spare = self.allocate(code);
-        }
-
-        let slot = match self
-            .locate_for_insert(address)
-            .ok_or(SetError::NoSpareBlock)?
-        {
-            Ok(slot) => slot,
-            Err(slot) => {
-                let block = self.block_mut(slot.block);
-                // The saved word at the new index keeps its previous value
-                // until the trap is written.
-                block.shift(slot.index, slot.index + 1);
-                let count = block.count();
-                block.set_word(0, count as u32 + 1);
-                block.set_word(ADDRESSES + 4 * slot.index, address);
-                block[FLAGS + slot.index] = 0;
-                slot
-            }
+        let Self { head, spare } = self;
+        let mut block: &mut Block = match head {
+            Some(head) => head,
+            None => head.insert(spare.take().ok_or(SetError::NoBlock)?),
         };
 
-        self.arm(slot, code);
+        while !block.covers(address) {
+            block = block.next.as_deref_mut().ok_or(SetError::NoBlock)?;
+        }
+
+        let index = loop {
+            let index = match block.search(address) {
+                Ok(index) => break index,
+                Err(index) => index,
+            };
+
+            if block.count() != BLOCK_ENTRIES {
+                block.insert(index, address);
+                break index;
+            }
+
+            block = block.split(spare.take().ok_or(SetError::NoBlock)?, address);
+        };
+
+        block.arm(index, code);
 
         Ok(())
     }
@@ -407,21 +440,14 @@ impl Breakpoints {
     where
         C: CodeWords + ?Sized,
     {
-        let Some(slot) = self.find(address) else {
+        let Some((block, index)) = self.find_mut(address) else {
             return false;
         };
 
-        self.disarm(slot, code);
-        self.remove(slot);
+        block.disarm(index, code);
+        block.remove(index);
 
         true
-    }
-
-    fn remove(&mut self, slot: Slot) {
-        let block = self.block_mut(slot.block);
-        block.shift(slot.index + 1, slot.index);
-        let count = block.count();
-        block.set_word(0, count as u32 - 1);
     }
 
     /// Disarm every entry and empty every block (stock 0x91f27290). The
@@ -430,16 +456,15 @@ impl Breakpoints {
     where
         C: CodeWords + ?Sized,
     {
-        let mut current = self.head;
+        let mut current = self.head.as_deref_mut();
 
         while let Some(block) = current {
-            for index in 0..self.block(block).count() {
-                self.disarm(Slot { block, index }, code);
+            for index in 0..block.count() {
+                block.disarm(index, code);
             }
 
-            let block = self.block_mut(block);
-            block.set_word(0, 0);
-            current = block.next();
+            block.count = 0;
+            current = block.next.as_deref_mut();
         }
     }
 
@@ -451,27 +476,27 @@ impl Breakpoints {
         C: CodeWords + ?Sized,
     {
         let end = base.wrapping_add(size);
-        let mut current = self.head;
+        let mut current = self.head.as_deref_mut();
 
         while let Some(block) = current {
-            let count = self.block(block).count();
+            let count = block.count();
             if count != 0 {
-                if end <= self.block(block).address(0) {
+                if end <= block.addresses[0] {
                     break;
                 }
 
-                if base <= self.block(block).address(count - 1).wrapping_add(4) {
+                if base <= block.addresses[count - 1].wrapping_add(4) {
                     let mut index = 0;
 
-                    while index < self.block(block).count() {
-                        let address = self.block(block).address(index);
+                    while index < block.count() {
+                        let address = block.addresses[index];
                         if end <= address {
                             break;
                         }
 
                         if base < address.wrapping_add(4) {
-                            self.disarm(Slot { block, index }, code);
-                            self.remove(Slot { block, index });
+                            block.disarm(index, code);
+                            block.remove(index);
                         } else {
                             index += 1;
                         }
@@ -479,7 +504,7 @@ impl Breakpoints {
                 }
             }
 
-            current = self.block(block).next();
+            current = block.next.as_deref_mut();
         }
     }
 
@@ -489,10 +514,28 @@ impl Breakpoints {
     where
         C: CodeWords + ?Sized,
     {
-        let slot = self.find(address)?;
-        self.disarm(slot, code);
+        let (block, index) = self.find_mut(address)?;
+        block.disarm(index, code);
 
-        Some(slot)
+        Some(Slot {
+            block: block.identity(),
+            index,
+        })
+    }
+
+    /// Restore the instruction of the breakpoint at `address`, keeping the
+    /// entry (stock 0x91f26b80). Returns whether one is set there.
+    pub(crate) fn disarm_at<C>(&mut self, address: u32, code: &mut C) -> bool
+    where
+        C: CodeWords + ?Sized,
+    {
+        let Some((block, index)) = self.find_mut(address) else {
+            return false;
+        };
+
+        block.disarm(index, code);
+
+        true
     }
 
     /// Arm the entry at `slot` after a step (stock 0x91f27630), whichever
@@ -501,37 +544,16 @@ impl Breakpoints {
     where
         C: CodeWords + ?Sized,
     {
-        self.arm(slot, code);
-    }
+        let mut current = self.head.as_deref_mut();
 
-    /// Stock 0x91f269f0.
-    fn arm<C>(&mut self, slot: Slot, code: &mut C)
-    where
-        C: CodeWords + ?Sized,
-    {
-        let block = self.block_mut(slot.block);
-        if block.armed(slot.index) {
-            return;
+        while let Some(block) = current {
+            if block.identity() == slot.block {
+                block.arm(slot.index, code);
+                return;
+            }
+
+            current = block.next.as_deref_mut();
         }
-
-        if let Some(original) = code.replace_code_word(block.address(slot.index), TRAP_INSTRUCTION)
-        {
-            block.set_word(SAVED + 4 * slot.index, original);
-            block[FLAGS + slot.index] = BreakpointFlags::ARMED.bits();
-        }
-    }
-
-    /// Stock 0x91f26ac0.
-    fn disarm<C>(&mut self, slot: Slot, code: &mut C)
-    where
-        C: CodeWords + ?Sized,
-    {
-        let block = self.block_mut(slot.block);
-        if block.armed(slot.index) {
-            code.replace_code_word(block.address(slot.index), block.saved(slot.index));
-        }
-
-        block[FLAGS + slot.index] = 0;
     }
 }
 
@@ -619,6 +641,21 @@ mod tests {
         fn mapped(words: &[(u32, u32)]) -> Self {
             Self(words.iter().copied().collect(), None)
         }
+
+        fn allocate(&mut self) -> Option<SpareBlock> {
+            if let Some(left) = &mut self.1 {
+                *left = left.checked_sub(1)?;
+            }
+
+            // Pool memory is not zeroed and is 8-byte aligned.
+            let size = SpareBlock::SIZE as usize;
+            let words = Vec::leak(std::vec![0xa5a5_a5a5_a5a5_a5a5u64; size.div_ceil(8)]);
+            // SAFETY: the leaked words are referenced only through the
+            // returned bytes.
+            SpareBlock::from_pool(unsafe {
+                core::slice::from_raw_parts_mut(words.as_mut_ptr().cast(), size)
+            })
+        }
     }
 
     impl CodeWords for Code {
@@ -627,32 +664,30 @@ mod tests {
                 .get_mut(&address)
                 .map(|word| core::mem::replace(word, value))
         }
+    }
 
-        fn allocate_block(&mut self) -> Option<&'static mut [u8]> {
-            if let Some(left) = &mut self.1 {
-                *left = left.checked_sub(1)?;
-            }
-            // Pool memory is not zeroed.
-            Some(Vec::leak(std::vec![0xa5; BLOCK_SIZE]))
+    /// A set as the server makes it: the spare comes from the pool first.
+    fn set(table: &mut Breakpoints, code: &mut Code, address: u32) -> Result<(), SetError> {
+        if table.needs_spare()
+            && let Some(spare) = code.allocate()
+        {
+            table.provide_spare(spare);
         }
+
+        table.set(address, code)
     }
 
     /// Set `count` breakpoints 8 bytes apart from 0x1000.
     fn set_ascending(table: &mut Breakpoints, code: &mut Code, count: usize) {
         for index in 0..count as u32 {
-            assert_eq!(table.set(0x1000 + index * 8, code), Ok(()));
+            assert_eq!(set(table, code, 0x1000 + index * 8), Ok(()));
         }
     }
 
     fn chain(table: &Breakpoints) -> Vec<Vec<u32>> {
         table
-            .blocks_in_chain()
-            .map(|id| {
-                let block = table.block(id);
-                (0..block.count())
-                    .map(|index| block.address(index))
-                    .collect()
-            })
+            .blocks()
+            .map(|block| block.addresses[..block.count()].to_vec())
             .collect()
     }
 
@@ -661,7 +696,7 @@ mod tests {
         let mut table = Breakpoints::new();
         let mut code = Code::default();
         set_ascending(&mut table, &mut code, BLOCK_ENTRIES);
-        assert_eq!(table.set(0x1004, &mut code), Ok(()));
+        assert_eq!(set(&mut table, &mut code, 0x1004), Ok(()));
         let blocks = chain(&table);
         assert_eq!(blocks.len(), 2);
         assert_eq!((blocks[0].len(), blocks[1].len()), (0x41, 0x40));
@@ -675,7 +710,7 @@ mod tests {
         let mut code = Code::default();
         set_ascending(&mut table, &mut code, BLOCK_ENTRIES + 1);
         assert!(table.contains(0x1100));
-        assert_eq!(table.set(0x800, &mut code), Ok(()));
+        assert_eq!(set(&mut table, &mut code, 0x800), Ok(()));
         assert_eq!(chain(&table)[1][0], 0x800);
         // The last block's first address no longer bounds the head, so the
         // head's entries are out of reach.
@@ -693,8 +728,8 @@ mod tests {
         let mut code = Code::default();
         set_ascending(&mut table, &mut code, BLOCK_ENTRIES + 1);
         table.clear_all(&mut code);
-        assert_eq!(table.set(0x3000, &mut code), Ok(()));
-        assert_eq!(table.set(0x1100, &mut code), Ok(()));
+        assert_eq!(set(&mut table, &mut code, 0x3000), Ok(()));
+        assert_eq!(set(&mut table, &mut code, 0x1100), Ok(()));
         assert_eq!(chain(&table), [&[0x1100][..], &[0x3000][..]]);
     }
 
@@ -702,8 +737,8 @@ mod tests {
     fn new_entry_keeps_the_saved_word_of_its_position() {
         let mut table = Breakpoints::new();
         let mut code = Code::mapped(&[(0x2000, 0x1122_3344)]);
-        assert_eq!(table.set(0x2000, &mut code), Ok(()));
-        assert_eq!(table.set(0x1000, &mut code), Ok(()));
+        assert_eq!(set(&mut table, &mut code, 0x2000), Ok(()));
+        assert_eq!(set(&mut table, &mut code, 0x1000), Ok(()));
         assert_eq!(table.shadow_read(0x1000), None);
         let mut data = [0u8; 6];
         table.restore_saved(0x0ffe, &mut data);
@@ -711,43 +746,63 @@ mod tests {
     }
 
     #[test]
-    fn set_fails_once_no_spare_block_can_be_obtained() {
+    fn chain_grows_while_pool_memory_lasts() {
         let mut table = Breakpoints::new();
         let mut code = Code::default();
-        let capacity = (BREAKPOINT_BLOCKS - 1) * BLOCK_ENTRIES / 2 + BLOCK_ENTRIES;
-        set_ascending(&mut table, &mut code, capacity);
-        assert_eq!(
-            table.set(0x1000 + capacity as u32 * 8, &mut code),
-            Err(SetError::NoSpareBlock)
-        );
-        // A block with room still takes entries.
-        assert_eq!(table.set(0x1004, &mut code), Ok(()));
+        // Ascending sets split each full block in half: every block but the
+        // last keeps 0x40 entries.
+        set_ascending(&mut table, &mut code, 15 * BLOCK_ENTRIES / 2 + 1);
+        let blocks = chain(&table);
+        assert_eq!(blocks.len(), 15);
+        assert_eq!(blocks[14].len(), 0x41);
     }
 
     #[test]
-    fn split_fails_without_pool_memory_and_the_static_block_keeps_working() {
+    fn set_fails_once_a_split_needs_a_block_the_pool_cannot_give() {
+        let mut table = Breakpoints::new();
+        // Head, then one spare per split; the spare after the second split
+        // cannot be obtained.
+        let mut code = Code(BTreeMap::new(), Some(3));
+        let capacity = 2 * BLOCK_ENTRIES;
+        set_ascending(&mut table, &mut code, capacity);
+        let past = 0x1000 + capacity as u32 * 8;
+        assert_eq!(set(&mut table, &mut code, past), Err(SetError::NoBlock));
+        assert!(!table.contains(past));
+        // A block with room still takes entries.
+        assert_eq!(set(&mut table, &mut code, 0x1004), Ok(()));
+        assert_eq!(chain(&table).len(), 3);
+    }
+
+    #[test]
+    fn set_fails_without_pool_memory_for_the_first_block() {
         let mut table = Breakpoints::new();
         let mut code = Code(BTreeMap::new(), Some(0));
-        set_ascending(&mut table, &mut code, BLOCK_ENTRIES);
-        assert_eq!(
-            table.set(0x1000 + BLOCK_ENTRIES as u32 * 8, &mut code),
-            Err(SetError::NoSpareBlock)
-        );
-        assert!(table.clear(0x1000, &mut code));
-        assert_eq!(table.set(0x1004, &mut code), Ok(()));
-        assert_eq!(chain(&table).len(), 1);
+        assert_eq!(set(&mut table, &mut code, 0x1000), Err(SetError::NoBlock));
+        assert!(!table.contains(0x1000));
+        assert!(chain(&table).is_empty());
     }
 
     #[test]
     fn rearm_targets_the_recorded_position() {
         let mut table = Breakpoints::new();
         let mut code = Code::mapped(&[(0x0ffc, 1), (0x1000, 2), (0x1004, 3)]);
-        assert_eq!(table.set(0x1000, &mut code), Ok(()));
-        assert_eq!(table.set(0x1004, &mut code), Ok(()));
+        assert_eq!(set(&mut table, &mut code, 0x1000), Ok(()));
+        assert_eq!(set(&mut table, &mut code, 0x1004), Ok(()));
         let slot = table.lift(0x1004, &mut code).unwrap();
-        assert_eq!(table.set(0x0ffc, &mut code), Ok(()));
+        assert_eq!(set(&mut table, &mut code, 0x0ffc), Ok(()));
         table.rearm(slot, &mut code);
         assert_eq!(code.0[&0x1000], TRAP_INSTRUCTION);
         assert_eq!(code.0[&0x1004], 3);
+    }
+
+    #[test]
+    fn disarm_at_keeps_the_entry() {
+        let mut table = Breakpoints::new();
+        let mut code = Code::mapped(&[(0x1000, 7)]);
+        assert_eq!(set(&mut table, &mut code, 0x1000), Ok(()));
+        assert!(table.disarm_at(0x1000, &mut code));
+        assert_eq!(code.0[&0x1000], 7);
+        assert!(table.contains(0x1000));
+        assert!(!table.disarm_at(0x1004, &mut code));
     }
 }

@@ -19,6 +19,11 @@ use openxbdm_client::commands::GetFileRange;
 use openxbdm_client::commands::MakeDirectory;
 use openxbdm_client::commands::Rename;
 use openxbdm_server::commands::filesystem;
+use openxbdm_server::commands::hardware::pgo;
+use openxbdm_server::commands::hardware::pgo::IniDirective;
+use openxbdm_server::network::Network;
+use openxbdm_server::network::SendBufferSize;
+use openxbdm_server::network::SocketId;
 use openxbdm_server::notify::ExecutionState;
 use openxbdm_server_host::Host;
 use openxbdm_server_host::backend::filesystem::HARDDISK;
@@ -600,6 +605,46 @@ fn a_stalled_transfer_reader_does_not_block_other_connections() {
 }
 
 #[test]
+fn getfile_sets_the_send_buffer_for_the_transfer() {
+    const LENGTH: usize = 0x100_0000;
+
+    let server = TestServer::start();
+    server
+        .host
+        .lock()
+        .backend
+        .filesystem
+        .write(&devkit("big"), &vec![0x5a; LENGTH]);
+    let mut session = session(&server);
+
+    // A size other than the transfer's, so the test does not depend on the
+    // platform default (Windows reports 0x10000 for a new socket).
+    let original = SendBufferSize(0x2000);
+    let socket = {
+        let mut host = server.host.lock();
+        let sockets: Vec<SocketId> = host.network.sockets().collect();
+        assert_eq!(sockets.len(), 1);
+
+        let socket = sockets[0];
+        host.network.set_send_buffer_size(socket, original).unwrap();
+        socket
+    };
+
+    session.send("getfile name=e:\\big");
+    assert_eq!(session.line(), "203- binary response follows");
+
+    // The reader stalls, so the transfer is still in progress.
+    server.wait_until(|host| {
+        host.network.recorded_send_buffer_size(socket) == Some(SendBufferSize(0x10000))
+    });
+
+    let data = read_bytes(&mut session, 4 + LENGTH);
+    assert_eq!(data[..4], (LENGTH as u32).to_le_bytes());
+
+    server.wait_until(|host| host.network.recorded_send_buffer_size(socket) == Some(original));
+}
+
+#[test]
 fn translation_handles_prefixes_and_dos_links() {
     let server = TestServer::start();
     server
@@ -773,6 +818,27 @@ fn sendvfile_reports_one_result_per_file() {
     assert_eq!(entry.creation_time.0, 0x0102_0304_0506_0708);
     assert_eq!(entry.last_write_time.0, 0x1112_1314_1516_1718);
     assert_eq!(entry.attributes, FileAttributes::READONLY);
+}
+
+#[test]
+fn sendvfile_header_without_name_for_data_ends_the_upload() {
+    let server = TestServer::start();
+    let mut session = session(&server);
+    assert_eq!(
+        session.command("sendvfile count=2"),
+        "204- send binary data"
+    );
+    let mut header = Vec::new();
+    header.extend_from_slice(&0x20u32.to_be_bytes());
+    header.extend_from_slice(&[0; 16]);
+    header.extend_from_slice(&11u64.to_be_bytes());
+    header.extend_from_slice(&0u32.to_be_bytes());
+    session.stream.write_all(&header).unwrap();
+
+    // The pump finds no bytes left to receive and ends the upload; the
+    // connection reads command lines again.
+    assert_eq!(session.line(), "200- OK");
+    assert_eq!(session.command("getvfattr"), "400- missing count");
 }
 
 #[test]
@@ -1006,6 +1072,15 @@ fn dvdperf_reports_valid_trace_records() {
             "timestamp=4 time=9 lba=64 cblk=2"
         ]
     );
+
+    // The console system software writes no records, so a trace on the
+    // console reports nothing.
+    assert_eq!(session.command("dvdperf start"), "200- OK");
+    assert_eq!(
+        session.command("dvdperf stop report"),
+        "202- multiline response follows"
+    );
+    assert!(session.multiline().is_empty());
     assert_eq!(session.command("dvdperf"), "400- ");
 }
 
@@ -1129,6 +1204,124 @@ fn title_drive_mappings_follow_the_monitor_table() {
     );
     let listed = session.multiline();
     assert_eq!(listed[2..], [&["drivename=\"T\""], &table[..]].concat());
+}
+
+/// The object name of `path` through the drive table published for the
+/// monitor exports, translated as an export does off the server thread.
+fn published_translation(server: &TestServer, path: &[u8]) -> Option<String> {
+    let mut host = server.host.lock();
+    let drives = host.backend.console.published.drives.clone();
+
+    drives
+        .translate(&mut host.backend, path)
+        .map(|object| String::from_utf8_lossy(object.as_bytes()).into_owned())
+}
+
+#[test]
+fn drive_table_changes_reach_the_published_table() {
+    let server = TestServer::start();
+    assert_eq!(
+        published_translation(&server, b"FLASH:\\f").as_deref(),
+        Some("\\Badpath\\f")
+    );
+    assert_eq!(
+        published_translation(&server, b"T:\\f").as_deref(),
+        Some("\\??\\T:\\f")
+    );
+
+    map_title_drive(
+        &server,
+        b"T",
+        Some((
+            MEMORY_BASE + 0x8100,
+            b"\\Device\\Harddisk0\\Partition1\\DEVKIT\\sub",
+        )),
+    );
+    assert_eq!(
+        published_translation(&server, b"T:\\f").as_deref(),
+        Some("\\Device\\Harddisk0\\Partition1\\DEVKIT\\sub\\f")
+    );
+    map_title_drive(&server, b"T", None);
+    assert_eq!(
+        published_translation(&server, b"T:\\f").as_deref(),
+        Some("\\??\\T:\\f")
+    );
+
+    let mut session = session(&server);
+    assert_eq!(session.command("setserver name=lab"), "200- OK");
+    assert_eq!(
+        published_translation(&server, b"F:\\f").as_deref(),
+        Some("\\Network\\Smb\\lab\\f")
+    );
+
+    let mut host = Host::default();
+    host.backend.system.settings = Some(b"drivemap internal=1\r\n".to_vec());
+    let server = TestServer::with_host(host);
+    assert_eq!(
+        published_translation(&server, b"FLASH:\\f").as_deref(),
+        Some("\\Device\\Flash\\f")
+    );
+}
+
+/// Settings export 107 applies for `module`, read with the published table.
+fn pogo_settings(server: &TestServer, module: &str) -> Vec<String> {
+    let mut host = server.host.lock();
+    let drives = host.backend.console.published.drives.clone();
+    let mut applied = Vec::new();
+
+    pgo::load_ini(
+        &drives,
+        &mut host.backend,
+        module.as_bytes(),
+        &mut |directive| {
+            applied.push(match directive {
+                IniDirective::OutputPath(path) => {
+                    format!("OutputPath({})", String::from_utf8_lossy(path))
+                }
+                directive => format!("{directive:?}"),
+            })
+        },
+    )
+    .unwrap();
+
+    applied
+}
+
+#[test]
+fn pogo_ini_loads_through_the_published_table() {
+    let server = TestServer::start();
+    {
+        let mut host = server.host.lock();
+        host.backend.filesystem.write(
+            &devkit("game\\pogo.ini"),
+            b"[other]\r\nAllocScale=9\r\n[default.xex]\r\nAllocScale=3\r\nOutputPath=t:\\pgo\r\nDisableDataCollection=1\r\n",
+        );
+        host.backend
+            .filesystem
+            .write(&devkit("pogo.ini"), b"[default.xex]\nAllocScale=7\n");
+    }
+    map_title_drive(
+        &server,
+        b"T",
+        Some((
+            MEMORY_BASE + 0x8100,
+            b"\\Device\\Harddisk0\\Partition1\\DEVKIT\\out",
+        )),
+    );
+
+    assert_eq!(
+        pogo_settings(&server, &devkit("game\\default.xex")),
+        [
+            "AllocScale(3)",
+            "OutputPath(\\Device\\Harddisk0\\Partition1\\DEVKIT\\out\\pgo)",
+            "DisableDataCollection",
+        ]
+    );
+    // Without a file beside the module, `xe:\pogo.ini` is read.
+    assert_eq!(
+        pogo_settings(&server, &devkit("other\\default.xex")),
+        ["AllocScale(7)"]
+    );
 }
 
 #[test]

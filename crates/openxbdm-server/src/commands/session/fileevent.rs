@@ -7,6 +7,7 @@ use core::fmt::Write as _;
 
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::NtStatus;
+use xbox360_sys::xboxkrnl::CreateOptions;
 
 use super::notification::send_posted_notifications;
 use crate::invocation::Invocation;
@@ -123,6 +124,90 @@ pub const fn file_event_kind(operation: u32) -> u32 {
         8 => 6,
         9 => 7,
         _ => 0,
+    }
+}
+
+/// What an operation number of a file service's event record tells the
+/// begin event (stock 0x91f2f5c8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileOperationClass {
+    /// Operations 0 and 1 open a file by path, with create options.
+    Open,
+    /// Operations 3 to 6 transfer data at a byte offset; 5 and 6 are
+    /// scatter/gather transfers.
+    Transfer {
+        scatter_gather: bool,
+    },
+    Other,
+}
+
+impl FileOperationClass {
+    #[inline(always)]
+    pub const fn of(operation: u32) -> Self {
+        match operation {
+            0 | 1 => Self::Open,
+            3 | 4 => Self::Transfer {
+                scatter_gather: false,
+            },
+            5 | 6 => Self::Transfer {
+                scatter_gather: true,
+            },
+            _ => Self::Other,
+        }
+    }
+}
+
+/// Begin flags from the file mode of a transfer or the create options of an
+/// open.
+pub fn file_mode_flags(mode: CreateOptions) -> FileEventFlags {
+    let mut flags = FileEventFlags::empty();
+
+    if mode.contains(CreateOptions::SYNCHRONOUS_IO_NONALERT) {
+        flags |= FileEventFlags::SYNCHRONOUS;
+    }
+
+    if !mode.contains(CreateOptions::NO_INTERMEDIATE_BUFFERING) {
+        flags |= FileEventFlags::BUFFERED;
+    }
+
+    flags
+}
+
+/// Titles whose file service events are reported (stock 0x91f9f62c and
+/// 0x91f9f630).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FileEventTitles {
+    /// Title whose events are suppressed after it terminated.
+    suppressed: Option<u32>,
+}
+
+impl FileEventTitles {
+    /// The dashboard and this system title never report.
+    const DASHBOARD_TITLE: u32 = 0xfffe_07d1;
+    const SYSTEM_TITLE: u32 = 0xfffe_07ff;
+
+    pub const fn new() -> Self {
+        Self { suppressed: None }
+    }
+
+    /// The title-terminate routine suppresses the ending title's events.
+    pub fn suppress(&mut self, title: u32) {
+        self.suppressed = Some(title);
+    }
+
+    /// Whether events of the running title `title` are reported; a
+    /// different title ends the suppression.
+    pub fn reports(&mut self, title: u32) -> bool {
+        if title == Self::DASHBOARD_TITLE
+            || title == Self::SYSTEM_TITLE
+            || self.suppressed == Some(title)
+        {
+            return false;
+        }
+
+        self.suppressed = None;
+
+        true
     }
 }
 

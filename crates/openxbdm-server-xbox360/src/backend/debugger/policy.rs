@@ -8,7 +8,6 @@ use openxbdm_server::commands::console::EventDeferMask;
 use openxbdm_server::commands::debugger::DataBreakpoint;
 use openxbdm_server::commands::debugger::DataKind;
 use openxbdm_server::commands::debugger::DirectPolicy;
-use openxbdm_server::commands::debugger::DirectStep;
 use openxbdm_server::commands::debugger::StopOn;
 
 /// Two copies of the published policy; `POLICY_SEQUENCE` selects the
@@ -17,9 +16,6 @@ use openxbdm_server::commands::debugger::StopOn;
 static POLICY: [[AtomicU32; policy_word::COUNT]; 2] =
     [const { [const { AtomicU32::new(0) }; policy_word::COUNT] }; 2];
 static POLICY_SEQUENCE: AtomicU32 = AtomicU32::new(0);
-
-/// Step over the data breakpoint begun in place, as a [`StepWord`].
-pub(super) static DIRECT_STEP: AtomicU32 = AtomicU32::new(StepWord::Idle as u32);
 
 xbox360_sys::flags! {
     /// Flags word of a published policy copy.
@@ -30,6 +26,8 @@ xbox360_sys::flags! {
         DUMP_IN_PROGRESS = 0x8,
         ATTACHED = 0x10,
         DATA_BREAKPOINT = 0x20,
+        QUIET_STEP_TITLE = 0x40,
+        QUIET_STEP_SYSTEM = 0x80,
     }
 }
 
@@ -46,35 +44,6 @@ mod policy_word {
     pub(super) const COUNT: usize = 7;
 }
 
-/// Encoding of an in-place [`DirectStep`] in [`DIRECT_STEP`].
-#[repr(u32)]
-#[derive(Clone, Copy)]
-pub(super) enum StepWord {
-    /// No step.
-    Idle = 0,
-    /// A step; trace was off before it.
-    Step = 1,
-    /// A step; trace was on before it.
-    TracedStep = 2,
-}
-
-impl StepWord {
-    #[inline(always)]
-    pub(super) fn decode(word: u32) -> Option<DirectStep> {
-        (word != Self::Idle as u32).then_some(DirectStep {
-            saved_trace: word == Self::TracedStep as u32,
-        })
-    }
-
-    #[inline(always)]
-    pub(super) fn encode(step: Option<DirectStep>) -> u32 {
-        const { assert!(StepWord::TracedStep as u32 == StepWord::Step as u32 + 1) };
-        step.map_or(Self::Idle as u32, |step| {
-            Self::Step as u32 + u32::from(step.saved_trace)
-        })
-    }
-}
-
 fn encode_policy(policy: &DirectPolicy) -> [u32; policy_word::COUNT] {
     let bit = |set: bool, bit: PolicyFlags| if set { bit } else { PolicyFlags::empty() };
     let flags = bit(policy.kd_lite, PolicyFlags::KD_LITE)
@@ -85,7 +54,9 @@ fn encode_policy(policy: &DirectPolicy) -> [u32; policy_word::COUNT] {
         | bit(
             policy.data_breakpoint.is_some(),
             PolicyFlags::DATA_BREAKPOINT,
-        );
+        )
+        | bit(policy.quiet_step[0], PolicyFlags::QUIET_STEP_TITLE)
+        | bit(policy.quiet_step[1], PolicyFlags::QUIET_STEP_SYSTEM);
     let data = policy.data_breakpoint;
     let mut words = [0; policy_word::COUNT];
     words[policy_word::FLAGS] = flags.bits();
@@ -125,6 +96,10 @@ fn decode_policy(words: [u32; policy_word::COUNT]) -> DirectPolicy {
                 size: words[policy_word::DATA_SIZE],
                 kind,
             }),
+        quiet_step: [
+            flags.contains(PolicyFlags::QUIET_STEP_TITLE),
+            flags.contains(PolicyFlags::QUIET_STEP_SYSTEM),
+        ],
     }
 }
 

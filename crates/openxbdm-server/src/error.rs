@@ -3,6 +3,7 @@
 use openxbdm_core::status::ErrorCode;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::KernelError;
+use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::Win32Error;
 use openxbdm_core::status::XbdmHresult;
 
@@ -52,6 +53,9 @@ pub enum CommandError {
     /// Another failure result of an external command processor, sent
     /// unchanged.
     Processor(Hresult),
+    /// The thread of a dispatch flag 0x4 command could not be created or
+    /// waited for; the monitor returns the status unchanged.
+    CommandThread(NtStatus),
 }
 
 impl CommandError {
@@ -114,6 +118,7 @@ impl From<CommandError> for Hresult {
             CommandError::Flash(error) => error.into(),
             CommandError::Hardware(error) => error.into(),
             CommandError::Processor(result) => result,
+            CommandError::CommandThread(status) => Hresult(status.0),
         }
     }
 }

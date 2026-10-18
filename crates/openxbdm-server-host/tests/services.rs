@@ -11,12 +11,12 @@ use openxbdm_core::status::Win32Error;
 use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::commands::console::ConfigSetting;
 use openxbdm_server::commands::services::CivProgress;
-use openxbdm_server::commands::services::CivResult;
 use openxbdm_server::commands::services::DetectionRoutine;
 use openxbdm_server::commands::services::DetectionRoutineMissing;
 use openxbdm_server::commands::services::LastError;
 use openxbdm_server::processors::ProcessorFlags;
 use openxbdm_server_host::backend::services::CivCall;
+use openxbdm_server_host::backend::services::SessionState;
 
 use common::RawSession;
 use common::TestServer;
@@ -351,8 +351,26 @@ fn civsetbits_is_absent_on_test_kits() {
     );
 }
 
+/// State and pending injected errors of the simulated XAM service.
+#[derive(Debug, PartialEq, Eq)]
+struct Verification {
+    state: SessionState,
+    pending_hash_errors: u32,
+    pending_read_errors: u32,
+}
+
+fn verification(server: &TestServer) -> Verification {
+    let host = server.host.lock();
+    let verification = &host.backend.services.verification;
+    Verification {
+        state: verification.state,
+        pending_hash_errors: verification.pending_hash_errors,
+        pending_read_errors: verification.pending_read_errors,
+    }
+}
+
 #[test]
-fn civstart_clamps_the_thread_id() {
+fn civstart_clamps_the_thread_id_and_opens_one_session() {
     let server = TestServer::start();
     let mut session = session(&server);
 
@@ -362,26 +380,143 @@ fn civstart_clamps_the_thread_id() {
     );
     assert_eq!(
         session.command("civstart threadid=-1"),
-        "200- XSecurityCreateProcess 0x0"
+        "200- XSecurityCreateProcess 0x5"
     );
-
-    server.host.lock().backend.services.create_result = CivResult::Returned(Hresult(0x8007_0005));
+    assert_eq!(session.command("civstop"), "200- XSecurityCloseProcess");
     assert_eq!(
         session.command("civstart"),
-        "200- XSecurityCreateProcess 0x80070005"
+        "200- XSecurityCreateProcess 0x0"
     );
     assert_eq!(
         session.command("civstart threadid=3"),
-        "200- XSecurityCreateProcess 0x80070005"
+        "200- XSecurityCreateProcess 0x5"
     );
     assert_eq!(
         civ_calls(&server),
         [
             CivCall::CreateProcess { thread_id: 5 },
             CivCall::CreateProcess { thread_id: 5 },
+            CivCall::CloseProcess,
             CivCall::CreateProcess { thread_id: 0 },
             CivCall::CreateProcess { thread_id: 3 },
         ]
+    );
+}
+
+#[test]
+fn civverify_needs_a_ready_session() {
+    let server = TestServer::start();
+    let mut session = session(&server);
+
+    assert_eq!(
+        session.command("civverify milliseconds=500"),
+        "200- XSecurityVerify 0x21"
+    );
+    assert_eq!(
+        session.command("civstart"),
+        "200- XSecurityCreateProcess 0x0"
+    );
+    assert_eq!(
+        session.command("civverify milliseconds=500"),
+        "200- XSecurityVerify 0x0"
+    );
+    assert_eq!(
+        session.command("civstatus"),
+        "200- Blocks Checked 0, Failed Reads 0, Failed Hashes 0, Total Blocks 0, In Progress."
+    );
+    assert_eq!(session.command("civstop"), "200- XSecurityCloseProcess");
+    assert_eq!(
+        session.command("civverify milliseconds=500"),
+        "200- XSecurityVerify 0x21"
+    );
+    assert_eq!(verification(&server).state, SessionState::Idle);
+}
+
+#[test]
+fn civinject_failures_fail_the_next_startup() {
+    let server = TestServer::start();
+    let mut session = session(&server);
+
+    assert_eq!(
+        session.command("civinject readerrors=2 hasherrors=1"),
+        "200- OK"
+    );
+    // Pending counts are only replaced once used up.
+    assert_eq!(
+        session.command("civinject readerrors=7 hasherrors=9"),
+        "200- OK"
+    );
+    assert_eq!(
+        verification(&server),
+        Verification {
+            state: SessionState::Idle,
+            pending_hash_errors: 1,
+            pending_read_errors: 2,
+        }
+    );
+
+    assert_eq!(
+        session.command("civstart"),
+        "200- XSecurityCreateProcess 0x571"
+    );
+    assert_eq!(
+        verification(&server),
+        Verification {
+            state: SessionState::Failed,
+            pending_hash_errors: 0,
+            pending_read_errors: 1,
+        }
+    );
+    assert_eq!(
+        session.command("civstatus"),
+        "200- XSecurityFailedBlocks returned 0x570"
+    );
+    assert_eq!(
+        session.command("civverify milliseconds=1"),
+        "200- XSecurityVerify 0x21"
+    );
+    assert_eq!(
+        session.command("civstart"),
+        "200- XSecurityCreateProcess 0x5"
+    );
+
+    assert_eq!(session.command("civstop"), "200- XSecurityCloseProcess");
+    assert_eq!(
+        session.command("civstatus"),
+        "200- Blocks Checked 0, Failed Reads 0, Failed Hashes 0, Total Blocks 0, In Progress."
+    );
+    assert_eq!(
+        session.command("civstart"),
+        "200- XSecurityCreateProcess 0x571"
+    );
+    assert_eq!(session.command("civstop"), "200- XSecurityCloseProcess");
+    assert_eq!(
+        session.command("civstart"),
+        "200- XSecurityCreateProcess 0x0"
+    );
+    assert_eq!(
+        verification(&server),
+        Verification {
+            state: SessionState::Ready,
+            pending_hash_errors: 0,
+            pending_read_errors: 0,
+        }
+    );
+}
+
+#[test]
+fn civinject_without_counts_opens_a_session() {
+    let server = TestServer::start();
+    let mut session = session(&server);
+
+    assert_eq!(
+        session.command("civinject readerrors=0 hasherrors=0"),
+        "200- OK"
+    );
+    assert_eq!(verification(&server).state, SessionState::Ready);
+    assert_eq!(
+        session.command("civstart"),
+        "200- XSecurityCreateProcess 0x5"
     );
 }
 
@@ -390,44 +525,51 @@ fn civstatus_formats_the_progress_record() {
     let server = TestServer::start();
     let mut session = session(&server);
 
-    server.host.lock().backend.services.progress = Ok(CivProgress {
+    server.host.lock().backend.services.verification.record = CivProgress {
         failed_reads: 2,
         failed_hashes: 3,
         blocks_checked: 10,
         total_blocks: 100,
         completed: false,
-    });
+    };
     assert_eq!(
         session.command("civstatus"),
         "200- Blocks Checked 10, Failed Reads 2, Failed Hashes 3, Total Blocks 100, In Progress."
     );
 
-    server.host.lock().backend.services.progress = Ok(CivProgress {
+    server.host.lock().backend.services.verification.record = CivProgress {
         failed_reads: 0xffff_ffff,
         failed_hashes: 0,
         blocks_checked: 100,
         total_blocks: 100,
         completed: true,
-    });
+    };
     assert_eq!(
         session.command("civstatus"),
         "200- Blocks Checked 100, Failed Reads -1, Failed Hashes 0, Total Blocks 100, Completed."
     );
 
-    server.host.lock().backend.services.progress = Err(CivResult::Returned(Hresult(0x8000_4005)));
+    // A startup clears the checked count, the total and the completion
+    // flag; the failure counters stay.
+    assert_eq!(
+        session.command("civstart"),
+        "200- XSecurityCreateProcess 0x0"
+    );
+    assert_eq!(session.command("civstop"), "200- XSecurityCloseProcess");
     assert_eq!(
         session.command("civstatus"),
-        "200- XSecurityFailedBlocks returned 0x80004005"
+        "200- Blocks Checked 0, Failed Reads -1, Failed Hashes 0, Total Blocks 0, In Progress."
     );
 }
 
 #[test]
-fn civstop_closes_the_process() {
+fn civstop_without_a_session_changes_nothing() {
     let server = TestServer::start();
     let mut session = session(&server);
 
     assert_eq!(session.command("civstop now"), "200- XSecurityCloseProcess");
     assert_eq!(civ_calls(&server), [CivCall::CloseProcess]);
+    assert_eq!(verification(&server).state, SessionState::Idle);
 }
 
 #[test]
@@ -449,7 +591,7 @@ fn own_thread_commands_run_on_title_connections() {
     assert_eq!(session.command("civstop"), "200- XSecurityCloseProcess");
     assert_eq!(
         session.command("civverify milliseconds=1"),
-        "200- XSecurityVerify 0x0"
+        "200- XSecurityVerify 0x21"
     );
     assert_eq!(
         session.command("civstatus"),
@@ -472,27 +614,321 @@ fn civverify_replaces_non_positive_budgets() {
         "civverify milliseconds=-1",
         "civverify milliseconds=-5",
         "civverify",
+        "civverify milliseconds=0x20q",
     ] {
+        assert_eq!(
+            session.command("civstart"),
+            "200- XSecurityCreateProcess 0x0"
+        );
         assert_eq!(
             session.command(command),
             "200- XSecurityVerify 0x0",
             "{command}"
         );
+        assert_eq!(session.command("civstop"), "200- XSecurityCloseProcess");
     }
-
-    server.host.lock().backend.services.verify_result = CivResult::Returned(Hresult(0x103));
-    assert_eq!(
-        session.command("civverify milliseconds=0x20q"),
-        "200- XSecurityVerify 0x103"
-    );
 
     let budgets: Vec<u32> = civ_calls(&server)
         .into_iter()
-        .map(|call| match call {
-            CivCall::Verify { milliseconds } => milliseconds,
-            other => panic!("unexpected {other:?}"),
+        .filter_map(|call| match call {
+            CivCall::Verify { milliseconds } => Some(milliseconds),
+            _ => None,
         })
         .collect();
 
     assert_eq!(budgets, [500, 0x100, 0xffff_ffff, 0x100, 0x100, 0x20]);
+}
+
+fn set_clock(server: &TestServer, milliseconds: u64) {
+    server.host.lock().backend.services.now = milliseconds;
+}
+
+fn progress(checked: u32, reads: u32, hashes: u32, total: u32) -> String {
+    format!(
+        "200- Blocks Checked {checked}, Failed Reads {reads}, Failed Hashes {hashes}, Total Blocks {total}, In Progress."
+    )
+}
+
+/// Blocks of the no-media layout.
+const TOTAL_BLOCKS: u32 = 264_354;
+
+#[test]
+fn civverify_runs_a_pass_until_its_budget_ends() {
+    let server = TestServer::start();
+    let mut session = session(&server);
+    assert_eq!(
+        session.command("civstart"),
+        "200- XSecurityCreateProcess 0x0"
+    );
+
+    // The first block also reads the hash index block: 200 ms.
+    assert_eq!(
+        session.command("civverify milliseconds=250"),
+        "200- XSecurityVerify 0x0"
+    );
+    assert_eq!(
+        session.command("civverify milliseconds=250"),
+        "200- XSecurityVerify 0x21"
+    );
+    set_clock(&server, 150);
+    assert_eq!(session.command("civstatus"), progress(0, 0, 0, 0));
+    set_clock(&server, 200);
+    assert_eq!(
+        session.command("civstatus"),
+        progress(1, 0, 0, TOTAL_BLOCKS)
+    );
+    assert_eq!(
+        session.command("civverify milliseconds=250"),
+        "200- XSecurityVerify 0x21"
+    );
+
+    // The second block ends the pass at 300 ms; the next pass checks
+    // blocks of 100 ms until 300 ms have passed.
+    set_clock(&server, 300);
+    assert_eq!(
+        session.command("civverify milliseconds=250"),
+        "200- XSecurityVerify 0x0"
+    );
+    set_clock(&server, 599);
+    assert_eq!(
+        session.command("civverify milliseconds=250"),
+        "200- XSecurityVerify 0x21"
+    );
+    assert_eq!(
+        session.command("civstatus"),
+        progress(4, 0, 0, TOTAL_BLOCKS)
+    );
+    set_clock(&server, 600);
+    assert_eq!(
+        session.command("civstatus"),
+        progress(5, 0, 0, TOTAL_BLOCKS)
+    );
+    assert_eq!(
+        session.command("civverify milliseconds=250"),
+        "200- XSecurityVerify 0x0"
+    );
+}
+
+#[test]
+fn civverify_consumes_injected_errors_per_check() {
+    let server = TestServer::start();
+    let mut session = session(&server);
+    assert_eq!(
+        session.command("civstart"),
+        "200- XSecurityCreateProcess 0x0"
+    );
+    assert_eq!(
+        session.command("civinject readerrors=1 hasherrors=1"),
+        "200- OK"
+    );
+
+    // The index read fails and ends the block.
+    assert_eq!(
+        session.command("civverify milliseconds=1"),
+        "200- XSecurityVerify 0x0"
+    );
+    set_clock(&server, 100);
+    assert_eq!(
+        session.command("civstatus"),
+        progress(1, 1, 0, TOTAL_BLOCKS)
+    );
+
+    // The index read succeeds and its hash check fails.
+    assert_eq!(
+        session.command("civverify milliseconds=1"),
+        "200- XSecurityVerify 0x0"
+    );
+    set_clock(&server, 200);
+    assert_eq!(
+        session.command("civstatus"),
+        progress(2, 1, 1, TOTAL_BLOCKS)
+    );
+
+    assert_eq!(
+        session.command("civverify milliseconds=1"),
+        "200- XSecurityVerify 0x0"
+    );
+    set_clock(&server, 399);
+    assert_eq!(
+        session.command("civverify milliseconds=1"),
+        "200- XSecurityVerify 0x21"
+    );
+    set_clock(&server, 400);
+    assert_eq!(
+        session.command("civstatus"),
+        progress(3, 1, 1, TOTAL_BLOCKS)
+    );
+
+    // The next session's verifier starts from the failure counts.
+    assert_eq!(session.command("civstop"), "200- XSecurityCloseProcess");
+    assert_eq!(
+        session.command("civstart"),
+        "200- XSecurityCreateProcess 0x0"
+    );
+    assert_eq!(
+        session.command("civverify milliseconds=1"),
+        "200- XSecurityVerify 0x0"
+    );
+    set_clock(&server, 600);
+    assert_eq!(
+        session.command("civstatus"),
+        progress(1, 1, 1, TOTAL_BLOCKS)
+    );
+}
+
+#[test]
+fn civstop_ends_an_unlimited_pass_after_its_block() {
+    let server = TestServer::start();
+    let mut session = session(&server);
+    assert_eq!(
+        session.command("civstart"),
+        "200- XSecurityCreateProcess 0x0"
+    );
+
+    // Each block of an unlimited pass is followed by a 200 ms wait.
+    assert_eq!(
+        session.command("civverify milliseconds=-1"),
+        "200- XSecurityVerify 0x0"
+    );
+    set_clock(&server, 1000);
+    assert_eq!(
+        session.command("civstatus"),
+        progress(3, 0, 0, TOTAL_BLOCKS)
+    );
+    assert_eq!(
+        session.command("civverify milliseconds=100"),
+        "200- XSecurityVerify 0x21"
+    );
+
+    assert_eq!(session.command("civstop"), "200- XSecurityCloseProcess");
+    assert_eq!(
+        session.command("civstatus"),
+        progress(0, 0, 0, TOTAL_BLOCKS)
+    );
+    assert_eq!(verification(&server).state, SessionState::Idle);
+}
+
+#[test]
+fn detected_hash_failure_makes_passes_unlimited() {
+    let server = TestServer::start();
+    let mut session = session(&server);
+    assert_eq!(
+        session.command("civsetbits on=12"),
+        "200- Result 0x0; old mask 0x0, new mask 0x1000"
+    );
+    assert_eq!(
+        session.command("civstart"),
+        "200- XSecurityCreateProcess 0x0"
+    );
+
+    // The budget is ignored; the worker waits 200 ms once more than 300 ms
+    // have passed since the last wait: blocks end at 200, 300, 400 (wait
+    // to 600), 700, 800 (wait to 1000).
+    assert_eq!(
+        session.command("civverify milliseconds=100"),
+        "200- XSecurityVerify 0x0"
+    );
+    set_clock(&server, 1000);
+    assert_eq!(
+        session.command("civstatus"),
+        progress(5, 0, 0, TOTAL_BLOCKS)
+    );
+    assert_eq!(
+        session.command("civverify milliseconds=100"),
+        "200- XSecurityVerify 0x21"
+    );
+}
+
+/// The devkit sequence with an empty tray: the checked count accumulates
+/// over the passes of a session. Observed: 4 after the first pass, 23
+/// three seconds into the unlimited pass (4 + 5 + 5 + 9).
+#[test]
+fn checked_blocks_accumulate_over_the_passes_of_a_session() {
+    let server = TestServer::start();
+    let mut session = session(&server);
+    assert_eq!(
+        session.command("civstart"),
+        "200- XSecurityCreateProcess 0x0"
+    );
+
+    // First block 200 ms (with the hash index block), then 100 ms each.
+    assert_eq!(
+        session.command("civverify milliseconds=500"),
+        "200- XSecurityVerify 0x0"
+    );
+    set_clock(&server, 1000);
+    assert_eq!(
+        session.command("civstatus"),
+        progress(4, 0, 0, TOTAL_BLOCKS)
+    );
+
+    assert_eq!(
+        session.command("civverify milliseconds=500"),
+        "200- XSecurityVerify 0x0"
+    );
+    assert_eq!(
+        session.command("civverify milliseconds=500"),
+        "200- XSecurityVerify 0x21"
+    );
+    set_clock(&server, 2000);
+    assert_eq!(
+        session.command("civverify milliseconds=500"),
+        "200- XSecurityVerify 0x0"
+    );
+    set_clock(&server, 3000);
+    assert_eq!(
+        session.command("civstatus"),
+        progress(14, 0, 0, TOTAL_BLOCKS)
+    );
+
+    // Unlimited: a 100 ms block, then a 200 ms wait; the ninth block ends
+    // 2500 ms after the start, the tenth 2800 ms.
+    assert_eq!(
+        session.command("civverify milliseconds=-1"),
+        "200- XSecurityVerify 0x0"
+    );
+    set_clock(&server, 5799);
+    assert_eq!(
+        session.command("civstatus"),
+        progress(23, 0, 0, TOTAL_BLOCKS)
+    );
+    set_clock(&server, 5800);
+    assert_eq!(
+        session.command("civstatus"),
+        progress(24, 0, 0, TOTAL_BLOCKS)
+    );
+
+    assert_eq!(session.command("civstop"), "200- XSecurityCloseProcess");
+    assert_eq!(
+        session.command("civstatus"),
+        progress(0, 0, 0, TOTAL_BLOCKS)
+    );
+}
+
+/// The devkit sequence of the gaps run: a successful startup clears the
+/// total a pass left; failed startups do not, and count no failures.
+#[test]
+fn successful_startup_clears_the_total() {
+    let server = TestServer::start();
+    let mut session = session(&server);
+
+    for (command, reply) in [
+        ("civstart", "200- XSecurityCreateProcess 0x0"),
+        ("civstart", "200- XSecurityCreateProcess 0x5"),
+        ("civverify milliseconds=100", "200- XSecurityVerify 0x0"),
+        ("civstop", "200- XSecurityCloseProcess"),
+        ("civverify milliseconds=100", "200- XSecurityVerify 0x21"),
+        ("civinject readerrors=2 hasherrors=1", "200- OK"),
+        ("civstart", "200- XSecurityCreateProcess 0x571"),
+        ("civstatus", "200- XSecurityFailedBlocks returned 0x570"),
+        ("civstop", "200- XSecurityCloseProcess"),
+        ("civstatus", &progress(0, 0, 0, TOTAL_BLOCKS)),
+        ("civstart", "200- XSecurityCreateProcess 0x571"),
+        ("civstop", "200- XSecurityCloseProcess"),
+        ("civstart", "200- XSecurityCreateProcess 0x0"),
+        ("civstop", "200- XSecurityCloseProcess"),
+        ("civstatus", &progress(0, 0, 0, 0)),
+    ] {
+        assert_eq!(session.command(command), reply, "{command}");
+    }
 }

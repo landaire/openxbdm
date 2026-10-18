@@ -32,6 +32,10 @@ pub struct Endpoint {
     pub port: u16,
 }
 
+/// A socket send buffer size in bytes (SO_SNDBUF).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SendBufferSize(pub u32);
+
 pub trait Network {
     /// Receive into `buffer`. `Ok(0)` means the peer closed the connection.
     fn receive(&mut self, socket: SocketId, buffer: &mut [u8]) -> Result<usize, NetError>;
@@ -41,12 +45,20 @@ pub trait Network {
     fn peer(&mut self, socket: SocketId) -> Result<Endpoint, NetError>;
     /// Open a TCP connection from a local port in `0x1000..0x5000`.
     fn connect(&mut self, endpoint: Endpoint, blocking: bool) -> Result<SocketId, NetError>;
-    /// Wait until `socket` can accept data, up to `timeout_ms`.
+    /// Wait until `socket` can accept data, up to `timeout_ms`;
+    /// `WouldBlock` when the time runs out.
     fn wait_writable(&mut self, socket: SocketId, timeout_ms: u32) -> Result<(), NetError>;
     /// Switch a socket between blocking and non-blocking mode.
     fn set_blocking(&mut self, socket: SocketId, blocking: bool) -> Result<(), NetError>;
     /// Bytes of input waiting to be received (FIONREAD).
     fn pending_input(&mut self, socket: SocketId) -> Result<usize, NetError>;
+    /// The socket send buffer size (SO_SNDBUF).
+    fn send_buffer_size(&mut self, socket: SocketId) -> Result<SendBufferSize, NetError>;
+    fn set_send_buffer_size(
+        &mut self,
+        socket: SocketId,
+        size: SendBufferSize,
+    ) -> Result<(), NetError>;
 }
 
 /// Send all of `data`, looping on partial sends.

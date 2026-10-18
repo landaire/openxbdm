@@ -35,10 +35,10 @@ the hardware, file system, performance, services and system domains:
 | dumpmode | matches, including the test-kit override | `test_kit` | none |
 | dumpsettings | matches | none | none |
 | eventdefer | matches | none | none |
-| feature | matches | call log; absent export | `XexGetProcedureAddress(xam, 515)` and call |
+| feature | matches | XAM 515: XConfig 11/2 mask, DbgPrint texts; absent export | `XexGetProcedureAddress(xam, 515)` and call |
 | getconsoleid | matches | id or failure | `XeKeysGetConsoleID(NULL, buf)` |
 | getnetaddrs | matches | both address records and statuses | `NetDll_XNetGet{Debug,Title}XnAddr(3)` |
-| httpreg | command, settings line and registration task match | asynchronous HTTP/1.1 client over TCP | XAM `XHttp*` (0xc9-0xd8) driven by the server loop |
+| httpreg | command, settings line and registration task match | asynchronous HTTP/1.1 client over TCP; request lines as XAM writes them | XAM `XHttp*` (0xc9-0xd8) driven by the server loop |
 | kiosk | matches | XConfig 3/0xd and 0xb/3 | export 700 or fallback, `ExSetXConfigSetting` |
 | livesigninrequired | matches | XConfig 3/0xd | export 700 or fallback |
 | resetnetra | matches | reset counter | `XMsgStartIORequest` with {2, 0, 0} |
@@ -147,12 +147,67 @@ since XAM calls it with the console ABI.
 - Control code 0x33 / export 17 with a zero size: stock underflows the
   size and copies the whole name past the buffer; openxbdm writes nothing
   and returns `0x82da0105` (`0x02da0000` for an empty name).
-- XAM ordinal 515 (`feature`) semantics are unknown (no xam.xex image).
-- XHttp request headers beyond `User-Agent` and `Host` are unknown (no
-  xam.xex image); the host simulation sends only those.
+- `httpreg` redirect to an `https://` location: XAM continues it over a
+  TLS connection unless its redirect checks refuse it (0x818d6990 to
+  0x818d6c00, error 12156); the host has no TLS client and fails the
+  request in state 3 without an error code.
 
 ## RE findings
 
+- `Excluding unknown features in mask: 0x%016XI64` (0x81747d40): the
+  kernel formatter (K16547 0x8014de48) reads an integer without the `I64`
+  prefix from the low word of its 8-byte argument slot (`lwz 4(slot)`,
+  0x8014e594, zero-extended at 0x8014e5b8), and `I64` after the
+  conversion is literal text. The unknown bits are always above bit 31
+  (the low word only holds bits 0..6), so the line reads
+  `0x0000000000000000I64`.
+- XHttp response handling seen by the registration task (xam.xex): after
+  the headers arrive, 0x818dc49c classifies the status. 100 is interim.
+  300..303, 305 and 307 are redirects while the request's allowance
+  (+0xf8, XHttp option 0x59 at 0x818c9760: 3 for the task)
+  is nonzero; each redirect decrements it (0x818dcb68), reads the
+  `Location` header (query 22; absent: request error 12150 at
+  0x818dcbcc) and calls 0x818d6530. Other statuses, and redirects with
+  no allowance left, reach the task as HEADERS_AVAILABLE (0x818dcf98).
+  0x818d6530: `http://host[:port]` (parser 0x818d2d80: port 1..65535,
+  no `?=#%` or spaces in the host; failure: request error 31) or a
+  relative location (sets connection flag 0x20000000, 0x818d6d58; a path
+  without a leading `/` is taken from the root). With that flag, the same
+  port and the same path, the redirect is a loop (8259, 0x818d7174) and
+  the status reaches the task. Otherwise XAM rewrites the request line,
+  notifies REDIRECT (0x4000, 0x818d7698; the task ignores it),
+  reconnects (0x818e44f0) and, once connected, notifies
+  SEND_REQUEST_COMPLETE again (0x818ddc10). The task then calls
+  XHttpReceiveResponse again, which XAM accepts (0x818db8c8: the request
+  is sent and its response not yet received). The task sees only the
+  final status and body; failures after the first headers are reported
+  in its receiving state 3.
+- XAM ordinal 515 and the feature table: `commands/group3.md#feature`. The
+  host simulation is `crates/openxbdm-server-host/src/backend/console/feature.rs`;
+  the running mask defaults to 0x7f (no stored setting) and the loader
+  flags to 0x9e, read from `XboxHardwareInfo` (0x801c0030) in the
+  reference console's kernel image.
+- XHttp request text (xam.xex): the request line and `User-Agent` are
+  written when the request is opened (0x818d4dd0): `<verb> <path>
+  <version>` (NULL version: `HTTP/1.1`; `HTTP/1.0` sets request flags
+  0x18000000), with `http://%s:%u` before the path when connection flag
+  0x00010000 (the session's proxy applies to the server, 0x818e3e38) is
+  set and 0x00400000 is clear, then `\r\nUser-Agent: <agent>\r\n`,
+  then `Referer: <referrer>\r\n` when given; accept types are ignored.
+  Sending (0x818daa30) adds `Connection: Keep-alive\r\n` unless request
+  flag 0x10000000 (disable feature 8, keep-alive: 0x818d6288) is set, then
+  `Connection: Close\r\n` unless 0x08000000 is also set; `Host:%s\r\n`
+  (default port: 80, or 443 for a secure connection, connection flag
+  0x00400000 from connect flag 0x00800000) or `Host:%s:%u\r\n`, unless
+  request flag 0x04000000 (disable feature 0x10); `If-Modified-Since` only
+  for the cache flags of the open flags; the caller's headers; then
+  `Content-Length: %u\r\n\r\n` for a body, or for a POST with request
+  flag 0x08000000 and connection flag 0x80000000 clear (0x818d4770), else
+  `\r\n`. Without a proxy the registration request is therefore
+  `GET <path> HTTP/1.1`, `User-Agent: Xbox Debugger/2.0.21256.0`,
+  `Connection: Close`, `Host:<server>` (`Host:<server>:<port>` for a port
+  other than 80; port 0 means 80), and an empty line. The host simulation
+  connects directly and sends this form.
 - I2C settings block (SMC command 0x11, device 0xd4): read 0x91f4e378 and
   write 0x91f4e4e0, 8-byte chunks, two attempts, 2 ms / 3 ms pauses on
   write. Layout: +0 version 2, +1 size 0x20, +0xa debug name length, +0xb

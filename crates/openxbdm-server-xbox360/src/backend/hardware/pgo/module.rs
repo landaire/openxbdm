@@ -5,7 +5,6 @@ use core::ffi::c_char;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
-use openxbdm_server::Server;
 use openxbdm_server::commands::hardware::PgoError;
 use openxbdm_server::commands::hardware::PgoModule;
 use openxbdm_server::commands::hardware::pgo;
@@ -77,13 +76,12 @@ use super::stop_counting;
 use super::sweep::block_time;
 use super::sweep::close_handle;
 use super::sweep::reset_counts;
-use crate::backend::Console;
 use crate::backend::debugger;
-use crate::backend::dispatcher;
+use crate::backend::filesystem;
+use crate::backend::filesystem::CallerPaths;
 use crate::exports::export_result;
 use crate::kernel::address_of;
 use crate::kernel::object_at;
-use crate::net::XamNetwork;
 
 /// The full name of the module containing an address (GetModuleFileName,
 /// 0x91f71128 and 0x91f71150).
@@ -139,14 +137,6 @@ impl ModuleFileName {
     fn fits(&self) -> bool {
         self.length < PATH_UNITS
     }
-}
-
-/// A `pogo.ini` request for the server thread.
-struct IniRequest<'a> {
-    path: &'a [u8],
-    record: Option<&'a ModuleRecord>,
-    /// Unchanged when the server cannot take the request.
-    result: Result<(), BadModulePath>,
 }
 
 /// What the image stores in a probe slot: it loads 8 bytes at the export's
@@ -354,58 +344,17 @@ fn create_block(record: &ModuleRecord) {
 }
 
 /// Apply `pogo.ini` to a record, then raise `pogomodstartup` when
-/// `stopon pogomodstart` is set. The drive table belongs to the server, so
-/// the file is read on its thread; when the server cannot take the
-/// request the file is not read.
+/// `stopon pogomodstart` is set. The file is read on the caller's thread
+/// with the published drive table.
 fn load_ini(path: &CStr, record: Option<&ModuleRecord>) -> Result<(), BadModulePath> {
-    /// Longest module path the request takes, in bytes.
-    const PATH_LIMIT: usize = 0x140;
-
-    let bytes = path.to_bytes();
-    if bytes.len() >= PATH_LIMIT {
-        return Err(BadModulePath);
-    }
-
-    let mut request = IniRequest {
-        path: bytes,
-        record,
-        result: Ok(()),
-    };
-    dispatcher::call_on_server_with(&mut request, service_load_ini);
-    request.result?;
-
-    debugger::report_pogo_module_start(
-        path.as_ptr().addr() as u32,
-        record.map_or(0, ModuleRecord::address),
-    );
-
-    Ok(())
-}
-
-/// Export 107 (stock 0x91f3e038).
-pub(super) extern "C" fn export_load_ini(path: *const c_char, record: u32) -> u32 {
-    // SAFETY: the caller passes a NUL-terminated module path and 0 or a
-    // record of export 112, as export 106 returns it.
-    let (path, record) = unsafe { (CStr::from_ptr(path), ModuleRecord::from_address(record)) };
-
-    export_result(load_ini(path, record)).0
-}
-
-fn service_load_ini(
-    server: &mut Server,
-    console: &mut Console,
-    _network: &mut XamNetwork,
-    request: &mut IniRequest<'_>,
-) -> u32 {
-    let record = request.record;
     let module = PgoModule::Record(record.map_or(0, ModuleRecord::address));
 
     // The results of the settings are not reported.
-    let result = pgo::load_ini(
-        &server.state,
-        console,
-        request.path,
-        &mut |_, _, directive| match directive {
+    pgo::load_ini(
+        &filesystem::published_drives(),
+        &mut CallerPaths::new(),
+        path.to_bytes(),
+        &mut |directive| match directive {
             IniDirective::AllocScale(scale) => {
                 let _ = set_allocation_scale(module, scale);
             }
@@ -426,10 +375,23 @@ fn service_load_ini(
                 let _ = set_option(module, option, value);
             }
         },
-    );
-    request.result = result;
+    )?;
 
-    0
+    debugger::report_pogo_module_start(
+        path.as_ptr().addr() as u32,
+        record.map_or(0, ModuleRecord::address),
+    );
+
+    Ok(())
+}
+
+/// Export 107 (stock 0x91f3e038).
+pub(super) extern "C" fn export_load_ini(path: *const c_char, record: u32) -> u32 {
+    // SAFETY: the caller passes a NUL-terminated module path and 0 or a
+    // record of export 112, as export 106 returns it.
+    let (path, record) = unsafe { (CStr::from_ptr(path), ModuleRecord::from_address(record)) };
+
+    export_result(load_ini(path, record)).0
 }
 
 /// Set up a new record (0x91f70250).

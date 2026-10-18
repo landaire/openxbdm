@@ -184,11 +184,10 @@ fn on_server(service: ExportService, first: u32, second: u32, third: u32) -> Hre
 /// Stock export 8 (0x91f25c60): `(thread, exception) -> HRESULT`.
 extern "C" fn continue_thread(thread: u32, exception: u32) -> Hresult {
     on_server(
-        |server, console, network, request| {
+        |server, console, _network, request| {
             command_result(debugger::continue_stopped_thread(
                 &mut server.state,
                 console,
-                network,
                 ThreadId(request.first),
                 request.second != 0,
             ))
@@ -312,20 +311,16 @@ extern "C" fn is_thread_stopped(thread: u32, record: u32) -> Hresult {
 }
 export!(22, is_thread_stopped);
 
-/// Stock export 34 (0x91f27258): `(address) -> HRESULT`.
+/// Stock export 34 (0x91f27258): `(address) -> HRESULT`, on the calling
+/// thread under the table lock.
 extern "C" fn remove_breakpoint(address: u32) -> Hresult {
-    on_server(
-        |server, console, _, request| {
-            command_result(debugger::clear_software_breakpoint(
-                &mut server.state,
-                console,
-                request.first,
-            ))
-        },
-        address,
-        0,
-        0,
-    )
+    let removed = if super::table::clear_breakpoint(address) {
+        Ok(())
+    } else {
+        Err(debugger::NoSuchBreakpoint)
+    };
+
+    command_result(removed)
 }
 export!(34, remove_breakpoint);
 
@@ -335,20 +330,10 @@ extern "C" fn resume_thread(thread: u32) -> Hresult {
 }
 export!(35, resume_thread);
 
-/// Stock export 37 (0x91f27140): `(address) -> HRESULT`.
+/// Stock export 37 (0x91f27140): `(address) -> HRESULT`, on the calling
+/// thread; the spare block is allocated before the table lock is taken.
 extern "C" fn set_breakpoint(address: u32) -> Hresult {
-    on_server(
-        |server, console, _, request| {
-            command_result(debugger::set_software_breakpoint(
-                &mut server.state,
-                console,
-                request.first,
-            ))
-        },
-        address,
-        0,
-        0,
-    )
+    command_result(super::table::set_breakpoint(address))
 }
 export!(37, set_breakpoint);
 
@@ -496,8 +481,8 @@ export!(49, thread_debug_data);
 extern "C" fn breakpoint_kind(address: u32, kind: u32) -> Hresult {
     let mut query = Request::new(address, 0, 0);
     let result = run(
-        |server, _, _, request| {
-            request.words[0] = debugger::breakpoint_kind(&server.state, request.first);
+        |server, console, _, request| {
+            request.words[0] = debugger::breakpoint_kind(&server.state, console, request.first);
             request.count = 1;
             Hresult::OK
         },
@@ -600,11 +585,11 @@ unsafe fn back_trace(
     }
 }
 
-/// Stock export 83 (0x91f26888): `(full)`; dump the calling thread, a full
-/// dump when `full` is nonzero.
-extern "C" fn write_dump(full: u32) -> u32 {
-    super::dump_calling_thread(if full != 0 {
-        DumpKind::Full
+/// Stock export 83 (0x91f26888): `(resume)`; dump the calling thread, and
+/// return afterwards instead of restarting when `resume` is nonzero.
+extern "C" fn write_dump(resume: u32) -> u32 {
+    super::dump_calling_thread(if resume != 0 {
+        DumpKind::Return
     } else {
         DumpKind::Default
     });

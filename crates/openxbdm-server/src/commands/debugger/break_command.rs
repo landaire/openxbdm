@@ -7,19 +7,14 @@ use super::DataKind;
 use super::NoSuchBreakpoint;
 use super::NotPending;
 use super::SetError;
-use super::ThreadId;
-use super::events;
+use super::has_breakpoint;
 use crate::backend::Backend as AnyBackend;
 use crate::commands::util;
 use crate::invocation::Invocation;
-use crate::network::Network;
-use crate::network::SocketId;
 use crate::notify::ExecutionState;
 use crate::reply::CommandResult;
 use crate::reply::Reply;
-use crate::server::send_status;
 use crate::state::ServerState;
-use crate::text::LineText;
 
 /// What a data breakpoint request does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,71 +37,17 @@ impl DataTarget {
     }
 }
 
-/// A command reply sent when `thread` stops waiting at its event.
-#[derive(Debug)]
-pub(super) struct HeldReply {
-    thread: ThreadId,
-    socket: SocketId,
-    result: CommandResult,
-    text: LineText,
-}
-
 /// `break`: `now`, `start`, `clearall`, `addr=` with optional `clear`, or a
 /// data breakpoint `read=|write=|readwrite=|execute=` with `size=`. `now`
-/// stops the command thread at a trap; the reply follows once a debugger
-/// continues it.
+/// executes a trap on the command thread and replies `200- OK` without
+/// looking at the other keys (stock 0x91f48a64..0x91f48a74).
 pub(super) fn set_breakpoint(invocation: &mut Invocation<'_>) -> CommandResult {
-    /// Keys of `break` that request more than `now`.
-    static BREAK_FLAGS: [&str; 7] = [
-        "start",
-        "clearall",
-        "addr",
-        "read",
-        "write",
-        "readwrite",
-        "execute",
-    ];
+    if invocation.line.has("now") {
+        invocation.backend.break_now();
+        return Ok(Reply::Ok);
+    }
 
-    let line = invocation.line;
-    let now = line.has("now");
-    let stopped = if now { break_now(invocation) } else { None };
-    let result = if now && !BREAK_FLAGS.iter().any(|key| line.has(key)) {
-        Ok(Reply::Ok)
-    } else {
-        breakpoint_flags(invocation)
-    };
-
-    let (Some(thread), Some(session)) = (stopped, invocation.session.as_ref()) else {
-        return result;
-    };
-
-    let mut text = LineText::new();
-    text.set_bytes(invocation.text.as_bytes());
-    let socket = session.socket();
-    invocation.state.debugger.held_reply = Some(HeldReply {
-        thread,
-        socket,
-        result,
-        text,
-    });
-    send_held_reply(invocation.state, invocation.backend, invocation.network);
-
-    Ok(Reply::Sent)
-}
-
-/// Trap on the command thread and process the trap as a debug event.
-/// Returns the thread when it waits at the trap.
-fn break_now(invocation: &mut Invocation<'_>) -> Option<ThreadId> {
-    let event = invocation.backend.break_now()?;
-    let thread = event.thread();
-    events::handle(
-        invocation.state,
-        invocation.backend,
-        invocation.network,
-        event,
-    );
-
-    Some(thread)
+    breakpoint_flags(invocation)
 }
 
 fn breakpoint_flags(invocation: &mut Invocation<'_>) -> CommandResult {
@@ -121,9 +62,10 @@ fn breakpoint_flags(invocation: &mut Invocation<'_>) -> CommandResult {
     }
 
     if line.has("clearall") {
-        let debugger = &mut invocation.state.debugger;
-        debugger.breakpoints.clear_all(invocation.backend);
-        debugger.data_breakpoint = None;
+        invocation
+            .backend
+            .lock_breakpoints(&mut |shared, code| shared.table.clear_all(code));
+        invocation.state.debugger.data_breakpoint = None;
         invocation.backend.set_data_breakpoint_register(0);
         return Ok(Reply::Ok);
     }
@@ -131,9 +73,9 @@ fn breakpoint_flags(invocation: &mut Invocation<'_>) -> CommandResult {
     let clear = line.has("clear");
     if let Some(address) = util::required_dword(invocation, "addr") {
         if clear {
-            clear_software_breakpoint(invocation.state, invocation.backend, address)?;
+            clear_software_breakpoint(invocation.backend, address)?;
         } else {
-            set_software_breakpoint(invocation.state, invocation.backend, address)?;
+            set_software_breakpoint(invocation.backend, address)?;
         }
 
         return Ok(Reply::Ok);
@@ -191,21 +133,18 @@ pub fn break_at_title_start(
 
 /// Set a software breakpoint at an aligned address (stock export 37,
 /// 0x91f27140).
-pub fn set_software_breakpoint(
-    state: &mut ServerState,
-    backend: &mut dyn AnyBackend,
-    address: u32,
-) -> Result<(), SetError> {
-    state.debugger.breakpoints.set(address, backend)
+pub fn set_software_breakpoint(backend: &mut dyn AnyBackend, address: u32) -> Result<(), SetError> {
+    backend.set_breakpoint(address)
 }
 
 /// Remove a software breakpoint (stock export 34, 0x91f27258).
 pub fn clear_software_breakpoint(
-    state: &mut ServerState,
     backend: &mut dyn AnyBackend,
     address: u32,
 ) -> Result<(), NoSuchBreakpoint> {
-    if !state.debugger.breakpoints.clear(address, backend) {
+    let mut cleared = false;
+    backend.lock_breakpoints(&mut |shared, code| cleared = shared.table.clear(address, code));
+    if !cleared {
         return Err(NoSuchBreakpoint);
     }
 
@@ -273,13 +212,12 @@ pub fn set_data_breakpoint(
 /// Breakpoint kind at `address` (stock export 56, 0x91f257f8): 4 for a
 /// software breakpoint, else the data breakpoint kind when the address is
 /// its exact address, else 0.
-pub fn breakpoint_kind(state: &ServerState, address: u32) -> u32 {
-    let debugger = &state.debugger;
-    if debugger.breakpoints.contains(address) {
+pub fn breakpoint_kind(state: &ServerState, backend: &mut dyn AnyBackend, address: u32) -> u32 {
+    if has_breakpoint(backend, address) {
         return 4;
     }
 
-    match debugger.data_breakpoint {
+    match state.debugger.data_breakpoint {
         Some(data) if data.address == address => data.kind as u32,
         _ => 0,
     }
@@ -291,47 +229,8 @@ pub(super) fn is_breakpoint(invocation: &mut Invocation<'_>) -> CommandResult {
         return Err(util::MISSING);
     };
 
-    let kind = breakpoint_kind(invocation.state, address);
+    let kind = breakpoint_kind(invocation.state, invocation.backend, address);
     invocation.set_text(format_args!("type={kind}"));
 
     Ok(Reply::Ok)
-}
-
-/// Send the held `break now` reply once its thread no longer waits at the
-/// trap.
-pub(super) fn send_held_reply(
-    state: &mut ServerState,
-    backend: &mut dyn AnyBackend,
-    network: &mut dyn Network,
-) {
-    let Some(held) = state.debugger.held_reply.as_ref() else {
-        return;
-    };
-
-    if events::is_waiting(state, held.thread) {
-        return;
-    }
-
-    if let Some(held) = state.debugger.held_reply.take() {
-        let _ = send_status(
-            state,
-            backend,
-            network,
-            held.socket,
-            held.result,
-            held.text.as_bytes(),
-        );
-    }
-}
-
-/// A connection closed: a reply held for it is dropped.
-pub(crate) fn connection_closed(state: &mut ServerState, socket: SocketId) {
-    if state
-        .debugger
-        .held_reply
-        .as_ref()
-        .is_some_and(|held| held.socket == socket)
-    {
-        state.debugger.held_reply = None;
-    }
 }

@@ -7,6 +7,7 @@
 mod error;
 
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::NtStatus;
 
 use crate::invocation::ConnectionIndex;
 use crate::text::LineText;
@@ -225,4 +226,14 @@ pub trait ProcessorBackend {
     /// Most bytes one call of the continuation receives during a 204
     /// upload (its data buffer size).
     fn processor_receive_limit(&mut self, continuation: &ExternalContinuation) -> usize;
+
+    /// Run the handler of a command with dispatch flag 0x4 (stock
+    /// 0x91f421c8) on a new thread of the title process and wait for it
+    /// without limit; the server thread does nothing meanwhile. `Err` is the
+    /// failure status of the thread creation, when `run` has not run, or of
+    /// the wait.
+    fn run_command_thread(
+        &mut self,
+        run: &mut dyn FnMut(&mut dyn crate::Backend),
+    ) -> Result<(), NtStatus>;
 }

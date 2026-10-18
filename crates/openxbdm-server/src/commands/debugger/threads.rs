@@ -21,7 +21,6 @@ use crate::commands::services::ThreadHandle;
 use crate::commands::util;
 use crate::continuation::ContinuationContext;
 use crate::invocation::Invocation;
-use crate::network::Network;
 use crate::notify::ExecutionState;
 use crate::reply::CommandError;
 use crate::reply::CommandResult;
@@ -62,11 +61,10 @@ pub(super) fn required_thread(invocation: &mut Invocation<'_>) -> Option<ThreadI
 pub fn continue_stopped_thread(
     state: &mut ServerState,
     backend: &mut dyn AnyBackend,
-    network: &mut dyn Network,
     thread: ThreadId,
     pass_exception: bool,
 ) -> Result<(), StoppedThreadError> {
-    events::continue_thread(state, backend, network, thread, pass_exception)
+    events::continue_thread(state, backend, thread, pass_exception)
 }
 
 /// `continue thread= [exception]`.
@@ -76,13 +74,7 @@ pub(super) fn continue_thread(invocation: &mut Invocation<'_>) -> CommandResult 
     };
 
     let pass_exception = invocation.line.has("exception");
-    continue_stopped_thread(
-        invocation.state,
-        invocation.backend,
-        invocation.network,
-        thread,
-        pass_exception,
-    )?;
+    continue_stopped_thread(invocation.state, invocation.backend, thread, pass_exception)?;
 
     Ok(Reply::Ok)
 }

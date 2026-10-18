@@ -1,15 +1,14 @@
-//! Notification texts queued by threads other than the server thread.
+//! Notification texts queued for the server thread.
 
-/// Longest notification text a posted slot holds; a poster sends longer
-/// texts through the server thread itself.
+/// Longest notification text a posted slot holds.
 pub const POSTED_TEXT_CAPACITY: usize = 0x200;
-/// Posted texts that can wait for the server thread.
+/// Posted texts that can wait for the server thread in slots.
 pub const POSTED_TEXT_SLOTS: usize = 16;
 
-/// Notification texts posted by threads other than the server thread,
-/// oldest first. The monitor sends such texts in the posting thread; here
-/// the server thread sends them on its next pass. Platforms keep the
-/// queue under their own lock.
+/// Notification texts posted for the server thread, oldest first. The
+/// monitor sends such texts in the posting thread; here the server thread
+/// sends them on its next pass. Platforms keep the queue under their own
+/// lock, together with the texts that did not fit it.
 #[derive(Debug, Clone)]
 pub struct PostedTexts {
     texts: [[u8; POSTED_TEXT_CAPACITY]; POSTED_TEXT_SLOTS],

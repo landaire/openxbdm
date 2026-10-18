@@ -31,6 +31,12 @@ use openxbdm_server::commands::hardware::automation::Gamepad;
 use openxbdm_server::commands::hardware::automation::QueueEntry;
 use openxbdm_server::commands::hardware::automation::QueueStatus;
 use openxbdm_server::commands::hardware::automation::UploadLayout;
+use openxbdm_server::commands::hardware::odd::MountRequest;
+use openxbdm_server::commands::hardware::odd::OddLog;
+use openxbdm_server::commands::hardware::odd::OddLogReservation;
+use openxbdm_server::commands::hardware::odd::OddPlatform;
+use openxbdm_server::commands::hardware::odd::ReadRequest;
+use openxbdm_server::commands::hardware::odd::SpeedChangeRequest;
 
 use self::automation::pool_allows;
 use super::MockBackend;
@@ -80,28 +86,103 @@ pub struct PgoRecord {
     pub resets: u32,
 }
 
-/// Optical disc log writer state.
-#[derive(Debug)]
-pub struct OddLog {
-    /// A start owns the writer.
-    pub busy: bool,
-    /// The writer is told to stop.
-    pub stopped: bool,
-
-    /// Result of the next file creation.
-    pub file_result: Result<(), KernelError>,
-    /// Paths of started logs.
-    pub files: Vec<Vec<u8>>,
+/// A log file the optical disc log writer created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogFile {
+    pub path: Vec<u8>,
+    pub content: Vec<u8>,
+    pub open: bool,
 }
 
-impl Default for OddLog {
+/// Index of a [`LogFile`] in [`OpticalDrive::files`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogFileIndex(usize);
+
+/// Simulated optical drive and the platform side of its log. The writer
+/// runs within each wake: it drains the log and, once the log is stopped,
+/// closes its file.
+#[derive(Debug)]
+pub struct OpticalDrive {
+    /// Timebase count drive events read.
+    pub timebase: u64,
+
+    /// Result of the next log file creation.
+    pub file_result: Result<(), KernelError>,
+    /// Log files in creation order.
+    pub files: Vec<LogFile>,
+    /// File of the running writer.
+    writer: Option<LogFileIndex>,
+}
+
+impl Default for OpticalDrive {
     fn default() -> Self {
         Self {
-            busy: false,
-            stopped: true,
+            timebase: 0,
             file_result: Ok(()),
             files: Vec::new(),
+            writer: None,
         }
+    }
+}
+
+impl OddPlatform for OpticalDrive {
+    type File = LogFileIndex;
+
+    fn timebase(&mut self) -> u64 {
+        self.timebase
+    }
+
+    fn create_file(&mut self, path: &[u8]) -> Result<LogFileIndex, KernelError> {
+        self.file_result?;
+
+        self.files.push(LogFile {
+            path: path.to_vec(),
+            content: Vec::new(),
+            open: true,
+        });
+
+        Ok(LogFileIndex(self.files.len() - 1))
+    }
+
+    fn write_file(&mut self, file: LogFileIndex, text: &[u8]) -> NtStatus {
+        self.files[file.0].content.extend_from_slice(text);
+
+        NtStatus::SUCCESS
+    }
+
+    fn close_file(&mut self, file: LogFileIndex) {
+        self.files[file.0].open = false;
+    }
+
+    fn writer_starting(&mut self) {
+        // The writer finishes within the wake that finds the log stopped.
+    }
+
+    fn start_writer(&mut self, file: LogFileIndex) -> NtStatus {
+        self.writer = Some(file);
+
+        NtStatus::SUCCESS
+    }
+
+    fn writer_absent(&mut self) {
+        self.writer = None;
+    }
+
+    fn wake_writer(&mut self, log: &OddLog) {
+        let Some(file) = self.writer else {
+            return;
+        };
+
+        log.drain(self, file);
+
+        if log.is_stopped() {
+            self.close_file(file);
+            self.writer = None;
+        }
+    }
+
+    fn join_writer(&mut self) {
+        // The writer finished within the stop's wake.
     }
 }
 
@@ -142,6 +223,7 @@ pub struct Mock {
     pub addresses: StackAddresses,
 
     pub odd_log: OddLog,
+    pub optical_drive: OpticalDrive,
     pub pgo_records: Vec<PgoRecord>,
     pub ignore_gdf_attributes: bool,
 
@@ -193,7 +275,8 @@ impl Default for Mock {
                 debug: [192, 168, 1, 31],
             },
 
-            odd_log: OddLog::default(),
+            odd_log: OddLog::new(),
+            optical_drive: OpticalDrive::default(),
             pgo_records: Vec::new(),
             ignore_gdf_attributes: false,
 
@@ -220,6 +303,31 @@ impl Mock {
         }
 
         Ok(selected)
+    }
+
+    /// Monitor control 0x46: the drive started a read.
+    pub fn odd_read_start(&mut self, request: ReadRequest) {
+        let timebase = self.optical_drive.timebase();
+
+        self.odd_log.read_start(request, timebase);
+    }
+
+    /// Monitor control 0x47: the pending read completed with `status`.
+    pub fn odd_read_complete(&mut self, status: NtStatus) {
+        let timebase = self.optical_drive.timebase();
+
+        self.odd_log
+            .read_complete(&mut self.optical_drive, status, timebase);
+    }
+
+    /// Monitor control 0x48: a GDFX volume was mounted.
+    pub fn odd_mount(&mut self, request: MountRequest) {
+        self.odd_log.mount(&mut self.optical_drive, request);
+    }
+
+    /// Monitor control 0x49: the spindle speed changed.
+    pub fn odd_speed_change(&mut self, request: SpeedChangeRequest) {
+        self.odd_log.speed_change(&mut self.optical_drive, request);
     }
 }
 
@@ -398,43 +506,38 @@ impl hardware::Backend for MockBackend {
         self.hardware.addresses
     }
 
-    fn odd_log_start(&mut self, path: Result<&[u8], KernelError>) -> Result<(), OddLogStartError> {
-        let log = &mut self.hardware.odd_log;
-        if log.busy {
-            return Err(OddLogStartError::Busy);
-        }
+    fn odd_log_reserve(&mut self) -> Result<OddLogReservation, OddLogStartError> {
+        let Mock {
+            odd_log,
+            optical_drive,
+            ..
+        } = &mut self.hardware;
 
-        log.busy = true;
-        log.stopped = false;
+        odd_log.reserve(optical_drive)
+    }
 
-        let error = match path.and_then(|path| log.file_result.map(|()| path)) {
-            Ok(path) => {
-                log.files.push(path.to_vec());
-                return Ok(());
-            }
-            Err(error) => error,
-        };
+    fn odd_log_start(
+        &mut self,
+        reservation: OddLogReservation,
+        path: Result<&[u8], KernelError>,
+    ) -> Result<(), OddLogStartError> {
+        let Mock {
+            odd_log,
+            optical_drive,
+            ..
+        } = &mut self.hardware;
 
-        // The writer reports a failure only for statuses with both
-        // severity bits set; it then exits without clearing the stop flag.
-        if NtStatus::from(error).0 & 0xc000_0000 == 0xc000_0000 {
-            log.busy = false;
-            return Err(OddLogStartError::Failed(error));
-        }
-
-        Ok(())
+        odd_log.start(optical_drive, reservation, path)
     }
 
     fn odd_log_stop(&mut self) -> Result<(), OddLogNotRunning> {
-        let log = &mut self.hardware.odd_log;
-        if log.stopped {
-            return Err(OddLogNotRunning);
-        }
+        let Mock {
+            odd_log,
+            optical_drive,
+            ..
+        } = &mut self.hardware;
 
-        log.stopped = true;
-        log.busy = false;
-
-        Ok(())
+        odd_log.stop(optical_drive)
     }
 
     fn pgo_start(&mut self, module: PgoModule) -> Result<(), PgoError> {

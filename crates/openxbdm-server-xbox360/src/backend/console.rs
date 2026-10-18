@@ -474,6 +474,7 @@ impl commands::console::Backend for Console {
             Published::DumpSettings(settings) => *DUMP_SETTINGS.lock() = settings.to_block(),
             Published::EventDefer(mask) => EVENT_DEFER.store(mask.bits(), Ordering::Release),
             Published::TraceMask(mask) => TRACE_MASK.store(mask.bits(), Ordering::Release),
+            Published::Drives(drives) => super::filesystem::publish_drives(drives),
             Published::Registration(registration) => {
                 // SAFETY: `publish` runs on the server thread, the only one
                 // that calls into XAM, so no XAM write to `HTTP_BODY` is in

@@ -628,7 +628,7 @@ fn get_memory_lines(
             }
 
             if page_valid {
-                let byte = match cx.state.debugger.shadow_read(*address) {
+                let byte = match crate::commands::debugger::shadow_read(cx.backend, *address) {
                     Some(byte) => Some(byte),
                     None => cx.backend.read_byte(*address),
                 };
@@ -690,7 +690,7 @@ fn set_memory(invocation: &mut Invocation<'_>) -> CommandResult {
         }
 
         let value = high << 4 | low;
-        if !invocation.state.debugger.shadow_write(current, value)
+        if !crate::commands::debugger::shadow_write(invocation.backend, current, value)
             && !invocation.backend.write_byte(current, value)
         {
             break true;
@@ -772,7 +772,7 @@ fn get_memory_chunk(
     let data = &mut cx.binary[2..2 + count as usize];
     // SAFETY: `is_readable` accepted every page of the `count` bytes.
     unsafe { cx.backend.read_memory(start, data) };
-    cx.state.debugger.restore_saved(start, data);
+    crate::commands::debugger::restore_saved(cx.backend, start, data);
 
     cx.binary[..2].copy_from_slice(&header.to_le_bytes());
     cx.binary_len = count as usize + 2;

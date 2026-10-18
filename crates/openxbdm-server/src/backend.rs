@@ -29,6 +29,7 @@ pub trait Backend:
     + commands::console::Backend
     + commands::system::Backend
     + commands::filesystem::Backend
+    + commands::filesystem::PathServices
     + commands::memory::Backend
     + commands::debugger::Backend
     + commands::network::Backend
@@ -46,6 +47,7 @@ impl<T> Backend for T where
         + commands::console::Backend
         + commands::system::Backend
         + commands::filesystem::Backend
+        + commands::filesystem::PathServices
         + commands::memory::Backend
         + commands::debugger::Backend
         + commands::network::Backend

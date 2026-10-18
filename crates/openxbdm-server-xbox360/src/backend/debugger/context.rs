@@ -14,14 +14,11 @@ use xbox360_sys::xboxkrnl::ContextFlags as KernelContextFlags;
 use xbox360_sys::xboxkrnl::KswitchFrame;
 use xbox360_sys::xboxkrnl::Kthread;
 
-use super::hook::BREAK_NOW;
-use super::hook::BREAK_NOW_STOPPED;
 use super::slot::SLOTS;
 use super::slot::SlotEventKind;
 use super::thread::ThreadListLock;
 use super::thread::ThreadRef;
 use super::thread::has_record;
-use super::thread::is_server;
 use super::thread::owning_process;
 
 /// Bytes `RtlCaptureContext` and `KeContextFromKframes` may write: the
@@ -121,15 +118,9 @@ unsafe fn write_context(target: *mut KernelContext, source: &Context) {
     }
 }
 
-/// Exception context of a thread stopped at an event: a thread waiting in
-/// a slot, or the command thread at the `break now` trap. `lock` is the
-/// lock of the thread's process.
+/// Exception context of a thread waiting in a slot at an event. `lock` is
+/// the lock of the thread's process.
 fn slot_context(lock: &ThreadListLock<'_>, thread: &Kthread) -> Option<*mut KernelContext> {
-    if is_server(thread) {
-        return BREAK_NOW_STOPPED
-            .load(Ordering::Acquire)
-            .then(|| BREAK_NOW.context.get());
-    }
     let slot = lock.record(thread)?.slot.load(Ordering::Relaxed);
     if slot == 0 {
         return None;

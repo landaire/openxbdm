@@ -3,6 +3,7 @@
 use super::ConfigSetting;
 use super::string_param;
 use crate::backend::Backend as AnyBackend;
+use crate::commands::filesystem;
 use crate::invocation::Invocation;
 use crate::reply::CommandError;
 use crate::reply::CommandResult;
@@ -76,4 +77,6 @@ pub(crate) fn refresh_network_share(state: &mut ServerState, backend: &mut dyn A
             .drives
             .set_network_share(Some(&setting[..length]));
     }
+
+    filesystem::publish_drives(state, backend);
 }

@@ -619,7 +619,7 @@ fn http_registration_exchange() {
     assert_eq!(
         head,
         format!(
-            "GET {path} HTTP/1.1\r\nUser-Agent: Xbox Debugger/2.0.21256.0\r\nHost: 127.0.0.1:{port}\r\n"
+            "GET {path} HTTP/1.1\r\nUser-Agent: Xbox Debugger/2.0.21256.0\r\nConnection: Close\r\nHost:127.0.0.1:{port}\r\n"
         )
     );
     wait_for_registration(&server, RegistrationState::InProgress);
@@ -646,6 +646,87 @@ fn http_registration_exchange() {
         output.contains(&"XBDM: Received 5 byte HTTP registration response.\n".to_owned()),
         "{output:?}"
     );
+}
+
+/// The request lines the registration task sends for `path` to the test
+/// listener on `port`.
+fn registration_head(path: &str, port: u16) -> String {
+    format!(
+        "GET {path} HTTP/1.1\r\nUser-Agent: Xbox Debugger/2.0.21256.0\r\nConnection: Close\r\nHost:127.0.0.1:{port}\r\n"
+    )
+}
+
+#[test]
+fn http_registration_follows_three_redirects() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = TestServer::start();
+    let (mut stream, _) = register(&server, &listener);
+
+    for (reply, path) in [
+        ("302 Found\r\nLocation: /next".to_owned(), "/next"),
+        (
+            format!("301 Moved\r\nLocation: http://127.0.0.1:{port}/third"),
+            "/third",
+        ),
+        // A path without a leading slash is taken from the root.
+        ("307 Temporary\r\nLocation: fourth".to_owned(), "/fourth"),
+    ] {
+        stream
+            .write_all(format!("HTTP/1.1 {reply}\r\nContent-Length: 0\r\n\r\n").as_bytes())
+            .unwrap();
+        let (next, head) = accept_registration(&listener);
+        assert_eq!(head, registration_head(path, port));
+        stream = next;
+    }
+
+    // The fourth redirect reaches the task.
+    stream
+        .write_all(b"HTTP/1.1 302 Found\r\nLocation: /fifth\r\nContent-Length: 0\r\n\r\n")
+        .unwrap();
+    wait_for_registration(&server, RegistrationState::Rejected);
+    assert!(
+        debug_output(&server)
+            .contains(&"XBDM: HTTP server returned status code other than OK (302)!\n".to_owned())
+    );
+}
+
+#[test]
+fn http_registration_redirect_failures() {
+    for (location, state, message) in [
+        // A relative location naming the current path is a loop.
+        (
+            None,
+            RegistrationState::Rejected,
+            "XBDM: HTTP server returned status code other than OK (303)!\n",
+        ),
+        (
+            Some("Location: http://bad host/x\r\n"),
+            RegistrationState::Failed,
+            "XBDM: HTTP registration failed (state 3, err = 31)!\n",
+        ),
+        (
+            Some(""),
+            RegistrationState::Failed,
+            "XBDM: HTTP registration failed (state 3, err = 12150)!\n",
+        ),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = TestServer::start();
+        let (mut stream, head) = register(&server, &listener);
+        let path = head.split(' ').nth(1).unwrap();
+        let location = location.map_or_else(|| format!("Location: {path}\r\n"), str::to_owned);
+        stream
+            .write_all(
+                format!("HTTP/1.1 303 See Other\r\n{location}Content-Length: 0\r\n\r\n").as_bytes(),
+            )
+            .unwrap();
+        wait_for_registration(&server, state);
+        assert!(
+            debug_output(&server).contains(&message.to_owned()),
+            "{message}"
+        );
+    }
 }
 
 #[test]
@@ -764,8 +845,33 @@ fn unreadable_settings_block_makes_a_test_kit() {
     }
 }
 
+/// XAM texts printed by the feature switch since `start`.
+fn printed_since(server: &TestServer, start: usize) -> String {
+    server.host.lock().backend.debug_output[start..]
+        .iter()
+        .map(|text| String::from_utf8_lossy(text).into_owned())
+        .collect()
+}
+
+fn feature_mask(server: &TestServer) -> Option<Vec<u8>> {
+    server
+        .host
+        .lock()
+        .backend
+        .console
+        .xconfig
+        .value(11, 2)
+        .map(<[u8]>::to_vec)
+}
+
+fn printed_count(server: &TestServer) -> usize {
+    server.host.lock().backend.debug_output.len()
+}
+
+const FEATURE_RULE: &str = "----------------------------------------------------------------------------------------------------------\n";
+
 #[test]
-fn feature_switch() {
+fn feature_switch_parameters() {
     let server = TestServer::start();
     let mut session = session(&server);
     assert_eq!(
@@ -776,14 +882,156 @@ fn feature_switch() {
         session.command("feature enable=1"),
         "423- 'feature' not specified"
     );
-    assert_eq!(session.command("feature enable=1 feature=0x20"), "200- OK");
+
+    let server = server_with(|host| host.backend.console.xam_features = None);
+    assert_eq!(self::session(&server).command("feature"), "200- OK");
+}
+
+#[test]
+fn feature_switch_stores_the_mask_for_the_next_boot() {
+    let server = TestServer::start();
+    let mut session = session(&server);
+
+    let start = printed_count(&server);
+    assert_eq!(session.command("feature enable=1 feature=0x21"), "200- OK");
+    let mut stored = vec![0u8; 16];
+    stored[3] = 1;
+    assert_eq!(feature_mask(&server), Some(stored.clone()));
     assert_eq!(
-        server.host.lock().backend.console.feature_calls,
-        Some(vec![(1, 0x20)])
+        printed_since(&server, start),
+        [
+            FEATURE_RULE,
+            "XAM FEATURE SELECTION\n",
+            FEATURE_RULE,
+            "Enabling DEVKIT_HEAP\n",
+            "Printing pending settings for next cold reboot...\n",
+            FEATURE_RULE,
+            "XAM FEATURE BUDGET\n",
+            FEATURE_RULE,
+            "1GB devkit - budgeting additional 003800000 bytes\n",
+            " + (Devkit)      DEVKIT_HEAP\t0x00060000 bytes\n",
+            FEATURE_RULE,
+            "Console features enabled:\t0x00518000 bytes\n",
+            "Console features disabled:\t0x00000000 bytes\n",
+            "Devkit features requested:\t0x00060000 bytes\n",
+            "Devkit features enabled:\t0x00060000 bytes\n",
+            FEATURE_RULE,
+        ]
+        .concat()
     );
 
-    let server = server_with(|host| host.backend.console.feature_calls = None);
-    assert_eq!(self::session(&server).command("feature"), "200- OK");
+    assert_eq!(session.command("feature enable=0 feature=2"), "200- OK");
+    stored[7] = 2;
+    assert_eq!(feature_mask(&server), Some(stored.clone()));
+
+    let start = printed_count(&server);
+    assert_eq!(session.command("feature enable=1 feature=8"), "200- OK");
+    assert_eq!(session.command("feature enable=1 feature=65"), "200- OK");
+    assert_eq!(printed_since(&server, start), "Unknown XAM feature 8\n");
+    assert_eq!(feature_mask(&server), Some(stored));
+}
+
+#[test]
+fn feature_switch_budgets_development_kit_features() {
+    let server = server_with(|host| {
+        if let Some(features) = &mut host.backend.console.xam_features {
+            features.loader_flags = 0;
+        }
+    });
+    let mut session = session(&server);
+
+    assert_eq!(session.command("feature enable=0 feature=3"), "200- OK");
+    let start = printed_count(&server);
+    assert_eq!(session.command("feature enable=1 feature=0x22"), "200- OK");
+    assert!(
+        printed_since(&server, start).ends_with(
+            &[
+                FEATURE_RULE,
+                "XAM FEATURE BUDGET\n",
+                FEATURE_RULE,
+                " - (Console)             XMP\t0x00200000 bytes\n",
+                " + (Devkit)       PIX_STREAM\t0x00073000 bytes\n",
+                FEATURE_RULE,
+                "Console features enabled:\t0x00318000 bytes\n",
+                "Console features disabled:\t0x00200000 bytes\n",
+                "Devkit features requested:\t0x00073000 bytes\n",
+                "Devkit features enabled:\t0x00073000 bytes\n",
+                FEATURE_RULE,
+            ]
+            .concat()
+        )
+    );
+
+    assert_eq!(session.command("feature enable=1 feature=3"), "200- OK");
+    let start = printed_count(&server);
+    assert_eq!(session.command("feature enable=1 feature=0x27"), "200- OK");
+    assert!(
+        printed_since(&server, start).ends_with(
+            &[
+                " - (Devkit)       PIX_STREAM\t0x00073000 bytes (only 0x00000000 available)\n",
+                " - (Devkit)  XAMUIAUTOMATION\t0x00038000 bytes (only 0x00000000 available)\n",
+                FEATURE_RULE,
+                "Console features enabled:\t0x00518000 bytes\n",
+                "Console features disabled:\t0x00000000 bytes\n",
+                "Devkit features requested:\t0x000AB000 bytes\n",
+                "Devkit features enabled:\t0x00000000 bytes\n",
+                FEATURE_RULE,
+            ]
+            .concat()
+        )
+    );
+}
+
+#[test]
+fn feature_switch_excludes_unknown_stored_bits() {
+    // Mask bits 36 and 40 belong to no feature.
+    let mut stored = vec![0u8; 16];
+    stored[2] = 0x01;
+    stored[3] = 0x10;
+    let server = server_with(|host| {
+        host.backend
+            .console
+            .xconfig
+            .settings
+            .insert(ConfigSetting::new(11, 2), stored);
+    });
+    let mut session = session(&server);
+
+    let start = printed_count(&server);
+    assert_eq!(session.command("feature enable=1 feature=1"), "200- OK");
+    // The format prints the low word of the mask, then `I64`.
+    assert!(
+        printed_since(&server, start)
+            .starts_with("Excluding unknown features in mask: 0x0000000000000000I64\n")
+    );
+    assert_eq!(feature_mask(&server), Some(vec![0u8; 16]));
+}
+
+#[test]
+fn feature_list_reports_the_running_mask() {
+    let server = TestServer::start();
+    let mut session = session(&server);
+
+    let start = printed_count(&server);
+    assert_eq!(session.command("feature enable=1 feature=0"), "200- OK");
+    let printed = printed_since(&server, start);
+    assert!(printed.starts_with(
+        &[
+            FEATURE_RULE,
+            "XAM FEATURE LIST\n",
+            FEATURE_RULE,
+            "Id             Name\tEnabled\tDevkit\tHeap Size\tImage Size\tPool Size\tStack Size\tTotal Size\n",
+            " 1    PRELOADED_HUD\tYes\t\tNo \t\t0x00000000\t0x00060000\t0x00000000\t0x00000000\t0x00060000\n",
+        ]
+        .concat()
+    ));
+    assert!(printed.contains(
+        "33      DEVKIT_HEAP\tNo \t\tYes\t\t0x00060000\t0x00000000\t0x00000000\t0x00000000\t0x00060000\n"
+    ));
+    assert!(printed.ends_with(&format!(
+        "39  XAMUIAUTOMATION\tNo \t\tYes\t\t0x00000000\t0x00030000\t0x00000000\t0x00008000\t0x00038000\n{FEATURE_RULE}"
+    )));
+    assert_eq!(feature_mask(&server), None);
 }
 
 #[test]

@@ -34,15 +34,16 @@ Image: stock XBDM 2.0.21256.0, base 0x91f00000. Commands: sendvfile, setconfig, 
 then file_size(low 32 bits) bytes of file data
 ```
 
-  - Name bytes are received into the start of the buffer (over the header). The server does not terminate the name; the sender must include the terminating NUL in header_len. Name limit: 0x4000 bytes.
+  - Name bytes are received into the start of the buffer (over the header). The server does not terminate the name; the sender must include the terminating NUL in header_len. Name limit: 0x4000 bytes. The receive window is 0x4000 less the name bytes received (0x91f4527c); for a longer name it reaches 0, the pump issues no `recv` and calls the continuation with 0 bytes, which changes nothing (0x91f44fc4), and the readable socket brings the server thread back at once: the connection never progresses and the server thread spins. Defective in the stock image.
   - If header_len == 0x20 and file_size == 0: the entry is skipped (no file), result 0.
+  - If header_len == 0x20 and file_size != 0: the continuation enters the name phase with 0 bytes expected and returns 0x02da0000 (0x91f44fb4, 0x91f45270); the pump then ends the upload (0x91f426ac): `200- OK`, context reset, the pool block not freed, and the file data is parsed as command lines. No file is opened and no results are sent.
   - Name starting with `\Device\` (case-insensitive, 8 chars): opened as an NT path (0x91f2ec08); otherwise translated as an XBDM path (0x91f2eb68). Open: access 0x40110000 (GENERIC_WRITE, DELETE, SYNCHRONIZE), allocation size = file_size, attributes 0, share 0, disposition 5 (overwrite-if), options 0 (asynchronous).
   - After open: NtSetInformationFile FileEndOfFileInformation (class 0x14) = file_size; NtCreateEvent (notification) for asynchronous writes. Any failure: the handle is marked delete-on-close (FileDispositionInformation, class 0xd), closed; result = 0x91f41f18(status, 0x82da000d); the file's data bytes are still consumed and discarded.
   - Data: received in 0x4000-byte buffers alternately; each buffer written with NtWriteFile at a running 64-bit offset, waiting on the event before reuse. Write failure: delete-on-close, close, result = 0x91f41f18(status, 0x8000ffff); remaining bytes of that file discarded.
   - On completion of a file (including zero-length): NtQueryInformationFile FileNetworkOpenInformation (0x22); on success NtSetInformationFile FileBasicInformation (4) with CreationTime = creation_time, LastWriteTime = last_write_time, other times 0, FileAttributes = attributes; query failure -> result 0x91f41f18(status, 0x82da000d). File closed. Each file close increments global 0x91f9feec.
   - Successful file: result entry stays 0x00000000.
 - Completion: after the last file the continuation returns 0x02da0003 -> `203- binary response follows`, then sends `count * 4` bytes: one big-endian u32 HRESULT per file in upload order, then frees the buffer and ends (no `.` line).
-- count=0: the first receive event (header bytes) frees the buffer and returns end-of-transfer while the receive state remains set; subsequent behavior is undefined. A reimplementation should not rely on it.
+- count=0: the first receive event (header bytes) frees the buffer (0x91f44ea4 remaining == 0, 0x91f44ee0 export 9) and returns 0x82da0104 while ctx+0x14 stays 0x20; the pump ignores results while ctx+0x14 != 0 (0x91f426b0), so it keeps receiving into the freed buffer and the continuation frees it again on every piece. Defective in the stock image.
 - Backend requirement: create/overwrite files by XBDM path or NT path, preallocate size, write sequential data, set end of file, set creation/last-write times and attributes, delete partially written files.
 - Status: spec complete.
 

@@ -15,7 +15,6 @@ use crate::network::SocketId;
 use crate::network::send_line;
 use crate::notify::ExecutionState;
 use crate::notify::MAX_NOTIFICATION_TARGETS;
-use crate::notify::POSTED_TEXT_CAPACITY;
 use crate::notify::TargetFlags;
 use crate::reply::CommandError;
 use crate::reply::CommandResult;
@@ -81,11 +80,10 @@ pub fn send_posted_notifications(
     backend: &mut dyn AnyBackend,
     network: &mut dyn Network,
 ) {
-    let mut text = [0u8; POSTED_TEXT_CAPACITY];
-
-    while let Some(length) = backend.next_posted_notification(&mut text) {
-        state.notifications.send_text(&text[..length], network);
-    }
+    let notifications = &mut state.notifications;
+    while backend.send_next_posted_notification(&mut |text| {
+        notifications.send_text(text, network);
+    }) {}
 }
 
 /// `notify` and `notifyport [reconnectport=<dword>] [debug] [reverse]`:

@@ -15,6 +15,7 @@ pub mod system;
 use std::time::Instant;
 
 use openxbdm_core::status::Hresult;
+use openxbdm_core::status::NtStatus;
 use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::ConnectionIndex;
 use openxbdm_server::Platform;
@@ -222,5 +223,17 @@ impl ProcessorBackend for MockBackend {
 
     fn processor_receive_limit(&mut self, _continuation: &ExternalContinuation) -> usize {
         TRANSFER_CAPACITY
+    }
+
+    /// The simulated console has no title process and the server thread
+    /// waits for the handler in stock, so the handler runs inline; thread
+    /// creation and the wait never fail.
+    fn run_command_thread(
+        &mut self,
+        run: &mut dyn FnMut(&mut dyn openxbdm_server::Backend),
+    ) -> Result<(), NtStatus> {
+        run(self);
+
+        Ok(())
     }
 }

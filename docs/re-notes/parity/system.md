@@ -107,10 +107,11 @@ Texts without a counterpart: `[XBDM] Error, WriteIniFile no server thread to sig
 
 ## Remaining gaps
 
-- `flash_commit` treats a missing image buffer as success. `flash_begin` always runs before the continuation, so the case is unreachable; removing it needs the buffer to move into the continuation, which the allocation-free server core cannot hold.
+None.
 
 ## Settled questions
 
 - The recovery boot bit (0x91fade6c bit 0x80) has no reader in the image; `State::recovery_boot` records it.
 - The wipe flag 0x91f9f664 has no writer in the image, so the WriteIniFile wipe gate never applies.
 - The startup SMC branch of dminit (0x91f329d4..0x91f32a6c) is implemented by the console domain (`console::check_settings_block`, called from `load_settings` when `drivemap internal` is off).
+- Each `flash` upload holds its own image buffer (stock connection context +8; `FlashUpload` carries the `FlashBuffer` the backend allocated), so uploads on several connections at once program their own images. The backend has no image buffer outside an upload.

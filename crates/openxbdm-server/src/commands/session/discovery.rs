@@ -52,8 +52,9 @@ pub fn answer_discovery(
 /// Answer a name discovery datagram. Type 3 asks every console for its
 /// name; type 1 asks the console whose debug name equals the given name,
 /// ignoring ASCII case. The reply is type 2, a length byte, and the name.
-/// Request bit 0x80 selects a broadcast reply. A request name with an
-/// embedded NUL is not matched.
+/// Request bit 0x80 selects a broadcast reply. The monitor compares the
+/// request name as a C string, so a name with a NUL matches by its text
+/// before the NUL.
 pub fn discovery_reply(
     name: &[u8],
     request: &[u8],
@@ -67,7 +68,15 @@ pub fn discovery_reply(
         DiscoveryOpcode::Lookup => {
             let (&length, requested) = body.split_first()?;
             let length = usize::from(length);
-            if length == 0 || requested.len() != length || !requested.eq_ignore_ascii_case(name) {
+            if length == 0 || requested.len() != length {
+                return None;
+            }
+
+            let text = requested
+                .iter()
+                .position(|&byte| byte == 0)
+                .map_or(requested, |end| &requested[..end]);
+            if !text.eq_ignore_ascii_case(name) {
                 return None;
             }
         }
@@ -107,5 +116,8 @@ mod tests {
         assert_eq!(discovery_reply(b"Kit", b"\x01\x03Kitx", &mut reply), None);
         assert_eq!(discovery_reply(b"Kit", b"\x02\x03Kit", &mut reply), None);
         assert_eq!(discovery_reply(b"", &[1, 0], &mut reply), None);
+        let answer = discovery_reply(b"Kit", b"\x01\x05kit\0x", &mut reply).unwrap();
+        assert_eq!(&reply[..answer.length], b"\x02\x03Kit");
+        assert_eq!(discovery_reply(b"Kit", b"\x01\x04ki\0t", &mut reply), None);
     }
 }

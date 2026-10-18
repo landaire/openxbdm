@@ -2,6 +2,7 @@
 
 pub mod automation;
 mod error;
+pub mod odd;
 pub mod pgo;
 
 use core::fmt::Write as _;
@@ -16,6 +17,7 @@ use self::automation::Gamepad;
 use self::automation::QueueStatus;
 use self::automation::UploadLayout;
 use self::error::AutomationError;
+use self::odd::OddLogReservation;
 use crate::access::Access;
 use crate::commands::console;
 use crate::commands::console::ConfigFlags;
@@ -401,9 +403,16 @@ pub trait Backend {
     fn play_to(&mut self, command: PlayToCommand) -> Result<PlayToState, XamError>;
     fn stack_addresses(&mut self) -> StackAddresses;
 
-    /// Start writing the optical disc log to the object path `path`, or
-    /// report the path translation failure as the writer's file status.
-    fn odd_log_start(&mut self, path: Result<&[u8], KernelError>) -> Result<(), OddLogStartError>;
+    /// Take the optical disc log writer and clear the log.
+    fn odd_log_reserve(&mut self) -> Result<OddLogReservation, OddLogStartError>;
+    /// Start writing the reserved optical disc log to the object path
+    /// `path`, or report the path translation failure as the writer's file
+    /// status.
+    fn odd_log_start(
+        &mut self,
+        reservation: OddLogReservation,
+        path: Result<&[u8], KernelError>,
+    ) -> Result<(), OddLogStartError>;
     /// Stop the optical disc log and wait for its writer.
     fn odd_log_stop(&mut self) -> Result<(), OddLogNotRunning>;
 
@@ -1035,6 +1044,8 @@ fn optical_disc_log(invocation: &mut Invocation<'_>) -> CommandResult {
         }
     }
 
+    // Stock checks the busy writer before its writer translates the name.
+    let reservation = invocation.backend.odd_log_reserve()?;
     let path = invocation
         .state
         .filesystem
@@ -1044,7 +1055,7 @@ fn optical_disc_log(invocation: &mut Invocation<'_>) -> CommandResult {
         .as_ref()
         .map(|path| path.as_bytes())
         .ok_or(KernelError::NoSuchFile);
-    invocation.backend.odd_log_start(path)?;
+    invocation.backend.odd_log_start(reservation, path)?;
 
     invocation.text.set_bytes(b"Logging to '");
     let _ = invocation.text.push_bytes(name.as_bytes());

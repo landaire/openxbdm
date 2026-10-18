@@ -236,9 +236,11 @@ rustc assembles the result, and rust-lld links it with
 `compiler_builtins` as rustc links the executable. The build fails unless
 the same link of rustc's own object reproduces rustc's image. An audit of
 the disassembly fails it if any rewritable sequence remains. The module
-targets have subtargets for the intermediate files: `[asm]`, `[elf]`,
-`[unstripped]`, `[disassembly]`, `[audit]`, `[rewrite-report]`,
-`[refusals]` (each sequence left unchanged and why) and `[reservations]`.
+targets have subtargets for the intermediate files: `[asm]`, `[elf]` (the
+image with symbols and debug information), `[disassembly]`, `[audit]`,
+`[rewrite-report]`, `[refusals]` (each sequence left unchanged and why),
+`[reservations]`, and `[gdb]` and `[lldb]` (debugger command files that
+load `[elf]` and the standard library source).
 
 In every case the build fails if the image holds an `lwarx`, `ldarx`,
 `stwcx.`, or `stdcx.` outside the interrupt-protected form the kernel

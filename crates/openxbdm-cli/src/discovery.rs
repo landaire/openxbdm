@@ -12,6 +12,7 @@ use openxbdm_client::discovery::find_by_name;
 use openxbdm_client::error::ArgumentError;
 use openxbdm_client::error::Error;
 use openxbdm_client::error::TransportError;
+use openxbdm_client::transport::tokio::Target;
 use rootcause::Report;
 use tabled::Tabled;
 
@@ -81,4 +82,30 @@ pub async fn resolve(name: &str, listen_ms: u64) -> Result<(), Report<Error>> {
     println!("{}\t{}", console.name, console.addr);
 
     Ok(())
+}
+
+/// Resolves a host name that DNS does not know as a console name with the
+/// name lookup protocol, which is how consoles are named on a network.
+pub async fn resolve_target(target: Target) -> Result<Target, Report<Error>> {
+    let Target::HostPort { host, port } = &target else {
+        return Ok(target);
+    };
+
+    let known = tokio::net::lookup_host((host.as_str(), *port))
+        .await
+        .is_ok_and(|mut addresses| addresses.next().is_some());
+    if known {
+        return Ok(target);
+    }
+
+    let mut config = DiscoveryConfig::broadcast();
+    config.destination = SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), NAP_PORT);
+    tracing::info!(name = %host, "DNS does not know the host; looking it up as a console name");
+
+    match find_by_name(host, config).await? {
+        Some(console) => Ok(Target::Addr(SocketAddr::new(console.addr.ip(), *port))),
+        None => Err(Report::new(Error::from(TransportError::UnknownHost {
+            name: host.clone(),
+        }))),
+    }
 }

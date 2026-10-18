@@ -165,4 +165,6 @@ pub enum TransportError {
     MissingBinaryLen,
     #[error("timed out opening XBDM connection")]
     ConnectTimeout,
+    #[error("neither DNS nor the console name lookup knows {name:?}")]
+    UnknownHost { name: String },
 }

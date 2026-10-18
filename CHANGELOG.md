@@ -62,6 +62,7 @@
 
 ### Client
 
+- `xeedee -H NAME` looks the name up as a console name when DNS does not know it.
 - Match stock replies in the client: debugger commands (`isbreak`, `isstopped`, `stopon`/`nostopon`, `continue`, `dbgextld`; no `execute` data breakpoint), `consoletype`, `consolemem`, `getnetaddrs`, `setmem` partial writes, `getmem` lengths, file transfer ranges and `fileeof` dispositions, `screenshot` detiling, and discovery name matching.
 - Add client commands for `getcontext`, `setcontext`, `isdebugger`, `debugger`, `kd`, `kdlite`, `kdnet`, `threadstat`, `crashdump`, `break now`, lock mode, users, privileges, `authuser`, `adminpw`, and `keyxchg`.
 - Add `xeedee parity record` and `xeedee parity compare`: record the replies to a command list and compare two recordings outside listed varying fields.

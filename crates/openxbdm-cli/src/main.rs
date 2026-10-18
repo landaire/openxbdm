@@ -74,7 +74,7 @@ async fn run(cli: Cli) -> Result<(), Report<Error>> {
         return Err(Report::new(Error::from(ArgumentError::EmptyFilename))
             .attach("--host is required for this subcommand"));
     };
-    let target = Target::parse(host, cli.port);
+    let target = discovery::resolve_target(Target::parse(host, cli.port)).await?;
     let conn_timeout = Duration::from_secs(cli.timeout);
     tracing::info!(target: "openxbdm_client", console = %target, "connecting");
 

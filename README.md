@@ -157,19 +157,20 @@ We have a custom [rust-xbox360](https://github.com/landaire/rust-xbox360) toolch
 
 If you are a nix user, a [devenv](https://devenv.sh), is present whcih can provide all necessary tooling. Run `devenv shell` to activate.
 
-| Command                                                     | Purpose                                                                                        |
-| ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `buck2 build //: //bindings/... //crates/... //xbox360/...` | Build everything: host crates, C++ headers, and the console module.                            |
-| `buck2 test //: //bindings/... //crates/... //xbox360/...`  | Run the unit, integration and documentation tests, and check the Rust release pin.             |
-| `buck2 build //xbox360:openxbdm --show-output`              | Build the console module, `openxbdm.xex`.                                                      |
-| `buck2 run //crates/openxbdm-cli:xeedee-bin -- ARGS`        | Run a tool; each binary is `//crates/<crate>:<binary>-bin`.                                    |
-| `buck2 build -c rust.profile=release //crates/...`          | Build the host crates with the optimizations of Cargo's release profile.                       |
-| `build_defs/lint.py`                                        | Check formatting and clippy diagnostics.                                                       |
-| `build_defs/lint.py --format`                               | Format the workspace crates.                                                                   |
-| `build_defs/package_release.py --version V --target T`      | Archive the host tools and the FFI libraries.                                                  |
-| `build_defs/package_module.py --version V`                  | Copy out the console module builds under release names.                                        |
-| `build_defs/update_buck_files.py`                           | Regenerate the build files after a change to a `Cargo.toml` or `Cargo.lock`.                   |
-| `toolchains/update_rustfmt_release.py`                      | Regenerate `toolchains/rustfmt_release.bzl` after a change to `RUSTFMT_NIGHTLY` in the script. |
+| Command                                                                 | Purpose                                                                                        |
+| ----------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `buck2 build //: //bindings/... //crates/... //xbox360/...`             | Build everything: host crates, C++ headers, and the console module.                            |
+| `buck2 test //: //bindings/... //crates/... //xbox360/...`              | Run the unit, integration and documentation tests, and check the Rust release pin.             |
+| `buck2 build //xbox360:openxbdm --show-output`                          | Build the console module, `openxbdm.xex`.                                                      |
+| `buck2 run //crates/openxbdm-cli:xeedee-bin -- ARGS`                    | Run a tool; each binary is `//crates/<crate>:<binary>-bin`.                                    |
+| `buck2 build //crates/openxbdm-cli:xeedee-bin?release`                  | Build an optimized host binary with external debug information.                               |
+| `buck2 build //crates/openxbdm-cli:xeedee-bin?release_no_symbols`       | Build an optimized host binary without symbols.                                                |
+| `build_defs/lint.py`                                                    | Check formatting and clippy diagnostics.                                                       |
+| `build_defs/lint.py --format`                                           | Format the workspace crates.                                                                   |
+| `build_defs/package_release.py --version V --target T`                  | Archive the host tools and the FFI libraries.                                                  |
+| `build_defs/package_module.py --version V`                              | Copy out the console module builds under release names.                                        |
+| `build_defs/update_buck_files.py`                                       | Regenerate the build files after a change to a `Cargo.toml` or `Cargo.lock`.                   |
+| `toolchains/update_rustfmt_release.py`                                  | Regenerate `toolchains/rustfmt_release.bzl` after a change to `RUSTFMT_NIGHTLY` in the script. |
 
 ## Tests
 

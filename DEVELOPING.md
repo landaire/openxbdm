@@ -167,19 +167,16 @@ The `smb` feature of `openxbdm-server`, `openxbdm-server-host`, and
 their own. `cargo build -p openxbdm-server --no-default-features` builds
 the engine without `smb2-server`.
 
-`buck2 build -c rust.profile=release` builds host crates like Cargo's
-release profile: every crate gets `-Copt-level=3` and `-Cstrip=debuginfo`,
-and binaries and tests get the workspace's `lto = "thin"` as `-Clto=thin`.
-rustc rejects `-Clto` for proc-macro crates, so libraries do not get it.
+Build modes are configuration modifiers. `?dev` is the default and keeps external debug information. For host builds, `?release` adds `-Copt-level=3` to every crate and thin LTO to binaries and tests while keeping external debug information. `?release_no_symbols` makes the same optimized host build without symbols. Console modules keep their size optimization and LTO settings; the modes select whether they retain symbols. For example:
 
-`build_defs/package_release.py` builds with that profile and archives the
-released executables (`xeedee` and `openxbdm-kd`) as
-`xeedee-<version>-<target>`, and the `openxbdm-ffi` shared and static
-libraries (the `[cdylib]` and `[staticlib]` subtargets of its library)
-with their C++ headers (`//bindings:cpp`, written by
-`openxbdm-ffi-bindgen`) as `xeedee-ffi-<version>-<target>`. The profile
-gives only binaries and tests `-Clto=thin`, so the FFI libraries are
-built without LTO.
+    buck2 build //crates/openxbdm-cli:xeedee-bin?release
+
+On Linux, a host binary's external debug file is its `[symbols]` subtarget. The console module's `[elf]` subtarget is its external debugger image.
+
+The target constraint is `//config:target`, with `[host]` and `[xbox]` values. Xbox module rules apply `[xbox]` and the required standard library configuration through their transition.
+
+`build_defs/package_release.py` builds with `?release` and archives the released executables (`xeedee` and `openxbdm-kd`) as `xeedee-<version>-<target>`. It archives the `openxbdm-ffi` shared and static libraries (the `[cdylib]` and `[staticlib]` subtargets of its library) with their C++ headers (`//bindings:cpp`, written by `openxbdm-ffi-bindgen`) as `xeedee-ffi-<version>-<target>`. The profile gives only host binaries and tests `-Clto=thin`, so the FFI libraries are built without LTO.
+
 `build_defs/package_module.py` copies out the console module builds.
 `.github/workflows/release.yml` publishes a release for a `vX.Y.Z` tag
 that names the workspace version, and `.github/workflows/nightly.yml`

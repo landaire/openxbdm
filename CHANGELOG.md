@@ -84,7 +84,7 @@
 - Buck2 uses the Rust release that the `xbox360` cell pins (1.98.0); `rust-toolchain.toml` names the same release for Cargo and rust-analyzer, and `//:rust-toolchain-test` checks that they match. On Linux the host C driver links with the lld bundled in `rustc`.
 - Generate the C++ headers of `openxbdm-ffi` with Buck2 (`//bindings:cpp`, through `openxbdm-ffi-bindgen`), and build its shared and static libraries as subtargets of its library.
 - Format with a pinned nightly rustfmt (`.rustfmt.toml`); `build_defs/lint.py` checks formatting and clippy diagnostics through Buck2.
-- `-c rust.profile=release` builds with the optimization, stripping and thin LTO of Cargo's release profile.
+- `?dev`, `?release` and `?release_no_symbols` select development, optimized and symbol-free optimized configurations. Development and release host binaries keep debug information in an external symbol file.
 - Report each libtest case as its own Buck2 test through the internal test runner.
 - `bin/buck2` (`bin\buck2.cmd` on Windows) runs the Buck2 release that the DotSlash file `toolchains/buck2` pins, through a DotSlash that `bootstrap.sh` or `bootstrap.ps1` installs into `.tools` on first use, so no Buck2 installation or Nix is needed. The bootstrap scripts report missing host tools (the C++ linker driver and SDK, git, long paths on Windows). The `build_defs` scripts, `devenv.nix`, `mise.toml` and CI use the wrapper; `devenv.nix` provides no C compiler or LLVM tools.
 - The devenv shell resolves `CARGO_HOME` through symbolic links, so Cargo builds of `openxbdm-ffi-bindgen` work when the home directory is a link (Fedora Atomic).

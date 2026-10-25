@@ -1,25 +1,7 @@
 load("@xbox360//buck:rust.bzl", "release_tool", "rust_release")
 load("@xbox360//buck:toolchains.bzl", "xbox360_toolchains")
+load("@xbox360//buck:profiles.bzl", "profile_rustc_binary_flags", "profile_rustc_flags", "profile_xbox360_rustc_flags")
 load(":rustfmt_release.bzl", "RUSTFMT_HOSTS")
-
-# `-c rust.profile=release` builds host crates like Cargo's release profile
-# (with the workspace's `lto = "thin"`), which also strips the standard
-# library's debug information from executables. The dev profile uses
-# rustc's defaults. Only binaries take -Clto: rustc rejects it for
-# proc-macro crates, and libraries carry the bitcode that it uses.
-_PROFILE_RUSTC_FLAGS = {
-    "dev": [],
-    "release": ["-Copt-level=3", "-Cstrip=debuginfo"],
-}
-
-_PROFILE_RUSTC_BINARY_FLAGS = {
-    "dev": [],
-    "release": ["-Clto=thin"],
-}
-
-_PROFILE = read_config("rust", "profile", "dev")
-
-_PROFILE in _PROFILE_RUSTC_FLAGS or fail("rust.profile must be one of {}, not `{}`".format(_PROFILE_RUSTC_FLAGS.keys(), _PROFILE))
 
 xbox360_toolchains(
     # The prelude runs doctests through a wrapper (`--test-runtool`), and
@@ -29,13 +11,13 @@ xbox360_toolchains(
         "-Zunstable-options",
         "--merge-doctests=no",
     ],
-    rustc_binary_flags = _PROFILE_RUSTC_BINARY_FLAGS[_PROFILE],
-    rustc_flags = _PROFILE_RUSTC_FLAGS[_PROFILE],
+    rustc_binary_flags = profile_rustc_binary_flags(),
+    rustc_flags = profile_rustc_flags(),
     # The console module (xbox360/BUCK) shares the console's memory with the
     # running title, so it is built for size in every profile, with panics
     # that trap without formatting a message. `xbox360_executable_core`
     # compiles it as one fat LTO module.
-    xbox360_rustc_flags = ["-Cpanic=immediate-abort"],
+    xbox360_rustc_flags = ["-Cpanic=immediate-abort"] + profile_xbox360_rustc_flags(),
 )
 
 # Downloaded only when something runs rustfmt.

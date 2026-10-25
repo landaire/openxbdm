@@ -49,7 +49,7 @@ def build(buck2_path, targets):
     with tempfile.TemporaryDirectory() as scratch:
         report_path = Path(scratch) / "report.json"
         subprocess.run(
-            [buck2_path, "build", "-c", "rust.profile=release", f"--build-report={report_path}", *targets],
+            [buck2_path, "build", "--modifier", "release", f"--build-report={report_path}", *targets],
             cwd=ROOT,
             check=True,
         )

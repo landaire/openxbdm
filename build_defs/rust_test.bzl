@@ -7,6 +7,7 @@ the DotSlash file toolchains/buck2 pins such a release.
 
 load("@prelude//rules.bzl", "clone_rule")
 load("@prelude//rust:rust_binary.bzl", "rust_test_impl")
+load("@xbox360//buck:profiles.bzl", "profile_separate_debug_info")
 
 _LIBTEST_STATUS = {
     "failed": "FAIL",
@@ -108,4 +109,10 @@ def _rust_test_impl(ctx: AnalysisContext) -> list[Provider]:
             result.append(provider)
     return result
 
-rust_test = clone_rule("rust_test", impl_override = _rust_test_impl)
+_rust_test = clone_rule("rust_test", impl_override = _rust_test_impl)
+
+def rust_test(**kwargs):
+    _rust_test(
+        separate_debug_info = profile_separate_debug_info(),
+        **kwargs
+    )

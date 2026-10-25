@@ -1,0 +1,11 @@
+alias(
+    name = "target",
+    actual = "xbox360//platforms:target",
+    visibility = ["PUBLIC"],
+)
+
+alias(
+    name = "mode",
+    actual = "xbox360//platforms:mode",
+    visibility = ["PUBLIC"],
+)

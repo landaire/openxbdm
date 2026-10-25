@@ -467,6 +467,8 @@ def crate_build_file(workspace, package, aliases):
         raise BuildFileError(f"{package['name']}: duplicate target names {', '.join(duplicates)}")
 
     text = HEADER.format(source=f"{directory}/Cargo.toml")
+    if any(rule.startswith("rust_binary(") for _, rule in rules):
+        text += '\nload("@xbox360//buck:profiles.bzl", rust_binary = "profiled_rust_binary")\n'
     if any(rule.startswith("rust_test(") for _, rule in rules):
         text += '\nload("//build_defs:rust_test.bzl", "rust_test")\n'
     if console is not None:

@@ -1,2 +1,3 @@
-[buildscript]
-run = true
+# windows-targets links system DLLs directly, so its bundled import library and
+# build-script search path are unused.
+buildscript.run = false

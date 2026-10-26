@@ -1,0 +1,3 @@
+# Use raw-dylib imports because Buck does not propagate the bundled import
+# library's build-script search path to the final link.
+cfgs = ["windows_raw_dylib"]

@@ -45,7 +45,7 @@ Stopping the host and rebooting returns to stock XBDM from flash. Placed at `DEV
 
 Enable kdnet with stock XBDM (`kdnet set IP=<host> Port=50000`, `kdnet enable`, reboot).
 
-    openxbdm-kd listen [--passive] [--log-file kd.log]
+    openxbdm-kd [--no-timeout] listen [--passive] [--log-file kd.log]
     openxbdm-kd [--target 169.254.59.14] break
     openxbdm-kd mem 0x80040000 64
     openxbdm-kd gdbserver [--listen 127.0.0.1:2159] [--registers 64|32] [--stop-on-load IMAGE]
@@ -53,6 +53,9 @@ Enable kdnet with stock XBDM (`kdnet set IP=<host> Port=50000`, `kdnet enable`, 
     openxbdm-kd reboot
 
 Without `--target` the address is learned from the kernel's beacon. While the tool is attached the kernel waits for it at every print, module load and stop.
+
+Pass `--no-timeout` without `--target` to wait indefinitely for the first
+kernel beacon instead of ending discovery after ten seconds.
 
 The `host` command keeps the console running while attached. It continues every event, prints debug output and module loads, and answers the kernel's host file requests.
 

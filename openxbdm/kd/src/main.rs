@@ -29,6 +29,9 @@ struct Cli {
     /// settings; the kernel drops datagrams from any other port.
     #[arg(long, default_value = "0.0.0.0:50000")]
     local: SocketAddr,
+    /// Wait indefinitely when discovering a target from its kdnet beacon.
+    #[arg(long)]
+    no_timeout: bool,
     /// tracing filter, for example `debug` or `openxbdm_kd=trace`.
     #[arg(long, default_value = "info")]
     log: String,
@@ -115,15 +118,15 @@ fn run(cli: Cli) -> Result<(), Report<CliError>> {
             passive: false,
             log_file,
         } => {
-            let mut client = connect(cli.target, cli.local)?;
+            let mut client = connect(cli.target, cli.local, cli.no_timeout)?;
             commands::listen(&mut client, log_file)
         }
         Command::Break { stack_words } => {
-            let mut client = connect(cli.target, cli.local)?;
+            let mut client = connect(cli.target, cli.local, cli.no_timeout)?;
             commands::break_in(&mut client, stack_words)
         }
         Command::Mem { address, length } => {
-            let mut client = connect(cli.target, cli.local)?;
+            let mut client = connect(cli.target, cli.local, cli.no_timeout)?;
             commands::memory(&mut client, address, length)
         }
         Command::Gdbserver {
@@ -131,7 +134,7 @@ fn run(cli: Cli) -> Result<(), Report<CliError>> {
             registers,
             stop_on_load,
         } => {
-            let client = connect(cli.target, cli.local)?;
+            let client = connect(cli.target, cli.local, cli.no_timeout)?;
             commands::gdb_server(client, listen, registers, stop_on_load)
         }
         Command::Host {
@@ -140,11 +143,11 @@ fn run(cli: Cli) -> Result<(), Report<CliError>> {
             log_file,
         } => {
             commands::check_host_files(&files)?;
-            let mut client = connect(cli.target, cli.local)?;
+            let mut client = connect(cli.target, cli.local, cli.no_timeout)?;
             commands::host(&mut client, files, stop_on_load, log_file)
         }
         Command::Reboot => {
-            let mut client = connect(cli.target, cli.local)?;
+            let mut client = connect(cli.target, cli.local, cli.no_timeout)?;
             commands::reboot(&mut client)
         }
     }

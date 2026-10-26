@@ -40,22 +40,23 @@ impl UdpTransport {
     }
 
     /// Binds `local` and waits for a beacon or packet to learn the target
-    /// address from its source.
-    pub fn discover(local: SocketAddr, timeout: Duration) -> io::Result<Self> {
+    /// address from its source. A missing timeout waits indefinitely.
+    pub fn discover(local: SocketAddr, timeout: Option<Duration>) -> io::Result<Self> {
         let socket = UdpSocket::bind(local)?;
-        let deadline = Instant::now() + timeout;
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
         let mut buffer = [0u8; MAX_DATAGRAM_LEN];
 
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            let remaining =
+                deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            if remaining.is_some_and(|remaining| remaining.is_zero()) {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "no kdnet datagram arrived; is kdnet enabled with this host's address?",
                 ));
             }
 
-            socket.set_read_timeout(Some(remaining))?;
+            socket.set_read_timeout(remaining)?;
             let (length, source) = match socket.recv_from(&mut buffer) {
                 Ok(received) => received,
                 Err(error) if is_timeout(&error) => continue,

@@ -12,17 +12,19 @@ use crate::print::print_notification;
 use crate::transport::UdpTransport;
 
 /// Binds `local` and connects to `target`, or to the first target whose
-/// beacon arrives when `target` is `None`. Notifications are printed.
+/// beacon arrives when `target` is `None`. Target discovery waits indefinitely
+/// when `no_timeout` is set. Notifications are printed.
 pub fn connect(
     target: Option<SocketAddr>,
     local: SocketAddr,
+    no_timeout: bool,
 ) -> Result<KdClient<UdpTransport>, Report<CliError>> {
     // The kernel sends a beacon every 3 s.
     const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
     let transport = match target {
         Some(target) => UdpTransport::bind(local, target),
-        None => UdpTransport::discover(local, DISCOVERY_TIMEOUT),
+        None => UdpTransport::discover(local, (!no_timeout).then_some(DISCOVERY_TIMEOUT)),
     }
     .map_err(CliError::from)
     .attach(format!("local {local}"))?;

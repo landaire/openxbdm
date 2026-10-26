@@ -1,8 +1,13 @@
 //! `gdbserver`: serve one GDB or LLDB client over TCP.
 
+use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 use std::net::TcpListener;
 use std::net::TcpStream;
+use std::path::PathBuf;
+use std::process::Child;
+use std::process::Command;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -35,16 +40,25 @@ pub enum RegisterWidth {
     Bits32,
 }
 
+/// GDB process launched after the listener and target stop are ready.
+#[derive(Debug)]
+pub struct DebuggerCommand {
+    pub program: PathBuf,
+    pub commands: PathBuf,
+}
+
 /// Accepts one debugger on `listen`, serves it, then lets the console run.
 /// Loads of the images in `stop_on_load` stop the console before their entry
 /// points run. `stop_on_connect` keeps the attachment stop while waiting for
-/// the debugger.
+/// the debugger. `debugger` launches GDB after the listener and target are
+/// ready.
 pub fn gdb_server(
     mut client: KdClient<UdpTransport>,
     listen: SocketAddr,
     width: RegisterWidth,
     stop_on_load: Vec<String>,
     stop_on_connect: bool,
+    debugger: Option<DebuggerCommand>,
 ) -> Result<(), Report<CliError>> {
     let (console, console_text) = mpsc::channel();
     client.set_notify(Box::new(move |notification| {
@@ -57,20 +71,50 @@ pub fn gdb_server(
     let listener = TcpListener::bind(listen)
         .map_err(CliError::from)
         .attach(format!("listen {listen}"))?;
+    let listener_address = listener
+        .local_addr()
+        .map_err(CliError::from)
+        .attach("reading debugger listener address")?;
+    let debugger_address = match listener_address {
+        SocketAddr::V4(address) if address.ip().is_unspecified() => {
+            SocketAddr::from((Ipv4Addr::LOCALHOST, address.port()))
+        }
+        SocketAddr::V6(address) if address.ip().is_unspecified() => {
+            SocketAddr::from((Ipv6Addr::LOCALHOST, address.port()))
+        }
+        address => address,
+    };
     listener.set_nonblocking(true).map_err(CliError::from)?;
 
     client.set_hold_loads(stop_on_load);
-    if stop_on_connect {
+    if stop_on_connect || debugger.is_some() {
         stop_target(&mut client)?;
         println!("the console is stopped; waiting for the debugger");
     } else {
         attach(&mut client)?;
     }
-    println!("waiting for a GDB client on {listen}");
+    println!("waiting for a GDB client on {listener_address}");
 
-    let stream = match accept(&mut client, &listener, &console_text) {
+    let mut debugger = match debugger {
+        Some(command) => match launch_debugger(&command, debugger_address, width) {
+            Ok(child) => Some(child),
+            Err(error) => {
+                if client.stop().is_some() {
+                    client
+                        .continue_from_stop()
+                        .map_err(CliError::from)
+                        .attach("release target after GDB launch failure")?;
+                }
+                return Err(error);
+            }
+        },
+        None => None,
+    };
+
+    let stream = match accept(&mut client, &listener, &console_text, debugger.as_mut()) {
         Ok(stream) => stream,
         Err(error) => {
+            stop_debugger(&mut debugger);
             if client.stop().is_some() {
                 client
                     .continue_from_stop()
@@ -81,6 +125,7 @@ pub fn gdb_server(
         }
     };
     if let Err(error) = stream.set_nonblocking(false) {
+        stop_debugger(&mut debugger);
         if client.stop().is_some() {
             client
                 .continue_from_stop()
@@ -90,7 +135,10 @@ pub fn gdb_server(
         return Err(Report::new(CliError::from(error)));
     }
 
-    stop_target(&mut client)?;
+    if let Err(error) = stop_target(&mut client) {
+        stop_debugger(&mut debugger);
+        return Err(error);
+    }
     if let Some(stop) = client.stop() {
         print_stop_report(stop);
     }
@@ -98,9 +146,55 @@ pub fn gdb_server(
     // Text sent before the debugger attached is printed only.
     while console_text.try_recv().is_ok() {}
 
-    match width {
+    let served = match width {
         RegisterWidth::Bits64 => serve::<Xenon64>(client, stream, console_text),
         RegisterWidth::Bits32 => serve::<Xenon32>(client, stream, console_text),
+    };
+    let debugger_status = debugger
+        .as_mut()
+        .map(Child::wait)
+        .transpose()
+        .map_err(CliError::from)
+        .attach("waiting for GDB")?;
+
+    served?;
+    if let Some(status) = debugger_status
+        && !status.success()
+    {
+        return Err(Report::new(CliError::GdbExit { status }));
+    }
+
+    Ok(())
+}
+
+fn launch_debugger(
+    debugger: &DebuggerCommand,
+    listen: SocketAddr,
+    width: RegisterWidth,
+) -> Result<Child, Report<CliError>> {
+    let architecture = match width {
+        RegisterWidth::Bits64 => "powerpc:common64",
+        RegisterWidth::Bits32 => "powerpc:common",
+    };
+
+    Command::new(&debugger.program)
+        .args(["-q", "-nx", "-batch"])
+        .args(["-ex", "set pagination off"])
+        .args(["-ex", "set confirm off"])
+        .args(["-ex", &format!("set architecture {architecture}")])
+        .args(["-ex", "set endian big"])
+        .args(["-ex", &format!("target remote {listen}")])
+        .arg("-x")
+        .arg(&debugger.commands)
+        .spawn()
+        .map_err(CliError::from)
+        .attach(format!("launching {}", debugger.program.display()))
+}
+
+fn stop_debugger(debugger: &mut Option<Child>) {
+    if let Some(debugger) = debugger {
+        let _ = debugger.kill();
+        let _ = debugger.wait();
     }
 }
 
@@ -128,11 +222,13 @@ fn attach(client: &mut KdClient<UdpTransport>) -> Result<(), Report<CliError>> {
 
 /// Keeps servicing the kernel until a debugger connects. Stops are
 /// continued, except a held image load and a stop that was pending at
-/// startup, which wait for the debugger.
+/// startup, which wait for the debugger. A launched debugger that exits
+/// before connecting ends the wait.
 fn accept(
     client: &mut KdClient<UdpTransport>,
     listener: &TcpListener,
     console_text: &mpsc::Receiver<ConsoleText>,
+    mut debugger: Option<&mut Child>,
 ) -> Result<TcpStream, Report<CliError>> {
     let stream = loop {
         match listener.accept() {
@@ -143,6 +239,12 @@ fn accept(
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 // Text without a debugger is printed only.
                 while console_text.try_recv().is_ok() {}
+
+                if let Some(debugger) = debugger.as_deref_mut()
+                    && let Some(status) = debugger.try_wait().map_err(CliError::from)?
+                {
+                    return Err(Report::new(CliError::GdbExit { status }));
+                }
 
                 if client.stop().is_some() {
                     client

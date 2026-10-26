@@ -86,6 +86,13 @@ enum Command {
         /// of resuming the console until the debugger connects.
         #[arg(long)]
         stop_on_connect: bool,
+        /// Launch GDB with this command file after the listener and target
+        /// stop are ready. GDB output uses this process's standard streams.
+        #[arg(long, value_name = "FILE")]
+        gdb_command: Option<PathBuf>,
+        /// GDB executable used with `--gdb-command`.
+        #[arg(long, default_value = "gdb")]
+        gdb: PathBuf,
     },
     /// Act as the console's debugger host: acknowledge and continue every
     /// event, print debug output and module loads, and answer the kernel's
@@ -138,9 +145,22 @@ fn run(cli: Cli) -> Result<(), Report<CliError>> {
             registers,
             stop_on_load,
             stop_on_connect,
+            gdb_command,
+            gdb,
         } => {
+            let debugger = gdb_command.map(|commands| commands::DebuggerCommand {
+                program: gdb,
+                commands,
+            });
             let client = connect(cli.target, cli.local, cli.no_timeout)?;
-            commands::gdb_server(client, listen, registers, stop_on_load, stop_on_connect)
+            commands::gdb_server(
+                client,
+                listen,
+                registers,
+                stop_on_load,
+                stop_on_connect,
+                debugger,
+            )
         }
         Command::Host {
             files,

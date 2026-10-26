@@ -3,6 +3,7 @@
 use std::net::AddrParseError;
 use std::num::ParseIntError;
 use std::num::TryFromIntError;
+use std::process::ExitStatus;
 
 use openxbdm_kd_core::DecodeError;
 use openxbdm_kd_core::NtStatus;
@@ -80,6 +81,8 @@ pub enum CliError {
     NoStop { seconds: u64 },
     #[error("GDB session failed: {message}")]
     Gdb { message: String },
+    #[error("GDB exited unsuccessfully: {status}")]
+    GdbExit { status: ExitStatus },
     #[error(transparent)]
     InvalidValue(#[from] ValueError),
     #[error("unrecognized command {line:?}")]

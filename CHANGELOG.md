@@ -64,6 +64,7 @@
 - Serving `DEVKIT\FlashEx\xbdm.xex` from the host boots openxbdm without writing the console disk; stopping the host and rebooting returns to stock XBDM.
 - `openxbdm-kd gdbserver` shows every processor as a thread (reading another processor's registers switches the kernel to it), forwards debug output and module loads to the debugger console, holds the console at an image load with `--stop-on-load`, and makes the kernel report to the host as soon as it starts. `--registers 32` describes the low words of the registers as 32-bit PowerPC (`powerpc:common`) for titles compiled as 32-bit code, so GDB loads their ELF and both debuggers unwind their frames; the default `64` describes the registers as they are. A trap that another processor reaches at a step target is reported for that processor, not as the end of the step.
 - Add `openxbdm-kd gdbserver --stop-on-connect` to hold the safe attachment stop while the debugger connects.
+- Let `openxbdm-kd gdbserver --gdb-command FILE` launch GDB automatically after the listener and target stop are ready, with the selected PowerPC register architecture and big-endian byte order; GDB uses the host process's standard streams for one-command trace capture.
 - `KdClient::switch_processor` and `Request::SwitchProcessor` (0x3150): the kernel makes the named processor serve requests and that processor reports its stop.
 
 ### Client

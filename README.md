@@ -48,7 +48,7 @@ Enable kdnet with stock XBDM (`kdnet set IP=<host> Port=50000`, `kdnet enable`, 
     openxbdm-kd [--no-timeout] listen [--passive] [--log-file kd.log]
     openxbdm-kd [--target 169.254.59.14] break
     openxbdm-kd mem 0x80040000 64
-    openxbdm-kd gdbserver [--listen 127.0.0.1:2159] [--registers 64|32] [--stop-on-load IMAGE]
+    openxbdm-kd gdbserver [--listen 127.0.0.1:2159] [--registers 64|32] [--stop-on-load IMAGE] [--gdb-command FILE]
     openxbdm-kd host [--file CONSOLE_PATH=LOCAL_PATH] [--stop-on-load IMAGE]
     openxbdm-kd reboot
 
@@ -98,6 +98,20 @@ Without a symbol file, start GDB with `-ex 'set endian big'`.
 - Do not set breakpoints in the kernel debugger's own code paths, such as the kd poll path at `0x801b4990`.
 - Single step through MSR.SE stops the console with bug check 0x2b.
 - LLDB releases (21 and earlier) have three defects with 32-bit PowerPC titles: they cannot unwind out of a function that saves no registers, they show values held in several registers with their bytes reversed, and with `--registers 64` they cannot unwind 32-bit frames. GDB has none of them. An LLDB with fixes for all three works with both register widths.
+
+
+`--gdb-command FILE` launches GDB after the listener and target stop are ready,
+sets the selected PowerPC register architecture and big-endian byte order,
+connects it to the server, and runs `FILE`. Use `--gdb PROGRAM` when the
+executable is not named `gdb`. GDB inherits the command's standard streams, so
+one redirection records the debugger host and GDB output together:
+
+    openxbdm-kd --no-timeout gdbserver --stop-on-connect \
+        --gdb-command boot.gdb > boot.log 2>&1
+
+The command file must detach or quit when its trace is complete. On debugger
+launch or command failure, `gdbserver` removes its breakpoints and resumes the
+console before returning an error.
 
 ## Client
 

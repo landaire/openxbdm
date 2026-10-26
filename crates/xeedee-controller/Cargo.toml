@@ -11,7 +11,6 @@ name = "xeedee-controller"
 path = "src/main.rs"
 
 [dependencies]
-gilrs = { workspace = true }
 gpui-kit = { workspace = true }
 openxbdm-client = { path = "../openxbdm-client" }
 rootcause = { workspace = true }
@@ -19,3 +18,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+objc2-game-controller = { workspace = true }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+gilrs = { workspace = true }

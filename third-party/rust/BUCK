@@ -9598,7 +9598,6 @@ cargo.rust_library(
     ],
     platform = {
         "linux-x86_64": dict(),
-        "macos-arm64": dict(),
         "windows-msvc": dict(),
     },
     rustc_flags = ["@$(location :gilrs-0.11-build-script-run[rustc_flags])"],
@@ -9641,7 +9640,6 @@ cargo.rust_binary(
     ],
     platform = {
         "linux-x86_64": dict(),
-        "macos-arm64": dict(),
         "windows-msvc": dict(),
     },
     visibility = [],
@@ -9669,7 +9667,6 @@ buildscript_run(
     ],
     platform = {
         "linux-x86_64": dict(),
-        "macos-arm64": dict(),
         "windows-msvc": dict(),
     },
     version = "0.11.2",
@@ -9717,13 +9714,6 @@ cargo.rust_library(
                 ":libc-0.2",
                 ":libudev-sys-0.1",
                 ":nix-0.31",
-                ":vec_map-0.8",
-            ],
-        ),
-        "macos-arm64": dict(
-            deps = [
-                ":objc2-core-foundation-0.3",
-                ":objc2-io-kit-0.3",
                 ":vec_map-0.8",
             ],
         ),
@@ -18316,6 +18306,12 @@ cargo.rust_library(
     ],
 )
 
+alias(
+    name = "objc2",
+    actual = ":objc2-0.6",
+    visibility = ["PUBLIC"],
+)
+
 cargo.http_archive(
     name = "objc2-0.6.5.crate",
     sha256 = "08849bbd4767dfae9457696856ae1c84fe4e0281bbe4a7abff2d0e06fb7981f8",
@@ -18988,7 +18984,6 @@ cargo.rust_library(
         "CFMachPort",
         "CFMessagePort",
         "CFNumber",
-        "CFPlugInCOM",
         "CFRunLoop",
         "CFSet",
         "CFStream",
@@ -19596,28 +19591,34 @@ cargo.rust_library(
     ],
 )
 
+alias(
+    name = "objc2-game-controller",
+    actual = ":objc2-game-controller-0.3",
+    visibility = ["PUBLIC"],
+)
+
 cargo.http_archive(
-    name = "objc2-io-kit-0.3.2.crate",
-    sha256 = "33fafba39597d6dc1fb709123dfa8289d39406734be322956a69f0931c73bb15",
-    strip_prefix = "objc2-io-kit-0.3.2",
-    urls = ["https://static.crates.io/crates/objc2-io-kit/0.3.2/download"],
+    name = "objc2-game-controller-0.3.2.crate",
+    sha256 = "1962c1882c5abcedb18e5f01acffeaad7b3cbd0a9d4cd8f5ca259ba8a64cb9a3",
+    strip_prefix = "objc2-game-controller-0.3.2",
+    urls = ["https://static.crates.io/crates/objc2-game-controller/0.3.2/download"],
     visibility = [],
 )
 
 cargo.rust_library(
-    name = "objc2-io-kit-0.3",
-    srcs = [":objc2-io-kit-0.3.2.crate"],
-    crate = "objc2_io_kit",
-    crate_root = "objc2-io-kit-0.3.2.crate/src/lib.rs",
+    name = "objc2-game-controller-0.3",
+    srcs = [":objc2-game-controller-0.3.2.crate"],
+    crate = "objc2_game_controller",
+    crate_root = "objc2-game-controller-0.3.2.crate/src/lib.rs",
     edition = "2021",
     env = {
-        "CARGO_BIN_NAME": "objc2_io_kit",
-        "CARGO_CRATE_NAME": "objc2_io_kit",
-        "CARGO_MANIFEST_DIR": "objc2-io-kit-0.3.2.crate",
+        "CARGO_BIN_NAME": "objc2_game_controller",
+        "CARGO_CRATE_NAME": "objc2_game_controller",
+        "CARGO_MANIFEST_DIR": "objc2-game-controller-0.3.2.crate",
         "CARGO_PKG_AUTHORS": "",
-        "CARGO_PKG_DESCRIPTION": "Bindings to the IOKit framework",
+        "CARGO_PKG_DESCRIPTION": "Bindings to the GameController framework",
         "CARGO_PKG_HOMEPAGE": "",
-        "CARGO_PKG_NAME": "objc2-io-kit",
+        "CARGO_PKG_NAME": "objc2-game-controller",
         "CARGO_PKG_README": "README.md",
         "CARGO_PKG_REPOSITORY": "https://github.com/madsmtm/objc2",
         "CARGO_PKG_RUST_VERSION": "1.71",
@@ -19628,10 +19629,15 @@ cargo.rust_library(
         "CARGO_PKG_VERSION_PRE": "",
     },
     features = [
+        "GCController",
+        "GCControllerAxisInput",
+        "GCControllerButtonInput",
+        "GCControllerDirectionPad",
+        "GCControllerElement",
+        "GCDevice",
+        "GCExtendedGamepad",
+        "GCPhysicalInputProfile",
         "alloc",
-        "bitflags",
-        "hid",
-        "libc",
         "std",
     ],
     platform = {
@@ -19639,9 +19645,8 @@ cargo.rust_library(
     },
     visibility = [],
     deps = [
-        ":bitflags-2",
-        ":libc-0.2",
-        ":objc2-core-foundation-0.3",
+        ":objc2-0.6",
+        ":objc2-foundation-0.3",
     ],
 )
 
@@ -31979,7 +31984,6 @@ cargo.rust_library(
     },
     platform = {
         "linux-x86_64": dict(),
-        "macos-arm64": dict(),
         "windows-msvc": dict(),
     },
     visibility = [],

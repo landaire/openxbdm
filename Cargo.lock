@@ -4725,6 +4725,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-game-controller"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1962c1882c5abcedb18e5f01acffeaad7b3cbd0a9d4cd8f5ca259ba8a64cb9a3"
+dependencies = [
+ "objc2 0.6.5",
+ "objc2-foundation 0.3.2",
+]
+
+[[package]]
 name = "objc2-io-kit"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9168,6 +9178,8 @@ version = "0.1.0"
 dependencies = [
  "gilrs",
  "gpui-kit",
+ "objc2 0.6.5",
+ "objc2-game-controller",
  "openxbdm-client",
  "rootcause",
  "serde",

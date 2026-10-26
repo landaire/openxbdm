@@ -76,6 +76,7 @@
 - The command-line client is `xeedee`.
 - Add typed `autoinput` client commands for virtual controller binding, fixed packets, timed packet queues, and queue status.
 - Add the GPUI Kit `xeedee-controller` application for relaying a connected host controller or a JSON controller script to a console.
+- Use the macOS Game Controller framework so connected controllers report live button, trigger, and stick input.
 
 ### Build
 

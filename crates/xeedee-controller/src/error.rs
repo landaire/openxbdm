@@ -38,6 +38,7 @@ pub enum ScriptError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ControllerError {
+    #[cfg(not(target_os = "macos"))]
     #[error("could not initialize the host controller service")]
     Initialize(#[source] gilrs::Error),
     #[error("selected controller is no longer connected")]

@@ -30,6 +30,18 @@ gilrs = "0.11.1"
 gpui-kit = "=0.8.0"
 jiff = "0.2.23"
 memchr = "2.8.0"
+objc2 = "0.6.5"
+objc2-game-controller = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "GCController",
+    "GCControllerAxisInput",
+    "GCControllerButtonInput",
+    "GCControllerDirectionPad",
+    "GCControllerElement",
+    "GCDevice",
+    "GCExtendedGamepad",
+    "GCPhysicalInputProfile",
+] }
 rootcause = "0.12.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"

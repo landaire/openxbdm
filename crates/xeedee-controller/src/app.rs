@@ -36,6 +36,7 @@ use gpui_kit::px;
 use openxbdm_client::commands::Gamepad;
 
 use crate::gamepad::HardwareController;
+use crate::gamepad::initialize as initialize_gamepads;
 use crate::gamepad::scan_controllers;
 use crate::relay::RelayPhase;
 use crate::relay::RelayRequest;
@@ -125,6 +126,14 @@ impl ControllerApp {
     fn scan_controllers(&mut self, cx: &mut Context<Self>) {
         self.scan_error = None;
         self.scan_task = Some(cx.spawn(async move |this, cx| {
+            #[cfg(target_os = "macos")]
+            let result = {
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                scan_controllers()
+            };
+            #[cfg(not(target_os = "macos"))]
             let result = cx.background_spawn(async { scan_controllers() }).await;
             _ = this.update(cx, |this, cx| {
                 match result {
@@ -520,6 +529,7 @@ pub fn run() {
     gpui_kit::application()
         .with_assets(assets::Assets)
         .run(|cx| {
+            initialize_gamepads();
             init(cx);
             open_window(WindowOptions::default(), cx, |window, cx| {
                 cx.new(|cx| ControllerApp::new(window, cx))

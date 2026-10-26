@@ -66,8 +66,40 @@ pub fn memory(
 pub fn reboot(client: &mut KdClient<UdpTransport>) -> Result<(), Report<CliError>> {
     stop_target(client)?;
 
-    client.reboot().map_err(CliError::from)?;
-    println!("reboot requested");
+    match client.reboot() {
+        Ok(()) => {
+            println!("reboot requested");
+            Ok(())
+        }
+        Err(error) if client.stop().is_some() => {
+            client
+                .continue_from_stop()
+                .map_err(CliError::from)
+                .attach("resuming after an unsent reboot request")?;
+            Err(Report::new(CliError::from(error)))
+        }
+        Err(error) => Err(Report::new(CliError::from(error))),
+    }
+}
+
+/// Requests a reboot and treats a missing acknowledgement as an uncertain
+/// delivery followed by reconnect.
+pub fn reboot_for_reconnect(client: &mut KdClient<UdpTransport>) -> Result<(), Report<CliError>> {
+    stop_target(client)?;
+
+    match client.reboot() {
+        Ok(()) => println!("reboot requested"),
+        Err(error) if client.stop().is_some() => {
+            client
+                .continue_from_stop()
+                .map_err(CliError::from)
+                .attach("resuming after an unsent reboot request")?;
+            return Err(Report::new(CliError::from(error)));
+        }
+        Err(error) => {
+            tracing::warn!(%error, "reboot delivery is uncertain; waiting for target restart");
+        }
+    }
 
     Ok(())
 }

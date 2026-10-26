@@ -113,6 +113,15 @@ pub enum CliError {
     },
     #[error("{path} line {line}: the trace point name is empty or contains a control character")]
     TracePointName { path: PathBuf, line: usize },
+    #[error(
+        "{path} line {line}: trace point {name} at {address:#x} is in the breakpoint exception path"
+    )]
+    TracePointDispatch {
+        path: PathBuf,
+        line: usize,
+        address: u32,
+        name: String,
+    },
     #[error("{path} contains no trace points")]
     NoTracePoints { path: PathBuf },
     #[error("read {actual} of 4 bytes at trace point {address:#x}")]

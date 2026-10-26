@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::Parser;
 use clap::Subcommand;
@@ -105,6 +106,9 @@ enum Command {
         /// Stop tracing when this image's load-symbols event arrives.
         #[arg(long, default_value = "xshell.xex", value_name = "IMAGE_NAME")]
         until_load: String,
+        /// Reboot through KD before attaching the tracer to the fresh kernel.
+        #[arg(long)]
+        reboot_first: bool,
         /// Record only the first execution of each function.
         #[arg(long)]
         once: bool,
@@ -181,8 +185,16 @@ fn run(cli: Cli) -> Result<(), Report<CliError>> {
             points,
             output,
             until_load,
+            reboot_first,
             once,
         } => {
+            if reboot_first {
+                {
+                    let mut client = connect(cli.target, cli.local, cli.no_timeout)?;
+                    commands::reboot_for_reconnect(&mut client)?;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
             let mut client = connect(cli.target, cli.local, cli.no_timeout)?;
             commands::function_trace(&mut client, points, output, until_load, once)
         }

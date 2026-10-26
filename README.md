@@ -126,22 +126,28 @@ starting with `#` are ignored. Repeated addresses attach aliases to one trace
 point:
 
     openxbdm-kd --no-timeout function-trace \
+        --reboot-first \
         --points 16547-trace-points.txt \
         --output /tmp/16547-function-trace.tsv \
         --until-load xshell.xex --once
 
-Start the command before power-on. It waits for KD, holds the first stop,
-installs the trace points, and resumes the console. Loading the selected image
-or pressing Ctrl-C stops the console, restores every installed instruction,
-flushes the trace, and resumes it.
+`--reboot-first` attaches without installing traps, reboots through KD, waits
+for the fresh kernel, and then starts the trace. Without it, start the command
+while the console is powered off, then power it on.
 
-The point file must omit the kernel debugger and every function the debugger
-can call while servicing memory, breakpoint, and continue requests. A trap in
-that path can prevent the request reply and leave the console stopped. Omitting
-only the `kd64` objects is not sufficient because those objects call common
-kernel routines. A process kill or host failure can also prevent restoration;
-power-cycle the console before running code from that image again. The command
-cannot observe execution before KD attaches and the points are installed.
+The command holds the first stop, installs the trace points, and resumes the
+console. Loading the selected image or pressing Ctrl-C stops the console,
+restores every installed instruction, flushes the trace, and resumes it.
+
+The point file must omit the breakpoint exception dispatch path, the kernel
+debugger, and every function the debugger can call while servicing memory,
+breakpoint, and continue requests. A trap in one of those paths can prevent the
+request reply and leave the console stopped. The parser rejects the three
+named breakpoint dispatch functions and their known 16547 addresses, but the
+caller must provide the complete build-specific dependency exclusions. A
+process kill or host failure can also prevent restoration; power-cycle the
+console before running code from that image again. The command cannot observe
+execution before KD attaches and the points are installed.
 
 ## Client
 

@@ -27,6 +27,11 @@ use crate::step;
 use crate::transport::UdpTransport;
 
 const TRACE_INSTRUCTION: [u8; 4] = 0x0fe0_0016_u32.to_be_bytes();
+const TRAP_DISPATCH_POINTS: [(&str, u32); 3] = [
+    ("KiDispatchException2", 0x8009_7c20),
+    ("KiDispatchException", 0x8009_7d60),
+    ("KiCommonDispatchExceptionDummy", 0x8009_c928),
+];
 
 #[derive(Debug)]
 struct TracePoint {
@@ -564,6 +569,20 @@ fn parse_points(input: impl BufRead, path: &Path) -> Result<Vec<TracePoint>, Rep
                 address,
             }));
         }
+        if let Some((dispatch_name, _)) =
+            TRAP_DISPATCH_POINTS
+                .iter()
+                .find(|(dispatch_name, dispatch_address)| {
+                    name == *dispatch_name || address == *dispatch_address
+                })
+        {
+            return Err(Report::new(CliError::TracePointDispatch {
+                path: path.to_owned(),
+                line: line_number,
+                address,
+                name: (*dispatch_name).to_owned(),
+            }));
+        }
 
         let names = by_address.entry(address).or_default();
         if !names.iter().any(|existing| existing == name) {
@@ -615,6 +634,24 @@ mod tests {
             parse_points(Cursor::new(b"0x80001002 bad\n"), Path::new("points.txt")).unwrap_err();
 
         assert!(error.to_string().contains("is not 4-byte aligned"));
+    }
+
+    #[test]
+    fn rejects_trap_dispatch_points() {
+        for (name, address) in TRAP_DISPATCH_POINTS {
+            for input in [
+                format!("0x80001000 {name}\n"),
+                format!("{address:#x} renamed\n"),
+            ] {
+                let error = parse_points(Cursor::new(input), Path::new("points.txt")).unwrap_err();
+
+                assert!(
+                    error
+                        .to_string()
+                        .contains("is in the breakpoint exception path")
+                );
+            }
+        }
     }
 
     #[test]

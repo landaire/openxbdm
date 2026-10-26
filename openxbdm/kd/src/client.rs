@@ -397,9 +397,15 @@ where
         self.link.held_reports.clear();
 
         let mut outbox = Outbox::default();
-        self.link
-            .send_request(stop.processor, Request::Reboot, &[], &mut outbox)?;
-        self.flush(outbox)?;
+        let sent = self
+            .link
+            .send_request(stop.processor, Request::Reboot, &[], &mut outbox)
+            .and_then(|()| self.flush(outbox));
+        if let Err(error) = sent {
+            self.link.session.abandon();
+            self.link.stop = Some(stop);
+            return Err(error);
+        }
 
         self.await_acknowledge("reboot acknowledgement")
     }

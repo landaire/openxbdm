@@ -113,6 +113,36 @@ The command file must detach or quit when its trace is complete. On debugger
 launch or command failure, `gdbserver` removes its breakpoints and resumes the
 console before returning an error.
 
+### Function-entry trace
+
+`function-trace` replaces each listed four-byte function entry with a trap,
+records each hit, executes the replaced instruction with temporary
+breakpoints, and installs the entry trap again. `--once` removes each entry
+trap after its first hit. The output is tab-separated: sequence number,
+address, processor, thread, and name.
+
+The point file has one `ADDRESS NAME` pair per line. Blank lines and lines
+starting with `#` are ignored. Repeated addresses attach aliases to one trace
+point:
+
+    openxbdm-kd --no-timeout function-trace \
+        --points 16547-trace-points.txt \
+        --output /tmp/16547-function-trace.tsv \
+        --until-load xshell.xex --once
+
+Start the command before power-on. It waits for KD, holds the first stop,
+installs the trace points, and resumes the console. Loading the selected image
+or pressing Ctrl-C stops the console, restores every installed instruction,
+flushes the trace, and resumes it.
+
+The point file must omit the kernel debugger and every function the debugger
+can call while servicing memory, breakpoint, and continue requests. A trap in
+that path can prevent the request reply and leave the console stopped. Omitting
+only the `kd64` objects is not sufficient because those objects call common
+kernel routines. A process kill or host failure can also prevent restoration;
+power-cycle the console before running code from that image again. The command
+cannot observe execution before KD attaches and the points are installed.
+
 ## Client
 
 Every wire verb is a type implementing [`openxbdm_client::Command`]. You hand one

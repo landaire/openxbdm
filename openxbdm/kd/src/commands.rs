@@ -1,5 +1,6 @@
 //! Command-line subcommands.
 
+mod function_trace;
 mod gdb_server;
 mod host;
 mod listen;
@@ -14,6 +15,7 @@ use crate::print::hexdump;
 use crate::print::print_stop;
 use crate::transport::UdpTransport;
 
+pub use self::function_trace::function_trace;
 pub use self::gdb_server::DebuggerCommand;
 pub use self::gdb_server::RegisterWidth;
 pub use self::gdb_server::gdb_server;

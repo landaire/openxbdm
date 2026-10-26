@@ -3,6 +3,7 @@
 use std::net::AddrParseError;
 use std::num::ParseIntError;
 use std::num::TryFromIntError;
+use std::path::PathBuf;
 use std::process::ExitStatus;
 
 use openxbdm_kd_core::DecodeError;
@@ -42,6 +43,10 @@ pub enum KdError {
     UnalignedBreakpoint { address: u64 },
     #[error("the kernel rejected a breakpoint at {address:#x}")]
     BreakpointRejected { address: u64 },
+    #[error(
+        "a breakpoint request for {address:#x} may have succeeded without returning its handle"
+    )]
+    UntrackedBreakpoint { address: u64 },
     #[error(
         "the kernel did not switch to processor {requested}; processor {stopped} reported the stop"
     )]
@@ -83,6 +88,41 @@ pub enum CliError {
     Gdb { message: String },
     #[error("GDB exited unsuccessfully: {status}")]
     GdbExit { status: ExitStatus },
+    #[error("Ctrl-C handler: {0}")]
+    CtrlC(#[from] ctrlc::Error),
+    #[error("{path} line {line}: expected ADDRESS NAME")]
+    TracePointSyntax { path: PathBuf, line: usize },
+    #[error("{path} line {line}: {text:?} is not an address: {error}")]
+    TracePointAddress {
+        path: PathBuf,
+        line: usize,
+        text: String,
+        error: ParseIntError,
+    },
+    #[error("{path} line {line}: trace point address {address:#x} is not a 32-bit address")]
+    TracePointRange {
+        path: PathBuf,
+        line: usize,
+        address: u64,
+    },
+    #[error("{path} line {line}: trace point address {address:#x} is not 4-byte aligned")]
+    TracePointUnaligned {
+        path: PathBuf,
+        line: usize,
+        address: u32,
+    },
+    #[error("{path} line {line}: the trace point name is empty or contains a control character")]
+    TracePointName { path: PathBuf, line: usize },
+    #[error("{path} contains no trace points")]
+    NoTracePoints { path: PathBuf },
+    #[error("read {actual} of 4 bytes at trace point {address:#x}")]
+    UnreadableTracePoint { address: u32, actual: usize },
+    #[error("trace point {address:#x} originally contains an unconditional trap")]
+    TraceOriginalTrap { address: u32 },
+    #[error("the target is running, so function trace points cannot be restored")]
+    TraceCleanupTargetRunning,
+    #[error("exception {status} at {address:#x} stopped the function trace")]
+    TraceException { address: u32, status: NtStatus },
     #[error(transparent)]
     InvalidValue(#[from] ValueError),
     #[error("unrecognized command {line:?}")]

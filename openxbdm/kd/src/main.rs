@@ -94,6 +94,21 @@ enum Command {
         #[arg(long, default_value = "gdb")]
         gdb: PathBuf,
     },
+    /// Record every mapped kernel function entered before an image loads.
+    FunctionTrace {
+        /// Lines of `ADDRESS NAME`, one function entry per line.
+        #[arg(long, value_name = "FILE")]
+        points: PathBuf,
+        /// Tab-separated function-entry trace to write.
+        #[arg(long, value_name = "FILE")]
+        output: PathBuf,
+        /// Stop tracing when this image's load-symbols event arrives.
+        #[arg(long, default_value = "xshell.xex", value_name = "IMAGE_NAME")]
+        until_load: String,
+        /// Record only the first execution of each function.
+        #[arg(long)]
+        once: bool,
+    },
     /// Act as the console's debugger host: acknowledge and continue every
     /// event, print debug output and module loads, and answer the kernel's
     /// host file requests. Unmapped paths are answered as not found, so the
@@ -161,6 +176,15 @@ fn run(cli: Cli) -> Result<(), Report<CliError>> {
                 stop_on_connect,
                 debugger,
             )
+        }
+        Command::FunctionTrace {
+            points,
+            output,
+            until_load,
+            once,
+        } => {
+            let mut client = connect(cli.target, cli.local, cli.no_timeout)?;
+            commands::function_trace(&mut client, points, output, until_load, once)
         }
         Command::Host {
             files,

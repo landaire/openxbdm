@@ -24,6 +24,7 @@ repository = "https://github.com/landaire/xeedee"
 
 [workspace.dependencies]
 bytes = "1.11.1"
+ctrlc = "3.5.2"
 futures-io = "0.3.32"
 futures-util = { version = "0.3.32", default-features = false, features = ["std", "io"] }
 gilrs = "0.11.1"

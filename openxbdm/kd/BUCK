@@ -31,6 +31,7 @@ rust_library(
     deps = [
         "//openxbdm/kd/core:openxbdm_kd_core",
         "//third-party/rust:clap",
+        "//third-party/rust:ctrlc",
         "//third-party/rust:gdbstub",
         "//third-party/rust:jiff",
         "//third-party/rust:rootcause",
@@ -55,6 +56,7 @@ rust_test(
     deps = [
         "//openxbdm/kd/core:openxbdm_kd_core",
         "//third-party/rust:clap",
+        "//third-party/rust:ctrlc",
         "//third-party/rust:gdbstub",
         "//third-party/rust:insta",
         "//third-party/rust:jiff",
@@ -76,6 +78,7 @@ rust_binary(
     deps = [
         "//openxbdm/kd/core:openxbdm_kd_core",
         "//third-party/rust:clap",
+        "//third-party/rust:ctrlc",
         "//third-party/rust:gdbstub",
         "//third-party/rust:jiff",
         "//third-party/rust:rootcause",
@@ -100,6 +103,7 @@ rust_test(
     deps = [
         "//openxbdm/kd/core:openxbdm_kd_core",
         "//third-party/rust:clap",
+        "//third-party/rust:ctrlc",
         "//third-party/rust:gdbstub",
         "//third-party/rust:insta",
         "//third-party/rust:jiff",

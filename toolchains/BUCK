@@ -20,6 +20,14 @@ xbox360_toolchains(
     xbox360_rustc_flags = ["-Cpanic=immediate-abort"] + profile_xbox360_rustc_flags(),
 )
 
+# The prelude validates both branches of its C++ default-dependency selector.
+# The config//:none branch is not selected by this repository.
+alias(
+    name = "cxx_no_default_deps",
+    actual = ":cxx",
+    visibility = ["PUBLIC"],
+)
+
 # Downloaded only when something runs rustfmt.
 rust_release(
     name = "rustfmt-nightly",

@@ -1,0 +1,9 @@
+package(
+    visibility = [
+        "//bindings/...",
+        "//openxbdm/...",
+        "//xbox360/...",
+    ],
+)
+
+enforce_visibility_intersection()

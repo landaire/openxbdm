@@ -32,13 +32,13 @@ BUCK2 = ROOT / "bin" / ("buck2.cmd" if sys.platform == "win32" else "buck2")
 # workspace executables are development tools: the mock host server, the
 # console module's assembly rewrite, and the FFI header generator.
 EXECUTABLES = {
-    "root//crates/openxbdm-cli:xeedee-bin": "xeedee",
-    "root//crates/openxbdm-kd:openxbdm-kd-bin": "openxbdm-kd",
-    "root//crates/xeedee-controller:xeedee-controller-bin": "xeedee-controller",
+    "root//openxbdm/cli:xeedee-bin": "xeedee",
+    "root//openxbdm/controller:xeedee-controller-bin": "xeedee-controller",
+    "root//openxbdm/kd:openxbdm-kd-bin": "openxbdm-kd",
 }
 
-FFI_SHARED = "root//crates/openxbdm-ffi:openxbdm_ffi[cdylib]"
-FFI_STATIC = "root//crates/openxbdm-ffi:openxbdm_ffi[staticlib]"
+FFI_SHARED = "root//openxbdm/ffi:openxbdm_ffi[cdylib]"
+FFI_STATIC = "root//openxbdm/ffi:openxbdm_ffi[staticlib]"
 FFI_HEADERS = "root//bindings:cpp"
 
 DOCUMENTS = ["README.md"]

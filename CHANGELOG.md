@@ -80,7 +80,10 @@
 
 ### Build
 
-- Build, test and lint with Buck2. `build_defs/update_buck_files.py` generates `crates/<name>/BUCK` for each workspace crate from Cargo's resolution, including test targets and `-all-features` variants, and `third-party/rust/BUCK` through Reindeer.
+- Build, test and lint with Buck2. `build_defs/update_buck_files.py` generates `openxbdm/**/BUCK` for each workspace crate from Cargo's resolution, including test targets and `-all-features` variants, and `third-party/rust/BUCK` through Reindeer.
+- Organize workspace crates by component under `openxbdm/`, including `cli`, `client`, `controller`, `ffi`, `kd`, and `server`, with nested packages for component-specific support crates.
+- Restrict generated openxbdm targets to the openxbdm, bindings, and Xbox module package trees with an enforced Buck2 package visibility boundary.
+- Provide a Nix flake with packages and apps for every host executable, an aggregate `openxbdm-tools` package, and a development shell that shares its packages and environment with `devenv.nix`.
 - Buck2 downloads each crates.io dependency and checks it against the SHA-256 in `Cargo.lock`; nothing is vendored. Cargo fetches from crates.io.
 - Build the Xbox 360 module with Buck2 (`//xbox360:openxbdm`, `//xbox360:openxbdm-boot-guard`) on every host, with the toolchain, standard library overlay, build rules, xex-link and xbox360-asm-rewrite of rust-xbox360 as the `xbox360` external cell pinned to a commit. rustc assembles the rewritten module, and llvm-objdump comes from the Rust release; no LLVM installation, overlay step or `build_xbox360.sh` is needed.
 - The module's `[elf]` keeps its symbols and debug information, which the XEX leaves out, and `[gdb]` and `[lldb]` load it into a debugger with the standard library source (rust-xbox360 with debug information).

@@ -4,11 +4,11 @@ Specs: `commands/group1.md` (addtitlemem, advmem), `group2.md` (detour),
 `group3.md` (getmem, getmemex), `group5.md` (memtrack, modsections,
 modules), `group6.md` (pdbinfo), `group7.md` (setmem), `group8.md`
 (traceimports, walkmem, xbeinfo, xexfield).
-Server: `crates/openxbdm-server/src/commands/memory.rs`. Host mock:
-`crates/openxbdm-server-host/src/backend/memory.rs`. Xbox backend:
-`crates/openxbdm-server-xbox360/src/backend/memory.rs`. Tests:
-`crates/openxbdm-server-host/tests/memory.rs`. Client:
-`crates/openxbdm-client/src/commands/memory.rs`, `process.rs`.
+Server: `openxbdm/server/src/commands/memory.rs`. Host mock:
+`openxbdm/server/host/src/backend/memory.rs`. Xbox backend:
+`openxbdm/server/xbox360/src/backend/memory.rs`. Tests:
+`openxbdm/server/host/tests/memory.rs`. Client:
+`openxbdm/client/src/commands/memory.rs`, `process.rs`.
 
 The Xbox module enumeration reads the loader lists and lock from the debug
 monitor data block (`ExDebugMonitorService` 1, copied at startup by
@@ -74,7 +74,7 @@ Settings file: `memory::memtrack_settings_lines` writes
 
 ## Detour engine
 
-Shared engine (`crates/openxbdm-server/src/commands/memory/detour.rs`):
+Shared engine (`openxbdm/server/src/commands/memory/detour.rs`):
 entry table with stock's list operations, record pool with lock-free
 free/filled queues, the logger notifications 0-3, and the completion
 slots. The console backend owns the stubs (copied from stock, entering the
@@ -88,7 +88,7 @@ completion pass whenever one is queued; `MockBackend::detour_call` and
 
 ## Exports
 
-Implemented in `crates/openxbdm-server-xbox360/src/backend/memory/exports.rs`:
+Implemented in `openxbdm/server/xbox360/src/backend/memory/exports.rs`:
 10 get memory, 12 get proc address, 16 get xbe info, 40 set memory, 51 and
 142 walk loaded modules, 52 walk module sections, 75 memory statistics
 (wrapper over `performance::memory_statistics`), 77 type name, 78 register

@@ -8,7 +8,7 @@ Specs: group1 (`autoprof`, `capctrl`), group4 (`gpucount`), group5
 
 ## Server
 
-Code: `crates/openxbdm-server/src/commands/performance.rs`,
+Code: `openxbdm/server/src/commands/performance.rs`,
 `performance/counters.rs` (counter objects, sampler, `querypc`
 evaluation), `performance/pix.rs` (`pixcmd`), `performance/studio.rs`
 (Xbox Studio socket transport framing, unit-tested),
@@ -33,7 +33,7 @@ an `Engine` trait, unit-tested).
 
 ## Host mock
 
-`crates/openxbdm-server-host/src/backend/performance.rs` and its submodules: the 32 built-in
+`openxbdm/server/host/src/backend/performance.rs` and its submodules: the 32 built-in
 counters in stock directory order with stock registration words and a
 source word layout matching 0x91fae680 (page counts, then per-processor
 idle/DPC/ISR pairs); `Counters::tick` runs the bucketed sampler. A tiled

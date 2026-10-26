@@ -1,18 +1,18 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/openxbdm-core",
-    "crates/openxbdm-client",
-    "crates/xeedee-controller",
-    "crates/openxbdm-cli",
-    "crates/openxbdm-ffi",
-    "crates/openxbdm-ffi-bindgen",
-    "crates/openxbdm-kd",
-    "crates/openxbdm-kd-core",
-    "crates/openxbdm-server",
-    "crates/openxbdm-server-host",
-    "crates/openxbdm-server-xbox360",
-    "crates/smb2-server",
+    "openxbdm/core",
+    "openxbdm/client",
+    "openxbdm/cli",
+    "openxbdm/controller",
+    "openxbdm/ffi",
+    "openxbdm/ffi/bindgen",
+    "openxbdm/kd",
+    "openxbdm/kd/core",
+    "openxbdm/server",
+    "openxbdm/server/host",
+    "openxbdm/server/smb2",
+    "openxbdm/server/xbox360",
     "third-party/rust",
 ]
 

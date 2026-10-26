@@ -8,7 +8,7 @@ Cargo.toml stays the description of every crate; the build files follow it:
 
 - third-party/rust/BUCK: `reindeer buckify` writes the rules for the
   crates.io dependencies, each listing the reindeer platforms that use it.
-- crates/*/BUCK: the rules for each workspace crate. A library becomes
+- openxbdm/**/BUCK: the rules for each workspace crate. A library becomes
   `:<lib>`, a binary `:<bin>-bin`, and their unit tests `:<lib>-lib-test` and
   `:<bin>-bin-test`; the integration test `tests/<name>.rs` becomes
   `:<name>-test`. A benchmark becomes the executable `:<name>-bench` (only
@@ -155,9 +155,9 @@ class Workspace:
     def is_member(self, package_id):
         return package_id in self.directories
 
-    def crates(self):
-        """The workspace members that get crates/*/BUCK files."""
-        return [package for package in self.members if self.directories[package["id"]].startswith("crates/")]
+    def product_crates(self):
+        """The workspace members that get openxbdm/**/BUCK files."""
+        return [package for package in self.members if self.directories[package["id"]].startswith("openxbdm/")]
 
     def missing_third_party_features(self):
         """Features that `--all-features` enables on third-party packages and
@@ -327,7 +327,6 @@ def crate_rules(package, directory, resolved, suffix, default, console):
         return enabled.pop()
 
     features = per_host(resolved.features)
-    visibility = ["PUBLIC"] if default else None
     labels = None if default else ["all-features"]
     rules = []
     library = library_target(package)
@@ -346,7 +345,6 @@ def crate_rules(package, directory, resolved, suffix, default, console):
             # The default-feature library runs the documentation tests.
             "doctests": library["doctest"] and default,
             "labels": labels,
-            "visibility": visibility,
         }
         if "cdylib" in library["crate_types"]:
             # The `[cdylib]` subtarget gets Cargo's file name, which is also
@@ -382,11 +380,10 @@ def crate_rules(package, directory, resolved, suffix, default, console):
                 "features": features,
                 "deps": resolved.deps(own_library),
                 "labels": labels,
-                "visibility": visibility,
             }
             if console is not None:
                 # xbox360/BUCK builds the module from every feature selection.
-                attributes = attributes | {"link_script": console["link_script"], "visibility": ["PUBLIC"]}
+                attributes = attributes | {"link_script": console["link_script"]}
                 rules.append(call("xbox360_executable_core", attributes))
                 continue
             rules.append(call("rust_binary", attributes))
@@ -491,7 +488,7 @@ def main():
         return 1
     written = set()
     try:
-        for package in workspace.crates():
+        for package in workspace.product_crates():
             directory, text = crate_build_file(workspace, package, aliases)
             path = ROOT / directory / "BUCK"
             path.write_text(text, encoding="utf-8")
@@ -500,8 +497,8 @@ def main():
         print(f"error: {error}", file=sys.stderr)
         return 1
 
-    # Build files of crates that are no longer workspace members.
-    for path in (ROOT / "crates").glob("*/BUCK"):
+    # Generated build files of crates that are no longer workspace members.
+    for path in (ROOT / "openxbdm").rglob("BUCK"):
         if path not in written and path.read_text(encoding="utf-8").startswith(GENERATED):
             path.unlink()
     return 0

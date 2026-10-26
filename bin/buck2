@@ -1,7 +1,7 @@
 #!/bin/sh
-# Runs the Buck2 release that toolchains/buck2 pins, through the DotSlash
-# that bootstrap.sh installs into .tools. Add this directory to PATH to run
-# it as buck2.
+# Runs the Buck2 release that toolchains/buck2 pins through DotSlash from
+# PATH or the copy that bootstrap.sh installs into .tools. Add this
+# directory to PATH to run it as buck2.
 set -eu
 
 # Resolve links to this file so a link on PATH finds the repository.
@@ -15,10 +15,14 @@ while [ -L "$self" ]; do
 done
 
 root=$(CDPATH='' cd -- "$(dirname -- "$self")/.." && pwd)
-dotslash=$root/.tools/bin/dotslash
-
-if [ ! -x "$dotslash" ]; then
+local_dotslash=$root/.tools/bin/dotslash
+if command -v dotslash >/dev/null 2>&1; then
+    dotslash=$(command -v dotslash)
+elif [ -x "$local_dotslash" ]; then
+    dotslash=$local_dotslash
+else
     "$root/bootstrap.sh"
+    dotslash=$local_dotslash
 fi
 
 DOTSLASH_CACHE=$root/.tools/dotslash

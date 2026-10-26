@@ -1,6 +1,6 @@
 # System domain parity
 
-Stock XBDM 2.0.21256.0. Server: `crates/openxbdm-server/src/commands/system.rs`. Host mock: `crates/openxbdm-server-host/src/backend/system.rs`. Xbox: `crates/openxbdm-server-xbox360/src/backend/system.rs` and `system/flash.rs`. Tests: `crates/openxbdm-server-host/tests/system.rs`.
+Stock XBDM 2.0.21256.0. Server: `openxbdm/server/src/commands/system.rs`. Host mock: `openxbdm/server/host/src/backend/system.rs`. Xbox: `openxbdm/server/xbox360/src/backend/system.rs` and `system/flash.rs`. Tests: `openxbdm/server/host/tests/system.rs`.
 
 ## Commands
 

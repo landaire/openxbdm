@@ -300,7 +300,7 @@ specified in `framework.md`. Points relied on in this file:
   kits).
 - Backend requirement: none.
 - Status: spec complete. Disagreement: the client wrapper `Halt` in
-  `crates/openxbdm-client/src/commands/debug.rs` expects `200- OK`.
+  `openxbdm/client/src/commands/debug.rs` expects `200- OK`.
 
 ## hdd
 

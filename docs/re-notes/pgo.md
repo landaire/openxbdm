@@ -6,8 +6,8 @@ Profile-guided-optimization instrumented titles call the exports below to
 register their modules and to record call, path, and value profiles; the
 runtime writes the profiles to `.pgc` files. Status: reverse engineered
 completely and reimplemented in
-`crates/openxbdm-server/src/commands/hardware/pgo.rs` (pure logic) and
-`crates/openxbdm-server-xbox360/src/backend/hardware/pgo.rs` (runtime and
+`openxbdm/server/src/commands/hardware/pgo.rs` (pure logic) and
+`openxbdm/server/xbox360/src/backend/hardware/pgo.rs` (runtime and
 exports). Deviations are listed in parity/hardware.md and nuances.md.
 
 ## Globals

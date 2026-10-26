@@ -1,0 +1,24 @@
+---
+source: openxbdm/client/src/commands/security.rs
+expression: entries
+---
+[
+    UserEntry {
+        name: "bob",
+        privileges: Privileges(
+            31,
+        ),
+    },
+    UserEntry {
+        name: "a\" read\"",
+        privileges: Privileges(
+            0,
+        ),
+    },
+    UserEntry {
+        name: "",
+        privileges: Privileges(
+            0,
+        ),
+    },
+]

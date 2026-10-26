@@ -7,11 +7,11 @@ dbgname, debugmemsize, debugmode, discoverable, dmversion), `group3.md`
 `group4.md` (httpreg), `group5.md` (kiosk, livesigninrequired), `group6.md`
 (resetnetra), `group7.md` (setconfig, setretail, setserver, systeminfo),
 `group8.md` (verbose, welcomedefault, welcomehide).
-Server: `crates/openxbdm-server/src/commands/console.rs`. Host mock:
-`crates/openxbdm-server-host/src/backend/console.rs`. Xbox backend:
-`crates/openxbdm-server-xbox360/src/backend/console.rs`. Tests:
-`crates/openxbdm-server-host/tests/console.rs`. Client:
-`crates/openxbdm-client/src/commands/info.rs`.
+Server: `openxbdm/server/src/commands/console.rs`. Host mock:
+`openxbdm/server/host/src/backend/console.rs`. Xbox backend:
+`openxbdm/server/xbox360/src/backend/console.rs`. Tests:
+`openxbdm/server/host/tests/console.rs`. Client:
+`openxbdm/client/src/commands/info.rs`.
 
 The domain also owns the simulated console configuration (XConfig) used by
 the hardware, file system, performance, services and system domains:
@@ -92,7 +92,7 @@ output limit as to stock's formatted messages.
 
 ## Exports
 
-Implemented in `crates/openxbdm-server-xbox360/src/backend/console.rs`.
+Implemented in `openxbdm/server/xbox360/src/backend/console.rs`.
 Readers use mirrors the server publishes through `Backend::publish`
 (`commands::console::Published`: debug name, dump mode, dump settings,
 event defer mask, trace mask, lab server registration). Writers build a
@@ -183,7 +183,7 @@ since XAM calls it with the console ABI.
   final status and body; failures after the first headers are reported
   in its receiving state 3.
 - XAM ordinal 515 and the feature table: `commands/group3.md#feature`. The
-  host simulation is `crates/openxbdm-server-host/src/backend/console/feature.rs`;
+  host simulation is `openxbdm/server/host/src/backend/console/feature.rs`;
   the running mask defaults to 0x7f (no stored setting) and the loader
   flags to 0x9e, read from `XboxHardwareInfo` (0x801c0030) in the
   reference console's kernel image.

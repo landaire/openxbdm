@@ -1,10 +1,10 @@
 load("//build_defs:cpp_bindings.bzl", "cpp_bindings")
 
 # The C++ headers for the openxbdm-ffi libraries
-# (`//crates/openxbdm-ffi:openxbdm_ffi[cdylib]` and `[staticlib]`).
+# (`//openxbdm/ffi:openxbdm_ffi[cdylib]` and `[staticlib]`).
 cpp_bindings(
     name = "cpp",
-    crate_sources = "//crates/openxbdm-ffi:openxbdm_ffi[sources]",
-    generator = "//crates/openxbdm-ffi-bindgen:openxbdm-ffi-bindgen-bin",
+    crate_sources = "//openxbdm/ffi:openxbdm_ffi[sources]",
+    generator = "//openxbdm/ffi/bindgen:openxbdm-ffi-bindgen-bin",
     visibility = ["PUBLIC"],
 )

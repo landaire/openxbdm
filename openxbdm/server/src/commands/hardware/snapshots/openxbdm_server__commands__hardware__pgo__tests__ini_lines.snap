@@ -1,0 +1,23 @@
+---
+source: openxbdm/server/src/commands/hardware/pgo.rs
+expression: results
+---
+[
+    "None false",
+    "None false",
+    "None false",
+    "None true",
+    "Some(\"AllocScale(3)\") true",
+    "Some(\"AllocScale(2)\") true",
+    "None true",
+    "Some(\"AllocScale(0)\") true",
+    "Some(\"OutputPath(e:\\\\pgo)\") true",
+    "Some(\"DisableDataCollection\") true",
+    "None true",
+    "Some(\"Option { option: StandardPgc, value: 1 }\") true",
+    "Some(\"Option { option: MaxTitleMemory, value: 4294967295 }\") true",
+    "Some(\"Option { option: EnableSweepFullBuffer, value: 0 }\") true",
+    "None true",
+    "None true",
+    "Some(\"Option { option: ValidateEplh, value: 1 }\") true",
+]

@@ -4,12 +4,12 @@ Specs: `commands/group3.md` (getsockinfo), `group4.md` (getxnkeyinfo,
 getxnqoslookupinfo, getxnsecassocinfo, ipproxy), `group5.md` (linkstate,
 netcap, netsim, nicstats), `group8.md` (xhttpproxy), `dispatcher.md` (control
 codes 0x0b..0x16, 0xa5..0xa7).
-Server: `crates/openxbdm-server/src/commands/network.rs` and
+Server: `openxbdm/server/src/commands/network.rs` and
 `commands/network/{ipproxy,netcap,netsim,xhttpproxy}.rs`. Host mock:
-`crates/openxbdm-server-host/src/backend/network.rs` and `backend/network/`.
-Xbox backend: `crates/openxbdm-server-xbox360/src/backend/network.rs` and
-`backend/network/`. Tests: `crates/openxbdm-server-host/tests/network.rs` and
-`tests/network/`. Client: `crates/openxbdm-client/src/commands/perf.rs`
+`openxbdm/server/host/src/backend/network.rs` and `backend/network/`.
+Xbox backend: `openxbdm/server/xbox360/src/backend/network.rs` and
+`backend/network/`. Tests: `openxbdm/server/host/tests/network.rs` and
+`tests/network/`. Client: `openxbdm/client/src/commands/perf.rs`
 (`GetSocketInfo`).
 
 | Command | Wire | Host mock | Xbox backend |
@@ -59,7 +59,7 @@ title proxies and stops a non-persistent capture.
 
 ## Exports
 
-Xbox only: `crates/openxbdm-server-xbox360/src/backend/network/exports.rs`.
+Xbox only: `openxbdm/server/xbox360/src/backend/network/exports.rs`.
 Structure codecs and blob builders: `commands/network/netsim/api.rs` (unit
 tested). The helpers are the command cores (`netcap::start_capture`,
 `netcap::stop_capture`, `netsim::{insert_queue, remove_queues,
@@ -135,7 +135,7 @@ items, built-in string functions only).
   faults.
 
 ### ipproxy
-- Wire-verified by host tests (crates/openxbdm-server-host/tests/network/ipproxy.rs):
+- Wire-verified by host tests (openxbdm/server/host/tests/network/ipproxy.rs):
   - `start_and_stop_report_the_tunnel`: `200- started ver=1 addr=0xc0a8011a port=0x%04x` (local UDP port, debug XNADDR address); the hook is installed, the bypass flag is set, and the socket is connected to addr:port; `200- stopped` clears everything.
   - `start_validates_parameters`: missing, zero or unparsable ver/addr/port, port > 0xffff, no flag, an unknown flag, and `stop start` all give `423- bad parameter`.
   - `start_twice_and_stop_without_start`: `410- file already exists`; `426- `.
@@ -150,7 +150,7 @@ items, built-in string functions only).
 - Unit tests (tunnel.rs): byte-exact encapsulate/decapsulate, including the zeroed checksum on oversized TCP, the size limit, and the fragment/options/protocol filters.
 
 ### netcap
-Wire-verified by host tests in crates/openxbdm-server-host/tests/network/netcap.rs:
+Wire-verified by host tests in openxbdm/server/host/tests/network/netcap.rs:
 - `netcap` with no subcommand: `423- bad parameter`; `netcap start` without `file=`: `412- filename is invalid`; `netcap stop` when idle: `435- `.
 - `netcap start file=e:\cap.bin`: `200- started`; frames go to `\Device\Harddisk0\Partition1\DEVKIT\cap.bin` (raw text when untranslatable). Default buffers are 0x20000/0x4000; flags 8 gives 0x2000/0x1000; buffersize sets chunk = min(size/2, 0x4000).
 - `netcap stop`: `200- stopped frames=N`. File bytes checked exactly: header, media block, records with microsecond times, frame table, table location at 0x18. An empty capture has a zero table location.
@@ -162,7 +162,7 @@ Wire-verified by host tests in crates/openxbdm-server-host/tests/network/netcap.
 - The capture file is created in the simulated file system (create-new, read/write access, share read; names without a leading backslash resolve below `\??\`, standing in for root handle 0xfffffffd), so `getfile` reads it (`getfile_reads_the_finished_capture`). A missing directory gives `402- err=0x82da0002` (`missing_directories_fail_the_start`).
 - Simulator chaining (`captures_chain_into_the_network_simulator`): a running capture moves into a new netsim instance and back to its own intercept when the instance is released; a capture started while an instance exists skips the intercept. A failed instance creation leaves the capture attached but unrouted until the next instance (`failed_simulator_creation_leaves_the_capture_unrouted`).
 
-### netsim (wire-verified by crates/openxbdm-server-host/tests/network/netsim.rs)
+### netsim (wire-verified by openxbdm/server/host/tests/network/netsim.rs)
 - Version gate (< 0x20278700): `407- unknown command` (requires_the_system_version).
 - getnumqs/getnumipv4redirs/removeq/removeipv4redir without an instance: `in=0 out=0`, `num=0`, `removed=0 inleft=0 outleft=0`, `removed=0 left=0` (counts_without_an_instance).
 - Parameter rules: no/unknown subcommand, missing direction, both directions, missing/empty cfg, missing index: `423- bad parameter`; bad hex (odd count, bad digit) `407- unknown command` before subcommand selection (parameter_errors).

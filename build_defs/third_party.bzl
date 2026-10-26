@@ -44,7 +44,7 @@ def _rust_library(name: str, **kwargs):
     # Proc macros are not limited: the prelude wraps each in an alias that
     # takes no compatibility attributes, and an alias of a limited macro fails
     # analysis on other hosts. A macro that only another host uses is
-    # outside the graph of //crates/... on this host.
+    # outside the graph of //openxbdm/... on this host.
     if not kwargs.get("proc_macro"):
         kwargs = _platform_gated(name, kwargs)
     _cargo.rust_library(name = name, **kwargs)

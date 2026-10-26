@@ -52,10 +52,10 @@ methods: Console deployment, below.
 `toolchains/buck2` is a [DotSlash](https://dotslash-cli.com) file that
 pins the Buck2 release: the URL, size and BLAKE3 digest of its build for
 each host. `bin/buck2` (`bin\buck2.cmd` on Windows) runs that release
-through a DotSlash that `bootstrap.sh` (`bootstrap.ps1` on Windows)
-installs into `.tools`, which Git ignores. The first run of `bin/buck2`
-runs the bootstrap script, which downloads DotSlash, checks its SHA-256,
-fetches Buck2 into `.tools/dotslash`, and reports missing host tools.
+through DotSlash. It uses DotSlash from `PATH` when available; otherwise
+`bootstrap.sh` (`bootstrap.ps1` on Windows) installs it into `.tools`,
+which Git ignores. The first run fetches Buck2 into `.tools/dotslash`
+and reports missing host tools.
 Add `bin` to `PATH` to run it as `buck2`; the `build_defs` scripts use
 `bin/buck2` unless `--buck2` names another executable. To run the
 bootstrap script yourself on Windows, where PowerShell may refuse a
@@ -71,11 +71,18 @@ To move to another Buck2 release, replace `toolchains/buck2` with the
 To move to another DotSlash release, change the version and SHA-256
 values in both bootstrap scripts and run them again.
 
-`devenv shell` (`devenv.nix`) puts `bin` on `PATH` and provides Reindeer,
-Python, and the Rust release in `rust-toolchain.toml`. It provides no C
-compiler. `devenv --profile ci shell` adds `bazel-remote` for the CI
-action cache (`ci/start-action-cache.sh`). `mise.toml` puts `bin` on
-`PATH` for its tasks.
+`devenv shell` and `nix develop path:.` use the shared definitions in
+`nix/development-environment.nix`. They put `bin` on `PATH` and provide
+the Rust release in `rust-toolchain.toml`, Reindeer, Python, Git, curl,
+DotSlash, and the Linux native dependencies. The default standard
+environment has no C compiler; the Linux shell includes Clang for the
+small C shims in native dependencies. `devenv --profile ci shell` also
+adds `bazel-remote` for the CI action cache (`ci/start-action-cache.sh`).
+`mise.toml` puts `bin` on `PATH` for its tasks.
+
+The flake locks its inputs in `flake.lock`. The default flake package
+contains every host executable; each is also an individual package and
+app.
 
 Buck2 takes its Rust toolchain from the `xbox360` cell,
 [rust-xbox360](https://github.com/landaire/rust-xbox360) at the commit in
@@ -151,8 +158,8 @@ the `.buckconfig.local` entry.
 Buck2 is the primary build system. Cargo builds the host crates from the
 same sources.
 
-    buck2 build //: //bindings/... //crates/... //xbox360/...
-    buck2 test //: //bindings/... //crates/... //xbox360/...
+    buck2 build //: //bindings/... //openxbdm/... //xbox360/...
+    buck2 test //: //bindings/... //openxbdm/... //xbox360/...
     build_defs/lint.py
 
     cargo build --workspace
@@ -169,7 +176,7 @@ the engine without `smb2-server`.
 
 Build modes are configuration modifiers. `?dev` is the default and keeps external debug information. For host builds, `?release` adds `-Copt-level=3` to every crate and thin LTO to binaries and tests while keeping external debug information. `?release_no_symbols` makes the same optimized host build without symbols. Console modules keep their size optimization and LTO settings; the modes select whether they retain symbols. For example:
 
-    buck2 build //crates/openxbdm-cli:xeedee-bin?release
+    buck2 build //openxbdm/cli:xeedee-bin?release
 
 On Linux, a host binary's external debug file is its `[symbols]` subtarget. The console module's `[elf]` subtarget is its external debugger image.
 
@@ -349,7 +356,7 @@ which writes:
 - `third-party/rust/BUCK`, through `reindeer buckify`: the rules for the
   crates.io dependencies, each limited to the hosts that use it
   (`build_defs/third_party.bzl`).
-- `crates/*/BUCK`: the rules for each workspace crate. A library becomes
+- `openxbdm/**/BUCK`: the rules for each workspace crate. A library becomes
   `:<lib>`, a binary `:<bin>-bin`, their unit tests `:<lib>-lib-test` and
   `:<bin>-bin-test`, the integration test `tests/<name>.rs`
   `:<name>-test`, and an example `:<name>-example`. A crate whose
@@ -408,7 +415,7 @@ To add or update a dependency:
 `openxbdm-kd-core` is the `no_std` codec and packet session for kdnet;
 `openxbdm-kd` holds the UDP transport, client, GDB target and the
 `openxbdm-kd` binary. Protocol notes are in `docs/re-notes/kd.md`. The codec
-snapshot tests decode `crates/openxbdm-kd-core/tests/fixtures/kd.log`
+snapshot tests decode `openxbdm/kd/core/tests/fixtures/kd.log`
 (`time peer length hex` lines, the format written by
 `openxbdm-kd listen --log-file`). Append new captures there and review the
 snapshots with `cargo insta review`. `tests/fixtures/file_io.log` holds the

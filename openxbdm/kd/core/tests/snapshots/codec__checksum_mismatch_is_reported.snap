@@ -1,0 +1,8 @@
+---
+source: openxbdm/kd/core/tests/codec.rs
+expression: packet.verify().unwrap_err()
+---
+ChecksumMismatch {
+    expected: Checksum(0x0000324e),
+    computed: Checksum(0x0000324f),
+}

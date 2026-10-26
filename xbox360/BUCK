@@ -1,6 +1,6 @@
 load("@xbox360//buck:xex.bzl", "xex_from_assembly")
 
-_MODULE = "//crates/openxbdm-server-xbox360:openxbdm-server-xbox360"
+_MODULE = "//openxbdm/server/xbox360:openxbdm-server-xbox360"
 
 # For the kd host (DEVELOPING.md, Console deployment).
 xex_from_assembly(

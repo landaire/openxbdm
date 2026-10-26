@@ -13,7 +13,7 @@ group7.md (tdecomp), group8.md (usbportctrl).
 
 ## Code
 
-- Server: `crates/openxbdm-server/src/commands/hardware.rs` (table, handlers,
+- Server: `openxbdm/server/src/commands/hardware.rs` (table, handlers,
   `queuepackets`/`setpacket` 204 continuations) and
   `commands/hardware/automation.rs` (virtual controller engine shared by both
   backends: queue playback, the 10 us advance timer, polls, and the
@@ -28,7 +28,7 @@ group7.md (tdecomp), group8.md (usbportctrl).
   create/write/close, writer thread). Start is split into `odd_log_reserve`
   (busy check, ring reset) and `odd_log_start` so the path is translated
   only after the busy check, as in stock.
-- Host mock: `crates/openxbdm-server-host/src/backend/hardware.rs`. Records
+- Host mock: `openxbdm/server/host/src/backend/hardware.rs`. Records
   every service request (binds, guide presses, debugger messages, radio,
   system messages, PlayTo, USB port power, avatar hooks, PGO operations)
   and replies from settable state, including injected failures. Its
@@ -37,7 +37,7 @@ group7.md (tdecomp), group8.md (usbportctrl).
   `odd_read_complete`, `odd_mount` and `odd_speed_change` deliver drive
   events through the shared engine as control codes 0x46..0x49 do, and
   `Mock::is_connected` takes the engine path of polls 0x7b/0x7c.
-- Xbox: `crates/openxbdm-server-xbox360/src/backend/hardware.rs`. Uses the
+- Xbox: `openxbdm/server/xbox360/src/backend/hardware.rs`. Uses the
   services stock uses: XAutomationpBindController/UnbindController/
   InputXenonButton, XInputdSetRFPowerMode, ExGet/ExSetXConfigSetting and
   kernel export 700 (through console::Backend), XMsgStartIORequest,
@@ -82,7 +82,7 @@ statuses). The PGO exports are described in docs/re-notes/pgo.md.
 
 ## Tests
 
-`crates/openxbdm-server-host/tests/hardware.rs` covers each command over TCP
+`openxbdm/server/host/tests/hardware.rs` covers each command over TCP
 with raw sessions (no client support exists for these commands): replies,
 error statuses and texts, argument parsing order, devkit-only rejection on a
 test kit, configuration bit edits, upload continuations (`204`, `400-` on an

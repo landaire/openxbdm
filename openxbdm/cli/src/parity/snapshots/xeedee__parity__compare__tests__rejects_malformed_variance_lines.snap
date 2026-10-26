@@ -1,0 +1,11 @@
+---
+source: openxbdm/cli/src/parity/compare.rs
+expression: errors
+---
+[
+    "line 1: expected `<command> | <fields> | <reason>`",
+    "line 1: no reason given",
+    "line 1: unknown field `pid`",
+    "line 1: unknown field `head.`",
+    "line 1: no fields given",
+]

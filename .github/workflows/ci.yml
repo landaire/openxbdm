@@ -20,7 +20,7 @@ on:
 # the action cache.
 
 env:
-  TARGETS: "//: //bindings/... //crates/... //xbox360/..."
+  TARGETS: "//: //bindings/... //openxbdm/... //xbox360/..."
 
 jobs:
   unix:

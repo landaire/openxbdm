@@ -1,0 +1,32 @@
+[package]
+name = "openxbdm-server-xbox360"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Xbox 360 system debugger module"
+publish = false
+
+[[bin]]
+name = "openxbdm-server-xbox360"
+path = "src/main.rs"
+
+[features]
+default = ["smb"]
+# SMB file server on TCP port 445.
+smb = ["openxbdm-server/smb"]
+# Deployment through DEVKIT:\FlashEx: a boot without the marker file
+# DEVKIT:\FlashEx\openxbdm.arm removes the override module and restarts.
+boot-guard = []
+
+[dependencies]
+openxbdm-core = { path = "../../core" }
+openxbdm-server = { path = "..", default-features = false }
+xbox360 = "0.2"
+xbox360-sys = "0.2"
+
+# The module targets powerpc-unknown-xbox360, which Buck2 builds
+# (build_defs/update_buck_files.py, xbox360/BUCK); for the host, Cargo
+# builds a stub.
+[package.metadata.buck2.xbox360]
+link_script = "link.x"

@@ -1,0 +1,12 @@
+---
+source: openxbdm/server/src/commands/hardware/pgo.rs
+expression: names
+---
+[
+    "\\device\\harddisk0\\partition1\\devkit\\game!1.pgc",
+    "\\device\\harddisk0\\partition1\\devkit\\game-boot!12.pgc",
+    "\\device\\harddisk0\\partition1\\devkit\\game-!3.pgc",
+    "\\device\\x\\ét!1.pgc",
+    "Some(BuildPathTooLong)",
+    "\"\\Device\\Harddisk0\\Partition1\\DEVKIT\\game\"",
+]

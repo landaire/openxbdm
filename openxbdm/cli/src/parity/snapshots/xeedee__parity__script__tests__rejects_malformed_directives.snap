@@ -1,0 +1,15 @@
+---
+source: openxbdm/cli/src/parity/script.rs
+expression: errors
+---
+[
+    "line 1: `%upload` does not follow a command",
+    "line 2: `%upload` data is not pairs of hex digits",
+    "line 3: the previous command already has an upload",
+    "line 2: `%upload` does not follow a command",
+    "line 1: `%repeat` needs a decimal count and text",
+    "line 1: `%repeat` needs a decimal count and text",
+    "line 1: unknown directive `%sleep`",
+    "line 1: `%reconnect` takes no argument",
+    "line 1: command line contains a carriage return",
+]

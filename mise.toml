@@ -4,11 +4,11 @@ _.path = ["{{config_root}}/bin"]
 
 [tasks.build]
 description = "Builds the host tools, the C++ headers and the console module with Buck2"
-run = "buck2 build //: //bindings/... //crates/... //xbox360/..."
+run = "buck2 build //: //bindings/... //openxbdm/... //xbox360/..."
 
 [tasks.test]
 description = "Runs the tests with Buck2"
-run = "buck2 test //: //bindings/... //crates/... //xbox360/..."
+run = "buck2 test //: //bindings/... //openxbdm/... //xbox360/..."
 
 [tasks.xex]
 description = "Builds the console module (openxbdm.xex and the boot-guard build)"

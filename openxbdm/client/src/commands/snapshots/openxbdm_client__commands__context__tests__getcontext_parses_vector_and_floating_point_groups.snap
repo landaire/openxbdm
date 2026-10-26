@@ -1,0 +1,32 @@
+---
+source: openxbdm/client/src/commands/context.rs
+expression: "format!(\"{:#x?}\",\n(fp.fpscr, fp.fpr[31], vector.vscr, vector.vr[0], vector.vr[127]))"
+---
+(
+    0x0,
+    0x3ff000000000001f,
+    Vector128(
+        [
+            0x0,
+            0x0,
+            0x0,
+            0x10000,
+        ],
+    ),
+    Vector128(
+        [
+            0x0,
+            0x3f800000,
+            0xdeadbeef,
+            0x0,
+        ],
+    ),
+    Vector128(
+        [
+            0x7f,
+            0x3f800000,
+            0xdeadbeef,
+            0x0,
+        ],
+    ),
+)

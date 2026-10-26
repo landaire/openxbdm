@@ -1,11 +1,11 @@
 # Parity: services domain (IPTV, CIV)
 
 Specs: `commands/group1.md` (civ*) and `commands/group4.md` (iptv*).
-Server: `crates/openxbdm-server/src/commands/services.rs`. Host mock:
-`crates/openxbdm-server-host/src/backend/services.rs` (CIV) and the console
+Server: `openxbdm/server/src/commands/services.rs`. Host mock:
+`openxbdm/server/host/src/backend/services.rs` (CIV) and the console
 domain's XConfig store (IPTV). Xbox backend:
-`crates/openxbdm-server-xbox360/src/backend/services.rs`. Tests:
-`crates/openxbdm-server-host/tests/services.rs`. The client has no commands
+`openxbdm/server/xbox360/src/backend/services.rs`. Tests:
+`openxbdm/server/host/tests/services.rs`. The client has no commands
 for this domain.
 
 | Command | Wire | Host mock | Xbox backend |

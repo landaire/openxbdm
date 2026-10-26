@@ -1,0 +1,60 @@
+[package]
+name = "openxbdm-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line XBDM client built on the `openxbdm-client` library"
+publish = false
+
+[[bin]]
+name = "xeedee"
+path = "src/main.rs"
+
+# One-shot reverse-engineering tools kept for future debugging. They
+# don't exercise the library API; treat them as scripts.
+[[example]]
+name = "cmdtbl"
+path = "examples/cmdtbl.rs"
+
+[[example]]
+name = "ppcdis"
+path = "examples/ppcdis.rs"
+
+[[example]]
+name = "xexgrep"
+path = "examples/xexgrep.rs"
+
+[features]
+default = ["capture", "dangerous"]
+# Video capture (xbmovie PIX! protocol) + `.xbm` decode toolchain.
+capture = ["openxbdm-client/capture"]
+# Dangerous, low-level commands that write into xbdm's code, dispatch
+# table, or data globals. See openxbdm_client::commands::dangerous.
+dangerous = ["openxbdm-client/dangerous"]
+
+[dependencies]
+openxbdm-client = { path = "../client", features = ["tokio", "jiff"] }
+
+clap = { version = "4.6.1", features = ["derive", "env"] }
+futures-io = { workspace = true }
+futures-util = { workspace = true }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+indicatif = "0.18.4"
+jiff = { workspace = true }
+owo-colors = { version = "4.3.0", features = ["supports-colors"] }
+powerpc = "0.4.1"
+rootcause = { workspace = true }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+similar = "2.7.0"
+tabled = "0.20.0"
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+xex2 = "0.1.0"
+
+[dev-dependencies]
+insta = { version = "1.47.2", features = ["json"] }

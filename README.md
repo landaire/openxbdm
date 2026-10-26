@@ -131,7 +131,7 @@ If you need a verb that doesn't have a typed wrapper yet, drop down to
 Or use the CLI:
 
 ```
-cargo install --path crates/openxbdm-cli
+cargo install --path openxbdm/cli
 xeedee -H 192.168.1.26 systime
 xeedee -H 192.168.1.26 file ls 'DEVKIT:\'
 xeedee -H 192.168.1.26 file get 'DEVKIT:\my-capture.xbm'
@@ -143,7 +143,7 @@ xeedee -H 192.168.1.26 dump-module xboxkrnl.exe /tmp/xboxkrnl.exe
 Run the GPUI controller relay and enter the console IP address or hostname:
 
 ```text
-buck2 run //crates/xeedee-controller:xeedee-controller-bin
+buck2 run //openxbdm/controller:xeedee-controller-bin
 ```
 
 Select a connected hardware controller to relay its current state. Select a JSON script to queue timed frames on the console instead:
@@ -185,16 +185,18 @@ You do need a few host tools:
 
 We have a custom [rust-xbox360](https://github.com/landaire/rust-xbox360) toolchain used and creates the `xbox360` buck2 cell. Additionally, tools from [acceleration](https://github.com/landaire/acceleration) are used for translating from ppc64 ELF to ppc64 PE, then wrapping that as an XEX2.
 
-If you are a nix user, a [devenv](https://devenv.sh), is present whcih can provide all necessary tooling. Run `devenv shell` to activate.
+Nix users can install the complete host tool set with `nix profile install path:.#openxbdm-tools`, run one tool with `nix run path:.#xeedee -- ARGS`, or enter the development environment with `nix develop path:.`. The Nix and devenv shells consume the same definitions from `nix/development-environment.nix`.
 
-| Command                                                                 | Purpose                                                                                        |
-| ----------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `buck2 build //: //bindings/... //crates/... //xbox360/...`             | Build everything: host crates, C++ headers, and the console module.                            |
-| `buck2 test //: //bindings/... //crates/... //xbox360/...`              | Run the unit, integration and documentation tests, and check the Rust release pin.             |
-| `buck2 build //xbox360:openxbdm --show-output`                          | Build the console module, `openxbdm.xex`.                                                      |
-| `buck2 run //crates/openxbdm-cli:xeedee-bin -- ARGS`                    | Run a tool; each binary is `//crates/<crate>:<binary>-bin`.                                    |
-| `buck2 build //crates/openxbdm-cli:xeedee-bin?release`                  | Build an optimized host binary with external debug information.                               |
-| `buck2 build //crates/openxbdm-cli:xeedee-bin?release_no_symbols`       | Build an optimized host binary without symbols.                                                |
+The flake exposes `xeedee`, `xeedee-controller`, `openxbdm-kd`, `openxbdm-server`, and `openxbdm-ffi-bindgen` as individual packages and apps. Its default `openxbdm-tools` package contains all five.
+
+| Command                                                                    | Purpose                                                                                        |
+| -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `buck2 build //: //bindings/... //openxbdm/... //xbox360/...`              | Build everything: host crates, C++ headers, and the console module.                            |
+| `buck2 test //: //bindings/... //openxbdm/... //xbox360/...`               | Run the unit, integration and documentation tests, and check the Rust release pin.             |
+| `buck2 build //xbox360:openxbdm --show-output`                             | Build the console module, `openxbdm.xex`.                                                      |
+| `buck2 run //openxbdm/cli:xeedee-bin -- ARGS`                              | Run `xeedee`.                                                                                  |
+| `buck2 build //openxbdm/cli:xeedee-bin?release`                            | Build an optimized host binary with external debug information.                               |
+| `buck2 build //openxbdm/cli:xeedee-bin?release_no_symbols`                 | Build an optimized host binary without symbols.                                                |
 | `build_defs/lint.py`                                                    | Check formatting and clippy diagnostics.                                                       |
 | `build_defs/lint.py --format`                                           | Format the workspace crates.                                                                   |
 | `build_defs/package_release.py --version V --target T`                  | Archive the host tools and the FFI libraries.                                                  |
@@ -204,8 +206,8 @@ If you are a nix user, a [devenv](https://devenv.sh), is present whcih can provi
 
 ## Tests
 
-- `crates/openxbdm-server-host/tests/<domain>.rs`: integration tests that start the host server and send every command over TCP, through `openxbdm-client` where it has the command and as raw lines otherwise. `framework.rs` covers dispatch and access rules, `trace.rs` the `verbose` trace texts, `network/` the `ipproxy`, `netcap`, and `netsim` engines; `common/` holds the shared harness.
-- `crates/openxbdm-client/tests/`: Insta snapshot tests of command encoding and reply parsing against captured fixtures.
+- `openxbdm/server/host/tests/<domain>.rs`: integration tests that start the host server and send every command over TCP, through `openxbdm-client` where it has the command and as raw lines otherwise. `framework.rs` covers dispatch and access rules, `trace.rs` the `verbose` trace texts, `network/` the `ipproxy`, `netcap`, and `netsim` engines; `common/` holds the shared harness.
+- `openxbdm/client/tests/`: Insta snapshot tests of command encoding and reply parsing against captured fixtures.
 - Unit tests in `openxbdm-core`, `openxbdm-client`, `openxbdm-cli`, and `openxbdm-server`.
 
 `build_defs/update_buck_files.py` generates a Buck2 test target for each

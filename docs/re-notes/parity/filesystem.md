@@ -1,9 +1,9 @@
 # Parity: file system domain
 
-Server: `crates/openxbdm-server/src/commands/filesystem.rs`. Host mock:
-`crates/openxbdm-server-host/src/backend/filesystem.rs`. Xbox:
-`crates/openxbdm-server-xbox360/src/backend/filesystem.rs`. Tests:
-`crates/openxbdm-server-host/tests/filesystem.rs`. Specs: group2..group8.
+Server: `openxbdm/server/src/commands/filesystem.rs`. Host mock:
+`openxbdm/server/host/src/backend/filesystem.rs`. Xbox:
+`openxbdm/server/xbox360/src/backend/filesystem.rs`. Tests:
+`openxbdm/server/host/tests/filesystem.rs`. Specs: group2..group8.
 
 ## Commands
 
@@ -93,7 +93,7 @@ Stock defects openxbdm does not reproduce:
 
 ## CD-ROM driver patch (DMSATA)
 
-`crates/openxbdm-server-xbox360/src/backend/dvd_hotplug.rs`, installed at
+`openxbdm/server/xbox360/src/backend/dvd_hotplug.rs`, installed at
 startup in the order of stock module initialization 0x91f32b10..0x91f32ba8
 (SMC tray notification, `\Device\Cdrom0` reference, patch). Each routine
 writes its texts straight into the `dbgprint` ring through the producer

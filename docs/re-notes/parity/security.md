@@ -3,13 +3,13 @@
 Specs: `commands/group1.md` (adminpw, authuser, boxid), `group4.md`
 (getuserpriv), `group5.md` (keyxchg, lockmode), `group7.md` (setuserpriv),
 `group8.md` (user, userlist); `framework.md` section 2 (lock-mode banner).
-Shared primitives: `crates/openxbdm-core/src/auth.rs` (response function,
+Shared primitives: `openxbdm/core/src/auth.rs` (response function,
 768-bit modular exponentiation, session key). Server:
-`crates/openxbdm-server/src/commands/security.rs`. Host mock:
-`crates/openxbdm-server-host/src/backend/security.rs`. Xbox backend:
-`crates/openxbdm-server-xbox360/src/backend/security.rs`. Tests:
-`crates/openxbdm-server-host/tests/security.rs`. Client:
-`crates/openxbdm-client/src/commands/security.rs`,
+`openxbdm/server/src/commands/security.rs`. Host mock:
+`openxbdm/server/host/src/backend/security.rs`. Xbox backend:
+`openxbdm/server/xbox360/src/backend/security.rs`. Tests:
+`openxbdm/server/host/tests/security.rs`. Client:
+`openxbdm/client/src/commands/security.rs`,
 `Client::{banner, lock_challenge, key_exchange}`.
 
 | Command | Wire | Host mock | Xbox backend |

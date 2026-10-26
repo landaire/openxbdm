@@ -1,0 +1,14 @@
+---
+source: openxbdm/client/src/commands/security.rs
+expression: "lines.join(\"\\n\")"
+---
+lockmode boxid=0q0011223344556677 encrypt
+lockmode unlock
+authuser resp=0q000000000000feed admin
+authuser passwd=0q0000000000000001 name="dev kit"
+adminpw none
+adminpw passwd=0q0102030405060718
+user name="bob" read manage
+user name="bob" remove
+getuserpriv me
+setuserpriv name="bob"

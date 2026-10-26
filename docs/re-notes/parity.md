@@ -3,10 +3,10 @@
 Reference: stock XBDM 2.0.21256.0 (`xbdm.xex`, base `0x91f00000`). This
 table aggregates the domain records under `parity/` and the specifications
 under `commands/`. Counts are taken from the code: the registry tables
-(`COMMANDS` in `crates/openxbdm-server/src/commands/<domain>.rs`, joined by
+(`COMMANDS` in `openxbdm/server/src/commands/<domain>.rs`, joined by
 `commands::TABLES`), the `export!`/`export_raw!` declarations in
-`crates/openxbdm-server-xbox360/src/`, and the control dispatcher in
-`crates/openxbdm-server-xbox360/src/backend/dispatcher.rs`.
+`openxbdm/server/xbox360/src/`, and the control dispatcher in
+`openxbdm/server/xbox360/src/backend/dispatcher.rs`.
 
 Columns:
 
@@ -16,7 +16,7 @@ Columns:
   `partial`: an open question is listed under Remaining gaps.
 - Server: registered in the `openxbdm-server` table with the stock access
   mask and dispatch flags.
-- Host test: file under `crates/openxbdm-server-host/tests/` that sends
+- Host test: file under `openxbdm/server/host/tests/` that sends
   the command over TCP to the simulated console.
 - Xbox backend: the console backend in `openxbdm-server-xbox360`
   implements every service the command uses.

@@ -24,7 +24,7 @@ BUCK2 = ROOT / "bin" / ("buck2.cmd" if sys.platform == "win32" else "buck2")
 
 # Rules of the workspace crates, including their tests. Console crates
 # (xbox360_executable_core rules) have no clippy subtarget.
-WORKSPACE_TARGETS = 'kind("^rust_(library|binary|test)$", root//crates/...)'
+WORKSPACE_TARGETS = 'kind("^rust_(library|binary|test)$", root//openxbdm/...)'
 
 
 def buck2(buck2_path, *args):
@@ -34,7 +34,7 @@ def buck2(buck2_path, *args):
 
 def rust_sources():
     # Not through git: jj workspaces other than the default one have no .git.
-    return sorted(path.relative_to(ROOT).as_posix() for path in (ROOT / "crates").rglob("*.rs"))
+    return sorted(path.relative_to(ROOT).as_posix() for path in (ROOT / "openxbdm").rglob("*.rs"))
 
 
 def run_rustfmt(buck2_path, check):

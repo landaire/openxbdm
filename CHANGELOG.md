@@ -95,7 +95,7 @@
 
 ### Releases
 
-- A `vX.Y.Z` tag that names the workspace version publishes the console module (`openxbdm-<version>.xex` and `openxbdm-boot-guard-<version>.xex`), and for Linux x86_64, macOS arm64 and Windows x86_64 the `xeedee` and `openxbdm-kd` executables and the FFI libraries with C++ headers, all built by Buck2.
+- A `vX.Y.Z` tag that names the workspace version publishes the console module (`openxbdm-<version>.xex` and `openxbdm-boot-guard-<version>.xex`), and for Linux x86_64, macOS arm64 and Windows x86_64 the `xeedee`, `openxbdm-kd`, and `xeedee-controller` executables and the FFI libraries with C++ headers, all built by Buck2.
 - The `nightly` pre-release is rebuilt each day the default branch has changed. The notes of each release give the build date, the commit, and the steps to install the module in `DEVKIT:\FlashEx`.
 
 ### Documentation

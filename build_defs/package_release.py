@@ -7,7 +7,7 @@ Usage: build_defs/package_release.py --version VERSION --target TRIPLE
 Runs from the repository root and writes, `.zip` on Windows and `.tar.gz`
 elsewhere:
 
-- `xeedee-VERSION-TRIPLE`: the executables and README.md.
+- `xeedee-VERSION-TRIPLE`: the released executables and README.md.
 - `xeedee-ffi-VERSION-TRIPLE`: the openxbdm-ffi shared and static
   libraries in `lib/`, their C++ headers in `include/`, and README.md.
 
@@ -28,13 +28,13 @@ ROOT = Path(__file__).resolve().parent.parent
 # The wrapper that runs the pinned Buck2 release.
 BUCK2 = ROOT / "bin" / ("buck2.cmd" if sys.platform == "win32" else "buck2")
 
-# The XBDM client and the kernel debugger host, and the Cargo name of each.
-# Buck2 names an executable after its crate. The other workspace
-# executables are development tools: the mock host server, the console
-# module's assembly rewrite, and the FFI header generator.
+# The released host executables and the Cargo name of each. The other
+# workspace executables are development tools: the mock host server, the
+# console module's assembly rewrite, and the FFI header generator.
 EXECUTABLES = {
     "root//crates/openxbdm-cli:xeedee-bin": "xeedee",
     "root//crates/openxbdm-kd:openxbdm-kd-bin": "openxbdm-kd",
+    "root//crates/xeedee-controller:xeedee-controller-bin": "xeedee-controller",
 }
 
 FFI_SHARED = "root//crates/openxbdm-ffi:openxbdm_ffi[cdylib]"

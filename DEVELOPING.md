@@ -175,7 +175,7 @@ On Linux, a host binary's external debug file is its `[symbols]` subtarget. The 
 
 The target constraint is `//config:target`, with `[host]` and `[xbox]` values. Xbox module rules apply `[xbox]` and the required standard library configuration through their transition.
 
-`build_defs/package_release.py` builds with `?release` and archives the released executables (`xeedee` and `openxbdm-kd`) as `xeedee-<version>-<target>`. It archives the `openxbdm-ffi` shared and static libraries (the `[cdylib]` and `[staticlib]` subtargets of its library) with their C++ headers (`//bindings:cpp`, written by `openxbdm-ffi-bindgen`) as `xeedee-ffi-<version>-<target>`. The profile gives only host binaries and tests `-Clto=thin`, so the FFI libraries are built without LTO.
+`build_defs/package_release.py` builds with `?release` and archives the released executables (`xeedee`, `openxbdm-kd`, and `xeedee-controller`) as `xeedee-<version>-<target>`. It archives the `openxbdm-ffi` shared and static libraries (the `[cdylib]` and `[staticlib]` subtargets of its library) with their C++ headers (`//bindings:cpp`, written by `openxbdm-ffi-bindgen`) as `xeedee-ffi-<version>-<target>`. The profile gives only host binaries and tests `-Clto=thin`, so the FFI libraries are built without LTO.
 
 `build_defs/package_module.py` copies out the console module builds.
 `.github/workflows/release.yml` publishes a release for a `vX.Y.Z` tag

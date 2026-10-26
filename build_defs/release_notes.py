@@ -22,8 +22,8 @@ development kit and serves the XBDM protocol on TCP port 730.
 
 | File | Use |
 | --- | --- |
-| `openxbdm-boot-guard-{version}.xex` | Installation in `DEVKIT:\\FlashEx` |
-| `openxbdm-{version}.xex` | Loading from a kernel debugger host; writes nothing to the console |
+| `openxbdm-boot-guard-{version}.xex` | Console module for `DEVKIT:\\FlashEx\\xbdm.xex`, with startup safety checks to preserve XBDM connectivity |
+| `openxbdm-{version}.xex` | Console module for temporary deployment through the kernel debugger host |
 
 ### Installation in DEVKIT:\\FlashEx
 
@@ -57,8 +57,8 @@ monitor:
 
 ## Host tools
 
-- `xeedee-{version}-<target>`: the `xeedee` XBDM client and the
-  `openxbdm-kd` kernel debugger host.
+- `xeedee-{version}-<target>`: the `xeedee` XBDM client, the
+  `openxbdm-kd` kernel debugger host, and the `xeedee-controller` application.
 - `xeedee-ffi-{version}-<target>`: the openxbdm-ffi shared and static
   libraries and their C++ headers.
 

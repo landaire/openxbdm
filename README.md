@@ -22,7 +22,7 @@ Release artifacts:
 
 - `openxbdm-boot-guard-<version>.xex`: the console module for `DEVKIT:\FlashEx\xbdm.xex` on a development kit which has some startup safety checks to avoid accidentally killing xbdm connectivity if something goes wrong.
 - `openxbdm-<version>.xex`: the console module if you're deploying using the kernel debugger host (temp). For Linux x86_64, macOS arm64 and Windows x86_64:
-- `xeedee-<version>-<target>`: the `xeedee` and `openxbdm-kd` executables.
+- `xeedee-<version>-<target>`: the `xeedee`, `openxbdm-kd`, and `xeedee-controller` executables.
 - `xeedee-ffi-<version>-<target>`: the `openxbdm-ffi` shared and static libraries and their C++ headers.
 
 ## Xbox 360 module

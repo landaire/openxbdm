@@ -1,2 +1,10 @@
-[buildscript]
-run = true
+# cc-rs cannot move its generated archive from Buck's scratch directory on
+# Windows. Build the same static library directly with Buck's C++ toolchain.
+buildscript.run = false
+rustc_flags = ["-l", "dylib=OleAut32", "-l", "dylib=Ole32"]
+
+[['cfg(target_os = "windows")'.cxx_library]]
+name = "vswhom"
+srcs = ["ext/vswhom.cpp"]
+compiler_flags = ["/MD", "/Zm2000"]
+preferred_linkage = "static"

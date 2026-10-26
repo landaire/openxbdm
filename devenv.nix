@@ -48,13 +48,7 @@ in
 
   env = pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
     LIBRARY_PATH = pkgs.lib.makeLibraryPath linuxLibraries;
-    # Host GPU drivers are outside Nix and load their own FHS dependencies.
-    LD_LIBRARY_PATH = pkgs.lib.concatStringsSep ":" [
-      (pkgs.lib.makeLibraryPath linuxLibraries)
-      "/usr/lib64"
-      "/usr/lib/x86_64-linux-gnu"
-      "/usr/lib"
-    ];
+    LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath linuxLibraries;
     PKG_CONFIG_PATH = pkgs.lib.makeSearchPathOutput "dev" "lib/pkgconfig" linuxLibraries;
   };
 

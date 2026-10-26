@@ -32073,6 +32073,7 @@ cargo.http_archive(
     name = "vswhom-sys-0.1.3.crate",
     sha256 = "fb067e4cbd1ff067d1df46c9194b5de0e98efd2810bbc95c5d5e5f25a3231150",
     strip_prefix = "vswhom-sys-0.1.3",
+    sub_targets = ["ext/vswhom.cpp"],
     urls = ["https://static.crates.io/crates/vswhom-sys/0.1.3/download"],
     visibility = [],
 )
@@ -32099,66 +32100,36 @@ cargo.rust_library(
         "CARGO_PKG_VERSION_MINOR": "1",
         "CARGO_PKG_VERSION_PATCH": "3",
         "CARGO_PKG_VERSION_PRE": "",
-        "OUT_DIR": "$(location :vswhom-sys-0.1-build-script-run[out_dir])",
     },
     platform = {
         "windows-msvc": dict(),
     },
-    rustc_flags = ["@$(location :vswhom-sys-0.1-build-script-run[rustc_flags])"],
+    rustc_flags = [
+        "-l",
+        "dylib=OleAut32",
+        "-l",
+        "dylib=Ole32",
+    ],
     visibility = [],
-    deps = [":libc-0.2"],
+    deps = [
+        ":libc-0.2",
+        ":vswhom-sys-0.1-vswhom",
+    ],
 )
 
-cargo.rust_binary(
-    name = "vswhom-sys-0.1-build-script-build",
-    srcs = [":vswhom-sys-0.1.3.crate"],
-    crate = "build_script_build",
-    crate_root = "vswhom-sys-0.1.3.crate/build.rs",
-    edition = "2015",
-    env = {
-        "CARGO_BIN_NAME": "build-script-build",
-        "CARGO_CRATE_NAME": "build_script_build",
-        "CARGO_MANIFEST_DIR": "vswhom-sys-0.1.3.crate",
-        "CARGO_PKG_AUTHORS": "наб <nabijaczleweli@nabijaczleweli.xyz>:forrestsmithfb <forrest.smith@fb.com>",
-        "CARGO_PKG_DESCRIPTION": "Pure FFI to Jon Blow's VS discovery script",
-        "CARGO_PKG_HOMEPAGE": "",
-        "CARGO_PKG_NAME": "vswhom-sys",
-        "CARGO_PKG_README": "README.md",
-        "CARGO_PKG_REPOSITORY": "https://github.com/nabijaczleweli/vswhom-sys.rs",
-        "CARGO_PKG_RUST_VERSION": "",
-        "CARGO_PKG_VERSION": "0.1.3",
-        "CARGO_PKG_VERSION_MAJOR": "0",
-        "CARGO_PKG_VERSION_MINOR": "1",
-        "CARGO_PKG_VERSION_PATCH": "3",
-        "CARGO_PKG_VERSION_PRE": "",
-    },
+cargo.cxx_library(
+    name = "vswhom-sys-0.1-vswhom",
+    srcs = [":vswhom-sys-0.1.3.crate[ext/vswhom.cpp]"],
+    headers = [],
+    compiler_flags = [
+        "/MD",
+        "/Zm2000",
+    ],
     platform = {
         "windows-msvc": dict(),
     },
+    preferred_linkage = "static",
     visibility = [],
-    deps = [":cc-1"],
-)
-
-buildscript_run(
-    name = "vswhom-sys-0.1-build-script-run",
-    package_name = "vswhom-sys",
-    buildscript_rule = ":vswhom-sys-0.1-build-script-build",
-    env = {
-        "CARGO_PKG_AUTHORS": "наб <nabijaczleweli@nabijaczleweli.xyz>:forrestsmithfb <forrest.smith@fb.com>",
-        "CARGO_PKG_DESCRIPTION": "Pure FFI to Jon Blow's VS discovery script",
-        "CARGO_PKG_HOMEPAGE": "",
-        "CARGO_PKG_README": "README.md",
-        "CARGO_PKG_REPOSITORY": "https://github.com/nabijaczleweli/vswhom-sys.rs",
-        "CARGO_PKG_RUST_VERSION": "",
-        "CARGO_PKG_VERSION_MAJOR": "0",
-        "CARGO_PKG_VERSION_MINOR": "1",
-        "CARGO_PKG_VERSION_PATCH": "3",
-        "CARGO_PKG_VERSION_PRE": "",
-    },
-    platform = {
-        "windows-msvc": dict(),
-    },
-    version = "0.1.3",
 )
 
 cargo.http_archive(

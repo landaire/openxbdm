@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use tokio::sync::watch;
 use std::thread::JoinHandle;
 use std::time::Duration;
+use tokio::sync::watch;
 
 use openxbdm_client::Client;
 use openxbdm_client::Connected;

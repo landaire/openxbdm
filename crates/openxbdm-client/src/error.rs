@@ -161,13 +161,8 @@ pub enum ArgumentError {
     EmptyControllerPacketQueue,
     #[error("controller queue length {length} exceeds the safe limit {maximum}")]
     ControllerQueueLengthOutOfRange { length: u32, maximum: u32 },
-    #[error(
-        "controller frame duration {duration_ms} ms is outside 1..={maximum_ms} ms"
-    )]
-    ControllerFrameDurationOutOfRange {
-        duration_ms: u32,
-        maximum_ms: u32,
-    },
+    #[error("controller frame duration {duration_ms} ms is outside 1..={maximum_ms} ms")]
+    ControllerFrameDurationOutOfRange { duration_ms: u32, maximum_ms: u32 },
     #[error("memory length exceeds the protocol's u32 limit")]
     MemoryLengthOverflow,
 }

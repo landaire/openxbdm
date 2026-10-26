@@ -2,10 +2,10 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
-use openxbdm_client::commands::Gamepad;
-use openxbdm_client::commands::GamepadDurationMillis;
 use openxbdm_client::commands::ControllerQueueLength;
+use openxbdm_client::commands::Gamepad;
 use openxbdm_client::commands::GamepadButtons;
+use openxbdm_client::commands::GamepadDurationMillis;
 use openxbdm_client::commands::TimedGamepad;
 use serde::Deserialize;
 
@@ -54,12 +54,11 @@ impl ControllerScript {
                 count: source.frames.len(),
                 maximum: ControllerQueueLength::MAX,
             })?;
-        let queue_length = ControllerQueueLength::new(frame_count).map_err(|_| {
-            ScriptError::TooManyFrames {
+        let queue_length =
+            ControllerQueueLength::new(frame_count).map_err(|_| ScriptError::TooManyFrames {
                 count: source.frames.len(),
                 maximum: ControllerQueueLength::MAX,
-            }
-        })?;
+            })?;
 
         let mut frames = Vec::with_capacity(source.frames.len());
         for (index, frame) in source.frames.into_iter().enumerate() {
@@ -266,8 +265,7 @@ mod tests {
 
     #[test]
     fn rejects_duration_outside_timer_range() {
-        let error =
-            parse(r#"{ "frames": [{ "duration_ms": 2147483648 }] }"#).unwrap_err();
+        let error = parse(r#"{ "frames": [{ "duration_ms": 2147483648 }] }"#).unwrap_err();
 
         assert!(matches!(
             error,

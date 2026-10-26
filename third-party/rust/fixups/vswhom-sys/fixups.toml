@@ -6,5 +6,8 @@ rustc_flags = ["-l", "dylib=OleAut32", "-l", "dylib=Ole32"]
 [['cfg(target_os = "windows")'.cxx_library]]
 name = "vswhom"
 srcs = ["ext/vswhom.cpp"]
-compiler_flags = ["/MD", "/Zm2000"]
+# The upstream /Zm2000 flag only sizes precompiled-header memory, which this
+# source does not use. MSVC 19.51 reports an internal compiler error for Buck's
+# compile command when the flag is present.
+compiler_flags = ["/MD"]
 preferred_linkage = "static"

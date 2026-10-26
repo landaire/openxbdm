@@ -32121,10 +32121,7 @@ cargo.cxx_library(
     name = "vswhom-sys-0.1-vswhom",
     srcs = [":vswhom-sys-0.1.3.crate[ext/vswhom.cpp]"],
     headers = [],
-    compiler_flags = [
-        "/MD",
-        "/Zm2000",
-    ],
+    compiler_flags = ["/MD"],
     platform = {
         "windows-msvc": dict(),
     },

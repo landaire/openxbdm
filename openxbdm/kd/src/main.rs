@@ -82,6 +82,10 @@ enum Command {
         /// runs. The stop waits for the debugger if none is attached.
         #[arg(long, value_name = "IMAGE_NAME")]
         stop_on_load: Vec<String>,
+        /// Keep the attachment stop while waiting for the debugger instead
+        /// of resuming the console until the debugger connects.
+        #[arg(long)]
+        stop_on_connect: bool,
     },
     /// Act as the console's debugger host: acknowledge and continue every
     /// event, print debug output and module loads, and answer the kernel's
@@ -133,9 +137,10 @@ fn run(cli: Cli) -> Result<(), Report<CliError>> {
             listen,
             registers,
             stop_on_load,
+            stop_on_connect,
         } => {
             let client = connect(cli.target, cli.local, cli.no_timeout)?;
-            commands::gdb_server(client, listen, registers, stop_on_load)
+            commands::gdb_server(client, listen, registers, stop_on_load, stop_on_connect)
         }
         Command::Host {
             files,

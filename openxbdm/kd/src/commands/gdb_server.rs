@@ -36,13 +36,15 @@ pub enum RegisterWidth {
 }
 
 /// Accepts one debugger on `listen`, serves it, then lets the console run.
-/// Loads of the images in `stop_on_load` stop the console, before their
-/// entry points run, with or without a debugger attached.
+/// Loads of the images in `stop_on_load` stop the console before their entry
+/// points run. `stop_on_connect` keeps the attachment stop while waiting for
+/// the debugger.
 pub fn gdb_server(
     mut client: KdClient<UdpTransport>,
     listen: SocketAddr,
     width: RegisterWidth,
     stop_on_load: Vec<String>,
+    stop_on_connect: bool,
 ) -> Result<(), Report<CliError>> {
     let (console, console_text) = mpsc::channel();
     client.set_notify(Box::new(move |notification| {
@@ -52,16 +54,41 @@ pub fn gdb_server(
         }
         print_notification(notification);
     }));
-
-    attach(&mut client)?;
-    client.set_hold_loads(stop_on_load);
-
     let listener = TcpListener::bind(listen)
         .map_err(CliError::from)
         .attach(format!("listen {listen}"))?;
+    listener.set_nonblocking(true).map_err(CliError::from)?;
+
+    client.set_hold_loads(stop_on_load);
+    if stop_on_connect {
+        stop_target(&mut client)?;
+        println!("the console is stopped; waiting for the debugger");
+    } else {
+        attach(&mut client)?;
+    }
     println!("waiting for a GDB client on {listen}");
 
-    let stream = accept(&mut client, &listener, &console_text)?;
+    let stream = match accept(&mut client, &listener, &console_text) {
+        Ok(stream) => stream,
+        Err(error) => {
+            if client.stop().is_some() {
+                client
+                    .continue_from_stop()
+                    .map_err(CliError::from)
+                    .attach("release target after debugger listener failure")?;
+            }
+            return Err(error);
+        }
+    };
+    if let Err(error) = stream.set_nonblocking(false) {
+        if client.stop().is_some() {
+            client
+                .continue_from_stop()
+                .map_err(CliError::from)
+                .attach("release target after debugger socket failure")?;
+        }
+        return Err(Report::new(CliError::from(error)));
+    }
 
     stop_target(&mut client)?;
     if let Some(stop) = client.stop() {
@@ -107,8 +134,6 @@ fn accept(
     listener: &TcpListener,
     console_text: &mpsc::Receiver<ConsoleText>,
 ) -> Result<TcpStream, Report<CliError>> {
-    listener.set_nonblocking(true).map_err(CliError::from)?;
-
     let stream = loop {
         match listener.accept() {
             Ok((stream, peer)) => {
@@ -140,9 +165,6 @@ fn accept(
             Err(error) => return Err(Report::new(CliError::from(error))),
         }
     };
-
-    stream.set_nonblocking(false).map_err(CliError::from)?;
-
     Ok(stream)
 }
 

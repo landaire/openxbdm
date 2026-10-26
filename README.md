@@ -74,6 +74,12 @@ To boot XBDM from a local image:
 - Every processor (hardware thread) is a thread of the debugger. A stop freezes all of them.
 - Debug output and module loads appear in the debugger console while the console runs.
 - `--stop-on-load debugprobe.xex` stops the console when that image loads, after it is mapped and before its entry point runs, so you can set breakpoints first. Launch the title after `gdbserver` starts.
+
+`--stop-on-connect` keeps the attachment stop while waiting for GDB or LLDB.
+Start it before a boot to stop at the first safe KD attachment point:
+
+    openxbdm-kd --no-timeout gdbserver --stop-on-connect
+
 - The registers are 64-bit, as on the processor. Titles compiled as 32-bit PowerPC, such as those built with [rust-xbox360](rust-xbox360), need `--registers 32`: GDB loads a 32-bit ELF only then, and both debuggers unwind 32-bit stack frames with it. A register write in that mode keeps the high word.
 
 Load the title's ELF before you connect so the debugger has its symbols and source. rust-xbox360 titles have `[gdb]` and `[lldb]` subtargets that do this, including the standard library source. Run the debugger from that project's root, since the source paths are relative to it:

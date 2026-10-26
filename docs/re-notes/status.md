@@ -19,6 +19,7 @@ Status labels:
 | --- | --- | --- | --- |
 | Protocol grammar, status codes, authentication | `openxbdm-core` | implemented | Shared by client and server; `no_std` |
 | Client library, CLI, C bindings | `openxbdm-client`, `openxbdm-cli`, `openxbdm-ffi` | implemented | Snapshot tests over captured replies; parity fixes listed per domain under `parity/` |
+| Controller relay | `xeedee-controller`, `openxbdm-client` | implemented | GPUI Kit application for hardware controller relay and timed JSON script playback through typed `autoinput` commands |
 | Command engine | `openxbdm-server` | implemented | `no_std`, allocation-free; 177 of 177 stock commands in 11 domains |
 | Host server and simulated console | `openxbdm-server-host` | implemented | One simulated console shared by all connections; every command exercised over TCP by `tests/` |
 | SMB file sharing | `openxbdm-server` (`smb`), `smb2-server` | implemented | SMB 2.0.2 and 2.1 shares of every drive whose device exists; host listener on `--smb-listen`, console listener on TCP port 445 |

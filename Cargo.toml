@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/openxbdm-core",
     "crates/openxbdm-client",
+    "crates/xeedee-controller",
     "crates/openxbdm-cli",
     "crates/openxbdm-ffi",
     "crates/openxbdm-ffi-bindgen",
@@ -25,9 +26,13 @@ repository = "https://github.com/landaire/xeedee"
 bytes = "1.11.1"
 futures-io = "0.3.32"
 futures-util = { version = "0.3.32", default-features = false, features = ["std", "io"] }
+gilrs = "0.11.1"
+gpui-kit = "=0.8.0"
 jiff = "0.2.23"
 memchr = "2.8.0"
 rootcause = "0.12.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
 thiserror = "2.0.18"
 tokio = { version = "1.52.1", features = ["net", "io-util", "rt-multi-thread", "macros", "time", "fs", "io-std"] }
 tokio-util = { version = "0.7.18", features = ["compat"] }

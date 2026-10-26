@@ -20,18 +20,43 @@ let
       pkgs.reindeer.overrideAttrs { doCheck = false; }
     else
       pkgs.reindeer;
+
+  linuxLibraries = with pkgs; [
+    alsa-lib
+    fontconfig
+    libxkbcommon
+    udev
+    vulkan-loader
+    wayland
+    xorg.libX11
+    xorg.libxcb
+  ];
 in
 {
-  # Buck2 links with the host's C compiler driver (cc, c++ and ar on Linux,
-  # Xcode's clang on macOS), so the shell provides none: the binaries then
-  # depend on the host's C library rather than on Nix store paths.
+  # Keep the default stdenv out of the shell. Buck2 uses Clang directly for
+  # the small C shims in Linux UI dependencies.
   stdenv = pkgs.stdenvNoCC;
 
   packages = [
     rustToolchain
     reindeer
     pkgs.python3
-  ];
+  ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux (
+    linuxLibraries
+    ++ [ pkgs.clang pkgs.pkg-config ]
+  );
+
+  env = pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+    LIBRARY_PATH = pkgs.lib.makeLibraryPath linuxLibraries;
+    # Host GPU drivers are outside Nix and load their own FHS dependencies.
+    LD_LIBRARY_PATH = pkgs.lib.concatStringsSep ":" [
+      (pkgs.lib.makeLibraryPath linuxLibraries)
+      "/usr/lib64"
+      "/usr/lib/x86_64-linux-gnu"
+      "/usr/lib"
+    ];
+    PKG_CONFIG_PATH = pkgs.lib.makeSearchPathOutput "dev" "lib/pkgconfig" linuxLibraries;
+  };
 
   # bin/buck2 runs the Buck2 release that toolchains/buck2 pins, through the
   # DotSlash that bootstrap.sh installs, as outside the shell. DotSlash and

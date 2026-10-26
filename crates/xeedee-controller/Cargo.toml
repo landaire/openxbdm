@@ -1,0 +1,21 @@
+[package]
+name = "xeedee-controller"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Relay host controller input to an Xbox 360 development console"
+
+[[bin]]
+name = "xeedee-controller"
+path = "src/main.rs"
+
+[dependencies]
+gilrs = { workspace = true }
+gpui-kit = { workspace = true }
+openxbdm-client = { path = "../openxbdm-client" }
+rootcause = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }

@@ -8,14 +8,19 @@ use std::path::PathBuf;
 
 use openxbdm_client::Client;
 use openxbdm_client::commands::AltAddr;
+use openxbdm_client::commands::BindController;
 use openxbdm_client::commands::ConsoleMem;
 use openxbdm_client::commands::ConsoleType;
+use openxbdm_client::commands::ControllerQueueLength;
 use openxbdm_client::commands::DbgName;
 use openxbdm_client::commands::DirList;
 use openxbdm_client::commands::DmVersion;
 use openxbdm_client::commands::DriveFreeSpace;
 use openxbdm_client::commands::DriveList;
 use openxbdm_client::commands::FileUploadKind;
+use openxbdm_client::commands::Gamepad;
+use openxbdm_client::commands::GamepadDurationMillis;
+use openxbdm_client::commands::GamepadButtons;
 use openxbdm_client::commands::GetConsoleFeatures;
 use openxbdm_client::commands::GetConsoleMem;
 use openxbdm_client::commands::GetConsoleType;
@@ -32,12 +37,16 @@ use openxbdm_client::commands::ModuleSections;
 use openxbdm_client::commands::Modules;
 use openxbdm_client::commands::PerfCounterList;
 use openxbdm_client::commands::PixelFormat;
+use openxbdm_client::commands::QueryControllerQueue;
 use openxbdm_client::commands::QueryPerfCounter;
 use openxbdm_client::commands::SetMem;
 use openxbdm_client::commands::SysTime;
 use openxbdm_client::commands::ThreadId;
 use openxbdm_client::commands::ThreadInfo;
 use openxbdm_client::commands::Threads;
+use openxbdm_client::commands::TimedGamepad;
+use openxbdm_client::commands::UnbindController;
+use openxbdm_client::commands::UserSlot;
 use openxbdm_client::commands::WalkMem;
 use openxbdm_client::commands::XbeInfo;
 #[cfg(feature = "capture")]
@@ -535,6 +544,93 @@ fn error_response_is_typed() {
         message: "unknown command",
     }
     "###);
+}
+
+#[test]
+fn autoinput_uploads_fixed_gamepad_packet() {
+    let log = fixture("autoinput_setpacket");
+    let mock = MockTransport::from_log(log);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    runtime.block_on(async move {
+        let mut client = Client::new(mock).read_banner().await.unwrap();
+        let user = UserSlot::new(2).unwrap();
+        client
+            .run(BindController {
+                user,
+                queue_length: ControllerQueueLength::FIXED_STATE,
+            })
+            .await
+            .unwrap();
+        client
+            .set_gamepad(
+                user,
+                Gamepad {
+                    buttons: GamepadButtons::GUIDE | GamepadButtons::A,
+                    left_trigger: 0x40,
+                    right_trigger: 0x80,
+                    left_thumb_x: -2,
+                    left_thumb_y: 0x1234,
+                    right_thumb_x: -0x1234,
+                    right_thumb_y: i16::MIN,
+                },
+            )
+            .await
+            .unwrap();
+        client.run(UnbindController { user }).await.unwrap();
+    });
+}
+
+#[test]
+fn autoinput_uploads_and_queries_timed_gamepad_packets() {
+    let log = fixture("autoinput_queue");
+    let mock = MockTransport::from_log(log);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    runtime.block_on(async move {
+        let mut client = Client::new(mock).read_banner().await.unwrap();
+        let user = UserSlot::new(0).unwrap();
+        client
+            .run(BindController {
+                user,
+                queue_length: ControllerQueueLength::new(2).unwrap(),
+            })
+            .await
+            .unwrap();
+        let queued = client
+            .queue_gamepads(
+                user,
+                &[
+                    TimedGamepad {
+                        packet: Gamepad {
+                            buttons: GamepadButtons::A,
+                            ..Gamepad::default()
+                        },
+                        duration: GamepadDurationMillis::new(10).unwrap(),
+                    },
+                    TimedGamepad {
+                        packet: Gamepad::default(),
+                        duration: GamepadDurationMillis::new(20).unwrap(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(queued.0, 2);
+
+        let status = client.run(QueryControllerQueue { user }).await.unwrap();
+        assert_eq!(status.capacity, 2);
+        assert_eq!(status.queued, 2);
+        assert_eq!(status.remaining_ms, 30);
+        assert_eq!(status.remaining_polls, 0);
+        client.run(UnbindController { user }).await.unwrap();
+    });
 }
 
 #[cfg(feature = "capture")]

@@ -1,0 +1,12 @@
+# xbdm capture v1
+S> 201- connected\r\n
+C> autoinput user=0 bind queuelen=2\r\n
+S> 200- OK\r\n
+C> autoinput user=0 queuepackets count=2 timearray\r\n
+S> 204- send binary data\r\n
+C> \x00\x10\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0a\x00\x00\x00\x14\x00\x00\x00
+S> 200- queued=0x00000002\r\n
+C> autoinput user=0 queryqueue\r\n
+S> 200- nQueue=0x00000002, nPacket=0x00000002, t_remain_ms=0x0000001e, t_remain_count=0x00000000\r\n
+C> autoinput user=0 unbind\r\n
+S> 200- OK\r\n

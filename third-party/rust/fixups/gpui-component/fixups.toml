@@ -1,0 +1,2 @@
+[buildscript.run]
+env = { DEP_GPUI_KIT_DEFAULT_ICONS_ICONS_DIR = "$(location :gpui-kit-assets-0.8.0.crate)/assets/icons" }

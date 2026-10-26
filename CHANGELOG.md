@@ -74,6 +74,8 @@
 - Report 4xx replies outside the result table as remote errors with their code (`RemoteStatus`); parse stop exception codes as `NtStatus`, thread last errors as `Win32Error`, and the PIX capture file result as a hexadecimal HRESULT, failing on malformed text.
 - Compute the key exchange in the group stock XBDM uses on the console, for both the client and the server: the group table reaches the kernel without the byte swap that client values get, so the generator is 2^761 and each modulus qword is byte reversed in wire layout. A session key from `keyxchg` matches stock XBDM's, so `adminpw passwd=` and `authuser passwd=` store the intended passwords.
 - The command-line client is `xeedee`.
+- Add typed `autoinput` client commands for virtual controller binding, fixed packets, timed packet queues, and queue status.
+- Add the GPUI Kit `xeedee-controller` application for relaying a connected host controller or a JSON controller script to a console.
 
 ### Build
 

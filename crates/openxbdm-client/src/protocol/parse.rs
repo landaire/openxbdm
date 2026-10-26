@@ -99,18 +99,23 @@ where
     parser(&mut cursor).map_err(|_| on_fail)
 }
 
-/// Consume whitespace-separated `KEY=VALUE` pairs and bare flag tokens.
+/// Consume whitespace- or comma-separated `KEY=VALUE` pairs and bare flag
+/// tokens.
 pub fn kv_tokens<'a>(input: &mut Input<'a>) -> Result<KvTokens<'a>, ErrMode<ContextError>> {
     let mut tokens = KvTokens::default();
 
     loop {
         space0.parse_next(input)?;
+        opt(',').parse_next(input)?;
+        space0.parse_next(input)?;
         if input.is_empty() {
             break;
         }
 
-        let key =
-            take_while(1.., |c: char| c != '=' && !c.is_ascii_whitespace()).parse_next(input)?;
+        let key = take_while(1.., |c: char| {
+            c != '=' && c != ',' && !c.is_ascii_whitespace()
+        })
+        .parse_next(input)?;
         match opt('=').parse_next(input)? {
             Some(_) => {
                 let value = kv_value.parse_next(input)?;
@@ -128,7 +133,7 @@ pub fn kv_value<'a>(input: &mut Input<'a>) -> Result<KvValue<'a>, ErrMode<Contex
 }
 
 fn bare_value<'a>(input: &mut Input<'a>) -> Result<KvValue<'a>, ErrMode<ContextError>> {
-    take_while(0.., |c: char| !c.is_ascii_whitespace())
+    take_while(0.., |c: char| c != ',' && !c.is_ascii_whitespace())
         .map(KvValue::Bare)
         .parse_next(input)
 }
@@ -191,6 +196,17 @@ mod tests {
         assert_eq!(tokens.pairs[1].0, "ADDR");
         assert_eq!(tokens.pairs[1].1.as_str(), "0x80000000");
         assert_eq!(tokens.flags, vec!["RUNNING"]);
+    }
+
+    #[test]
+    fn kv_tokens_accepts_comma_separators() {
+        let mut input = "nQueue=0x2, nPacket=0x1, t_remain_ms=0x20";
+        let tokens = kv_tokens.parse_next(&mut input).unwrap();
+
+        assert_eq!(tokens.pairs.len(), 3);
+        assert_eq!(tokens.pairs[0].1.as_str(), "0x2");
+        assert_eq!(tokens.pairs[1].1.as_str(), "0x1");
+        assert_eq!(tokens.pairs[2].1.as_str(), "0x20");
     }
 
     #[test]

@@ -1,0 +1,7 @@
+buildscript.run = false
+cfgs = ["folded_multiply"]
+# The compile-time RNG changes macro expansion between Buck's metadata and
+# codegen actions, so rustc rejects the resulting crate hash.
+features = ["runtime-rng"]
+omit_features = ["compile-time-rng", "const-random"]
+extra_deps = [":getrandom-0.3"]

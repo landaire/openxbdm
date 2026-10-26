@@ -1,0 +1,8 @@
+buildscript.run = false
+
+[[cxx_library]]
+name = "log-shims"
+srcs = [
+    "src/sys/client_impl/log_shim.c",
+    "src/sys/server_impl/log_shim.c",
+]

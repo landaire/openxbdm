@@ -1,0 +1,4 @@
+rustc_flags = ["-l", "udev"]
+
+[buildscript]
+run = true

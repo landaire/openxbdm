@@ -3,6 +3,7 @@
 //! Each submodule groups a family of commands. The modules only depend on
 //! [`crate::protocol`] and [`crate::error`]; they never touch I/O directly.
 
+pub mod automation;
 pub mod context;
 #[cfg(feature = "dangerous")]
 pub mod dangerous;
@@ -25,6 +26,17 @@ pub mod screenshot;
 pub mod security;
 pub mod system;
 
+pub use automation::BindController;
+pub use automation::ControllerQueueLength;
+pub use automation::ControllerQueueStatus;
+pub use automation::Gamepad;
+pub use automation::GamepadDurationMillis;
+pub use automation::GamepadButtons;
+pub use automation::QueryControllerQueue;
+pub use automation::QueuedPackets;
+pub use automation::TimedGamepad;
+pub use automation::UnbindController;
+pub use automation::UserSlot;
 pub use context::ContextGroups;
 pub use context::ControlRegisters;
 pub use context::FloatingPointRegisters;

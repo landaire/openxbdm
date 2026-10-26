@@ -1,0 +1,10 @@
+# xbdm capture v1
+S> 201- connected\r\n
+C> autoinput user=2 bind queuelen=0\r\n
+S> 200- OK\r\n
+C> autoinput user=2 setpacket\r\n
+S> 204- send binary data\r\n
+C> \x00\x14\x40\x80\xfe\xff\x34\x12\xcc\xed\x00\x80
+S> 200- OK\r\n
+C> autoinput user=2 unbind\r\n
+S> 200- OK\r\n

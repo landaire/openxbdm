@@ -155,6 +155,19 @@ pub enum ArgumentError {
     InvalidDbgNameChar,
     #[error("filename cannot be empty")]
     EmptyFilename,
+    #[error("controller packet count exceeds the protocol's u32 limit")]
+    ControllerPacketCountOverflow,
+    #[error("controller packet queue cannot be empty")]
+    EmptyControllerPacketQueue,
+    #[error("controller queue length {length} exceeds the safe limit {maximum}")]
+    ControllerQueueLengthOutOfRange { length: u32, maximum: u32 },
+    #[error(
+        "controller frame duration {duration_ms} ms is outside 1..={maximum_ms} ms"
+    )]
+    ControllerFrameDurationOutOfRange {
+        duration_ms: u32,
+        maximum_ms: u32,
+    },
     #[error("memory length exceeds the protocol's u32 limit")]
     MemoryLengthOverflow,
 }

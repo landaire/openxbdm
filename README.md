@@ -12,6 +12,7 @@ Clean-room Rust reimplementation of the Xbox 360 [XBDM][xbdm] (Xbox Debug Monito
 - Client library has an FFI crate which can be used to generate bindings for any target language supported by [diplomat](https://github.com/rust-diplomat/diplomat).
 - `kdnet` supported and a `kdnet` to `gdbstub` bridge is provided, so you can debug your console with `gdb` or `lldb`.
 - There is a `xeedee` cli which provides some features wrapping the client library for interacting with the devkit.
+- `xeedee-controller` relays a host gamepad or timed controller script to a console.
 
 ## Releases
 
@@ -136,6 +137,35 @@ xeedee -H 192.168.1.26 file ls 'DEVKIT:\'
 xeedee -H 192.168.1.26 file get 'DEVKIT:\my-capture.xbm'
 xeedee -H 192.168.1.26 dump-module xboxkrnl.exe /tmp/xboxkrnl.exe
 ```
+
+## Controller relay
+
+Run the GPUI controller relay and enter the console IP address or hostname:
+
+```text
+buck2 run //crates/xeedee-controller:xeedee-controller-bin
+```
+
+Select a connected hardware controller to relay its current state. Select a JSON script to queue timed frames on the console instead:
+
+```json
+{
+  "frames": [
+    {
+      "duration_ms": 250,
+      "buttons": ["a", "dpad_up"],
+      "left_trigger": 0.5,
+      "left_stick": { "x": -1.0, "y": 1.0 }
+    },
+    {
+      "duration_ms": 100,
+      "buttons": []
+    }
+  ]
+}
+```
+
+Stick values range from `-1.0` to `1.0`. Trigger values range from `0.0` to `1.0`. Frame durations range from 1 to 2,147,483,647 milliseconds. Button names use snake case XInput names such as `left_shoulder`, `dpad_up`, and `guide`.
 
 ## Building
 

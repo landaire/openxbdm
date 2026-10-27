@@ -74,7 +74,7 @@ pub use self::title::title_reboot_launch;
 pub use self::title::title_reboot_stop;
 pub use self::title::trace_title_reboot;
 
-/// Delay between the `200- OK` of a reboot and the reboot.
+/// Delay between the `200- OK` of a reboot command and the requested transition.
 const REBOOT_REPLY_DELAY_MS: u32 = 200;
 
 pub(crate) const COMMANDS: &[CommandEntry] = &[
@@ -131,12 +131,12 @@ pub enum BootWait {
     Forever,
 }
 
-/// How the console restarts.
+/// Whether the console restarts or powers down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RebootKind {
     /// Return to firmware and restart the system software.
     Normal,
-    /// Reset through the system management controller.
+    /// Power down through the system management controller.
     SmcReset,
 }
 
@@ -230,7 +230,7 @@ pub trait Backend {
     fn read_settings(&mut self, file: SettingsFile, buffer: &mut [u8]) -> Option<usize>;
     fn close_settings(&mut self, file: SettingsFile);
     fn sleep_milliseconds(&mut self, milliseconds: u32);
-    /// Restart the console. On a console this does not return.
+    /// Restart or power down the console. On a console this does not return.
     fn reboot(&mut self, kind: RebootKind);
     /// Set the system clock (FILETIME) and tell the network stack the
     /// clock changed.
@@ -284,9 +284,9 @@ pub(crate) fn resume(
     }
 }
 
-/// Control code 0x02 (stock 0x91f3b208): the system is about to restart.
-/// Exceptions go to the kernel debugger, trap pass-through ends, the
-/// settings file is written, `execution rebooting` is announced, every
+/// Control code 0x02 (stock 0x91f3b208): the system is about to restart or
+/// power down. Exceptions go to the kernel debugger, trap pass-through ends,
+/// the settings file is written, `execution rebooting` is announced, every
 /// connection is closed, and no further connection is accepted.
 pub fn prepare_reboot(
     server: &mut Server,
@@ -310,9 +310,9 @@ pub fn prepare_reboot(
     server.shut_down();
 }
 
-/// `reboot [stop] [wait] [smcreset]`: reply, then restart. The server
-/// writes the settings file, sends `execution rebooting`, and closes every
-/// connection and notification channel before the restart.
+/// `reboot [stop] [wait] [smcreset]`: reply, then restart or power down. The
+/// server writes the settings file, sends `execution rebooting`, and closes
+/// every connection and notification channel before the transition.
 fn reboot(invocation: &mut Invocation<'_>) -> CommandResult {
     let Some(session) = invocation.session.as_deref_mut() else {
         return Ok(Reply::Sent);

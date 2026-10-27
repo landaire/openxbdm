@@ -231,7 +231,7 @@ pub enum Command {
         /// Wait for a debugger connection after the reboot.
         #[arg(long)]
         wait: bool,
-        /// Reset through the system management controller.
+        /// Power down through the system management controller.
         #[arg(long = "smcreset")]
         smc_reset: bool,
     },

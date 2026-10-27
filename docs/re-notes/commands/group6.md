@@ -268,9 +268,8 @@ Conventions used below:
   2. Send `200- OK` on the connection socket, sleep 200 ms.
   3. If boot-wait mode 0x91fadec8 == 0: `stop` sets it to 2, else `wait` sets it to 1.
   4. 0x91f3b208: 0x91f975fc = 1, 0x91f9fd90 = 0, WriteIniFile, notification `execution rebooting`, close every command connection (0x91f41038), close every notification socket, further shutdown (0x91f27290).
-  5. `smcreset`: HalReturnToFirmware(4). Else current IRQL < 2: HalReturnToFirmware(6); else HalReturnToFirmware(1). Does not return.
-- Client disagreement: `system.rs` sends `reboot TITLE= DIRECTORY= CMDLINE= WARM STOP NODEBUG WAIT`; this image's `reboot` honors only STOP, WAIT, SMCRESET.
-- Backend requirement: console reboot (normal and SMC reset), persistent boot-wait mode.
+  5. `smcreset`: HalReturnToFirmware(4), which powers down the observed devkit and requires manual power-on. Else current IRQL < 2: HalReturnToFirmware(6); else HalReturnToFirmware(1). Does not return.
+- Backend requirement: console reboot, SMC power-down, persistent boot-wait mode.
 - Status: spec complete.
 
 ## recovery

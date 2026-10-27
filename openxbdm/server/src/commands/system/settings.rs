@@ -529,8 +529,8 @@ pub(crate) fn settings_keyword(invocation: &mut Invocation<'_>) -> bool {
     true
 }
 
-/// Restart without a connection to report to: write settings, announce
-/// `execution rebooting`, close the notification channels, and reboot.
+/// Restart or power down without a connection to report to: write settings,
+/// announce `execution rebooting`, and close the notification channels.
 pub(super) fn reboot_from_settings(invocation: &mut Invocation<'_>, kind: RebootKind) {
     save_settings(invocation.state, invocation.backend);
     invocation.state.notifications.deliver(

@@ -9,8 +9,8 @@ use crate::protocol::Command;
 use crate::protocol::ExpectedBody;
 use crate::protocol::Response;
 
-/// `reboot [STOP] [WAIT] [SMCRESET]`: reboot the console. The console
-/// replies `200- OK` before it restarts.
+/// `reboot [STOP] [WAIT] [SMCRESET]`: reboot the console, or request an SMC
+/// power-down with `SMCRESET`. The console replies `200- OK` first.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Reboot {
     /// `STOP`: stop at the title entry point after the reboot.
@@ -18,7 +18,7 @@ pub struct Reboot {
     /// `WAIT`: wait for a debugger connection after the reboot. Ignored
     /// with `stop`, and when a boot-wait mode is already recorded.
     pub wait: bool,
-    /// `SMCRESET`: reset through the system management controller.
+    /// `SMCRESET`: power down through the system management controller.
     pub smc_reset: bool,
 }
 

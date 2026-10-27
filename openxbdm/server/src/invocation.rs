@@ -36,7 +36,7 @@ pub enum SessionRequest {
     ReleaseSocket,
     /// Dedicate the connection; the server sends `205- connection dedicated`.
     Dedicate(DedicateTarget),
-    /// Restart the console after writing settings, announcing
+    /// Restart or power down the console after writing settings, announcing
     /// `execution rebooting`, and closing every connection and channel.
     Reboot(RebootKind),
 }

@@ -15,6 +15,8 @@
 /.tools
 # A local rust-xbox360 checkout for `xbox360 = disabled` (DEVELOPING.md).
 /rust-xbox360
+# The PPC64 source compiler bootstrap external cell.
+/rustc-bootstrap
 /.cargo/*
 /.devenv
 /.devenv.flake.nix

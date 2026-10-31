@@ -65,6 +65,7 @@ pub use self::arch::Registers64;
 pub use self::arch::Xenon32;
 pub use self::arch::Xenon64;
 pub use self::arch::XenonArch;
+pub use self::arch::XenonIlp32;
 
 /// Text for the debugger console.
 pub type ConsoleText = Vec<u8>;

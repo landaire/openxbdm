@@ -1,11 +1,12 @@
 //! Xenon register layouts and target descriptions for gdbstub.
 //!
 //! Xenon is 64-bit PowerPC. [`Xenon64`] describes its registers as they
-//! are (`powerpc:common64`). [`Xenon32`] describes their low words as
-//! 32-bit PowerPC (`powerpc:common`): titles compiled as 32-bit code use
-//! that ABI, and GDB accepts a 32-bit ELF as the symbol file only with a
-//! 32-bit description. A 32-bit register write replaces the low word of the
-//! 64-bit register and keeps the high word.
+//! are (`powerpc:common64`). [`XenonIlp32`] exposes those 64-bit registers
+//! to a debugger whose architecture remains 32-bit PowerPC, for an ELF32
+//! program compiled in 64-bit mode with 32-bit pointers. [`Xenon32`]
+//! describes the low words as 32-bit PowerPC (`powerpc:common`). A 32-bit
+//! register write replaces the low word of the 64-bit register and keeps
+//! the high word.
 //!
 //! The context record holds IAR, MSR and LR as 32-bit fields.
 
@@ -113,6 +114,22 @@ impl Arch for Xenon64 {
 }
 
 impl XenonArch for Xenon64 {}
+
+/// The 64-bit registers with a 32-bit PowerPC architecture and pointers.
+pub enum XenonIlp32 {}
+
+impl Arch for XenonIlp32 {
+    type Usize = u64;
+    type Registers = Registers64;
+    type BreakpointKind = usize;
+    type RegId = ();
+
+    fn target_description_xml() -> Option<&'static str> {
+        Some(target_xml!("powerpc:common", "64", "uint64"))
+    }
+}
+
+impl XenonArch for XenonIlp32 {}
 
 /// The low words, for code compiled as 32-bit PowerPC.
 pub enum Xenon32 {}

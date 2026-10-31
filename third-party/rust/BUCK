@@ -11616,6 +11616,9 @@ cargo.rust_library(
         "CARGO_PKG_VERSION_PRE": "",
         "OUT_DIR": "$(location :gpui-pre-windows-0.3-build-script-run[out_dir])",
     },
+    mapped_srcs = {
+        "fixups/gpui-pre-windows/overlay/build.rs": "gpui-pre-windows-0.3.9.crate/build.rs",
+    },
     platform = {
         "windows-msvc": dict(),
     },
@@ -11669,6 +11672,9 @@ cargo.rust_binary(
         "CARGO_PKG_VERSION_MINOR": "3",
         "CARGO_PKG_VERSION_PATCH": "9",
         "CARGO_PKG_VERSION_PRE": "",
+    },
+    mapped_srcs = {
+        "fixups/gpui-pre-windows/overlay/build.rs": "gpui-pre-windows-0.3.9.crate/build.rs",
     },
     platform = {
         "windows-msvc": dict(),

@@ -1,2 +1,4 @@
+overlay = "overlay"
+
 [buildscript]
 run = true

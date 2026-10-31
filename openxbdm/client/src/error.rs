@@ -147,8 +147,6 @@ pub enum ParseError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ArgumentError {
-    #[error("quoted argument cannot contain an unescaped double quote")]
-    QuotedContainsDoubleQuote,
     #[error("quoted argument cannot contain a carriage return or line feed")]
     QuotedContainsCrlf,
     #[error("dbgname value cannot contain CR, LF, or double quote")]

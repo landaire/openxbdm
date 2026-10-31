@@ -23,6 +23,7 @@ use crate::gdb::KdTarget;
 use crate::gdb::Xenon32;
 use crate::gdb::Xenon64;
 use crate::gdb::XenonArch;
+use crate::gdb::XenonIlp32;
 use crate::link::Notification;
 use crate::print::print_notification;
 use crate::print::print_stop_report;
@@ -34,6 +35,10 @@ pub enum RegisterWidth {
     /// The 64-bit registers of the processor (`powerpc:common64`).
     #[value(name = "64")]
     Bits64,
+    /// The full registers with a 32-bit PowerPC architecture, for ELF32
+    /// code compiled in 64-bit mode with 32-bit pointers.
+    #[value(name = "ilp32")]
+    Ilp32,
     /// Their low words (`powerpc:common`), for code compiled as 32-bit
     /// PowerPC: GDB accepts a 32-bit ELF as the symbol file only then.
     #[value(name = "32")]
@@ -148,6 +153,7 @@ pub fn gdb_server(
 
     let served = match width {
         RegisterWidth::Bits64 => serve::<Xenon64>(client, stream, console_text),
+        RegisterWidth::Ilp32 => serve::<XenonIlp32>(client, stream, console_text),
         RegisterWidth::Bits32 => serve::<Xenon32>(client, stream, console_text),
     };
     let debugger_status = debugger
@@ -174,7 +180,7 @@ fn launch_debugger(
 ) -> Result<Child, Report<CliError>> {
     let architecture = match width {
         RegisterWidth::Bits64 => "powerpc:common64",
-        RegisterWidth::Bits32 => "powerpc:common",
+        RegisterWidth::Ilp32 | RegisterWidth::Bits32 => "powerpc:common",
     };
 
     Command::new(&debugger.program)

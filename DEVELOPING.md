@@ -85,7 +85,7 @@ contains every host executable; each is also an individual package and
 app.
 
 Buck2 takes its Rust toolchain from the `xbox360` cell,
-[rust-xbox360](https://github.com/landaire/rust-xbox360) at the commit in
+[xenon-forge](https://github.com/landaire/xenon-forge) at the commit in
 `[external_cell_xbox360]` of `.buckconfig`, which Buck2 fetches with git.
 The cell's `buck/rust_release.bzl` records the archives of one Rust
 release: `rustc` (rustc, rustdoc, and the bundled lld), `rust-std`,
@@ -133,11 +133,11 @@ paths exceed 260 characters, and `link.exe` still fails under a long
 checkout path; CI copies the checkout to `C:\a`
 (`ci/prepare-windows-runner.ps1`).
 
-### Local changes to rust-xbox360
+### Local changes to xenon-forge
 
-To build against a rust-xbox360 working copy instead of the pinned
-commit, place the working copy at `rust-xbox360/` in this repository (the
-path of the cell in `.buckconfig`; Git ignores it) and make the cell an
+To build against a xenon-forge working copy instead of the pinned commit,
+place the working copy at `rust-xbox360/` in this repository (the path of
+the cell in `.buckconfig`; Git ignores it) and make the cell an
 ordinary cell in `.buckconfig.local`:
 
     [external_cells]
@@ -155,24 +155,22 @@ the `.buckconfig.local` entry.
 
 ## Build and test
 
-Buck2 is the primary build system. Cargo builds the host crates from the
-same sources.
+Buck2 builds and tests the complete workspace:
 
     buck2 build //: //bindings/... //openxbdm/... //xbox360/...
     buck2 test //: //bindings/... //openxbdm/... //xbox360/...
     build_defs/lint.py
 
-    cargo build --workspace
-    cargo test --workspace
+Cargo remains available for rust-analyzer and dependency maintenance, but
+is not a build or release path.
 
 `//third-party/rust` is not built as a whole: its rules for other hosts
 are incompatible with this one.
 
 The `smb` feature of `openxbdm-server`, `openxbdm-server-host`, and
-`openxbdm-server-xbox360` is on by default; the platform crates depend on
-`openxbdm-server` without its default features and enable `smb` through
-their own. `cargo build -p openxbdm-server --no-default-features` builds
-the engine without `smb2-server`.
+`openxbdm-server-xbox360` is on by default. The platform crates depend on
+`openxbdm-server` without its default features, then enable `smb` through
+their own feature sets.
 
 Build modes are configuration modifiers. `?dev` is the default and keeps external debug information. For host builds, `?release` adds `-Copt-level=3` to every crate and thin LTO to binaries and tests while keeping external debug information. `?release_no_symbols` makes the same optimized host build without symbols. Console modules keep their size optimization and LTO settings; the modes select whether they retain symbols. For example:
 
@@ -182,20 +180,34 @@ On Linux, a host binary's external debug file is its `[symbols]` subtarget. The 
 
 The target constraint is `//config:target`, with `[host]` and `[xbox]` values. Xbox module rules apply `[xbox]` and the required standard library configuration through their transition.
 
-`build_defs/package_release.py` builds with `?release` and archives the released executables (`xeedee`, `openxbdm-kd`, and `xeedee-controller`) as `xeedee-<version>-<target>`. It archives the `openxbdm-ffi` shared and static libraries (the `[cdylib]` and `[staticlib]` subtargets of its library) with their C++ headers (`//bindings:cpp`, written by `openxbdm-ffi-bindgen`) as `xeedee-ffi-<version>-<target>`. The profile gives only host binaries and tests `-Clto=thin`, so the FFI libraries are built without LTO.
+`build_defs/package_release.py` builds every release artifact with
+`?release`. It archives the released executables (`xeedee`,
+`openxbdm-kd`, and `xeedee-controller`) as
+`xeedee-<version>-<target>`. GPUI normally emits its Windows shaders only
+when its build script is compiled in release mode. Buck execution
+dependencies intentionally use a separate development configuration, so
+the Reindeer overlay in
+`third-party/rust/fixups/gpui-pre-windows/overlay` makes that build script
+emit the shaders on every Windows Buck build. The script archives the
+`openxbdm-ffi` shared and static libraries (the `[cdylib]` and
+`[staticlib]` subtargets of its library) with their C++ headers
+(`//bindings:cpp`, written by `openxbdm-ffi-bindgen`) as
+`xeedee-ffi-<version>-<target>`. The Buck profile gives only host binaries
+and tests `-Clto=thin`, so the FFI libraries are built without LTO.
 
 `build_defs/package_module.py` copies out the console module builds.
 `.github/workflows/release.yml` publishes a release for a `vX.Y.Z` tag
-that names the workspace version, and `.github/workflows/nightly.yml`
-replaces the `nightly` pre-release each day the default branch has
-changed. `build_defs/release_notes.py` writes the notes of both.
+that names the workspace version. `.github/workflows/nightly.yml`
+publishes an immutable `nightly-<commit>` pre-release and updates the
+`nightly` alias each day the default branch has changed.
+`build_defs/release_notes.py` writes the notes of both.
 
 ## Xbox 360 module
 
 `openxbdm-server-xbox360` targets `powerpc-unknown-xbox360`. Its
 `[package.metadata.buck2.xbox360]` table names its linker script, and
 `build_defs/update_buck_files.py` makes each of its binaries an
-`xbox360_executable_core` of the rust-xbox360 cell
+`xbox360_executable_core` of the xenon-forge cell
 (`@xbox360//buck:xex.bzl`). That rule configures itself and its
 dependencies for the console, with the `core`, `alloc` and
 `compiler_builtins` crates that the cell builds from the standard library
@@ -250,7 +262,7 @@ In every case the build fails if the image holds an `lwarx`, `ldarx`,
 `stwcx.`, or `stdcx.` outside the interrupt-protected form the kernel
 loader accepts. LLVM emits unprotected reservations for
 `core::sync::atomic` read-modify-write operations unless `core` carries
-the atomics overlay of rust-xbox360 (`toolchain/rust-std-xbox360`), as the
+the atomics overlay of xenon-forge (`toolchain/rust-std-xbox360`), as the
 cell's `core` does.
 
 xex-link (`xbox360//crates/xex-link:xex-link`) converts the image with the

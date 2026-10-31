@@ -76,19 +76,21 @@ impl ArgBuilder {
         self
     }
 
-    /// Append `KEY="..."` with minimal quoting. Backslashes pass through
-    /// unchanged (XBDM tokenises them literally); embedded double quotes
-    /// and CR/LF are rejected.
+    /// Append `KEY="..."` using XBDM's doubled-quote escaping. Backslashes
+    /// pass through unchanged; CR/LF are rejected.
     pub fn quoted(mut self, key: &str, value: &str) -> Result<Self, ArgumentError> {
-        if value.contains('"') {
-            return Err(ArgumentError::QuotedContainsDoubleQuote);
-        }
-
         if value.contains(['\r', '\n']) {
             return Err(ArgumentError::QuotedContainsCrlf);
         }
 
-        let _ = write!(self.buf, " {key}=\"{value}\"");
+        let _ = write!(self.buf, " {key}=\"");
+        for character in value.chars() {
+            self.buf.push(character);
+            if character == '"' {
+                self.buf.push('"');
+            }
+        }
+        self.buf.push('"');
 
         Ok(self)
     }
@@ -128,9 +130,12 @@ mod tests {
     }
 
     #[test]
-    fn builder_rejects_embedded_quote() {
-        let err = ArgBuilder::new("delete").quoted("NAME", "bad\"name");
-        assert!(matches!(err, Err(ArgumentError::QuotedContainsDoubleQuote)));
+    fn builder_escapes_embedded_quote() {
+        let line = ArgBuilder::new("magicboot")
+            .quoted("CMDLINE", r#"alpha "two words""#)
+            .unwrap()
+            .finish();
+        assert_eq!(line, r#"magicboot CMDLINE="alpha ""two words""""#);
     }
 
     #[test]

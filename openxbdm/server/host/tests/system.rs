@@ -389,23 +389,28 @@ fn settings_are_skipped_when_the_read_buffer_cannot_be_allocated() {
 
 #[test]
 fn settings_are_not_written_before_load_completes_or_on_cd_boot() {
-    let mut host = Host::default();
-    host.backend.filesystem.write(GAME, b"xex");
     let saved = format!("[xbdm]\r\ntitle name=\"{GAME}\"\r\n").into_bytes();
-    host.backend.system.settings = Some(saved.clone());
-    host.backend.system.recint = Some(b"wait forever\r\n".to_vec());
+    let host_with_settings = || {
+        let mut host = Host::default();
+        host.backend.filesystem.write(GAME, b"xex");
+        host.backend.system.settings = Some(saved.clone());
+        host.backend.system.recint = Some(b"wait forever\r\n".to_vec());
+        host
+    };
+
+    // Started directly: the timer thread of a served host rewrites the settings after startup,
+    // which would race the check of the load itself.
+    let mut host = host_with_settings();
+    host.start();
+    assert_eq!(
+        host.server.state.system.title.image.as_bytes(),
+        GAME.as_bytes()
+    );
+    assert_eq!(host.backend.system.settings.as_deref(), Some(&saved[..]));
+
+    let mut host = host_with_settings();
+    host.backend.system.cd_boot = true;
     let server = TestServer::with_host(host);
-
-    {
-        let host = server.host.lock();
-        assert_eq!(
-            host.server.state.system.title.image.as_bytes(),
-            GAME.as_bytes()
-        );
-        assert_eq!(host.backend.system.settings.as_deref(), Some(&saved[..]));
-    }
-
-    server.host.lock().backend.system.cd_boot = true;
 
     let mut session = server.raw();
     session.line();

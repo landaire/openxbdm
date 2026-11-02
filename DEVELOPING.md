@@ -366,7 +366,7 @@ them; after a change to a `Cargo.toml` or `Cargo.lock`, run
 which writes:
 
 - `third-party/rust/BUCK`, through `reindeer buckify`: the rules for the
-  crates.io dependencies, each limited to the hosts that use it
+  crates.io and git dependencies, each limited to the hosts that use it
   (`build_defs/third_party.bzl`).
 - `openxbdm/**/BUCK`: the rules for each workspace crate. A library becomes
   `:<lib>`, a binary `:<bin>-bin`, their unit tests `:<lib>-lib-test` and
@@ -411,9 +411,13 @@ The test harness layout follows the rarchive repository (`../rarchive`).
 
 Dependencies are not vendored. Cargo fetches them from crates.io, and
 Buck2 downloads each crate from crates.io and checks it against the
-SHA-256 in `Cargo.lock`. The xbox360 cell builds the console's standard
-library crates from the Rust release's `rust-src` archive with its
-overlay; it pins their crates.io dependencies by SHA-256 the same way.
+SHA-256 in `Cargo.lock`. The crates of
+[acceleration](https://github.com/landaire/acceleration), which are not on
+crates.io, are a git dependency pinned to one commit; Buck2 fetches that
+commit with `git` (a `git_fetch` rule). The xbox360 cell builds the
+console's standard library crates from the Rust release's `rust-src`
+archive with its overlay; it pins their crates.io dependencies by SHA-256
+the same way.
 
 To add or update a dependency:
 

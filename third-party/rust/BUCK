@@ -3,6 +3,13 @@
 load("@prelude//rust:cargo_buildscript.bzl", "buildscript_run")
 load("//build_defs:third_party.bzl", "cargo")
 
+git_fetch(
+    name = "acceleration-2db5a2638de2d497.git",
+    repo = "https://github.com/landaire/acceleration",
+    rev = "fe8a57aea2d3b994001f9853e77a3e402a68b36d",
+    visibility = [],
+)
+
 cargo.http_archive(
     name = "accesskit-0.24.1.crate",
     sha256 = "d3b7f7f85a7e5f68090000ed7622545829afd484d210358702ae4cb97dd0c320",
@@ -400,6 +407,50 @@ cargo.rust_library(
         ":cfg-if-1",
         ":cipher-0.4",
         ":cpufeatures-0.2",
+    ],
+)
+
+cargo.http_archive(
+    name = "aes-0.9.3.crate",
+    sha256 = "35f0f96ce78e38c3dc6d8948aa8163d06385be74000f3c7a95bf1eef35d3ea32",
+    strip_prefix = "aes-0.9.3",
+    urls = ["https://static.crates.io/crates/aes/0.9.3/download"],
+    visibility = [],
+)
+
+cargo.rust_library(
+    name = "aes-0.9",
+    srcs = [":aes-0.9.3.crate"],
+    crate = "aes",
+    crate_root = "aes-0.9.3.crate/src/lib.rs",
+    edition = "2024",
+    env = {
+        "CARGO_BIN_NAME": "aes",
+        "CARGO_CRATE_NAME": "aes",
+        "CARGO_MANIFEST_DIR": "aes-0.9.3.crate",
+        "CARGO_PKG_AUTHORS": "RustCrypto Developers",
+        "CARGO_PKG_DESCRIPTION": "Pure Rust implementation of the Advanced Encryption Standard (a.k.a. Rijndael)",
+        "CARGO_PKG_HOMEPAGE": "",
+        "CARGO_PKG_NAME": "aes",
+        "CARGO_PKG_README": "README.md",
+        "CARGO_PKG_REPOSITORY": "https://github.com/RustCrypto/block-ciphers",
+        "CARGO_PKG_RUST_VERSION": "1.89",
+        "CARGO_PKG_VERSION": "0.9.3",
+        "CARGO_PKG_VERSION_MAJOR": "0",
+        "CARGO_PKG_VERSION_MINOR": "9",
+        "CARGO_PKG_VERSION_PATCH": "3",
+        "CARGO_PKG_VERSION_PRE": "",
+    },
+    platform = {
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":cipher-0.5",
+        ":cpubits-0.1",
+        ":cpufeatures-0.3",
     ],
 )
 
@@ -2960,6 +3011,46 @@ cargo.rust_library(
 )
 
 cargo.http_archive(
+    name = "block-padding-0.4.2.crate",
+    sha256 = "710f1dd022ef4e93f8a438b4ba958de7f64308434fa6a87104481645cc30068b",
+    strip_prefix = "block-padding-0.4.2",
+    urls = ["https://static.crates.io/crates/block-padding/0.4.2/download"],
+    visibility = [],
+)
+
+cargo.rust_library(
+    name = "block-padding-0.4",
+    srcs = [":block-padding-0.4.2.crate"],
+    crate = "block_padding",
+    crate_root = "block-padding-0.4.2.crate/src/lib.rs",
+    edition = "2024",
+    env = {
+        "CARGO_BIN_NAME": "block_padding",
+        "CARGO_CRATE_NAME": "block_padding",
+        "CARGO_MANIFEST_DIR": "block-padding-0.4.2.crate",
+        "CARGO_PKG_AUTHORS": "RustCrypto Developers",
+        "CARGO_PKG_DESCRIPTION": "Padding and unpadding of messages divided into blocks.",
+        "CARGO_PKG_HOMEPAGE": "",
+        "CARGO_PKG_NAME": "block-padding",
+        "CARGO_PKG_README": "README.md",
+        "CARGO_PKG_REPOSITORY": "https://github.com/RustCrypto/utils",
+        "CARGO_PKG_RUST_VERSION": "1.85",
+        "CARGO_PKG_VERSION": "0.4.2",
+        "CARGO_PKG_VERSION_MAJOR": "0",
+        "CARGO_PKG_VERSION_MINOR": "4",
+        "CARGO_PKG_VERSION_PATCH": "2",
+        "CARGO_PKG_VERSION_PRE": "",
+    },
+    platform = {
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [":hybrid-array-0.4"],
+)
+
+cargo.http_archive(
     name = "block2-0.6.2.crate",
     sha256 = "cdeb9d870516001442e364c5220d3574d2da8dc765554b4a617230d33fa58ef5",
     strip_prefix = "block2-0.6.2",
@@ -3497,6 +3588,50 @@ cargo.rust_library(
 )
 
 cargo.http_archive(
+    name = "cbc-0.2.1.crate",
+    sha256 = "ce2dc9ee5f88d11e0beb842c88b33c8a5cf0d1329c4b19494af42b07dbfe8896",
+    strip_prefix = "cbc-0.2.1",
+    urls = ["https://static.crates.io/crates/cbc/0.2.1/download"],
+    visibility = [],
+)
+
+cargo.rust_library(
+    name = "cbc-0.2",
+    srcs = [":cbc-0.2.1.crate"],
+    crate = "cbc",
+    crate_root = "cbc-0.2.1.crate/src/lib.rs",
+    edition = "2024",
+    env = {
+        "CARGO_BIN_NAME": "cbc",
+        "CARGO_CRATE_NAME": "cbc",
+        "CARGO_MANIFEST_DIR": "cbc-0.2.1.crate",
+        "CARGO_PKG_AUTHORS": "RustCrypto Developers",
+        "CARGO_PKG_DESCRIPTION": "Cipher Block Chaining (CBC) block cipher mode of operation",
+        "CARGO_PKG_HOMEPAGE": "",
+        "CARGO_PKG_NAME": "cbc",
+        "CARGO_PKG_README": "README.md",
+        "CARGO_PKG_REPOSITORY": "https://github.com/RustCrypto/block-modes",
+        "CARGO_PKG_RUST_VERSION": "1.85",
+        "CARGO_PKG_VERSION": "0.2.1",
+        "CARGO_PKG_VERSION_MAJOR": "0",
+        "CARGO_PKG_VERSION_MINOR": "2",
+        "CARGO_PKG_VERSION_PATCH": "1",
+        "CARGO_PKG_VERSION_PRE": "",
+    },
+    features = [
+        "block-padding",
+        "default",
+    ],
+    platform = {
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [":cipher-0.5"],
+)
+
+cargo.http_archive(
     name = "cbindgen-0.28.0.crate",
     sha256 = "eadd868a2ce9ca38de7eeafdcec9c7065ef89b42b32f0839278d55f35c54d1ff",
     strip_prefix = "cbindgen-0.28.0",
@@ -3827,6 +3962,50 @@ cargo.rust_library(
         ":crypto-common-0.1",
         ":inout-0.1",
     ],
+)
+
+cargo.http_archive(
+    name = "cipher-0.5.2.crate",
+    sha256 = "e8cf2a2c93cd704877c0858356ed03480ff301ee950b43f1cbe4573b088bfa6c",
+    strip_prefix = "cipher-0.5.2",
+    urls = ["https://static.crates.io/crates/cipher/0.5.2/download"],
+    visibility = [],
+)
+
+cargo.rust_library(
+    name = "cipher-0.5",
+    srcs = [":cipher-0.5.2.crate"],
+    crate = "cipher",
+    crate_root = "cipher-0.5.2.crate/src/lib.rs",
+    edition = "2024",
+    env = {
+        "CARGO_BIN_NAME": "cipher",
+        "CARGO_CRATE_NAME": "cipher",
+        "CARGO_MANIFEST_DIR": "cipher-0.5.2.crate",
+        "CARGO_PKG_AUTHORS": "RustCrypto Developers",
+        "CARGO_PKG_DESCRIPTION": "Traits for describing block ciphers and stream ciphers",
+        "CARGO_PKG_HOMEPAGE": "",
+        "CARGO_PKG_NAME": "cipher",
+        "CARGO_PKG_README": "README.md",
+        "CARGO_PKG_REPOSITORY": "https://github.com/RustCrypto/traits",
+        "CARGO_PKG_RUST_VERSION": "1.85",
+        "CARGO_PKG_VERSION": "0.5.2",
+        "CARGO_PKG_VERSION_MAJOR": "0",
+        "CARGO_PKG_VERSION_MINOR": "5",
+        "CARGO_PKG_VERSION_PATCH": "2",
+        "CARGO_PKG_VERSION_PRE": "",
+    },
+    features = ["block-padding"],
+    named_deps = {
+        "common": ":crypto-common-0.2",
+    },
+    platform = {
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [":inout-0.2"],
 )
 
 alias(
@@ -4862,6 +5041,45 @@ cargo.rust_library(
         ":unicode-script-0.5",
         ":unicode-segmentation-1",
     ],
+)
+
+cargo.http_archive(
+    name = "cpubits-0.1.1.crate",
+    sha256 = "15b85f9c39137c3a891689859392b1bd49812121d0d61c9caf00d46ed5ce06ae",
+    strip_prefix = "cpubits-0.1.1",
+    urls = ["https://static.crates.io/crates/cpubits/0.1.1/download"],
+    visibility = [],
+)
+
+cargo.rust_library(
+    name = "cpubits-0.1",
+    srcs = [":cpubits-0.1.1.crate"],
+    crate = "cpubits",
+    crate_root = "cpubits-0.1.1.crate/src/lib.rs",
+    edition = "2024",
+    env = {
+        "CARGO_BIN_NAME": "cpubits",
+        "CARGO_CRATE_NAME": "cpubits",
+        "CARGO_MANIFEST_DIR": "cpubits-0.1.1.crate",
+        "CARGO_PKG_AUTHORS": "RustCrypto Developers",
+        "CARGO_PKG_DESCRIPTION": "Compile-time detection heuristics for the optimal word size to use for the\ntarget CPU, which in some cases may differ from its address size a.k.a.\n`target_pointer_width`. Implemented as `macro_rules!`\n",
+        "CARGO_PKG_HOMEPAGE": "",
+        "CARGO_PKG_NAME": "cpubits",
+        "CARGO_PKG_README": "README.md",
+        "CARGO_PKG_REPOSITORY": "https://github.com/RustCrypto/utils",
+        "CARGO_PKG_RUST_VERSION": "1.85",
+        "CARGO_PKG_VERSION": "0.1.1",
+        "CARGO_PKG_VERSION_MAJOR": "0",
+        "CARGO_PKG_VERSION_MINOR": "1",
+        "CARGO_PKG_VERSION_PATCH": "1",
+        "CARGO_PKG_VERSION_PRE": "",
+    },
+    platform = {
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
 )
 
 cargo.http_archive(
@@ -7482,6 +7700,102 @@ cargo.rust_library(
     visibility = [],
 )
 
+alias(
+    name = "fatx",
+    actual = ":fatx-0.4",
+    visibility = ["PUBLIC"],
+)
+
+cargo.rust_library(
+    name = "fatx-0.4",
+    srcs = [":acceleration-2db5a2638de2d497.git"],
+    crate = "fatx",
+    crate_root = "acceleration-2db5a2638de2d497/crates/fatx/src/lib.rs",
+    edition = "2024",
+    env = {
+        "CARGO_BIN_NAME": "fatx",
+        "CARGO_CRATE_NAME": "fatx",
+        "CARGO_MANIFEST_DIR": "acceleration-2db5a2638de2d497",
+        "CARGO_PKG_AUTHORS": "Lander Brandt",
+        "CARGO_PKG_DESCRIPTION": "Sans-io reader, writer and forensic scanner for Xbox 360 FATX volumes",
+        "CARGO_PKG_HOMEPAGE": "",
+        "CARGO_PKG_NAME": "fatx",
+        "CARGO_PKG_README": "",
+        "CARGO_PKG_REPOSITORY": "https://github.com/landaire/acceleration",
+        "CARGO_PKG_RUST_VERSION": "",
+        "CARGO_PKG_VERSION": "0.4.0",
+        "CARGO_PKG_VERSION_MAJOR": "0",
+        "CARGO_PKG_VERSION_MINOR": "4",
+        "CARGO_PKG_VERSION_PATCH": "0",
+        "CARGO_PKG_VERSION_PRE": "",
+    },
+    features = ["default"],
+    platform = {
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":fskit-0.2",
+        ":thiserror-2",
+        ":xenon_io-0.4",
+    ],
+)
+
+alias(
+    name = "fatxtool",
+    actual = ":fatxtool-0.4",
+    visibility = ["PUBLIC"],
+)
+
+cargo.rust_library(
+    name = "fatxtool-0.4",
+    srcs = [":acceleration-2db5a2638de2d497.git"],
+    crate = "fatxtool",
+    crate_root = "acceleration-2db5a2638de2d497/crates/fatxtool/src/lib.rs",
+    edition = "2024",
+    env = {
+        "CARGO_BIN_NAME": "fatxtool",
+        "CARGO_CRATE_NAME": "fatxtool",
+        "CARGO_MANIFEST_DIR": "acceleration-2db5a2638de2d497",
+        "CARGO_PKG_AUTHORS": "Lander Brandt",
+        "CARGO_PKG_DESCRIPTION": "Command-line inspector, recovery tool and editor for Xbox 360 FATX volumes",
+        "CARGO_PKG_HOMEPAGE": "",
+        "CARGO_PKG_NAME": "fatxtool",
+        "CARGO_PKG_README": "README.md",
+        "CARGO_PKG_REPOSITORY": "https://github.com/landaire/acceleration",
+        "CARGO_PKG_RUST_VERSION": "",
+        "CARGO_PKG_VERSION": "0.4.0",
+        "CARGO_PKG_VERSION_MAJOR": "0",
+        "CARGO_PKG_VERSION_MINOR": "4",
+        "CARGO_PKG_VERSION_PATCH": "0",
+        "CARGO_PKG_VERSION_PRE": "",
+    },
+    platform = {
+        "linux-x86_64": dict(
+            deps = [":libc-0.2"],
+        ),
+        "macos-arm64": dict(
+            deps = [":libc-0.2"],
+        ),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":anstream-1",
+        ":anstyle-1",
+        ":clap-4",
+        ":fatx-0.4",
+        ":memmap2-0.9",
+        ":rootcause-0.12",
+        ":same-file-1",
+        ":thiserror-2",
+        ":xenon_disk-0.4",
+        ":xenon_io-0.4",
+    ],
+)
+
 cargo.http_archive(
     name = "fax-0.2.7.crate",
     sha256 = "caf1079563223d5d59d83c85886a56e586cfd5c1a26292e971a0fa266531ac5a",
@@ -7600,6 +7914,50 @@ cargo.rust_library(
         ":libc-0.2",
         ":thiserror-1",
     ],
+)
+
+cargo.http_archive(
+    name = "filetime-0.2.29.crate",
+    sha256 = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759",
+    strip_prefix = "filetime-0.2.29",
+    urls = ["https://static.crates.io/crates/filetime/0.2.29/download"],
+    visibility = [],
+)
+
+cargo.rust_library(
+    name = "filetime-0.2",
+    srcs = [":filetime-0.2.29.crate"],
+    crate = "filetime",
+    crate_root = "filetime-0.2.29.crate/src/lib.rs",
+    edition = "2018",
+    env = {
+        "CARGO_BIN_NAME": "filetime",
+        "CARGO_CRATE_NAME": "filetime",
+        "CARGO_MANIFEST_DIR": "filetime-0.2.29.crate",
+        "CARGO_PKG_AUTHORS": "Alex Crichton <alex@alexcrichton.com>",
+        "CARGO_PKG_DESCRIPTION": "Platform-agnostic accessors of timestamps in File metadata\n",
+        "CARGO_PKG_HOMEPAGE": "https://github.com/alexcrichton/filetime",
+        "CARGO_PKG_NAME": "filetime",
+        "CARGO_PKG_README": "README.md",
+        "CARGO_PKG_REPOSITORY": "https://github.com/alexcrichton/filetime",
+        "CARGO_PKG_RUST_VERSION": "1.75.0",
+        "CARGO_PKG_VERSION": "0.2.29",
+        "CARGO_PKG_VERSION_MAJOR": "0",
+        "CARGO_PKG_VERSION_MINOR": "2",
+        "CARGO_PKG_VERSION_PATCH": "29",
+        "CARGO_PKG_VERSION_PRE": "",
+    },
+    platform = {
+        "linux-x86_64": dict(
+            deps = [":libc-0.2"],
+        ),
+        "macos-arm64": dict(
+            deps = [":libc-0.2"],
+        ),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [":cfg-if-1"],
 )
 
 cargo.http_archive(
@@ -8507,13 +8865,17 @@ cargo.rust_library(
         "CARGO_PKG_VERSION_PATCH": "0",
         "CARGO_PKG_VERSION_PRE": "",
     },
-    features = ["default"],
+    features = [
+        "default",
+        "vfs",
+    ],
     platform = {
         "linux-x86_64": dict(),
         "macos-arm64": dict(),
         "windows-msvc": dict(),
     },
     visibility = [],
+    deps = [":vfs-0.13"],
 )
 
 cargo.http_archive(
@@ -13967,6 +14329,50 @@ cargo.rust_library(
     deps = [
         ":block-padding-0.3",
         ":generic-array-0.14",
+    ],
+)
+
+cargo.http_archive(
+    name = "inout-0.2.5.crate",
+    sha256 = "3b5cf4372d022092674a83b8febf5865f7a573cc0c5baec5e49c879b6a20978f",
+    strip_prefix = "inout-0.2.5",
+    urls = ["https://static.crates.io/crates/inout/0.2.5/download"],
+    visibility = [],
+)
+
+cargo.rust_library(
+    name = "inout-0.2",
+    srcs = [":inout-0.2.5.crate"],
+    crate = "inout",
+    crate_root = "inout-0.2.5.crate/src/lib.rs",
+    edition = "2024",
+    env = {
+        "CARGO_BIN_NAME": "inout",
+        "CARGO_CRATE_NAME": "inout",
+        "CARGO_MANIFEST_DIR": "inout-0.2.5.crate",
+        "CARGO_PKG_AUTHORS": "RustCrypto Developers",
+        "CARGO_PKG_DESCRIPTION": "Custom reference types for code generic over in-place and buffer-to-buffer modes of operation.",
+        "CARGO_PKG_HOMEPAGE": "",
+        "CARGO_PKG_NAME": "inout",
+        "CARGO_PKG_README": "README.md",
+        "CARGO_PKG_REPOSITORY": "https://github.com/RustCrypto/utils",
+        "CARGO_PKG_RUST_VERSION": "1.85",
+        "CARGO_PKG_VERSION": "0.2.5",
+        "CARGO_PKG_VERSION_MAJOR": "0",
+        "CARGO_PKG_VERSION_MINOR": "2",
+        "CARGO_PKG_VERSION_PATCH": "5",
+        "CARGO_PKG_VERSION_PRE": "",
+    },
+    features = ["block-padding"],
+    platform = {
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":block-padding-0.4",
+        ":hybrid-array-0.4",
     ],
 )
 
@@ -26959,6 +27365,55 @@ cargo.rust_library(
 )
 
 cargo.http_archive(
+    name = "sha1-0.11.0.crate",
+    sha256 = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214",
+    strip_prefix = "sha1-0.11.0",
+    urls = ["https://static.crates.io/crates/sha1/0.11.0/download"],
+    visibility = [],
+)
+
+cargo.rust_library(
+    name = "sha1-0.11",
+    srcs = [":sha1-0.11.0.crate"],
+    crate = "sha1",
+    crate_root = "sha1-0.11.0.crate/src/lib.rs",
+    edition = "2024",
+    env = {
+        "CARGO_BIN_NAME": "sha1",
+        "CARGO_CRATE_NAME": "sha1",
+        "CARGO_MANIFEST_DIR": "sha1-0.11.0.crate",
+        "CARGO_PKG_AUTHORS": "RustCrypto Developers",
+        "CARGO_PKG_DESCRIPTION": "SHA-1 hash function",
+        "CARGO_PKG_HOMEPAGE": "",
+        "CARGO_PKG_NAME": "sha1",
+        "CARGO_PKG_README": "README.md",
+        "CARGO_PKG_REPOSITORY": "https://github.com/RustCrypto/hashes",
+        "CARGO_PKG_RUST_VERSION": "1.85",
+        "CARGO_PKG_VERSION": "0.11.0",
+        "CARGO_PKG_VERSION_MAJOR": "0",
+        "CARGO_PKG_VERSION_MINOR": "11",
+        "CARGO_PKG_VERSION_PATCH": "0",
+        "CARGO_PKG_VERSION_PRE": "",
+    },
+    features = [
+        "alloc",
+        "default",
+        "oid",
+    ],
+    platform = {
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":cfg-if-1",
+        ":cpufeatures-0.3",
+        ":digest-0.11",
+    ],
+)
+
+cargo.http_archive(
     name = "sha1_smol-1.0.1.crate",
     sha256 = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d",
     strip_prefix = "sha1_smol-1.0.1",
@@ -32175,6 +32630,46 @@ cargo.rust_library(
 )
 
 cargo.http_archive(
+    name = "vfs-0.13.0.crate",
+    sha256 = "69d33cbe2ac48f2a446f04c33aef4906078ffd224888df5ae60b7ed401ded771",
+    strip_prefix = "vfs-0.13.0",
+    urls = ["https://static.crates.io/crates/vfs/0.13.0/download"],
+    visibility = [],
+)
+
+cargo.rust_library(
+    name = "vfs-0.13",
+    srcs = [":vfs-0.13.0.crate"],
+    crate = "vfs",
+    crate_root = "vfs-0.13.0.crate/src/lib.rs",
+    edition = "2021",
+    env = {
+        "CARGO_BIN_NAME": "vfs",
+        "CARGO_CRATE_NAME": "vfs",
+        "CARGO_MANIFEST_DIR": "vfs-0.13.0.crate",
+        "CARGO_PKG_AUTHORS": "Manuel Woelker <github@manuel.woelker.org>",
+        "CARGO_PKG_DESCRIPTION": "A virtual filesystem for Rust",
+        "CARGO_PKG_HOMEPAGE": "",
+        "CARGO_PKG_NAME": "vfs",
+        "CARGO_PKG_README": "README.md",
+        "CARGO_PKG_REPOSITORY": "https://github.com/manuel-woelker/rust-vfs",
+        "CARGO_PKG_RUST_VERSION": "1.63.0",
+        "CARGO_PKG_VERSION": "0.13.0",
+        "CARGO_PKG_VERSION_MAJOR": "0",
+        "CARGO_PKG_VERSION_MINOR": "13",
+        "CARGO_PKG_VERSION_PATCH": "0",
+        "CARGO_PKG_VERSION_PRE": "",
+    },
+    platform = {
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [":filetime-0.2"],
+)
+
+cargo.http_archive(
     name = "vswhom-0.1.0.crate",
     sha256 = "be979b7f07507105799e854203b470ff7c78a1639e330a58f183b5fea574608b",
     strip_prefix = "vswhom-0.1.0",
@@ -35058,6 +35553,127 @@ cargo.rust_library(
     ],
 )
 
+cargo.rust_library(
+    name = "xecrypt-0.4",
+    srcs = [":acceleration-2db5a2638de2d497.git"],
+    crate = "xecrypt",
+    crate_root = "acceleration-2db5a2638de2d497/crates/xecrypt/src/lib.rs",
+    edition = "2024",
+    env = {
+        "CARGO_BIN_NAME": "xecrypt",
+        "CARGO_CRATE_NAME": "xecrypt",
+        "CARGO_MANIFEST_DIR": "acceleration-2db5a2638de2d497",
+        "CARGO_PKG_AUTHORS": "Lander Brandt <landerbrandt@gmail.com>",
+        "CARGO_PKG_DESCRIPTION": "Xbox 360 cryptographic primitives (AES, SHA-1, RSA signature verification)",
+        "CARGO_PKG_HOMEPAGE": "",
+        "CARGO_PKG_NAME": "xecrypt",
+        "CARGO_PKG_README": "README.md",
+        "CARGO_PKG_REPOSITORY": "https://github.com/landaire/acceleration",
+        "CARGO_PKG_RUST_VERSION": "",
+        "CARGO_PKG_VERSION": "0.4.0",
+        "CARGO_PKG_VERSION_MAJOR": "0",
+        "CARGO_PKG_VERSION_MINOR": "4",
+        "CARGO_PKG_VERSION_PATCH": "0",
+        "CARGO_PKG_VERSION_PRE": "",
+    },
+    platform = {
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":aes-0.9",
+        ":bitflags-2",
+        ":byteorder-1",
+        ":cbc-0.2",
+        ":rsa-0.9",
+        ":sha1-0.11",
+        ":thiserror-2",
+        ":xenon_types-0.4",
+    ],
+)
+
+alias(
+    name = "xenon_disk",
+    actual = ":xenon_disk-0.4",
+    visibility = ["PUBLIC"],
+)
+
+cargo.rust_library(
+    name = "xenon_disk-0.4",
+    srcs = [":acceleration-2db5a2638de2d497.git"],
+    crate = "xenon_disk",
+    crate_root = "acceleration-2db5a2638de2d497/crates/xenon_disk/src/lib.rs",
+    edition = "2024",
+    env = {
+        "CARGO_BIN_NAME": "xenon_disk",
+        "CARGO_CRATE_NAME": "xenon_disk",
+        "CARGO_MANIFEST_DIR": "acceleration-2db5a2638de2d497",
+        "CARGO_PKG_AUTHORS": "Lander Brandt",
+        "CARGO_PKG_DESCRIPTION": "Sans-io partition layouts, devkit partition tables and device detection for Xbox 360 disks and memory units",
+        "CARGO_PKG_HOMEPAGE": "",
+        "CARGO_PKG_NAME": "xenon_disk",
+        "CARGO_PKG_README": "",
+        "CARGO_PKG_REPOSITORY": "https://github.com/landaire/acceleration",
+        "CARGO_PKG_RUST_VERSION": "",
+        "CARGO_PKG_VERSION": "0.4.0",
+        "CARGO_PKG_VERSION_MAJOR": "0",
+        "CARGO_PKG_VERSION_MINOR": "4",
+        "CARGO_PKG_VERSION_PATCH": "0",
+        "CARGO_PKG_VERSION_PRE": "",
+    },
+    platform = {
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":fskit-0.2",
+        ":sha-1-0.10",
+        ":thiserror-2",
+        ":xecrypt-0.4",
+        ":xenon_io-0.4",
+        ":xenon_types-0.4",
+    ],
+)
+
+cargo.rust_library(
+    name = "xenon_io-0.4",
+    srcs = [":acceleration-2db5a2638de2d497.git"],
+    crate = "xenon_io",
+    crate_root = "acceleration-2db5a2638de2d497/crates/xenon_io/src/lib.rs",
+    edition = "2024",
+    env = {
+        "CARGO_BIN_NAME": "xenon_io",
+        "CARGO_CRATE_NAME": "xenon_io",
+        "CARGO_MANIFEST_DIR": "acceleration-2db5a2638de2d497",
+        "CARGO_PKG_AUTHORS": "Lander Brandt",
+        "CARGO_PKG_DESCRIPTION": "Sans-io machine, source and integrity-check types shared by the Xbox 360 storage crates",
+        "CARGO_PKG_HOMEPAGE": "",
+        "CARGO_PKG_NAME": "xenon_io",
+        "CARGO_PKG_README": "",
+        "CARGO_PKG_REPOSITORY": "https://github.com/landaire/acceleration",
+        "CARGO_PKG_RUST_VERSION": "",
+        "CARGO_PKG_VERSION": "0.4.0",
+        "CARGO_PKG_VERSION_MAJOR": "0",
+        "CARGO_PKG_VERSION_MINOR": "4",
+        "CARGO_PKG_VERSION_PATCH": "0",
+        "CARGO_PKG_VERSION_PRE": "",
+    },
+    platform = {
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":fskit-0.2",
+        ":thiserror-2",
+    ],
+)
+
 cargo.http_archive(
     name = "xenon_types-0.1.0.crate",
     sha256 = "aa9a75e60884aae3cb33bc7027afbd743186c654725b74698eafef674b73da88",
@@ -35096,6 +35712,41 @@ cargo.rust_library(
     },
     visibility = [],
     deps = [":serde-1"],
+)
+
+cargo.rust_library(
+    name = "xenon_types-0.4",
+    srcs = [":acceleration-2db5a2638de2d497.git"],
+    crate = "xenon_types",
+    crate_root = "acceleration-2db5a2638de2d497/crates/xenon_types/src/lib.rs",
+    edition = "2024",
+    env = {
+        "CARGO_BIN_NAME": "xenon_types",
+        "CARGO_CRATE_NAME": "xenon_types",
+        "CARGO_MANIFEST_DIR": "acceleration-2db5a2638de2d497",
+        "CARGO_PKG_AUTHORS": "Lander Brandt <landerbrandt@gmail.com>",
+        "CARGO_PKG_DESCRIPTION": "Common types for Xbox 360 (Xenon) file formats and protocols",
+        "CARGO_PKG_HOMEPAGE": "",
+        "CARGO_PKG_NAME": "xenon_types",
+        "CARGO_PKG_README": "README.md",
+        "CARGO_PKG_REPOSITORY": "https://github.com/landaire/acceleration",
+        "CARGO_PKG_RUST_VERSION": "",
+        "CARGO_PKG_VERSION": "0.4.0",
+        "CARGO_PKG_VERSION_MAJOR": "0",
+        "CARGO_PKG_VERSION_MINOR": "4",
+        "CARGO_PKG_VERSION_PATCH": "0",
+        "CARGO_PKG_VERSION_PRE": "",
+    },
+    platform = {
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":bitflags-2",
+        ":serde-1",
+    ],
 )
 
 alias(

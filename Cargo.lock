@@ -104,9 +104,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
 dependencies = [
  "cfg-if",
- "cipher",
+ "cipher 0.4.4",
  "cpufeatures 0.2.17",
  "zeroize",
+]
+
+[[package]]
+name = "aes"
+version = "0.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "35f0f96ce78e38c3dc6d8948aa8163d06385be74000f3c7a95bf1eef35d3ea32"
+dependencies = [
+ "cipher 0.5.2",
+ "cpubits",
+ "cpufeatures 0.3.1",
 ]
 
 [[package]]
@@ -738,6 +749,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "block-padding"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "710f1dd022ef4e93f8a438b4ba958de7f64308434fa6a87104481645cc30068b"
+dependencies = [
+ "hybrid-array",
+]
+
+[[package]]
 name = "block2"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -865,7 +885,16 @@ version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "26b52a9543ae338f279b96b0b9fed9c8093744685043739079ce85cd58f289a6"
 dependencies = [
- "cipher",
+ "cipher 0.4.4",
+]
+
+[[package]]
+name = "cbc"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce2dc9ee5f88d11e0beb842c88b33c8a5cf0d1329c4b19494af42b07dbfe8896"
+dependencies = [
+ "cipher 0.5.2",
 ]
 
 [[package]]
@@ -942,8 +971,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
 dependencies = [
  "crypto-common 0.1.7",
- "inout",
+ "inout 0.1.4",
  "zeroize",
+]
+
+[[package]]
+name = "cipher"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8cf2a2c93cd704877c0858356ed03480ff301ee950b43f1cbe4573b088bfa6c"
+dependencies = [
+ "crypto-common 0.2.2",
+ "inout 0.2.5",
 ]
 
 [[package]]
@@ -1286,6 +1325,12 @@ dependencies = [
  "unicode-script",
  "unicode-segmentation",
 ]
+
+[[package]]
+name = "cpubits"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15b85f9c39137c3a891689859392b1bd49812121d0d61c9caf00d46ed5ce06ae"
 
 [[package]]
 name = "cpufeatures"
@@ -1834,6 +1879,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
+name = "fatx"
+version = "0.4.0"
+source = "git+https://github.com/landaire/acceleration?rev=fe8a57aea2d3b994001f9853e77a3e402a68b36d#fe8a57aea2d3b994001f9853e77a3e402a68b36d"
+dependencies = [
+ "fskit",
+ "thiserror 2.0.18",
+ "xenon_io",
+]
+
+[[package]]
+name = "fatxtool"
+version = "0.4.0"
+source = "git+https://github.com/landaire/acceleration?rev=fe8a57aea2d3b994001f9853e77a3e402a68b36d#fe8a57aea2d3b994001f9853e77a3e402a68b36d"
+dependencies = [
+ "anstream",
+ "anstyle",
+ "clap",
+ "fatx",
+ "libc",
+ "memmap2",
+ "rootcause",
+ "same-file",
+ "thiserror 2.0.18",
+ "xenon_disk",
+ "xenon_io",
+]
+
+[[package]]
 name = "fax"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1857,6 +1930,16 @@ dependencies = [
  "libc",
  "thiserror 1.0.69",
  "winapi",
+]
+
+[[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc",
 ]
 
 [[package]]
@@ -2024,6 +2107,9 @@ name = "fskit"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "50473d85c892ab8cc04021d0b929f2c7ad1648c1af08cd2918b057c0f803166e"
+dependencies = [
+ "vfs",
+]
 
 [[package]]
 name = "futf"
@@ -3513,8 +3599,18 @@ version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
 dependencies = [
- "block-padding",
+ "block-padding 0.3.3",
  "generic-array",
+]
+
+[[package]]
+name = "inout"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b5cf4372d022092674a83b8febf5865f7a573cc0c5baec5e49c879b6a20978f"
+dependencies = [
+ "block-padding 0.4.2",
+ "hybrid-array",
 ]
 
 [[package]]
@@ -4890,14 +4986,14 @@ version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78f2bfed90f1618b4b48dcad9307f25e14ae894e2949642c87c351601d62cebd"
 dependencies = [
- "aes",
+ "aes 0.8.4",
  "ashpd",
  "async-fs",
  "async-io",
  "async-lock",
  "blocking",
- "cbc",
- "cipher",
+ "cbc 0.1.2",
+ "cipher 0.4.4",
  "digest 0.10.7",
  "endi",
  "futures-lite",
@@ -4940,6 +5036,8 @@ name = "openxbdm-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "fatx",
+ "fatxtool",
  "futures-io",
  "futures-util",
  "image",
@@ -4960,6 +5058,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "xenon_disk",
  "xex2",
 ]
 
@@ -6129,7 +6228,7 @@ dependencies = [
  "pkcs1",
  "pkcs8",
  "rand_core 0.6.4",
- "sha1",
+ "sha1 0.10.6",
  "signature",
  "spki",
  "subtle",
@@ -6614,6 +6713,17 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
  "digest 0.10.7",
+]
+
+[[package]]
+name = "sha1"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.1",
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -7860,6 +7970,15 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vfs"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69d33cbe2ac48f2a446f04c33aef4906078ffd224888df5ae60b7ed401ded771"
+dependencies = [
+ "filetime",
+]
 
 [[package]]
 name = "vswhom"
@@ -9185,13 +9304,28 @@ version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6187cad56c43cd6a25bf4b6e69b1e478803273d02bc4c5f101cb862e5445644c"
 dependencies = [
- "aes",
+ "aes 0.8.4",
  "bitflags 2.13.2",
  "byteorder",
- "cbc",
+ "cbc 0.1.2",
  "rsa",
- "sha1",
+ "sha1 0.10.6",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "xecrypt"
+version = "0.4.0"
+source = "git+https://github.com/landaire/acceleration?rev=fe8a57aea2d3b994001f9853e77a3e402a68b36d#fe8a57aea2d3b994001f9853e77a3e402a68b36d"
+dependencies = [
+ "aes 0.9.3",
+ "bitflags 2.13.2",
+ "byteorder",
+ "cbc 0.2.1",
+ "rsa",
+ "sha1 0.11.0",
+ "thiserror 2.0.18",
+ "xenon_types 0.4.0",
 ]
 
 [[package]]
@@ -9211,11 +9345,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "xenon_disk"
+version = "0.4.0"
+source = "git+https://github.com/landaire/acceleration?rev=fe8a57aea2d3b994001f9853e77a3e402a68b36d#fe8a57aea2d3b994001f9853e77a3e402a68b36d"
+dependencies = [
+ "fskit",
+ "sha-1",
+ "thiserror 2.0.18",
+ "xecrypt 0.4.0",
+ "xenon_io",
+ "xenon_types 0.4.0",
+]
+
+[[package]]
+name = "xenon_io"
+version = "0.4.0"
+source = "git+https://github.com/landaire/acceleration?rev=fe8a57aea2d3b994001f9853e77a3e402a68b36d#fe8a57aea2d3b994001f9853e77a3e402a68b36d"
+dependencies = [
+ "fskit",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "xenon_types"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa9a75e60884aae3cb33bc7027afbd743186c654725b74698eafef674b73da88"
 dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "xenon_types"
+version = "0.4.0"
+source = "git+https://github.com/landaire/acceleration?rev=fe8a57aea2d3b994001f9853e77a3e402a68b36d#fe8a57aea2d3b994001f9853e77a3e402a68b36d"
+dependencies = [
+ "bitflags 2.13.2",
  "serde",
 ]
 
@@ -9232,8 +9397,8 @@ dependencies = [
  "rootcause",
  "serde",
  "sha-1",
- "xecrypt",
- "xenon_types",
+ "xecrypt 0.1.0",
+ "xenon_types 0.1.0",
 ]
 
 [[package]]

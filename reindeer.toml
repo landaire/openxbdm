@@ -1,8 +1,10 @@
 # Generates third-party/rust/BUCK (`reindeer buckify`, which
-# build_defs/update_buck_files.py runs): rules for the crates.io dependencies
-# of the workspace crates, with an alias for each direct dependency. Crates
-# are not vendored; Buck2 downloads each one and checks it against the
-# checksum in Cargo.lock. Fixups are in third-party/rust/fixups.
+# build_defs/update_buck_files.py runs): rules for the crates.io and git
+# dependencies of the workspace crates, with an alias for each direct
+# dependency. Crates are not vendored; Buck2 downloads each crates.io crate
+# and checks it against the checksum in Cargo.lock, and fetches a git
+# dependency at the commit Cargo.lock pins. Fixups are in
+# third-party/rust/fixups.
 manifest_path = "Cargo.toml"
 third_party_dir = "third-party/rust"
 precise_srcs = false

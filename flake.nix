@@ -64,7 +64,11 @@
                 ./third-party/rust/lib.rs
               ];
             };
-            cargoLock.lockFile = ./Cargo.lock;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              # The acceleration crates, a git dependency.
+              outputHashes."fatxtool-0.4.0" = "sha256-HlgQRYRH2qZ5lglUR4Y504vP0t/U4vXfT9ZPJRxOPt0=";
+            };
             cargoBuildFlags = cargoPackageFlags;
             cargoTestFlags = cargoPackageFlags;
 

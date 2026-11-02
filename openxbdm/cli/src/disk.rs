@@ -1,5 +1,7 @@
 //! Read-only block device subcommands over `gethddblk`.
 
+mod inspect;
+
 use std::io;
 use std::io::SeekFrom;
 use std::path::Path;
@@ -7,6 +9,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Subcommand;
+use fatxtool::FatxCommand;
 use futures_io::AsyncRead;
 use futures_io::AsyncWrite;
 use openxbdm_client::Client;
@@ -38,6 +41,9 @@ use tokio::io::AsyncSeekExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 
+use self::inspect::Inspection;
+use self::inspect::LayoutArguments;
+use self::inspect::VolumeArguments;
 use crate::args::parse_u64;
 use crate::memory::print_hex_dump;
 use crate::ui::UiOptions;
@@ -85,13 +91,36 @@ pub enum DiskCommand {
         #[arg(long)]
         resume: bool,
     },
+
+    /// Identify the device and print its partition layout, as
+    /// `fatxtool partitions` does.
+    Partitions {
+        /// NT device name, e.g. '\Device\Harddisk0\Partition0'.
+        device: String,
+        #[command(flatten)]
+        layout: LayoutArguments,
+    },
+
+    /// Run a read-only `fatxtool` command on a FATX volume of a device.
+    ///
+    /// The volume is the whole device unless `--offset` and `--length` or
+    /// `--partition` select one. Extracted and recovered files are written
+    /// on this computer.
+    Fatx {
+        /// NT device name, e.g. '\Device\BuiltInMuSfc'.
+        device: String,
+        #[command(flatten)]
+        volume: VolumeArguments,
+        #[command(subcommand)]
+        command: FatxCommand,
+    },
 }
 
 pub async fn run<T>(
     mut client: Client<T, Connected>,
     command: DiskCommand,
     ui: UiOptions,
-) -> Result<Client<T, Connected>, Report<Error>>
+) -> Result<Client<T, Connected>, Report>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
@@ -119,6 +148,22 @@ where
         } => {
             let disk = RemoteDisk::open(client, device_name(&device)?).await?;
             Box::pin(pull(&disk, &output, resume, ui)).await?;
+
+            Ok(disk.into_client())
+        }
+        DiskCommand::Partitions { device, layout } => {
+            let disk = RemoteDisk::open(client, device_name(&device)?).await?;
+            Box::pin(inspect::run(&disk, Inspection::Partitions(layout))).await?;
+
+            Ok(disk.into_client())
+        }
+        DiskCommand::Fatx {
+            device,
+            volume,
+            command,
+        } => {
+            let disk = RemoteDisk::open(client, device_name(&device)?).await?;
+            Box::pin(inspect::run(&disk, Inspection::Volume { volume, command })).await?;
 
             Ok(disk.into_client())
         }

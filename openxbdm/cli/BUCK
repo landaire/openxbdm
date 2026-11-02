@@ -35,6 +35,8 @@ rust_binary(
     deps = [
         "//openxbdm/client:openxbdm_client",
         "//third-party/rust:clap",
+        "//third-party/rust:fatx",
+        "//third-party/rust:fatxtool",
         "//third-party/rust:futures-io",
         "//third-party/rust:futures-util",
         "//third-party/rust:image",
@@ -53,6 +55,7 @@ rust_binary(
         "//third-party/rust:tokio-util",
         "//third-party/rust:tracing",
         "//third-party/rust:tracing-subscriber",
+        "//third-party/rust:xenon_disk",
         "//third-party/rust:xex2",
     ],
 )
@@ -75,6 +78,8 @@ rust_test(
     deps = [
         "//openxbdm/client:openxbdm_client",
         "//third-party/rust:clap",
+        "//third-party/rust:fatx",
+        "//third-party/rust:fatxtool",
         "//third-party/rust:futures-io",
         "//third-party/rust:futures-util",
         "//third-party/rust:image",
@@ -94,6 +99,7 @@ rust_test(
         "//third-party/rust:tokio-util",
         "//third-party/rust:tracing",
         "//third-party/rust:tracing-subscriber",
+        "//third-party/rust:xenon_disk",
         "//third-party/rust:xex2",
     ],
 )
@@ -113,6 +119,8 @@ rust_binary(
     deps = [
         "//openxbdm/client:openxbdm_client",
         "//third-party/rust:clap",
+        "//third-party/rust:fatx",
+        "//third-party/rust:fatxtool",
         "//third-party/rust:futures-io",
         "//third-party/rust:futures-util",
         "//third-party/rust:image",
@@ -132,6 +140,7 @@ rust_binary(
         "//third-party/rust:tokio-util",
         "//third-party/rust:tracing",
         "//third-party/rust:tracing-subscriber",
+        "//third-party/rust:xenon_disk",
         "//third-party/rust:xex2",
     ],
     labels = [
@@ -154,6 +163,8 @@ rust_binary(
     deps = [
         "//openxbdm/client:openxbdm_client",
         "//third-party/rust:clap",
+        "//third-party/rust:fatx",
+        "//third-party/rust:fatxtool",
         "//third-party/rust:futures-io",
         "//third-party/rust:futures-util",
         "//third-party/rust:image",
@@ -173,6 +184,7 @@ rust_binary(
         "//third-party/rust:tokio-util",
         "//third-party/rust:tracing",
         "//third-party/rust:tracing-subscriber",
+        "//third-party/rust:xenon_disk",
         "//third-party/rust:xex2",
     ],
     labels = [
@@ -195,6 +207,8 @@ rust_binary(
     deps = [
         "//openxbdm/client:openxbdm_client",
         "//third-party/rust:clap",
+        "//third-party/rust:fatx",
+        "//third-party/rust:fatxtool",
         "//third-party/rust:futures-io",
         "//third-party/rust:futures-util",
         "//third-party/rust:image",
@@ -214,6 +228,7 @@ rust_binary(
         "//third-party/rust:tokio-util",
         "//third-party/rust:tracing",
         "//third-party/rust:tracing-subscriber",
+        "//third-party/rust:xenon_disk",
         "//third-party/rust:xex2",
     ],
     labels = [

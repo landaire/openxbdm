@@ -7,7 +7,8 @@ Run it from any directory after a change to a Cargo.toml or Cargo.lock.
 Cargo.toml stays the description of every crate; the build files follow it:
 
 - third-party/rust/BUCK: `reindeer buckify` writes the rules for the
-  crates.io dependencies, each listing the reindeer platforms that use it.
+  crates.io and git dependencies, each listing the reindeer platforms that
+  use it.
 - openxbdm/**/BUCK: the rules for each workspace crate. A library becomes
   `:<lib>`, a binary `:<bin>-bin`, and their unit tests `:<lib>-lib-test` and
   `:<bin>-bin-test`; the integration test `tests/<name>.rs` becomes

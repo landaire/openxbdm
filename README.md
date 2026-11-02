@@ -211,6 +211,17 @@ A pull records its finished 4 MiB segments in `hdd.bin.progress`. If it stops, r
 
 Without device names, `disk devices` probes only hard disk partitions and memory units. Do not name `\Device\Flash`: `gethddblk` on it stopped the console's kernel.
 
+You can also inspect a device's partitions and FATX volumes in place, without pulling an image first. These run the read-only commands of `fatxtool` from [acceleration](https://github.com/landaire/acceleration):
+
+```
+xeedee -H 192.168.1.26 disk partitions '\Device\Harddisk0\Partition0'
+xeedee -H 192.168.1.26 disk fatx '\Device\BuiltInMuSfc' list --deleted
+xeedee -H 192.168.1.26 disk fatx '\Device\Harddisk0\Partition0' --partition Partition1 info
+xeedee -H 192.168.1.26 disk fatx '\Device\BuiltInMuSfc' extract /DataRec360.xex DataRec360.xex
+```
+
+`disk fatx` also has `extract-all`, `scan` and `recover`. Extracted and recovered files are written on your computer.
+
 In Rust, `openxbdm_client::disk::RemoteDisk` presents a device as an [`fskit`](https://crates.io/crates/fskit) `AsyncReadAt` source, so parsers can read a live device without an image.
 
 ## Controller relay

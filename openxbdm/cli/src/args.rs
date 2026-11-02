@@ -406,7 +406,8 @@ pub enum Command {
     Parity(ParityCommand),
 
     /// Read the console's block devices with `gethddblk`: list them, read
-    /// bytes, or copy a whole device to an image file. Only reads.
+    /// bytes, copy a whole device to an image file, print a device's
+    /// partition layout, or inspect its FATX volumes. Only reads.
     #[command(subcommand)]
     Disk(DiskCommand),
 

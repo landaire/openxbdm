@@ -37,6 +37,8 @@ dangerous = ["openxbdm-client/dangerous"]
 openxbdm-client = { path = "../client", features = ["tokio", "jiff"] }
 
 clap = { version = "4.6.1", features = ["derive", "env"] }
+fatx = { git = "https://github.com/landaire/acceleration", rev = "fe8a57aea2d3b994001f9853e77a3e402a68b36d" }
+fatxtool = { git = "https://github.com/landaire/acceleration", rev = "fe8a57aea2d3b994001f9853e77a3e402a68b36d" }
 futures-io = { workspace = true }
 futures-util = { workspace = true }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
@@ -55,6 +57,7 @@ tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+xenon_disk = { git = "https://github.com/landaire/acceleration", rev = "fe8a57aea2d3b994001f9853e77a3e402a68b36d" }
 xex2 = "0.1.0"
 
 [dev-dependencies]

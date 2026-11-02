@@ -46,7 +46,9 @@ use crate::args::Command;
 use crate::args::DangerousCommand;
 use crate::ui::UiOptions;
 
-async fn run(cli: Cli) -> Result<(), Report<Error>> {
+// Dynamic, since the disk subcommands fail with the CLI's own error types as
+// well as the client's.
+async fn run(cli: Cli) -> Result<(), Report> {
     let ui = UiOptions {
         format: cli.format,
         no_progress: cli.no_progress,
@@ -59,21 +61,22 @@ async fn run(cli: Cli) -> Result<(), Report<Error>> {
         broadcast,
     } = &cli.cmd
     {
-        return discovery::discover(*listen_ms, broadcast.as_deref(), ui).await;
+        return Ok(discovery::discover(*listen_ms, broadcast.as_deref(), ui).await?);
     }
 
     if let Command::Resolve { name, listen_ms } = &cli.cmd {
-        return discovery::resolve(name, *listen_ms).await;
+        return Ok(discovery::resolve(name, *listen_ms).await?);
     }
 
     #[cfg(feature = "capture")]
     if let Command::Xbm(command) = &cli.cmd {
-        return xbm::run(command);
+        return Ok(xbm::run(command)?);
     }
 
     let Some(host) = cli.host.as_deref() else {
         return Err(Report::new(Error::from(ArgumentError::EmptyFilename))
-            .attach("--host is required for this subcommand"));
+            .attach("--host is required for this subcommand")
+            .into_dynamic());
     };
     let target = discovery::resolve_target(Target::parse(host, cli.port)).await?;
     let conn_timeout = Duration::from_secs(cli.timeout);
@@ -84,17 +87,17 @@ async fn run(cli: Cli) -> Result<(), Report<Error>> {
     // they bypass the shared connection and are not recorded by --capture.
     #[cfg(feature = "dangerous")]
     if let Command::Dangerous(DangerousCommand::DrivemapEnable) = &cli.cmd {
-        return dangerous::drivemap_enable(&target, conn_timeout).await;
+        return Ok(dangerous::drivemap_enable(&target, conn_timeout).await?);
     }
 
     #[cfg(feature = "dangerous")]
     if let Command::Dangerous(DangerousCommand::NandDump { output }) = &cli.cmd {
-        return dangerous::nand_dump(&target, conn_timeout, output.as_deref(), ui).await;
+        return Ok(dangerous::nand_dump(&target, conn_timeout, output.as_deref(), ui).await?);
     }
 
     #[cfg(feature = "capture")]
     if let Command::PixNotify { duration, log } = &cli.cmd {
-        return pix::pix_notify(&target, conn_timeout, *duration, log.as_deref()).await;
+        return Ok(pix::pix_notify(&target, conn_timeout, *duration, log.as_deref()).await?);
     }
 
     #[cfg(feature = "capture")]
@@ -113,7 +116,7 @@ async fn run(cli: Cli) -> Result<(), Report<Error>> {
             output_dir: output_dir.clone(),
             no_conversion: *no_conversion,
         };
-        return capture::capture(&target, conn_timeout, options, ui).await;
+        return Ok(capture::capture(&target, conn_timeout, options, ui).await?);
     }
 
     let transport = connect_target_timeout(&target, conn_timeout).await?;
@@ -132,7 +135,7 @@ async fn run(cli: Cli) -> Result<(), Report<Error>> {
     outcome
 }
 
-async fn drive<T>(client: Client<T>, cmd: Command, ui: UiOptions) -> Result<(), Report<Error>>
+async fn drive<T>(client: Client<T>, cmd: Command, ui: UiOptions) -> Result<(), Report>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
@@ -145,7 +148,7 @@ async fn drive_connected<T>(
     mut client: Client<T, Connected>,
     cmd: Command,
     ui: UiOptions,
-) -> Result<(), Report<Error>>
+) -> Result<(), Report>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {

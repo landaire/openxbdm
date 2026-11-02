@@ -80,6 +80,8 @@
 - Add typed `autoinput` client commands for virtual controller binding, fixed packets, timed packet queues, and queue status.
 - Add the GPUI Kit `xeedee-controller` application for relaying a connected host controller or a JSON controller script to a console.
 - Use the macOS Game Controller framework so connected controllers report live button, trigger, and stick input.
+- Add the `GetHddBlock` client command (`gethddblk`) and `openxbdm_client::disk`: `RemoteDisk` reads a console block device as an `fskit::AsyncReadAt` source in 128 KiB sector runs, up to 64 MiB per read, `Client::discover_device_size` finds a device's size from its `400` replies, and `Pull` drives a resumable whole-device copy.
+- Add `xeedee disk devices`, `xeedee disk read`, and `xeedee disk pull`: list and probe block devices, read bytes of one, or copy one to an image file that `--resume` continues from its `.progress` file. They only read. `devices` probes only hard disk and memory unit storage unless you name a device, since `gethddblk` on `\Device\Flash` stopped kernel 16547.
 
 ### Build
 

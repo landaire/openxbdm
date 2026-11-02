@@ -67,6 +67,19 @@ pub enum Error {
     #[error("module range at {base:#010x} with size {size:#x} exceeds the address space")]
     ModuleRangeOverflow { base: u32, size: u32 },
 
+    /// `gethddblk` answered `400` with no text: the device could not be
+    /// opened or the run could not be read, for example because it extends
+    /// past the end of the device.
+    #[error("console rejected the read of {count} sectors at sector {first} of {device}")]
+    BlockReadRejected {
+        device: crate::commands::DeviceName,
+        first: crate::commands::SectorIndex,
+        count: crate::commands::SectorCount,
+    },
+
+    #[error(transparent)]
+    Disk(#[from] crate::disk::DiskError),
+
     #[error("expected {expected:?} response but got status {got}")]
     UnexpectedStatus {
         expected: ExpectedShape,
@@ -163,6 +176,14 @@ pub enum ArgumentError {
     ControllerFrameDurationOutOfRange { duration_ms: u32, maximum_ms: u32 },
     #[error("memory length exceeds the protocol's u32 limit")]
     MemoryLengthOverflow,
+    #[error("sector count {count} is outside 1..={maximum}")]
+    SectorCountOutOfRange { count: u32, maximum: u32 },
+    #[error("device name cannot be empty")]
+    EmptyDeviceName,
+    #[error("device name of {length} bytes exceeds {maximum} bytes")]
+    DeviceNameTooLong { length: usize, maximum: usize },
+    #[error("device name cannot contain CR, LF, or double quote")]
+    DeviceNameInvalidCharacter,
 }
 
 #[derive(Debug, thiserror::Error)]

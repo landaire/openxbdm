@@ -5,6 +5,7 @@ mod capture;
 mod dangerous;
 mod debug;
 mod discovery;
+mod disk;
 mod file;
 mod kd;
 mod memory;
@@ -148,13 +149,27 @@ async fn drive_connected<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
+    // The disk subcommands move the connection into a `RemoteDisk`.
+    let cmd = match cmd {
+        Command::Disk(command) => {
+            let client = Box::pin(disk::run(client, command, ui)).await?;
+            let _ = client.bye().await;
+
+            return Ok(());
+        }
+        other => other,
+    };
+
     // Each handler future is boxed so that its state lives on the heap.
     // Awaited inline, every arm's state would share one future whose resume
     // function overflows the 1 MiB main thread stack on Windows in debug
     // builds.
     let client_ref = &mut client;
     match cmd {
-        Command::Discover { .. } | Command::Resolve { .. } | Command::Parity(_) => {
+        Command::Discover { .. }
+        | Command::Resolve { .. }
+        | Command::Parity(_)
+        | Command::Disk(_) => {
             unreachable!()
         }
         Command::Ping => println!("connected"),

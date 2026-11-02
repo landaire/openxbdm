@@ -197,6 +197,22 @@ xeedee -H 192.168.1.26 file get 'DEVKIT:\my-capture.xbm'
 xeedee -H 192.168.1.26 dump-module xboxkrnl.exe /tmp/xboxkrnl.exe
 ```
 
+### Raw storage
+
+`xeedee disk` reads a console's disks and memory units sector by sector with `gethddblk`. It never writes. You can list devices, read bytes, or copy a whole device to an image file:
+
+```
+xeedee -H 192.168.1.26 disk devices '\Device\BuiltInMuSfc'
+xeedee -H 192.168.1.26 disk read '\Device\BuiltInMuSfc' 0 0x200
+xeedee -H 192.168.1.26 disk pull '\Device\Harddisk0\Partition1' hdd.bin
+```
+
+A pull records its finished 4 MiB segments in `hdd.bin.progress`. If it stops, run it again with `--resume` to continue where it left off.
+
+Without device names, `disk devices` probes only hard disk partitions and memory units. Do not name `\Device\Flash`: `gethddblk` on it stopped the console's kernel.
+
+In Rust, `openxbdm_client::disk::RemoteDisk` presents a device as an [`fskit`](https://crates.io/crates/fskit) `AsyncReadAt` source, so parsers can read a live device without an image.
+
 ## Controller relay
 
 Run the GPUI controller relay and enter the console IP address or hostname:

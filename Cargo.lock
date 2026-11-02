@@ -2020,6 +2020,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fskit"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50473d85c892ab8cc04021d0b929f2c7ad1648c1af08cd2918b057c0f803166e"
+
+[[package]]
 name = "futf"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4944,6 +4950,7 @@ dependencies = [
  "owo-colors",
  "powerpc",
  "rootcause",
+ "same-file",
  "serde",
  "serde_json",
  "similar",
@@ -4961,6 +4968,7 @@ name = "openxbdm-client"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "fskit",
  "futures",
  "futures-io",
  "futures-util",
@@ -4970,6 +4978,7 @@ dependencies = [
  "openxbdm-core",
  "powerpc",
  "rootcause",
+ "sha2 0.11.1",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",

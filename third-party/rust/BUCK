@@ -8470,6 +8470,52 @@ buildscript_run(
     version = "0.20.1",
 )
 
+alias(
+    name = "fskit",
+    actual = ":fskit-0.2",
+    visibility = ["PUBLIC"],
+)
+
+cargo.http_archive(
+    name = "fskit-0.2.0.crate",
+    sha256 = "50473d85c892ab8cc04021d0b929f2c7ad1648c1af08cd2918b057c0f803166e",
+    strip_prefix = "fskit-0.2.0",
+    urls = ["https://static.crates.io/crates/fskit/0.2.0/download"],
+    visibility = [],
+)
+
+cargo.rust_library(
+    name = "fskit-0.2",
+    srcs = [":fskit-0.2.0.crate"],
+    crate = "fskit",
+    crate_root = "fskit-0.2.0.crate/src/lib.rs",
+    edition = "2024",
+    env = {
+        "CARGO_BIN_NAME": "fskit",
+        "CARGO_CRATE_NAME": "fskit",
+        "CARGO_MANIFEST_DIR": "fskit-0.2.0.crate",
+        "CARGO_PKG_AUTHORS": "Lander Brandt",
+        "CARGO_PKG_DESCRIPTION": "Abstractions for building read-only sans-io abstractions VFS",
+        "CARGO_PKG_HOMEPAGE": "",
+        "CARGO_PKG_NAME": "fskit",
+        "CARGO_PKG_README": "README.md",
+        "CARGO_PKG_REPOSITORY": "https://github.com/landaire/fskit",
+        "CARGO_PKG_RUST_VERSION": "",
+        "CARGO_PKG_VERSION": "0.2.0",
+        "CARGO_PKG_VERSION_MAJOR": "0",
+        "CARGO_PKG_VERSION_MINOR": "2",
+        "CARGO_PKG_VERSION_PATCH": "0",
+        "CARGO_PKG_VERSION_PRE": "",
+    },
+    features = ["default"],
+    platform = {
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+)
+
 cargo.http_archive(
     name = "futf-0.1.5.crate",
     sha256 = "df420e2e84819663797d1ec6544b13c5be84629e7bb00dc960d6917db2987843",
@@ -25722,6 +25768,12 @@ cargo.rust_library(
     visibility = [],
 )
 
+alias(
+    name = "same-file",
+    actual = ":same-file-1",
+    visibility = ["PUBLIC"],
+)
+
 cargo.http_archive(
     name = "same-file-1.0.6.crate",
     sha256 = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502",
@@ -26988,6 +27040,12 @@ cargo.rust_library(
         ":cpufeatures-0.2",
         ":digest-0.10",
     ],
+)
+
+alias(
+    name = "sha2",
+    actual = ":sha2-0.11",
+    visibility = ["PUBLIC"],
 )
 
 cargo.http_archive(

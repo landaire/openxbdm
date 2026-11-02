@@ -4,6 +4,7 @@
 //! [`crate::protocol`] and [`crate::error`]; they never touch I/O directly.
 
 pub mod automation;
+pub mod block;
 pub mod context;
 #[cfg(feature = "dangerous")]
 pub mod dangerous;
@@ -37,6 +38,11 @@ pub use automation::QueuedPackets;
 pub use automation::TimedGamepad;
 pub use automation::UnbindController;
 pub use automation::UserSlot;
+pub use block::DeviceName;
+pub use block::GetHddBlock;
+pub use block::SECTOR_SIZE;
+pub use block::SectorCount;
+pub use block::SectorIndex;
 pub use context::ContextGroups;
 pub use context::ControlRegisters;
 pub use context::FloatingPointRegisters;

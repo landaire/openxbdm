@@ -70,7 +70,11 @@ where
     let length = parse_u32(length).map_err(|e| Report::new(e).attach("--length"))?;
 
     let snapshot = client.run(GetMem { address, length }).await?;
-    print_hex_dump(snapshot.address, &snapshot.data, &snapshot.unmapped_offsets);
+    print_hex_dump(
+        u64::from(snapshot.address),
+        &snapshot.data,
+        &snapshot.unmapped_offsets,
+    );
 
     Ok(())
 }
@@ -96,12 +100,12 @@ where
 
 /// Print 16 bytes per row with an ASCII column. Bytes at the offsets in
 /// `unmapped` are shown as `??`.
-fn print_hex_dump(base: u32, data: &[u8], unmapped: &[u32]) {
+pub fn print_hex_dump(base: u64, data: &[u8], unmapped: &[u32]) {
     let unmapped: HashSet<u32> = unmapped.iter().copied().collect();
 
     for (row_index, row) in data.chunks(16).enumerate() {
         let row_offset = row_index * 16;
-        let address = base.wrapping_add(row_offset as u32);
+        let address = base + row_offset as u64;
         print!("{address:#010x}  ");
 
         for (column, byte) in row.iter().enumerate() {

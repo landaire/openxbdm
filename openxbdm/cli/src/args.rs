@@ -16,6 +16,7 @@ use openxbdm_client::error::Error;
 use rootcause::Report;
 use rootcause::prelude::ResultExt;
 
+use crate::disk::DiskCommand;
 use crate::parity::ParityCommand;
 
 #[derive(Parser, Debug)]
@@ -404,6 +405,11 @@ pub enum Command {
     #[command(subcommand)]
     Parity(ParityCommand),
 
+    /// Read the console's block devices with `gethddblk`: list them, read
+    /// bytes, or copy a whole device to an image file. Only reads.
+    #[command(subcommand)]
+    Disk(DiskCommand),
+
     /// Dangerous, low-level operations that write into xbdm's memory
     /// image. Each subcommand is gated behind the `dangerous` feature
     /// and documented with what it touches.
@@ -741,6 +747,22 @@ pub fn parse_u32(input: &str) -> Result<u32, Error> {
     };
 
     u32::from_str_radix(hex, 16)
+        .map_err(|_| Error::from(ParseError::InvalidHexDigits { key: "cli" }))
+}
+
+/// Parse a decimal number, or a hex number with a `0x` prefix.
+pub fn parse_u64(input: &str) -> Result<u64, Error> {
+    let trimmed = input.trim();
+    let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    else {
+        return trimmed
+            .parse::<u64>()
+            .map_err(|_| Error::from(ParseError::InvalidDecimalU64 { key: "cli" }));
+    };
+
+    u64::from_str_radix(hex, 16)
         .map_err(|_| Error::from(ParseError::InvalidHexDigits { key: "cli" }))
 }
 

@@ -3,6 +3,7 @@
 
 pub mod commands;
 pub mod discovery;
+pub mod disk;
 pub mod error;
 pub mod protocol;
 pub mod time;

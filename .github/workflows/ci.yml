@@ -82,10 +82,10 @@ jobs:
           test -z "$(git status --porcelain)"
 
       - name: Build
-        run: devenv --profile ci shell -- buck2 build $TARGETS
+        run: devenv --profile ci shell -- buck2 build -m ppc64-ilp32 $TARGETS
 
       - name: Test
-        run: devenv --profile ci shell -- buck2 test $TARGETS
+        run: devenv --profile ci shell -- buck2 test -m ppc64-ilp32 $TARGETS
 
       - name: Check formatting and clippy diagnostics
         if: matrix.checks
@@ -123,8 +123,8 @@ jobs:
 
       - name: Build
         working-directory: C:\a
-        run: buck2 build $env:TARGETS.Split(" ")
+        run: buck2 build -m ppc64-ilp32 $env:TARGETS.Split(" ")
 
       - name: Test
         working-directory: C:\a
-        run: buck2 test $env:TARGETS.Split(" ")
+        run: buck2 test -m ppc64-ilp32 $env:TARGETS.Split(" ")

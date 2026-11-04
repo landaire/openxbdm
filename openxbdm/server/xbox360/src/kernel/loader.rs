@@ -37,6 +37,10 @@ impl ModuleList {
 /// Holds the kernel loader spin lock, which guards both module lists, for
 /// its lifetime.
 pub struct LoaderLock {
+    held: Option<HeldLoaderLock>,
+}
+
+struct HeldLoaderLock {
     lock: *mut KspinLock,
     irql: Irql,
 }
@@ -45,16 +49,21 @@ impl LoaderLock {
     /// Inlined: two loads and the import call cost less than a call.
     #[inline(always)]
     pub fn acquire() -> Self {
-        let lock = core::ptr::with_exposed_provenance_mut::<KspinLock>(
+        let address = NonZeroU32::new(
             debug_monitor_data()
                 .loaded_module_list_lock
-                .load(Ordering::Relaxed) as usize,
+                .load(Ordering::Relaxed),
         );
-        // SAFETY: the debug monitor data holds the address of the kernel
-        // loader spin lock; Drop releases it at the returned IRQL.
-        let irql = unsafe { KfAcquireSpinLock(lock) };
+        let held = address.map(|address| {
+            let lock = core::ptr::with_exposed_provenance_mut::<KspinLock>(address.get() as usize);
+            // SAFETY: the debug monitor data holds the address of the kernel
+            // loader spin lock; Drop releases it at the returned IRQL.
+            let irql = unsafe { KfAcquireSpinLock(lock) };
 
-        Self { lock, irql }
+            HeldLoaderLock { lock, irql }
+        });
+
+        Self { held }
     }
 
     /// Entries of `list` in load order.
@@ -83,8 +92,10 @@ impl LoaderLock {
 impl Drop for LoaderLock {
     #[inline(always)]
     fn drop(&mut self) {
-        // SAFETY: `acquire` took this lock at `self.irql`.
-        unsafe { KfReleaseSpinLock(self.lock, self.irql) };
+        if let Some(held) = &self.held {
+            // SAFETY: `acquire` took this lock at `held.irql`.
+            unsafe { KfReleaseSpinLock(held.lock, held.irql) };
+        }
     }
 }
 

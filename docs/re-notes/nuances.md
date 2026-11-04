@@ -65,6 +65,14 @@ lists.
 - Export 60 zero-fills the whole 0x104-byte user record before copying the name, and opens the user again by that name to read its access; a user removed in between yields E_UNEXPECTED.
 - A user name longer than 64 bytes (only export 61 can create one) overflows the 0x4c-byte directory query buffer: the kernel copies a truncated name but reports its full length, and stock export 60 copies that length from its stack into the 0x104-byte record. openxbdm ends the user walk and `userlist` at such an entry.
 
+## Retail DashLaunch
+
+- Retail `ExDebugMonitorService` returns `0xc000001c` for every service. Registration is reconstructed without calling it. The retail wrapper provides memory statistics through `MmQueryStatistics` and the kernel 17559 CD-ROM channel state. Persistent CD-ROM hot-plug hooks stay disabled because asynchronous channel work cannot be detached safely during plugin unload. Kernel call capture and DVD emulation mode remain unavailable; XTrace uses the debug-routine fallback.
+- Retail executable writes validate the address, reject device ranges, and write through the console's patched kernel mapping. `KeSweepIcacheRange` runs `dcbst` and `icbi` per 128-byte line, then `sync` and `isync`. The devkit build continues to use the `MmDbg*` mapping routines.
+- DashLaunch `launch.xex` occupies `0x91f00000`, so the retail plugin uses `0x91500000`.
+- The debug routine and single-step patch come from `DL30` data. Retail reconstruction requires raw kernel version `2.0.17559.0x8000`, displayed as `2.0.17559.0`. The reconstructed monitor block remains private because an unload-safe control dispatcher would require a trampoline outside the plugin image. Processor blocks are collected with an IPI. Stack-overflow, context-swap, callback, DVD-trace, and trace-hook call sites are absent from the retail kernel; XTrace falls back to the debug routine.
+- Retail listeners use the `SystemApp` network caller and socket option `0x5801`. The `DebugMonitor` caller is not initialized.
+
 ## Console
 
 - `dbgname` with spaces is persisted unquoted and reloads truncated at the first space.

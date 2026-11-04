@@ -29,11 +29,18 @@ rust_library(
         "default",
         "smb",
     ],
-    deps = [
-        "//openxbdm/core:openxbdm_core",
-        "//openxbdm/server/smb2:smb2_server",
-        "//third-party/rust:xbox360-sys",
-    ],
+    deps = select({
+        "xbox360//platforms:target[xbox]": [
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server/smb2:smb2_server",
+            "xbox360//src/crates/xbox360-sys:xbox360-sys",
+        ],
+        "DEFAULT": [
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server/smb2:smb2_server",
+            "//third-party/rust:xbox360-sys",
+        ],
+    }),
     doctests = False,
 )
 
@@ -51,10 +58,18 @@ rust_test(
     run_env = {
         "CARGO_MANIFEST_DIR": "openxbdm/server",
     },
-    deps = [
-        "//openxbdm/core:openxbdm_core",
-        "//openxbdm/server/smb2:smb2_server",
-        "//third-party/rust:insta",
-        "//third-party/rust:xbox360-sys",
-    ],
+    deps = select({
+        "xbox360//platforms:target[xbox]": [
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server/smb2:smb2_server",
+            "//third-party/rust:insta",
+            "xbox360//src/crates/xbox360-sys:xbox360-sys",
+        ],
+        "DEFAULT": [
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server/smb2:smb2_server",
+            "//third-party/rust:insta",
+            "//third-party/rust:xbox360-sys",
+        ],
+    }),
 )

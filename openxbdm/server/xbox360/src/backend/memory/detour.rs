@@ -551,25 +551,9 @@ pub(crate) fn initialize() {
     }
 }
 
-/// Write an instruction word of this module's code section through a
-/// writable debugger mapping.
+/// Write an instruction word of this module's code section.
 fn write_code_word(address: u32, value: u32) {
-    let mut context = [0u32; super::WRITE_CONTEXT_WORDS];
-    // SAFETY: `context` is a live local of the size the kernel fills.
-    let mapped = unsafe { xboxkrnl::MmDbgWriteCheck(address, context.as_mut_ptr()) };
-    if mapped == 0 {
-        return;
-    }
-
-    let pointer = mapped as usize as *mut u32;
-    // SAFETY: the kernel mapped the aligned code word writable for the
-    // debugger; `mapped` and `context` come from `MmDbgWriteCheck` above.
-    // The sweep takes the pointer, so the store is kept before it.
-    unsafe {
-        pointer.write(value);
-        xboxkrnl::KeSweepIcacheRange(pointer.cast(), 4);
-        xboxkrnl::MmDbgReleaseAddress(mapped, context.as_mut_ptr());
-    }
+    crate::kernel::write_code_word(address, value);
 }
 
 /// Logger entry from the stubs (0x91f2c6d0): `context` is the stub

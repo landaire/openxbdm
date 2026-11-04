@@ -235,7 +235,7 @@ impl capture::Engine for Engine {
     fn set_kernel_call_cap(&mut self, enable: bool) -> Result<(), KernelError> {
         // SAFETY: the service takes no pointers.
         let status = unsafe {
-            xboxkrnl::ExDebugMonitorService(
+            crate::kernel::debug_monitor_service(
                 DebugMonitorService::KernelCallCapture,
                 u32::from(enable),
                 0,

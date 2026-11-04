@@ -446,7 +446,7 @@ fn write_memory_statistics(record: &mut [u32; XBDM_WORDS]) {
 
     // SAFETY: the buffer is 0x90 bytes, as its length word says.
     let status = unsafe {
-        xboxkrnl::ExDebugMonitorService(
+        crate::kernel::debug_monitor_service(
             DebugMonitorService::MemoryStatistics,
             statistics.as_mut_ptr() as usize as u32,
             0,

@@ -863,7 +863,7 @@ fn kernel_memory_statistics(output: &mut MmStatistics) -> Result<(), KernelError
 
     // SAFETY: `reply` is a live block whose length fields give its size.
     let status = unsafe {
-        xboxkrnl::ExDebugMonitorService(
+        crate::kernel::debug_monitor_service(
             DebugMonitorService::MemoryStatistics,
             &raw mut reply as usize as u32,
             0,

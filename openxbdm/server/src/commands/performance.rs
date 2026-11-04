@@ -43,6 +43,8 @@ use crate::server::MAX_CONNECTIONS;
 use crate::text::Text;
 use crate::transfer_blocks::TransferBlock;
 
+const AUTO_PROFILE_FLAG: HardwareFlags = HardwareFlags::from_bits_retain(0x10);
+
 pub use counters::CounterSample;
 pub use error::DisplayError;
 
@@ -557,7 +559,7 @@ fn auto_profile(invocation: &mut Invocation<'_>) -> CommandResult {
     if !invocation
         .backend
         .hardware_flags()
-        .contains(HardwareFlags::AUTO_PROFILE)
+        .contains(AUTO_PROFILE_FLAG)
     {
         return Err(ErrorCode::UnknownCommand.into());
     }

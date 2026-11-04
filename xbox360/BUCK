@@ -11,13 +11,20 @@ xex_from_assembly(
     visibility = ["PUBLIC"],
 )
 
-# For DEVKIT:\FlashEx. `boot-guard` is the module's only feature outside
-# the defaults, so the `-all-features` executable is the boot-guard build.
+# For DEVKIT:\FlashEx with the recovery marker check.
 xex_from_assembly(
     name = "openxbdm-boot-guard",
-    executable = _MODULE + "-all-features-bin",
+    executable = _MODULE + "-boot-guard-bin",
     manifest = "xex.toml",
     out = "openxbdm-boot-guard.xex",
+    visibility = ["PUBLIC"],
+)
+
+xex_from_assembly(
+    name = "openxbdm-retail-dashlaunch",
+    executable = _MODULE + "-retail-dashlaunch-bin",
+    manifest = "xex-retail-dashlaunch.toml",
+    out = "openxbdm-retail-dashlaunch.xex",
     visibility = ["PUBLIC"],
 )
 

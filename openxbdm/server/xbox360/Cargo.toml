@@ -18,6 +18,8 @@ smb = ["openxbdm-server/smb"]
 # Deployment through DEVKIT:\FlashEx: a boot without the marker file
 # DEVKIT:\FlashEx\openxbdm.arm removes the override module and restarts.
 boot-guard = []
+# Retail plugin loaded by DashLaunch.
+retail-dashlaunch = []
 
 [dependencies]
 openxbdm-core = { path = "../../core" }
@@ -30,3 +32,7 @@ xbox360-sys = "0.2"
 # builds a stub.
 [package.metadata.buck2.xbox360]
 link_script = "link.x"
+variants = [
+    { name = "boot-guard", link_script = "link.x" },
+    { name = "retail-dashlaunch", link_script = "link-retail-dashlaunch.x" },
+]

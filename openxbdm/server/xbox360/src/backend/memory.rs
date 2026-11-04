@@ -63,9 +63,6 @@ pub(crate) use self::exports::MODULE_RECORD_SHORT_SIZE;
 pub(crate) use self::exports::module_debug_directory;
 pub(crate) use self::exports::next_module;
 
-/// Debugger context the kernel fills for a writable mapping.
-const WRITE_CONTEXT_WORDS: usize = 14;
-
 const TRACKING_ASSERT_FILE: &core::ffi::CStr =
     c"e:\\xenon\\xdksep13\\core\\private\\xdk\\tools\\debug\\xbdm\\core\\alloctrk.c";
 
@@ -235,8 +232,8 @@ impl memory::Backend for Console {
             (u64::from(u32::MAX) + 1 - u64::from(address)).min(output.len() as u64) as usize;
         let (head, tail) = output.split_at_mut(before_wrap);
 
-        // SAFETY: the trait contract: `MmDbgReadCheck` accepted every page
-        // of the range.
+        // SAFETY: the trait contract: every page of the range passed the
+        // debugger readability check.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 address as usize as *const u8,
@@ -582,7 +579,7 @@ pub(crate) unsafe fn service_adjust_memory_statistics(argument: u32) -> u32 {
     let mut reply = DebugMemoryStatistics::new();
     // SAFETY: `reply` is a live block whose length fields give its size.
     let status = unsafe {
-        xboxkrnl::ExDebugMonitorService(
+        crate::kernel::debug_monitor_service(
             DebugMonitorService::MemoryStatistics,
             &raw mut reply as usize as u32,
             0,
@@ -736,7 +733,6 @@ fn tracking_diagnostic(arguments: core::fmt::Arguments<'_>) {
             kernel::DbgPrint(
                 c"DM: %s\n".as_ptr().cast(),
                 message.as_ptr() as usize as u32,
-                core::ptr::null(),
             )
         };
     }
@@ -939,10 +935,7 @@ fn untrack_allocation(address: u32, size: u32, kind: u16) -> Untracked {
 
 /// Whether the debugger may read the page of `address`.
 fn debug_readable(address: u32) -> bool {
-    // SAFETY: the kernel validates the address before it maps it.
-    let mapped = unsafe { xboxkrnl::MmDbgReadCheck(address) };
-
-    mapped != 0 && !memory::is_device_address(mapped)
+    kernel::debug_readable(address)
 }
 
 /// Read a byte the debugger may read (0x91f26bc8 without breakpoints).
@@ -959,32 +952,9 @@ fn read_debug_byte(address: u32) -> Option<u8> {
     Some(byte.load(Ordering::Relaxed))
 }
 
-/// Write a byte through a writable debugger mapping and flush the
-/// instruction cache for it (0x91f26cb8 without breakpoints).
+/// Write a byte through the debugger memory path and flush the instruction cache.
 fn write_debug_byte(address: u32, value: u8) -> bool {
-    let mut context = [0u32; WRITE_CONTEXT_WORDS];
-    // SAFETY: `context` is a live local of the size the kernel fills.
-    let mapped = unsafe { xboxkrnl::MmDbgWriteCheck(address, context.as_mut_ptr()) };
-    if mapped == 0 {
-        return false;
-    }
-    if memory::is_device_address(mapped) {
-        // SAFETY: `mapped` and `context` come from `MmDbgWriteCheck` above.
-        unsafe { xboxkrnl::MmDbgReleaseAddress(mapped, context.as_mut_ptr()) };
-        return false;
-    }
-
-    let pointer = core::ptr::with_exposed_provenance_mut::<u8>(mapped as usize);
-    // SAFETY: the kernel mapped the address writable for the debugger and
-    // it is not a device; other threads may access it, so it is written
-    // atomically. `mapped` and `context` come from `MmDbgWriteCheck` above.
-    unsafe {
-        AtomicU8::from_ptr(pointer).store(value, Ordering::Relaxed);
-        xboxkrnl::KeSweepIcacheRange(pointer, 1);
-        xboxkrnl::MmDbgReleaseAddress(mapped, context.as_mut_ptr());
-    }
-
-    true
+    kernel::write_debug_byte(address, value)
 }
 
 /// The debug directory of the module loaded at `base` when the loader list

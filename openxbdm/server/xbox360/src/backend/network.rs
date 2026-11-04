@@ -373,7 +373,7 @@ pub(crate) fn service_apply_xnet_config(_argument: u32) -> u32 {
 
     // The dispatcher case discards the result (0x91f3bb10).
     // SAFETY: the debug monitor caller with flags 0, as stock passes them.
-    unsafe { xam::xnp_config(XnCaller::DebugMonitor, &config, 0) };
+    unsafe { xam::xnp_config(crate::net::CALLER, &config, 0) };
 
     0
 }
@@ -417,7 +417,7 @@ fn config_status_word(index: usize) -> u32 {
     // bytes the network stack writes; atomics allow the shared writes.
     unsafe {
         NetDll_XnpGetConfigStatus(
-            XnCaller::DebugMonitor,
+            crate::net::CALLER,
             CONFIG_STATUS.as_ptr().cast::<u8>().cast_mut(),
         )
     };
@@ -542,7 +542,7 @@ fn query(function: Option<u32>, buffer: u32, count: &mut u32) -> Result<(), Win3
         Some(function) => unsafe {
             kernel::call_export(
                 function,
-                XnCaller::DebugMonitor.raw(),
+                crate::net::CALLER.raw(),
                 buffer,
                 count as *mut u32 as usize as u32,
                 0,
@@ -550,7 +550,7 @@ fn query(function: Option<u32>, buffer: u32, count: &mut u32) -> Result<(), Win3
         },
         // SAFETY: `buffer` holds `count` socket records; `count` is a live u32.
         None => unsafe {
-            NetDll_XnpGetActiveSocketList(XnCaller::DebugMonitor, buffer as usize as *mut u8, count)
+            NetDll_XnpGetActiveSocketList(crate::net::CALLER, buffer as usize as *mut u8, count)
         },
     };
 

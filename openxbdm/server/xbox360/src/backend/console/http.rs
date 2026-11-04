@@ -25,7 +25,6 @@ use xbox360_sys::xam::NetDll_XHttpSetOption;
 use xbox360_sys::xam::NetDll_XHttpSetStatusCallback;
 use xbox360_sys::xam::NetDll_XHttpShutdown;
 use xbox360_sys::xam::NetDll_XHttpStartup;
-use xbox360_sys::xam::XnCaller;
 
 use super::Data;
 use crate::exports::bridged;
@@ -102,7 +101,7 @@ impl Data {
         };
 
         // SAFETY: startup takes scalar arguments.
-        if unsafe { NetDll_XHttpStartup(XnCaller::DebugMonitor, 0, 0) } == 0 {
+        if unsafe { NetDll_XHttpStartup(crate::net::CALLER, 0, 0) } == 0 {
             return Err(HttpStartFailure {
                 stage: HttpStartStage::Startup,
                 error: last_error(),
@@ -113,7 +112,7 @@ impl Data {
         // SAFETY: the user agent string is NUL-terminated.
         self.http_session = unsafe {
             NetDll_XHttpOpen(
-                XnCaller::DebugMonitor,
+                crate::net::CALLER,
                 c"Xbox Debugger/2.0.21256.0".as_ptr().cast(),
                 0,
                 0,
@@ -132,7 +131,7 @@ impl Data {
         // the session.
         self.http_connection = unsafe {
             NetDll_XHttpConnect(
-                XnCaller::DebugMonitor,
+                crate::net::CALLER,
                 self.http_session,
                 self.http_server.as_ptr(),
                 u32::from(request.port),
@@ -150,7 +149,7 @@ impl Data {
         // is module state that outlives the request.
         self.http_request = unsafe {
             NetDll_XHttpOpenRequest(
-                XnCaller::DebugMonitor,
+                crate::net::CALLER,
                 self.http_connection,
                 c"GET".as_ptr().cast(),
                 self.http_path.as_ptr(),
@@ -169,14 +168,14 @@ impl Data {
         // `value` is a live 4-byte option buffer.
         unsafe {
             NetDll_XHttpSetStatusCallback(
-                XnCaller::DebugMonitor,
+                crate::net::CALLER,
                 self.http_request,
                 http_status_entry as *const () as usize as u32,
                 ALL_NOTIFICATIONS,
                 0,
             );
             NetDll_XHttpSetOption(
-                XnCaller::DebugMonitor,
+                crate::net::CALLER,
                 self.http_request,
                 OPTION_MAX_REDIRECTS,
                 &mut value,
@@ -184,7 +183,7 @@ impl Data {
             );
             value = DISABLE_KEEP_ALIVE;
             NetDll_XHttpSetOption(
-                XnCaller::DebugMonitor,
+                crate::net::CALLER,
                 self.http_request,
                 OPTION_DISABLE_FEATURE,
                 &mut value,
@@ -195,7 +194,7 @@ impl Data {
         HttpState::Sending.store();
         // SAFETY: the request handle was opened above; no headers or body.
         let sent = unsafe {
-            NetDll_XHttpSendRequest(XnCaller::DebugMonitor, self.http_request, 0, 0, 0, 0, 0, 0)
+            NetDll_XHttpSendRequest(crate::net::CALLER, self.http_request, 0, 0, 0, 0, 0, 0)
         };
         if sent == 0 {
             return fail(self, HttpStartStage::Send);
@@ -214,7 +213,7 @@ impl Data {
         const STATUS_OK: u32 = 200;
 
         // SAFETY: the session handle was opened by `begin_http`.
-        if unsafe { NetDll_XHttpDoWork(XnCaller::DebugMonitor, self.http_session, 0) } == 0 {
+        if unsafe { NetDll_XHttpDoWork(crate::net::CALLER, self.http_session, 0) } == 0 {
             return HttpProgress::Failed(HttpFailure::Work {
                 error: last_error(),
             });
@@ -223,9 +222,8 @@ impl Data {
         if HttpState::load() == HttpState::Sent as u32 {
             HttpState::Receiving.store();
             // SAFETY: the request handle was opened by `begin_http`.
-            let receiving = unsafe {
-                NetDll_XHttpReceiveResponse(XnCaller::DebugMonitor, self.http_request, 0)
-            };
+            let receiving =
+                unsafe { NetDll_XHttpReceiveResponse(crate::net::CALLER, self.http_request, 0) };
             if receiving == 0 {
                 return HttpProgress::Failed(HttpFailure::Receive {
                     error: last_error(),
@@ -239,7 +237,7 @@ impl Data {
             // SAFETY: `code` and `length` are live locals of the stated size.
             let queried = unsafe {
                 NetDll_XHttpQueryHeaders(
-                    XnCaller::DebugMonitor,
+                    crate::net::CALLER,
                     self.http_request,
                     QUERY_STATUS_CODE,
                     0,
@@ -263,7 +261,7 @@ impl Data {
             // stated size.
             let queried = unsafe {
                 NetDll_XHttpQueryHeaders(
-                    XnCaller::DebugMonitor,
+                    crate::net::CALLER,
                     self.http_request,
                     QUERY_CONTENT_LENGTH,
                     0,
@@ -307,7 +305,7 @@ impl Data {
             // at most its size; no reference covers it; `read` is not used.
             let reading = unsafe {
                 NetDll_XHttpReadData(
-                    XnCaller::DebugMonitor,
+                    crate::net::CALLER,
                     self.http_request,
                     target,
                     remaining,
@@ -353,13 +351,13 @@ impl Data {
 
             // SAFETY: nonzero handles were opened by `begin_http` and are
             // cleared after closing.
-            unsafe { NetDll_XHttpCloseHandle(XnCaller::DebugMonitor, *handle) };
+            unsafe { NetDll_XHttpCloseHandle(crate::net::CALLER, *handle) };
             *handle = 0;
         }
 
         if core::mem::take(&mut self.http_started) {
             // SAFETY: matches the successful startup recorded in `http_started`.
-            unsafe { NetDll_XHttpShutdown(XnCaller::DebugMonitor) };
+            unsafe { NetDll_XHttpShutdown(crate::net::CALLER) };
         }
 
         HttpState::Idle.store();

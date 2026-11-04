@@ -7,13 +7,7 @@ use super::call::DbgPrint;
 /// Write a NUL-terminated message to the debug output.
 pub fn debug_print(message: &CStr) {
     // SAFETY: the format and `message` are NUL-terminated.
-    unsafe {
-        DbgPrint(
-            c"%s".as_ptr().cast(),
-            message.as_ptr() as u32,
-            core::ptr::null(),
-        )
-    };
+    unsafe { DbgPrint(c"%s".as_ptr().cast(), message.as_ptr() as u32) };
 }
 
 /// Write `text` to the debug output as the argument of `%.*s`, so it is

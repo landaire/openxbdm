@@ -4,10 +4,9 @@
 Usage: build_defs/package_module.py --version VERSION
                                     [--buck2 PATH] [--out-dir DIR]
 
-Runs from the repository root and writes `openxbdm-VERSION.xex`, for the
-kernel debugger host, and `openxbdm-boot-guard-VERSION.xex`, for
-DEVKIT:\\FlashEx (DEVELOPING.md, Console deployment). The module is the
-same on every host. Prints the file paths.
+Runs from the repository root and writes the devkit, boot-guard, and
+DashLaunch retail XEX files with VERSION in each release name. The module
+is the same on every host. Prints the file paths.
 """
 
 import argparse
@@ -26,6 +25,7 @@ BUCK2 = ROOT / "bin" / ("buck2.cmd" if sys.platform == "win32" else "buck2")
 MODULES = {
     "root//xbox360:openxbdm": "openxbdm",
     "root//xbox360:openxbdm-boot-guard": "openxbdm-boot-guard",
+    "root//xbox360:openxbdm-retail-dashlaunch": "openxbdm-retail-dashlaunch",
 }
 
 
@@ -38,7 +38,11 @@ def main():
 
     with tempfile.TemporaryDirectory() as scratch:
         report_path = Path(scratch) / "report.json"
-        subprocess.run([args.buck2, "build", f"--build-report={report_path}", *MODULES], cwd=ROOT, check=True)
+        subprocess.run(
+            [args.buck2, "build", "-m", "ppc64-ilp32", f"--build-report={report_path}", *MODULES],
+            cwd=ROOT,
+            check=True,
+        )
         report = json.loads(report_path.read_text(encoding="utf-8"))
 
     args.out_dir.mkdir(parents=True, exist_ok=True)

@@ -31,11 +31,18 @@ rust_library(
         "default",
         "smb",
     ],
-    deps = [
-        "//openxbdm/core:openxbdm_core",
-        "//openxbdm/server:openxbdm_server",
-        "//third-party/rust:xbox360-sys",
-    ],
+    deps = select({
+        "xbox360//platforms:target[xbox]": [
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "xbox360//src/crates/xbox360-sys:xbox360-sys",
+        ],
+        "DEFAULT": [
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:xbox360-sys",
+        ],
+    }),
     doctests = True,
 )
 
@@ -53,13 +60,22 @@ rust_test(
     run_env = {
         "CARGO_MANIFEST_DIR": "openxbdm/server/host",
     },
-    deps = [
-        "//openxbdm/client:openxbdm_client",
-        "//openxbdm/core:openxbdm_core",
-        "//openxbdm/server:openxbdm_server",
-        "//third-party/rust:tokio",
-        "//third-party/rust:xbox360-sys",
-    ],
+    deps = select({
+        "xbox360//platforms:target[xbox]": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "xbox360//src/crates/xbox360-sys:xbox360-sys",
+        ],
+        "DEFAULT": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "//third-party/rust:xbox360-sys",
+        ],
+    }),
 )
 
 rust_binary(
@@ -73,12 +89,20 @@ rust_binary(
         "default",
         "smb",
     ],
-    deps = [
-        "//openxbdm/core:openxbdm_core",
-        "//openxbdm/server:openxbdm_server",
-        "//third-party/rust:xbox360-sys",
-        ":openxbdm_server_host",
-    ],
+    deps = select({
+        "xbox360//platforms:target[xbox]": [
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "xbox360//src/crates/xbox360-sys:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+        "DEFAULT": [
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+    }),
 )
 
 rust_test(
@@ -95,14 +119,24 @@ rust_test(
     run_env = {
         "CARGO_MANIFEST_DIR": "openxbdm/server/host",
     },
-    deps = [
-        "//openxbdm/client:openxbdm_client",
-        "//openxbdm/core:openxbdm_core",
-        "//openxbdm/server:openxbdm_server",
-        "//third-party/rust:tokio",
-        "//third-party/rust:xbox360-sys",
-        ":openxbdm_server_host",
-    ],
+    deps = select({
+        "xbox360//platforms:target[xbox]": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "xbox360//src/crates/xbox360-sys:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+        "DEFAULT": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "//third-party/rust:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+    }),
 )
 
 rust_test(
@@ -119,14 +153,24 @@ rust_test(
     run_env = {
         "CARGO_MANIFEST_DIR": "openxbdm/server/host",
     },
-    deps = [
-        "//openxbdm/client:openxbdm_client",
-        "//openxbdm/core:openxbdm_core",
-        "//openxbdm/server:openxbdm_server",
-        "//third-party/rust:tokio",
-        "//third-party/rust:xbox360-sys",
-        ":openxbdm_server_host",
-    ],
+    deps = select({
+        "xbox360//platforms:target[xbox]": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "xbox360//src/crates/xbox360-sys:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+        "DEFAULT": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "//third-party/rust:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+    }),
 )
 
 rust_test(
@@ -143,14 +187,24 @@ rust_test(
     run_env = {
         "CARGO_MANIFEST_DIR": "openxbdm/server/host",
     },
-    deps = [
-        "//openxbdm/client:openxbdm_client",
-        "//openxbdm/core:openxbdm_core",
-        "//openxbdm/server:openxbdm_server",
-        "//third-party/rust:tokio",
-        "//third-party/rust:xbox360-sys",
-        ":openxbdm_server_host",
-    ],
+    deps = select({
+        "xbox360//platforms:target[xbox]": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "xbox360//src/crates/xbox360-sys:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+        "DEFAULT": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "//third-party/rust:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+    }),
 )
 
 rust_test(
@@ -167,14 +221,24 @@ rust_test(
     run_env = {
         "CARGO_MANIFEST_DIR": "openxbdm/server/host",
     },
-    deps = [
-        "//openxbdm/client:openxbdm_client",
-        "//openxbdm/core:openxbdm_core",
-        "//openxbdm/server:openxbdm_server",
-        "//third-party/rust:tokio",
-        "//third-party/rust:xbox360-sys",
-        ":openxbdm_server_host",
-    ],
+    deps = select({
+        "xbox360//platforms:target[xbox]": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "xbox360//src/crates/xbox360-sys:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+        "DEFAULT": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "//third-party/rust:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+    }),
 )
 
 rust_test(
@@ -191,14 +255,24 @@ rust_test(
     run_env = {
         "CARGO_MANIFEST_DIR": "openxbdm/server/host",
     },
-    deps = [
-        "//openxbdm/client:openxbdm_client",
-        "//openxbdm/core:openxbdm_core",
-        "//openxbdm/server:openxbdm_server",
-        "//third-party/rust:tokio",
-        "//third-party/rust:xbox360-sys",
-        ":openxbdm_server_host",
-    ],
+    deps = select({
+        "xbox360//platforms:target[xbox]": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "xbox360//src/crates/xbox360-sys:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+        "DEFAULT": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "//third-party/rust:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+    }),
 )
 
 rust_test(
@@ -215,14 +289,24 @@ rust_test(
     run_env = {
         "CARGO_MANIFEST_DIR": "openxbdm/server/host",
     },
-    deps = [
-        "//openxbdm/client:openxbdm_client",
-        "//openxbdm/core:openxbdm_core",
-        "//openxbdm/server:openxbdm_server",
-        "//third-party/rust:tokio",
-        "//third-party/rust:xbox360-sys",
-        ":openxbdm_server_host",
-    ],
+    deps = select({
+        "xbox360//platforms:target[xbox]": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "xbox360//src/crates/xbox360-sys:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+        "DEFAULT": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "//third-party/rust:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+    }),
 )
 
 rust_test(
@@ -239,14 +323,24 @@ rust_test(
     run_env = {
         "CARGO_MANIFEST_DIR": "openxbdm/server/host",
     },
-    deps = [
-        "//openxbdm/client:openxbdm_client",
-        "//openxbdm/core:openxbdm_core",
-        "//openxbdm/server:openxbdm_server",
-        "//third-party/rust:tokio",
-        "//third-party/rust:xbox360-sys",
-        ":openxbdm_server_host",
-    ],
+    deps = select({
+        "xbox360//platforms:target[xbox]": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "xbox360//src/crates/xbox360-sys:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+        "DEFAULT": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "//third-party/rust:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+    }),
 )
 
 rust_test(
@@ -263,14 +357,24 @@ rust_test(
     run_env = {
         "CARGO_MANIFEST_DIR": "openxbdm/server/host",
     },
-    deps = [
-        "//openxbdm/client:openxbdm_client",
-        "//openxbdm/core:openxbdm_core",
-        "//openxbdm/server:openxbdm_server",
-        "//third-party/rust:tokio",
-        "//third-party/rust:xbox360-sys",
-        ":openxbdm_server_host",
-    ],
+    deps = select({
+        "xbox360//platforms:target[xbox]": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "xbox360//src/crates/xbox360-sys:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+        "DEFAULT": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "//third-party/rust:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+    }),
 )
 
 rust_test(
@@ -287,14 +391,24 @@ rust_test(
     run_env = {
         "CARGO_MANIFEST_DIR": "openxbdm/server/host",
     },
-    deps = [
-        "//openxbdm/client:openxbdm_client",
-        "//openxbdm/core:openxbdm_core",
-        "//openxbdm/server:openxbdm_server",
-        "//third-party/rust:tokio",
-        "//third-party/rust:xbox360-sys",
-        ":openxbdm_server_host",
-    ],
+    deps = select({
+        "xbox360//platforms:target[xbox]": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "xbox360//src/crates/xbox360-sys:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+        "DEFAULT": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "//third-party/rust:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+    }),
 )
 
 rust_test(
@@ -311,14 +425,24 @@ rust_test(
     run_env = {
         "CARGO_MANIFEST_DIR": "openxbdm/server/host",
     },
-    deps = [
-        "//openxbdm/client:openxbdm_client",
-        "//openxbdm/core:openxbdm_core",
-        "//openxbdm/server:openxbdm_server",
-        "//third-party/rust:tokio",
-        "//third-party/rust:xbox360-sys",
-        ":openxbdm_server_host",
-    ],
+    deps = select({
+        "xbox360//platforms:target[xbox]": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "xbox360//src/crates/xbox360-sys:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+        "DEFAULT": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "//third-party/rust:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+    }),
 )
 
 rust_test(
@@ -335,14 +459,24 @@ rust_test(
     run_env = {
         "CARGO_MANIFEST_DIR": "openxbdm/server/host",
     },
-    deps = [
-        "//openxbdm/client:openxbdm_client",
-        "//openxbdm/core:openxbdm_core",
-        "//openxbdm/server:openxbdm_server",
-        "//third-party/rust:tokio",
-        "//third-party/rust:xbox360-sys",
-        ":openxbdm_server_host",
-    ],
+    deps = select({
+        "xbox360//platforms:target[xbox]": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "xbox360//src/crates/xbox360-sys:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+        "DEFAULT": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "//third-party/rust:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+    }),
 )
 
 rust_test(
@@ -359,14 +493,24 @@ rust_test(
     run_env = {
         "CARGO_MANIFEST_DIR": "openxbdm/server/host",
     },
-    deps = [
-        "//openxbdm/client:openxbdm_client",
-        "//openxbdm/core:openxbdm_core",
-        "//openxbdm/server:openxbdm_server",
-        "//third-party/rust:tokio",
-        "//third-party/rust:xbox360-sys",
-        ":openxbdm_server_host",
-    ],
+    deps = select({
+        "xbox360//platforms:target[xbox]": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "xbox360//src/crates/xbox360-sys:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+        "DEFAULT": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "//third-party/rust:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+    }),
 )
 
 rust_test(
@@ -383,14 +527,24 @@ rust_test(
     run_env = {
         "CARGO_MANIFEST_DIR": "openxbdm/server/host",
     },
-    deps = [
-        "//openxbdm/client:openxbdm_client",
-        "//openxbdm/core:openxbdm_core",
-        "//openxbdm/server:openxbdm_server",
-        "//third-party/rust:tokio",
-        "//third-party/rust:xbox360-sys",
-        ":openxbdm_server_host",
-    ],
+    deps = select({
+        "xbox360//platforms:target[xbox]": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "xbox360//src/crates/xbox360-sys:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+        "DEFAULT": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "//third-party/rust:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+    }),
 )
 
 rust_test(
@@ -407,14 +561,24 @@ rust_test(
     run_env = {
         "CARGO_MANIFEST_DIR": "openxbdm/server/host",
     },
-    deps = [
-        "//openxbdm/client:openxbdm_client",
-        "//openxbdm/core:openxbdm_core",
-        "//openxbdm/server:openxbdm_server",
-        "//third-party/rust:tokio",
-        "//third-party/rust:xbox360-sys",
-        ":openxbdm_server_host",
-    ],
+    deps = select({
+        "xbox360//platforms:target[xbox]": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "xbox360//src/crates/xbox360-sys:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+        "DEFAULT": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "//third-party/rust:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+    }),
 )
 
 rust_test(
@@ -431,12 +595,22 @@ rust_test(
     run_env = {
         "CARGO_MANIFEST_DIR": "openxbdm/server/host",
     },
-    deps = [
-        "//openxbdm/client:openxbdm_client",
-        "//openxbdm/core:openxbdm_core",
-        "//openxbdm/server:openxbdm_server",
-        "//third-party/rust:tokio",
-        "//third-party/rust:xbox360-sys",
-        ":openxbdm_server_host",
-    ],
+    deps = select({
+        "xbox360//platforms:target[xbox]": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "xbox360//src/crates/xbox360-sys:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+        "DEFAULT": [
+            "//openxbdm/client:openxbdm_client",
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:tokio",
+            "//third-party/rust:xbox360-sys",
+            ":openxbdm_server_host",
+        ],
+    }),
 )

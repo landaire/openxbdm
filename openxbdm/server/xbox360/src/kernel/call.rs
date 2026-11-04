@@ -1,5 +1,6 @@
 //! Calls into console code with the console ABI.
 
+pub use xbox360_sys::xboxkrnl::DbgPrint;
 use xbox360_sys::xboxkrnl::KeQueryPerformanceFrequency;
 
 /// Define `$name` as a branch to `$target`: the arguments reach it in
@@ -17,14 +18,6 @@ macro_rules! forward {
     };
 }
 pub(crate) use forward;
-
-xbox360_sys::import_thunk!(
-    /// Variadic; callers pass at most the two arguments `%.*s` takes.
-    #[allow(non_snake_case)]
-    pub DbgPrint(format: *const u8, length: u32, text: *const u8) -> u32,
-    lib = xbox360_sys::lib_index::XBOXKRNL,
-    ordinal = 3
-);
 
 /// Call a resolved export with up to four arguments through a frame that
 /// reserves the console home area, as the import thunks do.

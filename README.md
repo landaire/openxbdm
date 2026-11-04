@@ -21,23 +21,26 @@ Nightly releases will be built iff there have been changes since last nightly.
 Release artifacts:
 
 - `openxbdm-boot-guard-<version>.xex`: the console module for `DEVKIT:\FlashEx\xbdm.xex` on a development kit which has some startup safety checks to avoid accidentally killing xbdm connectivity if something goes wrong.
+- `openxbdm-retail-dashlaunch-<version>.xex`: the DashLaunch plugin for a patched retail console.
 - `openxbdm-<version>.xex`: the console module if you're deploying using the kernel debugger host (temp). For Linux x86_64, macOS arm64 and Windows x86_64:
 - `xeedee-<version>-<target>`: the `xeedee`, `openxbdm-kd`, and `xeedee-controller` executables.
 - `xeedee-ffi-<version>-<target>`: the `openxbdm-ffi` shared and static libraries and their C++ headers.
 
 ## Xbox 360 module
 
-`buck2 build //xbox360:openxbdm` builds `openxbdm.xex` which is intended to be the replacement for XBDM.
+`buck2 build -m ppc64-ilp32 //xbox360:openxbdm` builds `openxbdm.xex` for a development kit. `buck2 build -m ppc64-ilp32 //xbox360:openxbdm-retail-dashlaunch` builds `openxbdm-retail-dashlaunch.xex` for a patched retail console running DashLaunch.
 
-Its XEX2 header info can be found under [xbox360/xex.toml](xbox360/xex.toml)
+The development XEX2 header is in [xbox360/xex.toml](xbox360/xex.toml). The retail header is in [xbox360/xex-retail-dashlaunch.toml](xbox360/xex-retail-dashlaunch.toml).
 
 Development loop, without writing the console disk: with kdnet enabled, run the kernel debugger host and reboot the console. The kernel then loads the module from the host:
 
 ```text
-openxbdm-kd host --file "host:\Device\Harddisk0\Partition1\DEVKIT\FlashEx\xbdm.xex=$(buck2 build //xbox360:openxbdm --show-simple-output)"
+openxbdm-kd host --file "host:\Device\Harddisk0\Partition1\DEVKIT\FlashEx\xbdm.xex=$(buck2 build -m ppc64-ilp32 //xbox360:openxbdm --show-simple-output)"
 ```
 
 Stopping the host and rebooting returns to stock XBDM from flash. Placed at `DEVKIT:\FlashEx\xbdm.xex` the boot-guard build also loads in place of the flash monitor and removes that file at startup. Read the hazards and recovery in `DEVELOPING.md` before using that method.
+
+The retail build is a DashLaunch plugin, not a flash replacement. It requires the verified retail kernel and patched-memory environment in [`docs/re-notes/retail-dashlaunch.md`](docs/re-notes/retail-dashlaunch.md).
 
 ## Kernel debugger (openxbdm-kd)
 
@@ -80,9 +83,9 @@ Start it before a boot to stop at the first safe KD attachment point:
 
     openxbdm-kd --no-timeout gdbserver --stop-on-connect
 
-- The registers are 64-bit, as on the processor. Titles compiled as 32-bit PowerPC, such as those built with [rust-xbox360](rust-xbox360), need `--registers 32`: GDB loads a 32-bit ELF only then, and both debuggers unwind 32-bit stack frames with it. A register write in that mode keeps the high word.
+- The registers are 64-bit, as on the processor. Titles compiled as 32-bit PowerPC, such as those built with [xenon-forge](xenon-forge), need `--registers 32`: GDB loads a 32-bit ELF only then, and both debuggers unwind 32-bit stack frames with it. A register write in that mode keeps the high word.
 
-Load the title's ELF before you connect so the debugger has its symbols and source. rust-xbox360 titles have `[gdb]` and `[lldb]` subtargets that do this, including the standard library source. Run the debugger from that project's root, since the source paths are relative to it:
+Load the title's ELF before you connect so the debugger has its symbols and source. xenon-forge titles have `[gdb]` and `[lldb]` subtargets that do this, including the standard library source. Run the debugger from that project's root, since the source paths are relative to it:
 
     openxbdm-kd gdbserver --registers 32 --stop-on-load stdhello.xex
     gdb -x "$(buck2 build //examples/stdhello:stdhello[gdb] --show-simple-output)" \
@@ -269,7 +272,7 @@ You do need a few host tools:
 
 `./bootstrap.sh` (`bootstrap.ps1` on Windows) does the first-run setup by hand and lists any host tools it can't find.
 
-We have a custom [rust-xbox360](https://github.com/landaire/rust-xbox360) toolchain used and creates the `xbox360` buck2 cell. Additionally, tools from [acceleration](https://github.com/landaire/acceleration) are used for translating from ppc64 ELF to ppc64 PE, then wrapping that as an XEX2.
+The pinned [xenon-forge](https://github.com/landaire/xenon-forge) cell supplies the Xbox 360 target, XEX tools, and checksum-pinned custom PPC64-ILP32 Rust and LLVM toolchains for Linux x86_64, macOS arm64, and Windows x86_64. Console builds use `-m ppc64-ilp32`.
 
 Nix users can install the complete host tool set with `nix profile install path:.#openxbdm-tools`, run one tool with `nix run path:.#xeedee -- ARGS`, or enter the development environment with `nix develop path:.`. The Nix and devenv shells consume the same definitions from `nix/development-environment.nix`.
 
@@ -280,6 +283,7 @@ The flake exposes `xeedee`, `xeedee-controller`, `openxbdm-kd`, `openxbdm-server
 | `buck2 build //: //bindings/... //openxbdm/... //xbox360/...`              | Build everything: host crates, C++ headers, and the console module.                            |
 | `buck2 test //: //bindings/... //openxbdm/... //xbox360/...`               | Run the unit, integration and documentation tests, and check the Rust release pin.             |
 | `buck2 build //xbox360:openxbdm --show-output`                             | Build the console module, `openxbdm.xex`.                                                      |
+| `buck2 build -m ppc64-ilp32 //xbox360:openxbdm-retail-dashlaunch --show-output` | Build the retail DashLaunch plugin, `openxbdm-retail-dashlaunch.xex`.                           |
 | `buck2 run //openxbdm/cli:xeedee-bin -- ARGS`                              | Run `xeedee`.                                                                                  |
 | `buck2 build //openxbdm/cli:xeedee-bin?release`                            | Build an optimized host binary with external debug information.                               |
 | `buck2 build //openxbdm/cli:xeedee-bin?release_no_symbols`                 | Build an optimized host binary without symbols.                                                |

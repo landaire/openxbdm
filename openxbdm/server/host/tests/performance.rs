@@ -269,7 +269,7 @@ fn autoprof_reads_and_writes_the_profile_setting() {
         .backend
         .system
         .hardware_flags
-        .remove(HardwareFlags::AUTO_PROFILE);
+        .remove(HardwareFlags::from_bits_retain(0x10));
     assert_eq!(session.command("autoprof"), "407- unknown command");
 }
 

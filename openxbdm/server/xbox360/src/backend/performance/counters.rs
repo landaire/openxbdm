@@ -1061,7 +1061,7 @@ pub(crate) fn memory_statistics(
     let mut statistics: MmStatistics;
     // SAFETY: `reply` is a live block whose first words give its length.
     let mut status = unsafe {
-        xboxkrnl::ExDebugMonitorService(
+        crate::kernel::debug_monitor_service(
             DebugMonitorService::MemoryStatistics,
             (&raw mut reply) as usize as u32,
             0,

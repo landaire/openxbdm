@@ -18,6 +18,8 @@ use openxbdm_server::commands::debugger::ThreadId;
 use openxbdm_server::commands::debugger::dispatch_direct;
 use openxbdm_server::commands::debugger::exception_stops;
 use xbox360::console::hardware_flags;
+#[cfg(feature = "retail-dashlaunch")]
+use xbox360::sync::SpinLock;
 use xbox360::time::sleep;
 use xbox360_sys::processor;
 use xbox360_sys::processor::current_irql;
@@ -34,6 +36,7 @@ use xbox360_sys::xboxkrnl::KeContextFromKframes;
 use xbox360_sys::xboxkrnl::KeIpiGenericCall;
 use xbox360_sys::xboxkrnl::KeResumeThread;
 use xbox360_sys::xboxkrnl::KeSetSpecialPurposeRegister;
+use xbox360_sys::xboxkrnl::KernelU32;
 use xbox360_sys::xboxkrnl::KtrapFrame;
 use xbox360_sys::xboxkrnl::NotificationRegistration;
 use xbox360_sys::xboxkrnl::SpecialPurposeRegister;
@@ -69,6 +72,9 @@ use crate::kernel::thread_at;
 
 /// Debug routine the kernel had before the hook.
 static PREVIOUS_DEBUG_ROUTINE: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "retail-dashlaunch")]
+static SINGLE_STEP_PATCH: SpinLock<Option<crate::dashlaunch::SingleStepPatch>> =
+    SpinLock::new(None);
 
 /// Thread notification registration, priority 0. The kernel uses all 0x10
 /// bytes of the record.
@@ -207,10 +213,9 @@ extern "C" fn stack_overflow(frame_address: u32) -> u32 {
     // live for the call.
     let frame = unsafe { object_at::<KtrapFrame>(frame_address) };
     let address = frame.iar;
-    // SAFETY: the kernel calls only after `install` stored this routine in
-    // the variable whose address the query service published.
-    let variable =
-        unsafe { kernel::routine_variable(RoutineVariable::StackOverflow).unwrap_unchecked() };
+    let Some(variable) = kernel::routine_variable(RoutineVariable::StackOverflow) else {
+        return address;
+    };
     // SAFETY: `KernelU32` is a transparent `AtomicU32`; storing 0 unhooks
     // the notification, which the kernel accepts.
     let hooked =
@@ -235,8 +240,13 @@ extern "C" fn stack_overflow(frame_address: u32) -> u32 {
     }
     let mut context = ContextStorage::new(KernelContextFlags::FULL);
     // SAFETY: `frame_address` is the trap frame the kernel passed;
-    // `context` is a live local of the size the kernel writes.
-    unsafe { KeContextFromKframes(frame_address, context.as_mut_ptr()) };
+    // `context` is a live local of the type the kernel writes.
+    unsafe {
+        KeContextFromKframes(
+            frame_address as *mut KtrapFrame,
+            core::ptr::from_mut(&mut context.context),
+        )
+    };
     let record = KernelExceptionRecord {
         code: NtStatus::STACK_OVERFLOW,
         flags: KernelExceptionFlags::NONCONTINUABLE,
@@ -539,36 +549,23 @@ extern "C" fn thread_notification(_registration: u32, thread_object: u32, create
     0
 }
 
-/// Hook the kernel debug routine and the stack overflow notification and
-/// register for thread notifications (stock 0x91f3bc38 and the thread
-/// notification registration in 0x91f32628). Call once after the debug
-/// monitor data is available.
+/// Hook the kernel debug routine and available notifications.
 pub(crate) fn install() {
     super::table::initialize();
-    if let Some(variable) = kernel::routine_variable(RoutineVariable::Debug)
-        && PREVIOUS_DEBUG_ROUTINE.load(Ordering::Relaxed) == 0
-    {
-        PREVIOUS_DEBUG_ROUTINE.store(variable.load(Ordering::Relaxed), Ordering::Release);
-        // SAFETY: the entry is a debug routine of the kernel's form that
-        // chains to the previous one.
-        unsafe {
-            variable.store(
-                debug_routine_entry as *const () as usize as u32,
-                Ordering::Relaxed,
-            );
+    if let Some(variable) = kernel::routine_variable(RoutineVariable::Debug) {
+        hook_debug_routine(variable);
+        if let Some(stack_overflow) = kernel::routine_variable(RoutineVariable::StackOverflow) {
+            // SAFETY: the entry is a stack overflow notification of the kernel's form.
+            unsafe {
+                stack_overflow.store(
+                    stack_overflow_entry as *const () as usize as u32,
+                    Ordering::Relaxed,
+                );
+            }
         }
-    }
-    // The query service always stores the variable's address (K16547
-    // 0x800894d4), and stock stores through it without a check (0x91f3bdec).
-    // SAFETY: `register_debug_monitor` succeeded before this call; the
-    // entry is a stack overflow notification of the kernel's form.
-    unsafe {
-        kernel::routine_variable(RoutineVariable::StackOverflow)
-            .unwrap_unchecked()
-            .store(
-                stack_overflow_entry as *const () as usize as u32,
-                Ordering::Relaxed,
-            );
+    } else {
+        #[cfg(feature = "retail-dashlaunch")]
+        install_dashlaunch();
     }
     // SAFETY: the record is not registered yet; the routine is the bridged
     // entry of `thread_notification`, which takes the arguments of a thread
@@ -582,6 +579,64 @@ pub(crate) fn install() {
     // SAFETY: the registration block is static and stays registered until
     // `uninstall`.
     unsafe { ExRegisterThreadNotification(THREAD_NOTIFICATION.as_ptr(), true) };
+}
+
+fn hook_debug_routine(variable: &KernelU32) {
+    if PREVIOUS_DEBUG_ROUTINE.load(Ordering::Relaxed) == 0 {
+        PREVIOUS_DEBUG_ROUTINE.store(variable.load(Ordering::Relaxed), Ordering::Release);
+        // SAFETY: the entry is a kernel debug routine that chains to the prior routine.
+        unsafe {
+            variable.store(
+                debug_routine_entry as *const () as usize as u32,
+                Ordering::Relaxed,
+            );
+        }
+    }
+}
+
+fn unhook_debug_routine(variable: &KernelU32) {
+    if variable.load(Ordering::Relaxed) == debug_routine_entry as *const () as usize as u32 {
+        // SAFETY: the stored value is the routine present before `install`.
+        unsafe {
+            variable.store(
+                PREVIOUS_DEBUG_ROUTINE.swap(0, Ordering::AcqRel),
+                Ordering::Relaxed,
+            );
+        }
+    }
+}
+
+#[cfg(feature = "retail-dashlaunch")]
+fn dashlaunch_debug_routine() -> Option<&'static KernelU32> {
+    let address = crate::dashlaunch::debug_routine_variable()?;
+    // SAFETY: DashLaunch resolved this live, word-aligned kernel variable.
+    Some(unsafe { kernel::object_at::<KernelU32>(address.get()) })
+}
+
+#[cfg(feature = "retail-dashlaunch")]
+fn install_dashlaunch() {
+    let mut patch = SINGLE_STEP_PATCH.lock();
+    if patch.is_none() {
+        *patch = crate::dashlaunch::enable_single_step();
+    }
+    drop(patch);
+
+    match dashlaunch_debug_routine() {
+        Some(variable) => hook_debug_routine(variable),
+        None => {
+            kernel::debug_print(c"openxbdm: DashLaunch data unavailable; exception hook disabled\n")
+        }
+    }
+}
+
+#[cfg(feature = "retail-dashlaunch")]
+fn uninstall_dashlaunch() {
+    if let Some(variable) = dashlaunch_debug_routine() {
+        unhook_debug_routine(variable);
+    }
+    if let Some(patch) = SINGLE_STEP_PATCH.lock().take() {
+        patch.restore();
+    }
 }
 
 /// Undo [`install`] before the image unloads.
@@ -603,17 +658,11 @@ pub(crate) fn uninstall() {
             Ordering::Relaxed,
         );
     }
-    if let Some(variable) = kernel::routine_variable(RoutineVariable::Debug)
-        && variable.load(Ordering::Relaxed) == debug_routine_entry as *const () as usize as u32
-    {
-        // SAFETY: the stored value is the routine the kernel had before
-        // `install`.
-        unsafe {
-            variable.store(
-                PREVIOUS_DEBUG_ROUTINE.swap(0, Ordering::AcqRel),
-                Ordering::Relaxed,
-            );
-        }
+    if let Some(variable) = kernel::routine_variable(RoutineVariable::Debug) {
+        unhook_debug_routine(variable);
+    } else {
+        #[cfg(feature = "retail-dashlaunch")]
+        uninstall_dashlaunch();
     }
 }
 

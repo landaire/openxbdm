@@ -30,6 +30,7 @@ Status labels:
 | PGO runtime | `docs/re-notes/pgo.md` | implemented | Exports and `pogoctrl` |
 | Boot-time replacement | `docs/re-notes/module-loading.md` | verified | Loader rule; `DEVKIT:\FlashEx\xbdm.xex` with a matching bounding path loads in place of flash XBDM |
 | Boot from the kd host | `docs/re-notes/kd.md`, `openxbdm/kd` | verified | With a kd host attached the kernel requests each module from the host before its own devices; `openxbdm-kd host --file` serves openxbdm without writing the disk |
+| Retail DashLaunch plugin | `openxbdm-server-xbox360` (`retail-dashlaunch`) | implemented | Port of tuxuser's kernel 17559 and DashLaunch 3.21 work; separate retail image, optional monitor state, SystemApp networking, and patched-memory executable writes |
 | Debugging over kdnet | `docs/re-notes/kd.md`, `openxbdm/kd` (`gdbserver`) | verified | GDB and LLDB over the GDB remote protocol: every processor as a thread through processor switch (0x3150), breakpoints, software step, stop at an image load, debug output and module loads on the debugger console |
 | Differential testing | `xeedee parity record`, `xeedee parity compare` | verified | Stock and openxbdm replies to `parity/hardware-commands.txt` |
 
@@ -46,6 +47,10 @@ differ. The other 39 commands are not run on hardware (persistent state,
 flash or disk writes, user interface, console restarts); see
 `parity/hardware.md`, which also lists the checks run outside the
 command list.
+
+The retail DashLaunch path has been ported from tuxuser's verified kernel
+17559 work. Its current status remains `implemented` until this port is
+exercised on a retail console. See `retail-dashlaunch.md`.
 
 Image requirements found on hardware:
 

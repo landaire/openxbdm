@@ -37,12 +37,10 @@ struct Chain {
 }
 
 impl Chain {
-    /// # Safety
-    ///
-    /// As for [`kernel_swap_routine`].
-    unsafe fn install(&mut self) {
-        // SAFETY: the caller's contract.
-        let kernel_slot = unsafe { kernel_swap_routine() };
+    fn install(&mut self) {
+        let Some(kernel_slot) = kernel_swap_routine() else {
+            return;
+        };
         self.replaced = kernel_slot.load(Ordering::Relaxed);
 
         // SAFETY: the dispatcher entry takes the kernel's swap routine
@@ -57,16 +55,9 @@ impl Chain {
     }
 }
 
-/// `KiContextSwapNotification`, the routine variable the kernel calls on
-/// each thread switch.
-///
-/// # Safety
-///
-/// The query service must have published the address of the variable,
-/// which it does at registration. Stock uses the word without a check.
-unsafe fn kernel_swap_routine() -> &'static KernelU32 {
-    // SAFETY: the caller's contract.
-    unsafe { kernel::routine_variable(kernel::RoutineVariable::ContextSwap).unwrap_unchecked() }
+/// `KiContextSwapNotification`, when published by the kernel.
+fn kernel_swap_routine() -> Option<&'static KernelU32> {
+    kernel::routine_variable(kernel::RoutineVariable::ContextSwap)
 }
 
 fn routine_address(routine: SwapRoutine) -> u32 {
@@ -88,9 +79,7 @@ pub(crate) fn register_swap_routine(routine: SwapRoutine, persistent: bool) {
     }
 
     if !chain.installed {
-        // SAFETY: the monitor registered with the kernel before any routine
-        // registers, so the variable is published, as stock assumes.
-        unsafe { chain.install() };
+        chain.install();
     }
 }
 
@@ -114,9 +103,10 @@ pub(crate) fn unregister_swap_routine(routine: SwapRoutine) {
     }
 
     if remaining == 0 && chain.installed {
-        // SAFETY: `install` found the variable; the routine the dispatcher
-        // replaced is the kernel's own.
-        unsafe { kernel_swap_routine().store(chain.replaced, Ordering::Relaxed) };
+        if let Some(kernel_slot) = kernel_swap_routine() {
+            // SAFETY: `install` found this variable and saved its prior routine.
+            unsafe { kernel_slot.store(chain.replaced, Ordering::Relaxed) };
+        }
         chain.installed = false;
     }
 }
@@ -143,8 +133,7 @@ pub(crate) fn remove_unflagged_swap_routines() {
     }
 
     if remaining > 0 {
-        // SAFETY: as in `register_swap_routine`.
-        unsafe { chain.install() };
+        chain.install();
     } else {
         chain.installed = false;
     }

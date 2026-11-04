@@ -1,6 +1,6 @@
 # Rust for Cargo and rust-analyzer, through rustup or devenv.nix. Buck2
 # downloads the release that the xbox360 cell pins
-# (rust-xbox360/buck/rust_release.bzl), which must be this one
+# (xenon-forge/buck/rust_release.bzl), which must be this one
 # (//:rust-toolchain-test). The Xbox 360 standard library overlay is
 # specific to that release.
 [toolchain]

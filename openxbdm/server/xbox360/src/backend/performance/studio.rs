@@ -32,7 +32,7 @@ use xbox360_sys::xam::Protocol;
 use xbox360_sys::xam::SockAddrIn;
 use xbox360_sys::xam::Socket;
 use xbox360_sys::xam::SocketType;
-use xbox360_sys::xam::XnCaller;
+
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::KspinLock;
 use xbox360_sys::xboxkrnl::ProcessorMode;
@@ -252,7 +252,7 @@ fn close_handle(handle: Handle) {
 
 fn close_socket(socket: SocketId) {
     // SAFETY: callers pass an owned socket and drop it afterwards.
-    unsafe { xam::NetDll_closesocket(XnCaller::DebugMonitor, Socket::from_raw(socket.0)) };
+    unsafe { xam::NetDll_closesocket(crate::net::CALLER, Socket::from_raw(socket.0)) };
 }
 
 /// Run `operation` holding [`LOCK`].
@@ -448,7 +448,7 @@ fn open_listener() -> Result<u16, StudioError> {
     // SAFETY: no pointer arguments; the result is checked below.
     let socket = unsafe {
         xam::NetDll_socket(
-            XnCaller::DebugMonitor,
+            crate::net::CALLER,
             AddressFamily::Inet,
             SocketType::Stream,
             Protocol::Tcp,
@@ -457,6 +457,7 @@ fn open_listener() -> Result<u16, StudioError> {
     if socket == Socket::INVALID {
         return Err(StudioError::Fail);
     }
+    crate::net::mark_insecure(socket);
 
     let socket = SocketId(socket.raw());
     let Some(port) = configure_listener(socket) else {
@@ -480,7 +481,7 @@ fn configure_listener(socket: SocketId) -> Option<u16> {
     // is a live u32.
     if unsafe {
         xam::NetDll_ioctlsocket(
-            XnCaller::DebugMonitor,
+            crate::net::CALLER,
             Socket::from_raw(socket.0),
             IoctlCommand::Fionbio,
             &mut nonblocking,
@@ -495,12 +496,12 @@ fn configure_listener(socket: SocketId) -> Option<u16> {
     // SAFETY: `address` is a live sockaddr of SOCKADDR_SIZE bytes.
     if unsafe {
         xam::NetDll_bind(
-            XnCaller::DebugMonitor,
+            crate::net::CALLER,
             Socket::from_raw(socket.0),
             address.as_ptr(),
             SOCKADDR_SIZE as i32,
         ) != 0
-            || xam::NetDll_listen(XnCaller::DebugMonitor, Socket::from_raw(socket.0), 1) != 0
+            || xam::NetDll_listen(crate::net::CALLER, Socket::from_raw(socket.0), 1) != 0
     } {
         return None;
     }
@@ -509,7 +510,7 @@ fn configure_listener(socket: SocketId) -> Option<u16> {
     // SAFETY: `address` and `length` are live and describe SOCKADDR_SIZE bytes.
     if unsafe {
         xam::NetDll_getsockname(
-            XnCaller::DebugMonitor,
+            crate::net::CALLER,
             Socket::from_raw(socket.0),
             address.as_mut_ptr(),
             &mut length,
@@ -726,7 +727,7 @@ fn accept_connection(
     // above.
     let selected = unsafe {
         xam::NetDll_WSAEventSelect(
-            XnCaller::DebugMonitor,
+            crate::net::CALLER,
             Socket::from_raw(listener.0),
             xboxkrnl::Handle::from_raw(ready.0),
             NetworkEvents::ACCEPT,
@@ -754,7 +755,7 @@ fn accept_connection(
                 // SAFETY: `listener` is the open listener; no address is requested.
                 let socket = unsafe {
                     xam::NetDll_accept(
-                        XnCaller::DebugMonitor,
+                        crate::net::CALLER,
                         Socket::from_raw(listener.0),
                         core::ptr::null_mut(),
                         core::ptr::null_mut(),
@@ -772,7 +773,7 @@ fn accept_connection(
     // SAFETY: `listener` is the open listener; a null event clears the selection.
     unsafe {
         xam::NetDll_WSAEventSelect(
-            XnCaller::DebugMonitor,
+            crate::net::CALLER,
             Socket::from_raw(listener.0),
             xboxkrnl::Handle::NULL,
             NetworkEvents::empty(),

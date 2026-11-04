@@ -196,7 +196,7 @@ impl Data {
     fn close_socket(&mut self) {
         if let Some(socket) = self.socket.take() {
             // SAFETY: the socket was opened by `open_proxy_socket` and is owned here.
-            unsafe { xam::NetDll_closesocket(XnCaller::DebugMonitor, socket) };
+            unsafe { xam::NetDll_closesocket(crate::net::CALLER, socket) };
         }
 
         SHARED
@@ -248,7 +248,7 @@ impl ipproxy::Backend for Console {
         // SAFETY: no pointer arguments; the result is checked below.
         let socket = unsafe {
             xam::NetDll_socket(
-                XnCaller::DebugMonitor,
+                crate::net::CALLER,
                 AddressFamily::Inet,
                 SocketType::Datagram,
                 Protocol::Udp,
@@ -266,7 +266,7 @@ impl ipproxy::Backend for Console {
         // SAFETY: `address` is a live sockaddr.
         if unsafe {
             xam::NetDll_connect(
-                XnCaller::DebugMonitor,
+                crate::net::CALLER,
                 socket,
                 (&raw const address).cast(),
                 size_of::<SockAddrIn>() as i32,
@@ -282,7 +282,7 @@ impl ipproxy::Backend for Console {
         // SAFETY: `address` and `length` are live and describe the sockaddr.
         let named = unsafe {
             xam::NetDll_getsockname(
-                XnCaller::DebugMonitor,
+                crate::net::CALLER,
                 socket,
                 (&raw mut address).cast(),
                 &mut length,
@@ -295,7 +295,7 @@ impl ipproxy::Backend for Console {
 
         let mut xnaddr = XnAddr::default();
         // SAFETY: `xnaddr` is a live XNADDR.
-        unsafe { xam::NetDll_XNetGetDebugXnAddr(XnCaller::DebugMonitor, xnaddr.0.as_mut_ptr()) };
+        unsafe { xam::NetDll_XNetGetDebugXnAddr(crate::net::CALLER, xnaddr.0.as_mut_ptr()) };
         let [octet0, octet1, octet2, octet3, ..] = xnaddr.0;
         SHARED.local_address.store(
             u32::from_be_bytes([octet0, octet1, octet2, octet3]),
@@ -423,7 +423,7 @@ extern "C" fn outbound_hook(context: u32, packet: *mut u8, length: *const u32) -
         Piece::of(outbound.message()),
         Piece::of(&packet[outbound.payload.clone()]),
     ];
-    shared.inject(XnCaller::DebugMonitor, &pieces, InjectDirection::ToHost);
+    shared.inject(crate::net::CALLER, &pieces, InjectDirection::ToHost);
     shared
         .last_send
         .store(TickCount::now().milliseconds(), Ordering::Relaxed);
@@ -441,7 +441,7 @@ extern "C" fn receive_thread(context: u32) -> u32 {
     // SAFETY: `timeout` is a live u32 option value of the stated size.
     unsafe {
         xam::NetDll_setsockopt(
-            XnCaller::DebugMonitor,
+            crate::net::CALLER,
             Socket::from_raw(shared.socket.load(Ordering::Relaxed)),
             SocketLevel::Socket,
             SocketOption::SO_RCVTIMEO,
@@ -458,7 +458,7 @@ extern "C" fn receive_thread(context: u32) -> u32 {
         // SAFETY: `buffer` is a live stack buffer of the stated length.
         let received = unsafe {
             xam::NetDll_recv(
-                XnCaller::DebugMonitor,
+                crate::net::CALLER,
                 Socket::from_raw(socket),
                 buffer.as_mut_ptr(),
                 buffer.len() as i32,
@@ -467,7 +467,7 @@ extern "C" fn receive_thread(context: u32) -> u32 {
         };
 
         let length = if received == xam::SOCKET_ERROR {
-            if xam::NetDll_WSAGetLastError(XnCaller::DebugMonitor).error()
+            if xam::NetDll_WSAGetLastError(crate::net::CALLER).error()
                 != Some(Win32Error::TIMED_OUT)
             {
                 return 0;
@@ -482,7 +482,7 @@ extern "C" fn receive_thread(context: u32) -> u32 {
             // SAFETY: KEEPALIVE is a static message of the stated length.
             unsafe {
                 xam::NetDll_send(
-                    XnCaller::DebugMonitor,
+                    crate::net::CALLER,
                     Socket::from_raw(socket),
                     tunnel::KEEPALIVE.as_ptr(),
                     tunnel::KEEPALIVE.len() as i32,
@@ -521,6 +521,6 @@ extern "C" fn receive_thread(context: u32) -> u32 {
 /// unset.
 fn socket_failed() -> SocketFailed {
     SocketFailed(WsaError::new(
-        xam::NetDll_WSAGetLastError(XnCaller::DebugMonitor).0 as i32,
+        xam::NetDll_WSAGetLastError(crate::net::CALLER).0 as i32,
     ))
 }

@@ -55,6 +55,7 @@ use xbox360_sys::xam;
 use xbox360_sys::xam::XamSetInactivityTimeFromConfig;
 use xbox360_sys::xam::XnAddrStatus;
 use xbox360_sys::xam::XnCaller;
+
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::DebugMemoryStatistics;
 use xbox360_sys::xboxkrnl::DebugMonitorService;
@@ -215,7 +216,7 @@ impl Console {
     ) -> NetworkAddress {
         let mut record = [0u8; NETWORK_ADDRESS_SIZE];
         // SAFETY: `record` is a live buffer of the XNADDR size.
-        let status = unsafe { query(XnCaller::DebugMonitor, record.as_mut_ptr()) }.bits();
+        let status = unsafe { query(crate::net::CALLER, record.as_mut_ptr()) }.bits();
 
         NetworkAddress { status, record }
     }
@@ -538,7 +539,7 @@ fn memory_statistics() -> Option<MemoryStatistics> {
     // SAFETY: `block` is a live statistics block whose length fields give
     // its size.
     let status = unsafe {
-        xboxkrnl::ExDebugMonitorService(
+        crate::kernel::debug_monitor_service(
             DebugMonitorService::MemoryStatistics,
             &mut block as *mut DebugMemoryStatistics as usize as u32,
             0,

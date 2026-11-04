@@ -2,7 +2,7 @@
   root = .
   prelude = prelude
   toolchains = toolchains
-  xbox360 = rust-xbox360
+  xbox360 = xenon-forge
   none = none
   rustc_bootstrap = rustc-bootstrap
 
@@ -23,11 +23,11 @@
 
 [external_cell_xbox360]
   git_origin = https://github.com/landaire/xenon-forge
-  commit_hash = 4ad5755e561ddd64a3db480612e1dce92349941c
+  commit_hash = 1fffff77c5a555d188ba30bc4f995537ff0babec
 
 [external_cell_rustc_bootstrap]
   git_origin = https://github.com/landaire-contrib/buck2-rustc-bootstrap
-  commit_hash = f75e1005adc480d93d59f1ef7ad49554f12f6020
+  commit_hash = 0f1673dc9abdef78697e31451ca4b0080bfe41e8
 
 [parser]
   target_platform_detector_spec = target:root//...->prelude//platforms:default \
@@ -36,7 +36,7 @@
     target:xbox360//...->prelude//platforms:default
 
 [build]
-  execution_platforms = prelude//platforms:default
+  execution_platforms = xbox360//platforms:execution
 
 [project]
   ignore = .claude, .git, .jj, .tools, buck-out, target

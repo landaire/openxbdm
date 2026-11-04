@@ -11,7 +11,6 @@ use core::sync::atomic::Ordering;
 use openxbdm_core::status::Hresult;
 use openxbdm_core::status::XbdmHresult;
 use openxbdm_server::commands::debugger::ExceptionNotificationFlags;
-use openxbdm_server::commands::memory::is_device_address;
 use openxbdm_server::commands::session::compare_names;
 use openxbdm_server::commands::session::notification_kind_length;
 use openxbdm_server::notify::DataAccess;
@@ -507,11 +506,7 @@ extern "C" fn open_notification_session(flags: u32, session: *mut u32) -> Hresul
 /// session block that is not linked is left alone. Kernel hooks keep their
 /// state until the next registration change.
 extern "C" fn close_notification_session(session: u32) -> Hresult {
-    let readable = session != 0 && {
-        // SAFETY: the check only translates the address.
-        let mapped = unsafe { xboxkrnl::MmDbgReadCheck(session) };
-        mapped != 0 && !is_device_address(mapped)
-    };
+    let readable = session != 0 && crate::kernel::debug_readable(session);
     // SAFETY: the debugger read check found the tag word readable.
     if !readable
         || unsafe { &*core::ptr::with_exposed_provenance::<AtomicU32>(session as usize) }

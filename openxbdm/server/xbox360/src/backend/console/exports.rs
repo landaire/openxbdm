@@ -39,6 +39,7 @@ use crate::exports::export_result;
 use crate::kernel;
 use crate::kernel::version_words;
 use crate::net::XamNetwork;
+const AUTO_PROFILE_FLAG: HardwareFlags = HardwareFlags::from_bits_retain(0x10);
 
 /// Result of a NULL output pointer.
 const BAD_PARAMETER: Hresult = ErrorCode::BadParameter.hresult();
@@ -275,7 +276,7 @@ fn xconfig_result(status: NtStatus) -> Hresult {
 
 /// Export 175: read the 8-byte setting [`XCONFIG_QWORD`] into `output`.
 extern "C" fn export_get_xconfig_qword(output: Option<&mut [u8; 8]>) -> Hresult {
-    if !hardware_flags().contains(HardwareFlags::AUTO_PROFILE) {
+    if !hardware_flags().contains(AUTO_PROFILE_FLAG) {
         return ErrorCode::UnknownCommand.hresult();
     }
 
@@ -300,7 +301,7 @@ export!(175, export_get_xconfig_qword);
 /// Export 176 with the 64-bit value split into its high and low words by
 /// [`export_set_xconfig_qword_entry`].
 extern "C" fn export_set_xconfig_qword(high: u32, low: u32) -> Hresult {
-    if !hardware_flags().contains(HardwareFlags::AUTO_PROFILE) {
+    if !hardware_flags().contains(AUTO_PROFILE_FLAG) {
         return ErrorCode::UnknownCommand.hresult();
     }
 

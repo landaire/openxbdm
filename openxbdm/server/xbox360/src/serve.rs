@@ -12,14 +12,18 @@ use openxbdm_server::network::Ipv4Address;
 use openxbdm_server::server::MAX_CONNECTIONS;
 use openxbdm_server::server::Owner;
 use xbox360::time::sleep;
+#[cfg(not(feature = "retail-dashlaunch"))]
 use xbox360_sys::xam;
 use xbox360_sys::xam::FdSet;
 use xbox360_sys::xam::Socket;
 use xbox360_sys::xam::TimeVal;
+#[cfg(not(feature = "retail-dashlaunch"))]
 use xbox360_sys::xam::WinsockVersion;
+#[cfg(not(feature = "retail-dashlaunch"))]
 use xbox360_sys::xam::WsaData;
-use xbox360_sys::xam::XnCaller;
+#[cfg(not(feature = "retail-dashlaunch"))]
 use xbox360_sys::xam::XnetStartupFlags;
+#[cfg(not(feature = "retail-dashlaunch"))]
 use xbox360_sys::xam::XnetStartupParams;
 
 use crate::backend::Console;
@@ -43,6 +47,7 @@ struct ActiveConnection {
     wants_write: bool,
 }
 
+#[cfg(not(feature = "retail-dashlaunch"))]
 // Startup work and rare paths stay out of line: a frame inlined into
 // the server loop would stay allocated under every command.
 #[inline(never)]
@@ -54,21 +59,20 @@ fn initialize_network() -> bool {
         ..XnetStartupParams::new()
     };
     // SAFETY: `startup` is a live parameter block.
-    if unsafe { xam::NetDll_XNetStartup(XnCaller::DebugMonitor, &startup) } != 0 {
+    if unsafe { xam::NetDll_XNetStartup(crate::net::CALLER, &startup) } != 0 {
         return false;
     }
 
     let mut wsa_data = WsaData::new();
     // SAFETY: `wsa_data` is live storage for the call to fill.
-    unsafe {
-        xam::NetDll_WSAStartup(
-            XnCaller::DebugMonitor,
-            WinsockVersion::new(2, 0),
-            &mut wsa_data,
-        )
-    }
-    .error()
-    .is_none()
+    unsafe { xam::NetDll_WSAStartup(crate::net::CALLER, WinsockVersion::new(2, 0), &mut wsa_data) }
+        .error()
+        .is_none()
+}
+
+#[cfg(feature = "retail-dashlaunch")]
+fn initialize_network() -> bool {
+    true
 }
 
 pub(crate) fn close_listener() {
@@ -334,6 +338,7 @@ fn load_settings() {
     let mut network = XamNetwork;
     crate::backend::dispatcher::with_startup_host(|server, console| {
         openxbdm_server::commands::system::load_settings(server, console, &mut network);
+        #[cfg(not(feature = "retail-dashlaunch"))]
         crate::backend::dvd_hotplug::install(server.state.console.trace_mask);
     });
 }

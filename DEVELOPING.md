@@ -10,14 +10,13 @@ This repository builds two kinds of things:
   debug monitor (XBDM) that a development kit normally loads from its
   flash at boot.
 
-The console module comes in two builds. They hold the same server; they
-differ only in how they get onto the console and how they recover from a
-bad boot.
+The console module comes in three builds. The development-kit builds differ in how they get onto the console and how they recover from a bad boot. The retail build replaces unavailable development-kit services and runs as a DashLaunch plugin.
 
 | Build | Target | Use it when |
 | --- | --- | --- |
 | `openxbdm.xex` | `//xbox360:openxbdm` | You run `openxbdm-kd host` on your PC and it hands the module to the console at boot. Nothing is written to the console. |
 | `openxbdm-boot-guard.xex` | `//xbox360:openxbdm-boot-guard` | You copy the module to `DEVKIT:\FlashEx\xbdm.xex` on the console's disk, with no PC involved at boot. |
+| `openxbdm-retail-dashlaunch.xex` | `//xbox360:openxbdm-retail-dashlaunch` | You run a patched retail kernel with DashLaunch 3.21 on kernel 17559. |
 
 Loading from the kd host is the safer method: if the module breaks, stop
 the host and restart the console, and it boots the stock monitor again.
@@ -136,7 +135,7 @@ checkout path; CI copies the checkout to `C:\a`
 ### Local changes to xenon-forge
 
 To build against a xenon-forge working copy instead of the pinned commit,
-place the working copy at `rust-xbox360/` in this repository (the path of
+place the working copy at `xenon-forge/` in this repository (the path of
 the cell in `.buckconfig`; Git ignores it) and make the cell an
 ordinary cell in `.buckconfig.local`:
 
@@ -147,7 +146,7 @@ Buck2 does not follow a symbolic link out of the repository, so the
 working copy must be a directory: a clone, a `git worktree`, or a jj
 workspace of an existing checkout, for example
 
-    jj -R ../llvm-xbox-360 workspace add --name xeedee rust-xbox360
+    jj -R ../openxbox/xenon-forge workspace add --name xeedee xenon-forge
 
 Buck2 then builds from the working copy as it changes. To pin a new
 commit, push it to GitHub, set `commit_hash` in `.buckconfig`, and remove
@@ -173,6 +172,8 @@ The `smb` feature of `openxbdm-server`, `openxbdm-server-host`, and
 their own feature sets.
 
 Build modes are configuration modifiers. `?dev` is the default and keeps external debug information. For host builds, `?release` adds `-Copt-level=3` to every crate and thin LTO to binaries and tests while keeping external debug information. `?release_no_symbols` makes the same optimized host build without symbols. Console modules keep their size optimization and LTO settings; the modes select whether they retain symbols. For example:
+
+Console CI and releases select `-m ppc64-ilp32`, which uses xenon-forge's checksum-pinned custom PPC64-ILP32 Rust and LLVM toolchain for the current host.
 
     buck2 build //openxbdm/cli:xeedee-bin?release
 
@@ -205,8 +206,9 @@ publishes an immutable `nightly-<commit>` pre-release and updates the
 ## Xbox 360 module
 
 `openxbdm-server-xbox360` targets `powerpc-unknown-xbox360`. Its
-`[package.metadata.buck2.xbox360]` table names its linker script, and
-`build_defs/update_buck_files.py` makes each of its binaries an
+`[package.metadata.buck2.xbox360]` table names the default linker script
+and the feature-specific boot-guard and retail variants.
+`build_defs/update_buck_files.py` makes each binary an
 `xbox360_executable_core` of the xenon-forge cell
 (`@xbox360//buck:xex.bzl`). That rule configures itself and its
 dependencies for the console, with the `core`, `alloc` and
@@ -218,6 +220,7 @@ overlay. `xbox360/BUCK` builds the module from it with the cell's
 | --- | --- |
 | `//xbox360:openxbdm` | `openxbdm.xex`, for the kd host |
 | `//xbox360:openxbdm-boot-guard` | `openxbdm-boot-guard.xex`, with the `boot-guard` feature, for `DEVKIT:\FlashEx` |
+| `//xbox360:openxbdm-retail-dashlaunch` | `openxbdm-retail-dashlaunch.xex`, with the `retail-dashlaunch` feature, for DashLaunch |
 | `//xbox360:openxbdm-no-rewrite` | `openxbdm-no-rewrite.xex`, without the save and restore rewrite |
 
 The module declares its kernel and XAM imports through `xbox360-sys` and
@@ -265,8 +268,8 @@ loader accepts. LLVM emits unprotected reservations for
 the atomics overlay of xenon-forge (`toolchain/rust-std-xbox360`), as the
 cell's `core` does.
 
-xex-link (`xbox360//crates/xex-link:xex-link`) converts the image with the
-metadata in `xbox360/xex.toml`.
+xex-link (`xbox360//crates/xex-link:xex-link`) converts each image with
+the matching development or retail manifest under `xbox360/`.
 
 ## Console deployment
 
@@ -336,6 +339,16 @@ entry point), or you installed a build without the boot guard, start
 `openxbdm-kd host --file` serving a working module for the same path and
 restart the console; that module deletes the file once its server starts.
 Each installation covers one boot; repeat steps 2 to 4 for the next one.
+
+### Retail DashLaunch plugin
+
+Build the retail plugin with the custom PPC64-ILP32 toolchain:
+
+    buck2 build -m ppc64-ilp32 //xbox360:openxbdm-retail-dashlaunch --show-output
+
+Configure DashLaunch to load the resulting `openxbdm-retail-dashlaunch.xex` as a plugin. Do not replace a retail system file with this image. The retail kernel must already permit direct kernel memory writes.
+
+The current implementation is verified only on retail kernel 17559 with DashLaunch 3.21. Startup rejects unknown kernel offsets and unknown DashLaunch data layouts. See `docs/re-notes/retail-dashlaunch.md` for the reconstructed boundaries and unsupported devkit services.
 
 ## Differential testing
 

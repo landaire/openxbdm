@@ -61,13 +61,6 @@ use crate::exports::bridged;
 use crate::kernel;
 use crate::kernel::version_words;
 
-xbox360_sys::import_thunk!(
-    #[allow(non_snake_case)]
-    DbgPrintInquiry(format: *const u8, vendor: *const u8, product: *const u8) -> u32,
-    lib = xbox360_sys::lib_index::XBOXKRNL,
-    ordinal = 3
-);
-
 /// Bits of the hot-plug register written back after a removal or an
 /// insertion; their device meaning is unknown.
 const HOTPLUG_REMOVED: SataHotplug = SataHotplug::from_bits_retain(0x10);
@@ -826,7 +819,12 @@ fn find_channel(
 ) -> Result<&'static ChannelExtension, PatchError> {
     let [major, minor, build, qfe] = version;
     trace(Trace::KernelVersion(version));
-    if major != 2 || minor != 0 || qfe != 0x8000 {
+    let retail_17559 = cfg!(feature = "retail-dashlaunch")
+        && major == 2
+        && minor == 0
+        && build == 17559
+        && qfe == 0x8000;
+    if !retail_17559 && (major != 2 || minor != 0 || qfe != 0x8000) {
         return Err(PatchError::UnsupportedKernel);
     }
 
@@ -838,7 +836,7 @@ fn find_channel(
             let mut info = CdromChannelInformation::default();
             // SAFETY: `info` is a local buffer of the size passed.
             let status = unsafe {
-                xboxkrnl::ExDebugMonitorService(
+                crate::kernel::debug_monitor_service(
                     DebugMonitorService::CdromChannel,
                     1,
                     size_of::<CdromChannelInformation>() as u32,
@@ -1417,7 +1415,7 @@ fn report_inquiry(data: Option<&ScsiInquiryData>) {
             // SAFETY: the format is NUL-terminated and its precisions bound
             // the reads to the vendor and product fields.
             unsafe {
-                DbgPrintInquiry(
+                kernel::DbgPrint(
                     c"XBDM: ODD VendorId=%.8s, ProductId=%.16s\n"
                         .as_ptr()
                         .cast(),
@@ -1452,7 +1450,7 @@ fn report_inquiry(data: Option<&ScsiInquiryData>) {
 
     // SAFETY: the DVD emulation service takes no buffer.
     let enabled = unsafe {
-        xboxkrnl::ExDebugMonitorService(
+        crate::kernel::debug_monitor_service(
             DebugMonitorService::DvdEmulation,
             u32::from(!state.is_empty()),
             0,

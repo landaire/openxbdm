@@ -75,9 +75,10 @@ fn unload() {
     }
 
     stop_server_services();
+    crate::backend::hardware::shut_down();
+    crate::backend::performance::shut_down();
     crate::backend::debugger::uninstall();
     crate::backend::session::uninstall();
-    crate::backend::performance::shut_down();
     crate::backend::dispatcher::wait_for_callers();
     crate::backend::debugger::wait_for_event_waiters();
 }
@@ -112,6 +113,7 @@ fn load(module: u32) -> bool {
     crate::backend::network::xhttpproxy::initialize();
     crate::backend::session::initialize();
     crate::backend::hardware::initialize();
+    #[cfg(not(feature = "retail-dashlaunch"))]
     crate::backend::dispatcher::install();
     crate::backend::performance::initialize();
     crate::backend::memory::initialize();

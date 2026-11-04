@@ -15,15 +15,17 @@ import sys
 NOTES = """\
 Built on {date} from {commit}.{nightly}
 
-## Console module
+## Console modules
 
-openxbdm replaces the Xbox Debug Monitor (xbdm.xex) of an Xbox 360
-development kit and serves the XBDM protocol on TCP port 730.
+Use the normal and boot-guard XEX files only on development-kit kernels. Use
+the retail XEX only as a DashLaunch plugin on a supported patched retail
+kernel. The retail build is not a flash replacement.
 
 | File | Use |
 | --- | --- |
-| `openxbdm-boot-guard-{version}.xex` | Console module for `DEVKIT:\\FlashEx\\xbdm.xex`, with startup safety checks to preserve XBDM connectivity |
-| `openxbdm-{version}.xex` | Console module for temporary deployment through the kernel debugger host |
+| `openxbdm-boot-guard-{version}.xex` | Development-kit module for `DEVKIT:\\FlashEx\\xbdm.xex`, with startup safety checks to preserve XBDM connectivity |
+| `openxbdm-{version}.xex` | Development-kit module for temporary deployment through the kernel debugger host |
+| `openxbdm-retail-dashlaunch-{version}.xex` | DashLaunch plugin for a supported patched retail kernel |
 
 ### Installation in DEVKIT:\\FlashEx
 

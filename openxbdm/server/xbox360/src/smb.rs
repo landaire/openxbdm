@@ -65,7 +65,7 @@ unsafe fn local() -> &'static mut Local {
 /// When a failed listen is tried again.
 fn retry_time(console: &mut Console) -> FileTime {
     /// Delay before a failed listen is tried again (5 s).
-    const LISTEN_RETRY: u64 = 5 * FileTime::INTERVALS_PER_SECOND;
+    const LISTEN_RETRY: u64 = 5 * 10_000_000;
 
     FileTime::from_intervals(console.system_time().wrapping_add(LISTEN_RETRY))
 }

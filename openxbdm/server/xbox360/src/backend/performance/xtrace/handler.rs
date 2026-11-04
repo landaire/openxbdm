@@ -12,6 +12,7 @@ use xbox360_sys::processor::Msr;
 use xbox360_sys::status::NtStatus;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::Context;
+#[cfg(not(feature = "retail-dashlaunch"))]
 use xbox360_sys::xboxkrnl::DebugMonitorService;
 use xbox360_sys::xboxkrnl::ExceptionRecord;
 use xbox360_sys::xboxkrnl::HardwareFlags;
@@ -38,6 +39,7 @@ use super::take_free_buffer;
 use super::title_terminated_entry;
 use crate::exports::bridged;
 use crate::kernel;
+#[cfg(not(feature = "retail-dashlaunch"))]
 use crate::kernel::RoutineVariable;
 
 /// A kernel routine the handler runs natively instead of stepping through
@@ -439,6 +441,18 @@ pub(super) fn resolve_spoofed_routines() {
     }
 }
 
+#[cfg(not(feature = "retail-dashlaunch"))]
+fn debug_routine_slot() -> Option<&'static KernelU32> {
+    kernel::routine_variable(RoutineVariable::Debug)
+}
+
+#[cfg(feature = "retail-dashlaunch")]
+fn debug_routine_slot() -> Option<&'static KernelU32> {
+    let address = crate::dashlaunch::debug_routine_variable()?;
+    // SAFETY: DashLaunch resolved this live, word-aligned kernel variable.
+    Some(unsafe { kernel::object_at::<KernelU32>(address.get()) })
+}
+
 /// Install the hooks (stock 0x91f66e88).
 pub(super) fn hook() {
     const TITLE_TERMINATE_PRIORITY: u32 = 0x6f00_0000;
@@ -468,35 +482,37 @@ pub(super) fn hook() {
         };
     }
 
-    let mut hook_slot = [0u32; 2];
-    // SAFETY: `hook_slot` is a live two-word reply block.
-    let status = unsafe {
-        xboxkrnl::ExDebugMonitorService(
-            DebugMonitorService::TraceHook,
-            hook_slot.as_mut_ptr() as usize as u32,
-            0,
-            0,
-        )
-    };
-    if status.is_success() {
-        HOOK_SLOT.store(hook_slot[0], Ordering::Release);
-        // SAFETY: the service replies with the address of the kernel's
-        // trace hook variable, kernel data that stays mapped.
-        let slot = unsafe { kernel::object_at::<KernelU32>(hook_slot[0]) };
-        // SAFETY: `trace_hook_entry` follows the kernel's trace hook
-        // convention and stays loaded until `unhook` clears the variable.
-        unsafe {
-            slot.store(
-                trace_hook_entry as *const () as usize as u32,
-                Ordering::Relaxed,
+    #[cfg(not(feature = "retail-dashlaunch"))]
+    {
+        let mut hook_slot = [0u32; 2];
+        // SAFETY: `hook_slot` is a live two-word reply block.
+        let status = unsafe {
+            crate::kernel::debug_monitor_service(
+                DebugMonitorService::TraceHook,
+                hook_slot.as_mut_ptr() as usize as u32,
+                0,
+                0,
             )
         };
+        if status.is_success() {
+            HOOK_SLOT.store(hook_slot[0], Ordering::Release);
+            // SAFETY: the service replies with the address of the kernel's
+            // trace hook variable, kernel data that stays mapped.
+            let slot = unsafe { kernel::object_at::<KernelU32>(hook_slot[0]) };
+            // SAFETY: `trace_hook_entry` follows the kernel's trace hook
+            // convention and stays loaded until `unhook` clears the variable.
+            unsafe {
+                slot.store(
+                    trace_hook_entry as *const () as usize as u32,
+                    Ordering::Relaxed,
+                )
+            };
+        }
     }
 
-    // SAFETY: the monitor registered before any trace starts, so the query
-    // service published the address of `KiDebugRoutine`; stock uses it
-    // without a check.
-    let slot = unsafe { kernel::routine_variable(RoutineVariable::Debug).unwrap_unchecked() };
+    let Some(slot) = debug_routine_slot() else {
+        return;
+    };
     ROUTINE_SLOT.store(kernel::address_of(slot), Ordering::Release);
 
     let routine = debug_routine_entry as *const () as usize as u32;

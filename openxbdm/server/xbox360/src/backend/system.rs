@@ -23,7 +23,7 @@ use openxbdm_server::commands::system::SettingsSource;
 use xbox360::console::hardware_flags;
 use xbox360::time::sleep;
 use xbox360_sys::xam;
-use xbox360_sys::xam::XnCaller;
+
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::AccessMask;
 use xbox360_sys::xboxkrnl::CreateDisposition;
@@ -59,6 +59,7 @@ pub(crate) use self::settings::service_write_settings_copy;
 
 /// The settings file the monitor writes.
 const SAVED_SETTINGS_PATH: &[u8] = b"\\SystemRoot\\MobileJ.dat";
+const FROM_DISC_FLAG: HardwareBootFlags = HardwareBootFlags::from_bits_retain(0x400);
 
 /// Platform state of this domain.
 pub struct Data {
@@ -109,9 +110,7 @@ impl commands::system::Backend for Console {
     }
 
     fn booted_from_disc(&mut self) -> bool {
-        kernel::hardware_info()
-            .boot_flags
-            .contains(HardwareBootFlags::FROM_DISC)
+        kernel::hardware_info().boot_flags.contains(FROM_DISC_FLAG)
     }
 
     fn title_process_caller(&mut self) -> bool {
@@ -277,7 +276,7 @@ impl commands::system::Backend for Console {
         // SAFETY: `file_time` and `previous` are live locals.
         unsafe {
             xboxkrnl::NtSetSystemTime(&file_time, &mut previous);
-            xam::NetDll_XnpNoteSystemTime(XnCaller::DebugMonitor);
+            xam::NetDll_XnpNoteSystemTime(crate::net::CALLER);
         }
     }
 

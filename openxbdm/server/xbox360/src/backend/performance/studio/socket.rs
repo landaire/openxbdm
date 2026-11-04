@@ -16,7 +16,7 @@ use xbox360_sys::xam::IoctlCommand;
 use xbox360_sys::xam::MessageFlags;
 use xbox360_sys::xam::NetworkEvents;
 use xbox360_sys::xam::Socket;
-use xbox360_sys::xam::XnCaller;
+
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::PoolTag;
 use xbox360_sys::xboxkrnl::PoolType;
@@ -81,7 +81,7 @@ impl SocketTransport {
             // caller's event handle.
             let status = unsafe {
                 xam::NetDll_WSAEventSelect(
-                    XnCaller::DebugMonitor,
+                    crate::net::CALLER,
                     Socket::from_raw(self.socket.0),
                     xboxkrnl::Handle::from_raw(event),
                     FD_READ_WRITE,
@@ -117,7 +117,7 @@ impl Stream for SocketStream {
         // or caller memory under the trait contract.
         let sent = unsafe {
             xam::NetDll_send(
-                XnCaller::DebugMonitor,
+                crate::net::CALLER,
                 Socket::from_raw(self.socket.0),
                 pointer,
                 length,
@@ -137,7 +137,7 @@ impl Stream for SocketStream {
         // or caller memory under the trait contract.
         let received = unsafe {
             xam::NetDll_recv(
-                XnCaller::DebugMonitor,
+                crate::net::CALLER,
                 Socket::from_raw(self.socket.0),
                 pointer,
                 length,
@@ -149,7 +149,7 @@ impl Stream for SocketStream {
     }
 
     fn would_block(&mut self) -> bool {
-        xam::NetDll_WSAGetLastError(XnCaller::DebugMonitor).error() == Some(Win32Error::WOULD_BLOCK)
+        xam::NetDll_WSAGetLastError(crate::net::CALLER).error() == Some(Win32Error::WOULD_BLOCK)
     }
 
     unsafe fn read_length(&mut self, address: u32) -> u32 {
@@ -207,7 +207,7 @@ pub(super) fn create_socket_transport(socket: SocketId) -> Result<u32, StudioErr
     // SAFETY: `socket` is the accepted connection; `nonblocking` is a live u32.
     if unsafe {
         xam::NetDll_ioctlsocket(
-            XnCaller::DebugMonitor,
+            crate::net::CALLER,
             Socket::from_raw(socket.0),
             IoctlCommand::Fionbio,
             &mut nonblocking,

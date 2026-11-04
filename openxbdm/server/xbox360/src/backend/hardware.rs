@@ -66,7 +66,7 @@ use xbox360::time::Timebase;
 use xbox360_sys::status::Win32ErrorCode;
 use xbox360_sys::xam;
 use xbox360_sys::xam::XnAddr;
-use xbox360_sys::xam::XnCaller;
+
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::AccessMask;
 use xbox360_sys::xboxkrnl::CreateDisposition;
@@ -78,8 +78,10 @@ use xbox360_sys::xboxkrnl::IoControlCode;
 use xbox360_sys::xboxkrnl::ObjectAttributeFlags;
 use xbox360_sys::xboxkrnl::PoolTag;
 use xbox360_sys::xboxkrnl::PoolType;
+use xbox360_sys::xboxkrnl::ProcessorMode;
 use xbox360_sys::xboxkrnl::ShareAccess;
 use xbox360_sys::xboxkrnl::ThreadCreationFlags;
+use xbox360_sys::xboxkrnl::WaitReason;
 use xbox360_sys::xboxkrnl::XInputdSetRFPowerMode;
 
 use super::Console;
@@ -113,9 +115,11 @@ static HEAP_COUNT: CachedExport = CachedExport::new();
 static HEAP_INFO: CachedExport = CachedExport::new();
 static USB_PORT_POWER: CachedExport = CachedExport::new();
 static ODD_LOG: OddLog = OddLog::new();
+static HARDWARE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static ODD_WRITER: OddWriter = OddWriter {
     work: KernelEvent::new(),
     finished: KernelEvent::new(),
+    joined: KernelEvent::new(),
     thread: AtomicU32::new(0),
 };
 /// Drive authentication state kept for the optical disc trace stream.
@@ -247,7 +251,7 @@ impl commands::hardware::Backend for Console {
     fn devkit_memory_statistics(&mut self, block: &mut [u8; 0x90]) -> Result<(), KernelError> {
         // SAFETY: `block` is the 0x90-byte buffer the statistics service fills.
         unsafe {
-            xboxkrnl::ExDebugMonitorService(
+            crate::kernel::debug_monitor_service(
                 DebugMonitorService::MemoryStatistics,
                 output_address(&mut block[..]),
                 0,
@@ -368,8 +372,8 @@ impl commands::hardware::Backend for Console {
         let mut debug = XnAddr::default();
         // SAFETY: each query stores one XNADDR.
         unsafe {
-            xam::NetDll_XNetGetTitleXnAddr(XnCaller::DebugMonitor, (&raw mut title).cast());
-            xam::NetDll_XNetGetDebugXnAddr(XnCaller::DebugMonitor, (&raw mut debug).cast());
+            xam::NetDll_XNetGetTitleXnAddr(crate::net::CALLER, (&raw mut title).cast());
+            xam::NetDll_XNetGetDebugXnAddr(crate::net::CALLER, (&raw mut debug).cast());
         }
 
         StackAddresses {
@@ -649,6 +653,8 @@ struct OddWriter {
     work: KernelEvent,
     /// Notification event: no writer runs.
     finished: KernelEvent,
+    /// Notification event: the writer's termination was observed.
+    joined: KernelEvent,
     /// Referenced thread object of the last writer started.
     thread: AtomicU32,
 }
@@ -708,12 +714,14 @@ impl OddPlatform for OddServices {
 
     fn writer_starting(&mut self) {
         ODD_WRITER.finished.reset();
+        ODD_WRITER.joined.reset();
     }
 
     fn start_writer(&mut self, file: Handle) -> NtStatus {
         const WRITER_STACK: u32 = 0x8000;
-        const WRITER_FLAGS: ThreadCreationFlags =
-            kernel::SYSTEM_THREAD_FLAGS.union(ThreadCreationFlags::EXEMPT_FROM_STOPS);
+        const WRITER_FLAGS: ThreadCreationFlags = kernel::SYSTEM_THREAD_FLAGS
+            .union(ThreadCreationFlags::SUSPENDED)
+            .union(ThreadCreationFlags::EXEMPT_FROM_STOPS);
 
         let mut thread = 0u32;
         // SAFETY: `thread` is a local word; `odd_writer` takes the handle as
@@ -730,7 +738,6 @@ impl OddPlatform for OddServices {
             )
         };
 
-        // A stop that ran before this store left the previous object behind.
         if thread != 0 {
             let previous = ODD_WRITER.thread.swap(thread, Ordering::AcqRel);
             if previous != 0 {
@@ -738,6 +745,10 @@ impl OddPlatform for OddServices {
                 // earlier start.
                 unsafe { xboxkrnl::ObDereferenceObject(previous) };
             }
+
+            // SAFETY: `thread` is the referenced, suspended thread object
+            // returned above and remains referenced in `ODD_WRITER`.
+            unsafe { xboxkrnl::KeResumeThread(thread as usize as *mut xboxkrnl::Kthread) };
         }
 
         created
@@ -759,8 +770,18 @@ impl OddPlatform for OddServices {
         let thread = ODD_WRITER.thread.swap(0, Ordering::AcqRel);
         if thread != 0 {
             // SAFETY: `thread` is the referenced object ExCreateThread returned.
-            unsafe { xboxkrnl::ObDereferenceObject(thread) };
+            unsafe {
+                xboxkrnl::KeWaitForSingleObject(
+                    thread as usize as *mut xboxkrnl::DispatcherObject,
+                    WaitReason::Executive,
+                    ProcessorMode::Kernel,
+                    false,
+                    core::ptr::null(),
+                );
+                xboxkrnl::ObDereferenceObject(thread);
+            }
         }
+        ODD_WRITER.joined.set();
     }
 }
 
@@ -794,6 +815,17 @@ pub(crate) fn initialize() {
         INPUT_FOCUS.store(address, Ordering::Relaxed);
     }
     nuicam::initialize();
+    HARDWARE_INITIALIZED.store(true, Ordering::Release);
+}
+
+/// Stop background hardware-domain work before the image unloads.
+pub(crate) fn shut_down() {
+    if !HARDWARE_INITIALIZED.swap(false, Ordering::AcqRel) {
+        return;
+    }
+
+    let _ = ODD_LOG.stop(&mut OddServices);
+    ODD_WRITER.joined.wait();
 }
 
 /// Monitor control 0x7a: current state of a virtual controller; the
@@ -1045,6 +1077,7 @@ fn odd_initialize() {
 
     ODD_WRITER.work.initialize();
     ODD_WRITER.finished.initialize_notification(true);
+    ODD_WRITER.joined.initialize_notification(true);
 
     let name = kernel::ansi_string(OPTICAL_DRIVE);
     let attributes = xboxkrnl::ObjectAttributes {

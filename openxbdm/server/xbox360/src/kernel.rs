@@ -2,9 +2,12 @@
 
 mod address;
 mod call;
+mod debug_memory;
 mod debug_output;
 mod loader;
 mod monitor;
+#[cfg(feature = "retail-dashlaunch")]
+mod retail;
 mod sync;
 
 use xbox360_sys::xboxkrnl::AnsiString;
@@ -21,6 +24,10 @@ pub use self::call::call_console;
 pub use self::call::call_export;
 pub(crate) use self::call::forward;
 pub use self::call::performance_frequency;
+pub use self::debug_memory::readable as debug_readable;
+pub use self::debug_memory::replace_code_word;
+pub use self::debug_memory::write_byte as write_debug_byte;
+pub use self::debug_memory::write_code_word;
 pub use self::debug_output::debug_print;
 pub use self::debug_output::debug_print_bytes;
 pub use self::loader::LoaderLock;
@@ -29,12 +36,19 @@ pub use self::monitor::RoutineVariable;
 pub use self::monitor::base_kernel_version;
 pub use self::monitor::data_imports_resolved;
 pub use self::monitor::debug_monitor_data;
+pub use self::monitor::debug_monitor_service;
 pub use self::monitor::hardware_info;
 pub use self::monitor::publish_debug_monitor_dispatcher;
 pub use self::monitor::published_debug_monitor_data;
 pub use self::monitor::register_debug_monitor;
 pub use self::monitor::routine_variable;
 pub use self::monitor::version_words;
+#[cfg(feature = "retail-dashlaunch")]
+pub use self::retail::adopt_module_list;
+#[cfg(feature = "retail-dashlaunch")]
+pub use self::retail::adopt_processes;
+#[cfg(feature = "retail-dashlaunch")]
+pub use self::retail::adopt_processors;
 pub use self::sync::CriticalSection;
 pub use self::sync::KernelEvent;
 

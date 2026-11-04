@@ -20,7 +20,6 @@ use xbox360_sys::xam::SockAddrIn;
 use xbox360_sys::xam::Socket;
 use xbox360_sys::xam::TimeVal;
 use xbox360_sys::xam::XnAddr;
-use xbox360_sys::xam::XnCaller;
 
 use crate::net;
 use crate::net::FdSetExt as _;
@@ -52,13 +51,13 @@ pub(crate) fn open_wake() -> Option<Socket> {
     // `non_blocking` are live locals of the stated sizes.
     let configured = unsafe {
         xam::NetDll_getsockname(
-            XnCaller::DebugMonitor,
+            crate::net::CALLER,
             socket,
             (&raw mut local).cast(),
             &mut length,
         ) != SOCKET_ERROR
             && xam::NetDll_ioctlsocket(
-                XnCaller::DebugMonitor,
+                crate::net::CALLER,
                 socket,
                 IoctlCommand::Fionbio,
                 &mut non_blocking,
@@ -71,7 +70,7 @@ pub(crate) fn open_wake() -> Option<Socket> {
 
     let mut debug = XnAddr::default();
     // SAFETY: the query stores one XNADDR.
-    unsafe { xam::NetDll_XNetGetDebugXnAddr(XnCaller::DebugMonitor, (&raw mut debug).cast()) };
+    unsafe { xam::NetDll_XNetGetDebugXnAddr(crate::net::CALLER, (&raw mut debug).cast()) };
 
     for address in [
         Ipv4Address([127, 0, 0, 1]),
@@ -143,7 +142,7 @@ pub(super) fn wake_server() {
         // stays open while `SENDERS` is nonzero.
         unsafe {
             xam::NetDll_sendto(
-                XnCaller::DebugMonitor,
+                crate::net::CALLER,
                 socket,
                 [0u8].as_ptr(),
                 1,

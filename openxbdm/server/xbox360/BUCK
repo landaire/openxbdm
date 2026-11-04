@@ -29,17 +29,25 @@ xbox360_executable_core(
         "default",
         "smb",
     ],
-    deps = [
-        "//openxbdm/core:openxbdm_core",
-        "//openxbdm/server:openxbdm_server",
-        "//third-party/rust:xbox360",
-        "//third-party/rust:xbox360-sys",
-    ],
+    deps = select({
+        "xbox360//platforms:target[xbox]": [
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "xbox360//src/crates/xbox360:xbox360",
+            "xbox360//src/crates/xbox360-sys:xbox360-sys",
+        ],
+        "DEFAULT": [
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:xbox360",
+            "//third-party/rust:xbox360-sys",
+        ],
+    }),
     link_script = "link.x",
 )
 
 xbox360_executable_core(
-    name = "openxbdm-server-xbox360-all-features-bin",
+    name = "openxbdm-server-xbox360-boot-guard-bin",
     srcs = glob(["Cargo.toml", "src/**"]),
     crate = "openxbdm_server_xbox360",
     crate_root = "src/main.rs",
@@ -50,14 +58,54 @@ xbox360_executable_core(
         "default",
         "smb",
     ],
-    deps = [
-        "//openxbdm/core:openxbdm_core",
-        "//openxbdm/server:openxbdm_server",
-        "//third-party/rust:xbox360",
-        "//third-party/rust:xbox360-sys",
-    ],
+    deps = select({
+        "xbox360//platforms:target[xbox]": [
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "xbox360//src/crates/xbox360:xbox360",
+            "xbox360//src/crates/xbox360-sys:xbox360-sys",
+        ],
+        "DEFAULT": [
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:xbox360",
+            "//third-party/rust:xbox360-sys",
+        ],
+    }),
     labels = [
-        "all-features",
+        "boot-guard",
     ],
     link_script = "link.x",
+)
+
+xbox360_executable_core(
+    name = "openxbdm-server-xbox360-retail-dashlaunch-bin",
+    srcs = glob(["Cargo.toml", "src/**"]),
+    crate = "openxbdm_server_xbox360",
+    crate_root = "src/main.rs",
+    edition = "2024",
+    env = ENV | {"CARGO_BIN_NAME": "openxbdm-server-xbox360"},
+    features = [
+        "default",
+        "retail-dashlaunch",
+        "smb",
+    ],
+    deps = select({
+        "xbox360//platforms:target[xbox]": [
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "xbox360//src/crates/xbox360:xbox360",
+            "xbox360//src/crates/xbox360-sys:xbox360-sys",
+        ],
+        "DEFAULT": [
+            "//openxbdm/core:openxbdm_core",
+            "//openxbdm/server:openxbdm_server",
+            "//third-party/rust:xbox360",
+            "//third-party/rust:xbox360-sys",
+        ],
+    }),
+    labels = [
+        "retail-dashlaunch",
+    ],
+    link_script = "link-retail-dashlaunch.x",
 )

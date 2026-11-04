@@ -1,6 +1,6 @@
 load("@xbox360//buck:rust.bzl", "release_tool", "rust_release")
 load("@xbox360//buck:toolchains.bzl", "xbox360_toolchains")
-load("@xbox360//buck:profiles.bzl", "profile_rustc_binary_flags", "profile_rustc_flags", "profile_xbox360_rustc_flags")
+load("@xbox360//buck:profiles.bzl", "profile_rustc_binary_flags", "profile_rustc_flags")
 load(":rustfmt_release.bzl", "RUSTFMT_HOSTS")
 
 xbox360_toolchains(
@@ -17,7 +17,10 @@ xbox360_toolchains(
     # running title, so it is built for size in every profile, with panics
     # that trap without formatting a message. `xbox360_executable_core`
     # compiles it as one fat LTO module.
-    xbox360_rustc_flags = ["-Cpanic=immediate-abort"] + profile_xbox360_rustc_flags(),
+    xbox360_rustc_flags = [
+        "-Cpanic=immediate-abort",
+        "-Copt-level=z",
+    ],
 )
 
 # The prelude validates both branches of its C++ default-dependency selector.

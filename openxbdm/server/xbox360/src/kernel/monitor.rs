@@ -5,6 +5,7 @@ use core::sync::atomic::Ordering;
 use xbox360::console::KernelVersion;
 use xbox360_sys::xboxkrnl::DebugMonitorData;
 use xbox360_sys::xboxkrnl::DebugMonitorService;
+#[cfg(not(feature = "retail-dashlaunch"))]
 use xbox360_sys::xboxkrnl::ExDebugMonitorService;
 use xbox360_sys::xboxkrnl::ExLoadedImageName;
 use xbox360_sys::xboxkrnl::ExThreadObjectType;
@@ -13,6 +14,7 @@ use xbox360_sys::xboxkrnl::IoDeviceObjectType;
 use xbox360_sys::xboxkrnl::KeDebugMonitorData;
 use xbox360_sys::xboxkrnl::KeTimeStampBundle;
 use xbox360_sys::xboxkrnl::KernelU32;
+use xbox360_sys::xboxkrnl::NtStatus;
 use xbox360_sys::xboxkrnl::XboxHardwareInfo;
 use xbox360_sys::xboxkrnl::XboxKrnlBaseVersion;
 use xbox360_sys::xboxkrnl::XexExecutableModuleHandle;
@@ -35,16 +37,17 @@ pub enum RoutineVariable {
 
 /// Register `module` as the debug monitor and keep the debug monitor data.
 /// Fails when either service fails, as stock module initialization does.
+#[cfg(not(feature = "retail-dashlaunch"))]
 pub fn register_debug_monitor(module: u32) -> bool {
     // SAFETY: the register service takes the module handle as a scalar.
-    if !unsafe { ExDebugMonitorService(DebugMonitorService::Register, module, 0, 0) }.is_success() {
+    if !unsafe { debug_monitor_service(DebugMonitorService::Register, module, 0, 0) }.is_success() {
         return false;
     }
 
     // SAFETY: the service fills the 0x68-byte block, whose fields are
     // atomics, before any other thread reads it.
     unsafe {
-        ExDebugMonitorService(
+        debug_monitor_service(
             DebugMonitorService::Query,
             core::ptr::from_ref(&DEBUG_MONITOR_DATA).expose_provenance() as u32,
             0,
@@ -52,6 +55,40 @@ pub fn register_debug_monitor(module: u32) -> bool {
         )
     }
     .is_success()
+}
+
+/// Build the subset of debug monitor data available on supported retail kernels.
+#[cfg(feature = "retail-dashlaunch")]
+pub fn register_debug_monitor(_module: u32) -> bool {
+    super::retail::supported_kernel()
+        && crate::dashlaunch::debug_routine_variable().is_some()
+        && super::adopt_module_list()
+        && super::adopt_processes()
+        && super::adopt_processors()
+}
+
+/// Call a devkit debug monitor service, or report it unavailable on retail.
+///
+/// # Safety
+///
+/// Pointer-valued arguments must meet the selected service's contract.
+pub unsafe fn debug_monitor_service(
+    service: DebugMonitorService,
+    first: u32,
+    second: u32,
+    third: u32,
+) -> NtStatus {
+    #[cfg(not(feature = "retail-dashlaunch"))]
+    {
+        // SAFETY: the caller supplies the service-specific arguments.
+        unsafe { ExDebugMonitorService(service, first, second, third) }
+    }
+
+    #[cfg(feature = "retail-dashlaunch")]
+    {
+        // SAFETY: the caller supplies the service-specific arguments.
+        unsafe { super::retail::debug_monitor_service(service, first, second, third) }
+    }
 }
 
 /// Debug monitor data stored by [`register_debug_monitor`].
@@ -80,11 +117,9 @@ pub unsafe fn publish_debug_monitor_dispatcher(dispatcher: u32) {
     // SAFETY: `data_imports_resolved` held at module load. The block is a
     // static that lives as long as the module, and its routine fields hold
     // the kernel's values or this module's entries.
-    unsafe {
-        KeDebugMonitorData
-            .get_unchecked()
-            .store(block, Ordering::Relaxed)
-    };
+    let slot = unsafe { KeDebugMonitorData.get_unchecked() };
+    // SAFETY: the published block satisfies the kernel's lifetime and field contracts.
+    unsafe { slot.store(block, Ordering::Release) };
 }
 
 /// Whether the loader resolved every data import that the module reads

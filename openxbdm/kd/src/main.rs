@@ -75,7 +75,7 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:2159")]
         listen: SocketAddr,
         /// Register width to describe. Use `32` with GDB and an ELF
-        /// compiled as 32-bit PowerPC, such as a rust-xbox360 title.
+        /// compiled as 32-bit PowerPC, such as a xenon-forge title.
         #[arg(long, value_enum, default_value = "64")]
         registers: commands::RegisterWidth,
         /// Stop the console at the load of this image (for example

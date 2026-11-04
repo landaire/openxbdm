@@ -26,9 +26,14 @@ rust_library(
     edition = "2024",
     env = ENV,
     features = [],
-    deps = [
-        "//third-party/rust:xbox360-sys",
-    ],
+    deps = select({
+        "xbox360//platforms:target[xbox]": [
+            "xbox360//src/crates/xbox360-sys:xbox360-sys",
+        ],
+        "DEFAULT": [
+            "//third-party/rust:xbox360-sys",
+        ],
+    }),
     doctests = False,
 )
 
@@ -43,7 +48,12 @@ rust_test(
     run_env = {
         "CARGO_MANIFEST_DIR": "openxbdm/core",
     },
-    deps = [
-        "//third-party/rust:xbox360-sys",
-    ],
+    deps = select({
+        "xbox360//platforms:target[xbox]": [
+            "xbox360//src/crates/xbox360-sys:xbox360-sys",
+        ],
+        "DEFAULT": [
+            "//third-party/rust:xbox360-sys",
+        ],
+    }),
 )

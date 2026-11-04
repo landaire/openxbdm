@@ -1,0 +1,17 @@
+# XEX metadata for the DashLaunch retail plugin. The address must match
+# link-retail-dashlaunch.x and avoid launch.xex at 0x91f00000.
+load_address = 0x91500000
+version = "2.0.21256.0"
+base_version = "2.0.21256.0"
+image_flags = ["SMALL_PAGES"]
+module_flags = ["EXPORTS_TO_TITLE", "SYSTEM_DEBUGGER", "DLL"]
+compress = true
+encrypt = "retail"
+
+[imports]
+version = "2.0.21256.0"
+min_version = "2.0.1861.0"
+
+[exports]
+module = "xbdm.xex"
+min_version = "2.0.1861.0"

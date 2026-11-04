@@ -9,6 +9,7 @@ use xbox360_sys::xboxkrnl::Handle;
 use xbox360_sys::xboxkrnl::ThreadCreationFlags;
 
 use crate::kernel;
+#[cfg(not(feature = "retail-dashlaunch"))]
 use crate::override_module::remove_override_module;
 use crate::serve::run_server;
 
@@ -79,6 +80,7 @@ pub(crate) extern "C" fn server_thread(_context: u32) -> u32 {
     crate::backend::debugger::set_server_thread();
     crate::backend::dispatcher::create_host();
 
+    #[cfg(not(feature = "retail-dashlaunch"))]
     remove_override_module();
     if !shutting_down() {
         run_server();

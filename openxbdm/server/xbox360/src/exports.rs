@@ -29,7 +29,7 @@ pub(crate) static RECOVERY: core::sync::atomic::AtomicU32 = core::sync::atomic::
 const RECOVERY_RESULT: u32 = Hresult::FAIL.0;
 
 /// `xbox360_sys::entry_bridge` for exports and callbacks: refuses every
-/// call during the recovery. The module entry point keeps the unchecked bridge.
+/// call during recovery. The module entry point keeps the unchecked bridge.
 #[cfg(feature = "boot-guard")]
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn export_bridge() {

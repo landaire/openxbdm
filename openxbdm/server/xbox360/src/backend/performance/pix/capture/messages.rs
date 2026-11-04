@@ -19,6 +19,9 @@ use xbox360::thread::current_object;
 use xbox360::time::TickCount;
 use xbox360::time::Timebase;
 use xbox360_sys::status::Hresult;
+use xbox360_sys::xam::UserIndex;
+use xbox360_sys::xam::Vibration;
+use xbox360_sys::xam::XamInputSetState;
 use xbox360_sys::xboxkrnl;
 use xbox360_sys::xboxkrnl::Handle;
 use xbox360_sys::xboxkrnl::XAudioRegisterRenderDriverClient;
@@ -1112,9 +1115,12 @@ fn call_kernel_routine(routine: u32, client: u32, enable: bool) {
 /// motor speeds; its capability query only decides whether to swap the
 /// two speeds).
 fn stop_vibration(port: u32) {
-    let vibration = [0u16; 2];
+    let Some(user) = u8::try_from(port).ok().and_then(UserIndex::from_slot) else {
+        return;
+    };
+    let vibration = Vibration::default();
     // SAFETY: `vibration` is live for the synchronous call.
-    unsafe { XamInputSetState(port, 0, vibration.as_ptr(), 0, 0, 0) };
+    unsafe { XamInputSetState(user, 0, &vibration) };
 }
 
 /// Title end part (stock 0x91f62100, from the title terminate routine):
@@ -1216,19 +1222,3 @@ pub(super) unsafe fn configure(argument: u32) -> u32 {
 
     1
 }
-
-// Xenia names xam 0x190 XamInputGetCapabilities; the ordinal follows the
-// stock import.
-xbox360_sys::import_thunk!(
-    #[allow(non_snake_case)]
-    XamInputSetState(
-        user: u32,
-        flags: u32,
-        vibration: *const u16,
-        overlapped: u32,
-        completion: u32,
-        context: u32,
-    ) -> u32,
-    lib = xbox360_sys::lib_index::XAM,
-    ordinal = 0x190
-);

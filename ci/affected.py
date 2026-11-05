@@ -115,6 +115,7 @@ def target_hashes(root: Path) -> list[Target] | None:
             "doctests": target.get("doctests", False),
         }
         for target in targets
+        if "buck.target_hash" in target
     ]
 
 

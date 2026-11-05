@@ -199,9 +199,9 @@ and tests `-Clto=thin`, so the FFI libraries are built without LTO.
 `build_defs/package_module.py` copies out the console module builds.
 `.github/workflows/release.yml` publishes a release for a `vX.Y.Z` tag
 that names the workspace version. `.github/workflows/nightly.yml`
-publishes an immutable `nightly-<commit>` pre-release and updates the
-`nightly` alias each day the default branch has changed.
-`build_defs/release_notes.py` writes the notes of both.
+publishes an immutable `nightly-<commit>` pre-release when the default
+branch commit has not been published already. `build_defs/release_notes.py`
+writes the notes of both.
 
 ## Xbox 360 module
 

@@ -16,7 +16,7 @@ Clean-room Rust reimplementation of the Xbox 360 [XBDM][xbdm] (Xbox Debug Monito
 
 ## Releases
 
-Nightly releases will be built iff there have been changes since last nightly.
+Nightly releases use immutable `nightly-<commit>` tags and are built only when the default branch commit has not been published already.
 
 Release artifacts:
 

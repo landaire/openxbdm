@@ -12,10 +12,8 @@ concurrency:
   group: nightly
   cancel-in-progress: false
 
-# Publishes the archives of the default branch under an immutable
-# `nightly-<commit>` pre-release and updates the `nightly` pre-release alias
-# when the branch has moved. Consumers can pin the immutable tag and archive
-# checksum; the alias keeps a stable URL for people who want the latest build.
+# Publishes the default branch under an immutable `nightly-<commit>`
+# pre-release when that commit has not been published already.
 
 jobs:
   check:
@@ -37,11 +35,8 @@ jobs:
           echo "head=$head" >> "$GITHUB_OUTPUT"
           immutable="nightly-${head:0:12}"
           echo "immutable=$immutable" >> "$GITHUB_OUTPUT"
-          # A missing tag means there is no nightly alias yet. The immutable
-          # release check also migrates nightlies published by the old workflow.
-          published=$(gh api "repos/$GH_REPO/git/ref/tags/nightly" --jq .object.sha 2>/dev/null || true)
-          if [ "$published" = "$head" ] && gh release view "$immutable" >/dev/null 2>&1; then
-            echo "The nightly releases already have $head."
+          if gh release view "$immutable" >/dev/null 2>&1; then
+            echo "The immutable nightly already exists for $head."
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -69,7 +64,7 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Publish the immutable nightly and update the nightly alias
+      - name: Publish the immutable nightly
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -86,16 +81,3 @@ jobs:
               --title "Nightly $date ($HEAD)" \
               --notes-file "$RUNNER_TEMP/notes.md"
           fi
-
-          if gh release view nightly >/dev/null 2>&1; then
-            gh release delete nightly --yes
-          fi
-          # `gh release create` reuses an existing tag and ignores --target.
-          if gh api "repos/$GH_REPO/git/ref/tags/nightly" >/dev/null 2>&1; then
-            gh api -X DELETE "repos/$GH_REPO/git/refs/tags/nightly"
-          fi
-          gh release create nightly dist/* \
-            --prerelease \
-            --target "$HEAD" \
-            --title "Nightly $date" \
-            --notes-file "$RUNNER_TEMP/notes.md"

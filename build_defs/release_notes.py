@@ -68,7 +68,7 @@ Targets: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`,
 `x86_64-pc-windows-msvc`.
 """
 
-NIGHTLY = " Nightly builds are not versioned releases; each one replaces the previous."
+NIGHTLY = " This nightly is pinned to the commit above."
 
 
 def main():

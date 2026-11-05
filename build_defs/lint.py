@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Checks formatting and clippy diagnostics of the workspace crates.
 
-Usage: build_defs/lint.py [--buck2 PATH] [--format]
+Usage: build_defs/lint.py [--buck2 PATH] [--format] [--targets TARGET ...]
 
 Runs from the repository root. Both checks go through Buck2: rustfmt
 through `toolchains//:rustfmt`, the pinned nightly rustfmt, and clippy
@@ -32,22 +32,49 @@ def buck2(buck2_path, *args):
     return subprocess.run([buck2_path, *args], cwd=ROOT, check=True, stdout=subprocess.PIPE, text=True).stdout
 
 
-def rust_sources():
+def rust_sources(targets):
     # Not through git: jj workspaces other than the default one have no .git.
-    return sorted(path.relative_to(ROOT).as_posix() for path in (ROOT / "openxbdm").rglob("*.rs"))
+    if not targets or any(target.endswith("/...") for target in targets):
+        roots = [ROOT / "openxbdm"]
+    else:
+        roots = {
+            ROOT / target.split(":", 1)[0].removeprefix("root//")
+            for target in targets
+            if target.startswith("root//openxbdm/")
+        }
+    return sorted(
+        path.relative_to(ROOT).as_posix()
+        for source_root in roots
+        for path in source_root.rglob("*.rs")
+    )
 
 
-def run_rustfmt(buck2_path, check):
+def run_rustfmt(buck2_path, check, targets):
     arguments = ["--check"] if check else []
     result = subprocess.run(
-        [buck2_path, "run", "toolchains//:rustfmt", "--", *arguments, "--edition", "2024", *rust_sources()],
+        [
+            buck2_path,
+            "run",
+            "toolchains//:rustfmt",
+            "--",
+            *arguments,
+            "--edition",
+            "2024",
+            *rust_sources(targets),
+        ],
         cwd=ROOT,
     )
     return result.returncode == 0
 
 
-def check_clippy(buck2_path):
-    targets = buck2(buck2_path, "uquery", WORKSPACE_TARGETS).split()
+def check_clippy(buck2_path, targets):
+    if targets:
+        query = 'kind("^rust_(library|binary|test)$", %Ss)'
+        query_args = targets
+    else:
+        query = WORKSPACE_TARGETS
+        query_args = []
+    targets = buck2(buck2_path, "uquery", query, *query_args).split()
     outputs = buck2(
         buck2_path,
         "build",
@@ -77,12 +104,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--buck2", default=str(BUCK2), help="the buck2 executable (default: bin/buck2)")
     parser.add_argument("--format", action="store_true", help="rewrite the files with rustfmt instead of checking")
+    parser.add_argument("--targets", nargs="*", help="Buck target labels to check (default: the workspace)")
     args = parser.parse_args()
 
     if args.format:
-        return 0 if run_rustfmt(args.buck2, check=False) else 1
-    format_ok = run_rustfmt(args.buck2, check=True)
-    clippy_ok = check_clippy(args.buck2)
+        return 0 if run_rustfmt(args.buck2, check=False, targets=args.targets) else 1
+    format_ok = run_rustfmt(args.buck2, check=True, targets=args.targets)
+    clippy_ok = check_clippy(args.buck2, args.targets)
     return 0 if format_ok and clippy_ok else 1
 
 

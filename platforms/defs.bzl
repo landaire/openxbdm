@@ -12,6 +12,9 @@ def _cached_execution_platform_impl(ctx: AnalysisContext) -> list[Provider]:
     constraints = dict()
     constraints.update(ctx.attrs.cpu_configuration[ConfigurationInfo].constraints)
     constraints.update(ctx.attrs.os_configuration[ConfigurationInfo].constraints)
+    for value in ctx.attrs.constraint_values:
+        info = value[ConstraintValueInfo]
+        constraints[info.setting.label] = info
     configuration = ConfigurationInfo(constraints = constraints, values = {})
 
     platform = ExecutionPlatformInfo(
@@ -39,6 +42,7 @@ def _cached_execution_platform_impl(ctx: AnalysisContext) -> list[Provider]:
 cached_execution_platform = rule(
     impl = _cached_execution_platform_impl,
     attrs = {
+        "constraint_values": attrs.list(attrs.dep(providers = [ConstraintValueInfo])),
         "cpu_configuration": attrs.dep(providers = [ConfigurationInfo]),
         "os_configuration": attrs.dep(providers = [ConfigurationInfo]),
         "use_windows_path_separators": attrs.bool(default = False),

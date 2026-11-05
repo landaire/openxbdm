@@ -13,5 +13,5 @@ in
   enterShell = developmentEnvironment.enterShell;
 
   # bazel-remote serves the Buck2 action cache in CI.
-  profiles.ci.module.packages = [ pkgs.bazel-remote ];
+  profiles.ci.module.packages = developmentEnvironment.packages ++ [ pkgs.bazel-remote ];
 }

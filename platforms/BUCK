@@ -1,10 +1,29 @@
 load("@prelude//platforms:defs.bzl", "host_configuration")
+load("@xbox360//buck:platforms.bzl", "execution_platforms")
 load(":defs.bzl", "cached_execution_platform")
 
 cached_execution_platform(
-    name = "cached",
+    name = "cached-host",
+    constraint_values = [],
     cpu_configuration = host_configuration.cpu,
     os_configuration = host_configuration.os,
     use_windows_path_separators = host_info().os.is_windows,
+)
+
+cached_execution_platform(
+    name = "cached-ppc64",
+    constraint_values = ["xbox360//platforms:codegen[ppc64-ilp32]"],
+    cpu_configuration = host_configuration.cpu,
+    os_configuration = host_configuration.os,
+    use_windows_path_separators = host_info().os.is_windows,
+)
+
+execution_platforms(
+    name = "cached",
+    platforms = [
+        ":cached-host",
+        ":cached-ppc64",
+        "rustc_bootstrap//platforms:execution",
+    ],
     visibility = ["PUBLIC"],
 )

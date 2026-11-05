@@ -4,11 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  # A manual run checks everything.
+  workflow_dispatch:
 
-# Buck2 builds, tests and lints everything on every platform: the host
-# crates with their examples and `-all-features` variants, the C++ headers
-# of the FFI crate, and the console module (xbox360/BUCK). Cargo only
-# resolves the workspace for reindeer and build_defs/update_buck_files.py.
+# Each platform builds and tests only the first-party targets whose code or
+# dependencies differ from the last successful run on main (ci/affected.py).
+# Changes to build configuration, toolchains, or the checks run everything.
 #
 # Every platform runs Buck2 through bin/buck2, which fetches the release
 # that toolchains/buck2 pins with DotSlash. On Linux and macOS, the devenv
@@ -19,8 +20,10 @@ on:
 # Nix nor a bazel-remote build, so it runs bootstrap.ps1 and builds without
 # the action cache.
 
-env:
-  TARGETS: "//: //bindings/... //openxbdm/... //xbox360/..."
+permissions:
+  contents: read
+  # Finding the last successful run on main.
+  actions: read
 
 jobs:
   unix:
@@ -73,8 +76,23 @@ jobs:
       - name: Start the action cache
         run: devenv --profile ci shell -- ci/start-action-cache.sh "$ACTION_CACHE_DIR"
 
+      - name: Select the affected targets
+        id: affected
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            devenv --profile ci shell -- python3 ci/affected.py select --full \
+              --out "$RUNNER_TEMP/openxbdm-affected.json" --github-output "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          base=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?branch=main&status=success&per_page=1" \
+            --jq '.workflow_runs[0].head_sha // ""') || base=""
+          devenv --profile ci shell -- python3 ci/affected.py select --base "$base" \
+            --out "$RUNNER_TEMP/openxbdm-affected.json" --github-output "$GITHUB_OUTPUT"
+
       - name: Check the generated files
-        if: matrix.checks
+        if: matrix.checks && steps.affected.outputs.generated == 'true'
         run: |
           devenv --profile ci shell -- python3 toolchains/update_rustfmt_release.py --check
           devenv --profile ci shell -- python3 build_defs/update_buck_files.py
@@ -82,19 +100,21 @@ jobs:
           test -z "$(git status --porcelain)"
 
       - name: Build
-        run: devenv --profile ci shell -- buck2 build -m ppc64-ilp32 $TARGETS
+        if: steps.affected.outputs.build == 'true'
+        run: devenv --profile ci shell -- python3 ci/affected.py run --selection "$RUNNER_TEMP/openxbdm-affected.json" --field build -- bin/buck2 build -m ppc64-ilp32
 
       - name: Test
-        run: devenv --profile ci shell -- buck2 test -m ppc64-ilp32 $TARGETS
+        if: steps.affected.outputs.tests == 'true'
+        run: devenv --profile ci shell -- python3 ci/affected.py run --selection "$RUNNER_TEMP/openxbdm-affected.json" --field tests -- bin/buck2 test -m ppc64-ilp32
 
       - name: Check formatting and clippy diagnostics
-        if: matrix.checks
-        run: devenv --profile ci shell -- python3 build_defs/lint.py
+        if: matrix.checks && steps.affected.outputs.lint == 'true'
+        run: devenv --profile ci shell -- python3 ci/affected.py run --selection "$RUNNER_TEMP/openxbdm-affected.json" --field lint -- python3 build_defs/lint.py --targets
 
       - name: Stop the action cache
         if: always()
         run: |
-          devenv --profile ci shell -- buck2 kill
+          devenv --profile ci shell -- bin/buck2 kill
           if [ -f "$ACTION_CACHE_DIR.pid" ]; then kill "$(cat "$ACTION_CACHE_DIR.pid")"; fi
 
       - name: Save the Buck2 action cache
@@ -121,10 +141,29 @@ jobs:
           ./bootstrap.ps1
           Add-Content -Path $env:GITHUB_PATH -Value C:\a\bin
 
-      - name: Build
+      - name: Select the affected targets
+        id: affected
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         working-directory: C:\a
-        run: buck2 build -m ppc64-ilp32 $env:TARGETS.Split(" ")
+        run: |
+          if ($env:GITHUB_EVENT_NAME -eq "workflow_dispatch") {
+            python ci/affected.py select --full --out "$env:RUNNER_TEMP\openxbdm-affected.json" --github-output $env:GITHUB_OUTPUT
+            exit $LASTEXITCODE
+          }
+          $base = gh api "repos/$env:GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?branch=main&status=success&per_page=1" --jq '.workflow_runs[0].head_sha // ""' 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            $base = ""
+          }
+          python ci/affected.py select --base "$base" --out "$env:RUNNER_TEMP\openxbdm-affected.json" --github-output $env:GITHUB_OUTPUT
+
+      - name: Build
+        if: steps.affected.outputs.build == 'true'
+        working-directory: C:\a
+        run: python ci/affected.py run --selection "$env:RUNNER_TEMP\openxbdm-affected.json" --field build -- buck2 build -m ppc64-ilp32
 
       - name: Test
+        if: steps.affected.outputs.tests == 'true'
         working-directory: C:\a
-        run: buck2 test -m ppc64-ilp32 $env:TARGETS.Split(" ")
+        run: python ci/affected.py run --selection "$env:RUNNER_TEMP\openxbdm-affected.json" --field tests -- buck2 test -m ppc64-ilp32

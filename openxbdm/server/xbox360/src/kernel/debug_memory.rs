@@ -5,6 +5,7 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
 use openxbdm_server::commands::memory::is_device_address;
+use xbox360::memory::synchronize_executable;
 use xbox360_sys::xboxkrnl;
 
 #[cfg(not(feature = "retail-dashlaunch"))]
@@ -89,10 +90,10 @@ pub fn write_byte(address: u32, value: u8) -> bool {
         return false;
     };
 
-    // SAFETY: the mapping is writable for this byte and remains live through the cache sweep.
+    // SAFETY: the writable mapping stays live through synchronization.
     unsafe {
         AtomicU8::from_ptr(mapping.byte()).store(value, Ordering::Relaxed);
-        xboxkrnl::KeSweepIcacheRange(mapping.byte(), 1);
+        synchronize_executable(mapping.byte(), 1);
     }
 
     true
@@ -106,8 +107,8 @@ pub fn replace_code_word(address: u32, value: u32) -> Option<u32> {
     let word = unsafe { AtomicU32::from_ptr(mapping.word()) };
     let previous = word.load(Ordering::Relaxed);
     word.store(value, Ordering::Relaxed);
-    // SAFETY: the mapped word remains live through this call.
-    unsafe { xboxkrnl::KeSweepIcacheRange(mapping.byte(), INSTRUCTION_SIZE) };
+    // SAFETY: the mapped word remains live through synchronization.
+    unsafe { synchronize_executable(mapping.byte(), INSTRUCTION_SIZE) };
 
     Some(previous)
 }
@@ -118,10 +119,10 @@ pub fn write_code_word(address: u32, value: u32) -> bool {
         return false;
     };
 
-    // SAFETY: the mapping is writable for this aligned word and remains live through the cache sweep.
+    // SAFETY: the writable mapping stays live through synchronization.
     unsafe {
         AtomicU32::from_ptr(mapping.word()).store(value, Ordering::Relaxed);
-        xboxkrnl::KeSweepIcacheRange(mapping.byte(), INSTRUCTION_SIZE);
+        synchronize_executable(mapping.byte(), INSTRUCTION_SIZE);
     }
 
     true

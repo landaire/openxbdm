@@ -15,7 +15,7 @@ Other retail kernel builds are not inferred. Module-list discovery rejects an un
 
 The retail kernel exports `ExDebugMonitorService`, but its implementation returns `STATUS_INVALID_SYSTEM_SERVICE` for every service. The retail build implements the services whose underlying kernel state still exists and leaves devkit-only mechanisms unavailable.
 
-The retail kernel also lacks the devkit `MmDbgReadCheck`, `MmDbgWriteCheck`, and `MmDbgReleaseAddress` behavior used to modify executable text. The retail build validates addresses with `MmIsAddressValid`, rejects device ranges, and writes through the kernel mapping supplied by the patched console. It then calls `KeSweepIcacheRange`. The reconstructed kernel 17559 routine applies `dcbst` and `icbi` to each 128-byte cache line, followed by `sync` and `isync`, so it writes back the data cache and invalidates the instruction cache. The devkit build retains the `MmDbg*` path.
+The retail kernel also lacks the devkit `MmDbgReadCheck`, `MmDbgWriteCheck`, and `MmDbgReleaseAddress` behavior used to modify executable text. The retail build validates addresses with `MmIsAddressValid`, rejects device ranges, and writes through the kernel mapping supplied by the patched console. It calls `KeFlushCacheRange` to write back the data cache, then `KeSweepIcacheRange` to invalidate the instruction cache. The devkit build retains the `MmDbg*` path and uses the same cache synchronization after the mapped write.
 
 Debug monitor registration is reconstructed from verified kernel and DashLaunch state:
 
@@ -52,4 +52,4 @@ The `DebugMonitor` XAM network caller is not initialized on retail. The retail b
 
 ## Image layout
 
-`launch.xex` occupies the devkit module range at `0x91f00000` on retail. The retail image and linker script use `0x91500000`, a verified free range between resident system modules. The manifest uses retail encryption and has no devkit bounding path.
+`launch.xex` occupies the devkit module range at `0x91f00000` on retail. The retail image uses `0x91500000`, a verified free range between resident system modules. Its manifest selects that address, retail encryption, and no devkit bounding path.

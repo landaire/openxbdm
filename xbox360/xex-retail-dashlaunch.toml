@@ -1,5 +1,5 @@
-# XEX metadata for the DashLaunch retail plugin. The address must match
-# link-retail-dashlaunch.x and avoid launch.xex at 0x91f00000.
+# XEX metadata for the DashLaunch retail plugin. Its address avoids
+# launch.xex at 0x91f00000.
 load_address = 0x91500000
 version = "2.0.21256.0"
 base_version = "2.0.21256.0"

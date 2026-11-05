@@ -43,7 +43,7 @@ xbox360_executable_core(
             "//third-party/rust:xbox360-sys",
         ],
     }),
-    link_script = "link.x",
+    manifest = "//xbox360:xex.toml",
 )
 
 xbox360_executable_core(
@@ -75,7 +75,7 @@ xbox360_executable_core(
     labels = [
         "boot-guard",
     ],
-    link_script = "link.x",
+    manifest = "//xbox360:xex.toml",
 )
 
 xbox360_executable_core(
@@ -107,5 +107,5 @@ xbox360_executable_core(
     labels = [
         "retail-dashlaunch",
     ],
-    link_script = "link-retail-dashlaunch.x",
+    manifest = "//xbox360:xex-retail-dashlaunch.toml",
 )

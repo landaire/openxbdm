@@ -4,6 +4,7 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
+use core::time::Duration;
 
 use openxbdm_server::Platform;
 use openxbdm_server::Server;
@@ -64,10 +65,9 @@ unsafe fn local() -> &'static mut Local {
 
 /// When a failed listen is tried again.
 fn retry_time(console: &mut Console) -> FileTime {
-    /// Delay before a failed listen is tried again (5 s).
-    const LISTEN_RETRY: u64 = 5 * 10_000_000;
+    const LISTEN_RETRY: Duration = Duration::from_secs(5);
 
-    FileTime::from_intervals(console.system_time().wrapping_add(LISTEN_RETRY))
+    FileTime::from_intervals(console.system_time()).wrapping_add(LISTEN_RETRY)
 }
 
 /// Start the service and listen on its port. Without a listener the

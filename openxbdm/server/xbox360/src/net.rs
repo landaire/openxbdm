@@ -390,13 +390,12 @@ pub fn listen(port: u16, backlog: i32) -> Result<Socket, NetError> {
     Ok(socket)
 }
 
-/// Disable the retail secure-channel requirement for a listening socket.
+/// Disable the retail secure-channel requirement for a socket.
 pub fn mark_insecure(
     #[cfg_attr(not(feature = "retail-dashlaunch"), allow(unused))] socket: Socket,
 ) {
     #[cfg(feature = "retail-dashlaunch")]
     {
-        const SO_DECRYPTSOCK: SocketOption = SocketOption(0x5801);
         let enable = 1u32.to_be_bytes();
         // SAFETY: the caller owns `socket`; `enable` is a live four-byte local.
         unsafe {
@@ -404,7 +403,7 @@ pub fn mark_insecure(
                 CALLER,
                 socket,
                 SocketLevel::Socket,
-                SO_DECRYPTSOCK,
+                SocketOption::SO_INSECURE,
                 enable.as_ptr(),
                 enable.len() as i32,
             )

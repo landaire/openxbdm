@@ -239,8 +239,9 @@ monitor's result codes and reply texts are its `XbdmHresult` trait,
 
 Each import record is in a section `.xthunks.<path>` and each data
 import slot in a section `.xvars.<path>`, so `--gc-sections` removes the
-ones nothing uses. `link.x` collects them with `*(.xthunks .xthunks.*)`
-and `*(.xvars .xvars.*)`.
+ones nothing uses. The linker script generated from the XEX manifest
+collects them with `*(.xthunks .xthunks.*)` and
+`*(.xvars .xvars.*)`.
 
 Console crates are built for size (`toolchains/BUCK`): `-Copt-level=z`,
 one code generation unit, and `-Cpanic=immediate-abort`.
@@ -390,10 +391,10 @@ which writes:
   `cdylib` crate type gets Cargo's shared library name.
 
 A crate built for the Xbox 360 has a `[package.metadata.buck2.xbox360]`
-table that names its linker script (`link_script`). It may have only
-binaries, which become `xbox360_executable_core` rules
-(`@xbox360//buck:xex.bzl`) without tests. Build scripts of workspace
-crates are not supported.
+table that names its XEX manifest (`manifest`). It may have only binaries,
+which become `xbox360_executable_core` rules (`@xbox360//buck:xex.bzl`)
+without tests. The rule derives its linker script from the manifest.
+Build scripts of workspace crates are not supported.
 
 The other build files are written by hand: `BUCK` (the Rust release
 check), `bindings/BUCK` (the C++ headers), `xbox360/BUCK` (the console

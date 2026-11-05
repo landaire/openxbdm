@@ -54,9 +54,6 @@ const CDROM_CHANNELS: &[CdromChannel] = &[CdromChannel {
     start_next_packet: 0x8009_df88,
 }];
 
-const STATUS_INVALID_PARAMETER: NtStatus = NtStatus(0xc000_000d);
-const STATUS_INVALID_SYSTEM_SERVICE: NtStatus = NtStatus(0xc000_001c);
-const STATUS_SUCCESS: NtStatus = NtStatus(0);
 const RETAIL_PHYSICAL_PAGE_THRESHOLD: u32 = 0x2_0000;
 
 /// Whether the running kernel is the retail build whose state is reconstructed here.
@@ -136,7 +133,7 @@ pub fn adopt_module_list() -> bool {
 /// Fill the debug-adjusted statistics service from the retail memory manager.
 unsafe fn memory_statistics(address: u32) -> NtStatus {
     if address == 0 {
-        return STATUS_INVALID_PARAMETER;
+        return NtStatus::INVALID_PARAMETER;
     }
     let words = core::ptr::with_exposed_provenance::<u32>(address as usize);
     // SAFETY: the service contract requires both length words to be readable.
@@ -145,7 +142,7 @@ unsafe fn memory_statistics(address: u32) -> NtStatus {
     if length < size_of::<DebugMemoryStatistics>() as u32
         || statistics_length < size_of::<MmStatistics>() as u32
     {
-        return STATUS_INVALID_PARAMETER;
+        return NtStatus::INVALID_PARAMETER;
     }
 
     let mut reply = DebugMemoryStatistics::new();
@@ -161,22 +158,22 @@ unsafe fn memory_statistics(address: u32) -> NtStatus {
         core::ptr::with_exposed_provenance_mut::<DebugMemoryStatistics>(address as usize)
             .write_unaligned(reply)
     };
-    STATUS_SUCCESS
+    NtStatus::SUCCESS
 }
 
 /// Return the retail SATA channel state reconstructed for the running kernel.
 unsafe fn cdrom_channel(version: u32, length: u32, address: u32) -> NtStatus {
     if version != 1 || length < size_of::<CdromChannelInformation>() as u32 || address == 0 {
-        return STATUS_INVALID_PARAMETER;
+        return NtStatus::INVALID_PARAMETER;
     }
     if !supported_kernel() {
-        return STATUS_INVALID_SYSTEM_SERVICE;
+        return NtStatus::INVALID_SYSTEM_SERVICE;
     }
     let Some(channel) = CDROM_CHANNELS
         .iter()
         .find(|channel| channel.build == kernel_version().build)
     else {
-        return STATUS_INVALID_SYSTEM_SERVICE;
+        return NtStatus::INVALID_SYSTEM_SERVICE;
     };
     let information = [
         size_of::<CdromChannelInformation>() as u32,
@@ -194,7 +191,7 @@ unsafe fn cdrom_channel(version: u32, length: u32, address: u32) -> NtStatus {
         core::ptr::with_exposed_provenance_mut::<[u32; 8]>(address as usize)
             .write_unaligned(information)
     };
-    STATUS_SUCCESS
+    NtStatus::SUCCESS
 }
 
 /// Implement retail monitor services whose state exists without the devkit kernel.
@@ -211,7 +208,7 @@ pub unsafe fn debug_monitor_service(
         // SAFETY: the caller upholds the selected service contract.
         unsafe { cdrom_channel(first, second, third) }
     } else {
-        STATUS_INVALID_SYSTEM_SERVICE
+        NtStatus::INVALID_SYSTEM_SERVICE
     }
 }
 

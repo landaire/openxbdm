@@ -1,5 +1,15 @@
 load("@xbox360//buck:xex.bzl", "xex_from_assembly")
 
+export_file(
+    name = "xex.toml",
+    visibility = ["PUBLIC"],
+)
+
+export_file(
+    name = "xex-retail-dashlaunch.toml",
+    visibility = ["PUBLIC"],
+)
+
 _MODULE = "//openxbdm/server/xbox360:openxbdm-server-xbox360"
 
 # For the kd host (DEVELOPING.md, Console deployment).

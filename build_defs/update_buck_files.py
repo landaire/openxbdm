@@ -23,10 +23,11 @@ Cargo.toml stays the description of every crate; the build files follow it:
 
 A crate built for the Xbox 360, the console module, has a
 `[package.metadata.buck2.xbox360]` table in its Cargo.toml that names its
-default linker script (`link_script`) and optional named build `variants`.
+default XEX manifest (`manifest`) and optional named build `variants`.
 Each binary becomes an `xbox360_executable_core`
-(`@xbox360//buck:xex.bzl`), which configures itself for the console; it has
-no tests. Build scripts are not supported.
+(`@xbox360//buck:xex.bzl`), which derives its linker script from the
+manifest and configures itself for the console. It has no tests. Build
+scripts are not supported.
 
 Reindeer generates rules and aliases only for the normal dependencies that
 the default features enable, and builds each third-party crate with one
@@ -313,7 +314,7 @@ class Resolved:
         return pinned_sdk_dependencies(dependencies)
 
 
-def crate_rules(package, directory, resolved, suffix, default, console, labels=None, link_script=None):
+def crate_rules(package, directory, resolved, suffix, default, console, labels=None, manifest=None):
     """The rules for one feature selection; `suffix` follows each target name.
 
     `console` is the `[package.metadata.buck2.xbox360]` table of a crate
@@ -414,7 +415,7 @@ def crate_rules(package, directory, resolved, suffix, default, console, labels=N
                 "labels": labels,
             }
             if console is not None:
-                attributes = attributes | {"link_script": link_script or console["link_script"]}
+                attributes = attributes | {"manifest": manifest or console["manifest"]}
                 rules.append(call("xbox360_executable_core", attributes))
                 continue
             rules.append(call("rust_binary", attributes))
@@ -467,22 +468,22 @@ def console_settings(package):
     console = metadata.get("xbox360")
     if console is None:
         return None
-    if not isinstance(console, dict) or set(console) != {"link_script", "variants"}:
+    if not isinstance(console, dict) or set(console) != {"manifest", "variants"}:
         raise BuildFileError(
-            f"{package['name']}: [package.metadata.buck2.xbox360] must set link_script and variants"
+            f"{package['name']}: [package.metadata.buck2.xbox360] must set manifest and variants"
         )
-    if not isinstance(console["link_script"], str) or not isinstance(console["variants"], list):
-        raise BuildFileError(f"{package['name']}: Xbox 360 link_script must be a path and variants must be a list")
+    if not isinstance(console["manifest"], str) or not isinstance(console["variants"], list):
+        raise BuildFileError(f"{package['name']}: Xbox 360 manifest must be a label and variants must be a list")
 
     names = []
     for variant in console["variants"]:
-        if not isinstance(variant, dict) or set(variant) != {"name", "link_script"}:
-            raise BuildFileError(f"{package['name']}: each Xbox 360 variant must set name and link_script")
+        if not isinstance(variant, dict) or set(variant) != {"name", "manifest"}:
+            raise BuildFileError(f"{package['name']}: each Xbox 360 variant must set name and manifest")
         name = variant["name"]
         if not isinstance(name, str) or name not in RESOLUTIONS or name in {"default", "all-features"}:
             raise BuildFileError(f"{package['name']}: unknown Xbox 360 variant resolution {name!r}")
-        if not isinstance(variant["link_script"], str):
-            raise BuildFileError(f"{package['name']}: Xbox 360 variant link_script must be a path")
+        if not isinstance(variant["manifest"], str):
+            raise BuildFileError(f"{package['name']}: Xbox 360 variant manifest must be a label")
         names.append(name)
     if len(names) != len(set(names)):
         raise BuildFileError(f"{package['name']}: duplicate Xbox 360 variant names")
@@ -515,7 +516,7 @@ def crate_build_file(workspace, package, aliases):
                 False,
                 console,
                 [name],
-                variant["link_script"],
+                variant["manifest"],
             )
 
     names = [name for name, _ in rules]

@@ -59,7 +59,6 @@ pub(crate) use self::settings::service_write_settings_copy;
 
 /// The settings file the monitor writes.
 const SAVED_SETTINGS_PATH: &[u8] = b"\\SystemRoot\\MobileJ.dat";
-const FROM_DISC_FLAG: HardwareBootFlags = HardwareBootFlags::from_bits_retain(0x400);
 
 /// Platform state of this domain.
 pub struct Data {
@@ -110,7 +109,9 @@ impl commands::system::Backend for Console {
     }
 
     fn booted_from_disc(&mut self) -> bool {
-        kernel::hardware_info().boot_flags.contains(FROM_DISC_FLAG)
+        kernel::hardware_info()
+            .boot_flags
+            .contains(HardwareBootFlags::CDROM_SYSTEM_ROOT)
     }
 
     fn title_process_caller(&mut self) -> bool {

@@ -31,8 +31,8 @@ xbox360-sys = "0.2"
 # (build_defs/update_buck_files.py, xbox360/BUCK); for the host, Cargo
 # builds a stub.
 [package.metadata.buck2.xbox360]
-link_script = "link.x"
+manifest = "//xbox360:xex.toml"
 variants = [
-    { name = "boot-guard", link_script = "link.x" },
-    { name = "retail-dashlaunch", link_script = "link-retail-dashlaunch.x" },
+    { name = "boot-guard", manifest = "//xbox360:xex.toml" },
+    { name = "retail-dashlaunch", manifest = "//xbox360:xex-retail-dashlaunch.toml" },
 ]

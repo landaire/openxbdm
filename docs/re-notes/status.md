@@ -54,9 +54,9 @@ exercised on a retail console. See `retail-dashlaunch.md`.
 
 Image requirements found on hardware:
 
-- The image is packed on 4 KB pages (`link.x` starts `.text` at
-  `0x91f01000`; xex-link derives section alignment from the small-pages
-  flag) and ends at `0x91fe5000`, below xshell at `0x92000000`.
+- The image is packed on 4 KB pages. The linker script generated from
+  `xbox360/xex.toml` starts `.text` at `0x91f01000`; the image ends at
+  `0x91fe5000`, below xshell at `0x92000000`.
 - The export table is in an executable section (`.xexp`): hypercall 0x17
   reads it only from protected code pages and otherwise fails with
   `0xc0000156` (`../acceleration/doc/re-notes/xex-loader.md`).

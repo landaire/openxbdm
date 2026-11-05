@@ -23,7 +23,7 @@
 
 [external_cell_xbox360]
   git_origin = https://github.com/landaire/xenon-forge
-  commit_hash = 1fffff77c5a555d188ba30bc4f995537ff0babec
+  commit_hash = f369053666c0d56176c8fdefd7d87f3dcc168c63
 
 [external_cell_rustc_bootstrap]
   git_origin = https://github.com/landaire-contrib/buck2-rustc-bootstrap

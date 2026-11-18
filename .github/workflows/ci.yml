@@ -14,11 +14,16 @@ on:
 # Every platform runs Buck2 through bin/buck2, which fetches the release
 # that toolchains/buck2 pins with DotSlash. On Linux and macOS, the devenv
 # `ci` profile provides reindeer, Cargo, Python and bazel-remote, and
-# Cachix holds the Nix store paths. bazel-remote serves Buck2's action
-# cache from a directory that actions/cache keeps between runs; runs on
-# main save it, and pull requests read the latest one. Windows has neither
-# Nix nor a bazel-remote build, so it runs bootstrap.ps1 and builds without
-# the action cache.
+# Cachix holds the Nix store paths. Windows has no Nix, so it runs
+# bootstrap.ps1.
+#
+# Pushes and manual runs read and write the shared action cache of
+# landaire/build-cache when the repository variables TS_CLIENT_ID and
+# TS_AUDIENCE name its Tailscale identity and the cache answers.
+# Otherwise, on Linux and macOS, bazel-remote serves Buck2's action cache
+# from a directory that actions/cache keeps between runs; runs on main save
+# it, and pull requests read the latest one. Windows has no bazel-remote
+# build, so it builds without an action cache.
 
 permissions:
   contents: read
@@ -40,6 +45,11 @@ jobs:
             os: macos-15
             checks: false
     runs-on: ${{ matrix.os }}
+    # Joining the tailnet to reach the shared action cache.
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -56,17 +66,42 @@ jobs:
       - name: Install devenv
         run: nix profile install nixpkgs#devenv
 
+      # Writes .buckconfig.local, which ci/start-action-cache.sh replaces, so
+      # a job uses either the shared cache or the local one.
+      - name: Connect to the shared action cache
+        id: shared-cache
+        uses: landaire/build-cache/.github/actions/buck-cache@e09a7ffe91cd628fc96f7fa169040d97cf0c5d47
+        with:
+          client-id: ${{ vars.TS_CLIENT_ID }}
+          audience: ${{ vars.TS_AUDIENCE }}
+
       # Action keys cover the linker command but not the compiler driver
-      # that it runs from PATH, so each runner image keeps its own cache.
-      # actions/cache rejects paths with `..`, and the directory stays
-      # outside the Buck2 project.
+      # that it runs from PATH. The shared cache keys actions on the runner
+      # image and the devenv definition (platforms/defs.bzl); the local cache
+      # is kept per runner image. actions/cache rejects paths with `..`, and
+      # the directory stays outside the Buck2 project.
       - name: Name the action cache
         id: action-cache
         run: |
           echo "prefix=buck2-action-cache-$ImageOS-$ImageVersion-${{ runner.arch }}-" >> "$GITHUB_OUTPUT"
           echo "ACTION_CACHE_DIR=$RUNNER_TEMP/buck2-action-cache" >> "$GITHUB_ENV"
 
+      - name: Select the shared action cache's platform
+        if: steps.shared-cache.outputs.enabled == 'true'
+        env:
+          DEVENV_HASH: ${{ hashFiles('devenv.*', 'nix/**') }}
+        run: |
+          cat >> .buckconfig.local <<CONFIG
+
+          [build]
+            execution_platforms = root//platforms:cached
+
+          [ci]
+            host_tools = $ImageOS-$ImageVersion-$RUNNER_ARCH-$DEVENV_HASH
+          CONFIG
+
       - name: Restore the Buck2 action cache
+        if: steps.shared-cache.outputs.enabled != 'true'
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.ACTION_CACHE_DIR }}
@@ -74,6 +109,7 @@ jobs:
           restore-keys: ${{ steps.action-cache.outputs.prefix }}
 
       - name: Start the action cache
+        if: steps.shared-cache.outputs.enabled != 'true'
         run: devenv --profile ci shell -- ci/start-action-cache.sh "$ACTION_CACHE_DIR"
 
       - name: Select the affected targets
@@ -118,7 +154,9 @@ jobs:
           if [ -f "$ACTION_CACHE_DIR.pid" ]; then kill "$(cat "$ACTION_CACHE_DIR.pid")"; fi
 
       - name: Save the Buck2 action cache
-        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: >-
+          always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+          && steps.shared-cache.outputs.enabled != 'true'
         uses: actions/cache/save@v4
         with:
           path: ${{ env.ACTION_CACHE_DIR }}
@@ -127,6 +165,11 @@ jobs:
   windows:
     name: Windows x86_64
     runs-on: windows-latest
+    # Joining the tailnet to reach the shared action cache.
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -140,6 +183,30 @@ jobs:
         run: |
           ./bootstrap.ps1
           Add-Content -Path $env:GITHUB_PATH -Value C:\a\bin
+
+      - name: Connect to the shared action cache
+        id: shared-cache
+        uses: landaire/build-cache/.github/actions/buck-cache@e09a7ffe91cd628fc96f7fa169040d97cf0c5d47
+        with:
+          client-id: ${{ vars.TS_CLIENT_ID }}
+          audience: ${{ vars.TS_AUDIENCE }}
+          buckconfig: C:/a/.buckconfig.local
+
+      # Action keys do not cover the MSVC tools of the runner image, so the
+      # shared cache keys actions on the image (platforms/defs.bzl).
+      - name: Select the shared action cache's platform
+        if: steps.shared-cache.outputs.enabled == 'true'
+        shell: bash
+        working-directory: C:\a
+        run: |
+          cat >> .buckconfig.local <<CONFIG
+
+          [build]
+            execution_platforms = root//platforms:cached
+
+          [ci]
+            host_tools = $ImageOS-$ImageVersion-$RUNNER_ARCH
+          CONFIG
 
       - name: Select the affected targets
         id: affected

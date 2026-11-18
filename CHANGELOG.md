@@ -102,7 +102,7 @@
 - Report each libtest case as its own Buck2 test through the internal test runner.
 - `bin/buck2` (`bin\buck2.cmd` on Windows) runs the Buck2 release that the DotSlash file `toolchains/buck2` pins, through a DotSlash that `bootstrap.sh` or `bootstrap.ps1` installs into `.tools` on first use, so no Buck2 installation or Nix is needed. The bootstrap scripts report missing host tools (the C++ linker driver and SDK, git, long paths on Windows). The `build_defs` scripts, `devenv.nix`, `mise.toml` and CI use the wrapper; `devenv.nix` provides no C compiler or LLVM tools.
 - The devenv shell resolves `CARGO_HOME` through symbolic links, so Cargo builds of `openxbdm-ffi-bindgen` work when the home directory is a link (Fedora Atomic).
-- CI builds and tests everything, including the console module and the C++ headers, with Buck2 on Linux x86_64, macOS arm64 and Windows x86_64, with a bazel-remote action cache on Linux and macOS, and checks formatting, clippy diagnostics and the generated files on Linux x86_64.
+- CI builds and tests everything, including the console module and the C++ headers, with Buck2 on Linux x86_64, macOS arm64 and Windows x86_64, and checks formatting, clippy diagnostics and the generated files on Linux x86_64. Pushes and manual runs read and write the shared action cache of [build-cache](https://github.com/landaire/build-cache) on every platform, with action keys that name the runner image and the devenv definition; other runs use a bazel-remote action cache on Linux and macOS.
 
 ### Releases
 

@@ -76,8 +76,11 @@ the Rust release in `rust-toolchain.toml`, Reindeer, Python, Git, curl,
 DotSlash, and the Linux native dependencies. The default standard
 environment has no C compiler; the Linux shell includes Clang for the
 small C shims in native dependencies. `devenv --profile ci shell` also
-adds `bazel-remote` for the CI action cache (`ci/start-action-cache.sh`).
-`mise.toml` puts `bin` on `PATH` for its tasks.
+adds `bazel-remote` for the local CI action cache
+(`ci/start-action-cache.sh`). Pushes and manual runs in CI use the shared
+action cache of [build-cache](https://github.com/landaire/build-cache)
+instead when the repository variables `TS_CLIENT_ID` and `TS_AUDIENCE`
+are set. `mise.toml` puts `bin` on `PATH` for its tasks.
 
 The flake locks its inputs in `flake.lock`. The default flake package
 contains every host executable; each is also an individual package and

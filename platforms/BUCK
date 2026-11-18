@@ -2,10 +2,15 @@ load("@prelude//platforms:defs.bzl", "host_configuration")
 load("@xbox360//buck:platforms.bzl", "execution_platforms")
 load(":defs.bzl", "cached_execution_platform")
 
+# The tools that actions find on PATH; see defs.bzl. CI sets it for the
+# shared action cache.
+_HOST_TOOLS = read_root_config("ci", "host_tools")
+
 cached_execution_platform(
     name = "cached-host",
     constraint_values = [],
     cpu_configuration = host_configuration.cpu,
+    host_tools = _HOST_TOOLS,
     os_configuration = host_configuration.os,
     use_windows_path_separators = host_info().os.is_windows,
 )
@@ -14,6 +19,7 @@ cached_execution_platform(
     name = "cached-ppc64",
     constraint_values = ["xbox360//platforms:codegen[ppc64-ilp32]"],
     cpu_configuration = host_configuration.cpu,
+    host_tools = _HOST_TOOLS,
     os_configuration = host_configuration.os,
     use_windows_path_separators = host_info().os.is_windows,
 )

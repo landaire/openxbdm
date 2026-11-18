@@ -66,14 +66,16 @@ jobs:
       - name: Install devenv
         run: nix profile install nixpkgs#devenv
 
-      # Writes .buckconfig.local, which ci/start-action-cache.sh replaces, so
-      # a job uses either the shared cache or the local one.
+      # When the job cannot use the shared cache, ci/start-action-cache.sh
+      # points Buck2 at a local one instead.
       - name: Connect to the shared action cache
         id: shared-cache
-        uses: landaire/build-cache/.github/actions/buck-cache@e09a7ffe91cd628fc96f7fa169040d97cf0c5d47
+        uses: landaire/build-cache/.github/actions/buck-cache@8ebcdd82280718d26191a9f5d81fdc88be66dcb3
         with:
           client-id: ${{ vars.TS_CLIENT_ID }}
           audience: ${{ vars.TS_AUDIENCE }}
+          pr-client-id: ${{ vars.TS_PR_CLIENT_ID }}
+          pr-audience: ${{ vars.TS_PR_AUDIENCE }}
 
       # Action keys cover the linker command but not the compiler driver
       # that it runs from PATH. The shared cache keys actions on the runner
@@ -186,10 +188,12 @@ jobs:
 
       - name: Connect to the shared action cache
         id: shared-cache
-        uses: landaire/build-cache/.github/actions/buck-cache@e09a7ffe91cd628fc96f7fa169040d97cf0c5d47
+        uses: landaire/build-cache/.github/actions/buck-cache@8ebcdd82280718d26191a9f5d81fdc88be66dcb3
         with:
           client-id: ${{ vars.TS_CLIENT_ID }}
           audience: ${{ vars.TS_AUDIENCE }}
+          pr-client-id: ${{ vars.TS_PR_CLIENT_ID }}
+          pr-audience: ${{ vars.TS_PR_AUDIENCE }}
           buckconfig: C:/a/.buckconfig.local
 
       # Action keys do not cover the MSVC tools of the runner image, so the
